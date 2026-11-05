@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from trading.adl_exchange import ORDER_QUERY_SYMBOL_LIMIT, order_query_symbols, reduction_rule, reduction_snapshot
-from trading.exchange import LiveBroker
+from trading.adl_exchange import ORDER_QUERY_SYMBOL_LIMIT, SymbolUnavailable, order_query_symbols, reduction_rule, reduction_snapshot
+from trading.exchange import ExchangeError, LiveBroker
 from trading.models import MARKET_SYMBOLS, TradingError, dec
 
 
@@ -406,7 +406,7 @@ class ReductionRuleTests(unittest.TestCase):
         self.assertEqual(len(api.calls), 2)
         self.assertEqual(market._adl_rule_cache["BTCUSDT"][0], 100)
 
-    def test_missing_invalid_or_delisted_rules_do_not_enter_cache(self):
+    def test_missing_invalid_or_delisted_rules_do_not_enter_positive_cache(self):
         mutations = (
             lambda d: d.pop("symbols"),
             lambda d: d.update(symbols=[]),
@@ -429,6 +429,85 @@ class ReductionRuleTests(unittest.TestCase):
                 with self.assertRaises(TradingError):
                     reduction_rule(market, "BTCUSDT")
                 self.assertEqual(market._adl_rule_cache, {})
+
+    def test_api_replaced_during_unavailable_read_is_scene_wide_uncertainty(self):
+        for changes in ({"symbol": "ETHUSDT"}, {"status": "BREAK"}, {"orderTypes": ["LIMIT"]}):
+            with self.subTest(changes=changes):
+                row = {**market_row(), **changes}
+                market, api = self.market({"symbols": [row]})
+                replacement = FakeAPI({INFO: {"symbols": [market_row()]}})
+                api.on_read = lambda _: setattr(market, "api", replacement)
+                with self.assertRaises(TradingError) as caught:
+                    reduction_rule(market, "BTCUSDT")
+                self.assertNotIsInstance(caught.exception, SymbolUnavailable)
+                self.assertIn("读取期间已失效", str(caught.exception))
+                self.assertEqual(reduction_rule(market, "BTCUSDT").symbol, "BTCUSDT")
+                self.assertEqual(len(replacement.calls), 1)
+
+    def test_slow_unavailable_read_is_scene_wide_uncertainty(self):
+        for changes in ({"symbol": "ETHUSDT"}, {"status": "BREAK"}, {"orderTypes": ["LIMIT"]}):
+            with self.subTest(changes=changes):
+                market, api = self.market({"symbols": [{**market_row(), **changes}]})
+                with patch("trading.adl_exchange.time.monotonic", side_effect=[100, 160]):
+                    with self.assertRaises(TradingError) as caught:
+                        reduction_rule(market, "BTCUSDT")
+                self.assertNotIsInstance(caught.exception, SymbolUnavailable)
+                self.assertIn("读取期间已失效", str(caught.exception))
+                api.responses[INFO] = {"symbols": [market_row()]}
+                with patch("trading.adl_exchange.time.monotonic", return_value=161):
+                    self.assertEqual(reduction_rule(market, "BTCUSDT").symbol, "BTCUSDT")
+                self.assertEqual(len(api.calls), 2)
+
+    def test_unavailable_cache_expires_after_ten_seconds_without_renewal(self):
+        for changes in ({"symbol": "ETHUSDT"}, {"status": "BREAK"}, {"orderTypes": ["LIMIT"]}):
+            with self.subTest(changes=changes):
+                market, api = self.market({"symbols": [{**market_row(), **changes}]})
+                with patch("trading.adl_exchange.time.monotonic", return_value=100):
+                    with self.assertRaises(SymbolUnavailable) as original:
+                        reduction_rule(market, "BTCUSDT")
+                api.responses[INFO] = {"symbols": [market_row()]}
+                for now in (101, 109.999):
+                    with patch("trading.adl_exchange.time.monotonic", return_value=now):
+                        with self.assertRaises(SymbolUnavailable) as cached:
+                            reduction_rule(market, "BTCUSDT")
+                    self.assertEqual(str(cached.exception), str(original.exception))
+                    self.assertEqual(len(api.calls), 1)
+                with patch("trading.adl_exchange.time.monotonic", return_value=110):
+                    self.assertEqual(reduction_rule(market, "BTCUSDT").symbol, "BTCUSDT")
+                self.assertEqual(len(api.calls), 2)
+
+    def test_unavailable_cache_is_scoped_to_api_and_symbol(self):
+        market, api = self.market({"symbols": [{**market_row(), "status": "BREAK"}, market_row("ETHUSDT")]})
+        with patch("trading.adl_exchange.time.monotonic", return_value=100):
+            with self.assertRaises(SymbolUnavailable):
+                reduction_rule(market, "BTCUSDT")
+            self.assertEqual(reduction_rule(market, "ETHUSDT").symbol, "ETHUSDT")
+            replacement = FakeAPI({INFO: {"symbols": [market_row()]}})
+            market.api = replacement
+            self.assertEqual(reduction_rule(market, "BTCUSDT").symbol, "BTCUSDT")
+        self.assertEqual(len(api.calls), 2)
+        self.assertEqual(len(replacement.calls), 1)
+
+    def test_uncertain_rule_failures_are_never_negatively_cached(self):
+        failures = (
+            ExchangeError("exchangeInfo unavailable", http_status=503),
+            {}, {"symbols": []},
+            {"symbols": [{**market_row(), "status": None}]},
+            {"symbols": [{**market_row(), "orderTypes": ["LIMIT", 7]}]},
+            {"symbols": [{**market_row(), "filters": []}]},
+        )
+        for response in failures:
+            with self.subTest(response=response):
+                market, api = self.market(response)
+                with patch("trading.adl_exchange.time.monotonic", return_value=100):
+                    for _ in range(2):
+                        with self.assertRaises(TradingError) as caught:
+                            reduction_rule(market, "BTCUSDT")
+                        self.assertNotIsInstance(caught.exception, SymbolUnavailable)
+                    self.assertEqual(len(api.calls), 2)
+                    api.responses[INFO] = {"symbols": [market_row()]}
+                    self.assertEqual(reduction_rule(market, "BTCUSDT").symbol, "BTCUSDT")
+                    self.assertEqual(len(api.calls), 3)
 
     def test_replaced_api_and_slow_fetch_cannot_reuse_rule(self):
         market, api = self.market()

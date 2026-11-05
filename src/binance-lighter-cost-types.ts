@@ -1,11 +1,14 @@
 export type CostSymbol = 'BTC' | 'ETH';
 export type CostVenue = 'binance' | 'lighter';
 export type CostConfig = {
-  schema: 2; symbols: CostSymbol[]; latencyScenarios: number[];
-  orderNotional: number; maxInventoryNotional: number; maxUnhedgedNotional: number;
+  schema: 2; symbols: ['BTC']; latencyScenarios: number[];
+  orderNotional: number; maxInventoryNotional: number; maxUnhedgedNotional: number; hedgeThresholdNotional: number;
   quoteOffsetBps: number; inventorySkewBps: number; quoteRefreshMs: number; quoteMaxAgeMs: number; hedgeWaitMs: number;
   maxBookAgeMs: number; maxSourceAgeMs: number; maxPairSkewMs: number; maxHedgeSlippageBps: number;
   queueMultiplier: number; binanceMakerFeeBps: number; lighterTakerFeeBps: number; fundingCostBpsPerHour: number | null;
+};
+export type CostSessionConfig = Omit<CostConfig, 'symbols' | 'hedgeThresholdNotional'> & {
+  symbols: CostSymbol[]; hedgeThresholdNotional?: number;
 };
 export type CostBook = {
   venue: CostVenue; symbol: CostSymbol; nativeSymbol: string; bid: number | null; ask: number | null;
@@ -23,7 +26,7 @@ export type CostScenario = {
   id: string; symbol: CostSymbol; latencyMs: number;
   status: 'waiting' | 'quoting' | 'hedging' | 'recovering' | 'blocked' | 'stopped'; reason: string | null;
   inventory: {
-    binanceQuantity: number; lighterQuantity: number; residualQuantity: number; projectedResidualQuantity: number;
+    binanceQuantity: number; lighterQuantity: number; residualQuantity: number; projectedResidualQuantity: number; residualNotional?: number | null;
     binanceAveragePrice: number | null; lighterAveragePrice: number | null; binanceNotional: number | null; utilization: number | null; limitNotional: number;
   };
   quotes: { buy: CostQuote | null; sell: CostQuote | null };
@@ -42,7 +45,7 @@ export type CostScenario = {
 export type CostReport = {
   schema: 2; strategy: 'inventory_quotes'; sessionId: string; startedAt: number; updatedAt: number; stopped: boolean; interrupted: boolean;
   detailLevel?: 'summary' | 'full' | 'scenario';
-  mode: 'paper'; sessionConfig: CostConfig; markets: unknown; books: CostBook[];
+  mode: 'paper'; sessionConfig: CostSessionConfig; markets: unknown; books: CostBook[];
   channels: { venue: CostVenue; channel: string; symbol?: CostSymbol; state: string; reason?: string; at: number }[];
   scenarios: CostScenario[]; diagnostics: { at: number; level: string; event: string; venue: CostVenue | null; message: string; reason?: string }[]; assumptions: string[];
 };

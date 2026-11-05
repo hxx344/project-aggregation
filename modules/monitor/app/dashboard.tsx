@@ -6,7 +6,7 @@ import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, Refr
 import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useMarketFeed } from "../hooks/use-market-feed";
-import { hynixSummary, type SummaryProps } from "../lib/monitor-summary";
+import { hynixSummary, hynixTrendOptions, type SummaryProps } from "../lib/monitor-summary";
 import { createTrend } from "../lib/monitor-trend";
 import type { InitialMarketData } from "../lib/initial-market";
 import { useHubFills } from "../lib/hub-fills";
@@ -32,8 +32,10 @@ export default function Dashboard({ onSummary, active = true, summaryActive = ac
   if (active && !hasOpened) setHasOpened(true);
   // The overview card stays visible while another market's detail is selected.
   // Share its feed with the detail without activating hidden charts or funding history.
-  const { data, quote, loading, error, quoteError, refresh } = useMarketFeed(initial?.hynix, initial?.renderedAt, active || summaryActive);
-  const trend = useMemo(() => createTrend(data ? { points: data.points.map(point => ({ time: point.time, value: point.premium })), status: data.status, fetchedAt: data.fetchedAt } : undefined, { days: 7, intervalMs: 3_600_000, label: "7 天小时线", shortLabel: "7天", unit: "%" }, Boolean(error)), [data, error]);
+  const { data, quote, loading, error, quoteError, refresh } = useMarketFeed(initial?.hynix, active || summaryActive);
+  const initialTrend = initial?.hynix?.trend ?? undefined;
+  // Until the full history arrives, keep the embedded overview trend and its real source time.
+  const trend = useMemo(() => createTrend(data ? { points: data.points.map(point => ({ time: point.time, value: point.premium })), status: data.status, fetchedAt: data.fetchedAt } : initialTrend, hynixTrendOptions, Boolean(error)), [data, error, initialTrend]);
   useEffect(() => { onSummary?.(hynixSummary(quote, quoteError, trend)); }, [onSummary, quote, quoteError, trend]);
   const [range,setRange] = useState<number | null>(null);
   const trades = useHubFills("hynix", tradesActive);
@@ -48,6 +50,8 @@ export default function Dashboard({ onSummary, active = true, summaryActive = ac
   },[points]);
   const recent = useMemo(() => dailyPoints(points).slice(-6).reverse(),[points]);
   const direction = !current || current.premium >= 0 ? "positive" : "negative";
+  // History is never embedded in the page, so before its first successful read an empty chart means pending, not absent.
+  const historyPending = loading || !data;
   return <div className="site-shell">
     <header className="topbar"><a className="brand" href="/" aria-label="Hynix Spread 首页"><span className="brand-mark"><BarChart3 size={23}/></span><span>HYNIX<span className="brand-light"> / SPREAD</span></span></a><div className="top-meta"><span>跨市场观察</span><span className="vertical-rule"/><span className="source-dot"/>Hyperliquid</div></header>
     <main>
@@ -63,11 +67,11 @@ export default function Dashboard({ onSummary, active = true, summaryActive = ac
         <article className="metric"><div className="metric-label"><span className="legend-dot ordinary"/>正股折算价格<span className="ticker">SKHX</span></div><div className="metric-value">{money(current?.equivalent)}</div><div className="metric-foot">正股 {money(current?.ordinary)} <span>÷ 10</span></div></article>
         <article className="metric"><div className="metric-label">区间平均溢价<span className="ticker">{ranges.find(r=>r.days===range)?.label}</span></div><div className="metric-value">{percent(stats?.mean)}</div><div className="metric-foot">{stats ? `${percent(stats.min)} 至 ${percent(stats.max)}` : "等待行情数据"}</div></article>
       </section>
-      {hasOpened && <ChartActivity mode={active ? "visible" : "hidden"}><SpreadChart data={data?.points ?? EMPTY_POINTS} loading={loading} range={range} onRangeChange={setRange} trades={trades} /></ChartActivity>}
+      {hasOpened && <ChartActivity mode={active ? "visible" : "hidden"}><SpreadChart data={data?.points ?? EMPTY_POINTS} loading={historyPending} range={range} onRangeChange={setRange} trades={trades} /></ChartActivity>}
       <p className="chart-footnote"><Info size={13} aria-hidden="true"/>缺失时段曲线断开，不补 0 · 采样 1 小时</p></div>
       {children}
       {hasOpened && <ChartActivity mode={active ? "visible" : "hidden"}><HynixFundingPanel range={range} onRangeChange={setRange}/></ChartActivity>}
-      <div className="bottom-grid"><section className="table-panel"><div className="section-heading"><h2>近期观察</h2><span>每日最后共同小时 · 起点 UTC</span></div><div className="table-scroll"><table><thead><tr><th>日期</th><th>ADR</th><th>正股 ÷ 10</th><th>每份价差</th><th>溢价率</th></tr></thead><tbody>{recent.map(p=><tr key={p.time}><td>{date(p.time,true)}<small>{new Date(p.time).toISOString().slice(11,16)}</small></td><td>{money(p.adr)}</td><td>{money(p.equivalent)}</td><td>{signedMoney(p.spread)}</td><td><span className={`premium-pill ${p.premium>=0 ? "positive" : "negative"}`}>{p.premium>=0 ? <ArrowUpRight size={13}/> : <ArrowDownRight size={13}/>}{percent(p.premium)}</span></td></tr>)}{!recent.length && <tr><td colSpan={5} className="empty-table">{loading ? "正在加载记录…" : "暂无记录"}</td></tr>}</tbody></table></div></section>
+      <div className="bottom-grid"><section className="table-panel"><div className="section-heading"><h2>近期观察</h2><span>每日最后共同小时 · 起点 UTC</span></div><div className="table-scroll"><table><thead><tr><th>日期</th><th>ADR</th><th>正股 ÷ 10</th><th>每份价差</th><th>溢价率</th></tr></thead><tbody>{recent.map(p=><tr key={p.time}><td>{date(p.time,true)}<small>{new Date(p.time).toISOString().slice(11,16)}</small></td><td>{money(p.adr)}</td><td>{money(p.equivalent)}</td><td>{signedMoney(p.spread)}</td><td><span className={`premium-pill ${p.premium>=0 ? "positive" : "negative"}`}>{p.premium>=0 ? <ArrowUpRight size={13}/> : <ArrowDownRight size={13}/>}{percent(p.premium)}</span></td></tr>)}{!recent.length && <tr><td colSpan={5} className="empty-table">{historyPending ? "正在加载记录…" : "暂无记录"}</td></tr>}</tbody></table></div></section>
       <aside className="method-panel"><div className="section-heading"><h2>如何比较</h2><span className="info-icon"><Info size={17}/></span></div><div className="conversion"><div><span className="instrument-label">韩国正股</span><strong>1 <small>股</small></strong><span>000660 · KRX</span></div><MoveRight size={22}/><div><span className="instrument-label">美国 ADR</span><strong>10 <small>份</small></strong><span>SKHY · NASDAQ</span></div></div><div className="formula"><span>ADR 溢价率</span><code>(ADR ÷ (正股美元价 ÷ 10) − 1) × 100%</code></div><p className="method-note">正数表示 ADR 溢价，负数表示折价。两条行情均来自 Hyperliquid 永续合约；价差包含合约基差，并非交易所现货价差。</p><div className="listing-note"><span>ADR 首次交易</span><b>2026.07.10</b></div></aside></div>
       <section className="source-panel"><button className="source-toggle" aria-expanded={details} onClick={()=>setDetails(!details)}><span><Info size={16}/>数据来源与覆盖范围</span><ChevronDown size={17} className={details ? "rotated" : ""}/></button>{details && <div className="source-content"><div><h3>行情来源</h3><p>Hyperliquid HIP-3 / XYZ：xyz:SKHX（正股美元代理）与 xyz:SKHY（ADR 代理）。SKHX 已包含韩元兑美元换算。顶部实时报价每 10 秒刷新，使用 allMids 中间价（空盘口时为最近成交价），时间标注为成功获取时间。入口卡片的净资金费取自 metaAndAssetCtxs：空 10 份 SKHY、多 1 份 SKHX，以两腿预言机价格对应的总名义金额为分母，净小时费率 × 24 × 365 换算为简单年化；正数净收款，负数净付款。资金费与价格并行获取，资金费缺失时显示“—”。历史图每 60 秒检查更新，使用已结束的 1 小时 K 线收盘价，仅匹配双方都有报价的时段；不补齐缺失报价。图中时间为该小时起点。</p><a href="https://docs.trade.xyz/perpetuals/specifications-and-schedules/specification-index" target="_blank" rel="noreferrer">XYZ 合约说明 <ArrowUpRight size={13}/></a><a className="second-source" href="https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding" target="_blank" rel="noreferrer">资金费计算口径 <ArrowUpRight size={13}/></a></div><div><h3>历史覆盖</h3><p>ADR 于 2026 年 7 月 10 日以 SKHYV 首次交易。小时图从当日 14:00 UTC 开始，排除上市前的合约交易。{data ? `当前共同可用行情始于 ${stamp(data.firstAvailable)}。取数时间：${stamp(data.fetchedAt)}。` : "正在检查历史覆盖范围。"} 接口保留最近 5,000 根小时线，已保存的历史与新行情合并展示。休市时永续合约仍可交易。</p><a href="https://depositaryreceipts.citi.com/adr/guides/pgm_dispabook.aspx?cusip=78392B206&pageId=15&subpageID=111" target="_blank" rel="noreferrer">Citi ADR 换算比例 <ArrowUpRight size={13}/></a><a className="second-source" href="https://news.skhynix.com/en/skhynix-lists-adrs-on-nasdaq/" target="_blank" rel="noreferrer">上市公告 <ArrowUpRight size={13}/></a></div></div>}</section>
       <footer><span>HYNIX / SPREAD<span className="footer-divider">·</span>同口径，看价差。</span><span>Hyperliquid 永续合约数据<span className="footer-divider">/</span>所有时间为 UTC</span></footer>

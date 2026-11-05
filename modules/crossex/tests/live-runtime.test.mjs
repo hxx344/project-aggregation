@@ -219,15 +219,15 @@ test('one display snapshot reuses its order read across a large execution histor
       }
     }
   });
-  const statement = f.store.prepare('SELECT json FROM live_orders ORDER BY updated_at DESC');
-  const all = statement.all.bind(statement); let orderReads = 0;
-  statement.all = (...args) => { orderReads++; return all(...args); };
+  const prepare = f.store.prepare; let orderReads = 0;
+  f.store.prepare = sql => { if (/FROM live_orders/.test(sql)) orderReads++; return prepare(sql); };
   try {
     const state = f.runtime.view();
     assert.equal(state.live.executions.length, 100);
     assert.ok(state.live.executions.every(e => e.state === 'completed' && e.legs.length === 2 && e.legs[0].index === 0));
-    assert.equal(orderReads, 1, 'each HTTP snapshot must not reread every order for every execution');
-  } finally { statement.all = all; }
+    // Query count does not grow with executions; remote attribution queries grow with open orders.
+    assert.ok(orderReads <= 4, `each HTTP snapshot must not reread orders for every execution (${orderReads} order queries)`);
+  } finally { f.store.prepare = prepare; }
 });
 
 test('double confirmation is idempotent and each complete fill precedes the next leg', async t => {
@@ -1075,6 +1075,59 @@ test('position projection only checks the traded direction and tolerates an IOC 
   f.advance(30000); await f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' });
 });
 
+test('position projection includes the one-hour write margin boundary and excludes older writes', async t => {
+  for (const offset of [1, 0, -1]) {
+    const f = fixture(t);
+    f.positions([{ user_id: '123', symbol: symbols[0], position_side: 'LONG', position_qty: '2', mark_price: '100', update_time: String(epoch - 5000) }]);
+    await f.connect();
+    const version = f.runtime.connectionView().version, updatedAt = f.now - 30000 - 3600000 + offset;
+    // Keep the fill recent even on the excluded row so a full-history fallback is observable.
+    const order = { id: 'margin-fill', executionId: 'old-execution', text: 'margin-fill-text', version, index: 0, status: 'FILLED',
+      symbol: symbols[0], side: 'SELL', positionSide: 'LONG', quantity: '1', executedQty: '1', reduceOnly: true, updatedAt,
+      raw: { update_time: String(f.now - 1000) } };
+    f.store.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)').run(order.id, order.executionId, order.text, version, order.status, updatedAt, JSON.stringify(order));
+    const preview = () => f.runtime.preview({ kind: 'close', positionId: `${symbols[0]}:LONG`, quantity: '1' });
+    if (offset >= 0) await assert.rejects(preview(), /尚未反映最近成交/, `write boundary offset ${offset}`);
+    else assert.equal((await preview()).positions[0].heldQuantity, '2', 'writes before the margin window are excluded');
+    assert.deepEqual(f.calls.create, []);
+  }
+});
+
+test('CrossEx reads remain usable when either optional partial index is missing', async t => {
+  for (const index of ['live_orders_unfinished', 'live_orders_finished']) await t.test(index, async t => {
+    const f = fixture(t); await f.connect();
+    const before = f.runtime.view(), summary = f.runtime.summary(), update = f.runtime.updateStatus();
+    f.store.db.exec(`DROP INDEX ${index}`);
+    assert.deepEqual(f.runtime.view(), before);
+    assert.deepEqual(f.runtime.summary(), summary);
+    assert.deepEqual(f.runtime.updateStatus(), update);
+    assert.equal((await f.preview()).canConfirm, true, 'projection reads also work without the index');
+    assert.deepEqual(f.calls.create, []);
+  });
+});
+
+test('SQLite selects the CrossEx partial indexes for active, finished and projection reads', async t => {
+  const f = fixture(t); await f.connect();
+  const prepare = f.store.prepare, plans = new Map();
+  f.store.prepare = sql => {
+    const statement = prepare(sql);
+    if (!/FROM live_orders (?:INDEXED BY \w+ )?WHERE (?:version=\? AND )?state (?:NOT )?IN/.test(sql)) return statement;
+    const read = (method, args) => {
+      const expected = sql.includes('state NOT IN') ? 'live_orders_unfinished' : 'live_orders_finished';
+      const details = f.store.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(...args).map(row => row.detail);
+      assert.ok(details.some(detail => new RegExp(`USING (?:COVERING )?INDEX ${expected}\\b`).test(detail)), `${sql}: ${details.join('; ')}`);
+      plans.set(sql, expected);
+      return statement[method](...args);
+    };
+    return { all: (...args) => read('all', args), get: (...args) => read('get', args) };
+  };
+  try {
+    f.runtime.view(); f.runtime.summary(); f.runtime.updateStatus(); await f.preview();
+    assert.equal(plans.size, 4, 'active rows, finished page, finished count and projection window are all checked');
+    assert.deepEqual([...new Set(plans.values())].sort(), ['live_orders_finished', 'live_orders_unfinished']);
+  } finally { f.store.prepare = prepare; }
+});
+
 test('external order history lookback is bounded and an older order stays pending with a visible reason', async t => {
   const f = fixture(t), created = epoch - 30 * 86400000;
   const raw = { order_id: 'external-ancient', text: 'app', symbol: symbols[0], type: 'LIMIT', time_in_force: 'GTC', side: 'BUY', position_side: 'LONG',
@@ -1185,4 +1238,65 @@ test('finished local history never pushes active local or external orders out of
     assert.deepEqual(shown.orders.slice(0, 2).map(o => o.id), ['local-active', 'external-new']);
     assert.equal(shown.hiddenClosed, closedCount - CLOSED_ORDER_DISPLAY_LIMIT, 'the panel reports finished orders beyond both limits');
   }
+});
+
+test('live view, summary and update checks keep every unfinished order while finished history reads stay bounded', async t => {
+  const results = [];
+  for (const closedCount of [400, 800]) {
+    const f = fixture(t);
+    f.orders([{ user_id: '123', order_id: 'remote-local', text: 'local-active-text', symbol: symbols[0], side: 'BUY', state: 'NEW', qty: '1', executed_qty: '0' },
+      { user_id: '123', order_id: 'external-new', text: 'external-new-text', symbol: symbols[1], side: 'SELL', state: 'NEW', qty: '2', executed_qty: '0' },
+      // These match finished local orders by exchange id or, without one, by text; they stay attributed to them.
+      { user_id: '123', order_id: 'closed-order-5', text: 'other-text', symbol: symbols[1], side: 'SELL', state: 'NEW', qty: '1', executed_qty: '0' },
+      { user_id: '123', order_id: 'remote-noid', text: 'closed-noid-text', symbol: symbols[1], side: 'SELL', state: 'NEW', qty: '1', executed_qty: '0' }]);
+    await f.connect();
+    const version = f.runtime.connectionView().version, db = f.store.db;
+    const insert = db.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)');
+    const save = (order, updatedAt) => insert.run(order.id, order.executionId, order.text, version, order.status, updatedAt,
+      JSON.stringify({ symbol: symbols[0], side: 'BUY', quantity: '1', executedQty: '1', reduceOnly: false, version, updatedAt, index: 0, ...order }));
+    f.store.transaction(() => {
+      // Unfinished orders are older than all finished history.
+      save({ id: 'unknown-old', executionId: 'execution-unknown', text: 'unknown-old-text', orderId: null, status: 'UNKNOWN', executedQty: '0' }, f.now - 100000);
+      save({ id: 'local-active', executionId: 'execution-active', text: 'local-active-text', orderId: 'remote-local', status: 'NEW', executedQty: '0' }, f.now - 90000);
+      save({ id: 'closed-noid', executionId: 'execution-noid', text: 'closed-noid-text', orderId: null, status: 'UNSENT', executedQty: '0' }, f.now - 80000);
+      for (let i = 0; i < closedCount; i++) {
+        const executionId = `execution-${Math.floor(i / 2)}`;
+        if (i % 2 === 0) db.prepare('INSERT INTO live_executions VALUES (?,?,?,?)').run(executionId, `preview-${executionId}`, f.now - closedCount + i, JSON.stringify({ id: executionId, kind: 'open', createdAt: f.now - closedCount + i }));
+        // Pairs of legs share one timestamp, so ties must keep their stored order.
+        save({ id: `closed-${i}`, executionId, index: i % 2, text: `closed-text-${i}`, orderId: `closed-order-${i}`, status: i % 3 ? 'FILLED' : 'CANCELLED', executedQty: i % 3 ? '1' : '0' }, f.now - closedCount + Math.floor(i / 2));
+      }
+    });
+    // Existing databases gain the read indexes on the next start.
+    for (const row of db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name IN ('live_orders','live_executions') AND sql IS NOT NULL").all()) db.exec(`DROP INDEX "${row.name}"`);
+    await f.reopen();
+    const prepare = f.store.prepare; let rows = 0;
+    f.store.prepare = sql => {
+      const statement = prepare(sql);
+      if (!/^\s*SELECT[\s\S]*FROM live_(orders|executions)/i.test(sql)) return statement;
+      return new Proxy(statement, { get(target, key) {
+        const value = Reflect.get(target, key);
+        if (key === 'all') return (...args) => { const found = value.apply(target, args); rows += found.length; return found; };
+        if (key === 'get') return (...args) => { const found = value.apply(target, args); if (found) rows++; return found; };
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    try {
+      rows = 0; const live = f.runtime.view().live, viewRows = rows;
+      rows = 0; const summary = f.runtime.summary(), summaryRows = rows;
+      rows = 0; const update = f.runtime.updateStatus(), updateRows = rows;
+      const finished = ['FILLED', 'CANCELLED', 'FAIL', 'REJECT', 'UNSENT'];
+      assert.deepEqual(live.orders.filter(o => !finished.includes(o.status)).map(o => [o.id, o.external]), [['local-active', false], ['unknown-old', false], ['external-new', true]]);
+      assert.equal(live.orders.length, 3 + 300); assert.equal(live.closedOrdersOmitted, closedCount + 1 - 300);
+      const reference = db.prepare("SELECT id FROM live_orders WHERE state IN ('FILLED','CANCELLED','FAIL','REJECT','UNSENT') ORDER BY updated_at DESC").all().map(row => row.id);
+      assert.deepEqual(live.orders.slice(3).map(o => o.id), reference.slice(0, 300), 'finished page keeps the previous order, ties included');
+      assert.equal(live.executions.length, 100);
+      assert.ok(live.executions.every(e => e.legs.length === 2 && e.legs[0].index === 0 && ['completed', 'partial'].includes(e.state)));
+      assert.equal(live.executions[0].id, `execution-${closedCount / 2 - 1}`);
+      assert.equal(summary.metrics.find(m => m.key === 'liveOrders').value, 3);
+      assert.equal(summary.metrics.find(m => m.key === 'unconfirmedOrders').value, 1);
+      assert.equal(update.busy, true);
+      results.push({ viewRows, summaryRows, updateRows });
+    } finally { f.store.prepare = prepare; }
+  }
+  assert.deepEqual(results[0], results[1], 'order reads do not grow with finished history');
 });

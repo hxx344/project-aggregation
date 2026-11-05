@@ -1,8 +1,10 @@
 """Margin transfers through the real managed writer and HTTPX dispatch hooks."""
 from contextlib import closing, nullcontext
 from copy import deepcopy
+import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import threading
@@ -20,7 +22,7 @@ from trading import margin_balance
 from trading.account_writer import ManagedWriter
 from trading.exchange import API, BudgetWait, LiveBroker, RateBudget, RequestNotSent, TransferRejected
 from trading.margin_balance import MarginBalancer, TransferAPI
-from trading.models import TradingError
+from trading.models import TradingError, positive
 from trading.pairing import PairManager, validate_pair
 from trading.paper import DemoMarket
 from trading.store import Store
@@ -28,6 +30,45 @@ from trading.workspace_control import WorkspaceControl
 
 
 CORE = Path(__file__).resolve().parents[3] / "server" / "execution" / "account_writer.py"
+
+
+def valid_unsettled_f30b4aa(record):
+    """Frozen rollback validator from f30b4aa:modules/aster/trading/margin_balance.py.
+
+    _valid_unsettled and _identifier are copied with the old bounds/types
+    inlined, so changes to the current validator cannot make this test pass.
+    """
+    def identifier(value):
+        if type(value) is int and value > 0:
+            return str(value)
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,100}", value):
+            return value
+        return None
+
+    if not (isinstance(record, dict) and identifier(record.get("request_id"))
+            and {record.get("source"), record.get("destination")} == {"long", "short"}
+            and isinstance(record.get("identity"), str)
+            and type(record.get("created_at")) in (int, float) and math.isfinite(record["created_at"])
+            and record["created_at"] > 0
+            and type(record.get("failures")) is int and 0 <= record["failures"] <= 3
+            and type(record.get("empty")) is int and 0 <= record["empty"] <= 2
+            and ("queried_at" not in record or type(record["queried_at"]) in (int, float)
+                 and math.isfinite(record["queried_at"]))
+            and isinstance(record.get("before_receipts", {}), dict)
+            and (record.get("transaction_id") is None or identifier(record["transaction_id"]))):
+        return False
+    evidence = record.get("evidence", [])
+    if not (isinstance(evidence, list) and len(evidence) <= 20
+            and all(isinstance(item, list) and len(item) == 3 and item[0] in ("long", "short")
+                    and item[1] in frozenset({"TRANSFER", "SUBUSER_ASSET_TRANSFER"})
+                    and identifier(item[2]) == item[2] for item in evidence)
+            and not (evidence and record["empty"])):
+        return False
+    try:
+        positive(record.get("amount"))
+    except TradingError:
+        return False
+    return True
 
 
 class ManagedMarginTransferTests(unittest.TestCase):
@@ -387,7 +428,12 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertIn("过有效期", result["reason"])
         self.assertNotIn("unsettled_transfers", self.state())
         self.assertEqual(self.settlement(operation_id), {"outcome": "rejected", "by": "expiry",
-            "note": "两侧流水均无该笔划转", "settled_at": self.settlement(operation_id)["settled_at"]})
+            "basis": "nonce_expired_no_receipt", "note": "两侧流水均无该笔划转",
+            "settled_at": self.settlement(operation_id)["settled_at"]})
+        # Without a receipt the ordinary cooldown applies.
+        self.assertLessEqual(self.state()["cooldown_until"] - margin_balance.time.time(),
+                             margin_balance.TRANSFER_SETTLE_COOLDOWN_SECONDS)
+        self.assertNotIn("迟到", result["reason"])
         self.assert_new_transfer_after_cooldown()
 
     def test_expired_unknown_with_matching_receipts_is_confirmed_without_resend(self):
@@ -407,6 +453,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertIn(["TRANSFER", "late-1"], self.state()["used_receipts"])
         self.assertNotIn("unsettled_transfers", self.state())
         self.assertEqual(self.settlement(operation_id)["outcome"], "confirmed")
+        self.assertEqual(self.settlement(operation_id)["basis"], "late_receipt_confirmed")
 
     def test_failed_or_partial_history_still_settles_by_expiry_with_one_read(self):
         for case in ("failed", "partial"):
@@ -450,6 +497,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((result["status"], self.income_queries(), len(self.posts())), ("cooldown", [], 1), result)
         self.assertEqual(self.shared_state(operation_id), "rejected")
         self.assertIn("身份", self.settlement(operation_id)["note"])
+        self.assertEqual(self.settlement(operation_id)["basis"], "identity_changed")
 
     def test_sweep_settles_expired_rows_without_a_follow_up(self):
         operation_id = self.skip_timed_out_transfer()
@@ -475,6 +523,8 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((result["status"], self.income_queries(), len(self.posts())), ("cooldown", [], 1), result)
         self.assertEqual((self.shared_state(operation_id), self.shared_state(legacy), self.shared_state(other)),
                          ("rejected", "rejected", "unknown"))
+        # The archive of a swept write records that no read was made.
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_follow_up")
         # The remaining unknown non-transfer write has expired as well, so it
         # no longer blocks the next transfer (ordinary orders stay blocked).
         self.due()
@@ -521,10 +571,16 @@ class ManagedMarginTransferTests(unittest.TestCase):
             result = self.balancer.tick(self.pair, self.snapshots())
         self.assertEqual((result["status"], result["blocks_trading"]), ("unknown", True), result)
         self.assertEqual((len(self.income_queries()), self.shared_state(operation_id)), (2, "unknown"))
-        self.assertEqual(self.state()["unsettled_transfers"][0]["label"], {"note": "两侧流水均无该笔划转"})
+        cooldown = self.state()["cooldown_until"]
+        self.assertGreater(cooldown, time.time())
+        self.assertEqual(self.state()["unsettled_transfers"][0]["label"],
+                         {"note": "两侧流水均无该笔划转", "basis": "nonce_expired_no_receipt",
+                          "cooldown_until": cooldown})
         self.due()
         result = self.balancer.tick(self.pair, self.snapshots())
         self.assertEqual((result["status"], self.shared_state(operation_id), len(self.income_queries())), ("cooldown", "rejected", 2))
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_receipt")
+        self.assertEqual(self.state()["cooldown_until"], cooldown)
 
     def test_swept_rows_keep_guards_and_settle_after_balancing_is_disabled(self):
         operation_id = self.skip_timed_out_transfer()
@@ -546,6 +602,63 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((result["status"], self.shared_state(operation_id), self.income_queries()), ("cooldown", "rejected", []), result)
         self.assertNotIn("unsettled_operations", self.state())
         self.store.delete_pair("gold")
+
+    def test_disabled_balancing_keeps_scan_guard_after_filtering_only_invalid_follow_up(self):
+        operation_id = self.skip_timed_out_transfer()
+        state = self.state()
+        state["unsettled_transfers"] = [{"request_id": "broken"}]
+        self.store.put("pair_margin:gold", state)
+        self.pair = self.store.save_pair(validate_pair({**self.pair, "enabled": False,
+            "margin": {**self.pair["margin"], "enabled": False}}))
+        for _ in range(2):
+            result = self.balancer.tick(self.pair, self.snapshots())
+            self.assertEqual((result["status"], result["blocks_trading"]), ("unknown", True), result)
+            self.assertTrue(MarginBalancer.unsettled_shared(self.state()))
+            self.assertEqual(self.state()["unsettled_operations"], [operation_id])
+            self.assertIn("master:ASTER_MASTER", self.writer.connections)
+        with self.assertRaisesRegex(TradingError, "保证金划转结果尚未核实"):
+            self.store.delete_pair("gold")
+        self.due(margin_balance.TRANSFER_NONCE_EXPIRY_SECONDS + 1)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, None)
+        self.assertEqual(self.income_queries(), [])
+        self.assertFalse(MarginBalancer.unsettled_shared(self.state()))
+
+    def test_filter_crash_preserves_disabled_scan_guard_until_restart_settles(self):
+        operation_id = self.skip_timed_out_transfer()
+        state = self.state()
+        state["unsettled_transfers"] = [{"request_id": "broken"}]
+        self.store.put("pair_margin:gold", state)
+        self.pair = self.store.save_pair(validate_pair({**self.pair, "enabled": False,
+            "margin": {**self.pair["margin"], "enabled": False}}))
+        put = self.store.put
+
+        def put_then_exit(key, value):
+            put(key, value)
+            if key == "pair_margin:gold" and value.get("unsettled_transfers") == []:
+                raise SystemExit("after filtering corrupt follow-ups")
+        with patch.object(self.store, "put", side_effect=put_then_exit), self.assertRaises(SystemExit):
+            self.balancer.tick(self.pair, self.snapshots())
+        self.assertTrue(MarginBalancer.unsettled_shared(self.state()))
+        self.assertEqual(self.shared_state(operation_id), "unknown")
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        self.assertIn("master:ASTER_MASTER", self.writer.connections)
+        self.due(margin_balance.TRANSFER_NONCE_EXPIRY_SECONDS + 1)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, None)
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_follow_up")
+        self.assertFalse(MarginBalancer.unsettled_shared(self.state()))
+
+    def test_disabled_valid_follow_up_keeps_master_until_orphan_sweep_finishes(self):
+        operation_id = self.skip_timed_out_transfer()
+        orphan = self.legacy_operation("orphan-after-valid")
+        self.pair = self.store.save_pair(validate_pair({**self.pair, "enabled": False,
+            "margin": {**self.pair["margin"], "enabled": False}}))
+        result = self.settle_expired()
+        self.assert_settled_once(operation_id, result, "两侧流水均无该笔划转")
+        self.assertEqual(self.shared_state(orphan), "rejected")
+        self.assertFalse(MarginBalancer.unsettled_shared(self.state()))
 
     def test_disabled_or_clean_pairs_do_not_touch_the_writer_on_every_tick(self):
         disabled = self.store.save_pair(validate_pair({**self.pair, "margin": {**self.pair["margin"], "enabled": False}}))
@@ -648,9 +761,47 @@ class ManagedMarginTransferTests(unittest.TestCase):
                 self.assertEqual(self.shared_state(operation_id), "rejected")
                 self.assertEqual(result["status"], "cooldown", result)
                 self.assertRegex(self.settlement(operation_id)["note"], "暂不可读.*(无法解析|无法分类)")
+                self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_unreadable")
                 self.income_rows = {}
                 self.balances.update(long="3000", short="1000")
                 self.due()
+
+    def test_blank_required_receipt_fields_are_unreadable_not_absent(self):
+        for field in ("asset", "incomeType", "tranId", "time", "income"):
+            for blank in ("", " \t "):
+                with self.subTest(field=field, blank=blank):
+                    self.income_rows = {}
+                    self.due()
+                    operation_id = self.skip_timed_out_transfer()
+                    self.due(self.SPAN + 1)
+                    row = {**self.receipt("blank-field"), "income": "1000.00000000", field: blank}
+                    self.income_rows = {"short": [row]}
+                    result = self.balancer.tick(self.pair, self.snapshots())
+                    self.assertEqual((self.shared_state(operation_id), result["status"]), ("rejected", "cooldown"), result)
+                    audit = self.settlement(operation_id)
+                    self.assertEqual(audit["basis"], "nonce_expired_unreadable")
+                    self.assertRegex(audit["note"], "暂不可读.*(无法解析|无法分类)")
+                    self.assertNotIn("evidence", audit)
+
+    def test_blank_classification_keeps_valid_receipts_before_and_after_it(self):
+        for field in ("asset", "incomeType"):
+            for blank in ("", " \t "):
+                with self.subTest(field=field, blank=blank):
+                    self.income_rows = {}
+                    self.due()
+                    self.requests = [request for request in self.requests if request[1] != "POST"]
+                    operation_id = self.skip_timed_out_transfer()
+                    self.due(self.SPAN + 1)
+                    row = {**self.receipt("before-blank"), "income": "-1000.00000000"}
+                    self.income_rows = {"long": [row, {**row, "tranId": "blank", field: blank},
+                                                 {**row, "tranId": "after-blank"}]}
+                    result = self.balancer.tick(self.pair, self.snapshots())
+                    self.assert_settled_once(operation_id, result, "暂不可读")
+                    audit = self.settlement(operation_id)
+                    self.assertEqual(audit["basis"], "nonce_expired_partial_receipt")
+                    self.assertCountEqual(audit["evidence"],
+                        [["long", "TRANSFER", "before-blank"], ["long", "TRANSFER", "after-blank"]])
+                    self.assertEqual(self.state().get("used_receipts", []), [])
 
     def test_clearly_unrelated_rows_are_excluded_from_the_label(self):
         operation_id = self.skip_timed_out_transfer()
@@ -722,6 +873,449 @@ class ManagedMarginTransferTests(unittest.TestCase):
                                      for index in range(21)]}
         self.assert_settled_once(operation_id, self.balancer.tick(self.pair, self.snapshots()), "部分匹配")
 
+    def throttle_after_source_receipt(self):
+        """Read the source debit, then hit a throttle on the destination; restart and clear it."""
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        debit = {**self.receipt("late-2"), "income": "-1000.00000000"}
+
+        def handler(aid, params, request):
+            if aid == "short":
+                return httpx.Response(429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
+            return httpx.Response(200, json=[debit])
+        self.income_handler = handler
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], self.shared_state(operation_id)), ("unknown", "unknown"), result)
+        self.assertNotIn("label", self.follow_up())
+        # The debit already read is durable proof that the transfer may exist.
+        self.assertEqual(self.follow_up()["evidence"], [["long", "TRANSFER", "late-2"]])
+        # The throttle clears, then the process restarts.
+        for api in self.api_instances:
+            api.budget.until = 0
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        self.income_handler = None
+        self.due()
+        return operation_id, debit
+
+    def test_invalid_follow_up_keeps_valid_partial_evidence_and_cooldown(self):
+        operation_id, _ = self.throttle_after_source_receipt()
+        invalid_id = "invalid-follow-up"
+        invalid_op = self.legacy_operation(invalid_id)
+        self.store.put("pair_margin_skipped:gold:" + invalid_id, {"result": {"status": "skipped"}})
+        self.due(self.SPAN + 1)
+        state = self.state()
+        state["unsettled_transfers"].insert(0, {"request_id": invalid_id})
+        self.store.put("pair_margin:gold", state)
+        settled_at = time.time()
+        with patch("time.time", return_value=settled_at):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, None)
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "late-2"]])
+        self.assertEqual(self.shared_state(invalid_op), "rejected")
+        self.assertEqual(self.settlement(invalid_op)["basis"], "nonce_expired_no_follow_up")
+        self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        with patch("time.time", return_value=settled_at + 31):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
+
+    def test_invalid_follow_up_keeps_persisted_label_and_deadline(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        self.income_rows = {"long": [{**self.receipt("saved-debit"), "income": "-1000.00000000"}]}
+        with patch.object(MarginBalancer, "_resolve_skipped", side_effect=RuntimeError("injected settlement failure")):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "unknown", result)
+        state = self.state()
+        valid = state["unsettled_transfers"][0]
+        label = deepcopy(valid["label"])
+        # Even a JSON value that is unhashable must only invalidate its own row.
+        state["unsettled_transfers"].append({**deepcopy(valid), "request_id": "broken", "source": ["long"]})
+        self.store.put("pair_margin:gold", state)
+        queried = len(self.income_queries())
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        with patch("time.time", return_value=label["cooldown_until"] - 269):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(len(self.income_queries()), queried)
+        self.assertEqual(self.state()["cooldown_until"], label["cooldown_until"])
+        self.assertEqual(self.settlement(operation_id)["basis"], label["basis"])
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "saved-debit"]])
+
+    def test_invalid_follow_up_keeps_unexpired_valid_follow_up(self):
+        operation_id = self.skip_timed_out_transfer()
+        state = self.state()
+        valid = deepcopy(state["unsettled_transfers"][0])
+        state["unsettled_transfers"].append({"request_id": "broken"})
+        self.store.put("pair_margin:gold", state)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], self.shared_state(operation_id)), ("unknown", "unknown"), result)
+        self.assertEqual(self.state().get("unsettled_transfers"), [valid])
+        self.assertEqual((self.income_queries(), len(self.posts())), ([], 1))
+
+    def test_upgrade_then_throttle_keeps_follow_up_valid_for_f30b4aa_rollback(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        state = self.state()
+        record = state["unsettled_transfers"][0]
+        record.update(empty=1, failures=0, evidence=[], queried_at=record["created_at"] + 1)
+        record.pop("skipped_at")
+        self.assertTrue(valid_unsettled_f30b4aa(record))
+        self.store.put("pair_margin:gold", state)
+        debit = {**self.receipt("upgrade-debit"), "income": "-1000.00000000"}
+
+        def handler(aid, params, request):
+            if aid == "short":
+                return httpx.Response(429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
+            return httpx.Response(200, json=[debit])
+        self.income_handler = handler
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], self.shared_state(operation_id)), ("unknown", "unknown"), result)
+        persisted = self.follow_up()
+        self.assertNotIn("label", persisted)
+        self.assertEqual(persisted["evidence"], [["long", "TRANSFER", "upgrade-debit"]])
+        # A downgrade reads this exact durable record, before any label exists.
+        self.assertTrue(valid_unsettled_f30b4aa(persisted), persisted)
+        self.assertEqual(persisted["empty"], 0)
+        self.assertFalse(valid_unsettled_f30b4aa({**persisted, "empty": 1}))
+        self.assertEqual(len(self.posts()), 1)
+
+    def test_malformed_evidence_is_ignored_and_settles_within_one_read(self):
+        variants = {"unhashable kind": [["long", ["TRANSFER"], "x"]], "dict kind": [["long", {"k": 1}, "x"]],
+                    "unhashable side": [[["long"], "TRANSFER", "x"]], "integer tranId": [["long", "TRANSFER", 7]],
+                    "not a list": {"long": "x"}}
+        for name, evidence in variants.items():
+            with self.subTest(evidence=name):
+                before = len(self.income_queries())
+                operation_id = self.skip_timed_out_transfer()
+                state = self.state()
+                state["unsettled_transfers"][0]["evidence"] = evidence
+                self.store.put("pair_margin:gold", state)
+                self.assert_settled_once(operation_id, self.settle_expired(), "两侧流水均无该笔划转")
+                self.assertEqual(len(self.income_queries()) - before, 2)
+                self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_receipt")
+                self.assertNotIn("evidence", self.settlement(operation_id))
+                self.due()
+                # Each case times out one fresh dispatch of its own.
+                self.requests = [request for request in self.requests if request[1] != "POST"]
+
+    def test_partial_receipt_waits_a_longer_cooldown_then_sends_one_new_request(self):
+        operation_id = self.skip_timed_out_transfer()
+        original = operation_id.removeprefix("aster:transfer:")
+        self.due(self.SPAN + 1)
+        # Only the source debit is visible: the credit may still be in flight.
+        self.income_rows = {"long": [{**self.receipt("in-flight"), "income": "-1000.00000000"}]}
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertIn("已见一侧流水，可能为迟到到账", result["reason"])
+        remaining = self.state()["cooldown_until"] - margin_balance.time.time()
+        self.assertGreater(remaining, margin_balance.TRANSFER_SETTLE_COOLDOWN_SECONDS + 60)
+        self.assertLessEqual(remaining, margin_balance.TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS)
+        # Past the ordinary cooldown but inside the extended one: no new POST.
+        state = self.state()
+        state["next_check_at"] = 0
+        state["cooldown_until"] -= margin_balance.TRANSFER_SETTLE_COOLDOWN_SECONDS + 1
+        self.store.put("pair_margin:gold", state)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
+        # The credit never landed: fresh balances still differ, so exactly one
+        # new request is sent, never the original.
+        self.income_rows = {}
+        self.due()
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 2), result)
+        self.assertNotEqual(self.state()["last_transfer"]["request_id"], original)
+        self.assertEqual(self.unresolved(), [])
+
+    def crash_after_partial_settlement(self, *, after_cleanup):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        self.income_rows = {"long": [{**self.receipt("crash-debit"), "income": "-1000.00000000"}]}
+        self.balances.update(long="2000", short="1000")
+        # An unintended new 500 USD1 dispatch must be observable, not rejected
+        # by the fixture's normal 1000 USD1 acknowledgement assertion.
+        self.fail_dispatch = True
+        resolve, put = MarginBalancer._resolve_skipped, self.store.put
+
+        def resolve_then_exit(*args, **kwargs):
+            resolve(*args, **kwargs)
+            raise SystemExit("after shared settlement")
+
+        def put_then_exit(key, value):
+            put(key, value)
+            if key == "pair_margin:gold" and value.get("unsettled_transfers") == []:
+                raise SystemExit("after private cleanup")
+
+        settled_at = time.time()
+        crash = (patch.object(self.store, "put", side_effect=put_then_exit) if after_cleanup
+                 else patch.object(MarginBalancer, "_resolve_skipped", staticmethod(resolve_then_exit)))
+        with patch("time.time", return_value=settled_at), crash, self.assertRaises(SystemExit):
+            self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(self.shared_state(operation_id), "rejected")
+        queried = len(self.income_queries())
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        # Use the persisted cooldown, without the due() helper clearing it.
+        for elapsed in (1, 31, 299):
+            with patch("time.time", return_value=settled_at + elapsed):
+                result = self.balancer.tick(self.pair, self.snapshots())
+            self.assertEqual((len(self.posts()), result["status"]), (1, "cooldown"), result)
+            self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        self.assertEqual(len(self.income_queries()), queried)
+        self.assertNotIn("unsettled_transfers", self.state())
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "crash-debit"]])
+        # Expiry still permits a genuinely new request from fresh balances.
+        self.fail_dispatch = False
+        self.balances.update(long="3000", short="1000")
+        with patch("time.time", return_value=settled_at + 301):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((len(self.posts()), result["status"]), (2, "acknowledged"), result)
+        self.assertNotEqual(self.state()["last_transfer"]["request_id"], operation_id.rsplit(":", 1)[1])
+
+    def test_partial_cooldown_and_audit_survive_crash_after_shared_settlement(self):
+        self.crash_after_partial_settlement(after_cleanup=False)
+
+    def test_partial_cooldown_survives_crash_after_private_cleanup(self):
+        self.crash_after_partial_settlement(after_cleanup=True)
+
+    def test_full_page_receipt_survives_successful_empty_subwindows(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, end = self.window()
+        debit = {**self.receipt("first-page"), "income": "-1000.00000000"}
+        page = self.busy_rows(999, start, end) + [debit]
+        calls = []
+
+        def handler(aid, params, request):
+            calls.append(aid)
+            return httpx.Response(200, json=page if len(calls) == 1 else [])
+        self.income_handler = handler
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(calls, ["long", "long", "long", "short"])
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "first-page"]])
+
+    def test_bad_row_keeps_valid_receipts_on_either_side_of_the_same_page(self):
+        for side, bad_first in (("long", False), ("long", True), ("short", False), ("short", True)):
+            with self.subTest(side=side, bad_first=bad_first):
+                self.income_rows = {}
+                self.due()
+                self.requests = [request for request in self.requests if request[1] != "POST"]
+                operation_id = self.skip_timed_out_transfer()
+                self.due(self.SPAN + 1)
+                row = self.receipt("mixed-page")
+                debit, credit = {**row, "income": "-1000.00000000"}, {**row, "income": "1000.00000000"}
+                self.income_rows = {"long": [debit], "short": [credit]}
+                bad = {**row, "tranId": "unreadable", "income": "abc"}
+                self.income_rows[side].insert(0 if bad_first else 1, bad)
+                result = self.balancer.tick(self.pair, self.snapshots())
+                self.assert_settled_once(operation_id, result, "暂不可读")
+                audit = self.settlement(operation_id)
+                self.assertEqual(audit["basis"], "nonce_expired_partial_receipt")
+                expected = [["long", "TRANSFER", "mixed-page"]]
+                if side == "short":
+                    expected.append(["short", "TRANSFER", "mixed-page"])
+                self.assertEqual(audit["evidence"], expected)
+                self.assertNotIn(["TRANSFER", "mixed-page"], self.state().get("used_receipts", []))
+
+    def test_legacy_accepted_read_keeps_partial_evidence_when_it_is_later_skipped(self):
+        self.fail_dispatch = True
+        self.balancer.tick(self.pair, self.snapshots())
+        self.fail_dispatch = False
+        state = self.state()
+        pending = state["pending"]
+        operation_id = "aster:transfer:" + pending["request_id"]
+        pending["status"] = "accepted"
+        pending["created_at"] -= self.SPAN + 1
+        pending["history_recovery"] = {"first_observed_at": pending["created_at"], "query_rounds": 2}
+        row = {"asset": "USD1", "incomeType": "TRANSFER", "tranId": "legacy-debit",
+               "time": int(pending["created_at"] * 1000) + 5000, "income": "-1000.00000000"}
+        self.income_rows = {"long": [{**row, "tranId": "bad", "income": "abc"}, row]}
+        state["next_check_at"] = 0
+        self.store.put("pair_margin:gold", state)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "skipped", result)
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        self.income_rows = {}
+        result = self.settle_expired()
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "legacy-debit"]])
+
+    def test_label_without_basis_from_the_previous_build_keeps_its_class(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        state = self.state()
+        state["unsettled_transfers"][0]["label"] = {"note": "两侧流水只部分匹配"}
+        self.store.put("pair_margin:gold", state)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(self.income_queries(), [])
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertIn("迟到到账", result["reason"])
+
+    def test_receipts_on_both_sides_from_an_incomplete_read_are_not_confirmed(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        start, end = self.window()
+        row = self.receipt("both")
+        debit, credit = {**row, "income": "-1000.00000000"}, {**row, "income": "1000.00000000"}
+        page = sorted(self.busy_rows(999, start, end) + [credit], key=lambda value: value["time"])
+        calls = []
+
+        def handler(aid, params, request):
+            calls.append(aid)
+            if aid == "long":
+                return httpx.Response(200, json=[debit])
+            if calls.count("short") == 1:
+                # A full page: the read must split it, and the next part fails.
+                return httpx.Response(200, json=page)
+            raise httpx.ConnectError("injected page failure", request=request)
+        self.income_handler = handler
+        self.assert_settled_once(operation_id, self.balancer.tick(self.pair, self.snapshots()), "暂不可读")
+        settlement = self.settlement(operation_id)
+        self.assertEqual(settlement["basis"], "nonce_expired_partial_receipt")
+        self.assertEqual(settlement["evidence"], [["long", "TRANSFER", "both"], ["short", "TRANSFER", "both"]])
+        self.assertNotIn(["TRANSFER", "both"], self.state().get("used_receipts", []))
+
+    def test_evidence_merged_across_reads_is_bounded(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        first = [{**self.receipt("a-%02d" % index), "income": "-1000.00000000"} for index in range(15)]
+        later = [{**self.receipt("b-%02d" % index), "income": "-1000.00000000"} for index in range(10)]
+
+        def handler(aid, params, request):
+            if aid == "short":
+                return httpx.Response(429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
+            return httpx.Response(200, json=first)
+        self.income_handler = handler
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "unknown", result)
+        self.assertEqual(len(self.follow_up()["evidence"]), 15)
+        for api in self.api_instances:
+            api.budget.until = 0
+        self.income_handler = None
+        self.income_rows = {"long": later}
+        self.due()
+        self.assert_settled_once(operation_id, self.balancer.tick(self.pair, self.snapshots()), "部分匹配")
+        evidence = self.settlement(operation_id)["evidence"]
+        self.assertEqual(len(evidence), margin_balance.TRANSFER_EVIDENCE_LIMIT)
+        # Earlier receipts are kept first; later ones fill the bound in order.
+        self.assertEqual(evidence, [["long", "TRANSFER", "a-%02d" % index] for index in range(15)]
+                         + [["long", "TRANSFER", "b-%02d" % index] for index in range(5)])
+
+    def test_receipt_seen_before_a_throttle_survives_a_later_empty_read(self):
+        operation_id, _ = self.throttle_after_source_receipt()
+        queried = len(self.income_queries())
+        # The history view is unstable: neither side shows the transfer now.
+        self.income_rows = {}
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(len(self.income_queries()) - queried, 2)
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertNotIn("两侧流水均无", self.settlement(operation_id)["note"])
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "late-2"]])
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+
+    def test_late_destination_credit_stays_partial_after_source_disappears(self):
+        operation_id, debit = self.throttle_after_source_receipt()
+        # The credit lands late and the source view no longer lists the debit.
+        self.income_rows = {"short": [{**debit, "income": "1000.00000000"}]}
+        self.balances.update(long="2000", short="2000")
+        settled_at = time.time()
+        with patch("time.time", return_value=settled_at):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertNotIn(["TRANSFER", "late-2"], self.state().get("used_receipts", []))
+        self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        with patch("time.time", return_value=settled_at + 31):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
+        # The next decision uses the fresh, already balanced reads: no resend.
+        self.due()
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(len(self.posts()), 1, result)
+        self.assertEqual(self.unresolved(), [])
+
+    def test_previous_transfer_receipts_across_reads_cannot_confirm_timed_out_request(self):
+        operation_id = self.skip_timed_out_transfer()  # A has no exchange transaction ID.
+        self.due(self.SPAN + 1)
+        self.assertNotIn("transaction_id", self.follow_up())
+        previous = {**self.receipt("previous-B"), "time": int((self.follow_up()["created_at"] - 30) * 1000),
+                    "income": "-1000.00000000"}
+
+        def handler(aid, params, request):
+            if aid == "short":
+                return httpx.Response(429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
+            return httpx.Response(200, json=[previous])
+        self.income_handler = handler
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(result["status"], "unknown", result)
+        self.assertEqual(self.follow_up()["evidence"], [["long", "TRANSFER", "previous-B"]])
+        for api in self.api_instances:
+            api.budget.until = 0
+        self.income_handler = None
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        self.due()
+        # Only B's credit is visible in the next complete read; A is still unknown.
+        self.income_rows = {"short": [{**previous, "income": "1000.00000000"}]}
+        settled_at = time.time()
+        with patch("time.time", return_value=settled_at):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertEqual(self.settlement(operation_id)["evidence"],
+                         [["long", "TRANSFER", "previous-B"], ["short", "TRANSFER", "previous-B"]])
+        self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        self.assertNotIn(["TRANSFER", "previous-B"], self.state().get("used_receipts", []))
+        with patch("time.time", return_value=settled_at + 31):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
+
+    def test_previous_transfer_in_one_complete_read_is_not_confirmation_without_original_id(self):
+        operation_id = self.skip_timed_out_transfer()
+        self.due(self.SPAN + 1)
+        previous = {**self.receipt("previous-B"), "time": int((self.follow_up()["created_at"] - 30) * 1000)}
+        self.income_rows = {"long": [{**previous, "income": "-1000.00000000"}],
+                            "short": [{**previous, "income": "1000.00000000"}]}
+        settled_at = time.time()
+        with patch("time.time", return_value=settled_at):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
+        self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        self.assertNotIn(["TRANSFER", "previous-B"], self.state().get("used_receipts", []))
+
+    def test_receipt_on_one_side_with_an_unreadable_other_side_is_partial_not_unreadable(self):
+        def network(request):
+            raise httpx.ConnectError("injected", request=request)
+        failures = {"network": network,
+                    "tranId": lambda request: httpx.Response(200, json=[{**self.credit, "tranId": None}]),
+                    "time": lambda request: httpx.Response(200, json=[{**self.credit, "time": "soon"}]),
+                    "amount": lambda request: httpx.Response(200, json=[{**self.credit, "income": "abc"}])}
+        for name, failure in failures.items():
+            with self.subTest(failure=name):
+                operation_id = self.skip_timed_out_transfer()
+                self.due(self.SPAN + 1)
+                debit = {**self.receipt("half-" + name), "income": "-1000.00000000"}
+                self.credit = {**debit, "income": "1000.00000000"}
+                self.income_handler = lambda aid, params, request: (
+                    failure(request) if aid == "short" else httpx.Response(200, json=[debit]))
+                self.assert_settled_once(operation_id, self.balancer.tick(self.pair, self.snapshots()), "部分匹配")
+                self.assertIn("暂不可读", self.settlement(operation_id)["note"])
+                self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "half-" + name]])
+                self.income_handler = None
+                self.balances.update(long="3000", short="1000")
+                self.due()
+                # Each case times out one fresh dispatch of its own.
+                self.requests = [request for request in self.requests if request[1] != "POST"]
+
     def test_quota_wait_and_rate_limit_defer_the_label_but_not_past_its_bound(self):
         operation_id = self.skip_timed_out_transfer()
         self.due(self.SPAN + 1)
@@ -748,6 +1342,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((self.shared_state(operation_id), result["status"], len(self.income_queries())),
                          ("rejected", "cooldown", 1), result)
         self.assertIn("暂不可读", self.settlement(operation_id)["note"])
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_unreadable")
         self.assertEqual(len(self.posts()), 1)
 
     def test_shared_settlement_before_private_cleanup_is_not_repeated_after_restart(self):
@@ -761,16 +1356,84 @@ class ManagedMarginTransferTests(unittest.TestCase):
             self.settle_expired()
         self.assertEqual(self.shared_state(operation_id), "rejected")
         self.assertIn("label", self.follow_up())
+        cooldown = self.follow_up()["label"]["cooldown_until"]
         queried = len(self.income_queries())
         self.restart_writer()
         self.due()
         result = self.balancer.tick(self.pair, self.snapshots())
-        # The follow-up clears without another read; the old row stays rejected
-        # and only a new request from fresh balances is sent.
+        # Cleanup replays the audit and original cooldown without another read
+        # or another settlement of the old shared row.
         self.assertNotIn("unsettled_transfers", self.state())
         self.assertEqual((self.shared_state(operation_id), len(self.income_queries())), ("rejected", queried))
-        self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 2), result)
+        self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
+        self.assertEqual(self.state()["cooldown_until"], cooldown)
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_receipt")
         self.assertEqual(self.unresolved(), [])
+        self.assert_new_transfer_after_cooldown()
+
+    def test_sweep_audit_survives_crash_after_shared_settlement(self):
+        operation_id = self.skip_timed_out_transfer()
+        state = self.state()
+        state.pop("unsettled_transfers")
+        self.store.put("pair_margin:gold", state)
+        self.due()
+        self.balancer.tick(self.pair, self.snapshots())
+        self.pair = self.store.save_pair(validate_pair({**self.pair, "enabled": False,
+            "margin": {**self.pair["margin"], "enabled": False}}))
+        self.due(margin_balance.TRANSFER_NONCE_EXPIRY_SECONDS + 1)
+        resolve = MarginBalancer._resolve_skipped
+
+        def resolve_then_exit(*args, **kwargs):
+            resolve(*args, **kwargs)
+            raise SystemExit("after swept shared settlement")
+        settled_at = time.time()
+        with patch("time.time", return_value=settled_at), \
+                patch.object(MarginBalancer, "_resolve_skipped", staticmethod(resolve_then_exit)), self.assertRaises(SystemExit):
+            self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(self.shared_state(operation_id), "rejected")
+        cooldown = self.state()["cooldown_until"]
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        with patch("time.time", return_value=settled_at + 5), \
+                patch.object(MarginBalancer, "_resolve_skipped", wraps=resolve) as retry:
+            result = self.balancer.tick(self.pair, self.snapshots())
+        archive = self.store.get("pair_margin_skipped:gold:" + operation_id.rsplit(":", 1)[1])
+        self.assertIn("settlement", archive)
+        self.assertEqual(archive["settlement"], {"outcome": "rejected", "settled_at": settled_at,
+                         "by": "expiry", "basis": "nonce_expired_no_follow_up"})
+        self.assertEqual((result["status"], len(self.posts()), self.income_queries()), ("cooldown", 1, []), result)
+        self.assertEqual(self.state()["cooldown_until"], cooldown)
+        retry.assert_not_called()
+        self.assertNotIn("unsettled_transfer_audits", self.state())
+        self.assertFalse(MarginBalancer.unsettled_shared(self.state()))
+
+    def test_sweep_audit_write_failure_keeps_retry_marker(self):
+        operation_id = self.skip_timed_out_transfer()
+        state = self.state()
+        state.pop("unsettled_transfers")
+        self.store.put("pair_margin:gold", state)
+        self.due(self.SPAN + 1)
+        put = self.store.put
+        archive_key = "pair_margin_skipped:gold:" + operation_id.rsplit(":", 1)[1]
+
+        def fail_audit(key, value):
+            if key == archive_key:
+                raise sqlite3.OperationalError("injected swept audit write failure")
+            return put(key, value)
+        with patch.object(self.store, "put", side_effect=fail_audit):
+            self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual(self.shared_state(operation_id), "rejected")
+        self.assertTrue(MarginBalancer.unsettled_shared(self.state()))
+        self.assertIn(operation_id, self.state()["unsettled_transfer_audits"])
+        cooldown = self.state()["cooldown_until"]
+        self.restart_writer()
+        self.balancer = MarginBalancer(self.engine)
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assert_settled_once(operation_id, result, None)
+        self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_follow_up")
+        self.assertEqual(self.state()["cooldown_until"], cooldown)
+        self.assertNotIn("unsettled_transfer_audits", self.state())
+        self.assertFalse(MarginBalancer.unsettled_shared(self.state()))
 
     def test_legacy_prefix_alone_is_settled(self):
         operation_id = self.skip_timed_out_transfer()
@@ -840,7 +1503,9 @@ class ManagedMarginTransferTests(unittest.TestCase):
         record.update(empty=0, failures=2, queried_at=record["created_at"] + 1,
                       evidence=[["long", "TRANSFER", "seen"]])
         self.store.put("pair_margin:gold", state)
-        self.assert_settled_once(operation_id, self.settle_expired(), "两侧流水均无该笔划转")
+        # Receipts that release already saw are not forgotten.
+        self.assert_settled_once(operation_id, self.settle_expired(), "部分匹配")
+        self.assertEqual(self.settlement(operation_id)["evidence"], [["long", "TRANSFER", "seen"]])
 
     def test_official_acknowledgement_is_durable_before_shared_finish(self):
         original = self.writer.registry.finish

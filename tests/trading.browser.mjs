@@ -222,9 +222,25 @@ async (page) => {
   const offlineCount = getCount(); await page.clock.runFor(15000);
   assert(getCount() === offlineCount, 'offline tab stops polling');
   await waitForText('网络已断开');
+  // Wake events, including online, share a one-second grace period before the read.
+  // The page's five-second poll was created before clock.install(), so it still runs on
+  // real time; only later timers such as the grace timer are fake. Pause fake time and
+  // count fetch calls in the page so the read is attributed to the grace timer itself.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 10));
+  await page.evaluate(() => {
+    const nativeFetch = window.fetch; window.__tradingReads = 0;
+    window.fetch = (input, init) => { if (String(input).startsWith('/api/trading?')) window.__tradingReads++; return nativeFetch(input, init); };
+  });
+  const pageReads = () => page.evaluate(() => window.__tradingReads);
+  const reconnectResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading', { timeout: 10_000 });
   await page.evaluate(() => { Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => true }); window.dispatchEvent(new Event('online')); });
   await page.waitForFunction(() => !document.querySelector('.trading-notice')?.textContent.includes('网络已断开'));
-  assert(getCount() > offlineCount, 'reconnecting immediately reads cache');
+  assert(await pageReads() === 0, 'clearing the offline notice is not itself a cache read');
+  await page.clock.runFor(1000);
+  assert(await pageReads() === 1, 'reconnecting reads cache once when the wake grace period ends');
+  await reconnectResponse;
+  assert(getCount() > offlineCount, 'reconnect read reaches the cache endpoint');
+  await page.clock.resume();
   expire = true; await refreshCache();
   await page.getByRole('heading', { name: '进入工作台', exact: true }).waitFor();
   const afterUnmount = getCount(); await page.clock.runFor(15000);

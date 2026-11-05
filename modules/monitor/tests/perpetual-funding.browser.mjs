@@ -137,7 +137,10 @@ async page => {
       check((await rowFor('BTC').locator(`[data-column="${id}"]`).innerText()).includes('采集中'), `${id} states backfill is still running`);
     }
     await tick(3000);
-    check(await rowFor('BTC').locator('[data-column="history7d"] strong').innerText() === '+0.1500%', 'Seven days uses its settled window after older coverage arrives');
+    // The re-read is issued inside the three-second tick, but its response renders after real network time.
+    // The clock stays paused while waiting, so the value can only come from a read triggered within that tick.
+    await rowFor('BTC').locator('[data-column="history7d"] strong').filter({ hasText: '+0.1500%' }).waitFor();
+    check(historyRequests.length >= 3 && await rowFor('BTC').locator('[data-column="history7d"] strong').innerText() === '+0.1500%', 'Seven days uses its settled window after older coverage arrives');
     check(await rowFor('BTC').locator('[data-column="history30d"] strong').innerText() === '+0.8400%', 'Thirty days uses its own settled window, without extrapolating recent rates');
     check((await rowFor('ETH').locator('[data-column="history7d"]').innerText()).includes('历史不足'), 'Complete backfill with insufficient listing history remains explicitly missing');
     const btcVolume = rowFor('BTC').locator('[data-column="volume"]');
@@ -302,8 +305,11 @@ async page => {
     await categories.getByRole('checkbox', { name: '未分类', exact: true }).uncheck(); await waitBases([]);
     check((await page.locator('.perp-empty').innerText()).includes('请选择至少一种资产类别'), 'Zero categories is an explicit empty selection');
     await categories.locator('summary').press('Escape');
-    await page.reload(); await waitBases([]);
-    await page.locator('.perp-scanner:visible .scanner-menu > summary').filter({ hasText: '类别（0 / 6）' }).waitFor();
+    await page.reload();
+    // An empty ranking is also what the page shows before hydration, so advance the paused clock until the restored menu renders.
+    const emptyCategories = page.locator('.perp-scanner:visible .scanner-menu > summary').filter({ hasText: '类别（0 / 6）' });
+    for (let attempt = 0; attempt < 100 && !await emptyCategories.isVisible(); attempt++) await tick(100);
+    await emptyCategories.waitFor(); await waitBases([]);
     categories = await openMenu(/^类别/);
     check(await categories.getByRole('checkbox', { checked: true }).count() === 0, 'An empty category selection survives reload');
     await categories.getByRole('button', { name: '全部类别', exact: true }).click(); await waitBases(['BTC', 'ADA', 'ETH', 'SOL']);
@@ -315,7 +321,9 @@ async page => {
     await columns.locator('summary').press('Escape');
     await page.locator('.perp-scanner:visible thead [data-column="history24h"]').waitFor();
     await page.locator('.perp-scanner:visible thead [data-column="time"]').waitFor({ state: 'detached' });
-    check(await page.locator('.perp-scanner:visible thead [data-column]').count() === 16, 'Restoring columns returns exactly the sixteen defaults');
+    // The CrossEx import action is a fixed column, not a display preference.
+    const restoredColumns = await page.locator('.perp-scanner:visible thead [data-column]').evaluateAll(cells => cells.map(cell => cell.dataset.column));
+    check(restoredColumns.filter(id => id === 'crossexImport').length === 1 && restoredColumns.filter(id => id !== 'crossexImport').length === 16, `Restoring columns returns exactly the sixteen defaults: ${restoredColumns.join(', ')}`);
     for (let attempt = 0; attempt < 100 && historyRequests.length === historyBeforePause; attempt++) await tick(100);
     check(historyRequests.length > historyBeforePause, 'Restoring the visible history column resumes its requests');
     priceAge = 29_000;

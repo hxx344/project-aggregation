@@ -26,6 +26,8 @@ function metric(label: string, value: number | null | undefined, digits: number,
   return { label, value: `${sign}${Math.abs(rounded).toFixed(digits)}${unit}`, tone: rounded > 0 ? "positive" : rounded < 0 ? "negative" : undefined };
 }
 
+export const hynixTrendOptions = { days: 7, intervalMs: 3_600_000, label: "7 天小时线", shortLabel: "7天", unit: "%" };
+
 export function hynixSummary(quote: LiveQuote | null, error = "", trend?: MonitorTrend): MonitorSummary {
   const funding = quote?.funding;
   return {
@@ -34,12 +36,12 @@ export function hynixSummary(quote: LiveQuote | null, error = "", trend?: Monito
     staleAfterMs: getQuoteStaleAfterMs(quote, 35_000),
     metrics: [metric("ADR 溢价率", quote?.premium, 2, "%"), metric("净资金费 / 年化", funding?.annualizedRate == null ? null : funding.annualizedRate * 100, 2, "%")],
     note: `空 10 份 ADR、多 1 股正股${quote && !funding ? " · 资金费暂不可用" : ""}`,
-    trend: trend ?? createTrend(undefined, { days: 7, intervalMs: 3_600_000, label: "7 天小时线", shortLabel: "7天", unit: "%" }),
+    trend: trend ?? createTrend(undefined, hynixTrendOptions),
     comparison: quote ? hynixExchangeQuote(quote, Boolean(error)) : undefined,
   };
 }
 
-const oilTrendOptions = { days: 7, intervalMs: 900_000, label: "7 天 · 15 分钟线", shortLabel: "7天", unit: "%" };
+export const oilTrendOptions = { days: 7, intervalMs: 900_000, label: "7 天 · 15 分钟线", shortLabel: "7天", unit: "%" };
 
 export function oilSummary(update?: OilSummaryUpdate, trend?: MonitorTrend): MonitorSummary {
   return {

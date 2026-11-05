@@ -3,10 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import http from 'node:http';
+import { runInNewContext } from 'node:vm';
 import { createAeroMarket, DEFAULT_CONFIG, strictMarketConfig } from '../server/research/aero-market.mjs';
 import { AERO_BASE } from '../server/research/aero-market-chains.mjs';
 import { createRpc } from '../server/research/aero-market-rpc.mjs';
 import { createApp } from '../server/app.mjs';
+import { errorResponder, HttpError } from '../server/http-common.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
 const Q96 = 2 ** 96;
@@ -36,7 +39,7 @@ function fakeChain({ start = 1_800_000_000, historyBlockTime = BLOCK_TIME, stall
   };
   const blockAt = (t) => Math.round((t - 1_700_000_000) / BLOCK_TIME);
   const reads = {
-    async readPoolAddresses(_rpc, _factory, known) { const all = Object.keys(statics); return { total: all.length, added: all.slice(known) }; },
+    async readPoolAddresses(_rpc, _factory, known, limit = Infinity) { const all = Object.keys(statics); return { total: all.length, added: all.slice(known, known + limit) }; },
     async readPoolStatics(_rpc, pools) { return pools.map((a) => ({ ...statics[a], gauge: undefined })); },
     async readGauges(_rpc, pools) { return pools.map((a) => statics[a].gauge); },
     async readTokens(_rpc, list) { return list.map((t) => ({ symbol: t === WETH ? 'WETH' : t === USDC ? 'USDC' : 'AERO', decimals: t === USDC ? 6 : 18 })); },
@@ -85,7 +88,22 @@ function onlyBase(dir, extra = {}) {
   writeFileSync(join(dir, 'aero-market/config.json'), JSON.stringify({ ...config, ...extra }));
 }
 
-async function settle(market) { for (let i = 0; i < 50; i++) { if (market.state().chains.every((c) => c.status !== 'loading')) return; await new Promise((r) => setTimeout(r, 5)); } }
+// 此文件最长的注入预算为 2000 ms × 首次发现 3 倍；上限覆盖截止与事件循环余量，达到明确终态即返回。
+async function settle(market, { timeoutMs = 10_000 } = {}) {
+  await waitFor(() => market.state().chains.every((c) => c.status !== 'loading'), { timeoutMs, message: '扫描未进入终态' });
+}
+
+async function waitFor(predicate, { timeoutMs = 4000, message = '等待条件超时' } = {}) {
+  const until = performance.now() + timeoutMs;
+  while (!predicate()) {
+    assert.ok(performance.now() < until, message);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+test('settle explicitly fails if a scan never reaches a terminal state', async () => {
+  await assert.rejects(settle({ state: () => ({ chains: [{ id: 'base', status: 'loading' }] }) }, { timeoutMs: 40 }), /扫描未进入终态/);
+});
 
 test('scan builds rows with prices, emission and backfilled volatility, then retains them through a failure', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -351,6 +369,8 @@ test('current rows publish before backfill, and backfill batches follow every 30
   for (let i = 0; i < 20 && !market.state().pools.length; i++) await new Promise((r) => setTimeout(r, 5));
   let state = market.state();
   assert.equal(state.chains.find((c) => c.id === 'base').status, 'loading', 'backfill still running');
+  assert.equal(state.chains.find((c) => c.id === 'base').nextAt, null, 'a running round has no past "next" time');
+  assert.equal(state.chains.find((c) => c.id === 'base').history.nextAt, null);
   assert.equal(state.pools.length, 2, 'current rows are visible while history is backfilled');
   assert.ok(state.revision > before);
   release(); await settle(market);
@@ -414,6 +434,765 @@ test('config is strict, invalid saved config falls back with a notice, and refre
   assert.equal(fake.chain.stateReads, 1);
   market.refresh(); await settle(market);
   assert.equal(fake.chain.stateReads, 1, 'a second manual refresh within 30 s is ignored');
+  await market.close();
+});
+
+// 慢节点：每次读取都在单次超时内返回，但累计超过整轮预算；读取遵守 rpc 上的取消信号。
+function slowChain() {
+  // stubborn：这些读取不理会取消信号（读完才返回），模拟读取已完成但整轮已到期。fail：这些读取直接报错。
+  const fake = fakeChain(), delays = { block: 0, state: 0, history: 0, addresses: 0, statics: 0, tokens: 0, gauges: 0 }, seen = { aborted: 0, statics: 0, gauges: 0, addressesFrom: [] };
+  const stubborn = new Set(), fail = new Set();
+  const wait = (ms, signal, name) => new Promise((resolve, reject) => {
+    if (fail.has(name)) return reject(new Error(`${name} 节点错误：execution reverted`));
+    if (stubborn.has(name)) { setTimeout(resolve, ms); return; }
+    let timer;
+    const cancel = () => { clearTimeout(timer); signal?.removeEventListener('abort', cancel); seen.aborted++; reject(Object.assign(new Error('eth_call 超过 20 秒未响应'), { kind: 'timeout' })); };
+    if (signal?.aborted) return cancel();
+    if (!ms) return resolve();
+    timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, ms);
+    signal?.addEventListener('abort', cancel, { once: true });
+  });
+  const createRpc = (options) => {
+    const base = fake.createRpc(options);
+    return { ...base, url: options.url, signal: options.signal, blockNumber: async () => { await wait(delays.block, options.signal, 'block'); return base.blockNumber(); } };
+  };
+  const reads = {
+    ...fake.reads,
+    readPoolStates: async (rpc, ...rest) => { await wait(delays.state, rpc.signal, 'state'); return fake.reads.readPoolStates(rpc, ...rest); },
+    readPoolHistory: async (rpc, ...rest) => { await wait(delays.history, rpc.signal, 'history'); return fake.reads.readPoolHistory(rpc, ...rest); },
+    readPoolAddresses: async (rpc, factory, known, ...rest) => { seen.addressesFrom.push(known); await wait(delays.addresses, rpc.signal, 'addresses'); return fake.reads.readPoolAddresses(rpc, factory, known, ...rest); },
+    readPoolStatics: async (rpc, pools) => { if (pools.length) { seen.statics++; await wait(delays.statics, rpc.signal, 'statics'); } return fake.reads.readPoolStatics(rpc, pools); },
+    readTokens: async (rpc, list) => { if (list.length) await wait(delays.tokens, rpc.signal, 'tokens'); return fake.reads.readTokens(rpc, list); },
+    readGauges: async (rpc, pools) => { seen.gauges++; await wait(delays.gauges, rpc.signal, 'gauges'); return fake.reads.readGauges(rpc, pools); },
+  };
+  return { ...fake, reads, createRpc, delays, seen, stubborn, fail };
+}
+
+test('a scan round has an overall deadline: slow reads are aborted, the chain is released, the last rows stay and the next round starts normally', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer, cycleDeadlineMs: 100 });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const good = market.state().chains.find((c) => c.id === 'base');
+  assert.equal(good.status, 'ok');
+
+  // 两次读取各 150 ms，单次都不超时，合计超过 100 ms 的整轮预算。
+  fake.chain.t += 30; fake.delays.block = 150; fake.delays.state = 150;
+  const started = Date.now();
+  await clock.fire(); await settle(market);
+  const elapsed = Date.now() - started;
+  let state = market.state(), base = state.chains.find((c) => c.id === 'base');
+  assert.equal(base.status, 'error');
+  assert.match(base.error, /本轮扫描超过/);
+  assert.ok(fake.seen.aborted >= 1, 'the in-flight read is cancelled');
+  assert.ok(elapsed < 300, `the chain is released at the deadline, before both reads (300 ms) finish (${elapsed} ms)`);
+  assert.equal(state.pools.length, 2, 'rows from the last good round stay');
+  assert.equal(base.updatedAt, good.updatedAt);
+  assert.equal(clock.pending()[0].ms, 60_000, 'bounded retry after the usual failure backoff');
+
+  fake.delays.block = 0; fake.delays.state = 0;
+  await clock.fire(); await settle(market);
+  base = market.state().chains.find((c) => c.id === 'base');
+  assert.equal(base.status, 'ok', 'the next round starts and completes normally');
+  assert.equal(base.error, null);
+
+  // 预算在回填中耗尽：本轮当前数据照常发布，回填按常规间隔再试，不追批。
+  fake.chain.t += 30; fake.delays.history = 60;
+  await clock.fire(); await settle(market);
+  state = market.state(); base = state.chains.find((c) => c.id === 'base');
+  assert.equal(base.status, 'ok');
+  assert.equal(base.updatedAt, fake.chain.t * 1000, 'current data of this round is published');
+  assert.ok(base.history.pending > 0);
+  assert.equal(clock.pending()[0].ms, 15 * 60 * 1000);
+  await market.close();
+});
+
+const marketWith = (dir, fake, clock, extra = {}) => createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer, ...extra });
+const baseOf = (market) => market.state().chains.find((c) => c.id === 'base');
+
+test('switching RPC clears a recorded archive failure while a TVL-only change preserves it', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock);
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  fake.chain.failHistory = 'node';
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const oldRetry = baseOf(market).history.nextAt;
+  assert.equal(baseOf(market).history.archive, 'unavailable');
+  fake.chain.failHistory = null;
+  await market.save({ ...market.state().config, minTvlUsd: 0 });
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(fake.chain.historyBlocks.length, 0, 'a TVL threshold does not change the same RPC archive capability');
+  assert.equal(baseOf(market).history.nextAt, oldRetry);
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl: 'https://readable-archive.example/rpc' } } });
+  fake.chain.t += 60;
+  assert.ok(fake.chain.t * 1000 < oldRetry);
+  await clock.fire(); await settle(market);
+  assert.ok(fake.chain.historyBlocks.length > 0, 'the new node must read history before the old six-hour pause expires');
+  assert.equal(baseOf(market).history.archive, 'archive');
+  assert.equal(baseOf(market).history.phase, 'catching_up');
+  assert.ok(baseOf(market).history.nextAt < oldRetry);
+});
+
+test('liquidity cache is tied to RPC identity but not the discovery TVL threshold', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock);
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const first = await market.liquidity('base', POOL_WETH);
+  await market.save({ ...market.state().config, minTvlUsd: 0 });
+  assert.equal(await market.liquidity('base', POOL_WETH), first);
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl: 'https://new-liquidity.example/rpc' } } });
+  assert.notEqual(await market.liquidity('base', POOL_WETH), first, 'an unchanged pool snapshot cannot reuse a result from the old RPC');
+  assert.equal(fake.chain.liquidityReads, 2);
+});
+
+test('a late liquidity failure uses its original RPC for redaction and preserves the new cache entry', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock);
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  t.after(async () => { release(); await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  const config = market.state().config, rpcUrl = 'https://old-rpc.example/probeAlpha%2Bbeta%2Fgamma%3D';
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl } } });
+  await clock.fire(); await settle(market);
+  const original = fake.reads.readPoolLiquidity, seen = [];
+  fake.reads.readPoolLiquidity = async (rpc, ...args) => {
+    seen.push(rpc.url);
+    if (rpc.url === rpcUrl) { await gate; throw new Error('quota denied: probeAlpha+beta/gamma='); }
+    return original(rpc, ...args);
+  };
+  const oldRead = market.liquidity('base', POOL_WETH).catch((error) => error);
+  await waitFor(() => seen.length === 1);
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl: 'https://new-rpc.example/rpc' } } });
+  const current = await market.liquidity('base', POOL_WETH);
+  release();
+  const oldError = await oldRead;
+  assert.equal(oldError.status, 502);
+  assert.match(oldError.message, /quota denied/);
+  assert.doesNotMatch(oldError.message, /probeAlpha/);
+  assert.equal(await market.liquidity('base', POOL_WETH), current);
+  assert.equal(seen.length, 2, 'the old rejected request must not remove or refill the replacement entry');
+});
+
+for (const sink of ['scan', 'discovery', 'history', 'liquidity']) test(`RPC diagnostic exits redact credentials: ${sink}`, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers(), logs = [];
+  const market = marketWith(dir, fake, clock, { log: { ...silent, warn: (...args) => logs.push(args) } });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  const config = market.state().config;
+  const rpcUrl = 'https://rpc.example/v2/probeAlpha%2Bbeta%2Fgamma%3D';
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl } } });
+  await clock.fire(); await settle(market);
+  const failure = () => { throw Object.assign(new Error(`quota denied: probeAlpha+beta/gamma= at ${rpcUrl}`), { kind: 'node' }); };
+  if (sink === 'scan') fake.reads.readPoolStates = failure;
+  if (sink === 'discovery') fake.reads.readGauges = failure;
+  if (sink === 'history') fake.reads.readPoolHistory = failure;
+  let diagnostic;
+  if (sink === 'liquidity') {
+    fake.reads.readPoolLiquidity = failure;
+    await assert.rejects(market.liquidity('base', POOL_WETH), (error) => {
+      diagnostic = JSON.stringify(errorResponder([HttpError])(error));
+      return error.status === 502;
+    });
+  } else {
+    fake.chain.t += sink === 'discovery' ? 6 * 3600 + 1 : 60;
+    await clock.fire(); await settle(market);
+    diagnostic = JSON.stringify({ chains: market.state().chains.map((c) => ({ error: c.error, discovery: c.discovery })), logs });
+  }
+  assert.match(diagnostic, /quota denied/);
+  assert.doesNotMatch(diagnostic, /probeAlpha|rpc\.example|https:\/\//, 'no RPC diagnostic exit may expose the configured credential or URL');
+});
+
+test('browser snapshot cache omits RPC diagnostic text as well as configured URLs', async () => {
+  // 执行共用客户端实际的缓存投影与旧缓存回调；不运行 hook、不复制脱敏规则。
+  const ts = await import('typescript');
+  const source = readFileSync(new URL('../src/aero-market-client.ts', import.meta.url), 'utf8');
+  const file = ts.createSourceFile('aero-market-client.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const statements = file.statements.filter((row) => ts.isVariableStatement(row) && row.declarationList.declarations.some((d) => ['forCache', 'usableSnapshot'].includes(d.name.getText(file))));
+  let restore;
+  const visit = (node) => {
+    if (ts.isCallExpression(node) && node.expression.getText(file) === "readCache<MarketSnapshot>('snapshot').then") restore = node.arguments[0];
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  assert.equal(statements.length, 2); assert.ok(restore);
+  const code = ts.transpileModule(`${statements.map((s) => s.getText(file)).join('\n')}\nmodule.exports = { forCache, restore: ${restore.getText(file)} };`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText;
+  let displayed, savedAt, cleared = 0;
+  const context = { module: { exports: {} }, controller: { signal: { aborted: false } }, revision: { current: null },
+    clearCache: async () => { cleared++; }, setSnapshot: (value) => { displayed = value; }, setCachedAt: (value) => { savedAt = value; } };
+  runInNewContext(code, context);
+  const project = context.module.exports.forCache;
+  const snapshot = { schema: 1, aero: { usd: null, at: null }, config: { chains: { base: { enabled: true, rpcUrl: 'https://rpc.example/probeAlpha%2Bbeta' } } }, pools: [],
+    chains: [{ id: 'base', error: 'probeAlpha+beta', discovery: { error: 'probeAlpha%2Bbeta', failures: 1 } }] };
+  const cached = project(snapshot);
+  assert.doesNotMatch(JSON.stringify(cached), /probeAlpha|rpc\.example/);
+  assert.equal(snapshot.chains[0].error, 'probeAlpha+beta', 'the cache projection does not mutate live diagnostics');
+  snapshot.config.chains.base.rpcUrl = '';
+  context.module.exports.restore({ data: snapshot, savedAt: 123 });
+  assert.equal(cleared, 1, 'the legacy persisted diagnostics are cleared even when the URL was already omitted');
+  assert.equal(savedAt, 123);
+  assert.doesNotMatch(JSON.stringify(displayed), /probeAlpha/);
+  context.module.exports.restore({ data: cached, savedAt: 456 });
+  assert.equal(cleared, 1, 'a clean cache stays available');
+  assert.equal(savedAt, 456);
+});
+
+test('rediscovery eventually completes across rounds with current reads taking more than 60 percent of the budget', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 500 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  fake.chain.failHistory = 'node';
+  await market.initialize();
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  const discoveredAt = baseOf(market).discovery.at;
+  fake.delays.state = 360; fake.delays.addresses = 10; fake.delays.gauges = 10;
+  fake.chain.t += 6 * 3600 + 1;
+  let activeReads = 0, maxReads = 0;
+  const readStates = fake.reads.readPoolStates;
+  fake.reads.readPoolStates = async (...args) => {
+    maxReads = Math.max(maxReads, ++activeReads);
+    try { return await readStates(...args); } finally { activeReads--; }
+  };
+  const rounds = [];
+  for (let round = 0; round < 3; round++) {
+    await clock.fire();
+    market.refresh();
+    await waitFor(() => baseOf(market).status !== 'loading');
+    const base = baseOf(market);
+    rounds.push({ status: base.status, updatedAt: base.updatedAt, discoveryAt: base.discovery.at, failures: base.discovery.failures, gauges: fake.seen.gauges });
+    assert.equal(base.status, 'ok');
+    assert.equal(base.updatedAt, fake.chain.t * 1000, 'slow but successful reads keep the current snapshot fresh');
+    assert.equal(clock.pending().length, 1, 'only one next round is scheduled');
+    fake.chain.t += 15 * 60;
+  }
+  t.diagnostic(JSON.stringify(rounds));
+  assert.ok(baseOf(market).discovery.at > discoveredAt, 'rediscovery must make progress despite consistently slow current reads');
+  assert.equal(baseOf(market).discovery.failures, 0, 'local budget exhaustion is not a node failure');
+  assert.equal(baseOf(market).discovery.retryAt, null);
+  assert.equal(maxReads, 1, 'manual refresh cannot overlap an existing round');
+});
+
+test('rediscovery budget exhaustion does not back off and defers at most one current update', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 300 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  fake.chain.failHistory = 'node';
+  await market.initialize();
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  fake.chain.t += 6 * 3600 + 1; fake.delays.gauges = 2000;
+  let lastUpdate = baseOf(market).updatedAt;
+  for (let round = 0; round < 4; round++) {
+    const gauges = fake.seen.gauges;
+    await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+    const base = baseOf(market);
+    assert.equal(base.status, 'ok');
+    assert.deepEqual([base.discovery.failures, base.discovery.error, base.discovery.retryAt], [0, null, null], 'budget exhaustion is a pending task, not a failed node');
+    if (round % 2 === 0) {
+      assert.equal(base.updatedAt, lastUpdate, 'one round may yield its current read to discovery');
+      assert.equal(base.discovery.phase, 'pending');
+      assert.equal(base.discovery.refreshPending, true, 'the deferred current update is visible');
+      assert.equal(fake.seen.gauges, gauges + 1);
+    } else {
+      assert.equal(base.updatedAt, fake.chain.t * 1000, 'the next round must update the current snapshot first');
+      assert.equal(base.discovery.refreshPending, false);
+      assert.equal(fake.seen.gauges, gauges, 'a required current refresh cannot be displaced by another discovery');
+      lastUpdate = base.updatedAt;
+    }
+    assert.equal(clock.pending().length, 1);
+    fake.chain.t += 15 * 60;
+  }
+});
+
+test('changing RPC clears the old discovery failures and backoff before the next attempt', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 1000 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  fake.chain.t += 6 * 3600 + 1; fake.fail.add('gauges');
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  assert.equal(baseOf(market).discovery.failures, 1);
+  const retryAt = baseOf(market).discovery.retryAt;
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl: 'https://new-node.example/rpc' } } });
+  assert.deepEqual([baseOf(market).discovery.failures, baseOf(market).discovery.error, baseOf(market).discovery.retryAt], [0, null, null], 'a new RPC does not inherit the old node failure');
+  fake.fail.delete('gauges'); fake.chain.t += 60;
+  assert.ok(fake.chain.t * 1000 < retryAt);
+  const gauges = fake.seen.gauges;
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  assert.equal(fake.seen.gauges, gauges + 1, 'the new node is tried before the old retry deadline');
+  assert.equal(baseOf(market).discovery.at, fake.chain.t * 1000);
+});
+
+for (const outcome of ['failure', 'success']) test(`a threshold change discards an in-flight discovery ${outcome} from the old generation`, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers(), gate = Promise.withResolvers();
+  let hold = false, entered = false, lateSuccess = false;
+  const readGauges = fake.reads.readGauges;
+  fake.reads.readGauges = async (...args) => {
+    if (hold) {
+      const result = args[1].map((address) => statics[address].gauge);
+      entered = true; await gate.promise;
+      if (outcome === 'failure') throw new Error('old generation gauges HTTP 503');
+      assert.equal(args[0].signal.aborted, true, 'the old request returns successfully despite configuration cancellation');
+      lateSuccess = true;
+      return result;
+    }
+    return readGauges(...args);
+  };
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 2000 });
+  t.after(async () => { gate.resolve(); await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  const discoveredAt = baseOf(market).discovery.at;
+  await market.save({ ...market.state().config, minTvlUsd: 0 });
+  fake.chain.t += 60; hold = true;
+  await clock.fire(); await waitFor(() => entered);
+  await market.save({ ...market.state().config, minTvlUsd: 1e9 });
+  gate.resolve();
+  await waitFor(() => baseOf(market).status !== 'loading');
+  const base = baseOf(market);
+  assert.equal(lateSuccess, outcome === 'success', 'the success case really returned data, rather than throwing an abort');
+  assert.deepEqual([base.discovery.failures, base.discovery.error, base.discovery.retryAt], [0, null, null], 'old errors cannot reinstate the cleared backoff');
+  assert.equal(base.discovery.at, discoveredAt, 'old results cannot replace the registry');
+  assert.equal(base.activeCount, 2, 'the old zero threshold cannot publish the third pool');
+  hold = false; fake.chain.t += 60;
+  await clock.fire(); await waitFor(() => baseOf(market).status !== 'loading');
+  assert.equal(baseOf(market).discovery.at, fake.chain.t * 1000, 'the new threshold is retried without waiting for the old failure backoff');
+  assert.equal(baseOf(market).activeCount, 2);
+});
+
+for (const change of ['RPC', 'threshold']) for (const outcome of ['success', 'failure', 'cancel']) {
+  test(`a ${change} change discards an in-flight backfill ${outcome} without changing history or backoff`, async (t) => {
+    const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+    onlyBase(dir);
+    const fake = slowChain(), clock = timers(), gate = Promise.withResolvers();
+    let hold = false, entered = false, completed = null;
+    const readHistory = fake.reads.readPoolHistory;
+    fake.reads.readPoolHistory = async (rpc, ...args) => {
+      if (!hold) return readHistory(rpc, ...args);
+      const prepared = await readHistory(rpc, ...args);
+      entered = true;
+      if (outcome === 'cancel') {
+        await new Promise((resolve) => {
+          if (rpc.signal.aborted) resolve();
+          else rpc.signal.addEventListener('abort', resolve, { once: true });
+        });
+        completed = 'cancel';
+        throw rpc.signal.reason;
+      }
+      await gate.promise;
+      assert.equal(rpc.signal.aborted, true);
+      completed = outcome;
+      if (outcome === 'failure') throw Object.assign(new Error('old archive missing trie node'), { kind: 'node' });
+      return prepared;
+    };
+    const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 2000 });
+    t.after(async () => { gate.resolve(); await market.close(); rmSync(dir, { recursive: true, force: true }); });
+    await market.initialize();
+    await clock.fire(); await settle(market);
+    hold = true; fake.chain.t += 60;
+    await clock.fire(); await waitFor(() => entered);
+    const historyState = () => { const { points, archive, pending, phase } = baseOf(market).history; return { points, archive, pending, phase }; };
+    const before = historyState();
+    const config = market.state().config;
+    await market.save(change === 'RPC'
+      ? { ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl: 'https://new-archive.example/rpc' } } }
+      : { ...config, minTvlUsd: config.minTvlUsd + 1 });
+    gate.resolve();
+    await settle(market);
+    assert.equal(completed, outcome, 'the fixture exercises the selected completion path');
+    assert.deepEqual(historyState(), before, 'an obsolete backfill must not append history or overwrite archive/backoff state');
+    assert.ok(baseOf(market).history.nextAt <= fake.chain.t * 1000 + 30_000, 'the old node cannot impose a six-hour archive pause');
+    hold = false; fake.chain.t += 60;
+    const readsBefore = fake.chain.historyBlocks.length;
+    await clock.fire(); await settle(market);
+    assert.ok(fake.chain.historyBlocks.length > readsBefore, 'backfill resumes in the new generation immediately');
+    assert.equal(baseOf(market).history.archive, 'archive');
+  });
+}
+
+test('rediscovery without retained progress backs off after three exhausted budgets while current reads continue', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 150 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  fake.chain.failHistory = 'node';
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  fake.chain.t += 6 * 3600 + 1; fake.delays.gauges = 2000;
+  let retryAt = null;
+  for (let attempt = 1; attempt <= 7; attempt++) {
+    if (retryAt !== null) fake.chain.t = retryAt / 1000;
+    const gauges = fake.seen.gauges;
+    await clock.fire(); await settle(market);
+    let base = baseOf(market);
+    assert.equal(fake.seen.gauges, gauges + 1);
+    assert.deepEqual([base.discovery.failures, base.discovery.error], [0, null], 'budget stalls are distinct from real RPC errors');
+    retryAt = attempt < 3 ? null : fake.chain.t * 1000 + Math.min(30 * 60 * 2 ** (attempt - 3), 6 * 3600) * 1000;
+    assert.equal(base.discovery.retryAt, retryAt);
+    assert.equal(base.discovery.phase, attempt < 3 ? 'pending' : 'budget_backoff');
+    if (attempt >= 3) assert.equal(base.discovery.stalledAttempts, attempt);
+    fake.chain.t += 60;
+    await clock.fire(); await settle(market);
+    base = baseOf(market);
+    assert.equal(base.updatedAt, fake.chain.t * 1000, 'the next round still refreshes the current snapshot');
+    if (attempt >= 3) assert.equal(base.discovery.stalledAttempts, attempt, 'current reads cannot reset discovery stall accounting');
+    assert.equal(fake.seen.gauges, gauges + 1);
+    if (retryAt !== null) {
+      fake.chain.t += 60; market.refresh(); await settle(market);
+      assert.equal(fake.seen.gauges, gauges + 1, 'manual refresh respects the bounded budget backoff');
+      assert.equal(baseOf(market).updatedAt, fake.chain.t * 1000);
+    }
+  }
+  await market.save({ ...market.state().config, minTvlUsd: 0 });
+  assert.equal(baseOf(market).discovery.stalledAttempts, 0);
+  assert.equal(baseOf(market).discovery.retryAt, null, 'a new configuration can try immediately');
+  fake.delays.gauges = 0; fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).discovery.phase, 'idle');
+  assert.equal(baseOf(market).discovery.stalledAttempts, 0);
+});
+
+test('new retained discovery progress resets budget stalls and is reused after another timeout', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers(), extra = '0x' + '4'.repeat(40);
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 150 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  fake.chain.failHistory = 'node';
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  fake.chain.t += 6 * 3600 + 1; fake.delays.gauges = 2000;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await clock.fire(); await settle(market);
+    fake.chain.t += 60;
+    await clock.fire(); await settle(market);
+    fake.chain.t += 60;
+  }
+  let staticReads = 0;
+  fake.reads.readPoolAddresses = async (_rpc, _factory, known) => ({ total: 4, added: known < 4 ? [extra] : [] });
+  fake.reads.readPoolStatics = async () => { staticReads++; return [{ ...statics[POOL_IDLE], address: extra }]; };
+  const readGauges = fake.reads.readGauges;
+  fake.reads.readGauges = async (rpc, addresses) => {
+    await readGauges(rpc, addresses.filter((address) => address !== extra));
+    return addresses.map((address) => statics[address]?.gauge ?? null);
+  };
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).discovery.retryAt, null, 'retained progress prevents a third-attempt budget cooldown');
+  assert.equal(baseOf(market).discovery.stalledAttempts, 0);
+  assert.equal(staticReads, 1);
+  for (let round = 0; round < 2; round++) { fake.chain.t += 60; await clock.fire(); await settle(market); }
+  assert.equal(baseOf(market).discovery.stalledAttempts, 1);
+  assert.equal(staticReads, 1, 'the timeout retains the newly read pool instead of starting over');
+  fake.chain.t += 60; await clock.fire(); await settle(market);
+  fake.delays.gauges = 0; fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).poolCount, 4);
+  assert.equal(baseOf(market).discovery.stalledAttempts, 0, 'successful discovery clears the stall count');
+});
+
+test('first discovery gets the enlarged round budget: it may take longer than a normal round', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  // 普通轮次 100 ms；首次发现的后半段要 150 ms，在放大后的预算（3 倍）内完成。
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 100 });
+  await market.initialize();
+  fake.delays.gauges = 150;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).status, 'ok', 'first discovery is not cut at the normal round budget');
+  assert.equal(market.state().pools.length, 2);
+  // 有了池子列表之后回到普通预算：同样慢的当前读数被截止。
+  fake.chain.t += 30; fake.delays.state = 150;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).status, 'error');
+  assert.match(baseOf(market).error, /本轮扫描超过/);
+  await market.close();
+});
+
+test('first discovery interrupted by the round deadline keeps its progress and finishes in the next round', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  // 首次发现预算 3 × 150 = 450 ms；静态信息与代币各 300 ms，一轮读不完（10 + 300 + 300 > 450），第二轮只剩代币（10 + 300 < 450）。
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 150 });
+  await market.initialize();
+  fake.delays.addresses = 10; fake.delays.statics = 300; fake.delays.tokens = 300;
+  await clock.fire(); await settle(market);
+  let base = baseOf(market);
+  assert.equal(base.status, 'error');
+  assert.match(base.error, /本轮扫描超过/);
+  assert.equal(market.state().pools.length, 0);
+  assert.equal(base.poolCount, null, 'an unfinished discovery is not published as the registry');
+  assert.equal(fake.seen.statics, 1);
+
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  base = baseOf(market);
+  assert.equal(base.status, 'ok', 'the second round continues from the saved progress');
+  assert.equal(fake.seen.addressesFrom.at(-1), 3, 'pool addresses resume after the ones already read');
+  assert.equal(fake.seen.statics, 1, 'pool statics are not read again');
+  assert.equal(base.poolCount, 3);
+  assert.equal(market.state().pools.length, 2);
+  await market.close();
+});
+
+test('discovery reads pools in batches and a deadline between batches keeps the finished ones', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  // 每批 1 个池子、每批静态信息 150 ms；首次发现预算 3 × 120 = 360 ms：读完两批后第三批被截止。
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 120, discoveryBatch: 1 });
+  await market.initialize();
+  fake.delays.statics = 150;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).status, 'error');
+  assert.deepEqual(fake.seen.addressesFrom, [0, 1, 2], 'one batch after another');
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).status, 'ok');
+  assert.deepEqual(fake.seen.addressesFrom.slice(3), [2], 'the next round resumes at the unfinished batch');
+  assert.equal(fake.seen.statics, 4, 'only the cut batch is read again');
+  assert.equal(baseOf(market).poolCount, 3);
+  await market.close();
+});
+
+test('an RPC change cancels the old round before discovery and the new RPC starts over', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 100 });
+  await market.initialize();
+  // 轮次开始后、发现开始前改 RPC：取消旧请求，不允许它再开始发现。
+  fake.delays.block = 60; fake.delays.tokens = 400;
+  const config = market.state().config, rpcUrl = 'https://other-node.example/rpc';
+  await clock.fire();
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, rpcUrl } } });
+  await settle(market);
+  assert.equal(baseOf(market).status, 'idle');
+  assert.equal(baseOf(market).error, null, 'config cancellation is not a node failure');
+  assert.equal(fake.seen.statics, 0);
+  fake.delays.block = 0; fake.delays.tokens = 0; fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).status, 'ok');
+  assert.equal(fake.seen.addressesFrom.at(-1), 0, 'progress read from the old RPC is not reused for the new one');
+  assert.equal(fake.seen.statics, 1);
+  await market.close();
+});
+
+test('a failed rediscovery keeps the old pool list, publishes current data, leaves budget for backfill and backs off', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 400 });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  assert.equal(fake.seen.gauges, 1);
+  const firstDiscovery = baseOf(market).discovery.at;
+  assert.ok(firstDiscovery > 0);
+  assert.equal(baseOf(market).discovery.failures, 0);
+  // 改门槛要求重新发现；这次节点明确报错，当前读取和回填仍可继续。
+  const config = market.state().config;
+  await market.save({ ...config, minTvlUsd: config.minTvlUsd + 1 });
+  fake.chain.t += 60; fake.fail.add('gauges');
+  const historyBefore = fake.chain.historyBlocks.length;
+  await clock.fire(); await settle(market);
+  let base = baseOf(market);
+  assert.equal(fake.seen.gauges, 2, 'rediscovery was attempted');
+  assert.equal(base.status, 'ok', 'the round still succeeds with the old pool list');
+  assert.equal(base.updatedAt, fake.chain.t * 1000, 'current data is published, not frozen');
+  assert.equal(market.state().pools.length, 2);
+  assert.ok(fake.chain.historyBlocks.length > historyBefore, 'backfill still runs after the rediscovery request fails');
+  assert.equal(base.history.phase, 'catching_up');
+  assert.equal(base.discovery.failures, 1);
+  assert.match(base.discovery.error, /重新发现/);
+  assert.equal(base.discovery.retryAt, fake.chain.t * 1000 + 30 * 60_000, 'first retry after 30 minutes');
+  assert.equal(base.discovery.at, firstDiscovery);
+
+  // 退避期内的轮次不再尝试重新发现。
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(fake.seen.gauges, 2, 'no rediscovery attempt during the backoff');
+  fake.chain.t += 30 * 60;
+  await clock.fire(); await settle(market);
+  base = baseOf(market);
+  assert.equal(fake.seen.gauges, 3);
+  assert.equal(base.status, 'ok');
+  assert.equal(base.discovery.failures, 2);
+  assert.match(base.discovery.error, /execution reverted/);
+  assert.equal(base.discovery.retryAt, fake.chain.t * 1000 + 60 * 60_000, 'the backoff doubles');
+
+  // 池子列表超过 12 小时未更新时提示过期。
+  fake.chain.t += 13 * 3600;
+  await clock.fire(); await settle(market);
+  base = baseOf(market);
+  assert.equal(base.discovery.stale, true);
+  assert.equal(base.discovery.failures, 3);
+  assert.equal(base.discovery.retryAt, fake.chain.t * 1000 + 2 * 3600_000);
+
+  fake.fail.delete('gauges'); fake.chain.t += 2 * 3600 + 60;
+  await clock.fire(); await settle(market);
+  base = baseOf(market);
+  assert.equal(fake.seen.gauges, 5);
+  assert.deepEqual([base.discovery.failures, base.discovery.error, base.discovery.retryAt, base.discovery.stale], [0, null, null, false]);
+  assert.ok(base.discovery.at > firstDiscovery);
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(fake.seen.gauges, 5, 'a finished rediscovery clears the request');
+  await market.close();
+});
+
+test('a threshold change during a rediscovery keeps the request, and a new threshold skips the failure backoff', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 2000 });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  let config = market.state().config;
+  await market.save({ ...config, minTvlUsd: config.minTvlUsd + 1 });
+  fake.chain.t += 60; fake.delays.gauges = 100;
+  await clock.fire();
+  await waitFor(() => fake.seen.gauges >= 2);
+  config = market.state().config;
+  await market.save({ ...config, minTvlUsd: config.minTvlUsd + 1 });
+  await settle(market);
+  assert.equal(fake.seen.gauges, 2);
+  fake.delays.gauges = 0; fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(fake.seen.gauges, 3, 'the rediscovery that used the old threshold is followed by another one');
+
+  // 失败退避期间改门槛：立即重试，不等退避结束。
+  fake.fail.add('gauges');
+  config = market.state().config;
+  await market.save({ ...config, minTvlUsd: config.minTvlUsd + 1 });
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).discovery.failures, 1);
+  fake.fail.delete('gauges');
+  config = market.state().config;
+  await market.save({ ...config, minTvlUsd: config.minTvlUsd + 1 });
+  fake.chain.t += 60;
+  await clock.fire(); await settle(market);
+  assert.equal(fake.seen.gauges, 5);
+  assert.equal(baseOf(market).discovery.failures, 0);
+  await market.close();
+});
+
+test('reads that complete after the round deadline are still published', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = slowChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 100 });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  // 当前读数不理会取消、150 ms 后完整返回：结果完整，照常发布。
+  fake.stubborn.add('state'); fake.delays.state = 150; fake.chain.t += 30;
+  await clock.fire(); await settle(market);
+  const base = baseOf(market);
+  assert.equal(base.status, 'ok');
+  assert.equal(base.updatedAt, fake.chain.t * 1000);
+  assert.equal(base.history.phase, 'backoff', 'backfill does not start after the deadline');
+  await market.close();
+});
+
+test('the round deadline cancels a real RPC request to a slow node: one request, error on time', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  let hits = 0;
+  // 节点收到请求后一直不回：单次请求超时 20 秒，只有整轮截止能及时结束。
+  const server = http.createServer((req) => { hits++; req.resume(); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve); }));
+  const config = structuredClone(DEFAULT_CONFIG);
+  for (const id of Object.keys(config.chains)) config.chains[id].enabled = id === 'base';
+  config.chains.base.rpcUrl = `http://127.0.0.1:${server.address().port}`;
+  mkdirSync(join(dir, 'aero-market'), { recursive: true });
+  writeFileSync(join(dir, 'aero-market/config.json'), JSON.stringify(config));
+  const clock = timers();
+  const market = createAeroMarket({ dataDir: dir, log: silent, setTimer: clock.setTimer, clearTimer: clock.clearTimer, cycleDeadlineMs: 150 });
+  await market.initialize();
+  const started = Date.now();
+  await clock.fire();
+  await settle(market);
+  const elapsed = Date.now() - started, base = market.state().chains.find((c) => c.id === 'base');
+  assert.equal(base.status, 'error');
+  assert.match(base.error, /本轮扫描超过/);
+  assert.ok(elapsed < 1500, `released by the round deadline, not the 20 s request timeout (${elapsed} ms)`);
+  assert.equal(hits, 1, 'an aborted round does not retry the request');
+  await market.close();
+});
+
+test('backfill status tells catching up, backing off after a failure, disabled and complete apart, with the next attempt time', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  await market.initialize();
+  const chainOf = (id = 'base') => market.state().chains.find((c) => c.id === id);
+  assert.equal(chainOf('arbitrum').history.phase, 'disabled', 'a disabled chain has no backfill');
+
+  await clock.fire(); await settle(market);
+  let h = chainOf().history;
+  assert.equal(h.phase, 'catching_up');
+  assert.equal(h.pending, 168 - 1 - 24);
+  assert.equal(h.nextAt, fake.chain.t * 1000 + 30_000, 'the next batch follows in 30 s');
+
+  // 部分进度后回填失败：剩余数不变，但不再追批，下次尝试是常规间隔。
+  fake.chain.t += 30; fake.chain.failHistory = 'timeout';
+  await clock.fire(); await settle(market);
+  h = chainOf().history;
+  assert.equal(chainOf().status, 'ok');
+  assert.equal(h.phase, 'backoff');
+  assert.equal(h.pending, 168 - 1 - 24);
+  assert.equal(h.nextAt, fake.chain.t * 1000 + 15 * 60 * 1000);
+
+  fake.chain.t += 900; fake.chain.failHistory = null;
+  await clock.fire(); await settle(market);
+  assert.equal(chainOf().history.phase, 'catching_up');
+  while (clock.pending()[0].ms === 30_000) { fake.chain.t += 30; await clock.fire(); await settle(market); }
+  h = chainOf().history;
+  assert.equal(h.phase, 'complete');
+  assert.equal(h.pending, 0);
+  assert.equal(h.nextAt, null);
+
+  // 节点拒绝历史状态：6 小时后再试。
+  fake.chain.t += 3 * 3600; fake.chain.failHistory = 'node';
+  await clock.fire(); await settle(market);
+  h = chainOf().history;
+  assert.equal(h.archive, 'unavailable');
+  assert.equal(h.phase, 'backoff');
+  assert.ok(h.nextAt >= (fake.chain.t + 6 * 3600) * 1000, 'the next archive attempt is after the 6-hour pause');
+
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, enabled: false } } });
+  h = chainOf().history;
+  assert.equal(h.phase, 'disabled');
+  assert.equal(h.nextAt, null);
   await market.close();
 });
 

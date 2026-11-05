@@ -29,26 +29,83 @@ export class RpcError extends Error {
 
 const transient = (error) => error?.kind === 'timeout' || error?.kind === 'network' || (error?.kind === 'http' && /^(5\d\d|429)$/.test(String(error.status)));
 
+// 正文按解压后的字节边读边数，超限立即取消：Content-Length 可能缺失、低报，或只是压缩后的长度。
+async function readBody(response, method) {
+  const tooLarge = () => new RpcError(`${method} 响应超过 ${MAX_BODY_BYTES / 1024 / 1024} MB`, { kind: 'format', method });
+  if (!response.body) return '';
+  const reader = response.body.getReader(), chunks = [];
+  let total = 0;
+  for (;;) {
+    let next;
+    try { next = await reader.read(); } catch (error) {
+      const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
+      throw new RpcError(timedOut ? `${method} 读取响应超时` : `${method} 读取响应中断`, { kind: timedOut ? 'timeout' : 'network', method });
+    }
+    if (next.done) break;
+    total += next.value.byteLength;
+    if (total > MAX_BODY_BYTES) { await reader.cancel().catch(() => {}); throw tooLarge(); }
+    chunks.push(next.value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks, total));
+}
+
+// 某一段含无效 % 转义或 UTF-8 时仍解码其余字节，不能让一个坏片段跳过后续凭据。
+function decodeFragment(value) {
+  try { return decodeURIComponent(value); } catch {
+    return value.replace(/(?:%[0-9a-f]{2})+/gi, (bytes) => new TextDecoder('utf-8', { ignoreBOM: true }).decode(Uint8Array.from(bytes.match(/[0-9a-f]{2}/gi), (hex) => parseInt(hex, 16))));
+  }
+}
+
+// RPC 诊断统一入口：先去密钥再裁剪/归一空白，兼容原文、解码回显和大小写混用的百分号转义。
+// 路径段和查询值均可能是短密钥，不按长度猜测；URL 无法解析或诊断过长时只保留固定类别。
+export function scrubRpcMessage(text, url, limit = 240) {
+  let out = String(text), parsed;
+  if (out.length > 8192) return 'RPC 错误（诊断内容过长）';
+  try { parsed = new URL(url); } catch { return 'RPC 错误（地址无效）'; }
+  const normalize = (value) => value.replace(/%[0-9a-f]{2}/gi, (hex) => hex.toUpperCase());
+  const secrets = new Set();
+  const add = (value) => {
+    if (!value) return;
+    const decoded = decodeFragment(value);
+    // 诊断也会解码一次；若实际密钥含字面的 %xx，已解码回显会因此再展开一层。
+    for (const variant of [value, decoded, decodeFragment(decoded)]) secrets.add(normalize(variant));
+  };
+  parsed.pathname.split('/').forEach(add);
+  for (const part of parsed.search.slice(1).split('&')) {
+    const value = part.slice(part.indexOf('=') + 1);
+    add(value); add(value.replace(/\+/g, ' '));
+  }
+  add(parsed.username); add(parsed.password);
+  // 先统一回显的编码形式，再从长到短匹配，避免 /v2 等短路由片段提前打断完整密钥。
+  out = normalize(decodeFragment(out));
+  for (const secret of [...secrets].sort((a, b) => b.length - a.length)) out = out.split(secret).join('***');
+  return out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()]+/gi, '<地址>')
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
 export function createRpc({ url, chainId, fetchImpl = fetch, timeoutMs = RPC_TIMEOUT_MS, retryDelayMs = RETRY_DELAY_MS, signal } = {}) {
   let id = 0, verified = false;
   async function once(method, params) {
     let response;
     try {
-      response = await fetchImpl(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs) });
+      // 不跟随跳转：可信边界是所配的地址本身，公网节点的 3xx 不能把请求带到本机或内网服务。
+      response = await fetchImpl(url, { method: 'POST', redirect: 'manual', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: ++id, method, params }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs) });
     } catch (error) {
       const timedOut = error?.name === 'TimeoutError' || error?.name === 'AbortError';
-      throw Object.assign(new RpcError(timedOut ? `${method} 超过 ${timeoutMs / 1000} 秒未响应` : `${method} 连接失败`, { kind: timedOut ? 'timeout' : 'network', method }), { cause: error });
+      throw new RpcError(timedOut ? `${method} 超过 ${timeoutMs / 1000} 秒未响应` : `${method} 连接失败`, { kind: timedOut ? 'timeout' : 'network', method });
+    }
+    if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400)) {
+      await response.body?.cancel?.().catch(() => {});
+      throw Object.assign(new RpcError(`${method} 节点返回跳转（HTTP ${response.status}），已拒绝；请填写跳转后的最终地址`, { kind: 'redirect', method }), { status: response.status });
     }
     if (!response.ok) { await response.body?.cancel?.().catch(() => {}); throw Object.assign(new RpcError(`${method} HTTP ${response.status}`, { kind: 'http', method }), { status: response.status }); }
     let body;
     const length = Number(response.headers.get('content-length'));
-    if (length > MAX_BODY_BYTES) { await response.body?.cancel?.().catch(() => {}); throw new RpcError(`${method} 响应超过 ${MAX_BODY_BYTES / 1024 / 1024} MB`, { kind: 'format', method }); }
-    try {
-      const text = await response.text();
-      if (text.length > MAX_BODY_BYTES) throw new RpcError(`${method} 响应超过 ${MAX_BODY_BYTES / 1024 / 1024} MB`, { kind: 'format', method });
-      body = JSON.parse(text);
-    } catch (error) { if (error instanceof RpcError) throw error; throw new RpcError(`${method} 响应不是 JSON`, { kind: 'format', method }); }
-    if (body?.error) throw Object.assign(new RpcError(`${method} 节点错误：${String(body.error.message || body.error.code).slice(0, 160)}`, { kind: 'node', method }), { code: body.error.code });
+    const encoded = !/^(identity)?$/i.test(response.headers.get('content-encoding') ?? '');
+    if (!encoded && length > MAX_BODY_BYTES) { await response.body?.cancel?.().catch(() => {}); throw new RpcError(`${method} 响应超过 ${MAX_BODY_BYTES / 1024 / 1024} MB`, { kind: 'format', method }); }
+    const text = await readBody(response, method);
+    try { body = JSON.parse(text); } catch { throw new RpcError(`${method} 响应不是 JSON`, { kind: 'format', method }); }
+    if (body?.error) throw Object.assign(new RpcError(`${method} 节点错误：${scrubRpcMessage(body.error.message || body.error.code, url, 160)}`, { kind: 'node', method }), { code: Number.isSafeInteger(body.error.code) ? body.error.code : undefined });
     if (!Object.hasOwn(body ?? {}, 'result')) throw new RpcError(`${method} 响应缺少 result`, { kind: 'format', method });
     return body.result;
   }
@@ -83,12 +140,17 @@ export function createRpc({ url, chainId, fetchImpl = fetch, timeoutMs = RPC_TIM
           const chunk = chunks[index];
           const data = MC.encodeFunctionData('aggregate3', [chunk.map((c) => ({ target: c.target, allowFailure: true, callData: c.iface.encodeFunctionData(c.fn, c.args ?? []) }))]);
           const raw = await send('eth_call', [{ to: MULTICALL3, data }, tag]);
-          const [rows] = MC.decodeFunctionResult('aggregate3', raw);
-          results[index] = rows.map((row, i) => {
-            if (!row.success || row.returnData === '0x') return { ok: false, value: null };
-            try { const out = chunk[i].iface.decodeFunctionResult(chunk[i].fn, row.returnData); return { ok: true, value: out.length === 1 ? out[0] : out }; }
-            catch { return { ok: false, value: null }; }
-          });
+          try {
+            const [rows] = MC.decodeFunctionResult('aggregate3', raw);
+            results[index] = rows.map((row, i) => {
+              if (!row.success || row.returnData === '0x') return { ok: false, value: null };
+              try { const out = chunk[i].iface.decodeFunctionResult(chunk[i].fn, row.returnData); return { ok: true, value: out.length === 1 ? out[0] : out }; }
+              catch { return { ok: false, value: null }; }
+            });
+          } catch {
+            // ethers 的解码异常会在 message/value/stack 中回显原始结果，不将该对象带出 RPC 边界。
+            throw new RpcError('eth_call 响应无法解码', { kind: 'format', method: 'eth_call' });
+          }
         }
       };
       await Promise.all(Array.from({ length: Math.min(PARALLEL, chunks.length) }, worker));
@@ -97,13 +159,13 @@ export function createRpc({ url, chainId, fetchImpl = fetch, timeoutMs = RPC_TIM
   };
 }
 
-// 工厂池子列表只增不减：从 known 起读新增地址。
-export async function readPoolAddresses(rpc, factory, known = 0) {
+// 工厂池子列表只增不减：从 known 起读新增地址，最多 limit 个（分批读，慢节点上进度可以跨轮保留）。
+export async function readPoolAddresses(rpc, factory, known = 0, limit = Infinity) {
   const [length] = await rpc.multicall([{ target: factory, iface: FACTORY, fn: 'allPoolsLength' }]);
   if (!length.ok) throw new RpcError('读取工厂池子数量失败', { kind: 'format', method: 'allPoolsLength' });
   const total = Number(length.value);
   const calls = [];
-  for (let i = known; i < total; i++) calls.push({ target: factory, iface: FACTORY, fn: 'allPools', args: [i] });
+  for (let i = known; i < Math.min(total, known + limit); i++) calls.push({ target: factory, iface: FACTORY, fn: 'allPools', args: [i] });
   const rows = await rpc.multicall(calls);
   if (rows.some((r) => !r.ok)) throw new RpcError('读取工厂池子地址不完整', { kind: 'format', method: 'allPools' });
   return { total, added: rows.map((r) => r.value.toLowerCase()) };

@@ -1,5 +1,5 @@
 import { ASSETS, API_URL, SOURCE, HISTORY_START, fetchCandles } from './binance.mjs';
-import { decimalDifference, oilSpreadPercent } from './spread.mjs';
+import { decimalDifference, spreadPercentOfWti } from './spread.mjs';
 
 export const OIL_CANDLE_INTERVAL = '15m';
 export const OIL_CANDLE_MS = 900_000;
@@ -76,9 +76,26 @@ export async function fetchIntradaySnapshot(existing = null, options = {}) {
   return createIntradaySnapshot([...merged.values()].sort((a, b) => a.time - b.time), new Date(now).toISOString());
 }
 
+// Validated legs are positive finite numbers or null, so this matches oilSpreadPercent while computing the difference once.
+function chartRow(row) {
+  if (row.brent === null || row.wti === null) return null;
+  const absolute = decimalDifference(row.brent, row.wti), spread = spreadPercentOfWti(absolute, row.wti);
+  return spread === null ? null : { ...row, date: new Date(row.time).toISOString(), spread, absolute };
+}
+
 export function intradayChartRows(snapshot) {
-  return validateIntradaySnapshot(snapshot).data.flatMap(row => {
-    const spread = oilSpreadPercent(row.brent, row.wti);
-    return spread === null ? [] : [{ ...row, date: new Date(row.time).toISOString(), spread, absolute: decimalDifference(row.brent, row.wti) }];
-  });
+  return validateIntradaySnapshot(snapshot).data.flatMap(row => chartRow(row) ?? []);
+}
+
+/** Chart rows opening within `durationMs` before the end of the last charted bar, the window a trend keeps. */
+export function recentIntradayChartRows(snapshot, durationMs) {
+  const { data } = validateIntradaySnapshot(snapshot), rows = [];
+  let start = -Infinity;
+  for (let index = data.length - 1; index >= 0 && data[index].time >= start; index--) {
+    const row = chartRow(data[index]);
+    if (row === null) continue;
+    if (!rows.length) start = row.time + OIL_CANDLE_MS - durationMs;
+    if (row.time >= start) rows.push(row);
+  }
+  return rows.reverse();
 }

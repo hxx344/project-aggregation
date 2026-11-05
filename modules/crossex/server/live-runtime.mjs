@@ -12,6 +12,12 @@ const REMOTE = new Set([...ACTIVE, 'FILLED', 'CANCELLED', 'FAIL', 'REJECT']);
 // Active, unknown and external orders are always returned; only finished local history is capped.
 const CLOSED_ORDER_LIMIT = 300;
 const POSITION_PROJECTION_WAIT_MS = 30000, POSITION_PROJECTION_TOLERANCE_MS = 1000, HISTORY_LOOKBACK_MS = 7 * 86400000;
+// Every persisted Gate response stamps the local updated_at. This margin
+// assumes that the local clock and exchange time differed by less than one
+// hour at the time of that write; older writes can then be excluded from
+// the projection window.
+const POSITION_PROJECTION_WRITE_MARGIN_MS = 3600000;
+const TERMINAL_SQL = [...TERMINAL].map(state => `'${state}'`).join(',');
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const copy = value => JSON.parse(JSON.stringify(value));
 const id = () => randomUUID();
@@ -36,6 +42,11 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     CREATE TABLE IF NOT EXISTS live_previews (id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL, consumed INTEGER NOT NULL DEFAULT 0, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_executions (id TEXT PRIMARY KEY, preview_id TEXT UNIQUE NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_orders (id TEXT PRIMARY KEY, execution_id TEXT NOT NULL, text TEXT UNIQUE NOT NULL, version INTEGER NOT NULL, state TEXT NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS live_orders_unfinished ON live_orders(updated_at) WHERE state NOT IN (${TERMINAL_SQL});
+    CREATE INDEX IF NOT EXISTS live_orders_finished ON live_orders(version, updated_at) WHERE state IN (${TERMINAL_SQL});
+    CREATE INDEX IF NOT EXISTS live_orders_execution ON live_orders(execution_id);
+    CREATE INDEX IF NOT EXISTS live_orders_exchange_id ON live_orders(json_extract(json,'$.orderId'));
+    CREATE INDEX IF NOT EXISTS live_executions_updated ON live_executions(updated_at);
     CREATE TABLE IF NOT EXISTS live_requests (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, kind TEXT NOT NULL, result TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_supplemental (version INTEGER PRIMARY KEY, json TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS live_trades (version INTEGER NOT NULL, transaction_id TEXT NOT NULL, created_at INTEGER NOT NULL, json TEXT NOT NULL, PRIMARY KEY(version,transaction_id));
@@ -46,9 +57,25 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
   const cacheRecord = () => readSingleton('live_cache') || { account: null, positions: [], openOrders: [], asOf: null, error: null };
   const supplementalRecord = version => { const row = store.prepare('SELECT json FROM live_supplemental WHERE version=?').get(version || 0); return row ? JSON.parse(row.json) : {}; };
   const historyRows = (table, version) => store.prepare(`SELECT json FROM ${table} WHERE version=? ORDER BY created_at DESC LIMIT 200`).all(version || 0).map(r => JSON.parse(r.json));
-  const orderRecords = () => store.prepare('SELECT json FROM live_orders ORDER BY updated_at DESC').all().map(r => JSON.parse(r.json));
-  const executionRecords = () => store.prepare('SELECT json FROM live_executions ORDER BY updated_at DESC LIMIT 100').all().map(r => JSON.parse(r.json));
-  const findOrder = orderId => { const row = store.prepare('SELECT json FROM live_orders WHERE id=? OR text=?').get(orderId, orderId); return row ? JSON.parse(row.json) : orderRecords().find(o => o.orderId === orderId); };
+  // writeOrder is the only writer and keeps the state column equal to the JSON
+  // status, so unfinished orders are selected in SQL and never capped. Equal
+  // timestamps keep insertion order.
+  const parsed = rows => rows.map(r => JSON.parse(r.json));
+  const orderRecords = () => parsed(store.prepare('SELECT json FROM live_orders ORDER BY updated_at DESC, rowid').all());
+  const activeOrders = () => parsed(store.prepare(`SELECT json FROM live_orders WHERE state NOT IN (${TERMINAL_SQL}) ORDER BY updated_at DESC, rowid`).all());
+  const finishedOrders = (version, limit) => parsed(store.prepare(`SELECT json FROM live_orders WHERE version=? AND state IN (${TERMINAL_SQL}) ORDER BY updated_at DESC, rowid LIMIT ?`).all(version ?? null, limit));
+  const finishedOrderCount = version => store.prepare(`SELECT count(*) AS n FROM live_orders WHERE version=? AND state IN (${TERMINAL_SQL})`).get(version ?? null).n;
+  const finishedOrdersSince = (version, since) => parsed(store.prepare(`SELECT json FROM live_orders WHERE version=? AND state IN (${TERMINAL_SQL}) AND updated_at>=? ORDER BY updated_at DESC, rowid`).all(version ?? null, since));
+  const executionOrders = executionIds => parsed(store.prepare('SELECT json FROM live_orders WHERE execution_id IN (SELECT value FROM json_each(?)) ORDER BY updated_at DESC, rowid').all(JSON.stringify(executionIds)));
+  // An exchange order belongs to a tracked order of this connection by its exchange id, or by client text while that id is unknown.
+  const tracksRemote = (version, raw) => !!store.prepare("SELECT 1 FROM live_orders WHERE version=? AND json_extract(json,'$.orderId')=? LIMIT 1").get(version ?? null, String(raw.order_id))
+    || typeof raw.text === 'string' && !!store.prepare("SELECT 1 FROM live_orders WHERE text=? AND version=? AND (json_extract(json,'$.orderId') IS NULL OR json_extract(json,'$.orderId')='')").get(raw.text, version ?? null);
+  const executionRecords = () => parsed(store.prepare('SELECT json FROM live_executions ORDER BY updated_at DESC, rowid LIMIT 100').all());
+  const findOrder = orderId => {
+    const row = store.prepare('SELECT json FROM live_orders WHERE id=? OR text=?').get(orderId, orderId)
+      ?? store.prepare("SELECT json FROM live_orders WHERE json_extract(json,'$.orderId')=? ORDER BY updated_at DESC, rowid LIMIT 1").get(orderId);
+    return row ? JSON.parse(row.json) : undefined;
+  };
   const getExecution = executionId => { const row = store.prepare('SELECT json FROM live_executions WHERE id=?').get(executionId); return row ? executionView(JSON.parse(row.json)) : null; };
   let stopped = false, lostOwnership = false, queue = Promise.resolve(), queuedOperations = 0, clientVersion = null, privateClient = null, supplementalFlight = null, supplementalAttempt = -Infinity;
   let writerTicket = null, writerError = null, writerLost = false, activeSubmission = null, writerHistoryReady = !accountWriter;
@@ -213,8 +240,8 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     store.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,updated_at=excluded.updated_at,json=excluded.json')
       .run(order.id, order.executionId, order.text, order.version, order.status, order.updatedAt, JSON.stringify(order));
   }
-  function executionView(execution, executionOrders) {
-    const legs = (executionOrders ?? orderRecords().filter(o => o.executionId === execution.id)).toSorted((a, b) => a.index - b.index);
+  function executionView(execution, legRecords) {
+    const legs = (legRecords ?? executionOrders([execution.id])).toSorted((a, b) => a.index - b.index);
     const unknown = legs.some(o => ['UNKNOWN', 'SENDING', 'INVALID', 'CANCEL_PENDING'].includes(o.status));
     const anyFill = legs.some(o => D(o.executedQty).gt(0));
     const allFilled = legs.length > 0 && legs.every(o => o.status === 'FILLED');
@@ -222,7 +249,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     return { ...execution, state, legs: legs.map(o => ({ ...o, filledQuantity: o.executedQty })) };
   }
   function recoverUnsent() {
-    for (const order of orderRecords()) {
+    for (const order of activeOrders()) {
       if (order.status === 'PREPARED') { order.status = 'UNSENT'; order.error = '服务重启后未发送此腿，请按当前实际持仓手动处理'; writeOrder(order); }
       else if (order.status === 'SENDING') { order.status = 'UNKNOWN'; order.error = '服务中断，正在按原订单标识只读核对'; writeOrder(order); }
     }
@@ -280,7 +307,6 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     }
     if (observed.size > 1) fail('交易所返回了不同账户的持仓或挂单');
   }
-  function activeOrders() { return orderRecords().filter(o => !TERMINAL.has(o.status)); }
   function freshCache() {
     const record = connectionRecord(), cache = cacheRecord();
     if (!record?.enabled) fail('请先连接 Gate CrossEx 账户');
@@ -543,7 +569,7 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     const single = cache.account?.position_mode === 'SINGLE', version = connectionRecord()?.version;
     const sideKey = (symbol, side) => single ? symbol : `${symbol}:${side}`;
     const traded = new Set(plan.legs.map(l => sideKey(l.symbol, l.positionSide)));
-    for (const order of orderRecords()) {
+    for (const order of finishedOrdersSince(version, clock() - POSITION_PROJECTION_WAIT_MS - POSITION_PROJECTION_WRITE_MARGIN_MS)) {
       const filledAt = Number(order.raw?.update_time);
       if (order.version !== version || !traded.has(sideKey(order.symbol, order.positionSide)) || !TERMINAL.has(order.status) || !positive(order.executedQty) || !Number.isSafeInteger(filledAt) || filledAt <= 0 || clock() - filledAt >= POSITION_PROJECTION_WAIT_MS) continue;
       const rows = cache.positions.filter(p => sideKey(p.symbol, p.position_side) === sideKey(order.symbol, order.positionSide));
@@ -944,9 +970,9 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       lastVerifiedAt: record?.verifiedAt ?? null, error: cache.error };
   }
   function view(options) {
-    const record = connectionRecord(), cache = cacheRecord(), tracked = orderRecords(), details = supplementalRecord(record?.version);
+    const record = connectionRecord(), cache = cacheRecord(), details = supplementalRecord(record?.version);
     const held = cache.positions.filter(p => !D(p.position_qty).isZero());
-    const current = tracked.filter(o => o.version === record?.version), unknown = current.some(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state));
+    const current = activeOrders().filter(o => o.version === record?.version), unknown = current.some(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status)) || cache.openOrders.some(o => !REMOTE.has(o.state));
     const stale = !cache.asOf || clock() - cache.asOf > freshnessMs || cache.asOf > clock() + 1000;
     const connected = !!record?.enabled, partial = connected && (!!cache.error || unknown);
     const freshnessState = !connected ? 'offline' : partial ? 'partial' : stale ? 'stale' : 'live';
@@ -960,10 +986,10 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!knownMode) reasons.push('账户持仓模式不明');
     if (record?.tradePermission === 'denied') reasons.push('此凭据只有读取权限');
     if (!owns()) reasons.push('本实例未持有执行锁');
-    const externalOrders = cache.openOrders.filter(raw => !current.some(o => o.orderId ? o.orderId === String(raw.order_id) : o.text === raw.text));
-    const closedOrders = current.filter(o => TERMINAL.has(o.status));
-    const byExecution = new Map();
-    for (const order of tracked) {
+    const externalOrders = cache.openOrders.filter(raw => !tracksRemote(record?.version, raw));
+    const closedOrders = finishedOrders(record?.version, CLOSED_ORDER_LIMIT), closedCount = finishedOrderCount(record?.version);
+    const executions = executionRecords(), byExecution = new Map();
+    for (const order of executionOrders(executions.map(execution => execution.id))) {
       if (!byExecution.has(order.executionId)) byExecution.set(order.executionId, []);
       byExecution.get(order.executionId).push(order);
     }
@@ -973,19 +999,18 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
       status: freshnessState, freshnessState, stale, partial, asOf: cache.asOf, tradingAllowed: connected && !!record.accountUid && !writerError && !writerLost && !stale && !partial && knownMode && record?.tradePermission !== 'denied' && owns(), reasons,
       account: cache.account, balances: Array.isArray(cache.account?.assets) ? cache.account.assets : [],
       positions: held.map(p => positionView(p, cache.asOf, details.adl || [])),
-      orders: [...current.filter(o => !TERMINAL.has(o.status)).map(o => orderView(o)), ...externalOrders.map(o => orderView(o, true)),
-        ...closedOrders.slice(0, CLOSED_ORDER_LIMIT).map(o => orderView(o))],
-      closedOrdersOmitted: Math.max(0, closedOrders.length - CLOSED_ORDER_LIMIT),
+      orders: [...current.map(o => orderView(o)), ...externalOrders.map(o => orderView(o, true)), ...closedOrders.map(o => orderView(o))],
+      closedOrdersOmitted: Math.max(0, closedCount - CLOSED_ORDER_LIMIT),
       recentTrades: historyRows('live_trades', record?.version), recentTradesAsOf: details.recentTradesAsOf ?? null, recentTradesError: details.recentTradesError ?? null,
       accountBook: historyRows('live_account_book', record?.version), accountBookAsOf: details.accountBookAsOf ?? null, accountBookError: details.accountBookError ?? null,
       fees: details.fees || [], feesAsOf: details.feesAsOf ?? null, feesError: details.feesError ?? null, adlAsOf: details.adlAsOf ?? null, adlError: details.adlError ?? null,
-      executions: executionRecords().map(execution => executionView(execution, byExecution.get(execution.id) || [])), alerts: reasons, updatedAt: clock() } };
+      executions: executions.map(execution => executionView(execution, byExecution.get(execution.id) || [])), alerts: reasons, updatedAt: clock() } };
   }
   function summary() {
     const record = connectionRecord(), cache = cacheRecord(), connected = !!record?.enabled;
-    const orders = orderRecords().filter(o => o.version === record?.version), unknown = orders.filter(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status));
+    const orders = activeOrders().filter(o => o.version === record?.version), unknown = orders.filter(o => ['SENDING', 'UNKNOWN', 'INVALID', 'CANCEL_PENDING'].includes(o.status));
     const stale = !cache.asOf || clock() - cache.asOf > freshnessMs || cache.asOf > clock() + 1000;
-    const externalOrders = cache.openOrders.filter(raw => !orders.some(o => o.orderId ? o.orderId === String(raw.order_id) : o.text === raw.text));
+    const externalOrders = cache.openOrders.filter(raw => !tracksRemote(record?.version, raw));
     const knownMode = ['SINGLE', 'DUAL'].includes(cache.account?.position_mode) && ['CROSS_EXCHANGE', 'ISOLATED_EXCHANGE'].includes(cache.account?.account_mode);
     const state = !connected ? 'offline' : cache.error || unknown.length || !knownMode || !record.accountUid || writerError ? 'partial' : stale ? 'stale' : 'online';
     const message = !connected ? '尚未连接 Gate CrossEx 实盘账户' : cache.error || writerError || (!record.accountUid ? '账户 UID 尚未核实，仅允许读取和预览' : unknown.length ? '存在未知或待确认订单，仅继续只读对账' : !knownMode ? '账户模式尚未核实，仅可查看' : stale ? '账户快照已过期' : '实盘账户已同步，仅接受手动确认下单');

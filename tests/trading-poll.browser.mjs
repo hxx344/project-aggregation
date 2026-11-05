@@ -66,6 +66,9 @@ async (page) => {
     else await page.waitForTimeout(20);
     assert(reads.length - before === expectedReads, `${elapsed}ms: expected ${expectedReads} reads, received ${reads.length - before}`);
   };
+  // Navigation below uses the desktop sidebar, which is hidden at phone widths; a
+  // reused session can still carry the 390px viewport left by trading.browser.mjs.
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await page.locator('.trading-position-table').waitFor();
   await checkFresh();

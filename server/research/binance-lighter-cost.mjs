@@ -10,6 +10,10 @@ import { discoverCostMarkets, startCostFeeds } from './binance-lighter-feeds.mjs
 const LIMIT = 8 * 1024 * 1024;
 const MAX_ARCHIVES = 50;
 const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
+// JSON string escaping can expand a source byte into six bytes. Preserve the
+// original UTF-8 text of the three bounded files without nesting later backups.
+const MIGRATION_BACKUP_LIMIT = 6 * (LIMIT + 128 * 1024) + 4096;
+const MIGRATION_FILES = { 'config-v2.json': 64 * 1024, 'session-v2.json': LIMIT, 'archives-v2.json': 64 * 1024 };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const EXECUTION = Object.freeze({ mode: 'paper', liveAvailable: false, version: 2 });
 const clone = value => structuredClone(value);
@@ -44,9 +48,31 @@ function migrateConfig(value) {
   const next = clone(DEFAULT_COST_CONFIG);
   for (const key of LEGACY_FIELDS) if (key !== 'schema' && Object.hasOwn(next, key)) next[key] = clone(value[key]);
   next.orderNotional = value.notionalPerLeg;
+  next.symbols = ['BTC'];
   // An old order larger than the new default limit remains a valid bounded order.
   next.maxInventoryNotional = Math.max(next.maxInventoryNotional, next.orderNotional);
   return validateCostConfig(next);
+}
+
+function historicalConfig(value) {
+  // Historical v2 reports keep their original symbols and immediate-hedge
+  // assumptions. Only this read adapter accepts the old exact field shape.
+  const fields = Object.keys(DEFAULT_COST_CONFIG).filter(key => key !== 'hedgeThresholdNotional');
+  const hasThreshold = object(value) && Object.hasOwn(value, 'hedgeThresholdNotional');
+  if (!object(value) || Object.keys(value).length !== fields.length + Number(hasThreshold)
+    || Object.keys(value).some(key => !fields.includes(key) && key !== 'hedgeThresholdNotional')
+    || !Array.isArray(value.symbols) || !value.symbols.length || value.symbols.length > 2
+    || new Set(value.symbols).size !== value.symbols.length || value.symbols.some(symbol => !['BTC', 'ETH'].includes(symbol))) {
+    throw new Error('invalid_historical_config');
+  }
+  // Reuse the numeric contract without changing the stored historical config.
+  validateCostConfig({ ...value, symbols: ['BTC'], hedgeThresholdNotional: hasThreshold ? value.hedgeThresholdNotional : 0 });
+  return value;
+}
+function migrateV2Config(value) {
+  historicalConfig(value);
+  return validateCostConfig({ ...value, symbols: ['BTC'],
+    hedgeThresholdNotional: Object.hasOwn(value, 'hedgeThresholdNotional') ? value.hedgeThresholdNotional : Math.min(1000, value.maxUnhedgedNotional) });
 }
 
 function regular(file, limit) {
@@ -91,7 +117,7 @@ function validReport(value, schema = 2) {
       || row.task != null && (!object(row.task) || !['binanceQuantity', 'lighterQuantity', 'residualQuantity'].every(key => finite(row.task[key]))))) throw new Error('invalid_legacy_report');
     return value;
   }
-  validateCostConfig(value.sessionConfig);
+  historicalConfig(value.sessionConfig);
   if (value.strategy !== 'inventory_quotes' || value.scenarios.length > 6) throw new Error('invalid_research_report');
   for (const row of value.scenarios) {
     if (!SCENARIO.test(row.id) || !value.sessionConfig.symbols.includes(row.symbol)
@@ -99,6 +125,8 @@ function validReport(value, schema = 2) {
       || !['waiting', 'quoting', 'hedging', 'recovering', 'blocked', 'stopped'].includes(row.status)
       || !object(row.inventory) || !object(row.quotes)
       || !['binanceQuantity', 'lighterQuantity', 'residualQuantity', 'projectedResidualQuantity', 'limitNotional'].every(key => finite(row.inventory[key]))
+      || (Object.hasOwn(value.sessionConfig, 'hedgeThresholdNotional') || Object.hasOwn(row.inventory, 'residualNotional'))
+        && row.inventory.residualNotional !== null && (!finite(row.inventory.residualNotional) || row.inventory.residualNotional < 0)
       || !['binanceAveragePrice', 'lighterAveragePrice', 'binanceNotional', 'utilization'].every(key => row.inventory[key] === null || finite(row.inventory[key]))
       || !['quoteUpdates', 'makerFills', 'hedgeFills', 'hedgeFailures'].every(key => count(row.stats[key]))
       || !['binanceTurnover', 'lighterTurnover', 'fees', 'realizedPnl'].every(key => finite(row.stats[key]))
@@ -151,6 +179,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
   const configPath = path.join(directory, 'config-v2.json');
   const sessionPath = path.join(directory, 'session-v2.json');
   const archivesPath = path.join(directory, 'archives-v2.json');
+  const migrationBackupPath = path.join(directory, 'threshold-migration-backup.json');
   const legacyArchiveDirectory = path.join(directory, 'archives');
   const legacyConfigPath = path.join(directory, 'config.json');
   const legacySessionPath = path.join(directory, 'session.json');
@@ -268,7 +297,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
   async function refreshMetadata(run) {
     if (!enabled || closed || generation !== run) return;
     try {
-      const markets = (await discover({ signal: controller.signal, cooldowns, onDiagnostic: row => {
+      const markets = (await discover({ symbols: config.symbols, signal: controller.signal, cooldowns, onDiagnostic: row => {
         if (enabled && generation === run) guarded(() => diagnostic(row));
       } })).filter(row => config.symbols.includes(row.symbol));
       if (!enabled || closed || generation !== run) return;
@@ -294,7 +323,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
   }
   async function launch(run) {
     try {
-      const markets = (await discover({ signal: controller.signal, cooldowns, onDiagnostic: row => {
+      const markets = (await discover({ symbols: config.symbols, signal: controller.signal, cooldowns, onDiagnostic: row => {
         if (enabled && generation === run) guarded(() => diagnostic(row));
       } })).filter(row => config.symbols.includes(row.symbol));
       if (!enabled || closed || generation !== run) return;
@@ -332,8 +361,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
     try { return clone(validateCostConfig(value)); }
     catch (error) { throw new HttpError(400, error instanceof Error ? error.message : '研究配置无效'); }
   }
-  function readIndex(file, schema) {
-    const index = read(file, 64 * 1024);
+  function validIndex(index, schema) {
     if (index === undefined) return [];
     if (!object(index) || index.schema !== schema || !Array.isArray(index.sessions) || index.sessions.length > MAX_ARCHIVES
       || index.sessions.some(item => !object(item) || typeof item.sessionId !== 'string' || !UUID.test(item.sessionId) || !finite(item.startedAt) || !finite(item.endedAt)
@@ -342,6 +370,29 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
         || item.interrupted !== undefined && typeof item.interrupted !== 'boolean')
       || new Set(index.sessions.map(item => item.sessionId)).size !== index.sessions.length) throw new Error('invalid_archive_index');
     return index.sessions.map(item => ({ ...item, schema }));
+  }
+  const readIndex = (file, schema) => validIndex(read(file, 64 * 1024), schema);
+  function saveMigrationBackup() {
+    const previous = read(migrationBackupPath, MIGRATION_BACKUP_LIMIT);
+    if (previous !== undefined) {
+      if (!object(previous) || previous.schema !== 1 || previous.migration !== 'btc-hedge-threshold' || !finite(previous.createdAt)
+        || !object(previous.files) || Object.keys(previous.files).length !== Object.keys(MIGRATION_FILES).length
+        || Object.entries(MIGRATION_FILES).some(([name, limit]) => previous.files[name] !== null
+          && (typeof previous.files[name] !== 'string' || Buffer.byteLength(previous.files[name]) > limit))) throw new Error('invalid_migration_backup');
+      historicalConfig(JSON.parse(previous.files['config-v2.json']));
+      if (previous.files['session-v2.json'] !== null) {
+        const session = JSON.parse(previous.files['session-v2.json']);
+        if (!object(session) || session.schema !== 2 || typeof session.clean !== 'boolean') throw new Error('invalid_migration_backup');
+        if (session.report !== null) validReport(session.report);
+      }
+      if (previous.files['archives-v2.json'] !== null) validIndex(JSON.parse(previous.files['archives-v2.json']), 2);
+      return;
+    }
+    const files = Object.fromEntries(Object.entries(MIGRATION_FILES).map(([name, limit]) => {
+      const file = path.join(directory, name);
+      return [name, regular(file, limit) ? readFileSync(file, 'utf8') : null];
+    }));
+    write(migrationBackupPath, { schema: 1, migration: 'btc-hedge-threshold', createdAt: now(), files }, MIGRATION_BACKUP_LIMIT);
   }
   async function halt(reason = 'stopped') {
     enabled = false; generation += 1; streamGeneration += 1;
@@ -381,7 +432,10 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
           legacyClean = legacy.clean;
         }
         const savedConfig = read(configPath, 64 * 1024);
-        config = savedConfig !== undefined ? publicConfig(savedConfig) : oldConfig !== undefined ? migrateConfig(oldConfig) : clone(DEFAULT_COST_CONFIG);
+        const needsMigration = savedConfig !== undefined && (!Object.hasOwn(savedConfig ?? {}, 'hedgeThresholdNotional')
+          || Array.isArray(savedConfig?.symbols) && savedConfig.symbols.includes('ETH'));
+        config = savedConfig !== undefined ? needsMigration ? migrateV2Config(savedConfig) : publicConfig(savedConfig)
+          : oldConfig !== undefined ? migrateConfig(oldConfig) : clone(DEFAULT_COST_CONFIG);
         const savedCooldowns = read(cooldownPath, 16 * 1024);
         if (savedCooldowns !== undefined) {
           if (!object(savedCooldowns) || Object.entries(savedCooldowns).some(([key, value]) => !['binance', 'lighter'].includes(key) || !Number.isSafeInteger(value) || value < 0)) throw new Error('invalid_cooldowns');
@@ -402,19 +456,24 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
             failure = '上次模拟未正常结束，已保留最后记录；归档前不会开始新会话';
           }
         }
-        if (savedConfig === undefined) write(configPath, config, 64 * 1024);
+        // Every source used by initialization has now passed validation. A failed
+        // backup or atomic config replacement leaves all original source files.
+        if (needsMigration) saveMigrationBackup();
+        if (savedConfig === undefined || needsMigration) write(configPath, config, 64 * 1024);
       } catch {
         configValid = false; phase = 'fault'; failure = '研究配置、旧版记录或新版记录无法校验或保存，原文件已保留，请检查数据目录';
       }
     },
     save: (value, authorize = () => {}) => serial(() => {
       authorize();
+      // Failed initialization cannot be repaired by overwriting its source or
+      // bypassing the required pre-migration recovery copy.
+      if (!configValid) throw new HttpError(409, '研究配置或记录无效，请先检查保留的数据文件');
       if (enabled) throw new HttpError(409, '请先停止研究，再保存参数');
       const next = publicConfig(value);
       write(configPath, next, 64 * 1024);
       config = next;
-      // Bad persisted reports must not be repaired by overwriting a config.
-      if (configValid) { phase = 'stopped'; failure = storedReport?.interrupted ? '上次模拟未正常结束，请先导出或归档记录' : null; }
+      phase = 'stopped'; failure = storedReport?.interrupted ? '上次模拟未正常结束，请先导出或归档记录' : null;
       return state();
     }),
     start: (authorize = () => {}) => serial(() => {

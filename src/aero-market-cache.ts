@@ -47,10 +47,13 @@ export async function readCache<T>(key: string): Promise<{ savedAt: number; data
   if (!db) return null;
   return withTimeout(new Promise((resolve) => {
     try {
-      const request = db.transaction(STORE, 'readonly').objectStore(STORE).get(key);
+      const store = db.transaction(STORE, 'readwrite').objectStore(STORE);
+      const request = store.get(key);
       request.onsuccess = () => {
         const entry = request.result as Entry<T> | undefined;
         const fresh = entry && entry.schema === SCHEMA && Number.isFinite(entry.savedAt) && Date.now() - entry.savedAt < MAX_AGE_MS;
+        // 过期或旧格式的副本同样删除：旧版缓存可能含节点回显的 RPC 密钥，不展示也不应留在本机。
+        if (entry && !fresh) store.delete(key);
         resolve(fresh ? { savedAt: entry.savedAt, data: entry.data } : null);
       };
       request.onerror = () => resolve(null);

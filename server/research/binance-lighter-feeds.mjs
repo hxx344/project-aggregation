@@ -3,7 +3,7 @@ const HTTP_URLS = Object.freeze({
   binance: 'https://fapi.binance.com/fapi/v1/exchangeInfo',
   lighter: 'https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails',
 });
-const SYMBOLS = ['BTC', 'ETH'];
+const SYMBOLS = ['BTC'];
 const BODY_LIMIT = 8_000_000;
 const LEVEL_LIMIT = 25_000;
 const HTTP_TIMEOUT_MS = 8_000;
@@ -154,7 +154,7 @@ async function readMetadata(venue, { signal, fetchImpl, onDiagnostic, cooldowns 
   }
 }
 
-/** Only selected BTC/ETH rows are validated; unrelated directory rows are ignored. */
+/** Only BTC rows are validated; unrelated directory rows, including ETH, are ignored. */
 export function parseCostMarkets(venue, body, observedAt = Date.now()) {
   const rows = venue === 'binance' ? body?.symbols : venue === 'lighter' ? body?.order_book_details : null;
   if (!Array.isArray(rows) || !timestamp(observedAt)) throw new CostFeedError('metadata_schema_error', venue);
@@ -204,12 +204,13 @@ export function parseCostMarkets(venue, body, observedAt = Date.now()) {
       quote: 'USDC', priceUnit: venue === 'lighter' ? 'USD' : 'USDC', settlement: 'USDC', status: 'active', multiplier: 1,
       tickSize, quantityStep, minQuantity, minNotional, observedAt };
   });
-  if (venue === 'lighter' && result[0].marketId === result[1].marketId) throw new CostFeedError('duplicate_market_id', venue);
+  if (venue === 'lighter' && new Set(result.map(row => row.marketId)).size !== result.length) throw new CostFeedError('duplicate_market_id', venue);
   return result;
 }
 
-export async function discoverCostMarkets({ signal, fetchImpl = fetch, onDiagnostic, cooldowns = sharedCooldowns } = {}) {
+export async function discoverCostMarkets({ signal, fetchImpl = fetch, onDiagnostic, cooldowns = sharedCooldowns, symbols = SYMBOLS } = {}) {
   signal?.throwIfAborted();
+  if (!Array.isArray(symbols) || symbols.length !== 1 || symbols[0] !== 'BTC') throw new CostFeedError('markets_invalid');
   const results = await Promise.allSettled(['binance', 'lighter'].map(venue => readMetadata(venue, { signal, fetchImpl, onDiagnostic, cooldowns })));
   signal?.throwIfAborted();
   const failures = results.filter(result => result.status === 'rejected');
