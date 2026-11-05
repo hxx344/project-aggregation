@@ -199,6 +199,10 @@ test('the prepare phase and its plan fields cross the client only as fixed value
   validateUpdateBody('apply', { planId, deployMode: 'ci', phase: 'prepare' });
   assert.throws(() => validateUpdateBody('apply', { planId, phase: 'switch' }), error => error.status === 400);
   assert.equal(publicUpdateState(state()).planPrepare, undefined, 'a legacy updater never offers the prepare phase');
+  assert.equal(publicUpdateState(state()).manualCheckAt, undefined, 'a legacy updater never reports the manual check limit');
+  assert.equal(publicUpdateState({ ...state(), manualCheckAt: null }).manualCheckAt, null);
+  assert.equal(publicUpdateState({ ...state(), manualCheckAt: now }).manualCheckAt, now);
+  for (const manualCheckAt of ['soon', 60, '']) assert.throws(() => publicUpdateState({ ...state(), manualCheckAt }), error => error.status === 503);
   assert.deepEqual(publicUpdateState({ ...state(), prepared: { planId, deployMode: 'ci', path: '/private' } }).prepared, { planId, deployMode: 'ci' });
   for (const extra of [{ planPrepare: 'yes' }, { prepared: { planId: 'another-plan-12345678', deployMode: 'ci' } }, { prepared: { planId, deployMode: 'auto' } },
     { prepared: true }, { job: { id: 'current-job', status: 'queued', phase: 'switch', startedAt: now, finishedAt: null, activeModule: null, message: '准备更新', steps: [] } }]) {
