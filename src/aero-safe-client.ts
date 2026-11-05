@@ -70,6 +70,7 @@ export function useAeroSafe(onExpired: () => void) {
   }, [fail]);
   return { state, loadError, busy, actionError, setActionError, read, call, execute, preview };
 }
+export type AeroSafe = ReturnType<typeof useAeroSafe>;
 
 // 领取后自动卖出走第一条卖出 AERO 的白名单路径（与服务端 sellRewards 一致）；返回目标代币符号，没有路径时为 null。
 export function rewardSellTarget(state: AeroSafeState | null) {

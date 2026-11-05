@@ -3,15 +3,11 @@ import { CircleAlert, LoaderCircle, Play, ScanSearch } from 'lucide-react';
 import type { MarketPool } from './aero-market-types';
 import type { AeroSafePreview } from './aero-safe-types';
 import { same, tokenOf, units, useAeroSafe } from './aero-safe-client';
+import { openAeroTab } from './aero-nav';
 import './aero-safe.css';
 
 const PREVIEW_TTL_MS = 2 * 60_000;
 
-// 打开工作台的 Aero 实盘页（App 监听 popstate 切换路由）。
-export function openAeroSafePage() {
-  history.pushState(null, '', `${location.pathname}?view=aero-safe`);
-  window.dispatchEvent(new PopStateEvent('popstate'));
-}
 
 // 池详情页里的实盘开仓：按页面上选定的区间（默认推荐区间），用 Safe 里的余额经 Roles 开仓并质押。先预览，再确认执行。
 export default function AeroSafePanel({ pool, range, onExpired }: { pool: MarketPool; range: [number, number]; onExpired: () => void }) {
@@ -35,7 +31,7 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
     return () => window.clearInterval(timer);
   }, [preview]);
   const expired = preview ? clock - preview.at > PREVIEW_TTL_MS - 10_000 : false;
-  const blocked = !state?.wallet ? '请先在 Aero 实盘页填写 bot 私钥' : state.paused ? state.pauseReason : running ? `${job.label}正在执行` : state.pending && !state.pending.stale ? `上一笔交易（${state.pending.label}）等待上链` : null;
+  const blocked = !state?.wallet ? '请先在 Aero「配置」填写 bot 私钥' : state.paused ? state.pauseReason : running ? `${job.label}正在执行` : state.pending && !state.pending.stale ? `上一笔交易（${state.pending.label}）等待上链` : null;
   const t0 = tokenOf(state?.chain, pool.token0.address), t1 = tokenOf(state?.chain, pool.token1.address);
   const amount = (raw: string | null | undefined, token: typeof t0) => (token ? `${units(raw, token.decimals)} ${token.symbol}` : '—');
 
@@ -60,14 +56,14 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
 
   const body = () => {
     if (!state) return <p className="as-muted">{loadError ? `读取实盘状态失败：${loadError}` : '正在读取实盘状态…'}</p>;
-    if (!state.configured) return <p className="as-muted">尚未配置 Safe 实盘。<button type="button" className="as-link" onClick={openAeroSafePage}>前往 Aero 实盘配置</button></p>;
+    if (!state.configured) return <p className="as-muted">尚未配置 Safe 实盘。<button type="button" className="as-link" onClick={() => openAeroTab('config')}>前往「配置」</button></p>;
     if (!whitelisted) return <p className="as-muted">这个池子不在 Roles 白名单里，bot 无权在此开仓；白名单在 Safe 上由硬件钱包设置。</p>;
     if (!chainPool) return <p className="as-muted">{state.chainError ? `链上读取失败：${state.chainError}` : '正在读取 Safe 链上状态…'}</p>;
     const stale = preview && (preview.key !== key || expired);
     return <>
       <div className="as-row">
         <span>Safe 余额：{amount(t0?.balance, t0)} · {amount(t1?.balance, t1)}</span>
-        <span>本池头寸 {chainPool.positions.length} 个{chainPool.positions.length ? <button type="button" className="as-link" onClick={openAeroSafePage}>管理</button> : null}</span>
+        <span>本池头寸 {chainPool.positions.length} 个{chainPool.positions.length ? <button type="button" className="as-link" onClick={() => openAeroTab('positions')}>在「仓位」管理</button> : null}</span>
       </div>
       <div className="as-form">
         <label>投入比例（%）<input type="number" min={1} max={100} step={1} value={shareText} onChange={(e) => setShareText(e.target.value)} /></label>
