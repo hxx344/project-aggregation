@@ -159,7 +159,7 @@ test('setup batch deploys, enables, scopes and assigns in order', () => {
   assert.ok(transactions.slice(2).every((t) => t.to === roles && t.value === '0'));
   assert.throws(() => buildSetupBatch({ permissions, safe: SAFE_ADDR, bot: SAFE_ADDR, saltNonce: 1n }), /bot must not be the Safe/);
   // 第二道防线：即使 permissions 绕过 normalizeConfig 带入零地址目标，也不生成 scopeTarget(0x0)。
-  assert.throws(() => buildSetupBatch({ permissions: { ...permissions, targets: [{ ...permissions.targets[0], target: ZERO }] }, safe: SAFE_ADDR, bot: BOT, saltNonce: 1n }), /zero address/);
+  assert.throws(() => buildSetupBatch({ permissions: { ...permissions, targets: [{ ...permissions.targets[0], target: ZERO }] }, safe: SAFE_ADDR, bot: BOT, saltNonce: 1n }), /refusing to scope the zero address/);
 });
 
 test('MultiSend packing and role execution encoding', () => {
