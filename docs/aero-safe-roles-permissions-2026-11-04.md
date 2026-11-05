@@ -186,6 +186,8 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 
 ## 9. 工作台侧改动（实施时另立任务）
 
+进度（2026-11-04）：执行器与读取已实现——交易 → Aero 实盘页（配置、bot 私钥、Safe 余额与额度、头寸解押/平仓/质押、领奖与卖出、手动兑换、交易记录），Aero 市场池详情页的「Safe 实盘开仓」面板按选定区间（默认推荐区间）预览后开仓并质押；首版只手动执行，自动调仓与下面的监控另立任务。AERO 奖励按已定方案自动卖成 WETH（AERO→WETH ts200 白名单路由）。
+
 - 执行器：交易改为经 Roles 代理以 Safe 名义执行；签名前本地校验保留，与 Roles 配置读同一份白名单 JSON，作为第二道防线。批量调用必须用 `addresses.mjs` 的 `SAFE.multiSendCallOnly`（拆包器只注册在这个地址上）；SDK 默认的 MultiSend 可能是别的版本，用了会被 Roles 全部拒绝。
 - 读取：持仓、质押、余额、估值改按 Safe 地址（`tokenOfOwnerByIndex(Safe)`、`gauge.stakedValues(Safe)`）。
 - 监控：独立只读进程监听 Safe 的出账和 Roles 配置事件，非预期变化发飞书。`plan` 只在部署时核对一次 Safe 状态，之后的变化靠监控：Safe 至少监听 `EnabledModule`、`DisabledModule`（Roles 被移除只会停摆，不会失窃）、`ChangedGuard`、`ChangedModuleGuard`（v1.5.0 新增）、`ChangedFallbackHandler`、`AddedOwner`、`RemovedOwner`、`ChangedThreshold`；Roles 代理至少监听 `OwnershipTransferred`、`AvatarSet`、`TargetSet`、`EnabledModule` / `DisabledModule`（Roles 自身的模块列表）、`SetUnwrapAdapter`、`SetDefaultRole`、`AssignRoles`，以及范围与额度变更（`ScopeTarget`、`AllowTarget`、`RevokeTarget`、`ScopeFunction`、`AllowFunction`、`RevokeFunction`、`SetAllowance`）；事件名按 Sourcify 验证的 mastercopy ABI 核对。Safe{Wallet} 的部分功能（如 TWAP）可能把 fallback handler 换成 ExtensibleFallbackHandler，需要 owner 签名，但属于部署后的状态漂移。
@@ -196,4 +198,4 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 1. ~~管理钱包形态~~：已定单个硬件钱包 1/1（2026-11-04）。硬件钱包丢失即失去 Safe 控制，助记词离线备份是唯一恢复手段；以后可由同一 Safe 加 owner 升级为多签，不需要迁移资产。
 2. 首批做市池与每日额度。
 3. Aero LP 是否同步迁到 Safe + Roles（结构相同，白名单只含 RSGP/USDC 一个池）。
-4. AERO 奖励自动卖成 USDC，还是留在 Safe 由管理钱包处理。
+4. ~~AERO 奖励处理~~：已定领取后自动卖成 WETH，低于最小卖出数量时留在 Safe（2026-11-04）。

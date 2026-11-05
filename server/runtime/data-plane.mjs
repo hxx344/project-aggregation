@@ -23,6 +23,7 @@ import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
 import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroLp } from '../automation/aero-lp.mjs';
+import { createAeroSafe } from '../automation/aero-safe.mjs';
 import { aeroLpValuation } from '../automation/aero-lp-valuation.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
@@ -64,6 +65,9 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // 只读链上行情；测试、非内置实例与 AERO_MARKET_SCAN=false 时默认不扫描，避免启动即访问公共 RPC；页面保存的配置优先。
   const aeroMarket = createAeroMarket({ dataDir, enabledByDefault: aeroMarketEnabledByDefault, log });
   const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
+    readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
+  // Aero 市场实盘：bot 经 Safe 的 Roles 模块执行，与 LP 调仓共用维护与隔离恢复闸门。
+  const aeroSafe = createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
     readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
   const writerDatabase = path.join(dataDir, 'execution-control.sqlite');
@@ -336,6 +340,23 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await aeroLp[action](authorize));
     }
+    if (pathname === '/api/automation/aero-safe' || pathname.startsWith('/api/automation/aero-safe/')) {
+      if (url.search) throw new HttpError(400, 'Aero 实盘接口不接受查询参数');
+      if (pathname === '/api/automation/aero-safe' && method === 'GET') return reply(200, aeroSafe.state());
+      const routes = { 'PUT /config': 'save', 'PUT /wallet': 'setKey', 'POST /wallet/clear': 'clearKey', 'POST /refresh': 'refresh', 'POST /preview': 'preview', 'POST /execute': 'execute' };
+      const action = routes[`${method} ${pathname.slice('/api/automation/aero-safe'.length)}`];
+      if (!action) throw new HttpError(404, 'Aero 实盘接口不存在');
+      const body = await bodyOf();
+      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
+      authorize();
+      const only = (...keys) => { if (Object.keys(body).some((key) => !keys.includes(key))) throw new HttpError(400, '请求包含未知字段'); };
+      if (action === 'save') { only('config'); return reply(200, await aeroSafe.save(body.config, authorize)); }
+      if (action === 'setKey') { only('privateKey'); return reply(200, await aeroSafe.setKey(body.privateKey, authorize)); }
+      if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize)); }
+      if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize)); }
+      if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      return reply(200, await aeroSafe[action](authorize));
+    }
     if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {
       if (url.search) throw new HttpError(400, '汇总接口不接受查询参数');
       if (pathname === '/api/automation/feishu-digest' && method === 'GET') return reply(200, feishuDigest.state());
@@ -467,8 +488,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
-    prepareStop: () => aeroLp.prepareStop(),
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroLp.initialize(); feishuDigest.initialize(); },
+    prepareStop: async () => { await aeroLp.prepareStop(); await aeroSafe.prepareStop(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroLp.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -480,6 +501,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroLp.close(); await aeroSafe.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }
