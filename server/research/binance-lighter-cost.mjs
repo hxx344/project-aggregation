@@ -1,6 +1,7 @@
 // Public-market paper research owned by the workbench runtime. No credentials,
 // signing clients or private exchange endpoints enter this service.
 import { existsSync, lstatSync, mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs';
+import { open, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { HttpError } from '../http-common.mjs';
@@ -102,6 +103,31 @@ function atomic(file, value, limit = LIMIT) {
     if (existsSync(temporary)) unlinkSync(temporary);
   }
 }
+// Same file contract as atomic(), split for the running session's snapshots:
+// the slow write + fsync run on the libuv pool so the feeds keep flowing, and
+// the caller decides on the main thread whether to rename. A synchronous
+// atomic() write made meanwhile is newer and the staged file is discarded.
+async function stageAtomic(file, value, limit = LIMIT) {
+  regular(file, limit);
+  const body = JSON.stringify(value);
+  if (Buffer.byteLength(body) > limit) throw new Error('research_storage_limit');
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporary, 'wx', 0o600);
+    await handle.writeFile(body); await handle.sync();
+    await handle.close(); handle = undefined;
+  } catch (error) {
+    await handle?.close().catch(() => {});
+    await rm(temporary, { force: true });
+    throw error;
+  }
+  const discard = () => { if (existsSync(temporary)) unlinkSync(temporary); };
+  return {
+    commit() { try { regular(file, limit); renameSync(temporary, file); } finally { discard(); } },
+    discard,
+  };
+}
 function validReport(value, schema = 2) {
   if (!object(value) || value.schema !== schema || value.mode !== 'paper' || typeof value.sessionId !== 'string' || !UUID.test(value.sessionId)
     || !finite(value.startedAt) || !finite(value.updatedAt) || !Array.isArray(value.scenarios) || value.scenarios.length > 12
@@ -173,7 +199,9 @@ function projectReport(report, { summary = false, scenarioId } = {}) {
 
 export function createBinanceLighterCost({ dataDir, log = console, now = Date.now, mono = () => performance.now(),
   discover = discoverCostMarkets, connect = startCostFeeds, engineFactory = (config, options) => new CostLabEngine(config, options),
-  tickMs = 50, snapshotMs = 1000, metadataMs = 10 * 60_000, stopWaitMs = 3000, write = atomic } = {}) {
+  tickMs = 50, snapshotMs = 1000, metadataMs = 10 * 60_000, stopWaitMs = 3000, persistGapMs = 200, write = atomic,
+  // An injected synchronous writer also serves the background path, so tests and fault injection see every write.
+  stage = write === atomic ? stageAtomic : async (file, value, limit) => ({ commit: () => write(file, value, limit), discard() {} }) } = {}) {
   const directory = path.join(dataDir, 'binance-lighter-cost');
   const archiveDirectory = path.join(directory, 'archives-v2');
   const configPath = path.join(directory, 'config-v2.json');
@@ -190,6 +218,8 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
   let configValid = true, enabled = false, phase = 'stopped', failure = null, generation = 0, streamGeneration = 0;
   let controller = null, feeds = null, launchTask = null, tickTimer = null, snapshotTimer = null, metadataTimer = null;
   let controls = Promise.resolve(), dirty = false, metadataIdentity = null, cooldownJson = '{}';
+  // Session writes are numbered; only the newest may land on disk (L083).
+  let sessionWrites = 0, background = null, cooling = false, coolTimer = null;
   const channels = new Map(), diagnostics = [], cooldowns = {};
   const serial = operation => {
     const next = controls.then(() => {
@@ -204,10 +234,30 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
     return { ...engine.report(options), channels: [...channels.values()].map(clone), diagnostics: clone(diagnostics) };
   }
   function persist(clean = !enabled) {
+    sessionWrites += 1;
     const report = currentReport();
     write(sessionPath, { schema: 2, clean, report });
     storedReport = report;
     dirty = false;
+  }
+  // Running-session snapshots. Every quote update marks the report dirty; a
+  // synchronous fsync per update stalled the whole data plane, WS feeds
+  // included, so they are written in the background: at most one in flight and
+  // one started per persistGapMs, the newest state each time. A crash loses at
+  // most that window, and the file stays unclean, so restart still treats the
+  // session as interrupted. Start, stop, fault and archive stay synchronous.
+  function persistSoon() {
+    if (!dirty || background || cooling || !enabled || closed) return;
+    const seq = ++sessionWrites, run = generation;
+    const report = currentReport();
+    storedReport = report; dirty = false;
+    const failed = () => { if (seq === sessionWrites && enabled && generation === run) fault('成本研究处理或记录失败，已停止新增模拟', 'processing_failed'); };
+    background = stage(sessionPath, { schema: 2, clean: false, report }).then(staged => {
+      if (seq !== sessionWrites || !enabled || closed || generation !== run) { staged.discard(); return; }
+      try { staged.commit(); } catch { failed(); }
+    }, failed).finally(() => { background = null; persistSoon(); });
+    cooling = true;
+    coolTimer = setTimeout(() => { cooling = false; coolTimer = null; persistSoon(); }, persistGapMs); coolTimer.unref?.();
   }
   function persistCooldowns() {
     const next = JSON.stringify(cooldowns);
@@ -228,8 +278,8 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
     persistCooldowns();
   }
   function clearTimers() {
-    clearInterval(tickTimer); clearInterval(snapshotTimer); clearTimeout(metadataTimer);
-    tickTimer = null; snapshotTimer = null; metadataTimer = null;
+    clearInterval(tickTimer); clearInterval(snapshotTimer); clearTimeout(metadataTimer); clearTimeout(coolTimer);
+    tickTimer = null; snapshotTimer = null; metadataTimer = null; coolTimer = null; cooling = false;
   }
   function fault(message, reason = 'service_fault') {
     if (!enabled && phase === 'fault') return;
@@ -248,7 +298,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
     if (!enabled || closed) return;
     try {
       operation();
-      if (dirty) persist(false);
+      persistSoon();
     } catch { fault('成本研究处理或记录失败，已停止新增模拟', 'processing_failed'); }
   }
   function legacySummary() {
@@ -303,7 +353,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
       if (!enabled || closed || generation !== run) return;
       const identity = marketIdentity(markets);
       engine.setMarkets(markets);
-      dirty = true; persist(false);
+      dirty = true; persistSoon();
       if (identity !== metadataIdentity) {
         const old = feeds; feeds = null; streamGeneration += 1;
         await waitStop(old);
@@ -333,7 +383,8 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
       attach(markets, run);
       if (!enabled || closed || generation !== run) return;
       tickTimer = setInterval(() => guarded(() => engine.tick()), tickMs); tickTimer.unref?.();
-      snapshotTimer = setInterval(() => guarded(() => { persist(false); persistCooldowns(); }), snapshotMs); snapshotTimer.unref?.();
+      // Refreshes valuation and book ages on disk even when nothing emitted.
+      snapshotTimer = setInterval(() => guarded(() => { dirty = true; persistCooldowns(); }), snapshotMs); snapshotTimer.unref?.();
       metadataTimer = setTimeout(() => void refreshMetadata(run), metadataMs); metadataTimer.unref?.();
     } catch {
       if (enabled && !closed && generation === run) fault('公开合约规则读取失败，未开始成交模拟；请检查诊断后重试', 'metadata_unavailable');
@@ -546,6 +597,8 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
       } else { clearTimers(); controller?.abort(); }
       // Discovery observes AbortSignal and has its own bounded HTTP deadline.
       await launchTask;
+      // halt() already wrote the final state; the staged file is only removed.
+      await background;
     },
   };
 }
