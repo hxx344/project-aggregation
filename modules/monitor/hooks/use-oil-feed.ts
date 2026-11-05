@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { HISTORY_REFRESH_MS, QUOTE_REFRESH_MS, startActivityPolling } from "../lib/polling";
+import { HISTORY_REFRESH_MS, HISTORY_TIMEOUT_MS, QUOTE_REFRESH_MS, startActivityPolling } from "../lib/polling";
 import { validateOilQuote } from "../lib/market-validation";
 import type { QuoteFreshness } from "../lib/market-freshness";
 import type { InitialMarketData } from "../lib/initial-market";
@@ -13,7 +13,8 @@ export type OilQuote = ReturnType<typeof validateOilQuote> & QuoteFreshness & { 
 const retainedQuote = "后台尚未取得新报价，显示上次保存的数据；请留意采集时间。";
 
 async function request(path: string, signal: AbortSignal): Promise<unknown> {
-  const response = await fetch(path, { cache: "no-store", signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) });
+  // The polling signal carries each read's deadline.
+  const response = await fetch(path, { cache: "no-store", signal });
   if (!response.ok) throw new Error("行情更新失败，将在下一轮自动重试。");
   return response.json();
 }
@@ -67,6 +68,7 @@ export function useOilFeed(initial?: InitialMarketData["oil"], initialReadAt?: n
     if (!active) return;
     const history = startActivityPolling({
       intervalMs: HISTORY_REFRESH_MS,
+      timeoutMs: HISTORY_TIMEOUT_MS,
       immediate: activated.current || !hydrated.current.history || Date.now() - hydrated.current.readAt >= HISTORY_REFRESH_MS,
       load: async signal => oilHistory(await request(`/api/monitors/oil/${OIL_CANDLE_ACTION}`, signal)),
       onData: next => { setData(previous => retainOilHistory(previous, next)); setError(""); },
