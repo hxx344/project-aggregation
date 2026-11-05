@@ -1406,7 +1406,7 @@ rollback() {
     # and the Python paths are those of the earlier release and stay as they are.
     log '新版本 API 启动失败，正在恢复之前的 API；运行时与模块未受影响。'
     if [[ -n "$old_api_unit_backup" && -f "$old_api_unit_backup" ]]; then cp -- "$old_api_unit_backup" "$API_UNIT_FILE"; fi
-    if [[ -n "$old_release" && -d "$old_release" ]]; then atomic_link "$old_release" "$APP_DIR/current"; fi
+    if [[ -n "$old_release" && -d "$old_release" ]]; then atomic_link "$old_release" "$APP_DIR/current" && rm -f -- "$APP_DIR/.pending-previous"; fi
     systemctl daemon-reload
     systemctl restart "$API_SERVICE" || true
     if wait_healthy; then log '已恢复之前的 API；运行时与持久数据保持原样。'; else log '之前的 API 尚未恢复健康，请查看服务日志。'; fi
@@ -1459,7 +1459,9 @@ rollback() {
         log '无法保留候选配置或恢复上次成功配置；未再次重启服务，请检查配置文件和磁盘空间。'
         exit "$exit_code"
       fi
-      atomic_link "$old_release" "$APP_DIR/current"
+      # The restored current and untouched previous link are the pre-activation
+      # state; a leftover record would only block the next no-op check.
+      atomic_link "$old_release" "$APP_DIR/current" && rm -f -- "$APP_DIR/.pending-previous"
       systemctl daemon-reload
       systemctl restart "$SERVICE" || true
       if wait_healthy; then log '已恢复上次成功的程序和配置；持久数据保持原样。'; else log '旧版本尚未恢复健康，请查看服务日志。'; fi
