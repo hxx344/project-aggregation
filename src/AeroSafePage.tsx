@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent } from 'react';
-import { ArrowLeftRight, CircleAlert, Coins, KeyRound, LoaderCircle, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
-import type { AeroSafeConfig as SafeConfig, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
+import { ArrowLeftRight, CircleAlert, Coins, KeyRound, LoaderCircle, Repeat, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
+import type { AeroAutoConfig, AeroAutoState, AeroSafeConfig as SafeConfig, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
 import type { AeroSafe } from './aero-safe-client';
 import { autoSellNote, rewardSellTarget, same, tokenOf, units } from './aero-safe-client';
 import type { AeroMarket } from './aero-market-client';
@@ -17,7 +17,8 @@ const time = (ms: number | null | undefined) => (typeof ms === 'number' && Numbe
 const short = (address: string | null | undefined) => (address ? `${address.slice(0, 6)}…${address.slice(-4)}` : '—');
 const txLink = (hash: string) => (/^0x[0-9a-fA-F]{64}$/.test(hash) ? <a href={`https://basescan.org/tx/${hash}`} target="_blank" rel="noreferrer">{short(hash)}</a> : hash);
 const statusLabels: Record<string, string> = { confirmed: '已确认', reverted: '链上回滚', dropped: '未上链', replaced: '已被替换' };
-const eventLabels: Record<string, string> = { job_started: '任务开始', job_done: '任务完成', job_failed: '任务失败', tx_signed: '交易已签名', tx_confirmed: '交易已确认', tx_settled: '交易结清', broadcast_error: '广播报错', pending_check_failed: '核对待确认交易失败' };
+const eventLabels: Record<string, string> = { job_started: '任务开始', job_done: '任务完成', job_failed: '任务失败', tx_signed: '交易已签名', tx_confirmed: '交易已确认', tx_settled: '交易结清', broadcast_error: '广播报错', pending_check_failed: '核对待确认交易失败',
+  auto_enabled: '启用自动调仓', auto_disabled: '关闭自动调仓', auto_halted: '自动调仓停用', auto_rebalanced: '自动调仓完成', auto_sell_failed: '调仓时卖出 AERO 失败' };
 const tone = (v: number | null | undefined) => ((v ?? 0) > 0 ? 'up' : (v ?? 0) < 0 ? 'down' : '');
 
 // 与 Safe 白名单池对应的行情池子（Base），并用 Safe 链上读到的现价覆盖快照里的现价。
@@ -45,6 +46,16 @@ function YieldCell({ metrics, market }: { metrics: PositionMetrics | null; marke
   </td>;
 }
 
+// 受自动调仓管理的头寸在出区间后显示倒计时或被挡住的原因。
+function autoLine(auto: AeroAutoState | undefined, tokenId: string, now: number) {
+  if (!auto?.config.enabled || auto.halted) return null;
+  const w = auto.watch.find((x) => x.tokenId === tokenId);
+  if (!w || w.dueAt === null) return null;
+  if (w.blocked) return `自动调仓暂缓：${w.blocked}`;
+  const left = Math.ceil((w.dueAt - now) / 60_000);
+  return left > 0 ? `出区间已 ${Math.max(0, Math.floor((now - (w.outSince ?? now)) / 60_000))} 分钟，约 ${left} 分钟后自动调仓` : '自动调仓即将执行';
+}
+
 function PositionRow({ pool, position, metrics, market, state, disabled, onAction }: { pool: AeroSafePool; position: AeroSafePosition; metrics: PositionMetrics | null; market: boolean; state: AeroSafeState; disabled: boolean; onAction: (action: 'close' | 'stake' | 'unstake', p: AeroSafePosition, penalty: boolean) => void }) {
   const chain = state.chain!;
   const t0 = tokenOf(chain, pool.token0), t1 = tokenOf(chain, pool.token1);
@@ -53,11 +64,12 @@ function PositionRow({ pool, position, metrics, market, state, disabled, onActio
   const penalty = penaltyBlocks > 0;
   const raw = (v: number | null, d = 18) => (typeof v === 'number' ? units(BigInt(Math.floor(v)).toString(), d) : '—');
   const m = metrics;
+  const auto = autoLine(state.auto, position.tokenId, state.serverNow);
   return <tr>
     <th scope="row">#{position.tokenId}</th>
     <td className="num">{m ? `${priceText(m.low)} – ${priceText(m.high)}` : `tick ${position.tickLower} 至 ${position.tickUpper}`}<small>{m ? `${m.width} · tick ${position.tickLower} 至 ${position.tickUpper}` : '行情未覆盖，只显示 tick'}</small></td>
     <td className={`num ${inRange ? 'as-in' : 'as-out'}`}>{m ? priceText(m.now) : `tick ${pool.tick}`}
-      <small>{!inRange ? m ? (m.toHigh > 0 ? `低于区间，需上涨 ${signed(m.toLow)} 回到区间` : `高于区间，需下跌 ${signed(m.toHigh)} 回到区间`) : pool.tick < position.tickLower ? 'tick 低于下沿' : 'tick 高于上沿' : m ? `距下沿 ${signed(m.toLow)} · 上沿 ${signed(m.toHigh)}` : '区间内'}</small></td>
+      <small>{!inRange ? m ? (m.toHigh > 0 ? `低于区间，需上涨 ${signed(m.toLow)} 回到区间` : `高于区间，需下跌 ${signed(m.toHigh)} 回到区间`) : pool.tick < position.tickLower ? 'tick 低于下沿' : 'tick 高于上沿' : m ? `距下沿 ${signed(m.toLow)} · 上沿 ${signed(m.toHigh)}` : '区间内'}</small>{auto ? <small className="as-warn">{auto}</small> : null}</td>
     <td className="num">{raw(position.amount0, t0?.decimals)} {t0?.symbol}<small>{raw(position.amount1, t1?.decimals)} {t1?.symbol}</small><small>≈ {usd(m?.valueUsd)}</small></td>
     <YieldCell metrics={m} market={market} />
     <td className="num">{!inRange ? '已出区间' : m ? days(m.daysIn) : '—'}<small>{m ? `日波动 ${pct(m.vol, 2)}` : ''}</small></td>
@@ -80,6 +92,36 @@ function JobCallouts({ state }: { state: AeroSafeState }) {
     {job ? <div className={`lp-callout ${job.status === 'failed' ? 'warning' : job.status === 'done' ? 'success' : ''}`} role="status">{job.status === 'running' ? <LoaderCircle size={16} className="spin" /> : job.status === 'failed' ? <CircleAlert size={16} /> : <ShieldCheck size={16} />}
       <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? '已完成' : `${job.error}${job.signed ? '（本任务已有交易签名发出，请按下方台账与 Safe 现状核对后再操作）' : '（未签名，可直接重试）'}`}</span></div> : null}
   </>;
+}
+
+// 自动调仓的状态：开关、停用原因、平仓后待重开的币与最近的调仓记录。
+// 待重开的数量（按池子代币换算；读不到池子时给原始单位）。
+function reopenCoins(state: AeroSafeState | null) {
+  const r = state?.auto?.reopen, chain = state?.chain;
+  if (!r) return '';
+  const pool = chain?.pools.find((p) => same(p.address, r.pool));
+  const t0 = pool ? tokenOf(chain, pool.token0) : null, t1 = pool ? tokenOf(chain, pool.token1) : null;
+  return t0 && t1 ? `${units(r.amount0, t0.decimals)} ${t0.symbol} + ${units(r.amount1, t1.decimals)} ${t1.symbol}` : `${r.amount0} + ${r.amount1}（原始单位）`;
+}
+function AutoStatus({ state, onConfig }: { state: AeroSafeState; onConfig: () => void }) {
+  const auto = state.auto;
+  if (!auto || !state.configured) return null;
+  const c = auto.config;
+  return <section className="panel lp-section" aria-label="自动调仓"><div className="panel-heading"><h2>自动调仓</h2><span className="muted">{c.enabled ? auto.halted ? '已停用' : '运行中' : '未开启'} · <button type="button" className="as-link" onClick={onConfig}>在「配置」设置</button></span></div>
+    <div className="as-pad">
+      {auto.halted ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>自动调仓已停用（{time(auto.halted.at)}）：{auto.halted.reason}。{auto.stuck ? '' : `核对 Safe 现状后在「配置」重新启用${auto.reopen ? (auto.reopen.minted ? '，启用后先质押下面已开出的新头寸' : '，启用后先重开下面待重开的币') : ''}。`}</span></div> : null}
+      {auto.stuck && auto.stuck !== auto.halted?.reason ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{auto.stuck}。</span></div> : null}
+      {auto.closing ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>平仓中断：#{auto.closing.tokenId}（{time(auto.closing.at)} 开始），宽度 {auto.closing.cells} 格。</span></div> : null}
+      {auto.reopen ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已平仓 #{auto.reopen.closed ?? '—'}（{time(auto.reopen.at)}），待重开：{reopenCoins(state)}，宽度 {auto.reopen.cells} 格{auto.reopen.minted ? `；新头寸 #${auto.reopen.minted} 已开出，待质押` : ''}{auto.reopen.inflight ? `；${auto.reopen.inflight === 'swap' ? '配平兑换' : '开仓'}交易结果未确认` : ''}。</span></div> : null}
+      {auto.error && auto.error !== auto.halted?.reason ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{auto.error}</span></div> : null}
+      <p className="as-muted">{c.enabled
+        ? `已质押头寸连续出区间 ${c.triggerMinutes} 分钟后平仓，把收回的币以现价为中心按原宽度重开并质押；现价偏离 ${c.twapSeconds / 60} 分钟 TWAP 超过 ${c.maxTwapDeviationBps / 100}% 时不动；同池冷却 ${c.cooldownMinutes} 分钟，24 小时最多 ${c.maxPerDay} 次；${c.acceptPenalty ? '罚没期内也会解押' : '罚没期内等待'}。`
+        : '未开启：出区间的头寸只提示，不会自动平仓。'}{c.enabled && auto.checkedAt ? ` 上次检查 ${time(auto.checkedAt)}${auto.note ? `：${auto.note}` : ''}。` : ''}</p>
+      {auto.history.length ? <div className="lp-table-scroll"><table className="lp-table"><thead><tr><th>时间</th><th>平仓</th><th>重开</th><th className="num">新区间 tick</th></tr></thead><tbody>
+        {auto.history.map((h, i) => <tr key={`${h.at}:${i}`}><td>{time(h.at)}</td><td>#{h.closed ?? '—'}</td><td className={h.opened ? 'as-in' : 'as-out'}>{h.opened ? `#${h.opened}` : auto.reopen && auto.reopen.closed === h.closed ? '待重开' : '未完成'}</td><td className="num">{h.tickLower !== null && h.tickUpper !== null ? `${h.tickLower} 至 ${h.tickUpper}` : '—'}</td></tr>)}
+      </tbody></table></div> : null}
+    </div>
+  </section>;
 }
 
 // 仓位标签：Safe 余额、头寸（价格区间、价值、预计收益与在区间时间）、领奖与兑换、交易台账。
@@ -140,6 +182,7 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
     {market.loadError && !market.snapshot ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>行情读取失败，收益估算不可用：{market.loadError}</span></div> : null}
     {!state ? <section className="panel lp-empty" role="status"><LoaderCircle className="spin" /><strong>正在读取状态</strong></section> : <>
       <JobCallouts state={state} />
+      <AutoStatus state={state} onConfig={onConfig} />
       {!state.configured ? <div className="lp-callout" role="status"><CircleAlert size={16} /><span>尚未配置 Safe 实盘。<button type="button" className="as-link" onClick={onConfig}>前往「配置」</button></span></div> : null}
 
       <section className="panel lp-status" aria-label="Safe 状态">
@@ -194,6 +237,61 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
       </section>
     </>}
   </>;
+}
+
+type AutoDraft = Record<Exclude<keyof AeroAutoConfig, 'enabled' | 'acceptPenalty'>, string> & { enabled: boolean; acceptPenalty: boolean };
+const autoDraftOf = (c: AeroAutoConfig): AutoDraft => ({ enabled: c.enabled, acceptPenalty: c.acceptPenalty, triggerMinutes: String(c.triggerMinutes), cooldownMinutes: String(c.cooldownMinutes),
+  maxPerDay: String(c.maxPerDay), twapSeconds: String(c.twapSeconds), maxTwapDeviationBps: String(c.maxTwapDeviationBps) });
+const AUTO_FIELDS: { key: Exclude<keyof AutoDraft, 'enabled' | 'acceptPenalty'>; label: string; hint: string; min: number; max: number }[] = [
+  { key: 'triggerMinutes', label: '出区间等待（分钟）', hint: '连续出区间满这么久才调仓，1–1440', min: 1, max: 1440 },
+  { key: 'cooldownMinutes', label: '同池冷却（分钟）', hint: '两次调仓的最短间隔，0–1440', min: 0, max: 1440 },
+  { key: 'maxPerDay', label: '24 小时最多（次）', hint: '1–48，防止来回震荡反复调仓', min: 1, max: 48 },
+  { key: 'twapSeconds', label: 'TWAP 窗口（秒）', hint: '60–1800', min: 60, max: 1800 },
+  { key: 'maxTwapDeviationBps', label: '现价偏离 TWAP 上限（bps）', hint: '10–1000；超过时本轮不动，防价格被拉偏', min: 10, max: 1000 },
+];
+
+// 配置标签里的自动调仓设置。启用前确认；重新启用会清除停用原因。
+function AutoForm({ safe }: { safe: AeroSafe }) {
+  const { state, busy, setActionError, call } = safe;
+  const auto = state?.auto;
+  const [draft, setDraft] = useState<AutoDraft | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [notice, setNotice] = useState('');
+  useEffect(() => { if (auto && !dirty) setDraft(autoDraftOf(auto.config)); }, [auto, dirty]);
+  if (!auto || !draft) return null;
+  const change = (patch: Partial<AutoDraft>) => { setDraft({ ...draft, ...patch }); setDirty(true); setNotice(''); };
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const value: AeroAutoConfig = { enabled: draft.enabled, acceptPenalty: draft.acceptPenalty } as AeroAutoConfig;
+    for (const f of AUTO_FIELDS) {
+      const text = draft[f.key].trim(), n = Number(text);
+      if (!/^\d+$/.test(text) || n < f.min || n > f.max) { setActionError(`${f.label}须为 ${f.min} 到 ${f.max} 的整数。`); return; }
+      (value as Record<string, number | boolean>)[f.key] = n;
+    }
+    if (value.enabled && (!auto.config.enabled || auto.halted) && !window.confirm(`启用自动调仓？\n\n已质押头寸连续出区间 ${value.triggerMinutes} 分钟后，bot 会经 Roles 自动：解押 → 平仓 → ${state?.config?.autoSellRewards ? '卖出本次领到的 AERO → ' : ''}把收回的币以现价为中心按原宽度配平兑换并重开 → 质押。\n每一步仍受 Roles 白名单与每日额度限制；任何异常都会停用自动调仓，等你核对。${auto.reopen ? (auto.reopen.minted ? `\n\n启用后先质押已开出的新头寸 #${auto.reopen.minted}。` : `\n\n启用后先用 Safe 的 ${reopenCoins(state)} 重开（上次平仓收回的币）。如果这些币已经手动用掉，请先放弃待重开记录。`) : ''}`)) return;
+    const data = await call('auto', '/auto', 'PUT', { auto: value });
+    if (data?.auto) { setDirty(false); setDraft(autoDraftOf(data.auto.config)); setNotice(value.enabled ? '自动调仓已启用，每 30 秒检查一次。' : '自动调仓已关闭。'); }
+  };
+  const discard = async () => {
+    const what = auto.closing ? `平仓中断的 #${auto.closing.tokenId}` : `待重开的 ${reopenCoins(state)}${auto.reopen?.minted ? `（新头寸 #${auto.reopen.minted} 已开出未质押）` : ''}`;
+    if (!window.confirm(`放弃${what}这条记录？\n\n放弃后自动调仓不再续做这一次，Safe 里的币和头寸保持现状，需要时请手动开仓或质押。`)) return;
+    const data = await call('discard', '/auto/discard', 'POST', {});
+    if (data?.auto) setNotice('已放弃这条调仓记录。');
+  };
+  return <form className="panel lp-section" onSubmit={(e) => void submit(e)} noValidate aria-label="自动调仓设置"><div className="panel-heading"><h2>自动调仓</h2><span className="muted">{auto.config.enabled ? auto.halted ? `已停用：${auto.halted.reason}` : '运行中' : '未开启'}</span></div>
+    {notice ? <div className="lp-callout success" role="status">{notice}</div> : null}
+    <fieldset disabled={!!busy}>
+      <div className="lp-grid">
+        <label className="lp-field as-check"><span>启用自动调仓</span><input type="checkbox" checked={draft.enabled} onChange={(e) => change({ enabled: e.target.checked })} /></label>
+        <label className="lp-field as-check"><span>罚没期内也解押</span><input type="checkbox" checked={draft.acceptPenalty} onChange={(e) => change({ acceptPenalty: e.target.checked })} /></label>
+        {AUTO_FIELDS.map((f) => <label key={f.key} className="lp-field"><span>{f.label}</span><input value={draft[f.key]} inputMode="numeric" onChange={(e) => change({ [f.key]: e.target.value })} /><small>{f.hint}</small></label>)}
+      </div>
+      <p className="as-muted">只管理已质押的头寸；新区间以现价为中心、宽度与原头寸相同，只投入这次平仓收回的币（{state?.config?.autoSellRewards ? '含卖出本次领到的 AERO 所得' : '不含 AERO'}），Safe 里的其他余额不动。今日额度不够时不平仓。</p>
+    </fieldset>
+    {auto.closing || auto.reopen ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>{auto.stuck ?? (auto.closing ? `平仓中断：#${auto.closing.tokenId}` : `有待重开的币：${reopenCoins(state)}${auto.reopen?.minted ? `，新头寸 #${auto.reopen.minted} 待质押` : ''}；如已手动处理，请放弃这条记录`)}。</span>
+      <button type="button" className="button secondary" disabled={!!busy || state?.job?.status === 'running' || !!state?.pending} title={state?.pending ? '上一笔交易尚未结清' : undefined} onClick={() => void discard()}>{busy === 'discard' ? <LoaderCircle size={15} className="spin" /> : null}放弃这条记录</button></div> : null}
+    <div className="lp-form-actions"><span>{dirty ? '有未保存的修改' : '设置已同步'}</span><div><button type="button" className="button secondary" disabled={!dirty || !!busy} onClick={() => { setDraft(autoDraftOf(auto.config)); setDirty(false); }}>放弃修改</button><button className="button primary" type="submit" disabled={(!dirty && !(auto.halted && draft.enabled)) || !!busy || (draft.enabled && !!auto.stuck)}>{busy === 'auto' ? <LoaderCircle size={15} className="spin" /> : <Repeat size={15} />}{auto.halted && draft.enabled && !dirty ? '重新启用' : '保存设置'}</button></div></div>
+  </form>;
 }
 
 type Draft = { rpcUrl: string; safe: string; roles: string; slippageBps: string; autoSellRewards: boolean; minRewardSell: string; permissions: string };
@@ -258,6 +356,7 @@ export function AeroSafeConfig({ safe }: { safe: AeroSafe }) {
         </fieldset>
         <div className="lp-form-actions"><span>{dirty ? '有未保存的修改' : '配置已同步'}</span><div><button type="button" className="button secondary" disabled={!dirty || !!busy} onClick={() => { setDraft(draftOf(state)); setDirty(false); }}>放弃修改</button><button className="button primary" type="submit" disabled={!dirty || !!busy || running}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存配置</button></div></div>
       </form>
+      {state.configured ? <AutoForm safe={safe} /> : null}
     </>}
   </>;
 }

@@ -20,7 +20,18 @@ export type AeroSafeChain = {
   allowances: { token: string; symbol: string; perDay: string; remaining: string; maxRefill: string; refillAt: number | null }[];
   pools: AeroSafePool[];
 };
-export type AeroSafeAction = 'open' | 'close' | 'stake' | 'unstake' | 'claim' | 'sell' | 'swap';
+export type AeroSafeAction = 'open' | 'close' | 'stake' | 'unstake' | 'claim' | 'sell' | 'swap' | 'rebalance';
+// 自动调仓（server/automation/aero-auto.mjs）。
+export type AeroAutoConfig = { enabled: boolean; triggerMinutes: number; cooldownMinutes: number; maxPerDay: number; acceptPenalty: boolean; twapSeconds: number; maxTwapDeviationBps: number };
+export type AeroAutoState = {
+  config: AeroAutoConfig; defaults: AeroAutoConfig; error: string | null; halted: { at: number; reason: string } | null;
+  reopen: { pool: string; cells: number; amount0: string; amount1: string; closed: string | null; at: number; minted: string | null; inflight: 'swap' | 'mint' | null } | null;
+  closing: { pool: string; tokenId: string; cells: number; at: number } | null;
+  stuck: string | null;
+  history: { at: number; pool: string; closed: string | null; opened: string | null; tickLower: number | null; tickUpper: number | null }[];
+  watch: { tokenId: string; pool: string; outSince: number | null; dueAt: number | null; blocked: string | null }[];
+  note: string | null; checkedAt: number | null; intervalMs: number;
+};
 export type AeroSafeJob = {
   id: string; action: AeroSafeAction; label: string; params: Record<string, unknown>; status: 'running' | 'done' | 'failed'; step: string | null;
   startedAt: number; finishedAt: number | null; error: string | null; result: unknown; signed?: boolean; code?: string | null;
@@ -32,7 +43,7 @@ export type AeroSafeState = {
   wallet: string | null; paused: boolean; pauseReason: string | null;
   pending: { hash: string; nonce: number; label: string; at: number; stale: boolean } | null;
   ledgerError?: string | null; job: AeroSafeJob | null; chain: AeroSafeChain | null; chainAt: number | null; chainError: string | null; refreshing: boolean;
-  events: AeroSafeEvent[]; ledger: AeroSafeLedger[]; serverNow: number;
+  events: AeroSafeEvent[]; ledger: AeroSafeLedger[]; serverNow: number; auto?: AeroAutoState;
 };
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string;

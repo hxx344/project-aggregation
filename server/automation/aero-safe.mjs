@@ -1,4 +1,5 @@
-// Aero 市场实盘（Safe + Zodiac Roles）：手动执行。页面发起操作，bot 私钥经 Roles 以 Safe 名义签名发送。
+// Aero 市场实盘（Safe + Zodiac Roles）：页面发起手动操作；开启自动调仓后，已质押头寸出区间满设定时间由服务端平仓并居中重开（aero-auto.mjs）。
+// bot 私钥经 Roles 以 Safe 名义签名发送。
 // 资产与头寸都在 Safe，bot 只付 gas；链上 Roles 是权限的最终判定，tools/aero-roles/policy.mjs 的本地校验是第二道防线。
 // 一次只运行一个任务；每笔交易签名后先持久化 pending.json 再广播，重启后按哈希与 nonce 结清，不会重复执行。
 import { appendFileSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, closeSync, rmSync } from 'node:fs';
@@ -9,6 +10,7 @@ import { buildPermissions } from '../../tools/aero-roles/permissions.mjs';
 import * as executor from '../../tools/aero-roles/executor.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
+import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, readAutoState, strictAutoConfig, stuckReason } from './aero-auto.mjs';
 
 const PRIVATE_KEY_PATTERN = /^(0x)?[0-9a-fA-F]{64}$/;
 const EVENT_LIMIT = 50;
@@ -27,7 +29,10 @@ export const PREVIEW_TTL_MS = 2 * 60_000;
 const MINTED_LIMIT = 100;
 const DEFAULTS = Object.freeze({ rpcUrl: 'https://mainnet.base.org', slippageBps: 50, autoSellRewards: true, minRewardSell: '1' });
 const ACTIONS = new Set(['open', 'close', 'stake', 'unstake', 'claim', 'sell', 'swap']);
-const actionLabels = { open: '开仓', close: '平仓', stake: '质押', unstake: '解押', claim: '领取排放', sell: '卖出 AERO', swap: '兑换' };
+const actionLabels = { open: '开仓', close: '平仓', stake: '质押', unstake: '解押', claim: '领取排放', sell: '卖出 AERO', swap: '兑换', rebalance: '自动调仓' };
+const AUTO_TICK_MS = 30_000;
+// 这些失败不停用自动调仓，下一轮重试：维护或隔离恢复暂停了签名、TWAP 偏离或不可用。
+const AUTO_RETRY_CODES = new Set(['halted', 'twap']);
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;
@@ -139,6 +144,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   const directory = path.join(dataDir, 'aero-safe');
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
+  const autoPath = path.join(directory, 'auto.json');
+  let auto = { config: { ...AUTO_DEFAULTS }, history: [], halted: null, reopen: null, closing: null }, autoError = null, autoWatch = [], autoNote = null, autoCheckedAt = null;
+  let outSince = new Map(), autoTimer = null, autoBusy = false, autoCorrupt = null;
   let config = null, configError = null, wallet = null, pending = null, job = null, snapshot = null, snapshotAt = null, snapshotError = null;
   let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [], burnSeen = new Map();
   const events = [];
@@ -169,6 +177,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       ledgerError,
       job: job && structuredClone(job), chain: snapshot && structuredClone(snapshot), chainAt: snapshotAt, chainError: snapshotError, refreshing: Boolean(refreshing),
       events: structuredClone(events), ledger: ledger(), serverNow: now(),
+      auto: { config: { ...auto.config }, defaults: AUTO_DEFAULTS, error: autoError, halted: auto.halted && { ...auto.halted }, reopen: auto.reopen && { ...auto.reopen }, closing: auto.closing && { ...auto.closing }, stuck: stuckReason(auto),
+        history: auto.history.slice(-10).reverse(), watch: structuredClone(autoWatch), note: autoNote, checkedAt: autoCheckedAt, intervalMs: AUTO_TICK_MS },
     };
   }
   function readKey() {
@@ -274,11 +284,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const ctx = await connection();
       const h = hooks(id, ctx);
       let result;
-      const sellAfter = async () => {
+      const sellAfter = async (maxAmount = null) => {
         if (!config.autoSellRewards) return null;
         h.step('卖出 AERO');
         const minAmount = parseUnits(config.minRewardSell, ctx.tokens.get(chain.REWARD_TOKEN)?.decimals ?? 18);
-        return chain.sellRewards(ctx, h, { slippageBps: params.slippageBps ?? config.slippageBps, minAmount });
+        return chain.sellRewards(ctx, h, { slippageBps: params.slippageBps ?? config.slippageBps, minAmount, maxAmount });
       };
       if (action === 'open') result = await chain.openPosition(ctx, h, params);
       else if (action === 'close') { result = await chain.closePosition(ctx, h, params); result.sold = await sellAfter(); }
@@ -287,6 +297,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       else if (action === 'claim') { h.step('领取排放'); result = await chain.claimRewards(ctx, h); result.sold = await sellAfter(); }
       else if (action === 'sell') result = await chain.sellRewards(ctx, h, { slippageBps: params.slippageBps, minAmount: 1n });
       else if (action === 'swap') result = await chain.swap(ctx, h, params);
+      else if (action === 'rebalance') result = await rebalance(ctx, h, params, sellAfter);
       Object.assign(job, { status: 'done', finishedAt: now(), result: jsonable(result), step: null });
       record({ event: 'job_done', job: id, action });
     } catch (error) {
@@ -294,8 +305,161 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       Object.assign(job, { status: 'failed', finishedAt: now(), error: error.message, signed: error.signed === true || job.signed === true, code: error.code ?? null });
       record({ event: 'job_failed', job: id, action, error: error.message });
       if (!(error instanceof chain.ExecError)) log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘操作异常');
+      // 自动调仓出错一律停用、等人工处理。只有暂停签名与 TWAP 核对不过、这笔没签名、进度也都已落盘（没有平仓中断或结果未定的兑换/开仓）时下一轮重试；
+      // 已平仓时重试只做重开，已开出新头寸时只做质押。
+      if (action === 'rebalance') {
+        const retry = error instanceof chain.ExecError && AUTO_RETRY_CODES.has(error.code) && error.signed !== true && !stuckReason(auto) && !autoError;
+        if (retry) autoNote = error.message;
+        else { auto.halted = { at: now(), reason: stuckReason(auto) ?? error.message }; saveAuto(); record({ event: 'auto_halted', error: error.message }); }
+      }
     }
     await refresh();
+  }
+
+  // ---- 自动调仓 ----
+  // 返回是否写入成功。写不进去时停用：进度与次数统计只在内存里，重启会丢。
+  function saveAuto() {
+    try { atomicJson(autoPath, { schema: 1, ...auto }); autoError = null; return true; } catch (error) {
+      log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录写入失败');
+      autoError = `自动调仓记录写入失败：${error.code ?? error.message}`;
+      if (auto.config.enabled && !auto.halted) auto.halted = { at: now(), reason: autoError };
+      return false;
+    }
+  }
+  const mustSaveAuto = (what) => { if (!saveAuto()) throw new chain.ExecError(`${autoError}，${what}`); };
+  // 现价须贴近 TWAP 才动手：拒绝在被拉偏的价格上平仓、兑换和定区间。返回现价 tick。
+  async function checkTwap(ctx, pool) {
+    const t = await chain.poolTwap(ctx, pool, auto.config.twapSeconds);
+    if (t.twap === null) throw new chain.ExecError(`${t.reason}，未调仓`, { code: 'twap' });
+    const off = deviationBps(t.tick, t.twap);
+    if (off > auto.config.maxTwapDeviationBps) throw new chain.ExecError(`现价偏离 ${auto.config.twapSeconds / 60} 分钟 TWAP ${off / 100}%（上限 ${auto.config.maxTwapDeviationBps / 100}%），本轮不调仓`, { code: 'twap' });
+    return t.tick;
+  }
+  // 调仓：核对 TWAP → 记一次并落盘"平仓中"（计入次数与冷却）→ 平仓 → 按余额变化落盘"待重开" → 卖出本次领到的 AERO 并计入 → 再核对 TWAP → 居中重开并质押。
+  // 每一步的进度都先落盘：兑换确认后记下兑换后的数量，开仓签名前记下"开仓结果未定"，开出后记下新头寸；重试按进度续做，不重复挪动 Safe 的币。
+  async function rebalance(ctx, h, params, sellAfter) {
+    const poolOf = (address) => ctx.pools.find((p) => p.address.toLowerCase() === address.toLowerCase());
+    const stuck = stuckReason(auto);
+    if (stuck) throw new chain.ExecError(stuck);
+    if (!auto.reopen && params.kind !== 'rebalance') return { skipped: '没有待重开的记录' };
+    if (!auto.reopen) {
+      const pool = poolOf(params.pool);
+      if (!pool) throw new chain.ExecError('池子不在白名单里');
+      h.step('核对 TWAP'); await checkTwap(ctx, pool.address);
+      const tokens = [pool.token0, pool.token1, chain.REWARD_TOKEN];
+      const [before0, before1, beforeReward] = await chain.safeBalances(ctx, tokens);
+      const entry = { at: now(), pool: pool.address, closed: params.tokenId, opened: null, tickLower: null, tickUpper: null };
+      const history = auto.history;
+      auto.history = [...history, entry].slice(-AUTO_HISTORY_LIMIT);
+      auto.closing = { pool: pool.address, tokenId: params.tokenId, cells: params.cells, at: entry.at };
+      if (!saveAuto()) { auto.history = history; auto.closing = null; throw new chain.ExecError(`${autoError}，未平仓`); }
+      h.step('平仓');
+      try {
+        await chain.closePosition(ctx, h, { tokenId: BigInt(params.tokenId), slippageBps: config.slippageBps, acceptPenalty: auto.config.acceptPenalty });
+      } catch (error) {
+        // 一笔都没签名时链上没有变化：撤回这次记录，不计次数与冷却。签过名就保留"平仓中"，等人工核对。
+        if (error.signed !== true && job?.signed !== true) { auto.history = history; auto.closing = null; saveAuto(); }
+        throw error;
+      }
+      const [after0, after1, afterReward] = await chain.safeBalances(ctx, tokens);
+      const gain = (a, b) => (a > b ? a - b : 0n);
+      auto.closing = null;
+      auto.reopen = { pool: pool.address, cells: params.cells, amount0: String(gain(after0, before0)), amount1: String(gain(after1, before1)), closed: params.tokenId, at: now(), minted: null, inflight: null };
+      mustSaveAuto('已平仓，待重开的数量只在内存里');
+      // 池子本身含 AERO 时不卖：收回的 AERO 是要重开的本金。只卖这次平仓领到的 AERO，Safe 原有的不动。
+      const holdsReward = [pool.token0, pool.token1].some((t) => t.toLowerCase() === chain.REWARD_TOKEN.toLowerCase());
+      const reward = gain(afterReward, beforeReward);
+      if (!holdsReward && reward > 0n) {
+        let sold = null;
+        try { sold = await sellAfter(reward); } catch (error) {
+          if (error.signed === true) throw error; // 卖出已签名、结果未定：停用，待重开的数量不含卖出所得
+          h.log({ event: 'auto_sell_failed', error: error.message });
+        }
+        if (sold?.sold) {
+          const [sold0, sold1] = await chain.safeBalances(ctx, tokens);
+          auto.reopen.amount0 = String(BigInt(auto.reopen.amount0) + gain(sold0, after0));
+          auto.reopen.amount1 = String(BigInt(auto.reopen.amount1) + gain(sold1, after1));
+          mustSaveAuto('卖出所得只在内存里');
+        }
+      }
+    }
+    const target = auto.reopen;
+    const pool = poolOf(target.pool);
+    if (!pool) throw new chain.ExecError('待重开的池子已不在白名单里');
+    let opened, tickLower, tickUpper;
+    if (target.minted) {
+      // 新头寸已开出，上次在质押前停下：只做质押。
+      h.step('质押');
+      await chain.stakePosition(ctx, h, { tokenId: BigInt(target.minted) });
+      opened = target.minted;
+    } else {
+      const amounts = { amount0: BigInt(target.amount0), amount1: BigInt(target.amount1) };
+      if (amounts.amount0 === 0n && amounts.amount1 === 0n) throw new chain.ExecError('平仓没有收回任何代币，未重开');
+      h.step('核对 TWAP');
+      const tick = await checkTwap(ctx, pool.address);
+      [tickLower, tickUpper] = centeredRange(tick, pool.tickSpacing, target.cells);
+      h.step('重开');
+      let stage = null;
+      const rh = {
+        ...h,
+        moving: (next) => { stage = next; },
+        // 兑换或开仓签名后、广播前先记下"结果未定"；写不进去就不广播。
+        persistPending: (entry) => {
+          if (stage) { target.inflight = stage; stage = null; if (!saveAuto()) { target.inflight = null; throw new Error(autoError); } }
+          // 待确认记录写不进去时交易不会广播：撤回"结果未定"，免得误判为已签名。
+          try { return h.persistPending(entry); } catch (error) { if (target.inflight) { target.inflight = null; saveAuto(); } throw error; }
+        },
+        swapped: ({ amount0, amount1 }) => { Object.assign(target, { amount0: String(amount0), amount1: String(amount1), inflight: null }); saveAuto(); },
+        minted: (tokenId) => {
+          h.minted(tokenId);
+          Object.assign(target, { minted: String(tokenId), inflight: null });
+          const entry = [...auto.history].reverse().find((x) => x.closed === target.closed);
+          if (entry) Object.assign(entry, { opened: String(tokenId), tickLower, tickUpper });
+          saveAuto();
+        },
+      };
+      const result = await chain.openPosition(ctx, rh, { pool: pool.address, tickLower, tickUpper, amounts, shareBps: 10_000, rebalance: true, slippageBps: config.slippageBps, stake: true });
+      opened = result.tokenId == null ? null : String(result.tokenId);
+    }
+    auto.reopen = null;
+    const last = [...auto.history].reverse().find((x) => x.closed === target.closed);
+    if (last) last.opened = opened;
+    saveAuto();
+    const done = { closed: target.closed, opened, tickLower: last?.tickLower ?? tickLower ?? null, tickUpper: last?.tickUpper ?? tickUpper ?? null };
+    record({ event: 'auto_rebalanced', ...done });
+    return done;
+  }
+  function startJob(action, parsed) {
+    job = { id: randomUUID(), action, label: actionLabels[action], params: jsonable(parsed), status: 'running', step: null, signed: false, startedAt: now(), finishedAt: null, error: null, result: null };
+    record({ event: 'job_started', job: job.id, action });
+    void run(action, parsed);
+  }
+  // 每 30 秒一轮：读链 → 判定 → 需要时启动调仓任务。手动任务、未结清交易、维护与隔离恢复期间不动。
+  async function autoTick() {
+    if (autoBusy || closed || !auto.config.enabled || auto.halted || stuckReason(auto)) return;
+    autoBusy = true;
+    try {
+      autoCheckedAt = now();
+      if (!config || !wallet) { autoNote = '请先保存 Safe 配置并填写 bot 私钥'; return; }
+      const hold = holdReason();
+      if (hold) { autoNote = hold; return; }
+      if (job?.status === 'running') return;
+      await refresh(); // 也会结清上一笔已签名交易
+      if (pending) { autoNote = `等待上一笔交易（${pending.label}）结清`; return; }
+      if (!snapshot || snapshotError) { autoNote = `链上读取失败：${snapshotError ?? '尚无数据'}`; return; }
+      const result = evaluateAuto({ config: auto.config, chain: snapshot, outSince, history: auto.history, reopen: auto.reopen, closing: auto.closing, now: now() });
+      outSince = result.outSince; autoWatch = result.watch; autoNote = result.note;
+      if (!result.due) return;
+      const ctx = await connection();
+      // 先核对 TWAP 再启动任务：偏离时不留下失败任务，也不计次数。
+      try { await checkTwap(ctx, result.due.pool); } catch (error) { if (error instanceof chain.ExecError && error.code === 'twap') { autoNote = error.message; return; } throw error; }
+      await serial(async () => {
+        if (closed || !auto.config.enabled || auto.halted || holdReason() || job?.status === 'running' || pending) return;
+        startJob('rebalance', result.due);
+      });
+    } catch (error) {
+      autoNote = `自动调仓检查失败：${error.message}`;
+    } finally { autoBusy = false; }
   }
 
   function saveMinted() {
@@ -332,8 +496,55 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         pending = { hash: 'unreadable', nonce: -1, label: '待确认记录损坏', at: 0, unreadable: true };
         log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘待确认记录无法读取');
       }
+      try { const saved = readBounded(autoPath, 64 * 1024); if (saved) auto = readAutoState(saved); } catch (error) {
+        // 记录损坏时不能当作没有：可能有平仓后待重开的币。停用并保留文件，等人工核对。
+        auto = { config: { ...AUTO_DEFAULTS }, history: [], halted: { at: now(), reason: `自动调仓记录 aero-safe/auto.json 无法读取（${error.message}），请核对 Safe 头寸后删除该文件` }, reopen: null, closing: null };
+        autoError = autoCorrupt = auto.halted.reason;
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录无法读取');
+      }
+      // 上次在平仓中或兑换/开仓结果未定时退出（停机、崩溃）：停用并写明要核对什么。
+      const stuck = stuckReason(auto);
+      if (stuck && !autoCorrupt && !auto.halted) { auto.halted = { at: now(), reason: stuck }; saveAuto(); record({ event: 'auto_halted', error: stuck }); }
+      autoTimer = setInterval(() => { void autoTick(); }, AUTO_TICK_MS); autoTimer.unref?.();
       if (config) void refresh();
     },
+    // 保存自动调仓设置；重新启用会清除停用原因，若有待重开的币，下一轮先重开。
+    setAuto: (value, authorize = () => {}) => serial(() => {
+      authorize();
+      if (autoCorrupt) throw new HttpError(409, autoCorrupt);
+      const next = strictAutoConfig(value);
+      const stuck = stuckReason(auto);
+      if (next.enabled && stuck) throw new HttpError(409, stuck);
+      const previous = auto;
+      auto = { ...auto, config: next, halted: next.enabled ? null : auto.halted };
+      try { atomicJson(autoPath, { schema: 1, ...auto }); autoError = null; } catch (error) {
+        auto = previous;
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓设置保存失败');
+        throw new HttpError(500, '自动调仓设置保存失败，请检查数据目录权限后重试');
+      }
+      if (!next.enabled) { outSince = new Map(); autoWatch = []; autoNote = null; }
+      record({ event: next.enabled ? 'auto_enabled' : 'auto_disabled' });
+      if (next.enabled) setTimeout(() => { void autoTick(); }, 0).unref?.();
+      return state();
+    }),
+    // 放弃进行中调仓的记录（平仓中断、待重开）：人工核对 Safe 后使用，之后自动调仓不再续做这一次。
+    discardAuto: (authorize = () => {}) => serial(() => {
+      authorize();
+      if (autoCorrupt) throw new HttpError(409, autoCorrupt);
+      requireIdle('请等它结束');
+      if (!auto.closing && !auto.reopen) throw new HttpError(409, '没有进行中的调仓记录');
+      if (pending) throw new HttpError(409, `上一笔交易（${pending.label}）尚未结清，结清后再核对并放弃`);
+      const previous = auto;
+      const dropped = auto.closing ? { closing: auto.closing } : { reopen: auto.reopen };
+      auto = { ...auto, closing: null, reopen: null };
+      try { atomicJson(autoPath, { schema: 1, ...auto }); autoError = null; } catch (error) {
+        auto = previous;
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录保存失败');
+        throw new HttpError(500, '自动调仓记录保存失败，请检查数据目录权限后重试');
+      }
+      record({ event: 'auto_discarded', ...dropped });
+      return state();
+    }),
     refresh: (authorize = () => {}) => { authorize(); if (!config) throw new HttpError(409, '请先保存 Safe 配置'); if (!refreshing && snapshotAt && now() - snapshotAt < REFRESH_MIN_MS) return state(); void refresh(); return state(); },
     save: (value, authorize = () => {}) => serial(() => {
       authorize();
@@ -399,20 +610,23 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         if (status === 'waiting' && ledgerError) throw new HttpError(409, ledgerError);
         if (status === 'waiting' && now() - pending.at < PENDING_STALE_MS) throw new HttpError(409, `上一笔交易（${pending.label}）仍在等待上链，请稍后再试`);
       }
-      job = { id: randomUUID(), action, label: actionLabels[action], params: jsonable(parsed), status: 'running', step: null, signed: false, startedAt: now(), finishedAt: null, error: null, result: null };
-      record({ event: 'job_started', job: job.id, action });
-      void run(action, parsed);
+      startJob(action, parsed);
       return state();
     }),
     // 更新停机前：维护标记已让任务在下一次签名前停下；只有已签名、回执未到时拒绝停机。
     async prepareStop() {
+      // 调仓任务在平仓与落盘待重开之间也没有待确认交易，停机会丢进度：等它在下一次签名前因维护停下。
+      if (job?.status === 'running' && job.action === 'rebalance') throw new HttpError(409, 'Aero 自动调仓正在执行，尚未满足安全停机条件，请稍后重试');
       if (job?.status === 'running' && pending) throw new HttpError(409, 'Aero 实盘正在等待链上交易回执，尚未满足安全停机条件，请稍后重试');
     },
     async close() {
       closed = true;
+      clearInterval(autoTimer);
       await operation;
       try { await refreshing; } catch {}
     },
+    // 立即跑一轮自动调仓检查（测试与启用后使用；平时由定时器每 30 秒调用）。
+    tickAuto: () => autoTick(),
     get directory() { return directory; },
   };
 }

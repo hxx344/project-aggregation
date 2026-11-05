@@ -184,7 +184,7 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 - 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测、链上额度跨日补充（本地折算公式有单元测试）。
 - 登记（不影响安全）：calldata 里 int24 / uint160 带高位脏位时，本地按规范化值放行、链上按原始字比较拒绝；`plan` 只用一个 RPC，多 RPC 交叉核对由人工换 RPC 重跑。
 
-## 9. 工作台侧改动（实施时另立任务）
+## 9. 工作台侧改动
 
 进度（2026-11-04）：执行器与读取已实现——交易 → Aero 实盘页（配置、bot 私钥、Safe 余额与额度、头寸解押/平仓/质押、领奖与卖出、手动兑换、交易记录），Aero 市场池详情页的「Safe 实盘开仓」面板按选定区间（默认推荐区间）预览后开仓并质押；首版只手动执行，自动调仓与下面的监控另立任务。AERO 奖励按已定方案自动卖成 WETH（AERO→WETH ts200 白名单路由）。
 
@@ -192,6 +192,32 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 - 读取：持仓、质押、余额、估值改按 Safe 地址（`tokenOfOwnerByIndex(Safe)`、`gauge.stakedValues(Safe)`）。
 - 监控：独立只读进程监听 Safe 的出账和 Roles 配置事件，非预期变化发飞书。`plan` 只在部署时核对一次 Safe 状态，之后的变化靠监控：Safe 至少监听 `EnabledModule`、`DisabledModule`（Roles 被移除只会停摆，不会失窃）、`ChangedGuard`、`ChangedModuleGuard`（v1.5.0 新增）、`ChangedFallbackHandler`、`AddedOwner`、`RemovedOwner`、`ChangedThreshold`；Roles 代理至少监听 `OwnershipTransferred`、`AvatarSet`、`TargetSet`、`EnabledModule` / `DisabledModule`（Roles 自身的模块列表）、`SetUnwrapAdapter`、`SetDefaultRole`、`AssignRoles`，以及范围与额度变更（`ScopeTarget`、`AllowTarget`、`RevokeTarget`、`ScopeFunction`、`AllowFunction`、`RevokeFunction`、`SetAllowance`）；事件名按 Sourcify 验证的 mastercopy ABI 核对。Safe{Wallet} 的部分功能（如 TWAP）可能把 fallback handler 换成 ExtensibleFallbackHandler，需要 owner 签名，但属于部署后的状态漂移。
 - 工作台只保存 bot 私钥和 Safe / Roles 地址，管理钱包私钥不录入。
+
+### 9.1 自动调仓（2026-11-05）
+
+Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/aero-auto.mjs`（纯函数），执行在 `server/automation/aero-safe.mjs`，每 30 秒检查一次，与手动操作共用串行任务队列，一次只做一件事。
+
+- 对象：只管理已质押、流动性大于 0 的头寸。连续出区间满「出区间等待」（默认 5 分钟）后：核对 TWAP → 解押 → 平仓 → 卖出 AERO（池子本身含 AERO 时不卖，收回的 AERO 是本金）→ 以现价为中心、按原格数重开（需要时先配平兑换）→ 质押。
+- 投入量：只投入这次平仓前后 Safe 余额的增量（含卖出 AERO 所得），Safe 里原有的其他余额不动。Roles 没有授权 `increaseLiquidity`，所以调仓是平仓 + 新开仓，新头寸 tokenId 不同。
+- 防操纵：执行前读池子 `observe([twapSeconds, 0])`，现价偏离 TWAP 超过上限（默认 5 分钟、1%）本轮不动，只写提示，下一轮再看；观测槽少于 2 个或历史不足窗口时同样不动。平仓前、重开前各核对一次。
+- 节流：同池冷却（默认 30 分钟）、24 小时最多次数（默认 6）、提前解押罚没期内等待（可选「罚没期内也解押」）、预估今日额度不够重开时不平仓。
+- 进度落盘（`aero-safe/auto.json`）：
+  - 平仓前写入调仓记录和 `closing`，写不进去就不平仓。平仓时一笔都没签名就失败（例如维护）：撤回这条记录，不计次数和冷却。签过名后失败：保留 `closing` 并停用；链上可能已解押或已平仓，系统不自动续做。
+  - 平仓后按余额增量写 `reopen`。卖 AERO 只卖这次平仓领到的数量，卖出所得确认后再计入。卖出签了名但结果未知：停用，待重开数量不含卖出所得。
+  - 重开时：配平兑换确认后，把 `reopen` 改为兑换后的数量；兑换或开仓那一笔签名后、广播前，记下 `inflight`；开出新头寸后，记下 `minted`。
+  - 重试按进度续做：已开出新头寸就只质押，不会再开一次；`inflight` 未落定时停用，不自动续做。
+- 失败与重试：
+  - 只有 TWAP 未通过、或工作台进入维护/隔离而在签名前中止，并且进度都已落盘、没有需要人工核对的记录时，才下一轮重试。其他任何错误都停用。
+  - 工作台在 `closing` 或 `inflight` 状态下重启：直接停用，并写明要核对什么。
+  - 调仓任务执行中，更新停机（`prepareStop`）一律拒绝，等任务在下一次签名前因维护停下。
+- 人工核对：`closing` 或 `inflight` 存在时不能重新启用。核对 Safe 头寸和余额（未质押的头寸可手动平仓或质押）后，在「配置 → 自动调仓 → 放弃这条记录」清掉记录（`POST /api/automation/aero-safe/auto/discard`），再重新启用。待重开记录也可以放弃，例如这些币已经手动用掉。
+- `auto.json` 读不出、或记录不合法（包括停用记录缺原因）时停用，并拒绝保存，需核对 Safe 头寸后删除该文件。
+- 紧急停止：在配置里关闭；不依赖服务器的办法仍是第 7 节撤销角色。
+- 分叉演练：`node tools/aero-roles/fork-rebalance.mjs`。2026-11-05 Base 区块 53541867 附近，WETH/USDC ts100，13/13 通过：手动开 2 格窄区间（投入一半余额）并质押；外部大额卖出把价格推出区间后，现价偏离 5 分钟 TWAP 3.3% 时不动；推进链上时间让 TWAP 追上后自动调仓，旧 NFT 销毁、新头寸居中同宽并已质押、Safe 原有的另一半余额没被投入、`auto.json` 落盘且无待重开、全部交易确认、新头寸在区间内不再触发。
+- 已知局限：
+  - 配平兑换按现价估算，兑换本身挪动价格后会有尾差留在 Safe。演练中窄区间、价格靠近区间边沿时，约 5% 的价值（231 USDC）没被重投；之后的调仓也只投入平仓所得，不会把这部分尾差重新投进去。
+  - 停用时没有飞书即时提醒，只在页面显示；飞书汇总暂未包含 Aero 实盘。
+  - 主网小额实测未做。
 
 ## 10. 待决策
 
