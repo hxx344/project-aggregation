@@ -783,6 +783,16 @@ expect_code 137
 in_order '^scope full$' '^activate_dual_full$' '^finish_activation'
 [[ $(link current) == "$r8" && $(link previous) == "$r6" ]]
 [[ $(cat "$app/.pending-previous") == "$r8 $r7 full" ]]
+# The resumed activation fails too. Its rollback can only restore current to
+# the candidate itself, so the record is the sole copy of the replaced release.
+printf '%s\n' "$r8" > "$fixture/unready-release"
+run_install
+rm -f -- "$fixture/unready-release"
+expect_code 1
+in_order '^scope full$' '^activate_dual_full$' '^restore_dual_units$'
+no_call '^finish_activation'
+[[ $(link current) == "$r8" && $(link previous) == "$r6" ]]
+[[ $(cat "$app/.pending-previous") == "$r8 $r7 full" ]]
 run_install
 expect_code 0
 has_call '^scope full$'
