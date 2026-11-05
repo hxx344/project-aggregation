@@ -16,7 +16,8 @@ async (page, options = {}) => {
   await app.locator('.trade-list-item').first().click();
   check(await app.locator('.trade-list-item[aria-pressed="true"]').count() === 1, 'the list selects the matching marker');
   await app.getByRole('button', { name: '价格对比', exact: true }).click(); check(await markers.count() === 0, 'prices never show trade markers');
-  await app.getByRole('button', { name: '百分比价差', exact: true }).click(); check(await markers.count() === 4, 'spread restores markers without a price update');
+  check(await app.getByRole('button', { name: '百分比价差', exact: true }).count() === 0, 'oil has no percentage tab');
+  await app.getByRole('button', { name: '价差', exact: true }).click(); check(await markers.count() === 4, 'spread restores markers without a price update');
   await page.locator('#fail').click();
   await app.getByText(/刷新失败，保留上次成功数据/).waitFor();
   check(await markers.count() === 4, 'failed refresh keeps old markers');

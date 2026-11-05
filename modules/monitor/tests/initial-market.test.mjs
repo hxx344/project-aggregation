@@ -74,7 +74,7 @@ test('first-render summaries retain valid zero quotes and stale status without c
   const summaries = initialSummaries({ renderedAt: Date.parse(fetchedAt), hynix: { quote: { fetchedAt, status: 'snapshot', adr: 20, ordinary: 200, equivalent: 20, spread: 0, premium: 0 }, trend: null }, oil: { quote: { source: 'Binance', currency: 'USDT', fetchedAt, status: 'live', brent: { ...leg, coin: 'BZUSDT' }, wti: { ...leg, coin: 'CLUSDT' } }, history: null } });
   assert.equal(summaries.hynix.metrics[0].value, '0.00%');
   assert.equal(summaries.hynix.status, 'stale');
-  assert.equal(summaries.oil.metrics[0].value, '0.000%');
+  assert.equal(summaries.oil.metrics[0].value, '0.000');
   assert.equal(summaries.oil.metrics[1].value, '0.00%');
   assert.match(summaries.oil.note, /等桶数/);
 });

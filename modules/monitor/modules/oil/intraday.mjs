@@ -1,5 +1,5 @@
 import { ASSETS, API_URL, SOURCE, HISTORY_START, fetchCandles } from './binance.mjs';
-import { decimalDifference, spreadPercentOfWti } from './spread.mjs';
+import { oilSpread } from './spread.mjs';
 
 export const OIL_CANDLE_INTERVAL = '15m';
 export const OIL_CANDLE_MS = 900_000;
@@ -76,11 +76,11 @@ export async function fetchIntradaySnapshot(existing = null, options = {}) {
   return createIntradaySnapshot([...merged.values()].sort((a, b) => a.time - b.time), new Date(now).toISOString());
 }
 
-// Validated legs are positive finite numbers or null, so this matches oilSpreadPercent while computing the difference once.
+/** `spread` is Brent − WTI in USDT per barrel; rows missing either leg are not charted. */
 function chartRow(row) {
   if (row.brent === null || row.wti === null) return null;
-  const absolute = decimalDifference(row.brent, row.wti), spread = spreadPercentOfWti(absolute, row.wti);
-  return spread === null ? null : { ...row, date: new Date(row.time).toISOString(), spread, absolute };
+  const spread = oilSpread(row.brent, row.wti);
+  return spread === null ? null : { ...row, date: new Date(row.time).toISOString(), spread };
 }
 
 export function intradayChartRows(snapshot) {

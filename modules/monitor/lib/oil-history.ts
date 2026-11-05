@@ -5,10 +5,13 @@ type OilSnapshot = ReturnType<typeof validateIntradaySnapshot>;
 /** Paired 15-minute closes on the shared spread-chart shape: leg A = Brent, leg B = WTI. */
 export type OilHistory = { points: Point[]; status: "live" | "snapshot"; fetchedAt: string; metadata: OilSnapshot["metadata"] };
 
-/** `premium` = (Brent − WTI) ÷ WTI × 100, `spread` = Brent − WTI in USDT per barrel. */
+/**
+ * `spread` = Brent − WTI in USDT per barrel. Oil charts only the absolute spread, so
+ * `premium` is NaN and the oil chart config leaves out the percentage tab.
+ */
 export function oilHistory(input: unknown): OilHistory {
   const snapshot = validateIntradaySnapshot(input);
-  const points = intradayChartRows(snapshot).flatMap(({ time, brent, wti, absolute, spread }) => brent === null || wti === null ? [] : [{ time: time as number, adr: brent, ordinary: wti, equivalent: wti, spread: absolute, premium: spread }]);
+  const points = intradayChartRows(snapshot).flatMap(({ time, brent, wti, spread }) => brent === null || wti === null ? [] : [{ time: time as number, adr: brent, ordinary: wti, equivalent: wti, spread, premium: NaN }]);
   return { points, status: snapshot.status === "snapshot" ? "snapshot" : "live", fetchedAt: snapshot.metadata.fetchedAt, metadata: snapshot.metadata };
 }
 

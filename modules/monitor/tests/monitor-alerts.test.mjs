@@ -29,18 +29,22 @@ test("oil editor roundtrips all metrics, decimal minutes and independent rule co
   assert.deepEqual(oilConfig(draft).rules.slice(1), oil.rules.slice(1));
 });
 
-test("new oil rules use percent, while amount configurations and historical event units remain explicit", async () => {
+test("oil rules use the absolute spread; old percentage events keep their own unit in history", async () => {
   const fresh = oilAlerts.newRule(oilDraft(oil));
-  assert.equal(fresh.metric, 'spreadPercent');
-  assert.equal(oilAlerts.metrics.find(metric => metric.id === fresh.metric).unit, '%');
-  assert.equal(oilAlerts.metrics.find(metric => metric.id === fresh.metric).hysteresisUnit, '百分点');
-  const mixed = { ...oil, rules: [...oil.rules, { ...oil.rules[0], id: 'percent', metric: 'spreadPercent' }] };
-  assert.deepEqual(oilConfig(oilDraft(mixed)), mixed);
+  assert.equal(fresh.metric, 'spread');
+  assert.equal(oilAlerts.metrics.find(metric => metric.id === fresh.metric).unit, 'USDT/桶');
+  assert.equal(oilAlerts.metrics.find(metric => metric.id === fresh.metric).hysteresisUnit, 'USDT/桶');
+  assert.ok(!oilAlerts.metrics.some(metric => metric.id === 'spreadPercent' || metric.unit === '%'), 'percentage is no longer selectable');
   const events = ['spreadPercent', 'spread'].map(metric => ({ id: metric, time: '2026-09-23T00:00:00Z', status: 'sent', rules: [{ label: '阈值', metric, operator: 'gte', value: 5, threshold: 5 }] }));
-  const view = await oilAlerts.load(signal(), async url => Response.json(url.endsWith('status') ? { available: true, market: { brent: { markPx: 80 }, wti: { markPx: 75 } } } : url.endsWith('config') ? { revision: 1, config: mixed } : { events }));
-  assert.match(view.market, /价差 6.6667%/);
-  assert.match(view.history[0].description, /百分比价差 5.0000 ≥ 5 %/);
-  assert.match(view.history[1].description, /绝对价差 5.0000 ≥ 5 USDT\/桶/);
+  const view = await oilAlerts.load(signal(), async url => Response.json(url.endsWith('status') ? { available: true, market: { brent: { markPx: 80 }, wti: { markPx: 75 } } } : url.endsWith('config') ? { revision: 1, config: oil } : { events }));
+  assert.match(view.market, /价差 5.0000 USDT\/桶/);
+  assert.match(view.history[0].description, /百分比价差（已停用） 5.0000 ≥ 5 %/);
+  assert.match(view.history[1].description, /价差 5.0000 ≥ 5 USDT\/桶/);
+  assert.equal(oilAlerts.notice(oilDraft(oil)), null);
+  const converted = { name: '价差 5%（原百分比）', enabled: false };
+  const draft = { ...oilDraft(oil), rules: [...oilDraft(oil).rules, { ...fresh, ...converted }] };
+  assert.match(oilAlerts.notice(draft), /有 1 档原百分比规则/);
+  assert.equal(oilAlerts.notice({ ...draft, rules: draft.rules.map(rule => ({ ...rule, enabled: true })) }), null, 'notice clears once re-enabled');
 });
 
 test("web-only oil availability does not request Linux-only configuration or events", async () => {

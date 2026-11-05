@@ -20,11 +20,11 @@ test('real Binance archive starts April 1, exceeds 5,000 complete paired bars, a
   rows.forEach((row, index) => {
     if (index) assert.equal(row.time - rows[index - 1].time, BAR);
     assert.ok(row.time + BAR <= Date.parse(snapshot.metadata.fetchedAt));
-    assert.ok(Math.abs(row.spread - (row.brent - row.wti) / row.wti * 100) < 1e-12);
+    assert.ok(Math.abs(row.spread - (row.brent - row.wti)) < 1e-12);
   });
   const { points } = oilHistory(saved);
   assert.equal(points.length, rows.length);
-  assert.deepEqual(points.at(-1), { time: rows.at(-1).time, adr: rows.at(-1).brent, ordinary: rows.at(-1).wti, equivalent: rows.at(-1).wti, spread: rows.at(-1).absolute, premium: rows.at(-1).spread });
+  assert.deepEqual(points.at(-1), { time: rows.at(-1).time, adr: rows.at(-1).brent, ordinary: rows.at(-1).wti, equivalent: rows.at(-1).wti, spread: rows.at(-1).spread, premium: NaN });
 });
 
 test('pairs completed trade closes at matching times, preserving missing legs and real gaps', () => {

@@ -223,12 +223,12 @@ test('an optional stable exchange id is kept only when well formed', () => {
 test('oil spreads pair only one CL and one BZ position in opposite directions on the same venue', () => {
   const cl = (overrides = {}) => item({ key: `cl-${Math.random()}`, symbol: 'CLUSDT', base: 'CL', side: 'long', entryPrice: '62.10', ...overrides });
   const bz = (overrides = {}) => item({ key: `bz-${Math.random()}`, symbol: 'BZUSDT', base: 'BZ', side: 'short', entryPrice: '65.80', ...overrides });
-  const spreads = { binance: { premium: 5.68, stale: false } };
+  const spreads = { binance: { value: 3.68, stale: false } };
   const oilSpreadPairs = (items, values) => relatedSpreadPairs('oil', items, values);
   const [paired] = oilSpreadPairs([cl(), bz()], spreads);
   assert.equal(paired.status, 'paired');
-  assert.ok(Math.abs(paired.opening - (65.8 - 62.1) / 62.1 * 100) < 1e-9);
-  assert.equal(paired.current, 5.68, 'the current spread is looked up by the normalized venue');
+  assert.equal(paired.opening, 3.7, 'the opening spread is BZ − CL in USDT per barrel on decimal prices');
+  assert.equal(paired.current, 3.68, 'the current spread is looked up by the normalized venue');
   assert.equal(oilSpreadPairs([cl({ exchange: 'Binance ' }), bz({ exchange: 'BINANCE' })], spreads).length, 1, 'display names are normalized before grouping');
   assert.deepEqual(oilSpreadPairs([cl(), bz({ side: 'long' })], spreads).map(pair => [pair.status, pair.reason]), [['unpaired', 'same-side']]);
   assert.deepEqual(oilSpreadPairs([cl(), cl(), bz()], spreads).map(pair => [pair.status, pair.reason]), [['unpaired', 'multiple']]);
@@ -243,7 +243,7 @@ test('oil spreads pair only one CL and one BZ position in opposite directions on
 test('Hynix pairs one ADR and one ordinary-share leg per venue using the 10 ADR to 1 share premium', () => {
   const adr = (overrides = {}) => item({ key: `adr-${Math.random()}`, symbol: 'SKHYUSDT', base: 'SKHY', side: 'short', entryPrice: '141.68', ...overrides });
   const ordinary = (overrides = {}) => item({ key: `ord-${Math.random()}`, symbol: 'SKHYNIXUSDT', base: 'SKHYNIX', side: 'long', entryPrice: '959.75', ...overrides });
-  const spreads = { binance: { premium: 46.2, stale: true } };
+  const spreads = { binance: { value: 46.2, stale: true } };
   const [paired] = relatedSpreadPairs('hynix', [adr(), ordinary()], spreads);
   assert.equal(paired.status, 'paired');
   assert.ok(Math.abs(paired.opening - (141.68 / (959.75 / 10) - 1) * 100) < 1e-9, 'matches the live comparison formula');
@@ -264,8 +264,9 @@ test('paired legs add up unrealized and realized results and show the closing sp
   const cl = (overrides = {}) => item({ key: 'cl', symbol: 'CLUSDT', base: 'CL', side: 'long', entryPrice: '91.07882352941174', unrealizedPnl: '10142.71680071', cycle: cycle(), ...overrides });
   const bz = (overrides = {}) => item({ key: 'bz', symbol: 'BZUSDT', base: 'BZ', side: 'short', entryPrice: '101.4829411764706', unrealizedPnl: '-9066.40914424', cycle: cycle({ closePrice: '105.766', realizedPnl: '-2141.52941173', fees: '-25.13735598', funding: '-4640.21922683', net: '-6806.88599454' }), ...overrides });
   const near = (actual, expected) => assert.ok(actual !== null && Math.abs(actual - expected) < 1e-6, `${actual} ≈ ${expected}`);
-  const [pair] = relatedSpreadPairs('oil', [cl(), bz()], { binance: { premium: 9.545, stale: false } });
-  near(pair.closing, (105.766 - 97.912) / 97.912 * 100);
+  const [pair] = relatedSpreadPairs('oil', [cl(), bz()], { binance: { value: 9.545, stale: false } });
+  near(pair.closing, 105.766 - 97.912);
+  near(pair.opening, 101.4829411764706 - 91.07882352941174);
   near(pair.change, 9.545 - pair.opening);
   assert.equal(pair.narrowingFavors, true, 'long CL / short BZ profits when the spread narrows');
   const t = pair.totals;

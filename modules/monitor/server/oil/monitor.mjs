@@ -4,9 +4,9 @@ import { staleMarketReason } from '../market-stale.mjs';
 
 const oilDefinition = {
   service: 'oil-spread-monitor', validateConfig, marketValues, testTitle: '原油阈值告警',
-  message: (market, values, due) => ['原油阈值告警', `采集时间：${market.fetchedAt}（UTC）`, '价格口径：Binance BZUSDT / CLUSDT 标记价，USDT/桶；百分比价差＝(布伦特 − WTI) ÷ WTI × 100%',
-    ...due.map(({ rule, value, id }) => `【${rule.label}】${METRICS[rule.metric]} ${value.toFixed(4)} ${rule.operator === 'gte' ? '≥' : '≤'} ${rule.threshold} ${rule.metric === 'spreadPercent' ? '%' : 'USDT/桶'}\n事件 ${id}`),
-    `布伦特 ${values.brent.toFixed(4)} · WTI ${values.wti.toFixed(4)} · 价差 ${values.spreadPercent.toFixed(4)}%`].join('\n'),
+  message: (market, values, due) => ['原油阈值告警', `采集时间：${market.fetchedAt}（UTC）`, '价格口径：Binance BZUSDT / CLUSDT 标记价，USDT/桶；价差＝布伦特 − WTI',
+    ...due.map(({ rule, value, id }) => `【${rule.label}】${METRICS[rule.metric]} ${value.toFixed(4)} ${rule.operator === 'gte' ? '≥' : '≤'} ${rule.threshold} USDT/桶\n事件 ${id}`),
+    `布伦特 ${values.brent.toFixed(4)} · WTI ${values.wti.toFixed(4)} · 价差 ${values.spread.toFixed(4)} USDT/桶`].join('\n'),
 };
 
 export class Monitor {

@@ -1,10 +1,10 @@
-import { oilSpreadPercent } from './spread.mjs';
+import { oilSpread } from './spread.mjs';
 import { decimal, decimalText, add, negate, absolute, compare, multiply, divide } from './trade-decimal.mjs';
 
 export const TRADE_GAP_MS = 10 * 60_000;
-/** left/right are the paired bases; spread is the market's chart metric in percent from fill prices. */
+/** left/right are the paired bases; spread is the market's chart metric from fill prices (oil: USDT/桶, Hynix: percent). */
 export const TRADE_PAIRS = {
-  oil: { left: 'BZ', right: 'CL', spread: oilSpreadPercent, priceUnit: '/桶',
+  oil: { left: 'BZ', right: 'CL', spread: oilSpread, priceUnit: '/桶',
     short: '做空价差（空布伦特 / 多 WTI）', long: '做多价差（多布伦特 / 空 WTI）' },
   // One ordinary share equals ten ADRs, matching the chart's ADR premium.
   hynix: { left: 'SKHY', right: 'SKHYNIX', priceUnit: '',

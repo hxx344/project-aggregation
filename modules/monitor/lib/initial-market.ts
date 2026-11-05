@@ -6,7 +6,7 @@ import { hynixSummary, hynixTrendOptions, oilSummary, oilTrendOptions } from "./
 import { createTrend, type TrendHistory } from "./monitor-trend.ts";
 import { binanceOilExchangeQuote, type ExternalQuoteSet } from "./exchange-quotes.ts";
 import { recentIntradayChartRows, type createIntradaySnapshot } from "../modules/oil/intraday.mjs";
-import { oilSpreadPercent } from "../modules/oil/spread.mjs";
+import { oilSpread } from "../modules/oil/spread.mjs";
 import { getQuoteStaleAfterMs, type QuoteFreshness } from './market-freshness.ts';
 
 export type InitialMarketData = {
@@ -23,7 +23,7 @@ export function initialSummaries(initial: InitialMarketData | null) {
     hynix: hynixSummary(hynix?.quote ?? null, hynix?.quote?.status === "snapshot" ? "行情待更新" : "", createTrend(hynix?.trend ?? undefined, hynixTrendOptions)),
     oil: oilSummary(oil ? {
       status: oil.quote ? oil.quote.status === "snapshot" ? "stale" : "live" : "loading",
-      spread: oil.quote ? oilSpreadPercent(oil.quote.brent.markPx, oil.quote.wti.markPx) : null,
+      spread: oil.quote ? oilSpread(oil.quote.brent.markPx, oil.quote.wti.markPx) : null,
       fundingHourlyRate: oil.quote ? calculateShortSpreadFunding(oil.quote).hourlyRate : null,
       fundingBasis: "quantity", fetchedAt: oil.quote?.fetchedAt ?? null,
       staleAfterMs: getQuoteStaleAfterMs(oil.quote, 75_000),

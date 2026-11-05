@@ -14,6 +14,9 @@ import { TRADE_TYPES } from "../modules/oil/trades.mjs";
 import { fillsStatusText, tradeDetailLines } from "../modules/oil/trade-markers.mjs";
 
 type Mode = SpreadMetric | "price";
+/** Labels per tab; the percentage tab is optional for markets that chart only the absolute spread. */
+type ModeLabels<T> = Record<"spread" | "price", T> & Partial<Record<"premium", T>>;
+const ALL_MODES: readonly Mode[] = ["premium", "spread", "price"];
 type Toggles = { sma: boolean; bands: boolean; zscore: boolean };
 /**
  * One spread market on the shared chart: leg A (`adr`) against leg B (`equivalent`),
@@ -31,9 +34,11 @@ export type SpreadChartConfig = {
   /** Reads a consecutive bar count, e.g. "480 个连续小时". */
   bars: (count: number) => string;
   checkCadence: string;
-  tabs: Record<Mode, string>;
-  units: Record<Mode, string>;
-  premiumName: string;
+  /** Tabs in display order; the first opens by default. Defaults to every mode. */
+  modes?: readonly Mode[];
+  tabs: ModeLabels<string>;
+  units: ModeLabels<string>;
+  premiumName?: string;
   spreadName: string;
   legs: readonly [string, string];
   zeroLabel: string;
@@ -41,7 +46,7 @@ export type SpreadChartConfig = {
   domainStep: number;
   digits: number;
   price: (value: number) => string;
-  tick: Record<Mode, (value: number) => string>;
+  tick: ModeLabels<(value: number) => string>;
   tradeEvents: (items: HubFillsView["items"]) => TradeEvent[];
   tradeMarkers: (events: TradeEvent[], points: Point[]) => SpreadTradeMarker[];
   trade: { priceUnit: string; chartLabel: string; chartNote: string; metricName: string };
@@ -68,7 +73,10 @@ const date = (time: number, full = false) => new Intl.DateTimeFormat("zh-CN", { 
 const stamp = (time: number) => `${date(time,true)} ${new Date(time).toISOString().slice(11,16)} UTC`;
 const beijingFormatter = new Intl.DateTimeFormat("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 const beijing = (time: number | string) => beijingFormatter.format(new Date(time));
-const premiumText = (v: number | null) => v === null ? "未知" : `${v.toFixed(3)}%`;
+const markerText = ({ value, unit }: SpreadTradeMarker) => value === null ? "未知" : unit === "absolute" ? `${value < 0 ? "−" : ""}${Math.abs(value).toFixed(3)}` : `${value.toFixed(3)}%`;
+const chartModes = (config: SpreadChartConfig) => config.modes ?? ALL_MODES;
+/** Tab names of the spread modes, e.g. "溢价率或美元价差". */
+const spreadTabs = (config: SpreadChartConfig) => chartModes(config).filter(mode => mode !== "price").map(mode => config.tabs[mode]).join("或");
 const tradeDetails = (marker: SpreadTradeMarker, config: SpreadChartConfig) => tradeDetailLines(marker, beijing, config.trade).join("\n");
 type TradeType = keyof typeof TRADE_TYPES;
 const zLayers: PlotLayer[] = [{ kind: "line", key: "zscore", color: "var(--chart-2)", width: 1.7, active: true }];
@@ -82,7 +90,7 @@ function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null;
   if (cx == null || cy == null || !Number.isFinite(cx) || !Number.isFinite(cy)) return <g/>;
   const type = TRADE_TYPES[marker.event.type as TradeType], select = () => onSelect(marker.event.key);
   return <g className="trade-marker" data-trade-type={marker.event.type} data-selected={selected || undefined} transform={`translate(${cx},${cy})`} tabIndex={0} role="button"
-    aria-label={`${type.label} · ${beijing(marker.event.time)} 北京时间 · ${marker.basis} ${premiumText(marker.value)}，查看成交明细`}
+    aria-label={`${type.label} · ${beijing(marker.event.time)} 北京时间 · ${marker.basis} ${markerText(marker)}，查看成交明细`}
     onClick={select} onMouseEnter={select} onFocus={select} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } }}>
     <circle r={12} fill="transparent"/>
     <text textAnchor="middle" dy=".35em" aria-hidden="true">{type.symbol}</text>
@@ -94,11 +102,11 @@ function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config 
   return <section className="trade-panel" aria-labelledby={titleId}>
     <h3 id={titleId}>套利成交</h3>
     <p className="trade-status" role="status">{fillsStatusText(trades, beijing)}</p>
-    <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === "trade" ? "成交（开平未知）" : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? "颜色只区分类型，不表示盈亏" : `切换到${config.tabs.premium}或${config.tabs.spread}可在图上查看标记`}</span></p>
+    <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === "trade" ? "成交（开平未知）" : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? "颜色只区分类型，不表示盈亏" : `切换到${spreadTabs(config)}可在图上查看标记`}</span></p>
     <div className="trade-list" aria-label="当前区间套利成交">
       {!markers.length && <p>{trades.status === "ok" && !trades.pending && !trades.incomplete ? "当前图表区间暂无套利成交" : "当前图表区间暂无可展示成交"}</p>}
       {[...markers].reverse().map(marker => { const type = TRADE_TYPES[marker.event.type as TradeType]; return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
-        {`${type.symbol} ${beijing(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${premiumText(marker.value)}`}
+        {`${type.symbol} ${beijing(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
       </button>; })}
     </div>
     {selected && <div className="trade-details" tabIndex={0} aria-label="套利成交明细">{tradeDetails(selected, config)}</div>}
@@ -107,7 +115,7 @@ function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config 
 
 /** Gap rows carry null prices and show no tooltip. */
 function indicatorTooltip(p: IndicatorPoint, mode: Mode, enabled: Toggles, config: SpreadChartConfig, zOnly = false) {
-  if (p.premium == null) return null;
+  if (p.adr == null) return null;
   const value = (v: number | null | undefined, as: Mode = mode) => metricValue(v, as, config);
   return <div className="chart-tooltip">
     <strong>{stamp(p.time)}</strong>
@@ -116,7 +124,7 @@ function indicatorTooltip(p: IndicatorPoint, mode: Mode, enabled: Toggles, confi
       <div><span>20 日均值</span><b>{value(p.basis)}</b></div>
       <div><span>{mode === "premium" ? config.premiumName : config.spreadName}</span><b>{value(p[mode === "spread" ? "spread" : "premium"])}</b></div>
     </> : <>
-      <div><span>{config.premiumName}</span><b className={p.premium >= 0 ? "positive" : "negative"}>{value(p.premium,"premium")}</b></div>
+      {chartModes(config).includes("premium") && <div><span>{config.premiumName}</span><b className={p.premium >= 0 ? "positive" : "negative"}>{value(p.premium,"premium")}</b></div>}
       <div><span>{config.legs.join(" / ")}</span><b>{config.price(p.adr)} / {config.price(p.equivalent)}</b></div>
       <div><span>{config.spreadName}</span><b>{value(p.spread,"spread")}</b></div>
       {mode !== "price" && <div className="tooltip-indicators">
@@ -141,7 +149,7 @@ function SpreadChart({ data, loading, range, onRangeChange, trades, config = HYN
   config?: SpreadChartConfig;
 }) {
   const { intervalMs, periods } = config;
-  const [mode,setMode] = useState<Mode>("premium");
+  const [mode,setMode] = useState<Mode>(() => chartModes(config)[0]);
   const [enabled,setEnabled] = useState<Toggles>({ sma: true, bands: true, zscore: true });
   const metric: SpreadMetric = mode === "spread" ? "spread" : "premium";
   // Calculate on ALL history first so selecting one week retains the 20-day warmup.
@@ -212,7 +220,7 @@ function SpreadChart({ data, loading, range, onRangeChange, trades, config = HYN
       <div className="segmented range-control" aria-label="时间范围">{ranges.map(r => <button key={r.label} aria-pressed={range === r.days} className={range === r.days ? "active" : ""} onClick={() => onRangeChange(r.days)}>{r.label}</button>)}</div>
     </div>
     <div className="chart-toolbar">
-      <div className="chart-tabs" aria-label="图表指标">{(["premium","spread","price"] as const).map(id => <button key={id} aria-pressed={mode === id} className={mode === id ? "active" : ""} onClick={() => setMode(id)}>{config.tabs[id]}</button>)}</div>
+      <div className="chart-tabs" aria-label="图表指标">{chartModes(config).map(id => <button key={id} aria-pressed={mode === id} className={mode === id ? "active" : ""} onClick={() => setMode(id)}>{config.tabs[id]}</button>)}</div>
       <span className="chart-unit">{config.units[mode]}</span>
     </div>
     {mode !== "price" && <>
@@ -231,7 +239,7 @@ function SpreadChart({ data, loading, range, onRangeChange, trades, config = HYN
     </>}
     <div className="chart-container">
       {!points.length ? <div className="empty-chart"><Activity size={28}/><p>{loading ? config.emptyText.loading : "暂无可用行情"}</p><span>{loading ? config.emptyText.hint : "点击刷新行情重试"}</span></div> :
-        <SvgPlot rows={sampled} hoverRows={chartPoints} xDomain={xRange} yDomain={mainAxis.domain} yTicks={mainAxis.ticks} yTick={config.tick[mode]}
+        <SvgPlot rows={sampled} hoverRows={chartPoints} xDomain={xRange} yDomain={mainAxis.domain} yTicks={mainAxis.ticks} yTick={config.tick[mode] ?? String}
           layers={layers} references={mode === "price" ? [] : zeroLine} margin={{top:25,right:82,bottom:36}} height={300} hover={hover}
           label={mode === "price" ? `${config.legs.join(" 与 ")} ${config.bar}收盘价格走势` : `${metricName}${config.bar}走势`}
           defs={premiumFill}
@@ -251,7 +259,7 @@ function SpreadChart({ data, loading, range, onRangeChange, trades, config = HYN
     {mode !== "price" && <details className="indicator-help"><summary><Info size={14}/>指标怎么看</summary><div>
       <p><b>7 日均线</b>平滑最近 {config.span(periods.sma)}的价差。<b>布林带</b>以 {config.span(periods.bands)}均值为中轨，上下轨为均值 ± 2 倍总体标准差；带宽反映这段时间的波动幅度。</p>
       <p><b>Z-score =（当前价差 − {config.span(periods.bands)}均值）÷ 标准差。</b>正值表示高于近期均值，负值表示低于近期均值；±2σ 是偏离参考线，不代表价差必然回归。</p>
-      <p>7 / 20 日均为自然日{config.bar}窗口，包含当前已收盘的{config.bar}线。先使用完整历史计算，再按所选时间范围显示；窗口不足或跨数据缺口时留空，零波动时 Z-score 留空。切换{config.tabs.premium}或{config.tabs.spread}时，所有指标同步换算口径。</p>
+      <p>7 / 20 日均为自然日{config.bar}窗口，包含当前已收盘的{config.bar}线。先使用完整历史计算，再按所选时间范围显示；窗口不足或跨数据缺口时留空，零波动时 Z-score 留空。{chartModes(config).includes("premium") ? `切换${spreadTabs(config)}时，所有指标同步换算口径。` : ""}</p>
       <a href="https://www.bollingerbands.com/bollinger-band-rules" target="_blank" rel="noreferrer">布林带官方说明 ↗</a><a href="https://www.itl.nist.gov/div898/software/dataplot/refman2/auxillar/standard.htm" target="_blank" rel="noreferrer">NIST 标准化定义 ↗</a>
     </div></details>}
   </section>;

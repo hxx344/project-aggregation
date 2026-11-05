@@ -1,8 +1,9 @@
 import type { HubPositionCycle, HubPositionItem } from './hub-bridge.ts';
 import { exchangeContracts, type SpreadMarket } from './exchange-quotes.ts';
+import { oilSpread } from '../modules/oil/spread.mjs';
 
-/** Current same-venue spread in percent, keyed by exchange id (for example `binance`). */
-export type VenueSpreads = Record<string, { premium: number | null; stale: boolean }>;
+/** Current same-venue spread in the market's unit (oil USDT/桶, Hynix percent), keyed by exchange id (for example `binance`). */
+export type VenueSpreads = Record<string, { value: number | null; stale: boolean }>;
 /** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. */
 export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'] };
 export type UnpairedReason = 'same-side' | 'multiple' | 'missing-leg';
@@ -21,7 +22,7 @@ export type PairTotals = {
 };
 export type SpreadPair =
   | { key: string; label: string; status: 'paired'; opening: number | null; current: number | null; currentStale: boolean;
-    /** Current minus opening, in percentage points. */
+    /** Current minus opening, in USDT/桶 for oil and percentage points for Hynix. */
     change: number | null;
     /** True when a falling spread profits this pair, i.e. the leg in the numerator is short. */
     narrowingFavors: boolean;
@@ -34,8 +35,8 @@ const HYNIX_UNITS = exchangeContracts.hynix.leftUnits;
  * Each market pairs a base leg with a quote leg; the opening spread uses the same
  * formula as the live exchange comparison so the two columns are comparable.
  */
-const PAIRS: Record<SpreadMarket, { base: readonly string[]; quote: readonly string[]; spread: (base: number, quote: number) => number; numerator: 'base' | 'quote' }> = {
-  oil: { base: ['CL'], quote: ['BZ'], spread: (cl, bz) => (bz - cl) / cl * 100, numerator: 'quote' },
+const PAIRS: Record<SpreadMarket, { base: readonly string[]; quote: readonly string[]; spread: (base: number, quote: number) => number | null; numerator: 'base' | 'quote' }> = {
+  oil: { base: ['CL'], quote: ['BZ'], spread: (cl, bz) => oilSpread(bz, cl), numerator: 'quote' },
   hynix: { base: ['SKHY'], quote: ['SKHX', 'SKHYNIX'], spread: (adr, ordinary) => (adr / (ordinary / HYNIX_UNITS) - 1) * 100, numerator: 'base' },
 };
 export const pairedMarket = (market: string): market is SpreadMarket => market === 'oil' || market === 'hynix';
@@ -99,7 +100,7 @@ export function relatedSpreadPairs(market: SpreadMarket, items: readonly HubPosi
     const [base] = group.base, [quote] = group.quote;
     if (base.side === quote.side) return { key, label: group.label, status: 'unpaired', reason: 'same-side' };
     const baseEntry = price(base.entryPrice), quoteEntry = price(quote.entryPrice), live = spreads?.[group.venue];
-    const opening = baseEntry !== null && quoteEntry !== null ? spec.spread(baseEntry, quoteEntry) : null, current = live?.premium ?? null;
+    const opening = baseEntry !== null && quoteEntry !== null ? spec.spread(baseEntry, quoteEntry) : null, current = live?.value ?? null;
     const closed = hasClosed(base.cycle) && hasClosed(quote.cycle) && (amount(base.cycle?.closedQuantity) ?? 0) > 0 && (amount(quote.cycle?.closedQuantity) ?? 0) > 0;
     const baseClose = closed ? price(base.cycle?.closePrice) : null, quoteClose = closed ? price(quote.cycle?.closePrice) : null;
     return {
