@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { HISTORY_REFRESH_MS, validateExchangeFundingHistory, type ExchangeFundingHistory } from "../lib/exchange-funding-history";
 import { validateOilHedgePrices, type OilHedgePrices } from "../lib/oil-hedge-prices";
-import { startActivityPolling } from "../lib/polling";
+import { HISTORY_TIMEOUT_MS, startActivityPolling } from "../lib/polling";
 
 type Source = "bybit" | "binance" | "prices";
 type HistoryData = { bybit?: ExchangeFundingHistory; binance?: ExchangeFundingHistory; prices?: OilHedgePrices };
@@ -29,6 +29,7 @@ export function useOilHedgeHistory(active: boolean) {
     const current = sources.map(source => {
       const polling = startActivityPolling({
         intervalMs: HISTORY_REFRESH_MS,
+        timeoutMs: HISTORY_TIMEOUT_MS,
         async load(signal) {
           const path = source === "prices" ? "funding-hedge/prices" : `exchanges/${source}/funding-history`;
           const response = await fetch(`/api/monitors/oil/${path}`, { cache: "no-store", signal });

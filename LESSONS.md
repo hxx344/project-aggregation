@@ -1609,6 +1609,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `crossex-holding-scenario-row-validity-20261105`；合并前审查发现；P1。
 
+### L099：全量历史读取的超时预算要按载荷与传输条件设定，内外两层超时只能保留一处
+
+**适用条件：** 浏览器按固定周期读取数百 KB 以上的全量历史（K 线、资金费结算、对冲价格等），并与报价轮询、SSE 共用同一主机的 HTTP/1.1 连接；或轮询框架已带截止时间，请求函数内又自行加了 `AbortSignal.timeout`。
+
+**根因：** Monitor 的历史读取与小体积报价共用 `startPolling` 默认 15 秒截止，请求函数里还各自套了一个 15 秒的 `AbortSignal.timeout`。原油 15 分钟 K 线约 2 万行、未压缩约 1 MB，每 60 秒全量重读；`8bc3bee` 把原油页改为 React 后，失败从数据说明里的一句“历史更新中断”改成带原因的红色提示，慢链路上超过 15 秒的读取因此变得显眼。只放宽轮询截止没有用，内层 15 秒超时仍会先中止请求。
+
+**以后做法：** 历史类读取统一使用 `HISTORY_TIMEOUT_MS`（30 秒），请求函数只透传轮询给出的 `signal`，不再自带第二个超时；报价等小体积读取保持 15 秒。新增历史类读取沿用同一常量。若线上仍超时，先取得同一次失败的响应头时间、正文完成时间和 Monitor 事件循环指标（`/api/monitors/perpetual/diagnostics` 的 `eventLoopP99Ms/eventLoopMaxMs`），再决定是改成增量协议还是减少同步写盘，不靠继续加大超时掩盖。
+
+**如何验证：** [原油历史超时浏览器回归](modules/monitor/tests/oil-history-timeout.browser.mjs) 用假时钟挂起 K 线响应：20 秒后才返回仍被采用且无提示；第二次读取 25 秒时无提示，31 秒时出现“数据读取超时”并保留已加载的数据。把 `HISTORY_TIMEOUT_MS` 改回 15 秒后该回归失败于第一段断言。
+
+**证据：** project-aggregation 基线 `b66cb0a` 的 [polling.ts](modules/monitor/lib/polling.ts) 与 [use-oil-feed.ts](modules/monitor/hooks/use-oil-feed.ts)。2026-11-05 用户截图显示实时报价正常、历史提示“数据读取超时”。本机实测客户端解析与校验约 30 ms，服务端读取为单行 SQLite 读取加 gzip，链路上未发现新增阻塞，也没有取得线上请求时序，不能断言每次超时都来自传输慢；重写只确认了提示变得显眼。
+
+**事件记录：** `monitor-history-read-timeout-20261105`；用户反馈；不推进主线复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。
