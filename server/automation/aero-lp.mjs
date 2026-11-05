@@ -80,6 +80,16 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       throw new HttpError(500, `启停设置保存失败，${unchanged}，请检查数据目录权限后重试`);
     }
   }
+  // Without a usable key nothing can sign either way, so the run intent is dropped only once the file
+  // says so: otherwise memory keeps enabled=true like the file, and the fault names the unsaved stop.
+  function abandonRun(reason) {
+    enabled = false;
+    try { persistWanted(); failure = reason; } catch (error) {
+      enabled = true;
+      log.warn?.({ type: 'aero-lp', err: error }, 'LP 启停设置保存失败');
+      failure = `${reason}；停止设置保存失败，磁盘上仍为启用，工作台重启后会再次尝试读取私钥（无法读取时不会签名），请检查数据目录权限`;
+    }
+  }
   const send = (message) => { try { if (child?.connected) child.send(message); } catch {} };
   function readKey() {
     const saved = readBounded(walletPath, 16 * 1024);
@@ -119,8 +129,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     if (readHold() === 'recovery') { heldByRecovery = true; failure = RECOVERY_HOLD; return; }
     heldByRecovery = false; childPaused = false; keyHanded = false;
     let key;
-    try { key = readKey(); } catch { failure = '已保存的私钥无法读取，请重新填写'; enabled = false; persistWanted(); return; }
-    if (!key) { failure = '请先填写钱包私钥'; enabled = false; persistWanted(); return; }
+    try { key = readKey(); } catch { abandonRun('已保存的私钥无法读取，请重新填写'); return; }
+    if (!key) { abandonRun('请先填写钱包私钥'); return; }
     const env = { ...process.env, NODE_ENV: 'production' };
     delete env.NODE_OPTIONS; delete env.NODE_PATH; delete env.AERO_LP_PRIVATE_KEY;
     generationStarted = now();
