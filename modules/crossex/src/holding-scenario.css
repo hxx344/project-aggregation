@@ -1,0 +1,26 @@
+.holding-scenario{border-top:1px solid var(--surface-4);padding:16px 20px;display:grid;gap:12px;min-width:0}
+.holding-heading{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.holding-heading h3{font-size:12px;color:var(--text-secondary);font-weight:600}
+.holding-heading h3 small{margin-left:6px;font-size:10px;color:var(--text-tertiary);font-weight:400}
+.holding-controls{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px 24px}
+.holding-controls label{display:grid;gap:6px;font-size:10px;color:var(--text-tertiary)}
+.holding-controls select{width:120px;height:32px}
+.holding-net{display:grid;gap:4px;min-width:0}
+.holding-net>span,.holding-net>small{font-size:10px;color:var(--text-tertiary)}
+.holding-net strong{font-size:18px;font-family:var(--font-mono);font-weight:500;overflow-wrap:anywhere}
+.holding-net strong small{font-size:10px}
+.holding-breakdown{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}
+.holding-breakdown>div{display:grid;gap:5px;min-width:0}
+.holding-breakdown dt{font-size:10px;color:var(--text-tertiary)}
+.holding-breakdown dd{font-size:12px;color:var(--text-secondary);overflow-wrap:anywhere}
+.holding-breakdown dd small{font-size:9px;color:var(--text-tertiary)}
+.holding-legs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.holding-leg{display:grid;gap:5px;padding:10px 12px;border:1px solid var(--surface-5);border-radius:5px;background:var(--surface-1);font-size:11px;color:var(--text-secondary);min-width:0;overflow-wrap:anywhere}
+.holding-leg>strong{font-size:11px;color:var(--text-primary);font-weight:550}
+.holding-leg b{font-weight:500}
+.holding-leg small{font-size:10px;color:var(--text-tertiary)}
+.holding-reasons{margin:0;padding-left:16px;font-size:11px;line-height:1.6;color:var(--warning)}
+.holding-assumptions{font-size:10px;line-height:1.6;color:var(--text-tertiary)}
+.holding-assumptions summary{cursor:pointer;color:var(--text-secondary)}
+.holding-assumptions p{margin-top:4px}
+@media(max-width:900px){.holding-breakdown{grid-template-columns:repeat(2,minmax(0,1fr))}.holding-legs{grid-template-columns:minmax(0,1fr)}}

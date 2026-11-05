@@ -1526,6 +1526,19 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `trading-browser-fixture-timing-drift-20261105`；夹具缺陷，非产品回归；P2。
 
+### L096：从机会行派生的估算必须继承该行的数据有效性，不能只看过期时间
+
+**适用条件：** 从服务端投影的机会行（带 `eligible`、`reason`、`expiresAt` 等字段）取部分字段，另行计算展示金额、情景或建议数量的前端或服务端代码。
+
+**根因：** #46 的 [持有期情景](modules/crossex/src/holding-scenario.ts) 最初只取资金费率、周期和 `expiresAt` 构造输入，丢弃了行的 `eligible/reason`。[服务端](modules/crossex/server/funding-opportunities.mjs) 会保留 Monitor 交易所离线、资金费时间异常等 `eligible=false` 但尚未到期的行；此时只要 CrossEx 盘口和费用仍新鲜，估算就返回 `complete=true` 和完整净额，页面没有离线提示。“未过期”不等于“数据有效”。
+
+**以后做法：** 派生计算把源行的有效性状态与原因一起带入，数据有效性问题（离线、时间异常、报价异常、未知原因）阻止给出完整结果并显示原因。策略状态（暂停开仓、充提准入等）与数据有效性分开，用完整字符串白名单列出允许继续估算的策略原因，前缀、拼接或未知原因默认阻止。读服务端代码确认 `reason` 的全部来源，不凭单个文案判断。
+
+**如何验证：** [情景测试](modules/crossex/tests/holding-scenario.test.mjs) 用真实服务端投影构造离线、资金费时间异常、策略状态与反向选腿的行，断言前两类不给完整净额且显示原因、策略状态不误阻止。去掉有效性检查后，离线与时间异常用例返回 `complete=true` 而失败。
+
+**证据：** project-aggregation 基线 `424869c` 的 #46 实现（2026-11-05）：独立审查静态确认 P1，修复前新增用例 7 通过 5 失败（离线与时间异常返回 `complete=true`）；修复后相关测试 32/32 通过，第二轮独立审查无新问题。合并前拦截，未发布。
+
+**事件记录：** `crossex-holding-scenario-row-validity-20261105`；合并前审查发现；P1。
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。
