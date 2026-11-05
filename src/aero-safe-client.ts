@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
-import type { AeroSafeAction, AeroSafeChain, AeroSafePoolPlan, AeroSafePreview, AeroSafeState } from './aero-safe-types';
+import type { AeroSafeAction, AeroSafeChain, AeroSafeChangeBatch, AeroSafePreview, AeroSafeState } from './aero-safe-types';
 
 export const AERO_SAFE_ROOT = '/api/automation/aero-safe';
 const message = (reason: unknown) => (reason instanceof Error ? reason.message : '请求失败，请重试。');
@@ -19,6 +19,25 @@ export function units(raw: string | number | null | undefined, decimals: number)
 }
 export const tokenOf = (chain: AeroSafeChain | null | undefined, address: string) => chain?.tokens.find((t) => t.address.toLowerCase() === address.toLowerCase());
 export const same = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+// 原始单位的十进制字符串 → 精确的代币数量文本（不舍入，供填回输入框）。
+export function exactUnits(raw: string, decimals: number) {
+  const value = BigInt(raw), scale = 10n ** BigInt(decimals);
+  const fraction = (value % scale).toString().padStart(decimals, '0').replace(/0+$/, '');
+  return fraction ? `${value / scale}.${fraction}` : `${value / scale}`;
+}
+// 代币数量文本 → 原始单位字符串；格式不符、超出精度或不为正时为 null。
+export function rawUnits(text: string, decimals: number) {
+  const match = /^(\d+)(?:\.(\d+))?$/.exec(text.trim());
+  if (!match || (match[2]?.length ?? 0) > decimals) return null;
+  const raw = BigInt(match[1]) * 10n ** BigInt(decimals) + BigInt((match[2] ?? '').padEnd(decimals, '0') || '0');
+  return raw > 0n ? String(raw) : null;
+}
+// 行情里的池子在白名单（同代币对与 tickSpacing）或待加池里（按地址）。
+export function poolStatus(state: AeroSafeState | null | undefined, pool: { address: string; tickSpacing: number; token0: { address: string }; token1: { address: string } }): 'listed' | 'queued' | null {
+  if (state?.config?.permissions.pools.some((p) => same(p.token0, pool.token0.address) && same(p.token1, pool.token1.address) && p.tickSpacing === pool.tickSpacing)) return 'listed';
+  if (state?.changes?.pools.some((p) => same(p.address, pool.address))) return 'queued';
+  return null;
+}
 
 // 页面与池详情面板共用：任务运行或交易待确认时每 3 秒轮询，否则 15 秒。
 export function useAeroSafe(onExpired: () => void) {
@@ -68,17 +87,17 @@ export function useAeroSafe(onExpired: () => void) {
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);
-  // 加池批次：成功时同步最新状态并返回批次；失败放进 actionError 返回 null。
-  const planPool = useCallback(async (body: { pool: string; allowances: Record<string, string> }): Promise<AeroSafePoolPlan | null> => {
+  // 生成白名单变更批次：成功时同步最新状态并返回批次；失败放进 actionError 返回 null。
+  const buildBatch = useCallback(async (): Promise<AeroSafeChangeBatch | null> => {
     const signal = lifetime.current?.signal;
     if (busyRef.current || !signal || signal.aborted) return null;
-    busyRef.current = 'plan'; setBusy('plan'); setActionError('');
+    busyRef.current = 'batch'; setBusy('batch'); setActionError('');
     generation.current++;
-    try { const data = await api<AeroSafePoolPlan>(`${AERO_SAFE_ROOT}/pools/plan`, { method: 'POST', body: JSON.stringify(body), signal, timeoutMs: 120_000 }); if (!signal.aborted) setState(data.state); return data; }
+    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: 30_000 }); if (!signal.aborted) setState(data.state); return data; }
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);
-  return { state, loadError, busy, actionError, setActionError, read, call, execute, preview, planPool };
+  return { state, loadError, busy, actionError, setActionError, read, call, execute, preview, buildBatch };
 }
 export type AeroSafe = ReturnType<typeof useAeroSafe>;
 

@@ -317,7 +317,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (url.search) throw new HttpError(400, 'Aero 实盘接口不接受查询参数');
       if (pathname === '/api/automation/aero-safe' && method === 'GET') return reply(200, aeroSafe.state());
       const routes = { 'PUT /config': 'save', 'PUT /wallet': 'setKey', 'POST /wallet/clear': 'clearKey', 'POST /refresh': 'refresh', 'POST /preview': 'preview', 'POST /execute': 'execute', 'PUT /auto': 'setAuto', 'POST /auto/discard': 'discardAuto',
-        'POST /pools/plan': 'planPool', 'POST /pools/apply': 'applyPool', 'POST /pools/discard': 'discardPoolPlan' };
+        'POST /changes/pool': 'addPoolChange', 'POST /changes/allowances': 'setAllowanceChanges', 'POST /changes/remove': 'removePoolChange',
+        'POST /changes/batch': 'buildChangeBatch', 'POST /changes/apply': 'applyChangeBatch', 'POST /changes/clear': 'clearChanges' };
       const action = routes[`${method} ${pathname.slice('/api/automation/aero-safe'.length)}`];
       if (!action) throw new HttpError(404, 'Aero 实盘接口不存在');
       const body = await bodyOf();
@@ -329,7 +330,9 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize)); }
       if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize)); }
       if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize)); }
-      if (action === 'planPool') { only('pool', 'allowances'); return reply(200, await aeroSafe.planPool(body, authorize)); }
+      if (action === 'addPoolChange') { only('pool', 'allowances'); return reply(200, await aeroSafe.addPoolChange(body, authorize)); }
+      if (action === 'setAllowanceChanges') { only('allowances'); return reply(200, await aeroSafe.setAllowanceChanges(body.allowances, authorize)); }
+      if (action === 'removePoolChange') { only('pool'); return reply(200, await aeroSafe.removePoolChange(body, authorize)); }
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await aeroSafe[action](authorize));
     }

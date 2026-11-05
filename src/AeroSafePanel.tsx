@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
-import { CircleAlert, Download, ListPlus, LoaderCircle, Play, ScanSearch, ShieldCheck } from 'lucide-react';
+import { CircleAlert, ListPlus, LoaderCircle, Play, ScanSearch, ShieldCheck } from 'lucide-react';
 import type { MarketPool } from './aero-market-types';
-import type { AeroSafePoolPlan, AeroSafePreview } from './aero-safe-types';
-import { same, tokenOf, units, useAeroSafe } from './aero-safe-client';
+import type { AeroSafePreview } from './aero-safe-types';
+import { exactUnits, rawUnits, same, tokenOf, units, useAeroSafe } from './aero-safe-client';
 import { openAeroTab } from './aero-nav';
 import './aero-safe.css';
 
 const PREVIEW_TTL_MS = 2 * 60_000;
+type OpenCap = { usd: number; usd0: number; usd1: number };
 // 新代币每日额度的默认值：约合这么多美元（按市场页的代币价折算），可改。
 const DEFAULT_ALLOWANCE_USD = 1000;
 
@@ -18,65 +19,46 @@ function defaultAllowance(usd: number | null, decimals: number) {
   return text.includes('.') ? text.replace(/0+$/, '').replace(/\.$/, '') : text;
 }
 
-// 原始单位的十进制字符串 → 精确的代币数量文本（不舍入，供重新生成同一批次）。
-function exactUnits(raw: string, decimals: number) {
-  const value = BigInt(raw), scale = 10n ** BigInt(decimals);
-  const fraction = (value % scale).toString().padStart(decimals, '0').replace(/0+$/, '');
-  return fraction ? `${value / scale}.${fraction}` : `${value / scale}`;
-}
-
-// 不在白名单的池子：生成增量 Safe 批次（新 gauge、mint/质押权限、新代币授权与额度、该池两个方向的兑换），
+// 不在白名单的池子：加入待加池（可多个并行），在「配置」→ 白名单变更里合成一份 Safe 批次，
 // 硬件钱包在 Safe{Wallet} 执行后，服务端以 bot 身份模拟核对生效，再并入配置。
 function AddPool({ pool, safe }: { pool: MarketPool; safe: ReturnType<typeof useAeroSafe> }) {
-  const { state, busy, call, planPool } = safe;
+  const { state, busy, call } = safe;
   const known = state?.config?.permissions.allowances ?? [];
-  const fresh = [pool.token0, pool.token1].filter((t) => !known.some((a) => same(a.token, t.address)));
-  const saved = state?.poolPlan;
-  const mine = saved && same(saved.pool.address, pool.address) ? saved : null;
-  // 已有本池的计划时沿用其中的额度（按当前币价重算会生成不同的批次，与已执行的批次对不上）。
-  const [amounts, setAmounts] = useState<Record<string, string>>(() => Object.fromEntries(fresh.map((t) => {
-    const kept = mine && !mine.stale ? mine.pool.allowances.find((a) => same(a.token, t.address)) : null;
-    return [t.address, kept ? exactUnits(kept.perDay, kept.decimals) : defaultAllowance(t.usd, t.decimals)];
-  })));
-  const [plan, setPlan] = useState<AeroSafePoolPlan | null>(null);
-  const current = plan && mine && same(plan.pool.address, pool.address) && plan.pool.transactions === mine.pool.transactions ? plan : null;
-  const missing = fresh.find((t) => !/^\d+(\.\d+)?$/.test(amounts[t.address] ?? '') || Number(amounts[t.address]) <= 0);
-  const generate = async () => {
+  const changes = state?.changes;
+  const queued = changes?.pools.find((p) => same(p.address, pool.address));
+  const pendingOf = (token: string) => changes?.allowances.find((a) => same(a.token, token));
+  // 已有额度（配置或其他待加池）的代币沿用；只有全新的代币要填。
+  const fresh = [pool.token0, pool.token1].filter((t) => !known.some((a) => same(a.token, t.address)) && !pendingOf(t.address));
+  const [amounts, setAmounts] = useState<Record<string, string>>(() => Object.fromEntries(fresh.map((t) => [t.address, defaultAllowance(t.usd, t.decimals)])));
+  const missing = fresh.find((t) => rawUnits(amounts[t.address] ?? '', t.decimals) === null);
+  const add = () => {
     if (missing) return;
-    const data = await planPool({ pool: pool.address, allowances: Object.fromEntries(fresh.map((t) => [t.address, amounts[t.address]])) });
-    if (data) setPlan(data);
+    void call('queue', '/changes/pool', 'POST', { pool: pool.address, allowances: Object.fromEntries(fresh.map((t) => [t.address, amounts[t.address]])) }, 120_000);
   };
-  const download = () => {
-    if (!current) return;
-    const url = URL.createObjectURL(new Blob([`${JSON.stringify(current.builder, null, 2)}\n`], { type: 'application/json' }));
-    const link = document.createElement('a');
-    link.href = url; link.download = `aero-add-pool-${current.pool.name.replace(/[^\w.-]+/g, '-')}.json`;
-    document.body.append(link); link.click(); link.remove();
-    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
-  };
-  const usage = current?.usage.length ? Math.max(...current.usage.map((u) => u.nodes)) : null;
+  const others = (changes?.pools.length ?? 0) - (queued ? 1 : 0);
+  if (queued) {
+    const newTokens = [queued.token0, queued.token1].filter((t) => !known.some((a) => same(a.token, t.address)));
+    return <>
+      <p className="as-muted">这个池子已在待加池里（{new Date(queued.addedAt).toLocaleString('zh-CN')} 加入）{others ? `，另有 ${others} 个待加池` : ''}。在「配置」→ 白名单变更里生成 Safe 批次，由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后核对启用。</p>
+      {newTokens.length ? <p className="as-muted">新代币每日额度：{newTokens.map((t) => { const a = pendingOf(t.address); return `${t.symbol} ${a ? exactUnits(a.perDay, a.decimals) : '—'}`; }).join('；')}（可在白名单变更里修改）</p> : null}
+      <div className="as-form">
+        <button type="button" className="button primary" onClick={() => openAeroTab('config')}><ShieldCheck size={15} />前往「配置」生成批次</button>
+        <button type="button" className="button secondary" disabled={!!busy} onClick={() => void call('unqueue', '/changes/remove', 'POST', { pool: pool.address })}>移出待加池</button>
+      </div>
+    </>;
+  }
   return <>
-    <p className="as-muted">这个池子不在 Roles 白名单里，bot 还不能在此开仓。可以生成一份加池 Safe 批次：增加该池的 gauge、开仓与质押权限、新代币的授权与每日额度，以及该池两个方向的配平兑换；由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后启用。</p>
-    {saved && !mine ? <p className="as-muted">已有另一个待启用的加池计划（{saved.pool.name}）；在这里生成会替换它。</p> : null}
-    {mine?.stale ? <p className="as-muted">之前生成的批次之后 Safe 配置已变化，请重新生成。</p> : null}
+    <p className="as-muted">这个池子不在 Roles 白名单里，bot 还不能在此开仓。加入待加池后，可与其他待加池、额度调整合成一份 Safe 批次：增加该池的 gauge、开仓与质押权限、新代币的授权与每日额度，以及该池两个方向的配平兑换；由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后启用。</p>
+    {others ? <p className="as-muted">已有 {others} 个待加池，会合进同一份批次。</p> : null}
     <div className="as-form">
       {fresh.map((t) => <label key={t.address}>{t.symbol} 每日额度
         <input inputMode="decimal" value={amounts[t.address] ?? ''} onChange={(e) => setAmounts((prev) => ({ ...prev, [t.address]: e.target.value.trim() }))} />
         <small className="as-muted">{t.usd && Number(amounts[t.address]) > 0 ? `约 $${Math.round(Number(amounts[t.address]) * t.usd).toLocaleString('zh-CN')}` : '\u00a0'}</small>
       </label>)}
       {fresh.length === 0 ? <span className="as-muted">两种代币已有每日额度，沿用现有额度。</span> : null}
-      <button type="button" className="button secondary" disabled={!!busy || !!missing} title={missing ? `请填写 ${missing.symbol} 的每日额度` : undefined} onClick={() => void generate()}>{busy === 'plan' ? <LoaderCircle size={15} className="spin" /> : <ListPlus size={15} />}生成 Safe 批次</button>
+      <button type="button" className="button secondary" disabled={!!busy || !!missing} title={missing ? `请填写 ${missing.symbol} 的每日额度` : undefined} onClick={add}>{busy === 'queue' ? <LoaderCircle size={15} className="spin" /> : <ListPlus size={15} />}加入待加池</button>
     </div>
-    {fresh.length ? <p className="as-muted">每日额度是 bot 每 24 小时最多能投入开仓或卖出兑换的数量，bot 私钥泄露时损失也以此为上限；已有代币的额度不在这里修改。</p> : null}
-    {current ? <>
-      <p className="as-muted">批次共 {current.transactions.length} 笔{usage !== null ? `，条件树最多用到 ${usage}/255 个节点` : ''}。下载后在 Safe{'{'}Wallet{'}'} →「应用」→ Transaction Builder 拖入 JSON（提示无法校验 checksum 属正常），逐笔核对后用硬件钱包签名执行；同一批次只执行一次，重复执行会把新代币当天的额度重置为满额。</p>
-      <details className="as-muted"><summary>批次明细</summary><ol>{current.transactions.map((t, i) => <li key={i}>{t.description}</li>)}</ol></details>
-      <div className="as-form"><button type="button" className="button secondary" onClick={download}><Download size={15} />下载批次 JSON</button></div>
-    </> : mine && !mine.stale ? <p className="as-muted">{new Date(mine.createdAt).toLocaleString('zh-CN')} 已生成 {mine.pool.transactions} 笔的批次；如需重新下载，请再点一次「生成 Safe 批次」（沿用相同额度，内容相同）。</p> : null}
-    {mine && !mine.stale ? <div className="as-form">
-      <button type="button" className="button primary" disabled={!!busy || !state?.wallet} title={!state?.wallet ? '请先在 Aero「配置」填写 bot 私钥' : undefined} onClick={() => void call('apply', '/pools/apply', 'POST', {}, 120_000)}>{busy === 'apply' ? <LoaderCircle size={15} className="spin" /> : <ShieldCheck size={15} />}已执行，核对并启用</button>
-      <button type="button" className="button secondary" disabled={!!busy} onClick={() => { setPlan(null); void call('discard', '/pools/discard', 'POST', {}); }}>放弃</button>
-    </div> : null}
+    {fresh.length ? <p className="as-muted">每日额度是 bot 每 24 小时最多能投入开仓或卖出兑换的数量，bot 私钥泄露时损失也以此为上限；已有代币的额度在「配置」→ 白名单变更里调整。</p> : null}
   </>;
 }
 
@@ -86,12 +68,18 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
   const safe = useAeroSafe(onExpired);
   const { state, loadError, busy, actionError, execute, preview: requestPreview } = safe;
   const [shareText, setShareText] = useState('100');
+  const [capText, setCapText] = useState('');
   const [rebalance, setRebalance] = useState(true);
-  const [preview, setPreview] = useState<{ key: string; data: AeroSafePreview; at: number } | null>(null);
+  const [preview, setPreview] = useState<{ key: string; data: AeroSafePreview; at: number; cap: OpenCap | null } | null>(null);
   const [clock, setClock] = useState(() => Date.now());
   const share = Number(shareText);
   const shareBps = Number.isFinite(share) && share > 0 && share <= 100 ? Math.round(share * 100) : null;
-  const key = `${range[0]}:${range[1]}:${shareBps}:${rebalance}`;
+  // 投入上限（美元，选填）：按行情里的两币美元价估值，超过时两币等比缩小；开仓沿用预览时的价格。
+  const capUsd = capText.trim() === '' ? null : Number(capText);
+  const priced = !!pool.token0.usd && pool.token0.usd > 0 && !!pool.token1.usd && pool.token1.usd > 0;
+  const capInvalid = capUsd !== null && (!Number.isFinite(capUsd) || capUsd <= 0 || !priced);
+  const cap: OpenCap | null = capUsd !== null && !capInvalid ? { usd: capUsd, usd0: pool.token0.usd!, usd1: pool.token1.usd! } : null;
+  const key = `${range[0]}:${range[1]}:${shareBps}:${rebalance}:${capUsd ?? ''}`;
   const whitelisted = state?.config?.permissions.pools.find((p) => (same(p.token0, pool.token0.address) && same(p.token1, pool.token1.address) && p.tickSpacing === pool.tickSpacing));
   const chainPool = state?.chain?.pools.find((p) => same(p.address, pool.address));
   const job = state?.job;
@@ -109,22 +97,22 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
   const amount = (raw: string | null | undefined, token: typeof t0) => (token ? `${units(raw, token.decimals)} ${token.symbol}` : '—');
 
   const runPreview = async () => {
-    if (shareBps === null) return;
-    const data = await requestPreview({ pool: pool.address, tickLower: range[0], tickUpper: range[1], shareBps, rebalance });
-    if (data) { const at = Date.now(); setPreview({ key, data, at }); setClock(at); }
+    if (shareBps === null || capInvalid) return;
+    const data = await requestPreview({ pool: pool.address, tickLower: range[0], tickUpper: range[1], shareBps, rebalance, ...(cap ? { cap } : {}) });
+    if (data) { const at = Date.now(); setPreview({ key, data, at, cap }); setClock(at); }
   };
   const open = () => {
     if (!preview || preview.key !== key || expired || shareBps === null) return;
     const p = preview.data;
     const slippage = (state?.config?.slippageBps ?? 50) / 100;
     const lines = [`在 ${pool.token0.symbol}/${pool.token1.symbol} CL${pool.tickSpacing} 开仓：tick ${range[0]} 至 ${range[1]}`,
-      `投入 Safe 余额的 ${shareBps / 100}%：${amount(p.amount0, t0)} + ${amount(p.amount1, t1)}`,
+      `投入 Safe 余额的 ${shareBps / 100}%${preview.cap ? `，上限 $${preview.cap.usd.toLocaleString('zh-CN')}${p.capped ? '（已按上限缩减）' : '（未触及）'}` : ''}：${amount(p.amount0, t0)} + ${amount(p.amount1, t1)}`,
       p.swap ? `先配平兑换 ${amount(p.swap.amountIn, tokenOf(state?.chain, p.swap.tokenIn))}` : '不兑换',
       `兑换与开仓的最小成交量按报价扣 ${slippage}% 滑点；执行时余额偏离预览超过 1%、配平兑换超出预览 10% 或方向改变都会停止。`,
       '开仓后自动质押到 gauge；提前解押会被罚没部分奖励。'];
     if (state?.pending?.stale) lines.push(`上一笔交易（${state.pending.label}）超过 10 分钟未上链，本次会用同一 nonce 提价替换它。`);
     const expect = { previewedAt: p.previewedAt, amount0: p.amount0, amount1: p.amount1, swapIn: p.swap?.amountIn ?? null, swapTokenIn: p.swap?.tokenIn ?? null };
-    if (window.confirm(`${lines.join('\n')}\n\n确认由 bot 经 Roles 发送？`)) void execute('open', { pool: pool.address, tickLower: range[0], tickUpper: range[1], shareBps, rebalance, expect });
+    if (window.confirm(`${lines.join('\n')}\n\n确认由 bot 经 Roles 发送？`)) void execute('open', { pool: pool.address, tickLower: range[0], tickUpper: range[1], shareBps, rebalance, ...(preview.cap ? { cap: preview.cap } : {}), expect });
   };
 
   const body = () => {
@@ -140,12 +128,14 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
       </div>
       <div className="as-form">
         <label>投入比例（%）<input type="number" min={1} max={100} step={1} value={shareText} onChange={(e) => setShareText(e.target.value)} /></label>
+        <label>投入上限（美元，选填）<input inputMode="decimal" placeholder="不限" value={capText} onChange={(e) => setCapText(e.target.value)} />
+          {capInvalid ? <small className="as-muted">{priced ? '须为正数' : '行情缺少代币美元价，暂不能按美元设上限'}</small> : null}</label>
         <label className="as-check"><input type="checkbox" checked={rebalance} onChange={(e) => setRebalance(e.target.checked)} />按区间比例先兑换配平</label>
         <span className="as-range">tick {range[0]} 至 {range[1]}</span>
-        <button type="button" className="button secondary" disabled={!!busy || shareBps === null || range[0] >= range[1]} onClick={() => void runPreview()}>{busy === 'preview' ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}预览</button>
-        <button type="button" className="button primary" disabled={!!busy || !!blocked || !preview || !!stale} title={blocked ?? (stale ? (expired ? '预览已过期，请重新预览' : '区间或比例已改变，请重新预览') : !preview ? '请先预览' : undefined)} onClick={open}>{busy === 'open' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开仓并质押</button>
+        <button type="button" className="button secondary" disabled={!!busy || shareBps === null || capInvalid || range[0] >= range[1]} onClick={() => void runPreview()}>{busy === 'preview' ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}预览</button>
+        <button type="button" className="button primary" disabled={!!busy || !!blocked || !preview || !!stale} title={blocked ?? (stale ? (expired ? '预览已过期，请重新预览' : '区间、比例或上限已改变，请重新预览') : !preview ? '请先预览' : undefined)} onClick={open}>{busy === 'open' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开仓并质押</button>
       </div>
-      {preview && !stale ? <p className="as-muted">预览：投入 {amount(preview.data.amount0, t0)} + {amount(preview.data.amount1, t1)}；{preview.data.swap ? `兑换 ${amount(preview.data.swap.amountIn, tokenOf(state.chain, preview.data.swap.tokenIn))}${preview.data.swap.quoted ? ` → 约 ${amount(preview.data.swap.quoted, tokenOf(state.chain, preview.data.swap.tokenOut))}` : '（授权后再报价）'}` : '无需兑换'}；预计存入约 {amount(preview.data.deposit0, t0)} + {amount(preview.data.deposit1, t1)}，零头留在 Safe。</p> : null}
+      {preview && !stale ? <p className="as-muted">预览：投入 {amount(preview.data.amount0, t0)} + {amount(preview.data.amount1, t1)}{preview.data.capped ? `（已按上限 $${preview.cap?.usd.toLocaleString('zh-CN')} 缩减）` : ''}；{preview.data.swap ? `兑换 ${amount(preview.data.swap.amountIn, tokenOf(state.chain, preview.data.swap.tokenIn))}${preview.data.swap.quoted ? ` → 约 ${amount(preview.data.swap.quoted, tokenOf(state.chain, preview.data.swap.tokenOut))}` : '（授权后再报价）'}` : '无需兑换'}；预计存入约 {amount(preview.data.deposit0, t0)} + {amount(preview.data.deposit1, t1)}，零头留在 Safe。</p> : null}
       {preview && expired && preview.key === key ? <p className="as-muted">预览已超过 2 分钟，请重新预览后再开仓。</p> : null}
       {blocked && state.wallet ? <p className="as-muted">{blocked}</p> : null}
     </>;

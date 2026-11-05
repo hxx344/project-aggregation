@@ -217,11 +217,15 @@ test('add-pool update batch only scopes what changed and never resets an existin
   assert.equal(allowances.length, 1);
   assert.equal(allowances[0].args[0], next.allowances.find((a) => a.token === WETH).key);
   assert.ok(!calls.some((c) => c.name === 'assignRoles' || c.name === 'setTransactionUnwrapper'));
-  // Nothing changed → nothing to sign; dropping a pool or changing an existing allowance is refused.
+  // Nothing changed → nothing to sign; dropping a pool is refused.
   assert.deepEqual(buildUpdateBatch({ current: permissions, next: permissions, roles: ROLES_ADDR }), []);
   assert.throws(() => buildUpdateBatch({ current: next, next: permissions, roles: ROLES_ADDR }), /drop/);
+  // Changing one daily amount re-issues only that allowance, with balance = refill = maxRefill = the new amount.
   const bumped = buildPermissions({ ...config, allowances: config.allowances.map((a, i) => (i === 0 ? { ...a, perDay: '1' } : a)) });
-  assert.throws(() => buildUpdateBatch({ current: permissions, next: bumped, roles: ROLES_ADDR }), /must not change/);
+  const adjust = buildUpdateBatch({ current: permissions, next: bumped, roles: ROLES_ADDR }).map((t) => ROLES_ABI.parseTransaction({ data: t.data }));
+  assert.deepEqual(adjust.map((c) => c.name), ['setAllowance']);
+  assert.equal(adjust[0].args[0], permissions.allowances[0].key);
+  assert.deepEqual([adjust[0].args[1], adjust[0].args[2], adjust[0].args[3], adjust[0].args[4], adjust[0].args[5]], [1n, 1n, 1n, 86400n, 0n]);
 });
 
 test('the whitelist fills up at the Roles 255-node limit with about 13 pools', () => {

@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import { ArrowLeftRight, CircleAlert, Coins, KeyRound, LoaderCircle, Repeat, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
 import type { AeroAutoConfig, AeroAutoState, AeroSafeConfig as SafeConfig, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
 import type { AeroSafe } from './aero-safe-client';
+import { AeroSafeChanges } from './AeroSafeChanges';
 import { autoSellNote, rewardSellTarget, same, tokenOf, units } from './aero-safe-client';
 import type { AeroMarket } from './aero-market-client';
 import { amount, days, pct, signed, usd } from './aero-market-format';
@@ -341,6 +342,8 @@ export function AeroSafeConfig({ safe }: { safe: AeroSafe }) {
           <div className="lp-key-actions"><button className="button primary" type="submit" disabled={!!busy || running || !privateKey.trim()}>{busy === 'key' ? <LoaderCircle size={15} className="spin" /> : <KeyRound size={15} />}保存私钥</button>{state.wallet ? <button className="button secondary" type="button" disabled={!!busy || running} onClick={() => void clearKey()}><Trash2 size={15} />清除私钥</button> : null}</div>
         </form>
       </section>
+
+      <AeroSafeChanges safe={safe} />
 
       <form className="panel lp-section" onSubmit={(e) => void save(e)} noValidate aria-label="Safe 配置"><div className="panel-heading"><h2>Safe 配置</h2><span className="muted">保存时核对 chainId、Roles 的 avatar/target 与 Safe 已启用该模块</span></div>
         <fieldset disabled={!!busy || running}>
