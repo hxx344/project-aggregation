@@ -17,13 +17,19 @@ const LEGACY_PERCENT_SUFFIX = '（原百分比）';
  * condition is dropped. The converted config is written back on the next persist (a save,
  * an alert event or the first tick), after which the dropped duplicates are gone for good.
  */
+// The label limit counts UTF-16 units (as validateConfig and the input's maxLength do); cut on whole code points.
+function truncateUnits(text, max) {
+  let out = '';
+  for (const char of text) { if (out.length + char.length > max) break; out += char; }
+  return out;
+}
 export function migrateLegacyConfig(input) {
   if (!input || !Array.isArray(input.rules) || !input.rules.some(rule => rule?.metric === 'spreadPercent')) return input;
   const condition = rule => JSON.stringify([rule.metric, rule.operator, rule.threshold]);
   const kept = new Set(input.rules.filter(rule => rule?.metric !== 'spreadPercent').map(condition));
   const rules = input.rules.flatMap(rule => {
     if (rule?.metric !== 'spreadPercent') return [rule];
-    const label = typeof rule.label === 'string' ? `${Array.from(rule.label.trim()).slice(0, 60 - LEGACY_PERCENT_SUFFIX.length).join('')}${LEGACY_PERCENT_SUFFIX}` : rule.label;
+    const label = typeof rule.label === 'string' ? `${truncateUnits(rule.label.trim(), 60 - LEGACY_PERCENT_SUFFIX.length)}${LEGACY_PERCENT_SUFFIX}` : rule.label;
     const next = { ...rule, label, metric: 'spread', enabled: false };
     if (kept.has(condition(next))) return [];
     kept.add(condition(next));

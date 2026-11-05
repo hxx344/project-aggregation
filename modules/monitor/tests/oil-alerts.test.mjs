@@ -51,12 +51,13 @@ test('oil alerts use the absolute Brent − WTI spread; percentage rules are onl
 
   const directory = await mkdtemp(path.join(os.tmpdir(), 'oil-legacy-'));
   try {
-    const legacy = [rule({ id: 'p5', label: '价差 5%', metric: 'spreadPercent' }), rule({ id: 'p4', label: '价差 4%', metric: 'spreadPercent', threshold: 4 }), rule({ id: 'abs4', label: '已有 4', threshold: 4 })];
+    const legacy = [rule({ id: 'p5', label: '价差 5%', metric: 'spreadPercent' }), rule({ id: 'p4', label: '价差 4%', metric: 'spreadPercent', threshold: 4 }), rule({ id: 'abs4', label: '已有 4', threshold: 4 }), rule({ id: 'emoji', label: '🛢'.repeat(30), metric: 'spreadPercent', threshold: 6 })];
     await writeFile(path.join(directory, 'monitor.json'), JSON.stringify({ ...emptyStore(), config: { enabled: true, rules: legacy }, states: { p5: { active: true, alerted: true, lastSentAt: 1, nextAttemptAt: 0 } } }));
     const stored = await new FileStore(directory, true).read(), { config } = stored;
     assert.deepEqual(config.rules.map(item => [item.id, item.metric, item.threshold, item.enabled, item.label]), [
       ['p5', 'spread', 5, false, '价差 5%（原百分比）'],
       ['abs4', 'spread', 4, true, '已有 4'],
+      ['emoji', 'spread', 6, false, `${'🛢'.repeat(27)}（原百分比）`],
     ], 'converted rules keep their numbers but stay off; a duplicate of an existing condition is dropped');
     const f = fixture({ data: stored });
     const enabled = { ...config, rules: config.rules.map(item => ({ ...item, enabled: true })) };
