@@ -12,6 +12,7 @@ import { emissionRate, liquiditySegments, priceChange, realizedVol, solvePrices,
 import * as chainReads from './aero-market-rpc.mjs';
 import { scrubRpcMessage } from './aero-market-rpc.mjs';
 import { openMarketSamples, SAMPLE_WINDOWS } from './aero-market-samples.mjs';
+import { MIN_REPLAY_HOURS, rebalanceCostFraction, replayPool } from './aero-market-replay.mjs';
 
 const HOUR = 3600;
 const HISTORY_SEC = 7 * 86400;
@@ -49,6 +50,9 @@ const LIQUIDITY_RPC_TIMEOUT_MS = 10_000;
 const MAX_FAVORITES = 500;
 // 详情页长周期价格图：本机历史只有 7 天，更早的整点取自样本库（保留 30 天）。
 const PRICE_HISTORY_SEC = 30 * 86400;
+// 一次回放请求最多的池子数：请求体上限 32 KB，页面按这个数分批。
+export const MAX_REPLAY_POOLS = 250;
+const MAX_REPLAY_DEPOSIT = 1e9, MAX_REPLAY_DELAY_MIN = 1440;
 
 export const DEFAULT_CONFIG = Object.freeze({
   enabled: true, intervalMin: 15, minTvlUsd: 50_000,
@@ -77,6 +81,21 @@ export function strictMarketConfig(value) {
 }
 
 // 收藏为 "链:池子地址"（小写）列表，按加入顺序保存，去重。
+// 回放请求：窗口、投入、停摆与 [链, 池地址, 区间格数（0 为全范围）] 列表；格数由页面按推荐区间给出（推荐搜索只在页面实现）。
+export function strictReplayRequest(value) {
+  if (!exactKeys(value, ['window', 'deposit', 'delayMin', 'pools'])) throw new HttpError(400, '回放请求包含缺失或不支持的字段');
+  if (!Object.hasOwn(SAMPLE_WINDOWS, value.window)) throw new HttpError(400, `窗口须为 ${Object.keys(SAMPLE_WINDOWS).join('、')} 之一`);
+  if (typeof value.deposit !== 'number' || !(value.deposit > 0) || value.deposit > MAX_REPLAY_DEPOSIT) throw new HttpError(400, '投入金额须为正数');
+  if (typeof value.delayMin !== 'number' || !(value.delayMin >= 0) || value.delayMin > MAX_REPLAY_DELAY_MIN) throw new HttpError(400, `停摆须为 0–${MAX_REPLAY_DELAY_MIN} 分钟`);
+  if (!Array.isArray(value.pools) || value.pools.length > MAX_REPLAY_POOLS) throw new HttpError(400, `池子列表须为不超过 ${MAX_REPLAY_POOLS} 项的数组`);
+  const pools = value.pools.map((p) => {
+    if (!Array.isArray(p) || p.length !== 3 || !chainById.has(p[0]) || typeof p[1] !== 'string' || !/^0x[0-9a-f]{40}$/.test(p[1])
+      || !Number.isInteger(p[2]) || p[2] < 0 || p[2] > 2 * 887272) throw new HttpError(400, '池子项须为 [链, 小写池地址, 区间格数]');
+    return { chain: p[0], address: p[1], cells: p[2] };
+  });
+  return { window: value.window, deposit: value.deposit, delayMin: value.delayMin, pools };
+}
+
 export function strictFavorites(value) {
   if (!Array.isArray(value) || value.length > MAX_FAVORITES) throw new HttpError(400, `收藏须为不超过 ${MAX_FAVORITES} 个池子的列表`);
   const ids = new Set(AERO_CHAINS.map((c) => c.id)), out = [];
@@ -553,6 +572,34 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       const on = new Set(enabled);
       // 与列表一致：停用的链不返回样本。
       return { ...result, tag, pools: Object.fromEntries(Object.entries(result.pools).filter(([k]) => on.has(k.slice(0, k.indexOf(':'))))) };
+    },
+    // 历史回放：按窗口取每个池子的逐小时序列，用页面给的格数与当前读数估算的单次调仓成本重放自动调仓策略。
+    // 停用的链、不在跟踪中的池子、样本不足 MIN_REPLAY_HOURS 的池子不返回。
+    async replay(value) {
+      const request = strictReplayRequest(value);
+      const empty = (error) => ({ window: request.window, available: false, error, version: samples?.status().version ?? 0, pools: {} });
+      if (!samples) return empty(null);
+      let store;
+      try { store = await samples.series(); } catch (reason) { return empty(String(reason?.message || reason).slice(0, 240)); }
+      if (!store) return empty(samples.status().error);
+      const nowSec = Math.floor(now() / 1000), from = Math.floor(nowSec / HOUR) * HOUR - SAMPLE_WINDOWS[request.window] + HOUR;
+      const pools = {}, rowsOf = new Map();
+      for (const { chain, address, cells } of request.pools) {
+        if (!config.enabled || !config.chains[chain].enabled) continue;
+        if (!rowsOf.has(chain)) rowsOf.set(chain, new Map(runtimes.get(chain).rows.map((r) => [r.address, r])));
+        const row = rowsOf.get(chain).get(address), key = `${chain}:${address}`, s = store.get(key);
+        if (!row || !s) continue;
+        const i = s.slots.findIndex((slot) => slot >= from);
+        if (i < 0) continue;
+        const view = Object.fromEntries(Object.entries(s).map(([f, list]) => [f, list.slice(i)]));
+        const result = replayPool(view, { tickSpacing: row.tickSpacing, decimals0: row.token0.decimals, decimals1: row.token1.decimals, cells,
+          costFraction: rebalanceCostFraction(row, request.deposit), deposit: request.deposit, delaySec: request.delayMin * 60 });
+        if (!result || result.hours < MIN_REPLAY_HOURS) continue;
+        const r = (v, d = 5) => Number(v.toPrecision(d));
+        pools[key] = { hours: r(result.hours, 4), net: r(result.net), emission: r(result.emission), impermanent: r(result.impermanent), cost: r(result.cost),
+          rebalances: result.rebalances, intraHour: r(result.intraHour, 3), inRange: r(result.inRange, 3), missingHours: r(result.missingHours, 3), apr: r(result.apr) };
+      }
+      return { window: request.window, available: true, error: null, version: samples.status().version, from: from * 1000, pools };
     },
     async initialize() {
       if (initialized) return;

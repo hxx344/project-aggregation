@@ -8,6 +8,36 @@ export const SAMPLE_WINDOWS = Object.freeze({ '24h': 86400, '3d': 3 * 86400, '7d
 // 每个池子最多返回这么多个样本：窗口越长抽样越稀，接口体积与窗口长度无关（约 400 个池子 × 24 点）。
 export const MAX_SAMPLES_PER_POOL = 24;
 const SCHEMA_VERSION = 1;
+// 回放序列首次读入时每批覆盖的整点跨度：约 400 个池子 × 6 个整点，一批十几毫秒，批与批之间让出事件循环。
+const SERIES_BATCH_SEC = 6 * HOUR;
+const SERIES_FIELDS = ['slots', 'ticks', 'staked', 'usd0', 'usd1', 'emission', 'vol'];
+const num = (v) => (v === null || v === undefined || !Number.isFinite(Number(v)) ? NaN : Number(v));
+const lowerBound = (list, value) => { let lo = 0, hi = list.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (list[mid] < value) lo = mid + 1; else hi = mid; } return lo; };
+// 一条读数在回放序列里的值：排放折成美元/秒，波动取 24h 与 7d 中较大者（与页面的风险波动一致，下限在回放里加）；缺失记 NaN。
+function seriesValues(tick, staked, usd0, usd1, emission, aeroUsd, vol24h, vol7d) {
+  const vols = [num(vol24h), num(vol7d)].filter(Number.isFinite);
+  return [Number(tick), num(staked), num(usd0), num(usd1), num(emission) * num(aeroUsd), vols.length ? Math.max(...vols) : NaN];
+}
+// 写入同一池子的序列：按整点有序插入；已有该整点时，force（库里读出的权威值）直接覆盖，否则与库的规则一致，只在原读数缺排放时补上。
+function putSeries(map, key, slot, values, force) {
+  let s = map.get(key);
+  if (!s) map.set(key, s = Object.fromEntries(SERIES_FIELDS.map((f) => [f, []])));
+  const n = s.slots.length, i = n && s.slots[n - 1] < slot ? n : lowerBound(s.slots, slot);
+  if (s.slots[i] === slot) {
+    if (!force && !(Number.isNaN(s.emission[i]) && Number.isFinite(values[4]))) return;
+    SERIES_FIELDS.slice(1).forEach((f, j) => { s[f][i] = values[j]; });
+    return;
+  }
+  if (i === n) { s.slots.push(slot); SERIES_FIELDS.slice(1).forEach((f, j) => s[f].push(values[j])); return; }
+  s.slots.splice(i, 0, slot); SERIES_FIELDS.slice(1).forEach((f, j) => s[f].splice(i, 0, values[j]));
+}
+function pruneSeries(map, cutoff) {
+  for (const [key, s] of map) {
+    const i = lowerBound(s.slots, cutoff);
+    if (i === s.slots.length) map.delete(key);
+    else if (i > 0) for (const f of SERIES_FIELDS) s[f].splice(0, i);
+  }
+}
 
 // 4–6 位有效数字足够算平均，同时让响应体积减半。
 const round = (v, digits) => (v === null || v === undefined || !Number.isFinite(v) ? null : Number(v.toPrecision(digits)));
@@ -25,6 +55,8 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
   const cache = new Map();
   const poolIds = new Map();
   const statements = {};
+  // 回放用的逐小时序列（"链:地址" → 各列按整点升序）：第一次回放时从库里分批读入，之后随 record 同步更新、按同一保留期清理。只在内存，重启后重读。
+  let series = null, seriesLoad = null;
   try {
     db = new DatabaseSync(file);
     db.exec('PRAGMA busy_timeout=1000');
@@ -60,6 +92,8 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
         (SELECT group_concat(slot) FROM (SELECT slot FROM samples s WHERE s.pool = p.id AND s.slot >= ? ORDER BY slot DESC)) AS slots FROM pools p`);
     statements.read = db.prepare(`SELECT s.pool, s.slot, s.tick, s.staked, s.usd0, s.usd1, s.emission, s.aero_usd, s.vol24h, s.vol7d, s.fee
       FROM json_each(?) j JOIN samples s ON s.slot = j.value ->> 0 AND s.pool = j.value ->> 1 ORDER BY s.pool, s.slot`);
+    statements.range = db.prepare(`SELECT p.chain, p.address, s.slot, s.tick, s.staked, s.usd0, s.usd1, s.emission, s.aero_usd, s.vol24h, s.vol7d
+      FROM samples s JOIN pools p ON p.id = s.pool WHERE s.slot >= ? AND s.slot < ?`);
     statements.ticks = db.prepare(`SELECT s.slot, s.tick FROM pools p JOIN samples s ON s.pool = p.id
       WHERE p.chain = ? AND p.address = ? AND s.slot >= ? AND s.slot < ? ORDER BY s.slot`);
   } catch (reason) {
@@ -87,13 +121,13 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
     if (!usable.length) return;
     try {
       db.exec('BEGIN IMMEDIATE');
-      let changes = 0;
+      let changes = 0, pruneAt = null;
       try {
         for (const r of usable) {
           changes += Number(statements.upsert.run(slot, idOf(chainId, r.address), r.tick, Number(r.stakedLiquidity), r.token0.usd, r.token1.usd,
             r.emissionPerSec, aeroUsd ?? null, r.vol24h?.daily ?? null, r.vol7d?.daily ?? null, r.fee ?? null).changes);
         }
-        if (nowSec - prunedAt >= HOUR) { changes += Number(statements.prune.run(nowSec - SAMPLE_RETENTION_SEC - HOUR).changes); prunedAt = nowSec; }
+        if (nowSec - prunedAt >= HOUR) { pruneAt = nowSec - SAMPLE_RETENTION_SEC - HOUR; changes += Number(statements.prune.run(pruneAt).changes); prunedAt = nowSec; }
         db.exec('COMMIT');
       } catch (reason) {
         // 回滚会撤销本轮新登记的池 id，内存映射一并作废；磁盘满等错误时 SQLite 可能已自行回滚，回滚失败不能盖掉原始错误。
@@ -102,6 +136,10 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
         throw reason;
       }
       if (changes) { version += 1; cache.clear(); }
+      if (series) {
+        for (const r of usable) putSeries(series, `${chainId}:${r.address}`, slot, seriesValues(r.tick, r.stakedLiquidity, r.token0.usd, r.token1.usd, r.emissionPerSec, aeroUsd, r.vol24h?.daily, r.vol7d?.daily), false);
+        if (pruneAt !== null) pruneSeries(series, pruneAt);
+      }
       error = null;
     } catch (reason) {
       // 写入失败（多为磁盘或锁）只丢这一轮样本，下一轮再试。
@@ -158,9 +196,37 @@ export function openMarketSamples({ file, log = console, now = Date.now }) {
     catch (reason) { log.warn?.({ type: 'aero-market', err: String(reason?.message || reason).slice(0, 240) }, 'Aero 样本库读取价格历史失败'); return []; }
   }
 
+  // 回放序列：已读入时直接返回；否则从保留期起点按整点分批读库（每批之间让出事件循环），读入期间到达的新样本同时写进内存。
+  // 读失败时丢弃半成品，下次请求重读。库不可用时为空。
+  function loadSeries() {
+    if (!db) return Promise.resolve(null);
+    if (series && !seriesLoad) return Promise.resolve(series);
+    if (!seriesLoad) {
+      const map = new Map();
+      series = map;
+      seriesLoad = (async () => {
+        const start = Math.floor(now() / 1000 / HOUR) * HOUR - SAMPLE_RETENTION_SEC - HOUR;
+        for (let from = start; from <= Math.floor(now() / 1000); from += SERIES_BATCH_SEC) {
+          if (series !== map || !db) throw new Error('样本库已关闭');
+          for (const r of statements.range.all(from, from + SERIES_BATCH_SEC)) {
+            putSeries(map, `${r.chain}:${r.address}`, Number(r.slot), seriesValues(r.tick, r.staked, r.usd0, r.usd1, r.emission, r.aero_usd, r.vol24h, r.vol7d), true);
+          }
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+        return map;
+      })().then((map) => { seriesLoad = null; return map; }, (reason) => {
+        if (series === map) series = null;
+        seriesLoad = null;
+        if (db) log.warn?.({ type: 'aero-market', err: String(reason?.message || reason).slice(0, 240) }, 'Aero 样本库读取回放序列失败');
+        throw reason;
+      });
+    }
+    return seriesLoad;
+  }
+
   return {
-    record, read, ticks,
+    record, read, ticks, series: loadSeries,
     status: () => ({ available: db !== null, error, version }),
-    close() { try { db?.close(); } catch { /* 关闭失败不影响退出 */ } db = null; cache.clear(); poolIds.clear(); },
+    close() { try { db?.close(); } catch { /* 关闭失败不影响退出 */ } db = null; cache.clear(); poolIds.clear(); series = null; },
   };
 }

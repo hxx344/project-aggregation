@@ -37,6 +37,11 @@ export type MarketSampleRow = [number, number, number, number | null, number | n
 export type MarketSamples = MarketSamplesStatus & { window: MarketWindow; unchanged?: false; tag?: string; from?: number; pools: Record<string, { hours: number; samples: MarketSampleRow[] }> };
 export type MarketSamplesUnchanged = { window: MarketWindow; available: true; unchanged: true; tag: string; version: number };
 export type MarketUnchanged = { schema: 1; revision: number; serverNow: number; unchanged: true };
+// 历史回放（服务端 server/research/aero-market-replay.mjs）：投入 deposit 美元按给定格数自动调仓，在窗口内的真实小时路径上相对一直持有初始两币多赚的美元。
+// net = emission − impermanent − cost；rebalances 为整点上看到的出区间次数，intraHour 为小时内碰边的估算次数（布朗桥概率之和）；
+// inRange 为产生排放的时间占比；apr 为 net 按窗口折算的年化。
+export type MarketReplay = { hours: number; net: number; emission: number; impermanent: number; cost: number; rebalances: number; intraHour: number; inRange: number; missingHours: number; apr: number };
+export type MarketReplays = { window: MarketWindow; available: boolean; error: string | null; version: number; from?: number; pools: Record<string, MarketReplay> };
 export type MarketPoolHistory = { chain: string; address: string; points: [number, number][] };
 // 详情页的流动性分布：segments 为 [下沿 tick, 上沿 tick, 流动性, 质押流动性]，只覆盖 [from, to]。
 export type MarketLiquidity = {
