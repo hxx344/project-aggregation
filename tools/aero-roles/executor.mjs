@@ -208,6 +208,13 @@ function policyContext(ctx) {
 }
 
 // Safe 的完整状态：余额、额度、各白名单池的头寸（已质押与未质押）、待领排放、bot 的 gas 与 nonce。
+// ethers 把节点返回的任何 JSON-RPC 错误（含限流）都报成 CALL_EXCEPTION，只有带 revert 数据的才是合约拒绝（NFT 已销毁）；
+// 其余错误按读取失败重试并抛出，不让头寸静默消失。
+export const isRevert = (error) => error?.code === 'CALL_EXCEPTION' && typeof error.data === 'string' && error.data.length > 2;
+export const ownerOrBurned = (ctx, tokenId) => read(`头寸 #${tokenId} 归属`, async () => {
+  try { return getAddress((await call(ctx.rpc, NPM_I, AERO.nft, 'ownerOf', [tokenId]))[0]); } catch (error) { if (isRevert(error)) return null; throw error; }
+});
+
 // knownIds：本系统开出的头寸，不论在 Safe 的 NFT 索引里排第几都读取（粉尘 NFT 挤不掉）。
 export async function readState(ctx, { knownIds = [] } = {}) {
   const bot = ctx.signer?.address ?? null;
@@ -224,13 +231,11 @@ export async function readState(ctx, { knownIds = [] } = {}) {
   const scanFrom = owned > BigInt(MAX_OWNED_SCAN) ? owned - BigInt(MAX_OWNED_SCAN) : 0n;
   for (let i = owned - 1n; i >= scanFrom; i--) ownedIds.push((await read('tokenOfOwnerByIndex', () => call(ctx.rpc, NPM_I, AERO.nft, 'tokenOfOwnerByIndex', [ctx.safe, i])))[0]);
   const scanned = ownedIds.length;
-  // 只有合约 revert 才算已销毁；RPC 故障照常重试并报错，不让头寸静默消失。每 10 个并发一组。
+  // 每 10 个并发一组；owner 为 null 表示合约 revert（已销毁）。
   const burnedIds = [];
   const known = knownIds.map((id) => BigInt(id)).filter((id) => !ownedIds.includes(id));
   for (let i = 0; i < known.length; i += 10) {
-    const owners = await Promise.all(known.slice(i, i + 10).map((tokenId) => read(`头寸 #${tokenId} 归属`, async () => {
-      try { return getAddress((await call(ctx.rpc, NPM_I, AERO.nft, 'ownerOf', [tokenId]))[0]); } catch (error) { if (error?.code === 'CALL_EXCEPTION') return null; throw error; }
-    })));
+    const owners = await Promise.all(known.slice(i, i + 10).map((tokenId) => ownerOrBurned(ctx, tokenId)));
     owners.forEach((owner, j) => { if (owner === ctx.safe) ownedIds.push(known[i + j]); else if (owner === null) burnedIds.push(known[i + j]); });
   }
   const ownedInfo = new Map();
@@ -443,7 +448,7 @@ export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, t
   if (!minted) throw new ExecError(`开仓已确认，但回执里没有 NFT 转入 Safe（${receipt.hash}）`, { signed: true });
   const tokenId = minted.args.tokenId;
   // 质押前先上报：质押失败时头寸留在 Safe，仍要能在页面找到。
-  hooks.minted?.(tokenId);
+  try { hooks.minted?.(tokenId); } catch {} // 只是记录，不能挡住质押
   if (stake) { hooks.step?.('质押'); await stakePosition(ctx, hooks, { tokenId }); }
   return { tokenId, amount0: quote.amount0, amount1: quote.amount1 };
 }

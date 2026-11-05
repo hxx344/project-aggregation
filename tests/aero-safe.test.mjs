@@ -398,6 +398,42 @@ test('a refresh that resolves the old transaction does not settle its same-nonce
   } finally { releaseRefresh(); releaseSign(); await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
+test('only a contract revert counts as a burned position; node errors are retried and reported', async () => {
+  const owner = (error) => {
+    const rpc = fakeRpc(); let calls = 0;
+    rpc.call = async () => { calls++; if (error) throw error; return new Interface(['function ownerOf(uint256) view returns (address)']).encodeFunctionResult('ownerOf', [SAFE]); };
+    return { run: () => executor.ownerOrBurned(ctxWith(rpc), 7n), calls: () => calls };
+  };
+  const live = owner(null);
+  assert.equal(await live.run(), SAFE);
+  const reverted = Object.assign(new Error('execution reverted: ERC721: owner query for nonexistent token'), { code: 'CALL_EXCEPTION', data: '0x08c379a0' + '00'.repeat(32) });
+  assert.equal(await owner(reverted).run(), null);
+  // A rate limit answered as a JSON-RPC error also surfaces as CALL_EXCEPTION, but without revert data.
+  const limited = owner(Object.assign(new Error('missing revert data'), { code: 'CALL_EXCEPTION', data: null }));
+  await assert.rejects(limited.run(), /读取 头寸 #7 归属 失败/);
+  assert.ok(limited.calls() > 1); // retried before giving up
+  await assert.rejects(owner(Object.assign(new Error('bad gateway'), { code: 'SERVER_ERROR' })).run(), /失败/);
+});
+
+test('a ledger failure on the replaced row of a same-nonce replacement does not raise the ledger alert for it', async () => {
+  const directory = fixtureDir();
+  const clock = 40_000_000;
+  const { manager: first } = managerWith(directory);
+  try { await first.initialize(); await first.save(baseConfig); await first.setKey(KEY); } finally { await first.close(); }
+  let release; const hang = new Promise((resolve) => { release = resolve; });
+  writeFileSync(join(directory, 'aero-safe/pending.json'), JSON.stringify({ hash: '0x' + 'ab'.repeat(32), raw: '0x00', from: BOT.address, nonce: 0, label: '旧兑换', at: clock - PENDING_STALE_MS }));
+  mkdirSync(join(directory, 'aero-safe/txs.jsonl'));
+  const { manager } = managerWith(directory, { chain: fakeChain({ hang }), manager: { now: () => clock } });
+  try {
+    await manager.initialize();
+    await until(() => !manager.state().refreshing);
+    await manager.execute('swap', { tokenIn: USDC, tokenOut: OTHER, amount: '1' });
+    const state = await until(() => manager.state().pending?.label === '兑换' && manager.state());
+    assert.ok(state.events.some((e) => e.event === 'ledger_write_failed' && e.label === '旧兑换' && e.status === 'replaced'));
+    assert.equal(state.ledgerError, null);
+  } finally { release(); await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
 test('a minted position is remembered before staking, read on every refresh and dropped once burned', async () => {
   const directory = fixtureDir();
   const reads = [];
@@ -416,6 +452,9 @@ test('a minted position is remembered before staking, read on every refresh and 
     assert.deepEqual(JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids, ['77']); // kept although staking failed
     assert.deepEqual(reads.at(-1), ['77']);
     burned = [77n];
+    clock += 60_000; manager.refresh();
+    await until(() => reads.length >= 3 && !manager.state().refreshing);
+    assert.deepEqual(JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids, ['77']); // one burned reading is not enough
     clock += 60_000; manager.refresh();
     await until(() => JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids.length === 0);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }

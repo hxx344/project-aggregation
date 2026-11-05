@@ -138,7 +138,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
   let config = null, configError = null, wallet = null, pending = null, job = null, snapshot = null, snapshotAt = null, snapshotError = null;
-  let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [];
+  let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [], burnSeen = new Set();
   const events = [];
   let operation = Promise.resolve();
   const serial = (fn) => {
@@ -188,7 +188,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     context = { stamp, at: now(), ctx };
     return ctx;
   }
-  // quiet：同 nonce 替换时旧交易的 replaced 行。写失败不设 ledgerError——新交易记录的 replaces 保留了旧哈希，结清时会按链上结果再记。
+  // quiet：同 nonce 替换时旧交易的 replaced 行。写失败只记事件、不设 ledgerError：旧哈希留在新交易记录的 replaces 里，
+  // 旧交易上链时结清会补记 confirmed；新交易上链时旧交易的 replaced 行就缺失（只剩事件），不影响资金判断。
   function settle(entry, receipt, outcome, { quiet = false } = {}) {
     const status = outcome ?? (receipt?.status === 1 ? 'confirmed' : 'reverted');
     try {
@@ -246,7 +247,10 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const ctx = await connection();
     try { await resolve(ctx); } catch (error) { record({ event: 'pending_check_failed', error: error.message }); }
     const value = await chain.readState(ctx, { knownIds: minted });
-    if (value.burnedIds?.length) forget(value.burnedIds.map(String));
+    // 连续两次刷新都判为已销毁才删除，偶发误判不会丢掉头寸记录。
+    const burned = (value.burnedIds ?? []).map(String);
+    forget(burned.filter((id) => burnSeen.has(id)));
+    burnSeen = new Set(burned);
     snapshot = serialize(value, ctx); snapshotAt = now(); snapshotError = null;
   }
   function refresh() {
