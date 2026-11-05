@@ -46,8 +46,9 @@ TRANSFER_HISTORY_WAIT_SECONDS = 120
 # expired unknown transfer is then settled without further evidence: one
 # history read over [created - TOLERANCE, created + SPAN] only labels it
 # confirmed (one-to-one receipts) or rejected (anything else, including a
-# failed read). The label is audit only: balances are re-read either way and a
-# wrong rejection at worst moves funds between the pair's own sub-accounts.
+# failed read). The label records evidence and selects the cooldown; balances
+# are re-read either way, and a wrong rejection at worst moves funds between
+# the pair's own sub-accounts.
 TRANSFER_NONCE_EXPIRY_SECONDS = 120
 TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 180
 TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
@@ -59,10 +60,24 @@ TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
 # incomplete.
 TRANSFER_INCOME_PAGE_ROWS = 1000
 TRANSFER_INCOME_MAX_PAGES = 8
+# Receipts a label read already saw stay with the follow-up as [side, kind,
+# tranId], so a throttled or failed read and an unstable later view cannot
+# turn them into "absent". The format and bound match the previous release,
+# which still reads these records after a rollback.
+TRANSFER_EVIDENCE_LIMIT = 20
 # A local quota wait or exchange throttle reads nothing, so the label waits
 # for it, but only this long past expiry: settling must never depend on it.
 TRANSFER_LABEL_DEFER_SECONDS = 300
 TRANSFER_SETTLE_COOLDOWN_SECONDS = 30
+# A one-sided receipt means funds may still be clearing. No Aster figure
+# bounds internal transfer clearing; this unverified local bound equals the
+# label defer bound so a late credit can land before balances are re-planned.
+TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS = 300
+PARTIAL_BASIS = "nonce_expired_partial_receipt"
+# Why an expired write was settled. The shared row only says it no longer
+# blocks: "rejected" there is never an exchange rejection.
+SETTLE_BASES = frozenset({"late_receipt_confirmed", "nonce_expired_no_receipt", PARTIAL_BASIS,
+                          "nonce_expired_unreadable", "identity_changed", "nonce_expired_no_follow_up"})
 TRANSFER_SWEEP_SECONDS = 30
 SETTLE_WAIT = "结算前共享准入暂停该组账户的新写入，原请求不会重发"
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
@@ -312,7 +327,7 @@ class MarginBalancer:
                 if key in pending and (pending[key] or key not in ("transaction_id", "before_receipts"))}
             if writer_for(self.engine).enabled:
                 # failures/empty/evidence keep the record valid for the previous release.
-                follow_up.update(failures=0, empty=0, evidence=[])
+                follow_up.update(failures=0, empty=0, evidence=deepcopy(self._evidence(pending)[:TRANSFER_EVIDENCE_LIMIT]))
                 updated["unsettled_transfers"] = [*state.get("unsettled_transfers", []), follow_up]
             for field in ("api_notice", "blocked_reason", "retry_without_blocking"):
                 updated.pop(field, None)
@@ -622,7 +637,8 @@ class MarginBalancer:
         return view("waiting", "等待系统下一次保证金检查" + _remaining_time(journal.get("next_check_at"), time.time())
                     + "；满足余额差额及安全可划条件后才发起划转")
 
-    def _income(self, members, start, end, *, reconciliation=False, observation=None):
+    def _income(self, members, start, end, *, reconciliation=False, observation=None, collected=None):
+        """Keep every validated row, including full pages and rows from a failed page."""
         self._require_budget(members, {side: 30 for side in members}, reconciliation=reconciliation)
         result = {}
         for side, member in members.items():
@@ -633,24 +649,24 @@ class MarginBalancer:
                 if pages >= TRANSFER_INCOME_MAX_PAGES:
                     raise TradingError(f"划转流水超过 {TRANSFER_INCOME_MAX_PAGES} 段读取上限，无法完整核对")
                 pages += 1
-                page = self._income_page(broker, low, high, reconciliation, observation)
+                page = self._income_page(broker, low, high, reconciliation, observation,
+                    collected=collected.setdefault(side, []) if collected is not None else None)
+                for row in page:
+                    identity = json.dumps(row, sort_keys=True, default=str)
+                    if identity not in seen:
+                        seen.add(identity)
+                        rows.append(row)
                 if len(page) >= TRANSFER_INCOME_PAGE_ROWS:
                     if high - low <= 1:
                         raise TradingError("划转流水在极短时间窗内超过单页上限，无法完整核对")
                     middle = (low + high) // 2
                     # Pop order reads the earlier half first.
                     windows += [(middle, high), (low, middle)]
-                    continue
-                for row in page:
-                    identity = json.dumps(row, sort_keys=True, default=str)
-                    if identity not in seen:
-                        seen.add(identity)
-                        rows.append(row)
             result[side] = rows
         return result
 
     @staticmethod
-    def _income_page(broker, start, end, reconciliation, observation):
+    def _income_page(broker, start, end, reconciliation, observation, *, collected=None):
         priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
         with priority:
             try:
@@ -669,15 +685,21 @@ class MarginBalancer:
             else:
                 if observation is not None:
                     observation["queried"] = True
-        if not isinstance(rows, list) or len(rows) > TRANSFER_INCOME_PAGE_ROWS or any(not isinstance(row, dict) for row in rows):
+        if not isinstance(rows, list):
             raise TradingError("划转流水不完整，无法核对")
+        incomplete = "划转流水不完整，无法核对" if len(rows) > TRANSFER_INCOME_PAGE_ROWS else None
         for row in rows:
+            if not isinstance(row, dict):
+                incomplete = incomplete or "划转流水不完整，无法核对"
+                continue
             # Only a row that is clearly another asset or type may be left
             # out; an unreadable candidate makes the read incomplete instead
             # of looking like the transfer is absent.
             asset, kind = row.get("asset"), row.get("incomeType")
-            if not isinstance(asset, str) or not isinstance(kind, str):
-                raise TradingError("划转流水含无法分类的记录，无法核对")
+            if (not isinstance(asset, str) or not asset.strip()
+                    or not isinstance(kind, str) or not kind.strip()):
+                incomplete = incomplete or "划转流水含无法分类的记录，无法核对"
+                continue
             if asset != "USD1" or kind not in TRANSFER_TYPES:
                 continue
             try:
@@ -686,7 +708,14 @@ class MarginBalancer:
                 dec(row.get("time"))
                 dec(row.get("income"))
             except TradingError:
-                raise TradingError("划转流水含无法解析的 USD1 划转记录，无法核对") from None
+                incomplete = incomplete or "划转流水含无法解析的 USD1 划转记录，无法核对"
+                continue
+            if collected is not None:
+                collected.append(row)
+        # A bad row cannot hide a valid receipt before or after it, but the
+        # incomplete page still cannot support absence or confirmation.
+        if incomplete:
+            raise TradingError(incomplete)
         return rows
 
     @staticmethod
@@ -718,9 +747,11 @@ class MarginBalancer:
 
     @staticmethod
     def _valid_unsettled(record):
-        # Older follow-ups also carry failures/empty/queried_at/evidence; they are unused.
+        # Older follow-ups also carry failures/empty/queried_at; they are unused.
         if not (isinstance(record, dict) and _identifier(record.get("request_id"))
-                and {record.get("source"), record.get("destination")} == {"long", "short"}
+                and record.get("source") in ("long", "short")
+                and record.get("destination") in ("long", "short")
+                and record["source"] != record["destination"]
                 and isinstance(record.get("identity"), str)
                 and type(record.get("created_at")) in (int, float) and math.isfinite(record["created_at"])
                 and record["created_at"] > 0
@@ -754,7 +785,7 @@ class MarginBalancer:
             return self._settle_skipped_records(pair, members, state, config)
         except Exception as exc:  # noqa: BLE001 - surface as a retry, never crash the tick
             LOG.warning("pair %s unknown transfer settlement failed: %s", pair["id"], type(exc).__name__)
-            if not known:
+            if not known and not self.unsettled_shared(state):
                 self._swept_at[pair["id"]] = now + TRANSFER_SWEEP_SECONDS
                 return None
             return self._view(state, config, "unknown", "未知划转的共享结算暂未完成（" + str(exc)[:200]
@@ -767,17 +798,29 @@ class MarginBalancer:
         records = state.get("unsettled_transfers")
         if not writer.enabled:
             # Standalone runs keep no shared write to settle.
-            if records is not None or "unsettled_operations" in state:
+            if records is not None or "unsettled_operations" in state or "unsettled_transfer_audits" in state:
                 state.pop("unsettled_transfers", None)
                 state.pop("unsettled_operations", None)
+                state.pop("unsettled_transfer_audits", None)
                 self.store.put(key, state)
             return None
-        if records is not None and (not isinstance(records, list)
-                                    or any(not self._valid_unsettled(record) for record in records)):
-            # A corrupt follow-up cannot label anything; the sweep below still
-            # settles its shared write once the original has expired.
-            LOG.warning("pair %s dropped invalid unsettled transfer records", pair["id"])
-            state["unsettled_transfers"] = records = []
+        changed = False
+        if records is not None:
+            valid = [record for record in records if self._valid_unsettled(record)] if isinstance(records, list) else []
+            if not isinstance(records, list) or len(valid) != len(records):
+                # Sweep only corrupt follow-ups. Valid ones retain their own
+                # evidence, label and cooldown even if this check must wait.
+                LOG.warning("pair %s dropped invalid unsettled transfer records", pair["id"])
+                state["unsettled_transfers"] = records = valid
+                changed = True
+        if state.get("unsettled_operations") in (None, []):
+            # Keep the master binding, scheduler and pair guards through the
+            # entire scan, including after the last valid follow-up is removed.
+            # Publish this in the SAME write that filters corrupt follow-ups.
+            state["unsettled_operations"] = ["scan_pending"]
+            changed = True
+        if changed:
+            self.store.put(key, state)
         records = records or []
         ids = [member["id"] for member in members.values()] + ["master:" + config["master_env_prefix"]]
         prefixes = ("aster:transfer:", "aster:legacy:pair_margin:" + pair["id"] + ":")
@@ -790,7 +833,7 @@ class MarginBalancer:
             return max(row["createdAt"] / 1000, row["updatedAt"] / 1000, floor) + TRANSFER_NONCE_EXPIRY_SECONDS
 
         view = lambda status, reason: self._view(state, config, status, reason, blocks=True)
-        settled = []
+        settled, in_flight = [], False
         while records:
             record = records[0]
             candidates = ("aster:transfer:" + record["request_id"],
@@ -799,8 +842,10 @@ class MarginBalancer:
             # failed or the process died mid-send; the skip proves the sender
             # ended, so it is settled the same way.
             open_ops = [value for value in candidates if value in rows]
-            if not open_ops:
-                # Settled elsewhere, or no longer on these accounts.
+            label = record.get("label")
+            if not open_ops and not isinstance(label, dict):
+                # No local settlement to finish; settled elsewhere or no
+                # longer on these accounts. A durable label must be replayed.
                 records.pop(0)
                 self.store.put(key, state)
                 continue
@@ -812,32 +857,47 @@ class MarginBalancer:
                 self.store.put(key, state)
             ready_at = max([expires_at(rows[value], record["skipped_at"] if rows[value]["state"] == "sending" else 0)
                             for value in open_ops] + [record["created_at"] + TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS])
-            if now < ready_at:
+            if open_ops and now < ready_at:
                 self._swept_at.pop(pair["id"], None)
                 return view("unknown", "上次划转（" + record["request_id"][:8] + "）结果未知，等待原请求过期"
                     + _remaining_time(ready_at, now) + "后自动结算；" + SETTLE_WAIT)
-            label = record.get("label")
             if not isinstance(label, dict):
                 try:
-                    receipt, note = self._label_expired(pair, members, state, record, now, ready_at,
+                    receipt, note, basis = self._label_expired(pair, members, state, record, now, ready_at,
                         defer=now < ready_at + TRANSFER_LABEL_DEFER_SECONDS)
                 except ExchangeError as exc:
+                    # Keep receipts the deferred read already saw.
+                    self.store.put(key, state)
                     self._swept_at.pop(pair["id"], None)
                     return view("unknown", "上次划转（" + record["request_id"][:8] + "）已过有效期，流水读取等待限流（"
                         + api_wait_notice(exc)["text"] + "），稍后自动结算；" + SETTLE_WAIT)
-                # Persisted first: a failed settle retries without another read.
-                record["label"] = label = {"receipt": list(receipt)} if receipt is not None else {"note": note}
-                self.store.put(key, state)
+                record["label"] = label = {**({"receipt": list(receipt)} if receipt is not None else {"note": note}),
+                                           "basis": basis}
             receipt = label.get("receipt")
             receipt = receipt if isinstance(receipt, list) and len(receipt) == 2 else None
-            self._resolve_skipped(writer, ids, open_ops, rejected=receipt is None)
+            evidence = self._evidence(record)
+            basis = self._label_basis(label, receipt, evidence)
+            cooldown = label.get("cooldown_until")
+            if type(cooldown) not in (int, float) or not math.isfinite(cooldown) or cooldown <= 0:
+                duration = (TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS if basis == PARTIAL_BASIS
+                            else TRANSFER_SETTLE_COOLDOWN_SECONDS)
+                label["cooldown_until"] = cooldown = time.time() + max(config["cooldown_seconds"], duration)
+            label["basis"] = basis
+            # Publish the label and absolute send barrier in the same private
+            # write BEFORE releasing any shared row. Recovery reuses this
+            # deadline, even if all shared rows have already finished.
+            state["cooldown_until"] = max(state.get("cooldown_until", 0), cooldown)
+            self.store.put(key, state)
+            if open_ops:
+                self._resolve_skipped(writer, ids, open_ops, rejected=receipt is None)
             if receipt is not None:
-                # Recorded after settling: crashing in between only leaves this
-                # receipt unrecorded, never a settled write still open.
-                state["used_receipts"] = (state.get("used_receipts", []) + [receipt])[-100:]
+                # Replay is idempotent after a shared-settle/private-write crash.
+                if receipt not in state.get("used_receipts", []):
+                    state["used_receipts"] = (state.get("used_receipts", []) + [receipt])[-100:]
             outcome = "confirmed" if receipt is not None else "rejected"
             settled.append(outcome)
-            self._audit_expired(pair, record["request_id"], outcome, label.get("note"), now)
+            in_flight |= basis == PARTIAL_BASIS
+            self._audit_expired(pair, record["request_id"], outcome, label.get("note"), now, basis, evidence)
             for value in open_ops:
                 rows.pop(value)
             records.pop(0)
@@ -849,16 +909,35 @@ class MarginBalancer:
         # may still belong to a live sender.
         rows = {value: row for value, row in rows.items() if row["state"] == "unknown"}
         expired = sorted(value for value, row in rows.items() if now >= expires_at(row))
+        audits = state.get("unsettled_transfer_audits", {})
+        new_expired = [value for value in expired if value not in audits]
+        if new_expired:
+            # Write the audit outbox and cooldown before releasing any shared
+            # row. A retry reuses both timestamps instead of restarting them.
+            for operation_id in new_expired:
+                audits[operation_id] = {"outcome": "rejected", "settled_at": now,
+                    "by": "expiry", "basis": "nonce_expired_no_follow_up"}
+            state["unsettled_transfer_audits"] = audits
+            state["cooldown_until"] = max(state.get("cooldown_until", 0),
+                time.time() + max(config["cooldown_seconds"], TRANSFER_SETTLE_COOLDOWN_SECONDS))
+            self.store.put(key, state)
         if expired:
             self._resolve_skipped(writer, ids, expired, rejected=True)
-            for operation_id in expired:
-                LOG.info("pair %s settled expired unknown transfer %s as rejected", pair["id"], operation_id)
+        for operation_id in list(audits):
+            if operation_id in rows and operation_id not in expired:
+                continue  # An unresolved row must finish before its audit.
+            LOG.info("pair %s settled expired unknown transfer %s as rejected", pair["id"], operation_id)
+            self._archive_settlement(pair, operation_id.rsplit(":", 1)[1], audits[operation_id],
+                                     replace=False, required=True)
+            audits.pop(operation_id)
             settled.append("rejected")
         waiting = sorted(value for value in rows if value not in expired)
         # The durable marker keeps the master binding and the pair guards
-        # until every open row is settled, even if balancing is disabled.
+        # until every open row and its audit finish, even while disabled.
         before = (state.get("unsettled_transfers"), state.get("unsettled_operations"))
         state.pop("unsettled_transfers", None)
+        if not audits:
+            state.pop("unsettled_transfer_audits", None)
         if waiting:
             state["unsettled_operations"] = waiting
         else:
@@ -877,16 +956,14 @@ class MarginBalancer:
             return None
         # Do not plan a new transfer in the same check that settled the old
         # one: balances may have moved, so wait a cooldown and read them again.
-        state["cooldown_until"] = max(state.get("cooldown_until", 0),
-            now + max(config["cooldown_seconds"], TRANSFER_SETTLE_COOLDOWN_SECONDS))
-        self.store.put(key, state)
         self._invalidate(members)
         outcome = "已由两侧流水核实到账" if settled == ["confirmed"] else "已过有效期并自动结算"
         return self._view(state, config, "cooldown", "上次结果未知的划转" + outcome
+                          + ("；已见一侧流水，可能为迟到到账，延长冷却" if in_flight else "")
                           + "；冷却结束后按最新余额重新评估，原请求不会重发")
 
     def _label_expired(self, pair, members, state, record, now, ready_at, *, defer=False):
-        """Label an expired write for audit: (receipt, None) or (None, note).
+        """Label an expired write for audit: (receipt, None, basis) or (None, note, basis).
 
         With ``defer`` a quota wait or throttle is raised instead, so the label
         comes from an actual read once the limit clears.
@@ -894,36 +971,104 @@ class MarginBalancer:
         try:
             self._verify_pending_identity(pair, members, record)
         except TradingError:
-            return None, "账户身份已变化，未核对流水"
+            return None, "账户身份已变化，未核对流水", "identity_changed"
         created = record["created_at"]
         start = int((created - TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
         # Up to expiry: a restore or late finish can move it past the span.
         end = int(min(now, max(created + TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS, ready_at)) * 1000)
+        collected, unreadable = {}, None
         try:
-            rows = self._income(members, start, end, reconciliation=True)
+            self._income(members, start, end, reconciliation=True, collected=collected)
         except (ExchangeError, TradingError) as exc:
+            # Valid rows are still receipts even if their own page failed.
+            self._keep_evidence(record, collected, state, start, end)
             if defer and api_wait_notice(exc) is not None:
                 raise
             # Remote response text is never published; local reasons are.
             detail = self._read_error_detail(exc) if isinstance(exc, ExchangeError) else str(exc)[:120]
-            return None, "流水暂不可读（" + (detail or type(exc).__name__) + "）"
-        source, destination = self._receipt_matches(record, rows, state, start, end)
+            unreadable = "流水暂不可读（" + (detail or type(exc).__name__) + "）"
+        else:
+            self._keep_evidence(record, collected, state, start, end)
+        source, destination = set(), set()
+        for side, kind, txn in self._evidence(record):
+            if [kind, txn] not in state.get("used_receipts", []):
+                (source if side == record["source"] else destination).add((kind, txn))
         common = source & destination
-        if len(common) == 1 and len(source) == 1 and len(destination) == 1:
-            return common.pop(), None
-        return None, "两侧流水均无该笔划转" if not source and not destination else "两侧流水只部分匹配"
+        one_to_one = len(common) == 1 and len(source) == 1 and len(destination) == 1
+        if unreadable is None and one_to_one:
+            # Accumulated evidence proves possible existence, not which
+            # request caused it. Confirm only from this complete read on BOTH
+            # sides. Without an original transaction ID, a pre-send receipt
+            # in the clock-tolerance window may belong to a previous transfer.
+            confirm_start = start if record.get("transaction_id") else max(start, math.ceil(created * 1000))
+            current = self._receipt_matches(record,
+                {side: collected.get(side, []) for side in ("long", "short")}, state, confirm_start, end)
+            if current == [source, destination]:
+                return common.pop(), None, "late_receipt_confirmed"
+        if unreadable is not None and one_to_one:
+            # An incomplete read may hide a conflicting receipt.
+            return None, "两侧均见该笔流水，但本次读取不完整；" + unreadable, PARTIAL_BASIS
+        if source or destination:
+            # Existence evidence is never reported as absence.
+            return None, "两侧流水只部分匹配" + ("；" + unreadable if unreadable else ""), PARTIAL_BASIS
+        if unreadable:
+            return None, unreadable, "nonce_expired_unreadable"
+        return None, "两侧流水均无该笔划转", "nonce_expired_no_receipt"
 
-    def _audit_expired(self, pair, request_id, outcome, note, now):
-        LOG.info("pair %s unknown transfer %s settled by expiry as %s%s", pair["id"], request_id[:8], outcome,
-                 ": " + note if note else "")
+    @staticmethod
+    def _label_basis(label, receipt, evidence):
+        """The persisted basis; labels written before it existed are classified once."""
+        if isinstance(label.get("basis"), str) and label["basis"] in SETTLE_BASES:
+            return label["basis"]
+        note = label.get("note") if isinstance(label.get("note"), str) else ""
+        if receipt is not None:
+            return "late_receipt_confirmed"
+        if note.startswith("账户身份"):
+            return "identity_changed"
+        if evidence or "部分匹配" in note:
+            return PARTIAL_BASIS
+        return "nonce_expired_unreadable" if "暂不可读" in note else "nonce_expired_no_receipt"
+
+    @staticmethod
+    def _evidence(record):
+        """Well-formed [side, kind, tranId] receipts kept on a follow-up."""
+        evidence = record.get("evidence")
+        # Checked as strings first: an unhashable value must not raise and stall settlement.
+        return [item for item in evidence if isinstance(item, list) and len(item) == 3
+                and all(isinstance(value, str) for value in item)
+                and item[0] in ("long", "short") and item[1] in TRANSFER_TYPES
+                and _identifier(item[2]) == item[2]] if isinstance(evidence, list) else []
+
+    def _keep_evidence(self, record, rows, state, start, end):
+        source, destination = self._receipt_matches(
+            record, {side: rows.get(side, []) for side in ("long", "short")}, state, start, end)
+        evidence = self._evidence(record)
+        seen = [[side, kind, txn] for side, found in ((record["source"], source),
+                (record["destination"], destination)) for kind, txn in sorted(found)]
+        record["evidence"] = (evidence + [item for item in seen if item not in evidence])[:TRANSFER_EVIDENCE_LIMIT]
+        if record["evidence"]:
+            # The previous release rejects evidence with an absence streak.
+            # Keep deferred reads rollback-compatible before any label exists.
+            record["empty"] = 0
+
+    def _audit_expired(self, pair, request_id, outcome, note, now, basis, evidence=()):
+        LOG.info("pair %s unknown transfer %s settled by expiry as %s (%s)%s", pair["id"], request_id[:8], outcome,
+                 basis, ": " + note if note else "")
+        self._archive_settlement(pair, request_id, {"outcome": outcome, "settled_at": now, "by": "expiry",
+            "basis": basis, **({"note": note} if note else {}), **({"evidence": list(evidence)} if evidence else {})},
+            required=True)
+
+    def _archive_settlement(self, pair, request_id, settlement, *, replace=True, required=False):
         key = "pair_margin_skipped:" + pair["id"] + ":" + request_id
         try:
             archive = self.store.get(key)
-            if isinstance(archive, dict):
-                archive["settlement"] = {"outcome": outcome, "settled_at": now, "by": "expiry",
-                                         **({"note": note} if note else {})}
+            if isinstance(archive, dict) and (replace or "settlement" not in archive):
+                archive["settlement"] = settlement
                 self.store.put(key, archive)
         except Exception:  # noqa: BLE001 - audit only; the shared write is already settled
+            if required:
+                # Keep the follow-up until its audit can be persisted.
+                raise
             LOG.warning("pair %s transfer settlement audit failed", pair["id"])
 
     @staticmethod
@@ -957,19 +1102,24 @@ class MarginBalancer:
                 + _remaining_time(deadline, time.time()) + "后重新读取两侧余额；不再重复查询旧流水", blocks=True)
         start = int(pending["created_at"] * 1000) // 1000 * 1000
         end = int((pending["created_at"] + 90) * 1000)
-        observation = {}
+        observation, collected = {}, {}
         try:
-            rows = self._income(members, start, end, reconciliation=True, observation=observation)
+            rows = self._income(members, start, end, reconciliation=True, observation=observation, collected=collected)
         except TradingError:
+            self._keep_evidence(pending, collected, state, start, end)
             if observation.get("queried"):
                 recovery["query_rounds"] += 1
-                self.store.put("pair_margin:" + pair["id"], state)
-                if recovery["query_rounds"] >= TRANSFER_HISTORY_QUERY_LIMIT and time.time() >= deadline:
-                    return self._resume_unknown(pair, members, state, config)
+            self.store.put("pair_margin:" + pair["id"], state)
+            if recovery["query_rounds"] >= TRANSFER_HISTORY_QUERY_LIMIT and time.time() >= deadline:
+                return self._resume_unknown(pair, members, state, config)
             raise
         if observation.get("queried"):
             recovery["query_rounds"] += 1
+        self._keep_evidence(pending, collected, state, start, end)
         self._record_success(pair, state)
+        # Legacy accepted requests still require both sides in this complete
+        # read; retained history is carried into a later skip, not authority
+        # to confirm the accepted request from receipts of different reads.
         matches = self._receipt_matches(pending, rows, state, start, end)
         common = matches[0] & matches[1]
         if len(common) != 1 or any(len(values) != 1 for values in matches):
