@@ -1,13 +1,45 @@
-import { decimalDifference, oilSpreadPercent } from '../../modules/oil/spread.mjs';
+import { oilSpread } from '../../modules/oil/spread.mjs';
 
-export const METRICS = Object.freeze({ spreadPercent: '布伦特相对 WTI 价差 (%)', spread: '绝对价差', brent: '布伦特价格', wti: 'WTI 价格' });
+export const METRICS = Object.freeze({ spread: '价差（布伦特 − WTI）', brent: '布伦特价格', wti: 'WTI 价格' });
 
 export function defaultConfig() {
-  return { enabled: false, rules: [3, 5, 8].map((threshold, index) => ({
-    id: `spread-${index + 1}`, label: `价差 ${threshold}%`, metric: 'spreadPercent', operator: 'gte',
+  return { enabled: false, rules: [3, 4, 5].map((threshold, index) => ({
+    id: `spread-${index + 1}`, label: `价差 ${threshold} USDT`, metric: 'spread', operator: 'gte',
     threshold, cooldownMinutes: 30, hysteresis: 0.1, enabled: true
   })) };
 }
+
+const LEGACY_PERCENT_SUFFIX = '（原百分比）';
+/**
+ * Stored percentage rules (`spreadPercent`) become disabled absolute-spread rules with the
+ * same numbers, so a 5% threshold is never silently read as 5 USDT/桶; the user re-enables
+ * them after checking the threshold. A converted rule that would duplicate an existing
+ * condition is dropped. The converted config is written back on the next persist (a save,
+ * an alert event or the first tick), after which the dropped duplicates are gone for good.
+ */
+// The label limit counts UTF-16 units (as validateConfig and the input's maxLength do); cut on whole code points.
+function truncateUnits(text, max) {
+  let out = '';
+  for (const char of text) { if (out.length + char.length > max) break; out += char; }
+  return out;
+}
+export function migrateLegacyConfig(input) {
+  if (!input || !Array.isArray(input.rules) || !input.rules.some(rule => rule?.metric === 'spreadPercent')) return input;
+  const condition = rule => JSON.stringify([rule.metric, rule.operator, rule.threshold]);
+  const kept = new Set(input.rules.filter(rule => rule?.metric !== 'spreadPercent').map(condition));
+  const rules = input.rules.flatMap(rule => {
+    if (rule?.metric !== 'spreadPercent') return [rule];
+    const label = typeof rule.label === 'string' ? `${truncateUnits(rule.label.trim(), 60 - LEGACY_PERCENT_SUFFIX.length)}${LEGACY_PERCENT_SUFFIX}` : rule.label;
+    const next = { ...rule, label, metric: 'spread', enabled: false };
+    if (kept.has(condition(next))) return [];
+    kept.add(condition(next));
+    return [next];
+  });
+  return { ...input, rules };
+}
+
+/** Store reads accept the legacy percentage metric once and convert it; API writes do not. */
+export const validateStoredConfig = input => validateConfig(migrateLegacyConfig(input));
 
 export function validateConfig(input, { metrics = METRICS, positiveMetrics = ['brent', 'wti'], thresholdError = '价格阈值必须大于 0；价差可为负数；绝对值不能超过 100 万' } = {}) {
   if (!input || typeof input.enabled !== 'boolean' || !Array.isArray(input.rules) || input.rules.length > 50) throw new Error('配置需包含总开关，最多允许 50 个梯度');
@@ -39,9 +71,9 @@ export function marketValues(market, now = Date.now(), maxAge = 90_000) {
   if (![brent, wti].every(value => typeof value === 'number' && Number.isFinite(value) && value > 0)) throw new Error('行情价格无效，暂停阈值判断');
   // Subtract decimal quotes before converting the spread back to Number so
   // tiny quoted spreads remain equal to the same user-entered decimal threshold.
-  const spreadPercent = oilSpreadPercent(brent, wti);
-  if (spreadPercent === null) throw new Error('行情价差无效，暂停阈值判断');
-  return { spread: decimalDifference(brent, wti), spreadPercent, brent, wti };
+  const spread = oilSpread(brent, wti);
+  if (spread === null) throw new Error('行情价差无效，暂停阈值判断');
+  return { spread, brent, wti };
 }
 
 // One notification per threshold episode. Cooldown also spans separate episodes.

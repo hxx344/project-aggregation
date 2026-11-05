@@ -32,29 +32,41 @@ test('configuration validates all gradients and rejects malformed numeric values
   assert.equal(validateConfig({ enabled: true, rules: [rule({ threshold: -2 })] }).rules[0].threshold, -2);
 });
 
-test('percentage alerts use percentage-point hysteresis while legacy amount rules keep their meaning', async () => {
-  assert.ok(defaultConfig().rules.every(item => item.metric === 'spreadPercent' && item.label.endsWith('%')));
-  const percentage = rule({ id: 'percent', metric: 'spreadPercent', threshold: 5, hysteresis: 0.1, cooldownMinutes: 0 });
-  const legacy = rule({ id: 'amount', threshold: 5 });
-  assert.equal(validateConfig({ enabled: true, rules: [percentage, legacy] }).rules.length, 2);
-  assert.equal(validateConfig({ enabled: true, rules: [{ ...percentage, threshold: -5 }] }).rules[0].threshold, -5);
-  const f = fixture({ rules: [percentage, legacy] });
-  f.prices(42, 40); await f.monitor.tick();
-  assert.equal(f.persisted.events[0].rules.length, 1);
-  assert.equal(f.persisted.events[0].rules[0].metric, 'spreadPercent');
+test('oil alerts use the absolute Brent − WTI spread; percentage rules are only accepted from storage as disabled conversions', async () => {
+  assert.ok(defaultConfig().rules.every(item => item.metric === 'spread' && item.label.endsWith('USDT')));
+  assert.throws(() => validateConfig({ enabled: true, rules: [rule({ metric: 'spreadPercent' })] }), /指标/, 'the API no longer accepts percentage rules');
+  const f = fixture({ rules: [rule({ cooldownMinutes: 0, hysteresis: 0.1 })] });
+  f.prices(85, 80); await f.monitor.tick();
+  assert.equal(f.persisted.events[0].rules[0].metric, 'spread');
   assert.equal(f.persisted.events[0].rules[0].value, 5);
-  assert.match(f.messages[0], /≥ 5 %/);
-  assert.match(f.messages[0], /价差 5.0000%/);
-  f.prices(41.96, 40); await f.monitor.tick();
-  assert.equal(f.monitor.data.states.percent.active, true, 'Equality at 4.9% does not rearm');
-  f.prices(41.95, 40); await f.monitor.tick();
-  assert.equal(f.monitor.data.states.percent.active, false);
-  f.prices(84, 80); await f.monitor.tick();
-  assert.equal(f.messages.length, 2);
-  const restart = fixture({ data: f.persisted }); restart.prices(84, 80); await restart.monitor.tick();
-  assert.equal(restart.messages.length, 0);
+  assert.match(f.messages[0], /价差（布伦特 − WTI） 5.0000 ≥ 5 USDT\/桶/);
+  assert.match(f.messages[0], /价差 5.0000 USDT\/桶/);
+  assert.doesNotMatch(f.messages[0], /%/);
+  f.prices(84.9, 80); await f.monitor.tick();
+  assert.equal(f.monitor.data.states['test-rule'].active, true, 'equality at 4.9 does not rearm');
+  f.prices(84.89, 80); await f.monitor.tick();
+  assert.equal(f.monitor.data.states['test-rule'].active, false);
   const exact = marketValues({ fetchedAt: new Date(0).toISOString(), brent: { markPx: 75.3 }, wti: { markPx: 75 } }, 0);
-  assert.equal(evaluateRule({ ...percentage, threshold: 0.4 }, {}, exact.spreadPercent, 0).shouldSend, true);
+  assert.equal(evaluateRule(rule({ threshold: 0.3 }), {}, exact.spread, 0).shouldSend, true, 'decimal quotes equal the typed threshold');
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'oil-legacy-'));
+  try {
+    const legacy = [rule({ id: 'p5', label: '价差 5%', metric: 'spreadPercent' }), rule({ id: 'p4', label: '价差 4%', metric: 'spreadPercent', threshold: 4 }), rule({ id: 'abs4', label: '已有 4', threshold: 4 }), rule({ id: 'emoji', label: '🛢'.repeat(30), metric: 'spreadPercent', threshold: 6 })];
+    await writeFile(path.join(directory, 'monitor.json'), JSON.stringify({ ...emptyStore(), config: { enabled: true, rules: legacy }, states: { p5: { active: true, alerted: true, lastSentAt: 1, nextAttemptAt: 0 } } }));
+    const stored = await new FileStore(directory, true).read(), { config } = stored;
+    assert.deepEqual(config.rules.map(item => [item.id, item.metric, item.threshold, item.enabled, item.label]), [
+      ['p5', 'spread', 5, false, '价差 5%（原百分比）'],
+      ['abs4', 'spread', 4, true, '已有 4'],
+      ['emoji', 'spread', 6, false, `${'🛢'.repeat(27)}（原百分比）`],
+    ], 'converted rules keep their numbers but stay off; a duplicate of an existing condition is dropped');
+    const f = fixture({ data: stored });
+    const enabled = { ...config, rules: config.rules.map(item => ({ ...item, enabled: true })) };
+    await f.monitor.configure(enabled, stored.revision);
+    assert.equal(f.monitor.data.config.rules.find(item => item.id === 'p5').metric, 'spread', 'the migrated rule passes strict API validation');
+    assert.equal(f.monitor.data.states.p5, undefined, 'percentage-era alert state is not carried into the re-enabled rule');
+    await f.monitor.tick();
+    assert.match(f.messages[0], /【价差 5%（原百分比）】价差（布伦特 − WTI） 5.0000 ≥ 5 USDT\/桶/);
+  } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
 test('upward equality triggers; hysteresis requires crossing the complete reset margin', () => {
@@ -84,7 +96,7 @@ test('cooldown spans separate episodes and a pending episode sends after cooldow
 
 test('market freshness and finite positive marks are required; spread is Brent minus WTI', () => {
   const now = Date.UTC(2026, 8, 11), market = { fetchedAt: new Date(now).toISOString(), brent: { markPx: 81 }, wti: { markPx: 83 } };
-  assert.deepEqual(marketValues(market, now), { brent: 81, wti: 83, spread: -2, spreadPercent: -2 / 83 * 100 });
+  assert.deepEqual(marketValues(market, now), { brent: 81, wti: 83, spread: -2 });
   assert.throws(() => marketValues(market, now + 90_001), /过期/);
   assert.throws(() => marketValues({ ...market, wti: { markPx: null } }, now), /无效/);
   assert.throws(() => marketValues({ ...market, fetchedAt: new Date(now + 6000).toISOString() }, now), /过期/);

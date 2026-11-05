@@ -5,13 +5,15 @@ import type { HubFillsView } from "./hub-fills-contract.ts";
 export const HOUR_MS = 3_600_000;
 const ADR_PER_SHARE = 10;
 export type TradeEvent = ReturnType<typeof groupTradeEvents>[number];
-/** premium/usd are chart y values; value/chartSpread feed the shared detail text in percent. */
+/** value/usd are chart y values; value/chartSpread feed the shared detail text in `unit`. */
 export type SpreadTradeMarker = {
   event: TradeEvent;
   value: number | null;
   chartSpread: number | null;
   basis: string;
   usd: number | null;
+  /** `percent` for a premium market (Hynix), `absolute` for a quote-currency spread (oil). */
+  unit: "percent" | "absolute";
 };
 export type HynixTradeMarker = SpreadTradeMarker;
 
@@ -32,22 +34,24 @@ export type SpreadTradeOptions = {
   rightPerUnit: number;
   tradedBasis: string;
   chartBasis: string;
+  /** The chart point field the market's trade spread matches; defaults to `premium`. */
+  metric?: "premium" | "spread";
 };
 
 /**
  * A fill belongs to the bar that contains it. Fills after the last closed bar stay listed
  * with their own prices and no chart value.
  */
-export function spreadTradeMarkers(events: TradeEvent[], points: Point[], { intervalMs, rightPerUnit, tradedBasis, chartBasis }: SpreadTradeOptions): HynixTradeMarker[] {
+export function spreadTradeMarkers(events: TradeEvent[], points: Point[], { intervalMs, rightPerUnit, tradedBasis, chartBasis, metric = "premium" }: SpreadTradeOptions): HynixTradeMarker[] {
   if (!points.length) return [];
   const start = points[0].time;
   return events.filter(event => event.time >= start).map(event => {
     const bar = points[containingIndex(points, event.time)];
     const covered = bar && event.time - bar.time < intervalMs ? bar : null;
-    const chartSpread = covered && Number.isFinite(covered.premium) ? covered.premium : null;
+    const chartSpread = covered && Number.isFinite(covered[metric]) ? covered[metric] : null;
     const prices = event.spreadVenue?.prices;
     const usd = prices ? prices.left - prices.right / rightPerUnit : covered && Number.isFinite(covered.spread) ? covered.spread : null;
-    return { event, chartSpread, value: event.spread ?? chartSpread, basis: event.spread === null ? chartBasis : tradedBasis, usd };
+    return { event, chartSpread, value: event.spread ?? chartSpread, basis: event.spread === null ? chartBasis : tradedBasis, usd, unit: metric === "spread" ? "absolute" : "percent" };
   });
 }
 

@@ -47,7 +47,7 @@ test('oil expands to seven exchanges with distinct symbols and currencies; Hynix
   }
   for (const exchange of ['lighter', 'variational', 'okx', 'bitget']) {
     const value = quote(exchange, 'oil');
-    assert.equal(calculateExchangeSpread(value).premium, 4);
+    assert.equal(calculateExchangeSpread(value).spread, 4);
     if (['lighter', 'variational'].includes(exchange)) assert.throws(() => validateExchangeQuote(value, exchange, 'hynix'), /Unsupported/);
     else assert.throws(() => validateExchangeQuote(value, exchange, 'hynix'), /mismatch/);
     assert.throws(() => validateExchangeQuote({ ...value, left: { ...value.left, symbol: 'BTC' } }, exchange, 'oil'));
@@ -81,7 +81,7 @@ test('fixed quantity spreads annualize each leg separately; mark notional and 10
   assert.ok(Math.abs(hynix.shortAnnualized - (-0.1752)) < 1e-12);
   assert.equal(hynix.longAnnualized, -hynix.shortAnnualized);
   const oil = calculateExchangeSpread(quote('binance', 'oil'));
-  assert.equal(oil.spread, 4); assert.ok(Math.abs(oil.premium - 4) < 1e-12);
+  assert.equal(oil.spread, 4, 'oil compares the decimal Brent − WTI spread');
   assert.ok(Math.abs(oil.shortAnnualized - ((104 * 0.0004 / 4 - 100 * 0.0008 / 4) / 204 * 8760)) < 1e-12);
 });
 

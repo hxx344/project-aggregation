@@ -10,7 +10,7 @@ export type { VenueSpreads };
 const unpairedText = (market: PositionsMarket): Record<UnpairedReason, string> => ({ "same-side": market === "hynix" ? "ADR 与正股同向" : "CL 与 BZ 同向", multiple: "同一交易所有多笔同币种持仓", "missing-leg": "缺少另一条腿" });
 const totalsFoot = "平仓价差用两腿本轮平仓均价按同一公式计算。组合盈亏为两腿相加：未实现取当前持仓，已实现取各腿本轮（自仓位从零开仓起）已平仓部分，总盈亏 = 未实现 + 已实现净额；币种不同不合并。";
 const pairFoot: Record<SpreadMarket, string> = {
-  oil: `价差 =（BZ − CL）÷ CL，仅在同一交易所 CL 与 BZ 各一笔且方向相反时计算；当前价差取本页交易所报价。${totalsFoot}`,
+  oil: `价差 = BZ − CL（USDT/桶），仅在同一交易所 CL 与 BZ 各一笔且方向相反时计算；当前价差取本页交易所报价。${totalsFoot}`,
   hynix: `价差 = ADR ÷（正股 ÷ 10）− 1，10 份 ADR 对 1 股正股；仅在同一交易所 ADR 与正股各一笔且方向相反时计算；当前价差取本页交易所报价，无报价的交易所显示 —。${totalsFoot}`,
 };
 
@@ -21,8 +21,9 @@ const dateClock = (value: string | null) => value && Number.isFinite(Date.parse(
 const finite = (value: string | null) => { if (value === null || value.trim() === "") return null; const number = Number(value); return Number.isFinite(number) ? number : null; };
 const tone = (value: number | null) => value === null || value === 0 ? "" : value > 0 ? "positive" : "negative";
 const sign = (value: number) => value > 0 ? "+" : value < 0 ? "−" : "";
-const signedPercent = (value: number | null) => value === null ? "—" : `${sign(Number(value.toFixed(3)))}${Math.abs(value).toFixed(3)}%`;
-const signedPoints = (value: number | null) => value === null ? "—" : `${sign(Number(value.toFixed(3)))}${Math.abs(value).toFixed(3)} 百分点`;
+const signedText = (suffix: string) => (value: number | null) => value === null ? "—" : `${sign(Number(value.toFixed(3)))}${Math.abs(value).toFixed(3)}${suffix}`;
+/** Oil spreads are USDT per barrel; Hynix spreads are an ADR premium in percent. */
+const spreadFormats = { oil: { level: signedText(""), change: signedText(" USDT/桶") }, hynix: { level: signedText("%"), change: signedText(" 百分点") } } as const;
 const moneyFormat = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 /** Sign and tone follow the rounded text, so a tiny loss never shows as "−0.00" in red. */
 const money = (value: number | null, currency: string | null) => {
@@ -60,16 +61,16 @@ const realizedNote: Partial<Record<RealizedStatus, string>> = {
   "mixed-currency": "两腿已实现结算币种不同，不合并",
 };
 
-function PairDetail({ pair }: { pair: Extract<SpreadPair, { status: "paired" }> }) {
-  const totals = pair.totals;
+function PairDetail({ pair, market }: { pair: Extract<SpreadPair, { status: "paired" }>; market: SpreadMarket }) {
+  const totals = pair.totals, format = spreadFormats[market];
   const changeTone = pair.change === null || Number(pair.change.toFixed(3)) === 0 ? "" : (pair.change < 0) === pair.narrowingFavors ? "positive" : "negative";
   const totalsNote = realizedNote[totals.realizedStatus] ?? (totals.unrealized === null && totals.unrealizedCurrency === null ? "两腿未实现盈亏币种不同，不合并" : "");
   return <>
     <dl>
-      <div><dt>开仓价差</dt><dd className={tone(pair.opening)}>{signedPercent(pair.opening)}</dd></div>
-      <div><dt>当前价差</dt><dd className={tone(pair.current)}>{signedPercent(pair.current)}{pair.current !== null && pair.currentStale ? <span className="detail-stale-tag">旧</span> : null}</dd></div>
-      <div><dt>平仓价差</dt><dd className={tone(pair.closing)}>{signedPercent(pair.closing)}</dd></div>
-      <div><dt title="当前价差 − 开仓价差；绿色表示对本组合有利">价差变化</dt><dd className={changeTone}>{signedPoints(pair.change)}</dd></div>
+      <div><dt>开仓价差</dt><dd className={tone(pair.opening)}>{format.level(pair.opening)}</dd></div>
+      <div><dt>当前价差</dt><dd className={tone(pair.current)}>{format.level(pair.current)}{pair.current !== null && pair.currentStale ? <span className="detail-stale-tag">旧</span> : null}</dd></div>
+      <div><dt>平仓价差</dt><dd className={tone(pair.closing)}>{format.level(pair.closing)}</dd></div>
+      <div><dt title="当前价差 − 开仓价差；绿色表示对本组合有利">价差变化</dt><dd className={changeTone}>{format.change(pair.change)}</dd></div>
     </dl>
     <div className="related-pair-totals" data-pair-totals={totals.realizedStatus}>
       <div className="related-cycle-head"><span>组合盈亏</span>{totals.realizedStatus === "partial" ? <span>已实现不完整</span> : null}</div>
@@ -137,7 +138,7 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
     {range ? <p className="detail-side-error">{range}</p> : null}
     {pairMarket && incomplete && shown.length ? <p className="detail-side-note">持仓列表不完整，暂不确认配对</p> : null}
     {keptAt ? <p className="detail-side-note">{keptAt}</p> : null}
-    {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === "paired" ? <PairDetail pair={pair}/> : <p className="related-unpaired">无法配对 · {unpairedText(market)[pair.reason]}</p>}</li>)}</ul> : null}
+    {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === "paired" ? <PairDetail pair={pair} market={pairMarket!}/> : <p className="related-unpaired">无法配对 · {unpairedText(market)[pair.reason]}</p>}</li>)}</ul> : null}
     {shown.length ? <PositionRows items={shown}/> : null}
     {pairMarket && pairs.length ? <p className="detail-side-foot">{pairFoot[pairMarket]}</p> : null}
   </>;

@@ -1,6 +1,6 @@
 import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
 import path from 'node:path';
-import { defaultConfig, validateConfig } from './config.mjs';
+import { defaultConfig, validateStoredConfig } from './config.mjs';
 
 export function emptyStore(defaults = defaultConfig, marketSource = 'binance') { return { schemaVersion: 1, marketSource, revision: 0, config: defaults(), states: {}, events: [] }; }
 
@@ -10,7 +10,7 @@ export function activateBinanceSource(data) {
 }
 
 export class FileStore {
-  constructor(directory, externallyLocked = false, { defaults = defaultConfig, validate = validateConfig, marketSource } = {}) { this.defaults = defaults; this.validate = validate; this.marketSource = marketSource; this.externallyLocked = externallyLocked; this.directory = path.resolve(directory); this.file = path.join(this.directory, 'monitor.json'); this.lock = path.join(this.directory, 'monitor.lock'); }
+  constructor(directory, externallyLocked = false, { defaults = defaultConfig, validate = validateStoredConfig, marketSource } = {}) { this.defaults = defaults; this.validate = validate; this.marketSource = marketSource; this.externallyLocked = externallyLocked; this.directory = path.resolve(directory); this.file = path.join(this.directory, 'monitor.json'); this.lock = path.join(this.directory, 'monitor.lock'); }
   async acquire() {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     if (this.externallyLocked) return;

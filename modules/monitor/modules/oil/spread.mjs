@@ -1,12 +1,7 @@
-/** Signed percentage points relative to WTI; null means the pair is unavailable. */
-export function oilSpreadPercent(brent, wti) {
+/** Brent − WTI in USDT per barrel, subtracted on the decimal quotes; null means the pair is unavailable. */
+export function oilSpread(brent, wti) {
   if (![brent, wti].every(value => typeof value === 'number' && Number.isFinite(value) && value > 0)) return null;
-  return spreadPercentOfWti(decimalDifference(brent, wti), wti);
-}
-
-/** The same percentage from an already computed Brent − WTI difference and a valid WTI price. */
-export function spreadPercentOfWti(difference, wti) {
-  const value = difference / wti * 100;
+  const value = decimalDifference(brent, wti);
   return Number.isFinite(value) ? value : null;
 }
 

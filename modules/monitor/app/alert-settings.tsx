@@ -107,6 +107,7 @@ function AlertSettings({ monitorId, title, adapter, active = true, onView, openR
       <p className="alert-help">持续满足阈值只提醒一次；再次提醒须同时满足重新越过阈值和冷却结束。{adapter.example}</p>
       {!connected ? <p className="alert-help" role="status">{loadError || view?.reason || "正在连接告警后台…"}</p> : <>
         <p className="alert-help">{view.webhookConfigured ? "使用整个面板的统一飞书机器人。" : "尚未配置共用机器人，可先保存梯度。"}关闭网页后，后台仍会检查并发送告警。 <button className="shared-settings-link" type="button" onClick={() => window.dispatchEvent(new Event("open-feishu-settings"))}>打开统一设置</button></p>
+        {adapter.notice?.(draft) && <p className="alert-feedback failure" role="status">{adapter.notice(draft)}</p>}
         <form onSubmit={(event: FormEvent) => { event.preventDefault(); void mutate(false); }}>
           <fieldset disabled={busy} className="alert-fields">
             <div className="alert-rules-heading"><h3>梯度设置 <span className="alert-summary">{draft.rules.length} / {adapter.maxRules} 档</span></h3><button type="button" className="alert-button" disabled={draft.rules.length >= adapter.maxRules} onClick={() => edit({ ...draft, rules: [...draft.rules, adapter.newRule(draft)] })}><Plus size={15}/>添加梯度</button></div>

@@ -26,7 +26,7 @@ test('quote updates reuse the oil trend; history corrections and metadata still 
   const update={status:'live',spread:2,fundingHourlyRate:0,fundingBasis:'quantity',fetchedAt,history};
   const first=read(update), quote=read({...update,spread:2.1});
   assert.equal(first.trend,quote.trend);
-  assert.equal(quote.metrics[0].value,'+2.100%');
+  assert.equal(quote.metrics[0].value,'+2.100');
   const stale=read({...update,history:{...history,status:'stale'}});
   assert.equal(stale.trend.points,first.trend.points);
   assert.equal(stale.trend.status,'stale');

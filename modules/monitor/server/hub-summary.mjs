@@ -1,4 +1,4 @@
-import { oilSpreadPercent } from '../modules/oil/spread.mjs';
+import { oilSpread } from '../modules/oil/spread.mjs';
 import { monitors } from '../lib/monitors.ts';
 const timestamp = value => { const at = typeof value === 'number' ? value : Date.parse(value); return Number.isFinite(at) && at > 0 ? at : null; };
 const finite = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
@@ -28,13 +28,13 @@ export async function readHubSummary(services, now = Date.now(), monitorId = 'oi
   } catch { /* A missing or wrong-instrument cache is explicitly offline. */ }
   const at = timestamp(quote?.fetchedAt), staleAfterSeconds = monitorId === 'oil' ? 90 : 35;
   const stale = quote && (!at || at > now + 1000 || now - at > staleAfterSeconds * 1000 || quote.status === 'snapshot' || quote.collection?.stale);
-  const spreadPercent = monitorId === 'oil' ? oilSpreadPercent(finite(quote?.brent?.markPx), finite(quote?.wti?.markPx)) : null;
-  const partial = monitorId === 'oil' && spreadPercent === null || quote?.status === 'partial' || quote?.status === 'connecting' || Boolean(quote?.collection?.error) || monitorId === 'hynix' && Boolean(quote?.fundingError);
+  const oilSpreadValue = monitorId === 'oil' ? oilSpread(finite(quote?.brent?.markPx), finite(quote?.wti?.markPx)) : null;
+  const partial = monitorId === 'oil' && oilSpreadValue === null || quote?.status === 'partial' || quote?.status === 'connecting' || Boolean(quote?.collection?.error) || monitorId === 'hynix' && Boolean(quote?.fundingError);
   const state = !quote ? 'offline' : stale ? 'stale' : partial ? 'partial' : 'online';
-  const detail = quote?.collection?.error || (monitorId === 'hynix' ? quote?.fundingError : '') || (!quote ? '后台尚未取得报价' : stale ? '报价已过期，保留原采集时间' : monitorId === 'oil' && spreadPercent === null ? '价格无效，价差暂不可用' : '');
+  const detail = quote?.collection?.error || (monitorId === 'hynix' ? quote?.fundingError : '') || (!quote ? '后台尚未取得报价' : stale ? '报价已过期，保留原采集时间' : monitorId === 'oil' && oilSpreadValue === null ? '价格无效，价差暂不可用' : '');
   const brent = finite(quote?.brent?.markPx), wti = finite(quote?.wti?.markPx), annualized = finite(quote?.funding?.annualizedRate);
   return { updatedAt: at ? new Date(at).toISOString() : null,
-    health: { state, message: healthMessage(entry.title + (detail ? '：' + detail : monitorId === 'oil' ? '监控已连接；Binance 标记价格，价差＝(布伦特 − WTI) ÷ WTI × 100%' : '监控已连接')), staleAfterSeconds },
-    metrics: monitorId === 'oil' ? [metric('brent', '布伦特原油', brent, 'USDT/桶'), metric('wti', 'WTI 原油', wti, 'USDT/桶'), metric('spread', '布伦特相对 WTI 价差', spreadPercent, '%'), modules]
+    health: { state, message: healthMessage(entry.title + (detail ? '：' + detail : monitorId === 'oil' ? '监控已连接；Binance 标记价格，价差＝布伦特 − WTI（USDT/桶）' : '监控已连接')), staleAfterSeconds },
+    metrics: monitorId === 'oil' ? [metric('brent', '布伦特原油', brent, 'USDT/桶'), metric('wti', 'WTI 原油', wti, 'USDT/桶'), metric('spread', '布伦特 − WTI 价差', oilSpreadValue, 'USDT/桶'), modules]
       : [metric('premium', 'ADR 溢价', finite(quote?.premium), '%'), metric('spread', 'ADR 与换算价格差', finite(quote?.spread), 'USD'), metric('funding', '资金费率年化', annualized === null ? null : annualized * 100, '%'), modules] };
 }

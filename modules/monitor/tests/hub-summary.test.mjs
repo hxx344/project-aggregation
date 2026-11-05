@@ -11,11 +11,11 @@ const timestamp = new Date(now).toISOString();
 const oil = { fetchedAt: timestamp, status: 'live', brent: { markPx: 80, funding: 0 }, wti: { markPx: 76, funding: 0 } };
 const services = (overrides = {}) => new Map(Object.entries({ oil: { handle: async () => oil }, hynix: { handle: async () => ({ fetchedAt: timestamp, status: 'live', premium: 1.2 }) }, perpetual: { summary: () => ({ state: 'online', updatedAt: now, quoteCount: 4900, message: '' }) }, ...overrides }));
 
-test('oil hub summaries use signed percentages and report unavailable denominators as partial', async () => {
-  for (const [brent, wti, expected] of [[75, 80, -6.25], [80, 80, 0], [80, 0, null], [80, null, null]]) {
+test('oil hub summaries use the signed Brent − WTI spread and report invalid legs as partial', async () => {
+  for (const [brent, wti, expected] of [[75, 80, -5], [80.3, 80, 0.3], [80, 80, 0], [80, 0, null], [80, null, null]]) {
     const result = await readHubSummary(services({ oil: { handle: async () => ({ ...oil, brent: { markPx: brent }, wti: { markPx: wti } }) } }), now);
     assert.equal(result.metrics[2].value, expected);
-    assert.equal(result.metrics[2].unit, '%');
+    assert.equal(result.metrics[2].unit, 'USDT/桶');
     assert.equal(result.health.state, expected === null ? 'partial' : 'online');
     assert.equal(result.updatedAt, timestamp);
   }
@@ -26,8 +26,8 @@ test('selected module summaries preserve legacy keys, units and source time with
   const cached = services({ hynix: { handle: async () => { hynixReads++; throw Error('hynix cache empty'); } } });
   const normal = await readHubSummary(cached, now);
   assert.equal(normal.health.state, 'online'); assert.equal(normal.updatedAt, timestamp); assert.equal(hynixReads, 0);
-  assert.deepEqual(normal.metrics.map(item => [item.key, item.unit]), [['brent', 'USDT/桶'], ['wti', 'USDT/桶'], ['spread', '%'], ['modules', '个']]);
-  assert.equal(normal.metrics[0].value, 80); assert.equal(normal.metrics[2].value, 4 / 76 * 100);
+  assert.deepEqual(normal.metrics.map(item => [item.key, item.unit]), [['brent', 'USDT/桶'], ['wti', 'USDT/桶'], ['spread', 'USDT/桶'], ['modules', '个']]);
+  assert.equal(normal.metrics[0].value, 80); assert.equal(normal.metrics[2].value, 4);
   const missing = await readHubSummary(cached, now, 'hynix'); assert.equal(missing.health.state, 'offline'); assert.equal(missing.updatedAt, null); assert.match(missing.health.message, /海力士/); assert.equal(hynixReads, 1);
   const hynix = await readHubSummary(services({ oil: { handle: async () => { throw Error('oil unavailable'); } }, hynix: { handle: async () => ({ fetchedAt: timestamp, status: 'live', premium: 1.2, spread: 0.5, funding: { annualizedRate: 0.15 } }) } }), now, 'hynix');
   assert.equal(hynix.health.state, 'online'); assert.deepEqual(hynix.metrics.map(item => [item.key, item.unit]), [['premium', '%'], ['spread', 'USD'], ['funding', '%'], ['modules', '个']]); assert.equal(hynix.metrics[2].value, 15);

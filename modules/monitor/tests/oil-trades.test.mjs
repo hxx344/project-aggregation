@@ -14,7 +14,7 @@ test('same-named Asset projects cannot contribute opposite legs to the same venu
   assert.ok(event.venues.every(venue => venue.direction === '单腿' && venue.spread === null && venue.legs.length === 1));
   assert.equal(event.spread, null); assert.equal(event.spreadVenue, null);
   const [sameProject] = groupTradeEvents([cl, { ...brent, sourceId: cl.sourceId, source: '重命名后的账本' }]);
-  assert.equal(sameProject.venues.length, 1); assert.equal(sameProject.spread, 10, 'display-name changes do not split stable project identity');
+  assert.equal(sameProject.venues.length, 1); assert.equal(sameProject.spread, 8, 'display-name changes do not split stable project identity');
 });
 
 test('fill effects cover opening, reducing, closing, crossing zero and unknown reconstruction', () => {
@@ -47,9 +47,9 @@ test('four legs across two venues remain separate with Binance spread preferred,
     fill(), bz(),
   ])[0];
   assert.equal(event.type, 'entry'); assert.equal(event.venues.length, 2);
-  assert.equal(event.spread, 10); assert.equal(event.spreadVenue.exchangeId, 'binance');
+  assert.equal(event.spread, 10, 'BZ 110 − CL 100 USDT/桶'); assert.equal(event.spreadVenue.exchangeId, 'binance');
   const okx = event.venues.find(venue => venue.exchangeId === 'okx');
-  assert.equal(okx.spread, 20); assert.ok(okx.legs.every(leg => leg.quantity === '8' && leg.quantityUnit === '张'));
+  assert.equal(okx.spread, 18); assert.ok(okx.legs.every(leg => leg.quantity === '8' && leg.quantityUnit === '张'));
   assert.ok(event.venues.every(venue => venue.direction.startsWith('做空价差')));
   assert.equal(groupTradeEvents([fill(), bz({ side: 'buy', positionAfter: '2' })])[0].venues[0].direction, '双向或同向成交');
   assert.equal(groupTradeEvents([fill()])[0].venues[0].direction, '单腿');

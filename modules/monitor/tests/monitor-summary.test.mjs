@@ -21,11 +21,12 @@ test("Hynix card retains last quote and its time when updates fail, then recover
   assert.equal(hynixSummary(quote).status, "live");
 });
 
-test("oil card shows simple annualized funding percent and labels the selected basis", () => {
+test("oil card shows the absolute spread in USDT per barrel and simple annualized funding percent", () => {
   const update = { status: "snapshot", spread: 5.4321, fundingHourlyRate: -0.00003125, fundingBasis: "quantity", fetchedAt };
   const snapshot = oilSummary(update);
   assert.equal(snapshot.status, "snapshot");
-  assert.equal(snapshot.metrics[0].value, "+5.432%");
+  assert.equal(snapshot.metrics[0].value, "+5.432");
+  assert.equal(snapshot.metrics[0].label, "价差 · USDT/桶");
   assert.equal(snapshot.metrics[1].label, "净资金费 / 年化");
   assert.equal(snapshot.metrics[1].value, "−27.38%");
   assert.equal(snapshot.metrics[1].tone, "negative");
