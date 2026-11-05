@@ -1,6 +1,8 @@
-# Aero 市场实盘：Safe + Zodiac Roles 权限清单（草案 v0.1）
+# Aero 市场实盘：Safe + Zodiac Roles 权限清单（v0.2）
 
-日期：2026-11-04　状态：设计草案，未实现、未部署、未在 fork 上验证。
+日期：2026-11-04　状态：首版工具已实现（`tools/aero-roles/`），Base fork 验收 56/56 通过（第 8 节）；未在主网部署，工作台执行器尚未接入（第 9 节）。
+
+v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版不授权 `increaseLiquidity`；Safe 必须设置 CompatibilityFallbackHandler；额度键与部署步骤改为 `tools/aero-roles` 的实际实现。
 
 ## 0. 结论与范围
 
@@ -74,7 +76,7 @@
 | 函数 | 选择器 | 参数条件 |
 | --- | --- | --- |
 | `mint(MintParams)` | `0xb5007d1f` | `token0/token1/tickSpacing` ∈ 池白名单；`recipient` EqualToAvatar；`amount0Desired` ≤ 额度[token0]，`amount1Desired` ≤ 额度[token1]；`sqrtPriceX96` = 0（非 0 会顺带创建新池） |
-| `increaseLiquidity(params)` | `0x219f5d17` | `tokenId` OwnedByAvatar；`amount0Desired/amount1Desired` 计入额度（需按 tokenId 所属池的代币取额度键，见第 5 节说明） |
+| ~~`increaseLiquidity(params)`~~ | `0x219f5d17` | 首版不授权（第 5 节）：调仓一律平仓 + 新开仓 |
 | `decreaseLiquidity(params)` | `0x0c49ccbe` | `tokenId` OwnedByAvatar（取出的代币记在仓位上，靠 `collect` 领取） |
 | `collect(params)` | `0xfc6f7865` | `tokenId` OwnedByAvatar；`recipient` EqualToAvatar |
 | `burn(uint256)` | `0x42966c68` | `tokenId` OwnedByAvatar |
@@ -121,15 +123,15 @@
 | 用途 | token0 / token1 | tickSpacing | 池 / gauge |
 | --- | --- | --- | --- |
 | 奖励卖出（swap） | AERO → USDC | 200 | `0xD0Ac…6816` / `0x4A3B…60D5` |
-| 做市池 | 待定：由 Aero 市场页的推荐结果选出后逐个加入 | | |
+| 做市池 | 待定：由 Aero 市场页的推荐结果选出后逐个加入（`config.example.json` 与 fork 验收用 RSGP/USDC ts100 作示例） | | |
 
 加池由管理钱包签一笔 Safe 交易，同时更新：NPM `mint` 的池白名单 `Or`、新 gauge 目标、新代币目标、`NPM.approve` 的 gauge 列表、必要的兑换路径。bot 无权自行扩大白名单。
 
 ## 5. 额度（Roles `WithinAllowance`）
 
-- 每个代币一个额度键，例如 `turnover-USDC`、`turnover-AERO`，mint/increase 的 desired 金额与 swap 的 `amountIn` 共用同一个键，按 24 小时补充。池白名单的每个 `Or` 分支固定了代币地址，分支内的金额字段直接挂对应代币的额度键。
+- 每个代币一个额度键（实现为 `keccak256("aero-roles:turnover:" + 小写代币地址)`），mint 的 desired 金额与 swap 的 `amountIn` 共用同一个键，按 24 小时补充。池白名单的每个 `Or` 分支固定了代币地址，分支内的金额字段直接挂对应代币的额度键。
 - `mint` 的 desired 是上限，实际投入可能更少，额度按 desired 扣，偏保守。
-- `increaseLiquidity` 的参数里没有代币地址，无法按代币取额度键：首版要么不授权 `increaseLiquidity`（调仓一律"平仓 + 新开仓"），要么给它单独一个按池分开的小额度。建议首版不授权。
+- `increaseLiquidity` 的参数里没有代币地址，无法按代币取额度键：首版不授权（已定），调仓一律"平仓 + 新开仓"。
 - 上限取预期日周转额的 2 倍左右；超限时 bot 交易 revert，策略停在当前状态，等管理钱包调额度或次日补充。
 - 可选：`CallWithinAllowance` 限制每日 swap 笔数，防止"小额多次"消耗。
 
@@ -145,7 +147,7 @@
 
 ## 7. 管理钱包操作（只由 Safe owner 签）
 
-- 部署：创建 Safe → 经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 按 JSON 下发 scope 与额度（用 `zodiac-roles-sdk` 4.x 生成差异调用）→ `assignRoles(bot, [roleKey], [true])`。
+- 部署：在 Safe{Wallet} 用硬件钱包创建 1/1 Safe（v1.4.1，界面默认带 CompatibilityFallbackHandler；gauge 解押用 `safeTransferFrom` 退回 NFT，没有 handler 时解押会失败）→ `node tools/aero-roles/cli.mjs plan` 链上核对并生成 Transaction Builder 批次 → 管理钱包在 Safe 界面导入、核对、签名。批次一笔完成：经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 下发 scope 与额度 → `assignRoles(bot, [roleKey], [true])`。权限与额度由 `tools/aero-roles/permissions.mjs` 从配置 JSON 生成，不依赖 `zodiac-roles-sdk`；之后改池或额度另生成差异批次（尚未实现）。
 - 日常：加删池子、调额度、从 Safe 直接提走利润或本金。
 - 紧急停止：`assignRoles(bot, [roleKey], [false])`，或 `disableModule(Roles)`，一笔交易生效，不依赖服务器；必要时再撤销代币授权。
 - 换 bot 私钥：先给新地址分配角色，再撤销旧地址。
@@ -162,6 +164,13 @@
 - 非白名单池的 `mint` / swap；`sqrtPriceX96 ≠ 0`；超额度；`value > 0`；delegatecall 到 MultiSend 以外的地址；MultiSend 内层 delegatecall。
 - 撤销角色后，bot 的任意调用。
 
+结果（2026-11-04，Base 区块约 53532400，`node tools/aero-roles/fork-test.mjs`，anvil 只监听 127.0.0.1）：56/56 通过。
+- 部署批次 27 笔经 MultiSendCallOnly 一次执行（gas 约 265 万）；Roles 实际地址与 `plan` 预测一致；`plan` 拒绝没有 fallback handler 的 Safe。
+- 上列正向流程全部成功（示例池 RSGP/USDC ts100、AERO→USDC ts200）；`mint` 按 `amount1Desired` 扣减额度。
+- 上列反向用例与额外用例（非成员地址、Safe / Roles 自身函数、MultiSend 夹带禁止调用、已质押 tokenId 的 `decreaseLiquidity`、`claimReferralEmissions`）全部由 Roles 权限拒绝（`ConditionViolation` / `NoMembership` / `NotAuthorized`），不是下游合约自身失败；本地签名前校验对每个用例的结论与链上一致。
+- 发现：经 Roles 执行兑换时，按 gas 估算值原样发送曾在链上 revert，加 30% 余量后通过（原因未确认）；执行器需给 gas 留余量。
+- 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测、额度跨日补充。
+
 ## 9. 工作台侧改动（实施时另立任务）
 
 - 执行器：交易改为经 Roles 代理以 Safe 名义执行；签名前本地校验保留，与 Roles 配置读同一份白名单 JSON，作为第二道防线。
@@ -171,7 +180,7 @@
 
 ## 10. 待决策
 
-1. 管理钱包形态：单个硬件钱包 1/1（简单），还是 2/3 多签（防单把丢失或泄露）。
+1. ~~管理钱包形态~~：已定单个硬件钱包 1/1（2026-11-04）。硬件钱包丢失即失去 Safe 控制，助记词离线备份是唯一恢复手段；以后可由同一 Safe 加 owner 升级为多签，不需要迁移资产。
 2. 首批做市池与每日额度。
 3. Aero LP 是否同步迁到 Safe + Roles（结构相同，白名单只含 RSGP/USDC 一个池）。
 4. AERO 奖励自动卖成 USDC，还是留在 Safe 由管理钱包处理。

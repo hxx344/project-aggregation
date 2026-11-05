@@ -1,0 +1,22 @@
+{
+  "roleKey": "aero-market-bot",
+  "pools": [
+    {
+      "name": "RSGP/USDC ts100",
+      "token0": "0x44B63aF715D5ef02CC3646a6CE96875e11d69E85",
+      "token1": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "tickSpacing": 100,
+      "gauge": "0x77e3e1b150d4509aade60b73c48f77cab00272b1"
+    }
+  ],
+  "swaps": [
+    { "tokenIn": "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee", "tokenOut": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "tickSpacing": 200 },
+    { "tokenIn": "0x44B63aF715D5ef02CC3646a6CE96875e11d69E85", "tokenOut": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "tickSpacing": 100 },
+    { "tokenIn": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "tokenOut": "0x44B63aF715D5ef02CC3646a6CE96875e11d69E85", "tickSpacing": 100 }
+  ],
+  "allowances": [
+    { "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "symbol": "USDC", "perDay": "1000000000" },
+    { "token": "0x44B63aF715D5ef02CC3646a6CE96875e11d69E85", "symbol": "RSGP", "perDay": "500000000000000000000000" },
+    { "token": "0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee", "symbol": "AERO", "perDay": "2000000000000000000000" }
+  ]
+}
