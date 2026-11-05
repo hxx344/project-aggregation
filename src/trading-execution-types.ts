@@ -52,3 +52,7 @@ export type ExecutionJob = {
 export type ExecutionState = {
   generatedAt: string; connections: ExecutionConnection[]; positions: ExecutionPosition[]; jobs: ExecutionJob[];
 };
+
+/** One top-of-book read; a failed read carries only `error`. */
+export type ExecutionQuoteBook = { exchange: TradingExchange; symbol: ExecutionSymbol; bid?: string; ask?: string; at?: string; error?: string };
+export type ExecutionQuotes = { generatedAt: string; maxAgeMs: number; books: ExecutionQuoteBook[] };

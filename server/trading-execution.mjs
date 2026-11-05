@@ -1,8 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, EXECUTION_EXCHANGES, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
-import { TRADING_NAMES, EXECUTION_MARKETS } from './trading-markets.mjs';
+import { ExecutionError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide } from './trading-execution-plan.mjs';
+import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_ALL_SYMBOLS } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL } from './control/execution-jobs.mjs';
@@ -23,6 +23,7 @@ const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
 // Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
 const CONNECT_SYMBOLS = EXECUTION_MARKETS.oil.symbols;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
+const QUOTES_TTL_MS = 2000, QUOTE_TIMEOUT_MS = 6000;
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
 const validRevision = value => Number.isSafeInteger(value) && value >= 0;
 const modeOf = (exchange, mode) => {
@@ -31,7 +32,7 @@ const modeOf = (exchange, mode) => {
 };
 
 /** Durable, explicit live execution. Read endpoints never submit exchange requests. */
-export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = EXECUTION_CALL_TIMEOUT_MS, isSessionActive = () => true, accountWriter = null } = {}) {
+export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory = createExecutionExchangeClient, now = Date.now, intervalMs = 1000, callTimeoutMs = EXECUTION_CALL_TIMEOUT_MS, quoteTimeoutMs = QUOTE_TIMEOUT_MS, isSessionActive = () => true, accountWriter = null } = {}) {
   // If stmt is explicitly null, use raw db.prepare (for tests that mock db.prepare)
   // If stmt is undefined, create a cached version for production
   // If stmt is provided, use it
@@ -363,6 +364,39 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     }));
     requireLease(); return { snapshots, markets, connections };
   }
+  // Display-only top of book on every venue (same-venue spreads are the main
+  // use, so the view does not depend on the selected pair). Public book only
+  // (withRule: false, so no exchangeInfo download) via the same clients the
+  // executor trades with; one attempt per leg, no retry, each leg bounded by
+  // QUOTE_TIMEOUT_MS; a failed leg is reported on that leg only. A read in
+  // flight is shared (up to twice the leg timeout, in case a client ignores the
+  // signal), and a finished one for QUOTES_TTL_MS after it settles, so several
+  // tabs or a slow leg do not multiply exchange requests; expiry is by time only.
+  let quoteCache = null;
+  function quotes() {
+    const started = now();
+    const age = quoteCache ? started - quoteCache.at : -1;
+    if (quoteCache && age >= 0 && age < (quoteCache.pending ? quoteTimeoutMs * 2 : QUOTES_TTL_MS)) return quoteCache.promise;
+    const entry = { at: started, pending: true, promise: null };
+    const legs = EXECUTION_EXCHANGES.flatMap(exchange => EXECUTION_ALL_SYMBOLS.map(symbol => ({ exchange, symbol })));
+    const timeouts = legs.map(() => AbortSignal.timeout(quoteTimeoutMs));
+    const promise = Promise.allSettled(legs.map((leg, index) => call(signal => clients.get(leg.exchange).market(leg.symbol, { signal: AbortSignal.any([signal, timeouts[index]]), withRule: false }))))
+      .then(results => ({
+        generatedAt: new Date(now()).toISOString(), maxAgeMs: QUOTE_MAX_AGE,
+        books: legs.map((leg, index) => {
+          const result = results[index];
+          // The leg timeout aborts the client from outside, which reports it as an interruption.
+          if (result.status === 'rejected') return { ...leg, error: timeouts[index].aborted && result.reason?.code === 'aborted' ? '交易所请求超时' : safeError(result.reason) };
+          const { symbol, bid, ask, at } = result.value ?? {};
+          if (symbol !== leg.symbol) return { ...leg, error: '交易所未返回完整盘口' };
+          return { ...leg, bid, ask, at };
+        }),
+      }))
+      .finally(() => { entry.pending = false; entry.at = now(); });
+    entry.promise = promise; quoteCache = entry;
+    return promise;
+  }
+
   async function preview(body, session) {
     writable(); checkSession(session);
     if (typeof session !== 'string' || !session) throw new ExecutionError(401, '请重新登录');
@@ -827,7 +861,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, connect, disconnect, preview, start, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       let ownsLease = false;

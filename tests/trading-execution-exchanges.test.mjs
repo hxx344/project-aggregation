@@ -399,6 +399,13 @@ for (const exchange of ['binance', 'bybit']) {
     assert.equal(calls.filter(call => call.url.pathname.endsWith('bookTicker') || call.url.pathname.endsWith('orderbook')).length, 2);
   });
 
+  test(`${exchange} display market reads the book only, without downloading rules`, async () => {
+    const { client, calls } = harness(exchange);
+    assert.deepEqual(await client.market('CLUSDT', { withRule: false }), { symbol: 'CLUSDT', bid: '80', ask: '80.1', at: new Date(NOW).toISOString() });
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].url.pathname.endsWith('bookTicker') || calls[0].url.pathname.endsWith('orderbook'));
+  });
+
   test(`${exchange} malformed or crossed market data cannot authorize a trade`, async () => {
     for (const change of ['missing-rule', 'crossed', 'timestamp']) {
       const { client } = harness(exchange, call => {

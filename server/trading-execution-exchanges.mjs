@@ -10,7 +10,8 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  * createExecutionExchangeClient(exchange, { fetchImpl, now, timeoutMs }) exposes:
  *   verify(credentials, options) -> { identity: string | null }
  *   account(credentials, options) -> { identity, modes, positions, openOrders, strategies }
- *   market(symbol, { signal }) -> { symbol, bid, ask, at, rule }
+ *   market(symbol, { signal, withRule = true }) -> { symbol, bid, ask, at, rule }
+ *     (withRule: false reads the book only, for display; rule is then absent)
  *   create(credentials, spec, options) -> { id, kind: 'order' | 'strategy' }
  *   inspect(credentials, { ...spec, id: string | null }, options) -> {
  *     id, kind, status: 'working' | 'paused' | 'terminal', quantity,
@@ -646,11 +647,11 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     return { ...rule };
   }
 
-  async function market(symbol, { signal } = {}) {
+  async function market(symbol, { signal, withRule = true } = {}) {
     if (!SYMBOLS.includes(symbol)) fail('input');
     checkAbort(signal);
     const [rule, book] = await Promise.all([
-      loadRule(symbol, signal),
+      withRule ? loadRule(symbol, signal) : null,
       request('book', null, exchange === 'binance' ? { symbol } : { category: 'linear', symbol, limit: '1' }, { signal }),
     ]);
     requireObject(book);
@@ -669,7 +670,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     }
     if (compareDecimals(bid, ask) >= 0) fail();
     checkAbort(signal);
-    return { symbol, bid, ask, at, rule };
+    return withRule ? { symbol, bid, ask, at, rule } : { symbol, bid, ask, at };
   }
 
   async function create(credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) {

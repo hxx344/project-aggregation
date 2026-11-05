@@ -410,6 +410,12 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // against the durable maintenance flag. Stop and reconcile stay open.
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && method === 'GET') return reply(200, execution.state());
+      if (pathname === '/api/trading/execution/quotes' && method === 'GET') {
+        if (url.search) throw new HttpError(400, '行情接口不接受查询参数');
+        const data = await execution.quotes();
+        if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
+        return reply(200, data);
+      }
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
       const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
       if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));

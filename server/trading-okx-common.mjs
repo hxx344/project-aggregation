@@ -303,16 +303,17 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
     ruleCache.set(symbol, { value, until: clock() + 60_000 });
     return { ...value };
   }
-  async function market(symbol, { signal, refreshRule = false } = {}) {
+  /** withRule: false reads the book only (display); the tick-size check then needs the rule and is skipped. */
+  async function market(symbol, { signal, refreshRule = false, withRule = true } = {}) {
     const instId = instrumentId(symbol);
-    const [rules, response] = await Promise.all([rule(symbol, signal, refreshRule), request('book', null, { instId, sz: '1' }, { signal })]);
+    const [rules, response] = await Promise.all([withRule ? rule(symbol, signal, refreshRule) : null, request('book', null, { instId, sz: '1' }, { signal })]);
     const book = one(response);
     if (list(book.bids, 1).length !== 1 || list(book.asks, 1).length !== 1
       || list(book.bids[0], 4).length < 2 || list(book.asks[0], 4).length < 2) fail();
     const bid = amount(book.bids[0][0], { positive: true }), ask = amount(book.asks[0][0], { positive: true });
     amount(book.bids[0][1], { positive: true }); amount(book.asks[0][1], { positive: true });
-    if (compareDecimals(bid, ask) >= 0 || !multiple(bid, rules.tickSize) || !multiple(ask, rules.tickSize)) fail('not_tradable');
-    return { symbol, bid, ask, at: iso(book.ts), rule: rules };
+    if (compareDecimals(bid, ask) >= 0 || (rules && (!multiple(bid, rules.tickSize) || !multiple(ask, rules.tickSize)))) fail('not_tradable');
+    return rules ? { symbol, bid, ask, at: iso(book.ts), rule: rules } : { symbol, bid, ask, at: iso(book.ts) };
   }
   return Object.freeze({ request, clock, rule, market, credentialsValid });
 }
