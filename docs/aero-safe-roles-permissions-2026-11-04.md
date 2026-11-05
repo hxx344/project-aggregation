@@ -133,7 +133,7 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 | 奖励卖出（swap） | AERO → USDC | 200 | `0xD0Ac…6816` / `0x4A3B…60D5` |
 | 做市池 | 待定：由 Aero 市场页的推荐结果选出后逐个加入（`config.example.json` 与 fork 验收用 RSGP/USDC ts100 作示例） | | |
 
-加池由管理钱包签一笔 Safe 交易，同时更新：NPM `mint` 的池白名单 `Or`、新 gauge 目标、新代币目标、`NPM.approve` 的 gauge 列表、必要的兑换路径。bot 无权自行扩大白名单。
+加池由管理钱包签一笔 Safe 交易，同时更新：NPM `mint` 的池白名单 `Or`、新 gauge 目标、新代币目标、`NPM.approve` 的 gauge 列表、必要的兑换路径。bot 无权自行扩大白名单。工作台已能为任意 Aero CL 池生成这份差异批次，见 9.2。
 
 ## 5. 额度（Roles `WithinAllowance`）
 
@@ -156,7 +156,7 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 
 ## 7. 管理钱包操作（只由 Safe owner 签）
 
-- 部署：在 Safe{Wallet} 用硬件钱包创建 1/1 Safe（v1.5.0 L2，选 Pay now 立即部署；界面默认带 CompatibilityFallbackHandler；gauge 解押用 `safeTransferFrom` 退回 NFT，没有 handler 时解押会失败）→ `node tools/aero-roles/cli.mjs plan` 链上核对并生成 Transaction Builder 批次 → 管理钱包在 Safe 界面导入、核对、签名。批次一笔完成：经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 下发 scope 与额度 → `assignRoles(bot, [roleKey], [true])`。权限与额度由 `tools/aero-roles/permissions.mjs` 从配置 JSON 生成，不依赖 `zodiac-roles-sdk`；之后改池或额度另生成差异批次（尚未实现）。
+- 部署：在 Safe{Wallet} 用硬件钱包创建 1/1 Safe（v1.5.0 L2，选 Pay now 立即部署；界面默认带 CompatibilityFallbackHandler；gauge 解押用 `safeTransferFrom` 退回 NFT，没有 handler 时解押会失败）→ `node tools/aero-roles/cli.mjs plan` 链上核对并生成 Transaction Builder 批次 → 管理钱包在 Safe 界面导入、核对、签名。批次一笔完成：经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 下发 scope 与额度 → `assignRoles(bot, [roleKey], [true])`。权限与额度由 `tools/aero-roles/permissions.mjs` 从配置 JSON 生成，不依赖 `zodiac-roles-sdk`；之后加池用工作台生成差异批次（9.2）；删池与调额度的差异批次尚未实现。
 - 日常：加删池子、调额度、从 Safe 直接提走利润或本金。
 - 紧急停止：`assignRoles(bot, [roleKey], [false])`，或 `disableModule(Roles)`，一笔交易生效，不依赖服务器；必要时再撤销代币授权。
 - 换 bot 私钥：先给新地址分配角色，再撤销旧地址。
@@ -219,9 +219,44 @@ Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/a
   - 停用时没有飞书即时提醒，只在页面显示；飞书汇总暂未包含 Aero 实盘。
   - 主网小额实测未做。
 
+### 9.2 任意池加入白名单（2026-11-05）
+
+入口：Aero 市场池详情页（Base 池），不在白名单的池子在「Safe 实盘开仓」面板里显示加池表单。
+
+- 生成（`POST /api/automation/aero-safe/pools/plan`，`{ pool, allowances: { 新代币地址: 每日数量 } }`）：
+  - 先链上核验池子（`executor.inspectPool`，与 `cli.mjs plan` 的池子核对相同）：
+    - 池子由 CL 工厂按 (token0, token1, tickSpacing) 登记；
+    - 有 gauge，没有 gauge 的池子拒绝；
+    - gauge 是已审实现的 EIP-1167 克隆，与池子互相指向，NFT 与 voter 是固定地址。
+    - 代币和 gauge 不能是 Safe、Roles、固定的协议合约，也不能与已有目标重合（同一地址出现两次时，后下发的 `scopeFunction` 会覆盖前一个）；`buildPermissions` 对所有配置都做这项检查。
+  - 再算出新权限：加池子；该代币对两个方向没有兑换路径时，按本池 tickSpacing 补上（已有路径沿用）；新代币加每日额度，必须填写，页面按约 1000 美元预填。已有代币的额度不在这里改。
+  - `buildUpdateBatch` 比较新旧权限，只生成差异：
+    - 新目标：`scopeTarget` 加全部函数；
+    - 已有目标上条件变化的函数：重下 `scopeFunction`（整体替换）；
+    - 新额度：`setAllowance`。
+    - 已有额度不重下，因为 `setAllowance` 会把余额重置为满额；减少权限的变更一律拒绝。
+  - 返回 Transaction Builder JSON，计划存入 `aero-safe/pool-plan.json`，重启后仍在。这一步不改配置、不签名。
+  - 刷新页面后，额度输入框沿用已保存计划里的数量，重新生成的批次与之前相同。同一批次只能执行一次：重复执行会把新代币当天的额度重置为满额。
+- 执行：页面下载 JSON，在 Safe{Wallet} → Transaction Builder 导入，核对后用硬件钱包签名执行。
+- 启用（`POST /pools/apply`）：以 bot 身份 `eth_call` `Roles.execTransactionWithRole(…, shouldRevert = true)`，金额一律为 0，不动资产。逐项核对：
+  - 新池 `mint`、`NPM.approve → 新 gauge`；
+  - 新 gauge 的 5 个函数；
+  - 新兑换路径；
+  - 新代币对 NPM / Router 的 `approve`。
+
+  Roles 放行，或只是下游合约自身失败（`ModuleTransactionFailed`），算生效。`NPM.approve` 用链上已有的 tokenId 模拟，`CustomConditionViolation`（头寸不归 Safe）也算 gauge 参数已放行。新额度直接读 `Roles.allowances`，补充量、上限和周期必须与计划一致。其他 Roles 拒绝、或非 Roles 原因的回滚都算未生效，配置不变。全部通过后才把新权限写入 `config.json`。Safe 配置在生成后又有变化时，计划作废，须重新生成。
+- 容量：Roles 每个函数的条件树最多 255 个节点。兑换 `Or` 每条路径 9 个节点，先用满：每加一个两边都是新代币的池子增加 2 条路径，按初始 3 条路径算，最多约 13 个池子。超出时生成接口返回 409「白名单已满」。
+- 分叉演练：`node tools/aero-roles/fork-add-pool.mjs`。2026-11-05 Base 区块 53546432，17/17 通过：
+  - 从只含 WETH/USDC ts100 的 Roles 出发，给 WETH/cbBTC ts1 生成 12 笔批次；
+  - 拒绝没有 gauge 的 WETH/cbBTC ts50 和非池子地址；
+  - 批次未执行时 12/14 项未通过；只执行前 11 笔时只差 cbBTC 额度一项，均拒绝且配置不变；
+  - 补执行后核对通过、并入配置；
+  - 在新池经新路径 WETH → cbBTC 配平开仓、质押到新 gauge、平仓，cbBTC 回到 Safe。
+- 未做：删池、调额度的差异批次；主网实测。
+
 ## 10. 待决策
 
 1. ~~管理钱包形态~~：已定单个硬件钱包 1/1（2026-11-04）。硬件钱包丢失即失去 Safe 控制，助记词离线备份是唯一恢复手段；以后可由同一 Safe 加 owner 升级为多签，不需要迁移资产。
 2. 首批做市池与每日额度。
-3. Aero LP 是否同步迁到 Safe + Roles（结构相同，白名单只含 RSGP/USDC 一个池）。
+3. ~~Aero LP 是否同步迁到 Safe + Roles~~：Aero LP 模块已移除（2026-11-05），Aero 只保留 Safe + Roles 一条执行路径。
 4. ~~AERO 奖励处理~~：已定领取后自动卖成 WETH，低于最小卖出数量时留在 Safe（2026-11-04）。

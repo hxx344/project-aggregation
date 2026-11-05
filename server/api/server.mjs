@@ -389,11 +389,6 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       if (req.headers.origin) sameOrigin(req);
       await forward(req, res, url, current); return;
     }
-    if (pathname === '/api/automation/aero-lp' || pathname.startsWith('/api/automation/aero-lp/')) {
-      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台操作 LP 调仓');
-      if (req.headers.origin) sameOrigin(req);
-      await forward(req, res, url, current); return;
-    }
     if (pathname === '/api/automation/aero-safe' || pathname.startsWith('/api/automation/aero-safe/')) {
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台操作 Aero 实盘');
       if (req.headers.origin) sameOrigin(req);

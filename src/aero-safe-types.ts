@@ -44,6 +44,17 @@ export type AeroSafeState = {
   pending: { hash: string; nonce: number; label: string; at: number; stale: boolean } | null;
   ledgerError?: string | null; job: AeroSafeJob | null; chain: AeroSafeChain | null; chainAt: number | null; chainError: string | null; refreshing: boolean;
   events: AeroSafeEvent[]; ledger: AeroSafeLedger[]; serverNow: number; auto?: AeroAutoState;
+  poolPlan?: { createdAt: number; pool: AeroSafePoolPlanPool; stale: boolean } | null;
+};
+type PlanToken = { address: string; symbol: string; decimals: number };
+export type AeroSafePoolPlanPool = {
+  address: string; name: string; gauge: string; tickSpacing: number; token0: PlanToken; token1: PlanToken;
+  allowances: { token: string; symbol: string; perDay: string; decimals: number }[]; transactions: number;
+};
+// POST /pools/plan：builder 为 Safe{Wallet} Transaction Builder 可导入的批次 JSON。
+export type AeroSafePoolPlan = {
+  pool: AeroSafePoolPlanPool; transactions: { to: string; description: string }[]; builder: unknown;
+  usage: { label: string; nodes: number }[]; state: AeroSafeState;
 };
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string;

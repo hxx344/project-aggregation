@@ -7,6 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Wallet, getAddress, parseUnits } from 'ethers';
 import { buildPermissions } from '../../tools/aero-roles/permissions.mjs';
+import { buildUpdateBatch, conditionUsage, toTransactionBuilderJson } from '../../tools/aero-roles/roles-calls.mjs';
 import * as executor from '../../tools/aero-roles/executor.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
@@ -21,6 +22,9 @@ const REFRESH_MIN_MS = 5_000;
 // 头寸判为已销毁后，须隔这么久、且区块号前进后再次判定才删除记录（防负载均衡后面滞后的节点）。
 const BURN_CONFIRM_MS = 60_000;
 const REFRESH_BUDGET_MS = 60_000;
+// 加池：链上核验与生效核对各自的总时限（单次读取另有 20 秒超时、最多 2 次）。
+const POOL_BUDGET_MS = 90_000;
+const POOL_PLAN_KEYS = new Set(['pool', 'allowances']);
 // 已签名未上链超过这个时长后，允许新操作用同一 nonce 提价替换（两笔最多只有一笔上链）。
 export const PENDING_STALE_MS = 10 * 60_000;
 // 开仓确认基于预览数字：预览超过这个时长后须重新预览。
@@ -139,12 +143,54 @@ function parseParams(action, params, config, tokens, now = Date.now(), withExpec
 
 const jsonable = (value) => JSON.parse(JSON.stringify(value, (_, v) => (typeof v === 'bigint' ? String(v) : v)));
 
+function withBudget(promise, ms, label) {
+  let timer;
+  const budget = new Promise((_, reject) => { timer = setTimeout(() => reject(new HttpError(504, `${label}超过 ${ms / 1000} 秒，请稍后重试`)), ms); timer.unref?.(); });
+  return Promise.race([promise, budget]).finally(() => clearTimeout(timer));
+}
+
+// 把任意池子并入权限配置：加池子、补两个方向的兑换路径（该代币对已有路径时沿用）、给新代币加每日额度。
+// info 为 executor.inspectPool 的结果；perDay 为 { 代币地址: 十进制数量（代币单位）}，只能也必须覆盖新代币。
+export function addPoolToPermissions(permissions, info, perDay) {
+  const same = (a, b) => getAddress(a) === getAddress(b);
+  if (permissions.pools.some((p) => same(p.gauge, info.gauge) || (same(p.token0, info.token0.address) && same(p.token1, info.token1.address) && Number(p.tickSpacing) === info.tickSpacing))) {
+    throw new HttpError(409, '这个池子已在白名单里');
+  }
+  const given = perDay && typeof perDay === 'object' && !Array.isArray(perDay) ? perDay : {};
+  const fresh = [info.token0, info.token1].filter((t) => !permissions.allowances.some((a) => same(a.token, t.address)));
+  for (const key of Object.keys(given)) {
+    let token;
+    try { token = getAddress(key); } catch { throw new HttpError(400, '额度代币地址无效'); }
+    if (!fresh.some((t) => t.address === token)) throw new HttpError(400, `代币 ${token} 不需要新额度（已有额度不在这里修改）`);
+  }
+  const allowances = fresh.map((t) => {
+    const entry = Object.entries(given).find(([key]) => getAddress(key) === t.address)?.[1];
+    if (typeof entry !== 'string' || !/^\d+(\.\d+)?$/.test(entry)) throw new HttpError(400, `请填写 ${t.symbol} 的每日额度`);
+    let raw;
+    try { raw = parseUnits(entry, t.decimals); } catch { throw new HttpError(400, `${t.symbol} 每日额度最多 ${t.decimals} 位小数`); }
+    if (raw <= 0n || raw >= 1n << 128n) throw new HttpError(400, `${t.symbol} 每日额度须大于 0 且小于 2^128 最小单位`);
+    return { token: t.address, symbol: t.symbol, perDay: String(raw) };
+  });
+  const name = `${info.token0.symbol}/${info.token1.symbol} ts${info.tickSpacing}`;
+  const swaps = [...(permissions.swaps ?? [])];
+  for (const [a, b] of [[info.token0.address, info.token1.address], [info.token1.address, info.token0.address]]) {
+    if (!swaps.some((s) => same(s.tokenIn, a) && same(s.tokenOut, b))) swaps.push({ tokenIn: a, tokenOut: b, tickSpacing: info.tickSpacing });
+  }
+  return {
+    name, allowances,
+    permissions: { roleKey: permissions.roleKey, pools: [...permissions.pools, { name, token0: info.token0.address, token1: info.token1.address, tickSpacing: info.tickSpacing, gauge: info.gauge }],
+      swaps, allowances: [...permissions.allowances, ...allowances] },
+  };
+}
+
 export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = () => false, readAdmission = () => true, log = console, now = Date.now,
   chain = executor, makeProvider = executor.provider } = {}) {
   const directory = path.join(dataDir, 'aero-safe');
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
-  const autoPath = path.join(directory, 'auto.json');
+  const autoPath = path.join(directory, 'auto.json'), poolPlanPath = path.join(directory, 'pool-plan.json');
+  // 待启用的加池计划：生成 Safe 批次时写入，链上核对生效并并入配置后删除。
+  let poolPlan = null;
   let auto = { config: { ...AUTO_DEFAULTS }, history: [], halted: null, reopen: null, closing: null }, autoError = null, autoWatch = [], autoNote = null, autoCheckedAt = null;
   let outSince = new Map(), autoTimer = null, autoBusy = false, autoCorrupt = null;
   let config = null, configError = null, wallet = null, pending = null, job = null, snapshot = null, snapshotAt = null, snapshotError = null;
@@ -177,6 +223,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       ledgerError,
       job: job && structuredClone(job), chain: snapshot && structuredClone(snapshot), chainAt: snapshotAt, chainError: snapshotError, refreshing: Boolean(refreshing),
       events: structuredClone(events), ledger: ledger(), serverNow: now(),
+      poolPlan: poolPlan && { createdAt: poolPlan.createdAt, pool: { ...poolPlan.pool }, stale: !config || poolPlan.baseline !== JSON.stringify(config.permissions) },
       auto: { config: { ...auto.config }, defaults: AUTO_DEFAULTS, error: autoError, halted: auto.halted && { ...auto.halted }, reopen: auto.reopen && { ...auto.reopen }, closing: auto.closing && { ...auto.closing }, stuck: stuckReason(auto),
         history: auto.history.slice(-10).reverse(), watch: structuredClone(autoWatch), note: autoNote, checkedAt: autoCheckedAt, intervalMs: AUTO_TICK_MS },
     };
@@ -490,6 +537,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       try { const saved = readBounded(configPath, 256 * 1024); config = saved && strictAeroSafeConfig(saved); } catch (error) { configError = `已保存的配置无效：${error.message}`; config = null; }
       try { wallet = readBounded(walletPath, 16 * 1024)?.address ?? null; } catch { wallet = null; }
+      // 加池计划可随时重新生成：读不出或不完整时当作没有。
+      try {
+        const saved = readBounded(poolPlanPath, 256 * 1024);
+        if (saved) { if (saved.schema !== 1 || typeof saved.baseline !== 'string' || !saved.pool?.name) throw new Error('格式不符'); buildPermissions(saved.permissions); poolPlan = saved; }
+      } catch (error) { poolPlan = null; log.warn?.({ type: 'aero-safe', err: error }, 'Aero 加池计划无法读取，已忽略'); }
       try { const ids = readBounded(mintedPath, 64 * 1024)?.ids; minted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && /^\d{1,78}$/.test(id)).slice(0, MINTED_LIMIT) : []; } catch { minted = []; }
       try { pending = readBounded(pendingPath, 64 * 1024); } catch (error) {
         // 待确认记录损坏时不能当作没有：保留文件，禁止新操作，等人工核对。
@@ -553,6 +605,85 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const next = strictAeroSafeConfig(value);
       atomicJson(configPath, next); config = next; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null;
       void refresh();
+      return state();
+    }),
+    // 加池第一步：链上核验池子，生成增量 Safe 批次（Transaction Builder JSON），并记下计划。不改配置、不签名。
+    planPool: (input, authorize = () => {}) => serial(async () => {
+      authorize();
+      if (!config) throw new HttpError(409, '请先保存 Safe 配置');
+      const body = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+      for (const key of Object.keys(body)) if (!POOL_PLAN_KEYS.has(key)) throw new HttpError(400, `未知字段 ${key}`);
+      const poolAddress = address(body.pool, '池子地址');
+      let info;
+      try { info = await withBudget(chain.inspectPool(makeProvider(config.rpcUrl), poolAddress), POOL_BUDGET_MS, '链上核验池子'); } catch (error) {
+        if (error instanceof HttpError) throw error;
+        if (error instanceof chain.ExecError && error.code !== 'rpc') throw new HttpError(400, error.message);
+        throw new HttpError(502, `链上核验池子失败：${error.message}`);
+      }
+      for (const a of [info.gauge, info.token0.address, info.token1.address]) {
+        if ([config.safe, config.roles].some((own) => getAddress(own) === getAddress(a))) throw new HttpError(400, '池子的代币或 gauge 不能是 Safe 或 Roles 合约');
+      }
+      const current = config.permissions;
+      const { name, allowances, permissions } = addPoolToPermissions(current, info, body.allowances);
+      let transactions, usage;
+      try {
+        const built = buildPermissions(permissions);
+        transactions = buildUpdateBatch({ current: buildPermissions(current), next: built, roles: config.roles });
+        usage = conditionUsage(built);
+      } catch (error) {
+        if (/condition tree has \d+ nodes/.test(error.message)) throw new HttpError(409, `白名单已满：${error.message}（Roles 每个函数最多 255 个条件节点）`);
+        throw new HttpError(400, `生成权限失败：${error.message}`);
+      }
+      const decimalsOf = (token) => [info.token0, info.token1].find((t) => t.address === token)?.decimals ?? 18;
+      const pool = { address: info.address, name, gauge: info.gauge, tickSpacing: info.tickSpacing, token0: info.token0, token1: info.token1,
+        allowances: allowances.map((a) => ({ ...a, decimals: decimalsOf(a.token) })), transactions: transactions.length };
+      const plan = { schema: 1, createdAt: now(), pool, baseline: JSON.stringify(current), permissions };
+      try { atomicJson(poolPlanPath, plan); } catch (error) {
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 加池计划保存失败');
+        throw new HttpError(500, '加池计划保存失败，请检查数据目录权限后重试');
+      }
+      poolPlan = plan;
+      record({ event: 'pool_planned', pool: name, transactions: transactions.length });
+      const builder = toTransactionBuilderJson({ safe: config.safe, transactions, createdAt: plan.createdAt, name: `Aero 加池 ${name}`,
+        description: `Roles ${config.roles} 增加池子 ${info.address}（gauge ${info.gauge}）` });
+      return { pool, transactions: transactions.map((t) => ({ to: t.to, description: t.description })), builder, usage, state: state() };
+    }),
+    // 加池第二步：硬件钱包在 Safe{Wallet} 执行批次后，以 bot 身份模拟核对新权限已在链上生效，再把池子并入配置。
+    applyPool: (authorize = () => {}) => serial(async () => {
+      authorize();
+      requireIdle('不能修改配置');
+      if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
+      if (!poolPlan) throw new HttpError(409, '没有待启用的加池计划');
+      if (!config || poolPlan.baseline !== JSON.stringify(config.permissions)) throw new HttpError(409, 'Safe 配置在生成批次后已变化，请重新生成加池批次');
+      if (!wallet) throw new HttpError(409, '请先填写 bot 私钥：生效核对以 bot 身份模拟');
+      let result;
+      try {
+        result = await withBudget(chain.verifyActive({ rpc: makeProvider(config.rpcUrl), safe: config.safe, roles: config.roles, bot: wallet,
+          current: buildPermissions(config.permissions), next: buildPermissions(poolPlan.permissions), now }), POOL_BUDGET_MS, '核对链上权限');
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        throw new HttpError(502, `核对链上权限失败：${error.message}`);
+      }
+      if (!result.ok) {
+        const failed = result.checks.filter((c) => !c.ok);
+        throw new HttpError(409, `批次尚未在链上生效（${failed.length}/${result.checks.length} 项未通过）：${failed.slice(0, 3).map((c) => `${c.label} ${c.status}`).join('；')}。请确认 Safe 已执行完整批次后再试`);
+      }
+      const next = strictAeroSafeConfig({ ...config, permissions: poolPlan.permissions });
+      atomicJson(configPath, next);
+      const name = poolPlan.pool.name;
+      config = next; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null; poolPlan = null;
+      try { rmSync(poolPlanPath, { force: true }); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 加池计划删除失败'); }
+      record({ event: 'pool_added', pool: name, checks: result.checks.length });
+      void refresh();
+      return state();
+    }),
+    discardPoolPlan: (authorize = () => {}) => serial(() => {
+      authorize();
+      try { rmSync(poolPlanPath, { force: true }); } catch (error) {
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 加池计划删除失败');
+        throw new HttpError(500, '加池计划删除失败，请检查数据目录权限后重试');
+      }
+      poolPlan = null;
       return state();
     }),
     setKey: (privateKey, authorize = () => {}) => serial(() => {

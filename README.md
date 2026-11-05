@@ -4,8 +4,6 @@
 
 Entropy / Lighter 行情研究也已内置，统一更新后从侧栏 **监控 → Entropy / Lighter** 打开；支持持续采集、启动停止、配置、报告和图表，默认只采集公开行情。工具随工作台运行时管理，关闭页面或单独重启 API 不会中断采集。详见 [研究工具说明](docs/entropy-lighter-lab.md)。
 
-Aerodrome 单边 LP 自动调仓从侧栏 **交易 → Aero LP** 打开：在页面填写钱包私钥（加密保存、只显示地址）和调仓参数，保存后立即生效；随工作台运行时管理，默认停止。详见 [工具说明](tools/aero-lp/README.md)。
-
 飞书定时汇总从侧栏 **系统 → 飞书汇总** 打开：配置机器人、发送时间和要包含的模块与指标，由服务器定时把各模块主要信息发到飞书群，详见 [飞书汇总](docs/feishu-digest.md)。
 
 服务器负载从侧栏 **系统 → 服务器状态** 查看：CPU 占用与负载、内存与交换分区、数据目录和系统盘的剩余空间、开机时长，页面打开时每 5 秒刷新。由控制面直接读取本机，数据面不可用时也能查看；不返回路径、主机名或进程信息。内存按整机 MemAvailable 计算，容器内运行时显示的是宿主机内存而非容器配额。
@@ -57,7 +55,6 @@ python -m venv .venv-aster
 | `modules/greeks/` | Greeks Python 业务及页面 |
 | `modules/aster/` | ASTER Python 交易引擎与静态 dashboard |
 | `tools/entropy-lighter-lab/` | 内置 Entropy / Lighter 行情采集与纸面模拟 |
-| `tools/aero-lp/` | 内置 Aerodrome 单边 LP 调仓（`server/automation/aero-lp.mjs` 管理进程） |
 | `deploy/` | 统一安装、迁移、打包与发布检查 |
 | `tests/` | 行为、集成及浏览器检查 |
 

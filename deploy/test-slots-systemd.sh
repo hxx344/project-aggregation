@@ -56,7 +56,7 @@ printf 'HOST=127.0.0.1\nPORT=%s\nDATA_DIR=%s\nNODE_ENV=production\nINITIAL_PASSW
   "$port" "$DATA_PATH" "$initial_password" "$DATA_PATH" > "$ENV_FILE"
 install -d -m 0700 -o "$SERVICE_USER" -g "$SERVICE_USER" "$DATA_PATH" "$DATA_PATH/modules"
 
-# pino and ethers (the Aero LP manager) with what they need, flat, from the checkout's locked install.
+# pino and ethers (the Aero Safe executor) with what they need, flat, from the checkout's locked install.
 cat > "$work_dir/collect.mjs" <<'JS'
 import { cpSync, existsSync, readFileSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -92,7 +92,7 @@ stage_release() {
   cp -a "$repository/server" "$dir/server"
   # What server/ reads outside itself.
   install -D -m 0644 "$repository/modules/asset/lib/auth-core.ts" "$dir/modules/asset/lib/auth-core.ts"
-  mkdir -p "$dir/tools" && cp -a "$repository/tools/entropy-lighter-lab" "$repository/tools/aero-lp" "$repository/tools/aero-roles" "$dir/tools/"
+  mkdir -p "$dir/tools" && cp -a "$repository/tools/entropy-lighter-lab" "$repository/tools/aero-roles" "$dir/tools/"
   cp -a "$work_dir/node_modules" "$dir/node_modules"
   cp "$repository/tests/fixtures/split-runtime.mjs" "$repository/tests/fixtures/split-modules.mjs" "$dir/tests/fixtures/"
   mv "$dir/server/runtime/main.mjs" "$dir/server/runtime/real-main.mjs"

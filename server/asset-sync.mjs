@@ -91,7 +91,7 @@ export function createAssetSync({
         result = await Promise.race([
           Promise.resolve().then(() => {
             if (controller.signal.aborted || closed) throw new UpstreamError('timeout', '资产同步已停止');
-            // Hub-side sources (Aero LP) ride along so Asset can value them in the same ledger write.
+            // Hub-side sources (none at present) ride along so Asset can value them in the same ledger write.
             return syncReader(project, credentials, { deadline: started + timeLimit, signal: controller.signal, body: syncBody() });
           }),
           canceled,

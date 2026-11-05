@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createApp } from '../server/app.mjs';
 import { DIGEST_DEFAULTS, buildDigest, latestSlot, localClock, nextSlot, postCard, renderCard, validateChannel, validateDigestConfig } from '../server/automation/feishu-digest-core.mjs';
 import { createFeishuDigest } from '../server/automation/feishu-digest.mjs';
-import { aeroSection, collectSections, executionSection, fundingSection, positionsSection, projectSection, researchSection } from '../server/automation/feishu-digest-sources.mjs';
+import { collectSections, executionSection, fundingSection, positionsSection, projectSection, researchSection } from '../server/automation/feishu-digest-sources.mjs';
 import { loadCredentialCipher } from '../server/runtime/credentials.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -499,45 +499,16 @@ test('funding, execution, Aero and research sections show their own state', () =
   assert.equal(attention.level, 'alert');
   assert.match(attention.issues[0], /委托待核对/);
 
-  const cycle = { at: new Date(AT_NINE - 1000).toISOString(), symbols: ['WETH', 'USDC'], price: 3500.5, positions: [{ liquidity: '0' }, { liquidity: '5', staked: true, state: 'in', value: 1000, apr: 0.125, aeroPerDay: 2, feeApr: null }], rewards: { pending: '1.5' } };
-  const aero = extra => ({ enabled: true, state: 'running', error: null, paused: false, lastCycle: cycle, ledger: { reward: '4', gasEth: '0.01' }, config: { intervalSec: 60 }, ...extra });
-  const running = aeroSection(aero(), AT_NINE);
-  assert.equal(running.level, 'ok');
-  assert.equal(running.metrics.find(item => item.key === 'apr').text, '12.5%');
-  assert.equal(running.metrics.find(item => item.key === 'feeApr').text, '—');
-  assert.equal(running.metrics.find(item => item.key === 'range').text, '区间内');
-  assert.equal(aeroSection(aero({ enabled: false, state: 'stopped' }), AT_NINE).level, 'idle');
-  assert.equal(aeroSection(aero({ state: 'fault', error: '私钥无法读取' }), AT_NINE).level, 'alert');
-  assert.equal(aeroSection(aero(), AT_NINE + 3600000).level, 'warn');
-  assert.equal(aeroSection(aero({ paused: true }), AT_NINE + 3600000).level, 'notice');
-
   assert.equal(researchSection({ enabled: false, state: 'stopped' }).level, 'idle');
   assert.equal(researchSection({ enabled: true, state: 'running', stale: false, error: null, insights: { asOf: AT_NINE, summary: { title: '无优势' }, leader: { title: 'SNDK', samples: 12 } } }).metrics[2].text, '12');
   assert.equal(researchSection({ enabled: true, state: 'running', stale: true, error: null, insights: null }).level, 'warn');
 });
 
-test('Aero digest uses the common wallet total instead of one independently estimated position', () => {
-  const cycle = { at: new Date(AT_NINE).toISOString(), symbols: ['RSGP', 'USDC'], positions: [
-    { liquidity: '200', staked: true, state: 'below', aeroPerDay: 57600, aeroPerDayEstimated: true },
-    { liquidity: '200', staked: true, state: 'below', aeroPerDay: 57600, aeroPerDayEstimated: true },
-  ], rewards: { dailyTotal: { perDay: 69120, scenario: 'same-lower', reason: null } } };
-  const value = () => aeroSection({ enabled: true, state: 'running', paused: false, lastCycle: cycle, config: { intervalSec: 60 } }, AT_NINE).metrics.find(item => item.key === 'aeroPerDay').text;
-  assert.equal(value(), '69,120（同下沿估计，假设其他活跃流动性不变）');
-  for (const reason of ['different-lower', 'mixed-ranges']) {
-    cycle.rewards.dailyTotal = { perDay: null, scenario: null, reason };
-    assert.equal(value(), '—（逐仓独立估计，不合计）');
-  }
-  cycle.rewards.dailyTotal = { perDay: 0, scenario: 'no-emissions', reason: null };
-  assert.equal(value(), '0');
-  delete cycle.rewards.dailyTotal;
-  assert.equal(value(), '—', 'old snapshots must not silently fall back to one position');
-});
-
 test('one failing source costs only its own section', async () => {
   const sections = await collectSections({ log: silent, now: () => AT_NINE, overview: () => ({ projects: [project(), { ...project(), project: { id: 'link', name: 'Link', adapter: 'link', enabled: true } }] }),
     positions: async () => { throw new Error('secret upstream text'); }, funding: () => { throw new Error('boom'); }, execution: () => ({ connections: [], positions: [], jobs: [] }),
-    aero: () => ({ enabled: false, state: 'stopped' }), research: () => ({ enabled: false, state: 'stopped' }) });
-  assert.deepEqual(sections.map(item => item.id), ['hub:positions', 'hub:funding', 'hub:execution', 'hub:aero-lp', 'hub:research', 'project:aster']);
+    research: () => ({ enabled: false, state: 'stopped' }) });
+  assert.deepEqual(sections.map(item => item.id), ['hub:positions', 'hub:funding', 'hub:execution', 'hub:research', 'project:aster']);
   assert.equal(sections[0].status, '读取失败');
   assert.ok(!JSON.stringify(sections).includes('secret upstream text'));
 });

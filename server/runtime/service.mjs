@@ -5,7 +5,7 @@ import { PROTOCOL_VERSION, RuntimeError, validateMaintenanceIds, validateModuleI
 const MODULES_DISABLED = '未启用内嵌模块';
 // The runtime side of the internal protocol. Both the in-process client and the
 // internal HTTP server call these methods; neither adds behaviour of its own.
-// prepareAutomation is the data plane's own stop check (the Aero LP signer); it
+// prepareAutomation is the data plane's own stop check (the Aero Safe signer); it
 // runs beside the module guard and refuses the same way.
 export function createRuntimeService({ instanceId = randomUUID(), moduleRuntime = null, guard = null, readMaintenance, isReady = () => true, prepareAutomation = async () => {} }) {
   if (typeof readMaintenance !== 'function') throw new Error('Runtime service needs the durable maintenance reader');

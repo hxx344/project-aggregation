@@ -6,7 +6,7 @@ import { AERO, ROLES, SAFE } from '../tools/aero-roles/addresses.mjs';
 import { AbiType, Operator, c, evaluate, flatten } from '../tools/aero-roles/conditions.mjs';
 import { buildPermissions, normalizeConfig } from '../tools/aero-roles/permissions.mjs';
 import { accruedAllowance, checkTransactions } from '../tools/aero-roles/policy.mjs';
-import { ROLES_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress } from '../tools/aero-roles/roles-calls.mjs';
+import { ROLES_ABI, buildSetupBatch, buildUpdateBatch, conditionUsage, encodeMultiSend, encodeRoleExecution, predictRolesAddress } from '../tools/aero-roles/roles-calls.mjs';
 
 const config = JSON.parse(readFileSync(new URL('../tools/aero-roles/config.example.json', import.meta.url), 'utf8'));
 const ZERO = '0x0000000000000000000000000000000000000000';
@@ -174,4 +174,68 @@ test('MultiSend packing and role execution encoding', () => {
   assert.deepEqual([single.args[0], single.args[3]], [USDC, 0n]);
   const multi = ROLES_ABI.parseTransaction({ data: encodeRoleExecution(permissions.roleKeyBytes, [{ to: USDC, data }, { to: RSGP, data }]) });
   assert.deepEqual([multi.args[0], multi.args[1], multi.args[3]], [SAFE.multiSendCallOnly, 0n, 1n]);
+});
+
+test('a token or gauge cannot collide with another Roles target or a protocol contract', () => {
+  const withPool = (a, b, gauge) => {
+    const [token0, token1] = [getAddress(a), getAddress(b)].sort((x, y) => (BigInt(x) < BigInt(y) ? -1 : 1));
+    return { ...config, pools: [...config.pools, { name: 'x', token0, token1, tickSpacing: 100, gauge }],
+    allowances: [...config.allowances, ...[token0, token1].filter((t) => !config.allowances.some((a) => getAddress(a.token) === getAddress(t))).map((token) => ({ token, symbol: 'X', perDay: '1' }))] };
+  };
+  const OTHER_TOKEN = new Wallet('0x' + '77'.repeat(32)).address, GAUGE = new Wallet('0x' + '78'.repeat(32)).address;
+  assert.throws(() => buildPermissions(withPool(AERO.nft, USDC, GAUGE)), /duplicate Roles target|protocol contract/);
+  assert.throws(() => buildPermissions(withPool(OTHER_TOKEN, USDC, AERO.voter)), /protocol contract/);
+  assert.throws(() => buildPermissions(withPool(OTHER_TOKEN, USDC, SAFE.multiSendCallOnly)), /protocol contract/);
+  assert.throws(() => buildPermissions(withPool(config.pools[0].gauge, USDC, GAUGE)), /duplicate Roles target/);
+  assert.ok(buildPermissions(withPool(OTHER_TOKEN, USDC, GAUGE)).targets.length > permissions.targets.length);
+});
+
+test('add-pool update batch only scopes what changed and never resets an existing allowance', () => {
+  const ROLES_ADDR = new Wallet('0x' + '55'.repeat(32)).address;
+  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const NEW_GAUGE = new Wallet('0x' + '66'.repeat(32)).address;
+  const next = buildPermissions({ ...config,
+    pools: [...config.pools, { name: 'WETH/USDC ts100', token0: WETH, token1: USDC, tickSpacing: 100, gauge: NEW_GAUGE }],
+    swaps: [...config.swaps, { tokenIn: WETH, tokenOut: USDC, tickSpacing: 100 }, { tokenIn: USDC, tokenOut: WETH, tickSpacing: 100 }],
+    allowances: [...config.allowances, { token: WETH, symbol: 'WETH', perDay: '1000000000000000000' }] });
+  const txs = buildUpdateBatch({ current: permissions, next, roles: ROLES_ADDR });
+  assert.ok(txs.every((t) => t.to === ROLES_ADDR && t.value === '0'));
+  const calls = txs.map((t) => ROLES_ABI.parseTransaction({ data: t.data }));
+  const scoped = (name) => calls.filter((c) => c.name === name).map((c) => (name === 'scopeTarget' ? c.args[1] : `${c.args[1]}:${c.args[2]}`));
+  // New targets: the gauge and WETH; NPM, Router and USDC already exist and are not re-scoped.
+  assert.deepEqual(scoped('scopeTarget').sort(), [NEW_GAUGE, WETH].sort());
+  const selector = (sig) => Interface.from([`function ${sig}`]).getFunction(sig.slice(0, sig.indexOf('('))).selector;
+  const changed = scoped('scopeFunction');
+  // NPM mint gains a branch and NPM approve a gauge; Router gains two routes; USDC approve is unchanged (NPM + Router already).
+  assert.ok(changed.includes(`${AERO.nft}:${selector('mint((address,address,int24,int24,int24,uint256,uint256,uint256,uint256,address,uint256,uint160))')}`));
+  assert.ok(changed.includes(`${AERO.nft}:${selector('approve(address,uint256)')}`));
+  assert.ok(changed.includes(`${AERO.swapRouter}:${selector('exactInputSingle((address,address,int24,address,uint256,uint256,uint256,uint160))')}`));
+  assert.ok(!changed.some((c) => c.startsWith(`${USDC}:`)));
+  assert.ok(!changed.some((c) => c.startsWith(`${AERO.nft}:${selector('collect((uint256,address,uint128,uint128))')}`)));
+  assert.equal(scoped('allowFunction').filter((c) => c.startsWith(NEW_GAUGE)).length, 3); // deposit, withdraw, emergencyWithdraw
+  const allowances = calls.filter((c) => c.name === 'setAllowance');
+  assert.equal(allowances.length, 1);
+  assert.equal(allowances[0].args[0], next.allowances.find((a) => a.token === WETH).key);
+  assert.ok(!calls.some((c) => c.name === 'assignRoles' || c.name === 'setTransactionUnwrapper'));
+  // Nothing changed → nothing to sign; dropping a pool or changing an existing allowance is refused.
+  assert.deepEqual(buildUpdateBatch({ current: permissions, next: permissions, roles: ROLES_ADDR }), []);
+  assert.throws(() => buildUpdateBatch({ current: next, next: permissions, roles: ROLES_ADDR }), /drop/);
+  const bumped = buildPermissions({ ...config, allowances: config.allowances.map((a, i) => (i === 0 ? { ...a, perDay: '1' } : a)) });
+  assert.throws(() => buildUpdateBatch({ current: permissions, next: bumped, roles: ROLES_ADDR }), /must not change/);
+});
+
+test('the whitelist fills up at the Roles 255-node limit with about 13 pools', () => {
+  let current = permissions, cfg = config, added = 0;
+  for (let i = 1; i < 40; i++) {
+    const [a, b] = [new Wallet('0x' + (1000 + 2 * i).toString(16).padStart(64, '0')).address, new Wallet('0x' + (1001 + 2 * i).toString(16).padStart(64, '0')).address].sort((x, y) => (BigInt(x) < BigInt(y) ? -1 : 1));
+    const gauge = new Wallet('0x' + (5000 + i).toString(16).padStart(64, '0')).address;
+    const candidate = { ...cfg, pools: [...cfg.pools, { name: `p${i}`, token0: a, token1: b, tickSpacing: 100, gauge }],
+      swaps: [...cfg.swaps, { tokenIn: a, tokenOut: b, tickSpacing: 100 }, { tokenIn: b, tokenOut: a, tickSpacing: 100 }],
+      allowances: [...cfg.allowances, { token: a, symbol: 'A', perDay: '1' }, { token: b, symbol: 'B', perDay: '1' }] };
+    const next = buildPermissions(candidate);
+    try { buildUpdateBatch({ current, next, roles: OTHER }); } catch (error) { assert.match(error.message, /condition tree has \d+ nodes/); break; }
+    current = next; cfg = candidate; added++;
+  }
+  assert.equal(added, 12); // the swap Or tree (2 + 9 per route) runs out first: 3 existing routes + 2 per pool
+  assert.ok(conditionUsage(current).every((u) => u.nodes <= 255));
 });

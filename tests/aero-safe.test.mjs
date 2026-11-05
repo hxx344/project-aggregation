@@ -509,3 +509,132 @@ test('workbench Aero Safe API requires login, same origin and CSRF, and accepts 
     assert.equal((await request('/nope', 'POST', {})).status, 404);
   } finally { await app?.close(); rmSync(directory, { recursive: true }); }
 });
+
+test('adding a pool: plan builds a Safe batch, apply merges it only after the chain shows it active', async () => {
+  const directory = fixtureDir();
+  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const POOL = new Wallet('0x' + '99'.repeat(32)).address, GAUGE = new Wallet('0x' + 'aa'.repeat(32)).address;
+  const info = { address: POOL, gauge: GAUGE, tickSpacing: 100, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: USDC, symbol: 'USDC', decimals: 6 } };
+  let active = false;
+  const probes = [];
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => { assert.equal(address, POOL); return info; },
+    verifyActive: async (args) => { probes.push(args); return { ok: active, checks: [{ label: 'NPM.mint WETH/USDC ts100', ok: active, status: active ? 'ModuleTransactionFailed' : 'OrViolation' }] }; } };
+  const { manager } = managerWith(directory, { chain });
+  try {
+    await manager.initialize();
+    await assert.rejects(manager.planPool({ pool: POOL }), (error) => error.status === 409 && /Safe 配置/.test(error.message));
+    await manager.save(baseConfig);
+    await assert.rejects(manager.planPool({ pool: POOL }), (error) => error.status === 400 && /WETH 的每日额度/.test(error.message));
+    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [USDC]: '5' } }), (error) => error.status === 400 && /不需要新额度/.test(error.message));
+    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '0.0000000000000000001' } }), (error) => error.status === 400);
+    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' }, extra: 1 }), (error) => error.status === 400);
+
+    const plan = await manager.planPool({ pool: POOL, allowances: { [WETH]: '2.5' } });
+    assert.equal(plan.pool.name, 'WETH/USDC ts100');
+    assert.deepEqual(plan.pool.allowances, [{ token: WETH, symbol: 'WETH', perDay: '2500000000000000000', decimals: 18 }]);
+    assert.equal(plan.builder.transactions.length, plan.transactions.length);
+    assert.ok(plan.builder.transactions.every((t) => t.to === ROLES));
+    assert.equal(plan.builder.meta.createdFromSafeAddress, SAFE);
+    assert.equal(plan.state.poolPlan.pool.address, POOL);
+    assert.equal(plan.state.config.permissions.pools.length, 1); // the config is untouched until apply
+    const saved = JSON.parse(readFileSync(join(directory, 'aero-safe/pool-plan.json'), 'utf8'));
+    // Both directions are added for the new pair; the existing USDC allowance is reused, not reset.
+    assert.deepEqual(saved.permissions.swaps.slice(-2), [{ tokenIn: WETH, tokenOut: USDC, tickSpacing: 100 }, { tokenIn: USDC, tokenOut: WETH, tickSpacing: 100 }]);
+    assert.equal(saved.permissions.allowances.length, permissionsConfig.allowances.length + 1);
+
+    await assert.rejects(manager.applyPool(), (error) => error.status === 409 && /私钥/.test(error.message));
+    await manager.setKey(KEY);
+    await assert.rejects(manager.applyPool(), (error) => error.status === 409 && /尚未在链上生效.*OrViolation/.test(error.message));
+    assert.equal(manager.state().config.permissions.pools.length, 1);
+    assert.equal(probes.at(-1).bot, BOT.address);
+    assert.equal(probes.at(-1).next.pools.length, 2);
+
+    // The plan survives a restart.
+    await manager.close();
+    const restarted = managerWith(directory, { chain }).manager;
+    await restarted.initialize();
+    assert.equal(restarted.state().poolPlan.pool.name, 'WETH/USDC ts100');
+    active = true;
+    const state = await restarted.applyPool();
+    assert.equal(state.poolPlan, null);
+    assert.equal(state.config.permissions.pools.at(-1).gauge, GAUGE);
+    assert.equal(existsSync(join(directory, 'aero-safe/pool-plan.json')), false);
+    assert.equal(JSON.parse(readFileSync(join(directory, 'aero-safe/config.json'), 'utf8')).permissions.pools.length, 2);
+    await assert.rejects(restarted.applyPool(), (error) => error.status === 409 && /没有待启用/.test(error.message));
+    await assert.rejects(restarted.planPool({ pool: POOL }), (error) => error.status === 409 && /已在白名单/.test(error.message));
+    await restarted.close();
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('an add-pool plan goes stale when the config changes and can be discarded', async () => {
+  const directory = fixtureDir();
+  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const POOL = new Wallet('0x' + '99'.repeat(32)).address;
+  const info = { address: POOL, gauge: new Wallet('0x' + 'aa'.repeat(32)).address, tickSpacing: 100, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: USDC, symbol: 'USDC', decimals: 6 } };
+  const chain = { ...fakeChain(), inspectPool: async () => info, verifyActive: async () => ({ ok: true, checks: [] }) };
+  const { manager } = managerWith(directory, { chain });
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await manager.setKey(KEY);
+    await manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.save({ ...baseConfig, slippageBps: 80 }); // execution settings only: permissions unchanged, plan still valid
+    assert.equal(manager.state().poolPlan.stale, false);
+    await manager.save({ ...baseConfig, permissions: { ...permissionsConfig, allowances: permissionsConfig.allowances.map((a, i) => (i === 0 ? { ...a, perDay: '7' } : a)) } });
+    assert.equal(manager.state().poolPlan.stale, true);
+    await assert.rejects(manager.applyPool(), (error) => error.status === 409 && /重新生成/.test(error.message));
+    const state = await manager.discardPoolPlan();
+    assert.equal(state.poolPlan, null);
+    assert.equal(existsSync(join(directory, 'aero-safe/pool-plan.json')), false);
+    chain.inspectPool = async () => { throw new executor.ExecError('这个池子没有 gauge（没有排放），不能加入白名单'); };
+    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 400 && /没有 gauge/.test(error.message));
+    chain.inspectPool = async () => ({ address: POOL, gauge: ROLES, tickSpacing: 1, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: USDC, symbol: 'USDC', decimals: 6 } });
+    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 400 && /Safe 或 Roles/.test(error.message));
+    chain.inspectPool = async () => { throw new executor.ExecError('读取 池子 factory 失败：timeout', { code: 'rpc' }); };
+    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 502 && /timeout/.test(error.message));
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('verifyActive passes only what Roles lets through and reads new allowances exactly', async () => {
+  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const GAUGE = new Wallet('0x' + 'aa'.repeat(32)).address;
+  const next = buildPermissions({ ...permissionsConfig,
+    pools: [...permissionsConfig.pools, { name: 'WETH/USDC ts100', token0: WETH, token1: USDC, tickSpacing: 100, gauge: GAUGE }],
+    swaps: [...permissionsConfig.swaps, { tokenIn: WETH, tokenOut: USDC, tickSpacing: 100 }],
+    allowances: [...permissionsConfig.allowances, { token: WETH, symbol: 'WETH', perDay: '1000' }] });
+  const errors = new Interface(['error ConditionViolation(uint8 status, bytes32 info)', 'error ModuleTransactionFailed()']);
+  const rolesI = new Interface(['function execTransactionWithRole(address to, uint256 value, bytes data, uint8 operation, bytes32 roleKey, bool shouldRevert) returns (bool)',
+    'function allowances(bytes32) view returns (uint128 refill, uint128 maxRefill, uint64 period, uint128 balance, uint64 timestamp)']);
+  const npmIndex = new Interface(['function tokenByIndex(uint256) view returns (uint256)']);
+  const revert = (data) => Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION', data });
+  const violation = (status) => revert(errors.encodeErrorResult('ConditionViolation', [status, '0x' + '00'.repeat(32)]));
+  const run = async (decide, period = 86400n) => executor.verifyActive({ safe: SAFE, roles: ROLES, bot: BOT.address, current: permissions, next, now: () => 1e12, rpc: { call: async ({ from, to, data }) => {
+    if (to === AERO.nft && data.startsWith(npmIndex.getFunction('tokenByIndex').selector)) return npmIndex.encodeFunctionResult('tokenByIndex', [5n]);
+    assert.equal(to, ROLES);
+    if (data.startsWith(rolesI.getFunction('allowances').selector)) return rolesI.encodeFunctionResult('allowances', [1000n, 1000n, period, 1000n, 0n]);
+    assert.equal(from, BOT.address);
+    const inner = rolesI.decodeFunctionData('execTransactionWithRole', data);
+    assert.equal(inner.shouldRevert, true);
+    return decide(getAddress(inner.to), inner.data);
+  } } });
+  const ok = () => '0x' + '00'.repeat(31) + '01';
+  // Everything let through: the inner call failing (zero amounts) still proves the permission; NFT approve may stop at the ownership check.
+  let result = await run((to, data) => {
+    if (to === GAUGE) throw revert(errors.encodeErrorResult('ModuleTransactionFailed', []));
+    if (to === AERO.nft && data.startsWith('0x095ea7b3')) throw violation(16); // CustomConditionViolation
+    return ok();
+  });
+  assert.equal(result.ok, true, JSON.stringify(result.checks));
+  const labels = result.checks.map((c) => c.label);
+  assert.ok(labels.includes('NPM.mint WETH/USDC ts100') && labels.includes('额度 WETH') && labels.some((l) => l.startsWith('Router 兑换 WETH → USDC')));
+  assert.ok(labels.includes('WETH.approve → NPM') && labels.includes('WETH.approve → Router'));
+  // Not active yet: the gauge is not a scoped target, and a custom-condition failure on anything but the NFT approve is a failure.
+  result = await run((to, data) => { if (to === GAUGE) throw violation(2); if (to === WETH) throw violation(16); return ok(); });
+  assert.equal(result.ok, false);
+  assert.ok(result.checks.filter((c) => !c.ok).every((c) => c.label.includes('gauge') || c.label.startsWith('WETH.')));
+  // An allowance with the wrong period is not the planned one.
+  result = await run(() => ok(), 3600n);
+  assert.deepEqual(result.checks.filter((c) => !c.ok).map((c) => c.label), ['额度 WETH']);
+  // A revert that is not a Roles error is never read as a pass.
+  await assert.rejects(run(() => { throw revert('0x08c379a0'); }), /原因不是 Roles 权限/);
+});

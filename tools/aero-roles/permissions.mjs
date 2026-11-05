@@ -1,7 +1,7 @@
 // 由策略配置生成角色权限：哪些合约、哪些函数、参数满足什么条件。Roles 默认拒绝，未列出的调用一律不能执行。
 // 清单与理由见 docs/aero-safe-roles-permissions-2026-11-04.md 第 3–5 节；本文件是链上配置与本地签名前校验的唯一来源。
 import { ZeroAddress, encodeBytes32String, getAddress, id, keccak256, toUtf8Bytes } from 'ethers';
-import { AERO } from './addresses.mjs';
+import { AERO, ROLES, SAFE } from './addresses.mjs';
 import { c, ExecutionOptions } from './conditions.mjs';
 
 export const SIGNATURES = {
@@ -118,7 +118,13 @@ export function buildPermissions(config) {
     target: token, label: `ERC20 ${allowances.find((a) => a.token === token).symbol}`,
     functions: [fn('approve', SIGNATURES.approve, c.calldata(c.oneOf([...set].map((s) => c.address(s))), c.pass()))],
   }));
-  return { ...normalized, targets: [nft, ...gauges, ...router, ...tokens], allowancePeriod: DAY };
+  // 同一地址只能是一个目标：否则后下发的 scopeFunction 会覆盖前一个（ERC20 与 NPM 的 approve 选择器相同）；
+  // gauge 与代币也不能是固定的协议、Safe 或 Roles 合约。
+  const targets = [nft, ...gauges, ...router, ...tokens];
+  unique(targets.map((t) => getAddress(t.target)), 'Roles target');
+  const reserved = new Set([...Object.values(AERO), ...Object.values(ROLES), SAFE.singletonL2, SAFE.proxyFactory, SAFE.multiSendCallOnly, SAFE.fallbackHandler].map((a) => getAddress(a)));
+  for (const t of [...gauges, ...tokens]) if (reserved.has(getAddress(t.target))) throw new Error(`${t.label}: ${t.target} is a protocol contract`);
+  return { ...normalized, targets, allowancePeriod: DAY };
 }
 
 function spacing(value, label) {
