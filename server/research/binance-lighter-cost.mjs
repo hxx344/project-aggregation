@@ -1,6 +1,6 @@
 // Public-market paper research owned by the workbench runtime. No credentials,
 // signing clients or private exchange endpoints enter this service.
-import { existsSync, lstatSync, mkdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, openSync, writeFileSync, fsyncSync, closeSync, renameSync, unlinkSync } from 'node:fs';
 import { open, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -76,6 +76,15 @@ function migrateV2Config(value) {
     hedgeThresholdNotional: Object.hasOwn(value, 'hedgeThresholdNotional') ? value.hedgeThresholdNotional : Math.min(1000, value.maxUnhedgedNotional) });
 }
 
+// A kill or power loss while a snapshot is staged leaves `<file>.<uuid>.tmp`.
+const STAGED = /^[\w.-]+\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+function removeStaged(folder) {
+  for (const name of readdirSync(folder)) {
+    if (!STAGED.test(name)) continue;
+    const file = path.join(folder, name);
+    if (lstatSync(file).isFile()) unlinkSync(file);
+  }
+}
 function regular(file, limit) {
   let info;
   try { info = lstatSync(file); }
@@ -107,6 +116,7 @@ function atomic(file, value, limit = LIMIT) {
 // the slow write + fsync run on the libuv pool so the feeds keep flowing, and
 // the caller decides on the main thread whether to rename. A synchronous
 // atomic() write made meanwhile is newer and the staged file is discarded.
+// Building and serializing the report still happens on the main thread.
 async function stageAtomic(file, value, limit = LIMIT) {
   regular(file, limit);
   const body = JSON.stringify(value);
@@ -119,7 +129,7 @@ async function stageAtomic(file, value, limit = LIMIT) {
     await handle.close(); handle = undefined;
   } catch (error) {
     await handle?.close().catch(() => {});
-    await rm(temporary, { force: true });
+    await rm(temporary, { force: true }).catch(() => {});
     throw error;
   }
   const discard = () => { if (existsSync(temporary)) unlinkSync(temporary); };
@@ -253,11 +263,16 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
     storedReport = report; dirty = false;
     const failed = () => { if (seq === sessionWrites && enabled && generation === run) fault('成本研究处理或记录失败，已停止新增模拟', 'processing_failed'); };
     background = stage(sessionPath, { schema: 2, clean: false, report }).then(staged => {
-      if (seq !== sessionWrites || !enabled || closed || generation !== run) { staged.discard(); return; }
-      try { staged.commit(); } catch { failed(); }
-    }, failed).finally(() => { background = null; persistSoon(); });
+      if (seq === sessionWrites && enabled && !closed && generation === run) staged.commit();
+      else staged.discard();
+    }).catch(failed).finally(() => { background = null; later(); }).catch(() => {});
     cooling = true;
-    coolTimer = setTimeout(() => { cooling = false; coolTimer = null; persistSoon(); }, persistGapMs); coolTimer.unref?.();
+    coolTimer = setTimeout(() => { cooling = false; coolTimer = null; later(); }, persistGapMs); coolTimer.unref?.();
+  }
+  // Timer and promise callbacks have no guarded() around them; a failure there
+  // must stop the simulation, not crash the data plane.
+  function later() {
+    try { persistSoon(); } catch { if (enabled) fault('成本研究处理或记录失败，已停止新增模拟', 'processing_failed'); }
   }
   function persistCooldowns() {
     const next = JSON.stringify(cooldowns);
@@ -468,6 +483,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
         if (!lstatSync(folder).isDirectory() || lstatSync(folder).isSymbolicLink()) throw new Error('invalid_research_directory');
       }
       try {
+        for (const folder of [directory, archiveDirectory]) removeStaged(folder);
         if (existsSync(legacyArchiveDirectory) && (!lstatSync(legacyArchiveDirectory).isDirectory()
           || lstatSync(legacyArchiveDirectory).isSymbolicLink())) throw new Error('invalid_legacy_directory');
         // Read and validate every legacy source before publishing migration. Legacy

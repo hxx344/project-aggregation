@@ -51,23 +51,23 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
   const [loading, setLoading] = useState(false);
   const lifetime = useRef<AbortController | null>(null);
   // Bound to the lifetime that started it, so a remount (StrictMode) is not blocked by the aborted read.
-  const inFlight = useRef<AbortSignal | null>(null);
+  const inFlight = useRef<Record<'host' | 'loop', AbortSignal | null>>({ host: null, loop: null });
   const read = useCallback(async () => {
     const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted || inFlight.current === signal) return;
-    inFlight.current = signal; setLoading(true);
-    // The data plane answers the event-loop read; host status still shows while it is down.
-    const [host, lag] = await Promise.allSettled([
-      api<HostStatus>('/api/system/host', { signal, timeoutMs: 10_000 }),
-      api<EventLoopStatus>('/api/system/event-loop', { signal, timeoutMs: 10_000 }),
-    ]);
-    try {
-      if (signal.aborted) return;
-      if ([host, lag].some(result => result.status === 'rejected' && result.reason instanceof ApiError && result.reason.status === 401)) { onExpired(); return; }
-      if (host.status === 'fulfilled') { setStatus(host.value); setError(''); } else setError(message(host.reason));
-      if (lag.status === 'fulfilled') { setLoop(lag.value); setLoopError(''); } else setLoopError(message(lag.reason));
+    if (!signal || signal.aborted) return;
+    // Independent reads: the control plane answers host status itself, the data
+    // plane answers the event loop, and a stalled data plane must not hold the host cards back.
+    async function one<T>(key: 'host' | 'loop', path: string, apply: (data: T) => void, fail: (text: string) => void) {
+      if (!signal || inFlight.current[key] === signal) return;
+      inFlight.current[key] = signal; if (key === 'host') setLoading(true);
+      try { const data = await api<T>(path, { signal, timeoutMs: 10_000 }); if (!signal.aborted) apply(data); }
+      catch (reason) { if (!signal.aborted) { if (reason instanceof ApiError && reason.status === 401) onExpired(); else fail(message(reason)); } }
+      finally { if (inFlight.current[key] === signal) inFlight.current[key] = null; if (key === 'host' && !signal.aborted) setLoading(false); }
     }
-    finally { if (inFlight.current === signal) inFlight.current = null; if (!signal.aborted) setLoading(false); }
+    await Promise.all([
+      one<HostStatus>('host', '/api/system/host', data => { setStatus(data); setError(''); }, setError),
+      one<EventLoopStatus>('loop', '/api/system/event-loop', data => { setLoop(data); setLoopError(''); }, setLoopError),
+    ]);
   }, [onExpired]);
   useEffect(() => {
     const controller = new AbortController(); lifetime.current = controller;
@@ -85,7 +85,8 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
       <button className="button secondary" disabled={loading} onClick={() => void read()}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
     </div></header>
     {error ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>状态读取失败：{error}。{status ? '下面是最后一次读取的数据，' : ''}稍后自动重试。</span></div> : null}
-    {!status ? error ? null : <section className="panel lp-empty" role="status"><LoaderCircle className="spin" /><strong>正在读取服务器状态</strong></section> : <div className="ss-grid">
+    {!status ? <>{error ? null : <section className="panel lp-empty" role="status"><LoaderCircle className="spin" /><strong>正在读取服务器状态</strong></section>}
+      {loop ? <div className="ss-grid"><EventLoopCard status={loop} error={loopError} /></div> : null}</> : <div className="ss-grid">
       <Card icon={<Cpu size={16} />} title="CPU" percent={status.cpu.usagePercent} suffix={`${status.cpu.cores} 核`}>
         <Row label="负载（1/5/15 分钟）" value={status.cpu.loadAverage.map(value => value.toFixed(2)).join(' / ')} />
         {status.cpu.model ? <Row label="型号" value={status.cpu.model} /> : null}

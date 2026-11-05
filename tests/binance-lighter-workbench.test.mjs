@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -161,6 +161,68 @@ test('running snapshots are staged off the hot path, coalesced, and a late one n
     assert.equal(JSON.parse(readFileSync(file)).clean, true, 'the synchronous stop record stays on disk');
     assert.equal(staged.length, 2);
   } finally { for (const row of staged) row.resolve(outcome); await manager.close(); f.cleanup(); }
+});
+
+test('real staged snapshots leave no temporary files and restart removes ones a crash left behind', async () => {
+  const f = fixture(); let manager = f.create();
+  const temporary = () => readdirSync(manager.directory).filter(name => name.endsWith('.tmp'));
+  try {
+    await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+    for (let i = 0; i < 5; i++) { f.sources[0].callbacks.onTrade({}); await delay(5); }
+    const file = join(manager.directory, 'session-v2.json');
+    await until(() => JSON.parse(readFileSync(file)).report.scenarios.length === 1);
+    await manager.stop(); await manager.close();
+    assert.deepEqual(temporary(), []);
+    writeFileSync(`${file}.${randomUUID()}.tmp`, '{"partial"');
+    writeFileSync(join(manager.directory, 'notes.tmp'), 'kept');
+    manager = f.create(); await manager.initialize();
+    assert.deepEqual(temporary(), ['notes.tmp'], 'only staged research files are removed');
+  } finally { await manager.close(); f.cleanup(); }
+});
+
+test('a rejected stage or a throw in the cooling timer stops the simulation instead of the process', async () => {
+  for (const mode of ['stage', 'timer']) {
+    let boom = false;
+    const f = fixture({
+      // A long gap keeps guarded() cooling, so in timer mode only the timer callback builds the next snapshot.
+      ...(mode === 'stage' ? { stage: async () => { throw new Error('fixture_stage_failure'); } } : { persistGapMs: 300 }),
+      engineFactory: (settings, options) => { const engine = fakeEngine(settings, options), report = engine.report;
+        return Object.assign(engine, { report: value => { if (boom) { boom = false; throw new Error('fixture_report_failure'); } return report(value); } }); },
+    });
+    const manager = f.create();
+    try {
+      await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+      if (mode === 'timer') {
+        const file = join(manager.directory, 'session-v2.json');
+        f.sources[0].callbacks.onTrade({});
+        await until(() => JSON.parse(readFileSync(file)).report.scenarios.length === 1);
+        boom = true; f.sources[0].callbacks.onTrade({}); // guarded() is cooling; the timer builds this snapshot and throws once
+      } else f.sources[0].callbacks.onTrade({});
+      // state() also builds a report, so let the background path take the one-shot failure first.
+      await until(() => !boom);
+      await until(() => manager.state().state === 'fault');
+      assert.equal(manager.state().enabled, false);
+    } finally { boom = false; await manager.close(); f.cleanup(); }
+  }
+});
+
+test('a staged snapshot of an archived session never lands over the next session', async () => {
+  const staged = [];
+  const f = fixture({ stage: (file, value) => new Promise(resolve => staged.push({ value, resolve })) });
+  const manager = f.create(), file = join(manager.directory, 'session-v2.json');
+  let committed = 0;
+  try {
+    await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+    const first = manager.state().report.sessionId;
+    f.sources[0].callbacks.onTrade({});
+    assert.equal(staged.length, 1);
+    await manager.stop(); await manager.archive(); await manager.start();
+    const second = manager.state().report.sessionId;
+    assert.notEqual(second, first);
+    staged[0].resolve({ commit() { committed += 1; }, discard() {} }); await delay(30);
+    assert.equal(committed, 0);
+    assert.equal(JSON.parse(readFileSync(file)).report.sessionId, second);
+  } finally { for (const row of staged) row.resolve({ commit() {}, discard() {} }); await manager.close(); f.cleanup(); }
 });
 
 test('archive interruption is separate from inventory exposure and fill count', async () => {
