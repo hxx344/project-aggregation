@@ -1,0 +1,95 @@
+# factory-automation: 142dfb35-b26e-4463-99d0-dc95a2ad8f1c
+name: 文档刷新
+"on":
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "**"
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Factory Droid
+        run: |
+          curl --retry 5 --retry-delay 2 --retry-all-errors -fsSL https://app.factory.ai/cli | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Write automation prompt
+        env:
+          FACTORY_AUTOMATION_PROMPT: |-
+            Commits were just pushed. Keep the documentation checked into this repository in step with them.
+
+            The event is available as `$GITHUB_EVENT_PATH` (JSON) and the pushed ref as `$GITHUB_REF_NAME`. Use `gh` for GitHub and `git` for branches; both are already authenticated.
+
+            1. Stop without acting unless the push was to the repository's default branch and the pushing actor was not factory-droid[bot] (that is your own docs pull request landing).
+            2. List the files changed by the pushed commits. Identify documentation that describes them: README sections, files under `docs/` (or wherever this repository keeps its docs), AGENTS.md, CHANGELOG, and API references.
+            3. Update only what the commits made inaccurate or incomplete: renamed flags, changed defaults, new commands, removed features. Do not rewrite style or reorganize.
+            4. If nothing needs updating, stop. If a docs pull request from factory-droid[bot] is already open, push to its branch instead. Otherwise create a branch `droid/docs-<short-sha>`, commit, and open one pull request `docs: <what changed>` whose body lists the commits it reflects.
+
+            Rules: never edit code, tests, or CI configuration; never merge; never force-push.
+        run: |
+          printf '%s' "$FACTORY_AUTOMATION_PROMPT" > "$RUNNER_TEMP/factory-automation-prompt.txt"
+      - name: Get Factory GitHub App token
+        shell: bash
+        run: |
+          # Exchange this run's GitHub OIDC token for a Factory GitHub App installation
+          # token scoped to this repository, so later steps can push, comment and open
+          # pull requests as the Factory app. When no token can be obtained the run
+          # continues without one.
+          skip() {
+            echo "::warning::$1 Continuing without a GitHub token, so the prompt cannot write to GitHub."
+            exit 0
+          }
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            skip "This run has no GitHub OIDC token (the workflow needs id-token: write; pull requests from forks never get one)."
+          fi
+          command -v jq >/dev/null || skip "jq is not installed on this runner."
+          oidc_token=$(curl -fsS --retry 3 --retry-delay 2 --retry-all-errors \
+            -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=droid-github-action" | jq -r '.value // empty') \
+            || skip "Requesting a GitHub OIDC token failed."
+          [ -n "$oidc_token" ] || skip "GitHub returned an empty OIDC token."
+          response="$RUNNER_TEMP/factory-github-token.json"
+          # Never leave an exchange response (success or failure body) behind for the
+          # later steps to read.
+          trap 'rm -f "$response"' EXIT
+          status=$(curl -sS --retry 3 --retry-delay 2 -o "$response" -w '%{http_code}' \
+            -X POST -H "Authorization: Bearer $oidc_token" \
+            https://app.factory.ai/api/github/token-exchange) \
+            || skip "The Factory token exchange could not be reached."
+          if [ "$status" != "200" ]; then
+            code=$(jq -r '.error_code // .error // empty' "$response" 2>/dev/null || true)
+            case "$code" in
+              workflow_not_found_on_default_branch|workflow_modified_from_default_branch|workflow_validation_failed)
+                skip "The Factory GitHub App token is only available to the version of this workflow file that is on the default branch (merge the pull request that adds or changes it)." ;;
+              app_not_installed)
+                skip "The Factory GitHub App is not installed on this repository (install it at https://github.com/apps/factory-droid)." ;;
+              *)
+                skip "The Factory token exchange failed (HTTP $status${code:+, $code})." ;;
+            esac
+          fi
+          token=$(jq -r '.token // empty' "$response" 2>/dev/null || true)
+          [ -n "$token" ] || skip "The Factory token exchange returned no token."
+          echo "::add-mask::$token"
+          # GH_TOKEN is a Factory GitHub App installation token for this repository only
+          # (it expires after one hour). gh reads it directly; git reads it through the
+          # credential helper below.
+          echo "GH_TOKEN=$token" >> "$GITHUB_ENV"
+          # actions/checkout stored the read-only Actions token as an Authorization
+          # header on this clone, which git would send instead of consulting a
+          # credential helper. Drop it so pushes authenticate as the Factory app.
+          git config --local --unset-all "http.$GITHUB_SERVER_URL/.extraheader" || true
+          git config --local --replace-all credential.helper ''
+          git config --local --add credential.helper '!f() { echo "username=x-access-token"; echo "password=$GH_TOKEN"; }; f'
+          git config user.name >/dev/null || git config --local user.name 'factory-droid[bot]'
+          git config user.email >/dev/null || git config --local user.email '138933559+factory-droid[bot]@users.noreply.github.com'
+          echo "GitHub writes from this run are made as the Factory GitHub App."
+      - name: Run Factory Droid
+        run: droid exec --auto high -m 'claude-opus-5-5' -r 'high' -f "$RUNNER_TEMP/factory-automation-prompt.txt"
+        env:
+          FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
