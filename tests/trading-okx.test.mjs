@@ -107,6 +107,10 @@ test('OKX read-only keys must be exactly read_only and execution keys exactly re
       assert.equal(h.calls.length, 1);
     }
   }
+  const withdraw = harness(); withdraw.state.config.perm = 'read_only,trade,withdraw';
+  await assert.rejects(withdraw.client.verify(credentials), error => error.code === 'permissions' && error.message.endsWith('：请关闭：提现'));
+  const readOnlyKey = harness(); readOnlyKey.state.config.perm = 'read_only';
+  await assert.rejects(readOnlyKey.client.verify(credentials), error => error.code === 'permissions' && error.message.endsWith('：请开启：交易'));
   const execute = harness(); execute.state.config.perm = 'trade,read_only';
   assert.deepEqual(await execute.client.verify(credentials), { identity: '1234567890123456789' });
   signed(execute.calls[0]);

@@ -75,6 +75,15 @@ export const MAX_STRATEGY_WINDOW = 7 * 86_400_000;
 const RECV_WINDOW = '5000';
 const ID_KEYS = new Set(['orderId', 'tranId', 'userID', 'userIDInt64', 'uid']);
 const BINANCE_RISKY_PERMISSIONS = ['enableWithdrawals', 'enableInternalTransfer', 'permitsUniversalTransfer', 'enableMargin', 'enableVanillaOptions', 'enableSpotAndMarginTrading'];
+// Names as shown on Binance's API management page, so the operator knows which box to change.
+const BINANCE_PERMISSION_LABELS = Object.freeze({
+  enableReading: '允许读取', enableFutures: '允许合约', enablePortfolioMarginTrading: '开启统一账户交易',
+  enableWithdrawals: '允许提现', enableInternalTransfer: '允许子母账户划转', permitsUniversalTransfer: '允许万向划转',
+  enableMargin: '允许杠杆借贷', enableVanillaOptions: '允许欧式期权', enableSpotAndMarginTrading: '启用现货、杠杆和股票交易',
+  enableFixApiTrade: '允许 FIX API 交易',
+});
+const BINANCE_ALLOWED_PERMISSIONS = ['enableReading', 'enableFutures', 'enablePortfolioMarginTrading', 'enableFixReadOnly'];
+const BYBIT_SCOPE_LABELS = Object.freeze({ ContractTrade: '合约交易', Derivatives: '统一账户衍生品', Wallet: '钱包', Spot: '现货', Options: '期权' });
 const BINANCE_TERMINAL = new Set(['FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED']);
 const BYBIT_ORDER_TERMINAL = new Set(['Filled', 'Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled']);
 const ERROR_MESSAGES = Object.freeze({
@@ -89,8 +98,9 @@ const ERROR_MESSAGES = Object.freeze({
 });
 
 export class ExecutionExchangeError extends Error {
-  constructor(code = 'upstream', { uncertain = false, notFound = false, providerCode } = {}) {
-    super(ERROR_MESSAGES[code] ?? ERROR_MESSAGES.upstream);
+  constructor(code = 'upstream', { uncertain = false, notFound = false, providerCode, detail } = {}) {
+    const base = ERROR_MESSAGES[code] ?? ERROR_MESSAGES.upstream;
+    super(typeof detail === 'string' && detail ? `${base}：${detail}` : base);
     this.name = 'ExecutionExchangeError';
     this.code = Object.hasOwn(ERROR_MESSAGES, code) ? code : 'upstream';
     this.uncertain = uncertain === true;
@@ -100,6 +110,40 @@ export class ExecutionExchangeError extends Error {
 }
 
 function fail(code = 'invalid_data', details) { throw new ExecutionExchangeError(code, details); }
+
+/**
+ * Returns a Chinese description of what to change on a Binance API key, or
+ * null when the key has exactly the permissions this execution mode needs.
+ * Only reading plus the one futures trading permission for the selected
+ * account mode may be on; every other enable/permits flag must be false.
+ */
+function binancePermissionProblem(info, mode) {
+  const label = name => labelOf(BINANCE_PERMISSION_LABELS, name);
+  const portfolio = mode === 'portfolio-margin';
+  const parts = [];
+  // A key for the other account mode is reported as a mode problem, so the
+  // remaining checks do not also ask to toggle that mode's trading permission.
+  let mismatch = true;
+  if (portfolio && info.enableFutures === true && info.enablePortfolioMarginTrading !== true) parts.push('密钥为普通合约密钥，请将账户模式改为「普通 U 本位」，或在组合保证金账户下新建开启统一账户交易的密钥');
+  else if (!portfolio && info.enablePortfolioMarginTrading === true) parts.push('密钥已开启统一账户交易，请将账户模式改为「组合保证金（Portfolio Margin）」');
+  else mismatch = false;
+  const required = mismatch ? ['enableReading'] : ['enableReading', portfolio ? 'enablePortfolioMarginTrading' : 'enableFutures'];
+  const missing = required.filter(name => info[name] !== true);
+  const unknown = [...BINANCE_RISKY_PERMISSIONS, 'enableFutures'].filter(name => typeof info[name] !== 'boolean');
+  const enabled = Object.entries(info)
+    .filter(([name, value]) => /^(?:enable|permits)/.test(name) && !BINANCE_ALLOWED_PERMISSIONS.includes(name) && value !== false)
+    .map(([name]) => name);
+  if (!portfolio && !mismatch && Object.hasOwn(info, 'enablePortfolioMarginTrading') && info.enablePortfolioMarginTrading !== false) enabled.push('enablePortfolioMarginTrading');
+  if (missing.length) parts.push(`请开启：${missing.map(label).join('、')}`);
+  const toClose = enabled.filter(name => !unknown.includes(name));
+  if (toClose.length) parts.push(`请关闭：${toClose.map(label).join('、')}`);
+  if (unknown.length) parts.push(`Binance 未返回权限状态：${unknown.map(label).join('、')}`);
+  return parts.length ? parts.join('；') : null;
+}
+/** Exchange-supplied names reach the UI only as short printable text. */
+function labelOf(labels, name) {
+  return Object.hasOwn(labels, name) ? labels[name] : String(name).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 64);
+}
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function requireObject(value) { if (!object(value)) fail(); return value; }
 function checkAbort(signal) { if (signal?.aborted) fail('aborted'); }
@@ -380,15 +424,10 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     const mode = modeOf(options.accountMode);
     const info = requireObject(await request('permissions', credentials, {}, options));
     if (exchange === 'binance') {
-      if (info.enableReading !== true || BINANCE_RISKY_PERMISSIONS.some(field => info[field] !== false)
-        || Object.hasOwn(info, 'enableFixApiTrade') && info.enableFixApiTrade !== false
-        || typeof info.enableFutures !== 'boolean'
-        || (mode === 'standard' ? info.enableFutures !== true || Object.hasOwn(info, 'enablePortfolioMarginTrading') && info.enablePortfolioMarginTrading !== false : info.enablePortfolioMarginTrading !== true)) fail('permissions');
-      for (const [name, value] of Object.entries(info)) {
-        if (/^(?:enable|permits)/.test(name) && !['enableReading', 'enableFutures', 'enablePortfolioMarginTrading', 'enableFixReadOnly'].includes(name) && value !== false) fail('permissions');
-      }
+      const detail = binancePermissionProblem(info, mode);
+      if (detail) fail('permissions', { detail });
       const config = requireObject(await request('config', credentials, {}, options));
-      if (config.canTrade !== true) fail('permissions');
+      if (config.canTrade !== true) fail('permissions', { detail: 'Binance 合约账户当前不可交易' });
       if (typeof config.dualSidePosition !== 'boolean') fail('account_mode');
       let identity = null;
       if (options.requireIdentity) {
@@ -406,17 +445,19 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       }
       return { identity, positionMode: config.dualSidePosition ? 'hedge' : 'one-way' };
     }
-    if (info.readOnly !== 0 || !object(info.permissions)) fail('permissions');
+    if (info.readOnly !== 0) fail('permissions', { detail: '密钥为只读，请改为读写并开启合约交易（订单、持仓）' });
+    if (!object(info.permissions)) fail('permissions', { detail: 'Bybit 未返回密钥权限清单' });
     const scopes = info.permissions;
     // ContractTrade is documented as [Order, Position]. DerivativesTrade is the
     // UTA scope. Other nonempty capabilities (including transfer/withdrawal) are
     // intentionally rejected; missing Wallet/Spot/Options cannot prove absence.
-    for (const name of ['ContractTrade', 'Wallet', 'Spot', 'Options', 'Derivatives']) if (!Array.isArray(scopes[name])) fail('permissions');
-    if (!scopes.ContractTrade.includes('Order')) fail('permissions');
+    for (const name of ['ContractTrade', 'Wallet', 'Spot', 'Options', 'Derivatives']) if (!Array.isArray(scopes[name])) fail('permissions', { detail: `Bybit 未返回「${BYBIT_SCOPE_LABELS[name]}」权限状态` });
+    if (!scopes.ContractTrade.includes('Order')) fail('permissions', { detail: '请开启：合约交易 - 订单' });
     for (const [name, values] of Object.entries(scopes)) {
-      if (!Array.isArray(values) || values.some(value => typeof value !== 'string')) fail('permissions');
+      if (!Array.isArray(values) || values.some(value => typeof value !== 'string')) fail('permissions', { detail: 'Bybit 权限清单格式无效' });
       const allowed = name === 'ContractTrade' ? ['Order', 'Position'] : name === 'Derivatives' ? ['DerivativesTrade'] : [];
-      if (values.some(value => !allowed.includes(value))) fail('permissions');
+      const extra = values.filter(value => !allowed.includes(value));
+      if (extra.length) fail('permissions', { detail: `请关闭：${labelOf(BYBIT_SCOPE_LABELS, name)} - ${extra.map(value => labelOf({}, value)).join('、')}` });
     }
     const identity = identifier(info.userID);
     const config = requireObject(await request('config', credentials, {}, options));

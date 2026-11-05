@@ -42,7 +42,8 @@ const MESSAGES = Object.freeze({
 
 export class OkxProtocolError extends Error {
   constructor(code = 'invalid_data', details = {}) {
-    super(MESSAGES[code] ?? MESSAGES.upstream);
+    const base = MESSAGES[code] ?? MESSAGES.upstream;
+    super(typeof details.detail === 'string' && details.detail ? `${base}：${details.detail}` : base);
     this.code = code;
     this.uncertain = details.uncertain === true;
     if (details.notFound) this.notFound = true;
@@ -96,11 +97,20 @@ export function multiple(value, step) { return units(step) > 0n && units(value) 
 
 export function validateConfig(row, { execution = false } = {}) {
   requireObject(row);
-  if (typeof row.perm !== 'string') fail('permissions');
+  if (typeof row.perm !== 'string') fail('permissions', { detail: 'OKX 未返回密钥权限' });
   const permissions = row.perm.split(',');
   const allowed = execution ? ['read_only', 'trade'] : ['read_only'];
   if (permissions.length !== allowed.length || new Set(permissions).size !== allowed.length
-    || allowed.some(value => !permissions.includes(value))) fail('permissions');
+    || allowed.some(value => !permissions.includes(value))) {
+    const names = { read_only: '读取', trade: '交易', withdraw: '提现' };
+    const label = value => Object.hasOwn(names, value) ? names[value] : value.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 64);
+    const missing = allowed.filter(value => !permissions.includes(value));
+    const extra = [...new Set(permissions)].filter(value => value && !allowed.includes(value));
+    const parts = [];
+    if (missing.length) parts.push(`请开启：${missing.map(label).join('、')}`);
+    if (extra.length) parts.push(`请关闭：${extra.map(label).join('、')}`);
+    fail('permissions', { detail: parts.join('；') || `仅允许${allowed.map(label).join('、')}权限` });
+  }
   if (!(execution ? ['2', '3'] : ['2', '3', '4']).includes(row.acctLv)
     || !['net_mode', 'long_short_mode'].includes(row.posMode)
     || row.acctLv === '4' && row.posMode !== 'net_mode') fail('account_mode');

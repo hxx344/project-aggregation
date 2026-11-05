@@ -427,6 +427,38 @@ test('Binance permission checks fail closed for missing fields, extra financial 
   await assert.rejects(unknownMode.client.account(credentials), isError('account_mode'));
 });
 
+test('Binance permission errors name the exact checkbox to change', async () => {
+  const cases = [
+    // The reported key: portfolio margin with spot/margin/stock trading enabled.
+    ['portfolio-margin', { ...binancePermission(true), enableSpotAndMarginTrading: true }, '交易密钥权限不符合要求：请关闭：启用现货、杠杆和股票交易'],
+    ['portfolio-margin', { ...binancePermission(true), enablePortfolioMarginTrading: false, enableFutures: false }, '请开启：开启统一账户交易'],
+    ['standard', binancePermission(true), '请将账户模式改为「组合保证金（Portfolio Margin）」'],
+    ['standard', { ...binancePermission(true), enableSpotAndMarginTrading: true }, '请将账户模式改为「组合保证金（Portfolio Margin）」；请关闭：启用现货、杠杆和股票交易'],
+    ['standard', { ...binancePermission(), 'enable\u0007X': true }, '请关闭：enableX'],
+    ['portfolio-margin', binancePermission(false), '请将账户模式改为「普通 U 本位」'],
+    ['standard', { ...binancePermission(), enableReading: false, enableWithdrawals: true, enableFixApiTrade: true }, '请开启：允许读取；请关闭：允许提现、允许 FIX API 交易'],
+    ['standard', { ...binancePermission(), enableMargin: undefined }, 'Binance 未返回权限状态：允许杠杆借贷'],
+    ['standard', { ...binancePermission(), enableFutureUnknownFinancialScope: true }, '请关闭：enableFutureUnknownFinancialScope'],
+  ];
+  for (const [accountMode, permissions, text] of cases) {
+    const { client } = harness('binance', call => call.url.pathname.endsWith('apiRestrictions') ? permissions : undefined);
+    await assert.rejects(client.account(credentials, { accountMode }), error => isError('permissions')(error) && error.message.includes(text));
+  }
+});
+
+test('Bybit permission errors name the scope to change', async () => {
+  const base = bybitPermission();
+  for (const [permissions, text] of [
+    [{ ...base, readOnly: 1 }, '密钥为只读'],
+    [{ ...base, permissions: { ...base.permissions, Spot: ['SpotTrade'] } }, '请关闭：现货 - SpotTrade'],
+    [{ ...base, permissions: { ...base.permissions, ContractTrade: ['Position'] } }, '请开启：合约交易 - 订单'],
+    [{ ...base, permissions: { ...base.permissions, constructor: ['Order'] } }, '请关闭：constructor - Order'],
+  ]) {
+    const { client } = harness('bybit', call => call.url.pathname.endsWith('query-api') ? permissions : undefined);
+    await assert.rejects(client.verify(credentials), error => isError('permissions')(error) && error.message.includes(text));
+  }
+});
+
 test('Binance preflight independently checks conditional orders and never cancels an external order', async () => {
   for (const mode of ['standard', 'portfolio-margin']) {
     const { client, calls } = harness('binance', call => {
