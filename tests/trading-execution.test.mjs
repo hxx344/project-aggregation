@@ -26,7 +26,7 @@ async function fixture(t, options = {}) {
   const writer = guarded ? createAccountWriter({ databasePath: join(directory, 'execution-control.sqlite'), moduleId: 'hub', runtimeId: randomUUID(), now: () => time }) : null;
   const records = new Map(), calls = [], handlers = {}, markets = {};
   const accounts = Object.fromEntries(['binance', 'bybit', 'okx'].map((exchange, index) => [exchange, { identity: guarded ? String(index + 1) : exchange === 'binance' ? null : 'fixture-uid', modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [] }]));
-  const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
+  const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: new Date(time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null, maxMarketQuantity: '1' } });
   const factory = exchange => Object.fromEntries(['verify', 'account', 'endedStrategies', 'market', 'create', 'amend', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
     if (handlers[`${exchange}:${method}`]) return handlers[`${exchange}:${method}`](...args);
@@ -37,7 +37,7 @@ async function fixture(t, options = {}) {
     const spec = args[1];
     if (method === 'create') {
       if (guarded) args[2].beforeMutation();
-      const id = String(++serial), record = { ...spec, id, kind: exchange === 'bybit' ? 'strategy' : 'order', status: 'working', terminal: false, childrenSettled: false, filledQuantity: '0', price: '70', averagePrice: null, createdAt: new Date(time).toISOString() };
+      const id = String(++serial), record = { ...spec, id, kind: exchange === 'bybit' && spec.orderType !== 'market' ? 'strategy' : 'order', status: 'working', terminal: false, childrenSettled: false, filledQuantity: '0', price: '70', averagePrice: null, createdAt: new Date(time).toISOString() };
       records.set(id, record); return { id, kind: record.kind };
     }
     const record = spec.id ? records.get(spec.id) : [...records.values()].find(item => item.clientId === spec.clientId);
@@ -1294,4 +1294,82 @@ test('a display read stuck past twice the leg timeout is replaced, and its late 
   await Promise.all([stuck, replacement]);
   assert.equal(await f.service.quotes(), await replacement, 'the late first read does not displace the replacement');
   assert.equal(f.calls.length - before, 24);
+});
+
+test('order type and optional chase limit are validated per leg; legacy legs stay chase orders', () => {
+  const legs = intent().legs;
+  assert.deepEqual(normalizeIntent(intent()).legs.map(leg => [leg.orderType, leg.stopPrice]), [['chase', '90'], ['chase', '50']]);
+  const mixed = normalizeIntent(intent({ legs: [{ ...legs[0], orderType: 'market', stopPrice: undefined }, { ...legs[1], stopPrice: null }] }));
+  assert.deepEqual(mixed.legs.map(leg => [leg.exchange, leg.orderType, leg.stopPrice]), [['binance', 'market', null], ['bybit', 'chase', null]]);
+  assert.throws(() => normalizeIntent(intent({ legs: [{ ...legs[0], orderType: 'market' }, legs[1]] })), /市价单不设追价界限/);
+  assert.throws(() => normalizeIntent(intent({ legs: [{ ...legs[0], orderType: 'MARKET' }, legs[1]] })), /下单方式/);
+  assert.throws(() => normalizeIntent(intent({ legs: [{ ...legs[0], stopPrice: '' }, legs[1]] })), /追价界限/);
+});
+
+test('market legs send one market order per batch, are never amended, and Bybit market legs are ordinary orders', async t => {
+  const f = await fixture(t, { guarded: true });
+  const legs = intent().legs;
+  const preview = await f.preview(intent({ batchCount: 1, legs: [{ ...legs[0], orderType: 'market', stopPrice: undefined }, { ...legs[1], orderType: 'market', stopPrice: undefined }] }));
+  // Two lots exceed the fixture's one-lot market cap, so the plan adds a batch.
+  assert.equal(preview.batchCount, 2);
+  assert.deepEqual(preview.legs.map(leg => [leg.orderType, leg.stopPrice, leg.batchQuantities]), [['market', null, ['1', '1']], ['market', null, ['1', '1']]]);
+  assert.ok(preview.notes.some(note => note.includes('市价腿')));
+  // Market legs are estimated at the taker side: buys at the ask, sells at the bid.
+  assert.deepEqual(preview.legs.map(leg => leg.estimatedNotional), preview.legs.map(leg => leg.orderSide === 'buy' ? '140.02' : '140'));
+  f.start(preview); await f.service.tick();
+  assert.deepEqual(f.creates.map(call => [call.exchange, call.args[1].orderType, call.args[1].stopPrice]), [['binance', 'market', null], ['bybit', 'market', null]]);
+  assert.deepEqual([...f.records.values()].map(record => record.kind), ['order', 'order']);
+  f.advance(5000); await f.service.tick();
+  assert.equal(f.calls.filter(call => call.method === 'amend').length, 0);
+  for (const id of f.records.keys()) f.fill(id);
+  await f.service.tick(); f.advance(1000); await f.service.tick();
+  assert.equal(f.creates.length, 4);
+  for (const id of f.records.keys()) f.fill(id);
+  await f.service.tick();
+  assert.equal(f.job.status, 'completed');
+  assert.deepEqual(f.job.legs.map(leg => [leg.orderType, leg.filledQuantity]), [['market', '2'], ['market', '2']]);
+});
+
+test('a market leg is refused where the venue offers no market orders, and a partial market fill pauses the job', async t => {
+  const f = await fixture(t);
+  const legs = intent().legs, body = intent({ batchCount: 1, legs: [{ ...legs[0], quantity: '1', orderType: 'market', stopPrice: undefined }, { ...legs[1], quantity: '1' }] });
+  const original = market => ({ symbol: market, bid: '70', ask: '70.01', at: new Date(f.time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null, maxMarketQuantity: null } });
+  f.handlers['binance:market'] = async symbol => original(symbol);
+  await assert.rejects(f.preview(body), /不支持市价单/);
+  delete f.handlers['binance:market'];
+  f.start(await f.preview(body)); await f.service.tick();
+  const binance = [...f.records.values()].find(record => record.orderType === 'market');
+  f.fill(binance.id, '0.4'); await f.service.tick();
+  assert.equal(f.job.status, 'paused');
+  assert.match(f.job.reason, /Binance CLUSDT 市价单未全部成交/);
+  // Resuming the remainder keeps each leg's order type and limit.
+  const resumed = await f.preview({ resumeJobId: f.job.id });
+  assert.deepEqual(resumed.legs.map(leg => [leg.exchange, leg.orderType, leg.stopPrice, leg.quantity]), [['binance', 'market', null, '0.6'], ['bybit', 'chase', '50', '1']]);
+});
+
+test('a chase leg without a limit keeps following the book and its Bybit strategy carries no stop price', async t => {
+  const f = await fixture(t);
+  const legs = intent().legs;
+  f.start(await f.preview(intent({ batchCount: 1, legs: [{ ...legs[0], stopPrice: null }, { ...legs[1], stopPrice: null }] }))); await f.service.tick();
+  assert.deepEqual(f.creates.map(call => [call.exchange, call.args[1].orderType, call.args[1].stopPrice]), [['binance', 'chase', null], ['bybit', 'chase', null]]);
+  // Far beyond any former limit, the Binance leg is still amended to the book.
+  f.handlers['binance:market'] = async symbol => ({ symbol, bid: '500', ask: '500.01', at: new Date(f.time).toISOString(), rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null, maxMarketQuantity: '1' } });
+  f.markets.binance = { bid: '500', ask: '500.01' };
+  f.advance(1500); await f.service.tick();
+  assert.equal(f.calls.filter(call => call.method === 'amend').length, 1);
+  assert.equal(f.job.status, 'running');
+});
+
+test('an uncertain Bybit market create is reconciled by client order id like Binance, not by operator strategy confirmation', async t => {
+  const f = await fixture(t);
+  const legs = intent().legs;
+  f.handlers['bybit:create'] = async () => { throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  f.start(await f.preview(intent({ batchCount: 1, legs: [{ ...legs[0], quantity: '1' }, { ...legs[1], quantity: '1', orderType: 'market', stopPrice: undefined }] })));
+  await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const bybit = f.job.legs.find(leg => leg.exchange === 'bybit');
+  assert.equal(bybit.currentOrder.kind, 'order'); assert.equal(bybit.currentOrder.confirmAfter, undefined);
+  await f.service.tick();
+  assert.ok(f.calls.some(call => call.exchange === 'bybit' && call.method === 'inspect' && call.args[1].id === null && call.args[1].orderType === 'market'));
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /确认未创建/);
 });

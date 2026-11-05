@@ -6,7 +6,8 @@ import {
   optionalPrice, id, iso, instrumentId, validateConfig, positionSize, multiply, multiple, checkAbort,
 } from './trading-okx-common.mjs';
 
-// Native ordinary PostOnly orders with in-place price amendment. No market,
+// Native ordinary PostOnly orders with in-place price amendment, or one
+// ordinary market order per batch for market legs (never amended). No
 // close-position, mode-setting, leverage-setting or algo-write route exists.
 // A create/amend/cancel ACK is never a fill or cancellation confirmation.
 // https://www.okx.com/docs-v5/en/#order-book-trading-trade-post-place-order
@@ -39,8 +40,12 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     if (!object(value) || !OKX_EXECUTION_SYMBOLS.includes(value.symbol) || !['buy', 'sell'].includes(value.side)
       || !Object.hasOwn(POSITION_SIDES, value.positionSide) || typeof value.reduceOnly !== 'boolean'
       || typeof value.clientId !== 'string' || !/^[.A-Z:/a-z0-9_-]{1,32}$/.test(value.clientId)) fail('input');
-    let quantity, stopPrice;
-    try { quantity = amount(value.quantity, { positive: true }); stopPrice = amount(value.stopPrice, { positive: true }); } catch { fail('input'); }
+    const orderType = value.orderType ?? 'chase';
+    if (!['chase', 'market'].includes(orderType)) fail('input');
+    const unset = value.stopPrice === undefined || value.stopPrice === null;
+    if (orderType === 'market' && !unset) fail('input');
+    let quantity, stopPrice = null;
+    try { quantity = amount(value.quantity, { positive: true }); if (!unset) stopPrice = amount(value.stopPrice, { positive: true }); } catch { fail('input'); }
     if (value.positionSide !== 'BOTH' && value.reduceOnly !== hedgeClose(value.side, value.positionSide)) fail('input');
     let orderId = value.id ?? null;
     if (orderId !== null) { try { orderId = id(orderId); } catch { fail('input'); } }
@@ -48,7 +53,7 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     let contractSize;
     if (value.contractSize !== undefined) { try { contractSize = amount(value.contractSize, { positive: true }); } catch { fail('input'); } }
     if (value.instrumentId !== undefined && value.instrumentId !== instrumentId(value.symbol)) fail('input');
-    return { symbol: value.symbol, side: value.side, positionSide: value.positionSide, quantity, stopPrice,
+    return { symbol: value.symbol, side: value.side, positionSide: value.positionSide, quantity, orderType, stopPrice,
       reduceOnly: value.reduceOnly, clientId: value.clientId, nativeClientId: clientIdFor(value.clientId), id: orderId,
       ...(contractSize === undefined ? {} : { contractSize }), ...(value.instrumentId === undefined ? {} : { instrumentId: value.instrumentId }) };
   }
@@ -68,7 +73,7 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     requireObject(row);
     const positionSide = positionSideOf(row.posSide), size = volume(row);
     if (row.instId !== instrumentId(spec.symbol) || row.instType !== 'SWAP' || row.tdMode !== mode
-      || row.clOrdId !== spec.nativeClientId || row.ordType !== 'post_only' || !['buy', 'sell'].includes(row.side)
+      || row.clOrdId !== spec.nativeClientId || row.ordType !== (spec.orderType === 'market' ? 'market' : 'post_only') || !['buy', 'sell'].includes(row.side)
       || !['live', 'partially_filled', ...TERMINAL].includes(row.state) || !['true', 'false'].includes(row.reduceOnly)
       || row.algoId !== undefined && row.algoId !== '' || matchQuantity && row.attachAlgoOrds !== undefined && list(row.attachAlgoOrds).length !== 0
       || row.ccy !== undefined && row.ccy !== '' && row.ccy !== 'USDT') fail();
@@ -100,11 +105,15 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     if (!Number.isFinite(time) || now - time > QUOTE_MAX_AGE || time - now > 1000) fail('not_tradable');
     if (spec.contractSize !== undefined && spec.contractSize !== rule.contractSize
       || spec.instrumentId !== undefined && spec.instrumentId !== rule.instrumentId) fail('not_tradable');
-    if (!multiple(spec.quantity, rule.quantityStep) || !multiple(spec.stopPrice, rule.tickSize)
-      || compareDecimals(spec.quantity, rule.minQuantity) < 0 || compareDecimals(spec.quantity, rule.maxQuantity) > 0) fail('input');
-    const price = spec.side === 'buy' ? market.bid : market.ask;
-    if (spec.side === 'buy' ? compareDecimals(price, spec.stopPrice) >= 0 : compareDecimals(price, spec.stopPrice) <= 0) {
-      const error = new OkxProtocolError('rejected'); error.message = 'OKX 盘口已触及追价停止价，本次委托未发送'; throw error;
+    const taker = spec.orderType === 'market';
+    if (taker && !rule.maxMarketQuantity) { const error = new OkxProtocolError('rejected'); error.message = 'OKX 合约当前不支持市价单，本次委托未发送'; throw error; }
+    if (!multiple(spec.quantity, rule.quantityStep) || spec.stopPrice !== null && !multiple(spec.stopPrice, rule.tickSize)
+      || compareDecimals(spec.quantity, rule.minQuantity) < 0 || compareDecimals(spec.quantity, rule.maxQuantity) > 0
+      || taker && compareDecimals(spec.quantity, rule.maxMarketQuantity) > 0) fail('input');
+    // Chase posts at the same-side best price; a market order takes the opposite side.
+    const price = (spec.side === 'buy') !== taker ? market.bid : market.ask;
+    if (spec.stopPrice !== null && (spec.side === 'buy' ? compareDecimals(price, spec.stopPrice) >= 0 : compareDecimals(price, spec.stopPrice) <= 0)) {
+      const error = new OkxProtocolError('rejected'); error.message = 'OKX 盘口已触及追价界限，本次委托未发送'; throw error;
     }
     if (rule.maxNotional !== null && compareDecimals(multiply(spec.quantity, rule.contractSize, price), rule.maxNotional) > 0) fail('input');
     return price;
@@ -178,8 +187,9 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     const quote = await protocol.market(spec.symbol, { signal, refreshRule: true }), price = assertMarket(quote, spec);
     const rows = await protocol.request('create', credentials, {
       instId: instrumentId(spec.symbol), tdMode: mode, clOrdId: spec.nativeClientId,
-      side: spec.side, posSide: POSITION_SIDES[spec.positionSide], ordType: 'post_only', px: price, sz: spec.quantity,
-      ...(spec.positionSide === 'BOTH' ? { reduceOnly: spec.reduceOnly } : {}), pxAmendType: '0',
+      side: spec.side, posSide: POSITION_SIDES[spec.positionSide], sz: spec.quantity,
+      ...(spec.orderType === 'market' ? { ordType: 'market' } : { ordType: 'post_only', px: price, pxAmendType: '0' }),
+      ...(spec.positionSide === 'BOTH' ? { reduceOnly: spec.reduceOnly } : {}),
     }, { signal, beforeMutation: mutationGuard(quote, spec, beforeMutation) });
     return ack(rows, spec);
   });
@@ -191,7 +201,7 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
   // or adapter rebuild, and an ACK for an earlier intent cannot match (L062).
   const amend = wrapped(async (credentials, rawSpec, { accountMode, signal, beforeMutation, amendSequence } = {}) => {
     const mode = modeOf(accountMode), spec = specOf(rawSpec, true), readOptions = { accountMode: mode, signal };
-    if (!Number.isSafeInteger(amendSequence) || amendSequence < 1) fail('input');
+    if (!Number.isSafeInteger(amendSequence) || amendSequence < 1 || spec.orderType !== 'chase') fail('input');
     const current = await readOrder(credentials, spec, readOptions);
     if (current.terminal) return current;
     const quote = await protocol.market(spec.symbol, { signal, refreshRule: true }), price = assertMarket(quote, spec);

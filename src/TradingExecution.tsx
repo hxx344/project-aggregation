@@ -4,7 +4,7 @@ import { ArrowRightLeft, ChevronDown, CircleAlert, Clock3, Link2, LoaderCircle, 
 import { api, ApiError } from './api';
 import { pairExchanges } from './trading-cache';
 import type { TradingAccountMode, TradingExchange, TradingPair } from './trading-types';
-import type { ExecutionAction, ExecutionConnection, ExecutionJob, ExecutionLegInput, ExecutionMarket, ExecutionPlanInput, ExecutionPreset, ExecutionPreview, ExecutionSide, ExecutionState, ExecutionSymbol } from './trading-execution-types';
+import type { ExecutionAction, ExecutionConnection, ExecutionJob, ExecutionLegInput, ExecutionMarket, ExecutionOrderType, ExecutionPlanInput, ExecutionPreset, ExecutionPreview, ExecutionSide, ExecutionState, ExecutionSymbol } from './trading-execution-types';
 import './trading-execution.css';
 
 const BASE = '/api/trading/execution';
@@ -48,6 +48,9 @@ function structure(market: ExecutionMarket, preset: ExecutionPreset, exchange: T
 function Choice<T extends string>({ label, value, options, onChange }: { label: string; value: T; options: [T, string][]; onChange: (value: T) => void }) {
   return <div className="execution-choice"><span aria-hidden="true">{label}</span><div className="execution-segmented" role="group" aria-label={label}>{options.map(([key, text]) => <button key={key} type="button" aria-pressed={value === key} onClick={() => { if (value !== key) onChange(key); }}>{text}</button>)}</div></div>;
 }
+const ORDER_TYPES: [ExecutionOrderType, string][] = [['chase', '追价限价'], ['market', '市价']];
+const orderBadge = (legs: { orderType: ExecutionOrderType }[]) => legs.every(leg => leg.orderType === 'market') ? '市价 · 吃单' : legs.some(leg => leg.orderType === 'market') ? '追价限价 + 市价' : '限价 · 仅挂单';
+const limitText = (leg: { orderType: ExecutionOrderType; orderSide: 'buy' | 'sell'; stopPrice: string | null }) => leg.orderType === 'market' ? <>市价<small>不设价格界限</small></> : leg.stopPrice === null ? <>不设界限<small>一直跟随盘口</small></> : <>{leg.orderSide === 'buy' ? '≤ ' : '≥ '}{amount(leg.stopPrice)}<small>{leg.orderSide === 'buy' ? '买单上限' : '卖单下限'}</small></>;
 const batchSummary = (quantities: string[]) => quantities.every(quantity => quantity === quantities[0]) ? `${quantities.length} 批 × ${amount(quantities[0])}` : quantities.map(amount).join(' / ');
 
 const ConnectionForm = memo(function ConnectionForm({ connection, disabled, write }: { connection: ExecutionConnection; disabled: boolean; write: Write }) {
@@ -87,11 +90,11 @@ const JobCard = memo(function JobCard({ job, disabled, canPreview, write, resume
     <div className="execution-table-wrap"><table className="execution-progress-table"><thead><tr><th scope="col">交易腿</th><th scope="col">已成交 / 目标<small>原生合约单位</small></th><th scope="col">剩余数量</th><th scope="col">当前委托 / 策略</th><th scope="col">最后对账<small>北京时间</small></th></tr></thead><tbody>{job.legs.map(leg => <tr key={leg.id}>
       <th scope="row"><strong>{EXCHANGES[leg.exchange]} {leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(job.action, leg.side)}</span></th>
       <td data-label="已成交 / 目标"><strong>{amount(leg.filledQuantity)}</strong> / {amount(leg.quantity)}{leg.exchange === 'okx' ? ' 张' : ''}</td><td data-label="剩余数量">{amount(leg.remainingQuantity)}{leg.exchange === 'okx' ? ' 张' : ''}</td>
-      <td data-label="当前委托 / 策略">{leg.currentOrder ? <><span className={leg.currentOrder.unknown ? 'execution-warning' : ''}>{leg.currentOrder.unknown ? '结果未知，等待核对' : leg.currentOrder.state}</span><small>{leg.currentOrder.kind === 'strategy' ? 'Bybit 原生追逐' : `${EXCHANGES[leg.exchange]} 同向价一`}{leg.currentOrder.price ? ` · ${amount(leg.currentOrder.price)} USDT` : ''}</small>{leg.currentOrder.id || leg.exchange !== 'bybit' && leg.currentOrder.clientId ? <small style={{ maxWidth: '26ch', marginLeft: 'auto', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{leg.currentOrder.id ? `${leg.currentOrder.kind === 'strategy' ? '策略' : '订单'} ID：${leg.currentOrder.id}` : `客户单号：${leg.currentOrder.clientId}`}</small> : null}</> : '尚无活动委托'}</td>
+      <td data-label="当前委托 / 策略">{leg.currentOrder ? <><span className={leg.currentOrder.unknown ? 'execution-warning' : ''}>{leg.currentOrder.unknown ? '结果未知，等待核对' : leg.currentOrder.state}</span><small>{leg.currentOrder.kind === 'strategy' ? 'Bybit 原生追逐' : leg.orderType === 'market' ? `${EXCHANGES[leg.exchange]} 市价单` : `${EXCHANGES[leg.exchange]} 同向价一`}{leg.currentOrder.price ? ` · ${amount(leg.currentOrder.price)} USDT` : ''}</small>{leg.currentOrder.id || leg.currentOrder.kind !== 'strategy' && leg.currentOrder.clientId ? <small style={{ maxWidth: '26ch', marginLeft: 'auto', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{leg.currentOrder.id ? `${leg.currentOrder.kind === 'strategy' ? '策略' : '订单'} ID：${leg.currentOrder.id}` : `客户单号：${leg.currentOrder.clientId}`}</small> : null}</> : '尚无活动委托'}</td>
       <td data-label="最后对账">{date(leg.currentOrder?.lastCheckedAt ?? null)}</td>
     </tr>)}</tbody></table></div>
     {job.legs.filter(leg => leg.currentOrder?.unknown).map(leg => {
-      const needsId = leg.exchange === 'bybit' && !leg.currentOrder?.id;
+      const needsId = leg.currentOrder?.kind === 'strategy' && !leg.currentOrder.id;
       return <form key={leg.id} className="execution-reconcile" onSubmit={event => { event.preventDefault(); void write(`/jobs/${encodeURIComponent(job.id)}/reconcile`, { legId: leg.id, ...(needsId ? { strategyId: (strategyIds[leg.id] || '').trim(), acknowledge: true } : {}) }); }}>
         <strong>{EXCHANGES[leg.exchange]} {leg.symbol} · {operation(job.action, leg.side)}</strong>
         {needsId ? <><p>请在 Bybit 核对该账户、合约、方向与数量，填写对应追逐策略 ID。核对后将停止该策略的余单。</p><label>对应策略 ID<input type="text" autoComplete="off" spellCheck={false} maxLength={100} required value={strategyIds[leg.id] || ''} onChange={event => setStrategyIds(current => ({ ...current, [leg.id]: event.target.value }))} disabled={disabled} /></label><label className="execution-checkbox"><input type="checkbox" checked={!!acknowledged[leg.id]} onChange={event => setAcknowledged(current => ({ ...current, [leg.id]: event.target.checked }))} required disabled={disabled} />我已核对这是此交易腿提交的策略</label></> : <p>先向交易所核对实际状态；结果未知期间不会重复提交。</p>}
@@ -107,19 +110,19 @@ const JobCard = memo(function JobCard({ job, disabled, canPreview, write, resume
 
 const Preview = memo(function Preview({ preview, expired, disabled, uncertain, onSubmit, onEdit }: { preview: ExecutionPreview; expired: boolean; disabled: boolean; uncertain: boolean; onSubmit: () => void; onEdit: () => void }) {
   return <section className="execution-review" aria-labelledby="execution-review-title" tabIndex={-1}>
-    <div className="execution-review-title"><div><h3 id="execution-review-title">确认{preview.resumeJobId ? '剩余数量的' : ''}{MARKETS[preview.market].name}{PRESETS[preview.preset]}{preview.action === 'open' ? '开仓' : '平仓'}</h3><p>预览有效至 {date(preview.expiresAt)}（北京时间）</p></div><span className="execution-badge connected">限价 · 仅挂单</span></div>
+    <div className="execution-review-title"><div><h3 id="execution-review-title">确认{preview.resumeJobId ? '剩余数量的' : ''}{MARKETS[preview.market].name}{PRESETS[preview.preset]}{preview.action === 'open' ? '开仓' : '平仓'}</h3><p>预览有效至 {date(preview.expiresAt)}（北京时间）</p></div><span className="execution-badge connected">{orderBadge(preview.legs)}</span></div>
     <div className="execution-review-accounts">{preview.connections.map(connection => <p key={connection.exchange}><strong>{EXCHANGES[connection.exchange]}</strong> {MODES[connection.accountMode]} · UID {connection.identity ?? '未返回'} · 密钥尾号 {connection.keyLabel ?? '未返回'}</p>)}</div>
     <dl className="execution-review-settings"><div><dt>批次</dt><dd>{preview.batchCount} 批</dd></div><div><dt>批间等待</dt><dd>{seconds(preview.batchIntervalMs)}</dd></div><div><dt>本地追价间隔（Binance / OKX）</dt><dd>{seconds(preview.repriceIntervalMs)}</dd></div><div><dt>最长执行</dt><dd>{seconds(preview.timeoutMs)}</dd></div></dl>
-    <div className="execution-review-legs execution-table-wrap"><table className="execution-progress-table execution-review-table"><thead><tr><th scope="col">交易腿</th><th scope="col">数量</th><th scope="col">估算名义<small>USDT</small></th><th scope="col">当前该方向<small>持仓模式</small></th><th scope="col">追价界限<small>USDT</small></th><th scope="col">买一 / 卖一<small>盘口时间</small></th><th scope="col">分批</th></tr></thead><tbody>{preview.legs.map(leg => <tr key={leg.id}>
+    <div className="execution-review-legs execution-table-wrap"><table className="execution-progress-table execution-review-table"><thead><tr><th scope="col">交易腿</th><th scope="col">数量</th><th scope="col">估算名义<small>USDT</small></th><th scope="col">当前该方向<small>持仓模式</small></th><th scope="col">下单方式 / 界限<small>USDT</small></th><th scope="col">买一 / 卖一<small>盘口时间</small></th><th scope="col">分批</th></tr></thead><tbody>{preview.legs.map(leg => <tr key={leg.id}>
       <th scope="row"><strong>{EXCHANGES[leg.exchange]} {leg.rule?.instrumentId ?? leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(preview.action, leg.side)}</span></th>
       <td data-label="数量"><strong>{amount(leg.quantity)}</strong> {quantityUnit(leg.exchange, leg.rule?.quantityUnit)}{leg.exchange === 'okx' ? <small>每张 {amount(leg.rule?.contractSize ?? null)}</small> : null}</td>
       <td data-label="估算名义">{amount(leg.estimatedNotional)}</td>
       <td data-label="当前持仓">{amount(leg.currentQuantity)}<small>{leg.positionMode === 'hedge' ? '双向' : '单向'}</small></td>
-      <td data-label="追价界限">{leg.orderSide === 'buy' ? '≤ ' : '≥ '}{amount(leg.stopPrice)}<small>{leg.orderSide === 'buy' ? '买单上限' : '卖单下限'}</small></td>
+      <td data-label="下单方式 / 界限">{limitText(leg)}</td>
       <td data-label="买一 / 卖一">{amount(leg.bid)} / {amount(leg.ask)}<small>{date(leg.quoteAt)}</small></td>
       <td data-label="分批">{batchSummary(leg.batchQuantities)}</td>
     </tr>)}</tbody></table></div>
-    <p className="execution-help">Bybit 使用原生追逐限价单，按本方一档追价；Binance 与 OKX 由服务定时按同向价一追价并修改原订单；OKX 使用 post_only 仅挂单。OKX 名义金额按张数 × 合约乘数 × 价格估算。达到停止价时停止追价并撤销余单；停止价不是严格成交限价，盘口瞬时跳价仍可能越过它。</p>
+    <p className="execution-help">追价限价：Bybit 使用原生追逐限价单，按本方一档追价；Binance 与 OKX 由服务定时按同向价一追价并修改原订单；OKX 使用 post_only 仅挂单。达到追价界限时停止追价并撤销余单；界限不是严格成交限价，盘口瞬时跳价仍可能越过它。市价：每批发送一次普通市价单，立即按对手盘成交，成交价可能明显偏离预览盘口。OKX 名义金额按张数 × 合约乘数 × 价格估算。</p>
     {preview.notes.length ? <ul className="execution-review-notes">{preview.notes.map((note, index) => <li key={index}>{note}</li>)}</ul> : null}
     {uncertain ? <p className="execution-warning" role="alert">本次提交结果尚未确认。请用下方按钮核对同一次提交，不要重复创建组合。</p> : expired ? <p className="execution-warning" role="status">预览已过期，请重新获取盘口与持仓后确认。</p> : null}
     <div className="execution-actions"><button className="button primary" type="button" disabled={disabled || expired && !uncertain} onClick={onSubmit}>{disabled ? <LoaderCircle size={16} className="spin" /> : <ArrowRightLeft size={16} />}{uncertain ? '重新核对本次提交' : `确认并一键${preview.action === 'open' ? '开仓' : '平仓'}`}</button><button className="button secondary" type="button" disabled={disabled || uncertain} onClick={onEdit}>返回修改参数</button></div>
@@ -135,7 +138,7 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
   const [market, setMarket] = useState<ExecutionMarket>('oil'), [sizeMode, setSizeMode] = useState<'equal' | 'per-leg'>('equal'), [equalSize, setEqualSize] = useState('');
   const [selectedExchange, setSelectedExchange] = useState<TradingExchange>('binance'), [selectedSymbol, setSelectedSymbol] = useState<ExecutionSymbol>('CLUSDT');
   const [orientation, setOrientation] = useState('');
-  const [values, setValues] = useState<Record<string, { quantity: string; stopPrice: string }>>({});
+  const [values, setValues] = useState<Record<string, { quantity: string; stopPrice: string; orderType: ExecutionOrderType }>>({});
   const [batchCount, setBatchCount] = useState('1'), [batchInterval, setBatchInterval] = useState('1'), [repriceInterval, setRepriceInterval] = useState('5'), [timeout, setExecutionTimeout] = useState('300');
   const [storedReview, setReview] = useState<{ preview: ExecutionPreview; requestId: string; uncertain: boolean; pair: TradingPair } | null>(null);
   const review = storedReview?.pair === pair ? storedReview : null;
@@ -239,9 +242,14 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
   async function submit(event: FormEvent) {
     event.preventDefault();
     if (!orientation) return;
-    const equal = sizeMode === 'equal', stopPrices = draftLegs.map(leg => values[legKey(leg)]?.stopPrice.trim() || '');
-    const legs = draftLegs.map((leg, index) => ({ ...leg, ...(equal ? {} : { quantity: values[legKey(leg)]?.quantity.trim() || '' }), stopPrice: stopPrices[index] }));
-    if (equal ? !positive(equalSize.trim()) || stopPrices.some(value => !positive(value)) : legs.some(leg => !positive(leg.quantity ?? '') || !positive(leg.stopPrice))) { setWriteError(equal ? `请填写大于零的每腿${market === 'oil' ? '桶数' : '名义金额'}和每腿追价停止价。` : '每腿数量和追价停止价均需填写大于零的十进制数。'); return; }
+    const equal = sizeMode === 'equal';
+    // An empty chase limit means no limit; market legs never send one.
+    const legs = draftLegs.map(leg => {
+      const value = values[legKey(leg)], orderType = value?.orderType ?? 'chase', stopPrice = orderType === 'chase' ? value?.stopPrice.trim() ?? '' : '';
+      return { ...leg, orderType, ...(equal ? {} : { quantity: value?.quantity.trim() || '' }), ...(stopPrice ? { stopPrice } : {}) };
+    });
+    if (equal && !positive(equalSize.trim()) || !equal && legs.some(leg => !positive(leg.quantity ?? ''))) { setWriteError(equal ? `请填写大于零的每腿${market === 'oil' ? '桶数' : '名义金额'}。` : '每腿数量须填写大于零的十进制数。'); return; }
+    if (legs.some(leg => leg.stopPrice !== undefined && !positive(leg.stopPrice))) { setWriteError('追价界限须为大于零的十进制数，或留空表示不设界限。'); return; }
     await preview({ market, preset, action, legs, ...(equal ? { equalSize: equalSize.trim() } : {}), batchCount: Number(batchCount), batchIntervalMs: Math.round(Number(batchInterval) * 1000), repriceIntervalMs: Math.round(Number(repriceInterval) * 1000), timeoutMs: Math.round(Number(timeout) * 1000) });
   }
   async function confirm() {
@@ -269,7 +277,7 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
   const [leftName, rightName] = pairExchanges(pair).map(exchange => EXCHANGES[exchange]);
   if (expiredSession) return <section className="trading-panel execution-panel"><p className="execution-session-expired">登录已过期，请重新登录后核对执行状态。</p></section>;
   return <section className="trading-panel execution-panel" aria-labelledby="execution-title">
-    <header className="trading-panel-heading"><div><h2 id="execution-title">组合交易</h2><p>Bybit 原生追逐限价单 · Binance / OKX 原订单追价 · 分批开平仓</p></div><button className="button secondary" type="button" disabled={disabled || reading} onClick={() => void load(true)}><RefreshCw size={15} className={reading ? 'spin' : ''} />刷新执行状态</button></header>
+    <header className="trading-panel-heading"><div><h2 id="execution-title">组合交易</h2><p>Bybit 原生追逐限价单 · Binance / OKX 原订单追价 · 可选市价 · 分批开平仓</p></div><button className="button secondary" type="button" disabled={disabled || reading} onClick={() => void load(true)}><RefreshCw size={15} className={reading ? 'spin' : ''} />刷新执行状态</button></header>
     <div className={`execution-sync${offline || stale || readError ? ' stale' : ''}`} role="status"><Clock3 size={14} /><span>{offline ? '网络已断开，显示最后取得的执行状态。' : readError ? '执行状态读取失败，当前保留上次结果。' : stale ? '执行状态已过期，正在重新核对。' : state ? '前台每 3 秒更新执行状态。' : '正在读取执行状态…'}{state ? ` 最近取得：${date(state.generatedAt)}（北京时间）` : ''}</span></div>
     {readError ? <p className="execution-message warning" role="alert">{readError}</p> : null}
     {writeError ? <p className="execution-message warning" role="alert"><CircleAlert size={16} />{writeError}</p> : null}
@@ -293,10 +301,10 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
           <p className="execution-help">{sizeMode === 'equal' ? `${MARKETS[market].hint}实际各腿数量以预览为准。` : 'OKX 按张填写，其他交易所按原生合约单位；开仓时多空两侧须大致平衡。'}</p>
         </div>
         {orientation ? <div className={`execution-leg-inputs${sizeMode === 'per-leg' ? ' per-leg' : ''}`}>{draftLegs.map(leg => {
-          const key = legKey(leg), value = values[key] || { quantity: '', stopPrice: '' }, buy = orderSide(action, leg.side) === 'buy';
+          const key = legKey(leg), value = values[key] || { quantity: '', stopPrice: '', orderType: 'chase' as const }, buy = orderSide(action, leg.side) === 'buy';
           const position = state?.positions.find(row => row.exchange === leg.exchange && row.symbol === leg.symbol && row.side === leg.side);
-          return <section key={key} className="execution-leg-input" aria-label={`${EXCHANGES[leg.exchange]} ${leg.symbol} 交易参数`}><header><strong>{EXCHANGES[leg.exchange]} {leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(action, leg.side)}</span></header>{sizeMode === 'per-leg' ? <div><label>数量 · {quantityUnit(leg.exchange)}<input type="text" inputMode="decimal" autoComplete="off" value={value.quantity} required maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" onChange={event => setValues(current => ({ ...current, [key]: { ...value, quantity: event.target.value } }))} /></label>{action === 'close' ? <div className="execution-position-hint"><span>{position ? `最近${direction(leg.side)} ${amount(position.quantity)} · ${date(position.fetchedAt)}` : `尚无该方向仓位数据`}</span><button type="button" className="text-button" disabled={!position || !positive(position.quantity)} onClick={() => position && setValues(current => ({ ...current, [key]: { ...value, quantity: position.quantity } }))}>填入当前数量</button></div> : null}</div> : null}<label>{buy ? '追价上限' : '追价下限'} · USDT<input type="text" inputMode="decimal" autoComplete="off" value={value.stopPrice} required maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" placeholder={buy ? '买单价格不高于' : '卖单价格不低于'} onChange={event => setValues(current => ({ ...current, [key]: { ...value, stopPrice: event.target.value } }))} /></label></section>;
-        })}</div> : <p className="execution-choose-direction">先选择方向，再填写各腿追价界限。</p>}
+          return <section key={key} className="execution-leg-input" aria-label={`${EXCHANGES[leg.exchange]} ${leg.symbol} 交易参数`}><header><strong>{EXCHANGES[leg.exchange]} {leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(action, leg.side)}</span></header>{sizeMode === 'per-leg' ? <div><label>数量 · {quantityUnit(leg.exchange)}<input type="text" inputMode="decimal" autoComplete="off" value={value.quantity} required maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" onChange={event => setValues(current => ({ ...current, [key]: { ...value, quantity: event.target.value } }))} /></label>{action === 'close' ? <div className="execution-position-hint"><span>{position ? `最近${direction(leg.side)} ${amount(position.quantity)} · ${date(position.fetchedAt)}` : `尚无该方向仓位数据`}</span><button type="button" className="text-button" disabled={!position || !positive(position.quantity)} onClick={() => position && setValues(current => ({ ...current, [key]: { ...value, quantity: position.quantity } }))}>填入当前数量</button></div> : null}</div> : null}<Choice label="下单方式" value={value.orderType} options={ORDER_TYPES} onChange={next => setValues(current => ({ ...current, [key]: { ...value, orderType: next } }))} />{value.orderType === 'market' ? <p className="execution-help execution-market-note">按对手盘吃单成交，不设价格界限，成交价可能偏离盘口。</p> : <label>{buy ? '追价上限' : '追价下限'} · USDT（选填）<input type="text" inputMode="decimal" autoComplete="off" value={value.stopPrice} maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" placeholder={`留空不设${buy ? '上限' : '下限'}`} onChange={event => setValues(current => ({ ...current, [key]: { ...value, stopPrice: event.target.value } }))} /></label>}</section>;
+        })}</div> : <p className="execution-choose-direction">先选择方向，再设置各腿下单方式。</p>}
         <details className="execution-advanced"><summary><span><strong>执行参数</strong><small>{batchCount || '?'} 批 · 批间 {batchInterval || '?'} 秒 · 追价间隔 {repriceInterval || '?'} 秒 · 最长 {timeout || '?'} 秒</small></span><ChevronDown size={16} /></summary>
           <div className="execution-settings"><label>拆分批数<input type="number" min="1" max="200" step="1" required value={batchCount} onChange={event => setBatchCount(event.target.value)} /></label><label>批间等待 · 秒<input type="number" min="0" max="600" step="0.001" required value={batchInterval} onChange={event => setBatchInterval(event.target.value)} /></label><label>本地追价间隔（Binance / OKX） · 秒<input type="number" min="1" max="60" step="0.001" required value={repriceInterval} onChange={event => setRepriceInterval(event.target.value)} /></label><label>最长执行 · 秒<input type="number" min="30" max="3600" step="0.001" required value={timeout} onChange={event => setExecutionTimeout(event.target.value)} /></label></div>
           <p className="execution-help">每批各腿完成后才进入下一批。达到追价界限、最长时间或出现无法核对的状态时，停止后续批次并处理余单；已成交数量单独保留。</p>

@@ -61,6 +61,8 @@ export function amount(value, options = {}) {
   try { if (typeof value !== 'string') fail(); return decimal(value, options); } catch { fail(); }
 }
 export function optionalAmount(value, options = {}) { return value === '' || value === null || value === undefined ? null : amount(value, options); }
+// Market support is optional: an unparsable maxMktSz disables market legs only.
+function optionalMarketQuantity(value) { try { return optionalAmount(value, { positive: true }); } catch { return null; } }
 export function optionalPrice(value) { const result = optionalAmount(value, { nonnegative: true }); return result === '0' ? null : result; }
 export function absolute(value) { return compareDecimals(value, '0') < 0 ? negateDecimal(value) : value; }
 export function id(value) { if (typeof value !== 'string' || !/^\d{1,30}$/.test(value)) fail(); return value; }
@@ -161,7 +163,7 @@ function providerFailure(raw, httpStatus, mutation) {
   // Unknown, duplicate-id and timeout errors do not prove non-execution. Never
   // infer safety from a range of provider codes, or retry ambiguous mutations.
   const rejected = [50011, 50101, 50103, 50104, 50105, 50106, 50107, 50108, 50109, 50110, 50111, 50113, 50114,
-    51000, 51001, 51004, 51005, 51006, 51007, 51008, 51010, 51020, 51120, 51121, 51122, 51131].includes(providerCode);
+    51000, 51001, 51004, 51005, 51006, 51007, 51008, 51010, 51020, 51120, 51121, 51122, 51131, 51201, 51202].includes(providerCode);
   return new OkxProtocolError(rejected && httpStatus < 500 ? 'rejected' : 'upstream', {
     providerCode, httpStatus, uncertain: mutation && (httpStatus >= 500 || !rejected),
   });
@@ -295,6 +297,8 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
       instrumentId: instId, quantityUnit: '张', contractSize: multiply(amount(row.ctVal, { positive: true }), amount(row.ctMult, { positive: true })),
       tickSize: amount(row.tickSz, { positive: true }), quantityStep: amount(row.lotSz, { positive: true }),
       minQuantity: amount(row.minSz, { positive: true }), maxQuantity: amount(row.maxLmtSz, { positive: true }),
+      // A post_only instrument state rejects market orders.
+      maxMarketQuantity: row.state === 'live' ? optionalMarketQuantity(row.maxMktSz) : null,
       // maxLmtAmt is explicitly USD. Do not label it as the generic USDT
       // maxNotional or silently assume the stablecoin trades at dollar parity.
       minNotional: '0', maxNotional: null, maxNotionalUsd: optionalAmount(row.maxLmtAmt, { positive: true }),
