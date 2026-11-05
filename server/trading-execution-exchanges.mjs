@@ -28,7 +28,13 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  *   (OKX derives its reqId from it; Binance ignores it).
  * spec = { symbol, side: 'buy' | 'sell', positionSide: 'BOTH' | 'LONG' | 'SHORT',
  *          quantity: decimal string, reduceOnly: boolean, clientId: string <= 32,
- *          stopPrice: positive decimal string }.
+ *          orderType?: 'chase' | 'market' (default 'chase'),
+ *          stopPrice: positive decimal string | null (chase only; null = no limit) }.
+ *
+ * Market legs (orderType 'market') send one ordinary market order and are
+ * never amended: Binance MARKET, Bybit linear Market with orderLinkId=clientId
+ * (kind 'order', inspected by orderId/orderLinkId like Binance). Market size
+ * is capped by rule.maxMarketQuantity (null = market orders unavailable).
  *
  * Binance: LIMIT + GTX + priceMatch=QUEUE; never sends an explicit price.
  * stopPrice is a strategy stop trigger, NOT a guaranteed execution-price cap;
@@ -36,7 +42,8 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  * original total quantity. Each amendment is a single native modify operation,
  * not an exchange-managed chase. A failed amendment can leave the original live;
  * reconcile that order instead of canceling and replacing it to chase prices.
- * Bybit: native chaseOrder, zero offset, maxChasePrice=stopPrice. There is no
+ * Bybit: native chaseOrder, zero offset, maxChasePrice=stopPrice (omitted when
+ * the leg has no limit). There is no
  * documented client id / idempotency token for native strategy creation. An
  * uncertain create must never be retried or matched by approximate parameters.
  * inspect requires an explicitly known strategyId and checks all child pages.
@@ -63,6 +70,10 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  * https://bybit-exchange.github.io/docs/v5/strategy/strategy-list
  * https://bybit-exchange.github.io/docs/v5/strategy/order-list
  * https://bybit-exchange.github.io/docs/v5/strategy/stop-strategy
+ * https://bybit-exchange.github.io/docs/v5/order/create-order
+ * https://bybit-exchange.github.io/docs/v5/order/open-order
+ * https://bybit-exchange.github.io/docs/v5/order/order-list
+ * https://bybit-exchange.github.io/docs/v5/order/cancel-order
  * https://bybit-exchange.github.io/docs/v5/user/apikey-info
  */
 
@@ -87,6 +98,8 @@ const BINANCE_ALLOWED_PERMISSIONS = ['enableReading', 'enableFutures', 'enablePo
 const BYBIT_SCOPE_LABELS = Object.freeze({ ContractTrade: '合约交易', Derivatives: '统一账户衍生品', Wallet: '钱包', Spot: '现货', Options: '期权' });
 const BINANCE_TERMINAL = new Set(['FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED']);
 const BYBIT_ORDER_TERMINAL = new Set(['Filled', 'Cancelled', 'Rejected', 'Deactivated', 'PartiallyFilledCanceled']);
+// Market support is optional: an unparsable market size field means "no market legs".
+const optionalMarketQuantity = parse => { try { return parse(); } catch { return null; } };
 const ERROR_MESSAGES = Object.freeze({
   input: '交易执行参数无效', configuration: '交易执行配置无效', credentials: '交易凭据格式无效',
   permissions: '交易密钥权限不符合要求', account_mode: '交易账户或持仓模式无法确认',
@@ -252,6 +265,9 @@ const BYBIT_ENDPOINTS = Object.freeze({
   children: ['https://api.bybit.com', '/v5/strategy/order-list', 'GET', true],
   create: ['https://api.bybit.com', '/v5/strategy/create', 'POST', true],
   stop: ['https://api.bybit.com', '/v5/strategy/stop', 'POST', true],
+  orderCreate: ['https://api.bybit.com', '/v5/order/create', 'POST', true],
+  orderCancel: ['https://api.bybit.com', '/v5/order/cancel', 'POST', true],
+  orderHistory: ['https://api.bybit.com', '/v5/order/history', 'GET', true],
   rules: ['https://api.bybit.com', '/v5/market/instruments-info', 'GET', false],
   book: ['https://api.bybit.com', '/v5/market/orderbook', 'GET', false],
   time: ['https://api.bybit.com', '/v5/market/time', 'GET', false],
@@ -405,20 +421,29 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     if (!object(spec) || !SYMBOLS.includes(spec.symbol) || !['buy', 'sell'].includes(spec.side)
       || !['BOTH', 'LONG', 'SHORT'].includes(spec.positionSide) || typeof spec.reduceOnly !== 'boolean'
       || typeof spec.clientId !== 'string' || !/^[.A-Z:/a-z0-9_-]{1,32}$/.test(spec.clientId)) fail('input');
-    let quantity, stopPrice;
+    const orderType = spec.orderType ?? 'chase';
+    if (!['chase', 'market'].includes(orderType) || orderType === 'market' && spec.stopPrice !== null && spec.stopPrice !== undefined) fail('input');
+    let quantity, stopPrice = null;
     try {
-      if (typeof spec.quantity !== 'string' || typeof spec.stopPrice !== 'string') fail('input');
-      quantity = decimal(spec.quantity, { positive: true }); stopPrice = decimal(spec.stopPrice, { positive: true });
+      if (typeof spec.quantity !== 'string') fail('input');
+      quantity = decimal(spec.quantity, { positive: true });
+      if (spec.stopPrice !== null && spec.stopPrice !== undefined) {
+        if (typeof spec.stopPrice !== 'string') fail('input');
+        stopPrice = decimal(spec.stopPrice, { positive: true });
+      }
     } catch { fail('input'); }
     if (spec.positionSide !== 'BOTH' && spec.reduceOnly !== hedgeClose(spec.side, spec.positionSide)) fail('input');
+    // Bybit chase legs are native strategies (UUID); every other leg is an ordinary order.
+    const strategy = exchange === 'bybit' && orderType === 'chase';
     let id = spec.id ?? null;
     if (id !== null) {
-      try { id = exchange === 'bybit' ? strategyId(id) : identifier(id); }
+      try { id = strategy ? strategyId(id) : identifier(id); }
       catch { fail('input'); }
+      // Binance ids are numeric; Bybit linear order ids are UUID-like strings.
       if (exchange === 'binance' && !/^\d{1,30}$/.test(id)) fail('input');
     }
-    if (idRequired && exchange === 'bybit' && id === null) fail('strategy_id_required');
-    return { symbol: spec.symbol, side: spec.side, positionSide: spec.positionSide, quantity, reduceOnly: spec.reduceOnly, clientId: spec.clientId, stopPrice, id };
+    if (idRequired && strategy && id === null) fail('strategy_id_required');
+    return { symbol: spec.symbol, side: spec.side, positionSide: spec.positionSide, quantity, reduceOnly: spec.reduceOnly, clientId: spec.clientId, orderType, stopPrice, strategy, id };
   }
 
   async function permissionSnapshot(credentials, options) {
@@ -496,6 +521,18 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       price: optionalPrice(row.price), averagePrice: optionalPrice(row.avgPrice), terminal, childrenSettled: terminal,
       symbol: row.symbol, side, reduceOnly: row.reduceOnly || hedgeClose(side, positionSide), positionSide, createdAt: iso(row.time, true) };
   }
+  function parseBybitOrder(row, spec) {
+    requireObject(row);
+    if (row.symbol !== spec.symbol || row.orderLinkId !== spec.clientId || row.orderType !== 'Market'
+      || !['Created', 'New', 'PartiallyFilled', ...BYBIT_ORDER_TERMINAL].includes(row.orderStatus) || typeof row.reduceOnly !== 'boolean'
+      || Object.hasOwn(row, 'stopOrderType') && !['', 'UNKNOWN'].includes(row.stopOrderType)) fail();
+    const side = sideOf(row.side), positionSide = positionSideForIndex(row.positionIdx), size = volumes(row.qty, row.cumExecQty);
+    if (row.orderStatus === 'Filled' && size.quantity !== size.filledQuantity) fail();
+    const terminal = BYBIT_ORDER_TERMINAL.has(row.orderStatus);
+    return { id: identifier(row.orderId), kind: 'order', status: terminal ? 'terminal' : 'working', ...size,
+      price: null, averagePrice: optionalPrice(row.avgPrice), terminal, childrenSettled: terminal,
+      symbol: row.symbol, side, reduceOnly: row.reduceOnly || hedgeClose(side, positionSide), positionSide, createdAt: iso(row.createdTime) };
+  }
   function parseStrategy(row) {
     requireObject(row);
     if (!SYMBOLS.includes(row.symbol) || row.category !== 'UTA_USDT' || row.strategyType !== 'chaseOrder' || typeof row.reduceOnly !== 'boolean') fail();
@@ -568,7 +605,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
         const orders = await pages('openOrders', credentials, { category: 'linear', symbol, openOnly: '0', limit: '50' }, options, { category: 'linear' });
         for (const row of orders) {
           requireObject(row);
-          if (row.symbol !== symbol || !['New', 'PartiallyFilled', 'Untriggered', 'Triggered', ...BYBIT_ORDER_TERMINAL].includes(row.orderStatus)) fail();
+          if (row.symbol !== symbol || !['Created', 'New', 'PartiallyFilled', 'Untriggered', 'Triggered', ...BYBIT_ORDER_TERMINAL].includes(row.orderStatus)) fail();
           const id = identifier(row.orderId), size = volumes(row.qty, row.cumExecQty), positionSide = positionSideForIndex(row.positionIdx);
           if (seenOrders.has(id)) fail();
           seenOrders.add(id);
@@ -630,7 +667,15 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       const getFilter = name => { const values = filters.filter(filter => filter?.filterType === name); if (values.length !== 1) fail(); return values[0]; };
       const price = getFilter('PRICE_FILTER'), lot = getFilter('LOT_SIZE'), notional = getFilter('MIN_NOTIONAL');
       rule = { tickSize: amount(price.tickSize, { positive: true }), quantityStep: amount(lot.stepSize, { positive: true }),
-        minQuantity: amount(lot.minQty, { positive: true }), maxQuantity: amount(lot.maxQty, { positive: true }), minNotional: amount(notional.notional, { nonnegative: true }), maxNotional: null };
+        minQuantity: amount(lot.minQty, { positive: true }), maxQuantity: amount(lot.maxQty, { positive: true }), minNotional: amount(notional.notional, { nonnegative: true }), maxNotional: null, maxMarketQuantity: null };
+      // Market orders have their own size filter. Offer them only when that
+      // filter shares the limit-order step, so one batch split fits both.
+      // A malformed market filter only disables market legs, never chase legs.
+      const marketLots = filters.filter(filter => filter?.filterType === 'MARKET_LOT_SIZE');
+      if (row.orderTypes.includes('MARKET') && marketLots.length === 1) rule.maxMarketQuantity = optionalMarketQuantity(() => {
+        const lot = marketLots[0];
+        return amount(lot.stepSize, { positive: true }) === rule.quantityStep && compareDecimals(amount(lot.minQty, { positive: true }), rule.minQuantity) <= 0 ? amount(lot.maxQty, { positive: true }) : null;
+      });
     } else {
       const data = requireObject(await request('rules', null, { category: 'linear', symbol }, { signal }));
       if (data.category !== 'linear') fail();
@@ -640,7 +685,8 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (row.status !== 'Trading' || row.contractType !== 'LinearPerpetual' || row.quoteCoin !== 'USDT' || row.settleCoin !== 'USDT' || row.unifiedMarginTrade !== true) fail('not_tradable');
       const price = requireObject(row.priceFilter), lot = requireObject(row.lotSizeFilter);
       rule = { tickSize: amount(price.tickSize, { positive: true }), quantityStep: amount(lot.qtyStep, { positive: true }),
-        minQuantity: amount(lot.minOrderQty, { positive: true }), maxQuantity: amount(lot.maxOrderQty, { positive: true }), minNotional: amount(lot.minNotionalValue, { nonnegative: true }), maxNotional: null };
+        minQuantity: amount(lot.minOrderQty, { positive: true }), maxQuantity: amount(lot.maxOrderQty, { positive: true }), minNotional: amount(lot.minNotionalValue, { nonnegative: true }), maxNotional: null,
+        maxMarketQuantity: optionalMarketQuantity(() => lot.maxMktOrderQty === undefined || lot.maxMktOrderQty === '' ? null : amount(lot.maxMktOrderQty, { positive: true })) };
     }
     if (compareDecimals(rule.maxQuantity, rule.minQuantity) < 0 || compareDecimals(rule.quantityStep, rule.maxQuantity) > 0) fail();
     ruleCache.set(symbol, { rule, expiresAt: clock() + RULE_TTL });
@@ -675,20 +721,31 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
 
   async function create(credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) {
     const options = { accountMode: modeOf(accountMode), signal, beforeMutation }, spec = validateSpec(rawSpec);
+    const market = spec.orderType === 'market';
     let parameters;
     if (exchange === 'binance') parameters = {
       symbol: spec.symbol, side: spec.side.toUpperCase(), positionSide: spec.positionSide,
-      type: 'LIMIT', timeInForce: 'GTX', priceMatch: 'QUEUE', quantity: spec.quantity,
+      ...(market ? { type: 'MARKET' } : { type: 'LIMIT', timeInForce: 'GTX', priceMatch: 'QUEUE' }), quantity: spec.quantity,
       ...(spec.positionSide === 'BOTH' ? { reduceOnly: String(spec.reduceOnly) } : {}), newClientOrderId: spec.clientId, newOrderRespType: 'ACK',
+    };
+    else if (market) parameters = {
+      category: 'linear', symbol: spec.symbol, side: spec.side === 'buy' ? 'Buy' : 'Sell', orderType: 'Market', qty: spec.quantity,
+      positionIdx: ['BOTH', 'LONG', 'SHORT'].indexOf(spec.positionSide), reduceOnly: spec.reduceOnly, orderLinkId: spec.clientId,
     };
     else parameters = {
       category: 'UTA_USDT', symbol: spec.symbol, side: spec.side === 'buy' ? 'Buy' : 'Sell', size: spec.quantity,
       strategyType: 'chaseOrder', positionIdx: ['BOTH', 'LONG', 'SHORT'].indexOf(spec.positionSide),
-      reduceOnly: spec.reduceOnly, chaseDistance: '0', maxChasePrice: spec.stopPrice,
+      // maxChasePrice is optional: without it the strategy follows the book until filled or stopped.
+      reduceOnly: spec.reduceOnly, chaseDistance: '0', ...(spec.stopPrice === null ? {} : { maxChasePrice: spec.stopPrice }),
     };
-    const result = await request('create', credentials, parameters, options);
+    const result = await request(exchange === 'bybit' && market ? 'orderCreate' : 'create', credentials, parameters, options);
     try {
       requireObject(result);
+      if (exchange === 'bybit' && market) {
+        const id = identifier(result.orderId);
+        if (result.orderLinkId !== spec.clientId) fail();
+        return { id, kind: 'order' };
+      }
       if (exchange === 'binance') {
         const id = identifier(result.orderId);
         if (!/^\d{1,30}$/.test(id) || Object.hasOwn(result, 'symbol') && result.symbol !== spec.symbol
@@ -703,7 +760,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   async function amend(credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) {
     if (exchange !== 'binance') fail('input');
     const options = { accountMode: modeOf(accountMode), signal, beforeMutation }, spec = validateSpec(rawSpec, true);
-    if (spec.id === null) fail('input');
+    if (spec.id === null || spec.orderType !== 'chase') fail('input');
     const row = await request('amend', credentials, {
       symbol: spec.symbol, side: spec.side.toUpperCase(), orderId: spec.id,
       quantity: spec.quantity, priceMatch: 'QUEUE',
@@ -727,8 +784,20 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       const row = await request('inspect', credentials, { symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { origClientOrderId: spec.clientId }) }, options);
       const result = parseBinanceOrder(row);
       if (result.symbol !== spec.symbol || result.side !== spec.side || result.positionSide !== spec.positionSide
-        || result.reduceOnly !== spec.reduceOnly || spec.id && result.id !== spec.id
-        || row.clientOrderId !== spec.clientId || row.type !== 'LIMIT' || row.timeInForce !== 'GTX') fail();
+        || result.reduceOnly !== spec.reduceOnly || spec.id && result.id !== spec.id || row.clientOrderId !== spec.clientId
+        || (spec.orderType === 'market' ? row.type !== 'MARKET' : row.type !== 'LIMIT' || row.timeInForce !== 'GTX')) fail();
+      return result;
+    }
+    if (!spec.strategy) {
+      // Recent orders (open or closed) come from the realtime endpoint; older
+      // or restart-cleared ones from history. Both are keyed by our id.
+      const key = spec.id ? { orderId: spec.id } : { orderLinkId: spec.clientId };
+      let rows = await pages('openOrders', credentials, { category: 'linear', symbol: spec.symbol, ...key, limit: '50' }, options, { category: 'linear' });
+      if (rows.length === 0) rows = await pages('orderHistory', credentials, { category: 'linear', symbol: spec.symbol, ...key, limit: '50' }, options, { category: 'linear' });
+      if (rows.length === 0) fail('not_found', { notFound: true });
+      if (rows.length !== 1) fail();
+      const result = parseBybitOrder(rows[0], spec);
+      if (spec.id && result.id !== spec.id || result.side !== spec.side || result.positionSide !== spec.positionSide || result.reduceOnly !== spec.reduceOnly) fail();
       return result;
     }
     const rows = await pages('strategies', credentials, { strategyId: spec.id, category: 'UTA_USDT', symbol: spec.symbol, strategyType: 'chaseOrder', pageSize: '50' }, options, { cursorField: 'nextCursor' });
@@ -765,12 +834,14 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
 
   async function stop(credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) {
     const options = { accountMode: modeOf(accountMode), signal, beforeMutation }, spec = validateSpec(rawSpec, true);
-    const result = await request('stop', credentials, exchange === 'binance'
-      ? { symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { origClientOrderId: spec.clientId }) }
-      : { strategyId: spec.id }, options);
+    const result = exchange === 'binance'
+      ? await request('stop', credentials, { symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { origClientOrderId: spec.clientId }) }, options)
+      : spec.strategy ? await request('stop', credentials, { strategyId: spec.id }, options)
+        : await request('orderCancel', credentials, { category: 'linear', symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { orderLinkId: spec.clientId }) }, options);
     try {
       requireObject(result);
-      if (exchange === 'bybit') { if (strategyId(result.strategyId) !== spec.id) fail(); }
+      if (exchange === 'bybit' && spec.strategy) { if (strategyId(result.strategyId) !== spec.id) fail(); }
+      else if (exchange === 'bybit') { if (spec.id && identifier(result.orderId) !== spec.id || result.orderLinkId !== spec.clientId) fail(); }
       else {
         const id = identifier(result.orderId);
         if (spec.id && id !== spec.id || result.symbol !== spec.symbol || result.clientOrderId !== spec.clientId) fail();

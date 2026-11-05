@@ -16,7 +16,7 @@ const config = (readOnly = false, overrides = {}) => ({ uid: '123456789012345678
   perm: readOnly ? 'read_only' : 'read_only,trade', ctIsoMode: 'automatic', ...overrides });
 const rule = (instId, overrides = {}) => ({ instId, instType: 'SWAP', ctType: 'linear', settleCcy: 'USDT', state: 'live',
   ctValCcy: instId.startsWith('CL-') ? 'CL' : 'BZ', ctVal: instId.startsWith('CL-') ? '0.1' : '0.01', ctMult: '1',
-  baseCcy: '', quoteCcy: '', tickSz: '0.01', lotSz: '1', minSz: '1', maxLmtSz: '100000000', maxLmtAmt: '20000000', ...overrides });
+  baseCcy: '', quoteCcy: '', tickSz: '0.01', lotSz: '1', minSz: '1', maxLmtSz: '100000000', maxMktSz: '50', maxLmtAmt: '20000000', ...overrides });
 const position = (instId = 'CL-USDT-SWAP', overrides = {}) => ({ instId, instType: 'SWAP', posSide: 'net', mgnMode: 'cross',
   pos: '20', ccy: 'USDT', markPx: '80', avgPx: '79.5', upl: '1', lever: '5', liqPx: '65', uTime: String(NOW), notionalUsd: '999999', ...overrides });
 const order = (overrides = {}) => ({ instType: 'SWAP', instId: 'CL-USDT-SWAP', ordId: ORDER, clOrdId: nativeId(spec.clientId),
@@ -74,7 +74,7 @@ test('OKX public oil rules preserve different CL/BZ contract sizes and native lo
   for (const [symbol, size] of [['CLUSDT', '0.1'], ['BZUSDT', '0.01']]) {
     const market = await client.market(symbol);
     assert.deepEqual(market.rule, { instrumentId: symbol === 'CLUSDT' ? 'CL-USDT-SWAP' : 'BZ-USDT-SWAP', quantityUnit: '张', contractSize: size,
-      tickSize: '0.01', quantityStep: '1', minQuantity: '1', maxQuantity: '100000000', minNotional: '0', maxNotional: null, maxNotionalUsd: '20000000' });
+      tickSize: '0.01', quantityStep: '1', minQuantity: '1', maxQuantity: '100000000', maxMarketQuantity: '50', minNotional: '0', maxNotional: null, maxNotionalUsd: '20000000' });
   }
   await client.market('CLUSDT');
   assert.equal(calls.filter(call => call.url.pathname.endsWith('/instruments')).length, 2);
@@ -518,4 +518,40 @@ test('OKX execution trades SK hynix share contracts while the read-only ledger s
   const readOnly = harness({ readOnly: true });
   await readOnly.client.positions(credentials);
   assert.deepEqual([...new Set(readOnly.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['CL-USDT-SWAP', 'BZ-USDT-SWAP']);
+});
+
+test('OKX market legs send ordType market without a price, are read back as market and never amended', async () => {
+  const market = { ...spec, orderType: 'market', stopPrice: null };
+  const h = harness();
+  h.state.order = order({ ordType: 'market', px: '', state: 'filled', accFillSz: '2', avgPx: '80.12' });
+  assert.deepEqual(await h.client.create(credentials, { ...market, side: 'sell', reduceOnly: true }), { id: ORDER, kind: 'order' });
+  assert.deepEqual(mutations(h.calls)[0].parameters, { instId: 'CL-USDT-SWAP', tdMode: 'cross', clOrdId: nativeId(spec.clientId), side: 'sell', posSide: 'net', sz: '2', ordType: 'market', reduceOnly: true });
+  const result = await h.client.inspect(credentials, market);
+  assert.deepEqual([result.terminal, result.filledQuantity, result.price, result.averagePrice], [true, '2', null, '80.12']);
+  // A market leg never claims a resting post_only order, and a chase leg never claims a market one.
+  await assert.rejects(h.client.inspect(credentials, spec), isExecutionError('invalid_data'));
+  await assert.rejects(h.client.amend(credentials, { ...market, id: ORDER }, { amendSequence: 1 }), isExecutionError('input'));
+  await assert.rejects(h.client.create(credentials, { ...market, stopPrice: '90' }), isExecutionError('input'));
+  // The market size cap and a post_only instrument state both block submission before any write.
+  const large = harness();
+  await assert.rejects(large.client.create(credentials, { ...market, quantity: '51' }), isExecutionError('input'));
+  const postOnly = harness({ handler: call => call.url.pathname.endsWith('/instruments') ? [rule(call.parameters.instId, { state: 'post_only' })] : undefined });
+  await assert.rejects(postOnly.client.create(credentials, market), error => isExecutionError('rejected')(error) && /不支持市价单/.test(error.message));
+  const malformed = harness({ handler: call => call.url.pathname.endsWith('/instruments') ? [rule(call.parameters.instId, { maxMktSz: 'abc' })] : undefined });
+  // A malformed market cap disables market legs only; chase legs keep their rule.
+  assert.equal((await malformed.client.market('CLUSDT')).rule.maxMarketQuantity, null);
+  await assert.rejects(malformed.client.create(credentials, market), isExecutionError('rejected'));
+  await malformed.client.create(credentials, spec);
+  assert.equal(mutations(large.calls).length + mutations(postOnly.calls).length, 0);
+  assert.equal(mutations(malformed.calls).length, 1);
+  // Exceeding the exchange market-order amount cap is a definite rejection, not an unknown outcome.
+  const capped = harness({ handler: call => call.init.method === 'POST' ? response({ code: '1', data: [{ sCode: '51202' }] }) : undefined });
+  await assert.rejects(capped.client.create(credentials, market), error => isExecutionError('rejected')(error) && !error.uncertain);
+});
+
+test('OKX chase legs without a limit still post at the same-side best price', async () => {
+  const h = harness();
+  await h.client.create(credentials, { ...spec, stopPrice: null });
+  const sent = mutations(h.calls)[0].parameters;
+  assert.deepEqual([sent.ordType, sent.px, sent.pxAmendType], ['post_only', '80', '0']);
 });

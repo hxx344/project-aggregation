@@ -12,13 +12,18 @@ export type ExecutionConnection = {
 export type ExecutionPosition = {
   exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string; fetchedAt: string;
 };
+/** chase: passive limit order that follows the book; market: one taker order per batch. */
+export type ExecutionOrderType = 'chase' | 'market';
 export type ExecutionLegInput = {
-  exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string; stopPrice: string;
+  exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string;
+  orderType: ExecutionOrderType;
+  /** Chase limit; null = follow the book without a limit. Always null for market legs. */
+  stopPrice: string | null;
 };
 /** With equalSize the server sizes every leg: oil in barrels, SK hynix in USDT notional. */
 export type ExecutionPlanInput = {
   market: ExecutionMarket; preset: ExecutionPreset; action: ExecutionAction;
-  legs: (Omit<ExecutionLegInput, 'quantity'> & { quantity?: string })[]; equalSize?: string;
+  legs: (Omit<ExecutionLegInput, 'quantity' | 'stopPrice'> & { quantity?: string; stopPrice?: string })[]; equalSize?: string;
   batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
 };
 export type ExecutionPreviewLeg = ExecutionLegInput & {
