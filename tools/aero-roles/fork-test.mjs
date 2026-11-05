@@ -11,7 +11,7 @@ import { AERO, ROLES, SAFE } from './addresses.mjs';
 import { verifyOnChain } from './cli.mjs';
 import { buildPermissions } from './permissions.mjs';
 import { accruedAllowance, checkTransactions } from './policy.mjs';
-import { GUARD_SLOT, MODULES_SENTINEL, ROLES_ABI, SAFE_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress, prevalidatedSignature, toTransactionBuilderJson } from './roles-calls.mjs';
+import { GUARD_SLOT, MODULE_GUARD_SLOT, MODULES_SENTINEL, ROLES_ABI, SAFE_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress, prevalidatedSignature, toTransactionBuilderJson } from './roles-calls.mjs';
 
 const opts = Object.fromEntries(process.argv.slice(2).reduce((acc, v, i, all) => (i % 2 === 0 ? [...acc, [v.replace(/^--/, ''), all[i + 1]]] : acc), []));
 const FORK_URL = opts['fork-url'] ?? 'https://mainnet.base.org';
@@ -32,7 +32,7 @@ const RSGP = '0x44B63aF715D5ef02CC3646a6CE96875e11d69E85';
 const AERO_TOKEN = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee';
 const RSGP_POOL = getAddress('0x8e859b6cf564c4ac2b848693c85c496e81dbf6c8');
 const AERO_USDC_POOL = '0xD0Acf293547457Fb4fE9eE32CA93e89497626816';
-const SAFE_141_NON_L2 = '0x41675C099F32341bf84BFc5382aF534df5C7461a'; // Safe 1.4.1 非 L2 singleton
+const SAFE_NON_L2 = '0xFf51A5898e281Db6DfC7855790607438dF2ca44b'; // Safe 1.5.0 非 L2 singleton（safe-deployments 规范地址）
 const GAUGE = getAddress(config.pools[0].gauge);
 const GAUGE2 = getAddress(config.pools[1].gauge);
 
@@ -138,8 +138,10 @@ async function run(rpc) {
   const tamper = async (name, pattern, change, restore) => { await change(); try { await planCase(name, { safe, roles }, pattern); } finally { await restore(); } };
   await tamper('plan 拒绝设置了 guard 的 Safe', /设置了 guard/,
     () => rpc.send('anvil_setStorageAt', [safe, GUARD_SLOT, word(outsider.address)]), () => rpc.send('anvil_setStorageAt', [safe, GUARD_SLOT, word(ZeroAddress)]));
-  await tamper('plan 拒绝 singleton 不是 SafeL2 的 Safe（非 L2 版 1.4.1）', /不是 v1\.4\.1 SafeL2/,
-    () => rpc.send('anvil_setStorageAt', [safe, '0x0', word(SAFE_141_NON_L2)]), () => rpc.send('anvil_setStorageAt', [safe, '0x0', word(SAFE.singletonL2)]));
+  await tamper('plan 拒绝设置了 module guard 的 Safe', /设置了 module guard/,
+    () => rpc.send('anvil_setStorageAt', [safe, MODULE_GUARD_SLOT, word(outsider.address)]), () => rpc.send('anvil_setStorageAt', [safe, MODULE_GUARD_SLOT, word(ZeroAddress)]));
+  await tamper(`plan 拒绝 singleton 不是 SafeL2 的 Safe（非 L2 版 ${SAFE.version}）`, /不是 v1\.5\.0 SafeL2/,
+    () => rpc.send('anvil_setStorageAt', [safe, '0x0', word(SAFE_NON_L2)]), () => rpc.send('anvil_setStorageAt', [safe, '0x0', word(SAFE.singletonL2)]));
   const proxyCode = await rpc.getCode(safe);
   await tamper('plan 拒绝非标准代理（字节码多 1 字节，读数照常）', /标准 SafeProxy/,
     () => rpc.send('anvil_setCode', [safe, proxyCode + '00']), () => rpc.send('anvil_setCode', [safe, proxyCode]));

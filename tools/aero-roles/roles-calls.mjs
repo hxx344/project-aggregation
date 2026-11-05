@@ -34,6 +34,8 @@ const MULTISEND_ABI = new Interface(['function multiSend(bytes transactions)']);
 export const FALLBACK_HANDLER_SLOT = '0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5';
 // Safe 的 guard 存储槽：keccak256("guard_manager.guard.address")。
 export const GUARD_SLOT = '0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8';
+// keccak256("module_manager.module_guard.address")：v1.5.0 新增，能拦截模块（Roles）发起的交易。
+export const MODULE_GUARD_SLOT = '0xb104e0b93118902c651344349b610029d694cfdec91c589c91ebafbcd0289947';
 export const MODULES_SENTINEL = '0x0000000000000000000000000000000000000001';
 
 export function rolesInitializer(safe) {

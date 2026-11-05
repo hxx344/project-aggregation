@@ -1,6 +1,6 @@
 # Aero 市场实盘：Safe + Zodiac Roles 权限清单（v0.2）
 
-日期：2026-11-04　状态：首版工具已实现（`tools/aero-roles/`），Base fork 验收 71/71 通过（第 8 节）；未在主网部署，工作台执行器尚未接入（第 9 节）。
+日期：2026-11-04　状态：首版工具已实现（`tools/aero-roles/`），Base fork 验收 72/72 通过（第 8 节）；Safe 版本为 v1.5.0（Safe{Wallet} 在 Base 上新建的版本，不能选旧版）；未在主网部署，工作台执行器尚未接入（第 9 节）。
 
 v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版不授权 `increaseLiquidity`；Safe 必须设置 CompatibilityFallbackHandler；额度键与部署步骤改为 `tools/aero-roles` 的实际实现。
 
@@ -37,9 +37,10 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 | 合约 | 地址 | 核实 |
 | --- | --- | --- |
-| SafeL2 v1.4.1 singleton | `0x29fcB43b46531BcA003ddC8FCB67FFE91900C762` | 链（safe-deployments 规范地址，源未在本次重读） |
-| SafeProxyFactory v1.4.1 | `0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67` | 链（同上） |
-| MultiSendCallOnly v1.4.1 | `0x9641d764fc13c8B624c04430C7356C1C7C8102e2` | 链、选择器 `multiSend(bytes)` |
+| SafeL2 v1.5.0 singleton | `0xEdd160fEBBD92E350D4D398fb636302fccd67C7e` | 源 `safe-global/safe-deployments` v1.5.0（Base 为 canonical）、链（codehash 与源记录一致） |
+| SafeProxyFactory v1.5.0 | `0x14F2982D601c9458F93bd70B218933A6f8165e7b` | 同上 |
+| MultiSendCallOnly v1.5.0 | `0xA83c336B20401Af773B6219BA5027174338D1836` | 同上，选择器 `multiSend(bytes)` |
+| CompatibilityFallbackHandler v1.5.0 | `0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4` | 同上 |
 | Zodiac ModuleProxyFactory | `0x000000000000aDdB49795b0f9bA5BC298cDda236` | 链（部署前对照 Zodiac 文档再核一次） |
 | Roles v2 mastercopy | `0xF2964CE6161ce0e75964Fe7927cE114cb0B283D5` | 源 `zodiaceco/zodiac-modifier-roles-v2` README（Base 在列）、链、选择器 |
 | Roles Integrity / Packer 库 | `0x6a6Af4b16458Bc39817e4019fB02BD3b26d41049` / `0x869718c939652084bc491fbc5ce0d3c1d5b309f0` | 源、链 |
@@ -153,7 +154,7 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 ## 7. 管理钱包操作（只由 Safe owner 签）
 
-- 部署：在 Safe{Wallet} 用硬件钱包创建 1/1 Safe（v1.4.1，界面默认带 CompatibilityFallbackHandler；gauge 解押用 `safeTransferFrom` 退回 NFT，没有 handler 时解押会失败）→ `node tools/aero-roles/cli.mjs plan` 链上核对并生成 Transaction Builder 批次 → 管理钱包在 Safe 界面导入、核对、签名。批次一笔完成：经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 下发 scope 与额度 → `assignRoles(bot, [roleKey], [true])`。权限与额度由 `tools/aero-roles/permissions.mjs` 从配置 JSON 生成，不依赖 `zodiac-roles-sdk`；之后改池或额度另生成差异批次（尚未实现）。
+- 部署：在 Safe{Wallet} 用硬件钱包创建 1/1 Safe（v1.5.0 L2，选 Pay now 立即部署；界面默认带 CompatibilityFallbackHandler；gauge 解押用 `safeTransferFrom` 退回 NFT，没有 handler 时解押会失败）→ `node tools/aero-roles/cli.mjs plan` 链上核对并生成 Transaction Builder 批次 → 管理钱包在 Safe 界面导入、核对、签名。批次一笔完成：经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 下发 scope 与额度 → `assignRoles(bot, [roleKey], [true])`。权限与额度由 `tools/aero-roles/permissions.mjs` 从配置 JSON 生成，不依赖 `zodiac-roles-sdk`；之后改池或额度另生成差异批次（尚未实现）。
 - 日常：加删池子、调额度、从 Safe 直接提走利润或本金。
 - 紧急停止：`assignRoles(bot, [roleKey], [false])`，或 `disableModule(Roles)`，一笔交易生效，不依赖服务器；必要时再撤销代币授权。
 - 换 bot 私钥：先给新地址分配角色，再撤销旧地址。
@@ -170,15 +171,15 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 - 非白名单池的 `mint` / swap；`sqrtPriceX96 ≠ 0`；超额度；`value > 0`；delegatecall 到 MultiSend 以外的地址；MultiSend 内层 delegatecall。
 - 撤销角色后，bot 的任意调用。
 
-结果（2026-11-04，Base 区块 53533394，`node tools/aero-roles/fork-test.mjs`，anvil 只监听 127.0.0.1）：71/71 通过。
+结果（2026-11-04，Base 区块 53534429，`node tools/aero-roles/fork-test.mjs`，anvil 只监听 127.0.0.1，Safe 由 v1.5.0 工厂创建）：72/72 通过。
 - 配置为示例池 RSGP/USDC ts100 再加 AERO/USDC ts200，`mint` 与 `NPM.approve` 的条件是两分支 `Or`，两个分支都在链上执行过；另加只用于兑换的 WETH→USDC，WETH 只能授权给 Router，授权给 NPM 被拒（`ParameterNotAllowed`）。
-- `plan` 通过真实 Safe 的核对，并拒绝：没有 fallback handler、owner 不是指定硬件钱包、已启用其他模块、设置了 guard、singleton 不是 SafeL2、代理字节码非标准、固定合约字节码被替换（后四项在分叉上改状态模拟，改完复原后 `plan` 再次通过）。`factory.getPool` 与 `gauge.pool()` 不一致的拒绝路径没有分叉用例。
+- `plan` 通过真实 Safe 的核对，并拒绝：没有 fallback handler、owner 不是指定硬件钱包、已启用其他模块、设置了 guard 或 module guard（v1.5.0 新增，可拦截模块交易）、singleton 不是 SafeL2、代理字节码非标准、固定合约字节码被替换（后五项在分叉上改状态模拟，改完复原后 `plan` 再次通过）。另对用户在 Safe{Wallet} 建出的真实 1.5.0 Safe 只读运行 `plan`，核对全部通过。`factory.getPool` 与 `gauge.pool()` 不一致的拒绝路径没有分叉用例。
 - 额度：多分支 `Or` 下链上只报 `OrViolation`，超额用例另断言本地在第几笔、因超额拒绝；同批两笔 300 USDC 合计超额前先模拟证明单笔 300 能通过。`Or` 分支扣额度后失败的回滚、同一笔内同一额度用两次、嵌套 `Matches` 的累计由单元测试覆盖。
 - 部署批次经 MultiSendCallOnly 一次执行；Roles 实际地址与 `plan` 预测一致。
 - 上列正向流程全部成功（两个池各开一仓、质押、两种 `claimEmissions`、解押、同批平两仓、AERO→USDC）；`mint` 按 `amount1Desired` 扣减额度；`claimEmissions` 到账的是 AERO。
 - 上列反向用例与额外用例（非成员地址、Safe / Roles 自身函数、MultiSend 夹带禁止调用、同批两笔 mint 合计超额、已质押 tokenId 的 `decreaseLiquidity`、`claimReferralEmissions`、3 参数 `claimEmissions` 的外部 recipient）全部由 Roles 以写明的期望原因拒绝（`ConditionViolation` 的具体 status / `NoMembership` / `NotAuthorized`），不是下游合约自身失败；本地签名前校验对每个用例的结论与链上一致。
 - 发现：经 Roles 执行兑换时，按 gas 估算值原样发送曾在链上 revert，加 30% 余量后通过（原因未确认）；执行器需给 gas 留余量。
-- 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测（含 Safe{Wallet} 在 Base 上能否建 1.4.1 版本）、链上额度跨日补充（本地折算公式有单元测试）。
+- 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测、链上额度跨日补充（本地折算公式有单元测试）。
 - 登记（不影响安全）：calldata 里 int24 / uint160 带高位脏位时，本地按规范化值放行、链上按原始字比较拒绝；`plan` 只用一个 RPC，多 RPC 交叉核对由人工换 RPC 重跑。
 
 ## 9. 工作台侧改动（实施时另立任务）

@@ -3,11 +3,13 @@
 // gauge 与代币地址来自配置，plan 靠 RPC 读回的字节码与关联读数判断真伪，所以 plan 必须用可信 RPC。
 export const BASE_CHAIN_ID = 8453;
 
+// Safe{Wallet} 目前在 Base 上新建的是 v1.5.0（L2），不能选旧版本；地址为 safe-deployments v1.5.0 规范部署。
 export const SAFE = {
-  singletonL2: '0x29fcB43b46531BcA003ddC8FCB67FFE91900C762',
-  proxyFactory: '0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67',
-  multiSendCallOnly: '0x9641d764fc13c8B624c04430C7356C1C7C8102e2',
-  fallbackHandler: '0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99',
+  version: '1.5.0',
+  singletonL2: '0xEdd160fEBBD92E350D4D398fb636302fccd67C7e',
+  proxyFactory: '0x14F2982D601c9458F93bd70B218933A6f8165e7b',
+  multiSendCallOnly: '0xA83c336B20401Af773B6219BA5027174338D1836',
+  fallbackHandler: '0x3EfCBb83A4A7AfcB4F68D501E2c2203a38be77f4',
 };
 
 export const ROLES = {
@@ -28,12 +30,12 @@ export const AERO = {
 
 export const MULTISEND_SELECTOR = '0x8d80ff0a';
 
-// 运行时字节码哈希：2026-11-04 由 mainnet.base.org 与 base-rpc.publicnode.com 分别读取，结果一致。plan 逐个核对。
+// 运行时字节码哈希：2026-11-04 由 mainnet.base.org 与 base-rpc.publicnode.com 分别读取，结果一致；Safe 四项另与 safe-deployments 记录的 codeHash 一致。plan 逐个核对。
 // 均非可升级代理，钉的是不可变代码；不覆盖治理可改参数，代币（USDC 为可升级代理）不在此列（文档第 2 节）。
 export const CODEHASH = {
-  [SAFE.singletonL2]: '0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff',
-  [SAFE.multiSendCallOnly]: '0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939',
-  [SAFE.fallbackHandler]: '0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9',
+  [SAFE.singletonL2]: '0x180193227186ccb85316c94db1f0d156ed932b14712cfaac78901899178572dc',
+  [SAFE.multiSendCallOnly]: '0xcdbdcec38d2f1c7d961b0029ff8416b7e86e9974d6f0e9c9580c7d17fcfb6663',
+  [SAFE.fallbackHandler]: '0x3c6a85bcf7b563daa624b884b4e9a1b9fa5371edde7be945d998071a48f28bbc',
   [ROLES.mastercopy]: '0x471d8b3b419f1eb955230c0326c8812176df49bf3c7b414a563fda5a3c6c10b6',
   [ROLES.moduleProxyFactory]: '0x01623cbcf010a1c326230f1b2d5f48a66b440232ee49096102bc84967dc5f21e',
   [ROLES.multiSendUnwrapper]: '0x1f6e088be5e6ef9d0fbe0547d3fa9a9e40d823433fd8a4449215b5663209a1eb',
@@ -45,6 +47,6 @@ export const CODEHASH = {
   [AERO.gaugeImplementation]: '0xfdb516e0cf5b1c3f42789c4d7607a16e16b0ae5e73894e21e52a29c93b1ecee3',
 };
 
-// SafeProxy 1.4.1 的运行时代码与 singleton 无关（singleton 存在槽 0），所有 Safe 相同；171 字节。
-// 由 proxyFactory.proxyCreationCode() + singleton 参数做一次创建 eth_call 取得，两个 RPC 结果一致。
-export const SAFE_PROXY_CODEHASH = '0xd7d408ebcd99b2b70be43e20253d6d92a8ea8fab29bd3be7f55b10032331fb4c';
+// SafeProxy 1.5.0 的运行时代码与 singleton 无关（singleton 存在槽 0），所有 Safe 相同；123 字节。
+// 由 proxyFactory.proxyCreationCode() + singleton 参数做一次创建 eth_call 取得，两个 RPC 结果一致，与 Safe{Wallet} 实际建出的 Safe 相同。
+export const SAFE_PROXY_CODEHASH = '0x4e381985ca68b3e5d27b4425fa581c19cf33146d3f887a3cfca96f55528ea46f';
