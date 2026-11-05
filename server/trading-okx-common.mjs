@@ -103,7 +103,7 @@ export function validateConfig(row, { execution = false } = {}) {
   if (permissions.length !== allowed.length || new Set(permissions).size !== allowed.length
     || allowed.some(value => !permissions.includes(value))) {
     const names = { read_only: '读取', trade: '交易', withdraw: '提现' };
-    const label = value => names[value] ?? value;
+    const label = value => Object.hasOwn(names, value) ? names[value] : value.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 64);
     const missing = allowed.filter(value => !permissions.includes(value));
     const extra = [...new Set(permissions)].filter(value => value && !allowed.includes(value));
     const parts = [];

@@ -118,23 +118,31 @@ function fail(code = 'invalid_data', details) { throw new ExecutionExchangeError
  * account mode may be on; every other enable/permits flag must be false.
  */
 function binancePermissionProblem(info, mode) {
-  const label = name => BINANCE_PERMISSION_LABELS[name] ?? name;
+  const label = name => labelOf(BINANCE_PERMISSION_LABELS, name);
   const portfolio = mode === 'portfolio-margin';
-  if (portfolio && info.enableFutures === true && info.enablePortfolioMarginTrading !== true) return '密钥为普通合约密钥，请将账户模式改为「普通 U 本位」，或在组合保证金账户下新建开启统一账户交易的密钥';
-  if (!portfolio && info.enablePortfolioMarginTrading === true) return '密钥已开启统一账户交易，请将账户模式改为「组合保证金（Portfolio Margin）」';
-  const required = ['enableReading', portfolio ? 'enablePortfolioMarginTrading' : 'enableFutures'];
+  const parts = [];
+  // A key for the other account mode is reported as a mode problem, so the
+  // remaining checks do not also ask to toggle that mode's trading permission.
+  let mismatch = true;
+  if (portfolio && info.enableFutures === true && info.enablePortfolioMarginTrading !== true) parts.push('密钥为普通合约密钥，请将账户模式改为「普通 U 本位」，或在组合保证金账户下新建开启统一账户交易的密钥');
+  else if (!portfolio && info.enablePortfolioMarginTrading === true) parts.push('密钥已开启统一账户交易，请将账户模式改为「组合保证金（Portfolio Margin）」');
+  else mismatch = false;
+  const required = mismatch ? ['enableReading'] : ['enableReading', portfolio ? 'enablePortfolioMarginTrading' : 'enableFutures'];
   const missing = required.filter(name => info[name] !== true);
   const unknown = [...BINANCE_RISKY_PERMISSIONS, 'enableFutures'].filter(name => typeof info[name] !== 'boolean');
   const enabled = Object.entries(info)
     .filter(([name, value]) => /^(?:enable|permits)/.test(name) && !BINANCE_ALLOWED_PERMISSIONS.includes(name) && value !== false)
     .map(([name]) => name);
-  if (!portfolio && Object.hasOwn(info, 'enablePortfolioMarginTrading') && info.enablePortfolioMarginTrading !== false) enabled.push('enablePortfolioMarginTrading');
-  const parts = [];
+  if (!portfolio && !mismatch && Object.hasOwn(info, 'enablePortfolioMarginTrading') && info.enablePortfolioMarginTrading !== false) enabled.push('enablePortfolioMarginTrading');
   if (missing.length) parts.push(`请开启：${missing.map(label).join('、')}`);
   const toClose = enabled.filter(name => !unknown.includes(name));
   if (toClose.length) parts.push(`请关闭：${toClose.map(label).join('、')}`);
   if (unknown.length) parts.push(`Binance 未返回权限状态：${unknown.map(label).join('、')}`);
   return parts.length ? parts.join('；') : null;
+}
+/** Exchange-supplied names reach the UI only as short printable text. */
+function labelOf(labels, name) {
+  return Object.hasOwn(labels, name) ? labels[name] : String(name).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 64);
 }
 function object(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function requireObject(value) { if (!object(value)) fail(); return value; }
@@ -449,7 +457,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (!Array.isArray(values) || values.some(value => typeof value !== 'string')) fail('permissions', { detail: 'Bybit 权限清单格式无效' });
       const allowed = name === 'ContractTrade' ? ['Order', 'Position'] : name === 'Derivatives' ? ['DerivativesTrade'] : [];
       const extra = values.filter(value => !allowed.includes(value));
-      if (extra.length) fail('permissions', { detail: `请关闭：${BYBIT_SCOPE_LABELS[name] ?? name} - ${extra.join('、')}` });
+      if (extra.length) fail('permissions', { detail: `请关闭：${labelOf(BYBIT_SCOPE_LABELS, name)} - ${extra.map(value => labelOf({}, value)).join('、')}` });
     }
     const identity = identifier(info.userID);
     const config = requireObject(await request('config', credentials, {}, options));
