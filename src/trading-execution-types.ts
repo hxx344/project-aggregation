@@ -48,6 +48,8 @@ export type ExecutionJob = {
   status: 'queued' | 'running' | 'stopping' | 'paused' | 'attention' | 'completed' | 'stopped';
   createdAt: string; updatedAt: string; deadlineAt: string; batchIndex: number; batchCount: number;
   reason: string | null; canResume: boolean;
+  /** Set when an automatic threshold rule created the job. */
+  auto?: { ruleId: string; action: ExecutionAction; unsent?: true };
   legs: (ExecutionLegInput & {
     id: string; orderSide: 'buy' | 'sell'; filledQuantity: string; remainingQuantity: string;
     currentOrder: ExecutionOrder | null;
@@ -61,3 +63,24 @@ export type ExecutionState = {
 /** One top-of-book read; a failed read carries only `error`. */
 export type ExecutionQuoteBook = { exchange: TradingExchange; symbol: ExecutionSymbol; bid?: string; ask?: string; at?: string; error?: string };
 export type ExecutionQuotes = { generatedAt: string; maxAgeMs: number; books: ExecutionQuoteBook[] };
+
+export type AutoMarket = ExecutionMarket;
+export type AutoDirection = 'short' | 'long';
+export type AutoPhase = 'idle' | 'opening' | 'holding' | 'closing' | 'review';
+export type AutoRuleConfig = {
+  name: string; market: AutoMarket; exchange: TradingExchange; direction: AutoDirection;
+  /** Oil: BZ − CL in USDT per barrel. SK hynix: ADR premium over ordinary ÷ 10 in percent. */
+  openThreshold: string; closeThreshold: string; equalSize: string; orderType: ExecutionOrderType;
+  confirmSamples: number; maxOpensPerDay: number; batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
+};
+export type AutoRule = {
+  id: string; revision: number; enabled: boolean; createdAt: string; title: string; config: AutoRuleConfig;
+  spread: { label: string; unit: string };
+  state: {
+    phase: AutoPhase; jobId: string | null; held: { exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string }[] | null;
+    opensToday: number; failures: number; retryAt: string | null; reason: string | null; events: { time: string; message: string }[];
+  };
+  /** In-memory reading of the next action's executable spread; null until the rule is checked. */
+  live: { hits: number; value: number | null; met: boolean; side: 'sell' | 'buy' | null; at: string | null; note: string | null } | null;
+};
+export type AutoState = { generatedAt: string; maintenance: boolean; rules: AutoRule[] };

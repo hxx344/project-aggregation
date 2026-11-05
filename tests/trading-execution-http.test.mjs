@@ -131,6 +131,53 @@ test('execution HTTP routes require a session, same Origin and CSRF; state GET p
   assert.equal(f.calls.length, 0); assert.equal(f.readOnlyCalls.length, 0);
 });
 
+test('automatic rule routes require a session, same Origin and CSRF, and saving a rule never touches an exchange', async t => {
+  const f = await fixture(t), rule = randomUUID(), AUTO = `${PREFIX}/auto`;
+  const config = { name: '', market: 'oil', exchange: 'binance', direction: 'short', openThreshold: '4', closeThreshold: '2', equalSize: '1', orderType: 'chase',
+    confirmSamples: 3, maxOpensPerDay: 3, batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300_000 };
+  const mutations = [[`${AUTO}/rules`, 'POST'], [`${AUTO}/rules/${rule}`, 'PUT'], [`${AUTO}/rules/${rule}`, 'DELETE'],
+    [`${AUTO}/rules/${rule}/enable`, 'POST'], [`${AUTO}/rules/${rule}/disable`, 'POST'], [`${AUTO}/rules/${rule}/reset`, 'POST']];
+  for (const [route, method] of [[AUTO, 'GET'], ...mutations]) assert.equal((await f.request(route, { method, ...(method === 'GET' ? {} : { body: {} }) })).status, 401);
+  await f.login();
+  for (const [route, method] of mutations) {
+    assert.equal((await f.request(route, { method, body: {}, originHeader: 'https://other.example' })).status, 403);
+    assert.equal((await f.request(route, { method, body: {}, csrfHeader: '' })).status, 403);
+  }
+  assert.equal((await f.request(`${AUTO}/rules`, { method: 'POST', body: { config, enabled: true } })).status, 400, 'enabling needs explicit live confirmation');
+  const created = await f.request(`${AUTO}/rules`, { method: 'POST', body: { config } });
+  assert.equal(created.status, 201); assert.equal(created.data.rules.length, 1);
+  const saved = created.data.rules[0];
+  assert.equal(saved.enabled, false); assert.equal(saved.state.phase, 'idle');
+  assert.equal((await f.request(`${AUTO}/rules/${saved.id}/enable`, { method: 'POST', body: { revision: saved.revision } })).status, 400);
+  const enabled = await f.request(`${AUTO}/rules/${saved.id}/enable`, { method: 'POST', body: { revision: saved.revision, confirmLive: true } });
+  assert.equal(enabled.status, 200); assert.equal(enabled.data.rules[0].enabled, true);
+  assert.equal((await f.request(`${AUTO}/rules/${saved.id}/enable`, { method: 'POST', body: { revision: saved.revision, confirmLive: true } })).status, 409, 'stale revision');
+  assert.equal((await f.request(`${AUTO}/rules/${saved.id}/pause`, { method: 'POST', body: {} })).status, 404);
+  const disabled = await f.request(`${AUTO}/rules/${saved.id}/disable`, { method: 'POST', body: { revision: enabled.data.rules[0].revision } });
+  assert.equal(disabled.status, 200);
+  const removed = await f.request(`${AUTO}/rules/${saved.id}`, { method: 'DELETE', body: { revision: disabled.data.rules[0].revision } });
+  assert.equal(removed.status, 200); assert.deepEqual(removed.data.rules, []);
+  const state = await f.request(AUTO);
+  assert.equal(state.status, 200); assert.equal(state.headers.get('cache-control'), 'no-store'); assert.equal(state.data.maintenance, false);
+  assert.equal(f.calls.length, 0);
+});
+test('logout while an automatic rule body is still arriving saves nothing', async t => {
+  const f = await fixture(t), session = await f.login();
+  const origin = `http://127.0.0.1:${f.app.server.address().port}`, encoder = new TextEncoder();
+  const body = JSON.stringify({ config: { name: '', market: 'oil', exchange: 'binance', direction: 'short', openThreshold: '4', closeThreshold: '2', equalSize: '1', orderType: 'chase',
+    confirmSamples: 3, maxOpensPerDay: 3, batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300_000 }, enabled: true, confirmLive: true });
+  let controller;
+  const stream = new ReadableStream({ start(value) { controller = value; } });
+  const pending = fetch(`${origin}${PREFIX}/auto/rules`, { method: 'POST', duplex: 'half', body: stream,
+    headers: { Cookie: session.cookie, Origin: origin, 'X-CSRF-Token': session.csrf, 'Content-Type': 'application/json' } });
+  controller.enqueue(encoder.encode(body.slice(0, 12)));
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal((await f.request('/api/logout', { method: 'POST' })).status, 200);
+  controller.enqueue(encoder.encode(body.slice(12))); controller.close();
+  const response = await pending;
+  assert.equal(response.status, 401);
+  assert.equal(f.rows('SELECT * FROM execution_auto_rules').length, 0);
+});
 test('OKX execution connection requires a Passphrase, persists isolated mode and hides all credentials', async t => {
   const f = await fixture(t); await f.login();
   const live = { ...credentials('okx_exec'), passphrase: 'private_http_okx_passphrase' };

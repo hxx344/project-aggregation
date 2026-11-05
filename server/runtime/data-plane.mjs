@@ -9,6 +9,7 @@ import { createTradingImporter } from '../trading-import.mjs';
 import { createAssetPositions } from '../asset-positions.mjs';
 import { createAssetFills, ASSET_FILLS_BACKGROUND_MS, FILL_MARKETS } from '../asset-fills.mjs';
 import { createTradingExecution } from '../trading-execution.mjs';
+import { createTradingAuto } from '../trading-auto.mjs';
 import { ExecutionError } from '../trading-execution-plan.mjs';
 import { normalizeTradingPair } from '../trading-markets.mjs';
 import { UpdateError } from '../updates.mjs';
@@ -73,6 +74,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const sharedAccountWriter = accountWriter || (embeddedModules || existsSync(writerDatabase) || existsSync(`${writerDatabase}.required`) ? createAccountWriter({ databasePath: writerDatabase, runtimeId: randomUUID(), moduleId: 'hub' }) : null);
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
   const executionEntries = createExecutionEntries({ db, log, readMaintenance: () => control.getSetting('updates-maintenance') === '1', refuse: () => { throw new UpdateError(409, EXECUTION_MAINTENANCE); } });
+  // Automatic rules create jobs through the same maintenance entry as a manual start.
+  const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   // Overview subscribers; wants() lets an in-process subscriber skip the projection while nobody listens.
   const subscribers = new Set();
@@ -399,6 +402,14 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
         return reply(200, data);
       }
+      if (pathname === '/api/trading/execution/auto' && method === 'GET') return reply(200, executionAuto.state());
+      // A logout while the body was arriving must not save or enable a rule.
+      const signedBody = async () => { const body = await bodyOf(); if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台'); return body; };
+      if (pathname === '/api/trading/execution/auto/rules' && method === 'POST') return reply(201, executionAuto.create(await signedBody()));
+      const autoRule = pathname.match(/^\/api\/trading\/execution\/auto\/rules\/([0-9a-f-]{36})(?:\/(enable|disable|reset))?$/);
+      if (autoRule && !autoRule[2] && method === 'PUT') return reply(200, executionAuto.update(autoRule[1], await signedBody()));
+      if (autoRule && !autoRule[2] && method === 'DELETE') return reply(200, executionAuto.remove(autoRule[1], await signedBody()));
+      if (autoRule && autoRule[2] && method === 'POST') return reply(200, executionAuto.act(autoRule[1], autoRule[2], await signedBody()));
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
       const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
       if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));
@@ -469,7 +480,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // All collectors, WS feeds and research share this process's single thread.
   const eventLoop = createEventLoopLag(); eventLoop.start();
 
-  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); }
+  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); executionAuto.stop(); }
   return {
     trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle,
     get baseline() { return baseline; },
@@ -490,6 +501,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }
