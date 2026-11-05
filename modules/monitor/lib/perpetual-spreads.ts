@@ -60,6 +60,8 @@ const compareLegs = (leftLong: PerpetualQuote, leftShort: PerpetualQuote, rightL
 
 /** Funding rates older than this leave funding metrics and sorting. */
 export const PERPETUAL_FUNDING_MAX_AGE_MS = 300_000;
+/** Maximum price-time difference between the two legs of a ranked pair. */
+export const PERPETUAL_LEG_SKEW_MS = 5_000;
 
 export function quotePriceTime(quote: PerpetualQuote, mode: PerpetualPriceMode): number {
   const priceTime = mode === "book" ? quote.bidAskAt : quote.markAt;
@@ -140,7 +142,7 @@ function rankingContext(snapshot: PerpetualSnapshot, filters: PerpetualFilters, 
       for (const shortLeg of quotes) {
         const short = shortLeg.quote;
         if (!compatiblePair(longLeg.venue, shortLeg.venue, filters.pairMode)) continue;
-        if (Math.abs(longLeg.time - shortLeg.time) > 5_000) continue;
+        if (Math.abs(longLeg.time - shortLeg.time) > PERPETUAL_LEG_SKEW_MS) continue;
         const crossCurrency = long.quoteCurrency !== short.quoteCurrency;
         if (crossCurrency && (!filters.crossCurrency || !stableQuotes.has(long.quoteCurrency) || !stableQuotes.has(short.quoteCurrency))) continue;
         const sellPrice = shortLeg.sell;
