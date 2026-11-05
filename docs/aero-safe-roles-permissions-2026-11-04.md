@@ -188,7 +188,7 @@ v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 R
 
 - 执行器：交易改为经 Roles 代理以 Safe 名义执行；签名前本地校验保留，与 Roles 配置读同一份白名单 JSON，作为第二道防线。批量调用必须用 `addresses.mjs` 的 `SAFE.multiSendCallOnly`（拆包器只注册在这个地址上）；SDK 默认的 MultiSend 可能是别的版本，用了会被 Roles 全部拒绝。
 - 读取：持仓、质押、余额、估值改按 Safe 地址（`tokenOfOwnerByIndex(Safe)`、`gauge.stakedValues(Safe)`）。
-- 监控：独立只读进程监听 Safe 的出账和 Roles 配置事件，非预期变化发飞书。`plan` 只在部署时核对一次 Safe 状态，之后的变化靠监控：至少监听 `EnabledModule`、`ChangedGuard`、`ChangedModuleGuard`（v1.5.0 新增）、`ChangedFallbackHandler`、`AddedOwner`、`ChangedThreshold`。Safe{Wallet} 的部分功能（如 TWAP）可能把 fallback handler 换成 ExtensibleFallbackHandler，需要 owner 签名，但属于部署后的状态漂移。
+- 监控：独立只读进程监听 Safe 的出账和 Roles 配置事件，非预期变化发飞书。`plan` 只在部署时核对一次 Safe 状态，之后的变化靠监控：Safe 至少监听 `EnabledModule`、`DisabledModule`（Roles 被移除只会停摆，不会失窃）、`ChangedGuard`、`ChangedModuleGuard`（v1.5.0 新增）、`ChangedFallbackHandler`、`AddedOwner`、`RemovedOwner`、`ChangedThreshold`；Roles 代理至少监听 `OwnershipTransferred`、`AvatarSet`、`TargetSet`、`EnabledModule` / `DisabledModule`（Roles 自身的模块列表）、`SetUnwrapAdapter`、`SetDefaultRole`、`AssignRoles`，以及范围与额度变更（`ScopeTarget`、`AllowTarget`、`RevokeTarget`、`ScopeFunction`、`AllowFunction`、`RevokeFunction`、`SetAllowance`）；事件名按 Sourcify 验证的 mastercopy ABI 核对。Safe{Wallet} 的部分功能（如 TWAP）可能把 fallback handler 换成 ExtensibleFallbackHandler，需要 owner 签名，但属于部署后的状态漂移。
 - 工作台只保存 bot 私钥和 Safe / Roles 地址，管理钱包私钥不录入。
 
 ## 10. 待决策
