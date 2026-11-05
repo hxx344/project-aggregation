@@ -135,19 +135,22 @@ test('resolvePending confirms by hash, rebroadcasts while the nonce is open and 
   // After two replacements the earliest one can still be the one that was mined.
   assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6, receipts: { [first.hash]: original } })), pending), { state: 'dropped', replaced: first, replacedReceipt: original });
   assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6 })), { ...pending, replaces: [] }), { state: 'dropped', replaced: null, replacedReceipt: null });
+  // A record written before the chain format (a single object) still resolves.
+  assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6, receipts: { [first.hash]: original } })), { ...pending, replaces: first }), { state: 'dropped', replaced: first, replacedReceipt: original });
 });
 
 test('opening stops when the balances or the rebalance swap moved away from the confirmed preview', () => {
-  const preview = { amount0: 10_000n, amount1: 5_000n, swap: { amountIn: 1_000n } };
-  assert.doesNotThrow(() => executor.checkExpectation(preview, { amount0: 10_050n, amount1: 5_000n, swapIn: 950n }));
-  assert.throws(() => executor.checkExpectation(preview, { amount0: 9_800n, amount1: 5_000n, swapIn: 1_000n }), /余额自预览后变化/);
-  assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 800n }), /配平兑换量超出预览/);
+  const preview = { amount0: 10_000n, amount1: 5_000n, swap: { tokenIn: USDC, amountIn: 1_000n } };
+  assert.doesNotThrow(() => executor.checkExpectation(preview, { amount0: 10_050n, amount1: 5_000n, swapIn: 950n, swapTokenIn: USDC }));
+  assert.throws(() => executor.checkExpectation(preview, { amount0: 9_800n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: USDC }), /余额自预览后变化/);
+  assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 800n, swapTokenIn: USDC }), /配平兑换量超出预览/);
   assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 0n }), /配平兑换量超出预览/);
-  assert.doesNotThrow(() => executor.checkExpectation({ ...preview, swap: null }, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n }));
+  assert.doesNotThrow(() => executor.checkExpectation({ ...preview, swap: null }, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: USDC }));
   // The price moved enough to flip the rebalance: amounts of different tokens are not comparable.
   const flipped = { ...preview, swap: { tokenIn: OTHER, amountIn: 900n } };
   assert.throws(() => executor.checkExpectation(flipped, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: USDC }), /方向已改变/);
   assert.doesNotThrow(() => executor.checkExpectation(flipped, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: OTHER }));
+  assert.throws(() => executor.checkExpectation(flipped, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: null }), /缺少配平兑换代币/);
 });
 
 test('openPosition checks the confirmed preview before anything is estimated or signed', async () => {
@@ -193,11 +196,11 @@ function fakeChain(overrides = {}) {
   return {
     calls, ExecError: executor.ExecError, REWARD_TOKEN: executor.REWARD_TOKEN,
     connect: async ({ signer }) => ({ signer, tokens: new Map([[USDC, { address: USDC, symbol: 'USDC', decimals: 6 }]]), now: Date.now }),
-    readState: async () => ({ blockNumber: 1, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {}, allowances: [], pools: [] }),
+    readState: overrides.readState ?? (async () => ({ blockNumber: 1, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {}, allowances: [], pools: [] })),
     resolvePending: overrides.resolvePending ?? (async () => ({ state: 'waiting' })),
     claimRewards: async (ctx, hooks) => { calls.push('claim'); await sign(ctx, hooks, '领取排放'); return { claimed: true }; },
     sellRewards: overrides.sellRewards ?? (async (_ctx, _hooks, options) => { calls.push(['sell', options.minAmount]); return { sold: false }; }),
-    openPosition: async (_ctx, _hooks, params) => { calls.push(['open', params.expect]); return {}; },
+    openPosition: overrides.openPosition ?? (async (_ctx, _hooks, params) => { calls.push(['open', params.expect]); return {}; }),
     swap: async (ctx, hooks, params) => { calls.push(['swap', params.amountIn]); await sign(ctx, hooks, '兑换'); return {}; },
     previewOpen: async () => ({ amount0: 1n }),
   };
@@ -393,6 +396,29 @@ test('a refresh that resolves the old transaction does not settle its same-nonce
     await until(() => manager.state().events.some((e) => e.event === 'tx_settled' && e.hash === old && e.status === 'confirmed'));
     assert.equal(manager.state().pending?.hash, replaced.pending.hash); // the replacement record is kept
   } finally { releaseRefresh(); releaseSign(); await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a minted position is remembered before staking, read on every refresh and dropped once burned', async () => {
+  const directory = fixtureDir();
+  const reads = [];
+  let burned = [];
+  const chain = fakeChain({
+    openPosition: async (_ctx, hooks) => { hooks.minted(77n); throw new executor.ExecError('质押：bot 的 ETH 不足以支付 gas', { code: 'gas' }); },
+    readState: async (_ctx, options) => { reads.push(options.knownIds.slice()); return { blockNumber: 1, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {}, allowances: [], pools: [], burnedIds: burned }; },
+  });
+  let clock = 30_000_000;
+  const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    const preview = await manager.preview({ pool: OTHER, tickLower: -100, tickUpper: 100 });
+    await manager.execute('open', { pool: OTHER, tickLower: -100, tickUpper: 100, expect: { previewedAt: preview.previewedAt, amount0: '1', amount1: '0' } });
+    await until(() => manager.state().job?.status === 'failed' && !manager.state().refreshing);
+    assert.deepEqual(JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids, ['77']); // kept although staking failed
+    assert.deepEqual(reads.at(-1), ['77']);
+    burned = [77n];
+    clock += 60_000; manager.refresh();
+    await until(() => JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids.length === 0);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
 test('update stop check refuses only while a running job waits on a signed transaction', async () => {

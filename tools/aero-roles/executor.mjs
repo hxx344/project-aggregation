@@ -224,12 +224,14 @@ export async function readState(ctx, { knownIds = [] } = {}) {
   const scanFrom = owned > BigInt(MAX_OWNED_SCAN) ? owned - BigInt(MAX_OWNED_SCAN) : 0n;
   for (let i = owned - 1n; i >= scanFrom; i--) ownedIds.push((await read('tokenOfOwnerByIndex', () => call(ctx.rpc, NPM_I, AERO.nft, 'tokenOfOwnerByIndex', [ctx.safe, i])))[0]);
   const scanned = ownedIds.length;
-  for (const id of knownIds) {
-    const tokenId = BigInt(id);
-    if (ownedIds.includes(tokenId)) continue;
-    let owner = null;
-    try { owner = getAddress((await call(ctx.rpc, NPM_I, AERO.nft, 'ownerOf', [tokenId]))[0]); } catch {} // 已销毁
-    if (owner === ctx.safe) ownedIds.push(tokenId);
+  // 只有合约 revert 才算已销毁；RPC 故障照常重试并报错，不让头寸静默消失。每 10 个并发一组。
+  const burnedIds = [];
+  const known = knownIds.map((id) => BigInt(id)).filter((id) => !ownedIds.includes(id));
+  for (let i = 0; i < known.length; i += 10) {
+    const owners = await Promise.all(known.slice(i, i + 10).map((tokenId) => read(`头寸 #${tokenId} 归属`, async () => {
+      try { return getAddress((await call(ctx.rpc, NPM_I, AERO.nft, 'ownerOf', [tokenId]))[0]); } catch (error) { if (error?.code === 'CALL_EXCEPTION') return null; throw error; }
+    })));
+    owners.forEach((owner, j) => { if (owner === ctx.safe) ownedIds.push(known[i + j]); else if (owner === null) burnedIds.push(known[i + j]); });
   }
   const ownedInfo = new Map();
   const positionOf = async (tokenId) => {
@@ -256,7 +258,7 @@ export async function readState(ctx, { knownIds = [] } = {}) {
     if (stakedIds.length) { try { earned = (await call(ctx.rpc, GAUGE_I, pool.gauge, 'earned', [ctx.safe, [...stakedIds]]))[0]; } catch {} }
     pools.push({ ...pool, sqrtPriceX96: slot0.sqrtPriceX96, tick: Number(slot0.tick), feePips: Number(feePips), penalty: { minStakeBlocks: penalty.minStakeBlocks, penaltyRate: penalty.penaltyRate }, positions, earned });
   }
-  return { blockNumber, timestamp, bot, botEth, latestNonce, pendingNonce, balances, allowances: [...allowances.values()], pools, ownedNfts: owned, ownedScanned: scanned };
+  return { blockNumber, timestamp, bot, botEth, latestNonce, pendingNonce, balances, allowances: [...allowances.values()], pools, ownedNfts: owned, ownedScanned: scanned, burnedIds };
 }
 
 // 已签名交易的去向：confirmed / reverted（已上链）、dropped（同一 nonce 已被其他交易占用，这笔不会再上链）、waiting（仍可能上链，重新广播一次）。
@@ -413,6 +415,7 @@ export function checkExpectation(preview, expect) {
   // 价格移动可能让配平方向翻转：卖出的币与预览不同时，数量没有可比性，一律拒绝。
   if (preview.swap && expect.swapTokenIn && getAddress(preview.swap.tokenIn) !== getAddress(expect.swapTokenIn)) throw new ExecError('池子价格自预览后变化，配平兑换方向已改变，请重新预览后再确认，未签名');
   const swapIn = preview.swap?.amountIn ?? 0n;
+  if (expect.swapIn > 0n && !expect.swapTokenIn) throw new ExecError('预览缺少配平兑换代币，请重新预览后再确认，未签名');
   if (swapIn * 10_000n > expect.swapIn * 11_000n) throw new ExecError('池子价格自预览后变化，配平兑换量超出预览 10%，请重新预览后再确认，未签名');
 }
 
@@ -439,6 +442,8 @@ export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, t
     .find((e) => e?.name === 'Transfer' && BigInt(e.args.from) === 0n && getAddress(e.args.to) === ctx.safe);
   if (!minted) throw new ExecError(`开仓已确认，但回执里没有 NFT 转入 Safe（${receipt.hash}）`, { signed: true });
   const tokenId = minted.args.tokenId;
+  // 质押前先上报：质押失败时头寸留在 Safe，仍要能在页面找到。
+  hooks.minted?.(tokenId);
   if (stake) { hooks.step?.('质押'); await stakePosition(ctx, hooks, { tokenId }); }
   return { tokenId, amount0: quote.amount0, amount1: quote.amount1 };
 }

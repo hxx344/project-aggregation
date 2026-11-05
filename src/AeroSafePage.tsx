@@ -121,7 +121,7 @@ export default function AeroSafePage({ onExpired }: { onExpired: () => void }) {
           <button type="button" className="button secondary" disabled={disabled || !aero || aero.balance === '0' || !sellTarget} title={sellTarget ? undefined : '白名单里没有卖出 AERO 的路径'} onClick={() => { if (window.confirm(`把 Safe 里的全部 AERO 卖成 ${sellTarget}（不超过今日额度）？`)) void run('sell', {}, '已开始卖出。'); }}>{busy === 'sell' ? <LoaderCircle size={15} className="spin" /> : <ArrowLeftRight size={15} />}卖出 AERO</button>
           {blocked ? <span className="as-muted">{blocked}</span> : <span className="as-muted">开仓在 Aero 市场的池详情页选区间后进行</span>}
         </div>
-        {chain?.ownedNfts != null && chain.ownedScanned != null && BigInt(chain.ownedNfts) > BigInt(chain.ownedScanned) ? <p className="as-muted">Safe 持有 {chain.ownedNfts} 个头寸 NFT，未质押头寸只列出最新的 {chain.ownedScanned} 个（已质押的全部列出）。</p> : null}
+        {chain?.ownedNfts != null && chain.ownedScanned != null && BigInt(chain.ownedNfts) > BigInt(chain.ownedScanned) ? <p className="as-muted">Safe 持有 {chain.ownedNfts} 个头寸 NFT，未质押头寸只列出索引最靠后的 {chain.ownedScanned} 个，另含本系统开出的头寸（已质押的全部列出）。</p> : null}
         {chain?.pools.map((pool) => <div key={pool.address} className="as-pool">
           <h3>{pool.name} <small>tick {pool.tick} · 待领 {aero ? units(pool.earned, aero.decimals) : pool.earned} AERO</small></h3>
           <div className="lp-table-scroll"><table className="lp-table"><thead><tr><th>头寸</th><th>区间</th><th>现价</th><th>持有（估）</th><th>质押</th><th>操作</th></tr></thead><tbody>

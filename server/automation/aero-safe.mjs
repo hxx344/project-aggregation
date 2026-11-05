@@ -188,7 +188,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     context = { stamp, at: now(), ctx };
     return ctx;
   }
-  function settle(entry, receipt, outcome) {
+  // quiet：同 nonce 替换时旧交易的 replaced 行。写失败不设 ledgerError——新交易记录的 replaces 保留了旧哈希，结清时会按链上结果再记。
+  function settle(entry, receipt, outcome, { quiet = false } = {}) {
     const status = outcome ?? (receipt?.status === 1 ? 'confirmed' : 'reverted');
     try {
       appendFileSync(ledgerPath, `${JSON.stringify({ at: now(), hash: entry.hash, nonce: entry.nonce, label: entry.label, status, block: receipt?.blockNumber ?? null,
@@ -196,11 +197,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     } catch (error) {
       // 台账没写上就保留待确认记录：它是这笔交易唯一的持久记录，下次结清时按回执重写。
       log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘交易记录写入失败');
-      ledgerError = `交易记录写入失败（${entry.label}，${status}）：${error.code ?? error.message}；交易本身已有结果，修复数据目录后刷新即可补记`;
       record({ event: 'ledger_write_failed', label: entry.label, hash: entry.hash, status });
+      if (quiet) return false;
+      ledgerError = `交易记录写入失败（${entry.label}，${status}）：${error.code ?? error.message}；交易本身已有结果，修复数据目录后刷新即可补记`;
       return false;
     }
-    ledgerError = null;
+    if (!quiet) ledgerError = null;
     // 删除失败时记录留在磁盘，下次结清会按回执再记一次（台账按哈希去重）。
     if (pending?.hash === entry.hash) {
       try { rmSync(pendingPath, { force: true }); pending = null; } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘待确认记录删除失败'); }
@@ -232,17 +234,19 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       atomicJson(pendingPath, entry); pending = entry;
       if (job?.id === jobId) job.signed = true;
       // 同 nonce 提价替换：旧交易与新交易最多一笔上链，旧的结果记为 replaced（以链上为准）。
-      if (replaced) settle(replaced, null, 'replaced');
+      if (replaced) settle(replaced, null, 'replaced', { quiet: true });
     },
     settle: (entry, receipt) => settle(entry, receipt),
     log: (entry) => record({ job: jobId, ...entry }),
     step: (name) => { if (job?.id === jobId) job.step = name; },
+    minted: (tokenId) => remember(tokenId),
   });
 
   async function readChain() {
     const ctx = await connection();
     try { await resolve(ctx); } catch (error) { record({ event: 'pending_check_failed', error: error.message }); }
     const value = await chain.readState(ctx, { knownIds: minted });
+    if (value.burnedIds?.length) forget(value.burnedIds.map(String));
     snapshot = serialize(value, ctx); snapshotAt = now(); snapshotError = null;
   }
   function refresh() {
@@ -267,7 +271,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         const minAmount = parseUnits(config.minRewardSell, ctx.tokens.get(chain.REWARD_TOKEN)?.decimals ?? 18);
         return chain.sellRewards(ctx, h, { slippageBps: params.slippageBps ?? config.slippageBps, minAmount });
       };
-      if (action === 'open') { result = await chain.openPosition(ctx, h, params); remember(result?.tokenId); }
+      if (action === 'open') result = await chain.openPosition(ctx, h, params);
       else if (action === 'close') { result = await chain.closePosition(ctx, h, params); result.sold = await sellAfter(); }
       else if (action === 'stake') result = await chain.stakePosition(ctx, h, params);
       else if (action === 'unstake') { result = await chain.unstakePosition(ctx, h, params); result.sold = await sellAfter(); }
@@ -285,10 +289,20 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     await refresh();
   }
 
+  function saveMinted() {
+    try { atomicJson(mintedPath, { schema: 1, ids: minted }); } catch (error) {
+      log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘头寸记录写入失败');
+      record({ event: 'minted_write_failed', error: error.code ?? error.message });
+    }
+  }
   function remember(tokenId) {
     if (tokenId == null) return;
     minted = [String(tokenId), ...minted.filter((id) => id !== String(tokenId))].slice(0, MINTED_LIMIT);
-    try { atomicJson(mintedPath, { schema: 1, ids: minted }); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘头寸记录写入失败'); }
+    saveMinted();
+  }
+  function forget(ids) {
+    const next = minted.filter((id) => !ids.includes(id));
+    if (next.length !== minted.length) { minted = next; saveMinted(); }
   }
 
   function requireIdle(what) {
