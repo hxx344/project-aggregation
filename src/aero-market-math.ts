@@ -194,3 +194,59 @@ export function rangeLabel(pool: MarketPool, range: [number, number], flip = fal
   if (range[0] <= fullRange(pool.tickSpacing)[0] && range[1] >= fullRange(pool.tickSpacing)[1]) return '全范围';
   return a < 0 && b > 0 && Math.abs(a + b) <= 0.1 * (b - a) ? `±${abs((b - a) / 2)}%` : `${fmt(a)}%/${fmt(b)}%`;
 }
+
+// Safe 已有头寸的价格区间、价值、预计收益与在区间时间（Aero 仓位标签）：用行情快照的排放、质押流动性、波动率与美元价估算，
+// 现价由调用方用 Safe 链上读到的 tick 覆盖（比行情快照新）。只用于展示，不参与签名或下单。
+// Base 出块约 2 秒。
+export const BASE_BLOCK_SECONDS = 2;
+
+export type PositionInput = { tickLower: number; tickUpper: number; liquidity: string; staked: boolean; amount0: number | null; amount1: number | null; depositBlock: string | null };
+export type PositionMetrics = {
+  pair: string; quoteLabel: string;
+  low: number; high: number; now: number;
+  // 现价到区间下沿、上沿的涨跌幅（按报价方向）；出区间时一侧为同号。
+  toLow: number; toHigh: number;
+  width: string; inRange: boolean;
+  valueUsd: number | null;
+  // 占当前价位质押流动性的份额；未质押时为质押后的预计份额（加上自身后稀释）。
+  share: number | null; projected: boolean;
+  aeroPerDay: number | null; usdPerDay: number | null; apr: number | null;
+  daysIn: number | null; vol: number | null;
+  yield: NetYield | null;
+  stakedSeconds: number | null;
+};
+
+// live 为用 Safe 链上现价覆盖 tick/sqrtPriceX96 后的行情池子。
+// chainTime 为 Safe 链上快照的区块时间（秒），snapshotAt 为行情快照的扫描时间（毫秒），用来判断质押流动性里是否已含本头寸。
+export type PositionContext = { aeroUsd: number | null; blockNumber: number | null; chainTime: number | null; snapshotAt: number | null };
+export function positionMetrics(live: MarketPool, position: PositionInput, { aeroUsd, blockNumber, chainTime, snapshotAt }: PositionContext, plan: RebalancePlan = DEFAULT_PLAN): PositionMetrics {
+  const q = quoteOf(live);
+  const edges = [q.price(position.tickLower), q.price(position.tickUpper)].sort((a, b) => a - b);
+  const now = q.price(live.tick);
+  const inRange = live.tick >= position.tickLower && live.tick < position.tickUpper;
+  const p0 = live.token0.usd, p1 = live.token1.usd;
+  const valueUsd = position.amount0 === null || position.amount1 === null || p0 === null || p1 === null ? null
+    : (position.amount0 / 10 ** live.token0.decimals) * p0 + (position.amount1 / 10 ** live.token1.decimals) * p1;
+  const mine = Number(position.liquidity) || 0, staked = Math.max(Number(live.stakedLiquidity) || 0, 0);
+  const stakedSeconds = position.staked && position.depositBlock !== null && blockNumber !== null ? Math.max(blockNumber - Number(position.depositBlock), 0) * BASE_BLOCK_SECONDS : null;
+  // 行情快照晚于本次质押时，质押流动性已含本头寸：份额 = mine / staked（按 mine 封顶，不超过 1）；
+  // 快照早于质押、或时间无法判断时按未计入处理：mine / (staked + mine)，偏保守。未质押头寸按质押后加入计算。
+  const stakedAt = stakedSeconds !== null && chainTime !== null ? (chainTime - stakedSeconds) * 1000 : null;
+  const included = position.staked && snapshotAt !== null && stakedAt !== null && snapshotAt >= stakedAt;
+  const share = !live.gauge || !(mine > 0) ? null : included ? mine / Math.max(staked, mine) : mine / (staked + mine);
+  const emitting = inRange && share !== null && live.emissionPerSec !== null;
+  const aeroPerDay = !inRange ? 0 : emitting ? live.emissionPerSec! * 86_400 * share! : null;
+  const usdPerDay = aeroPerDay === null || aeroUsd === null ? null : aeroPerDay * aeroUsd;
+  const apr = usdPerDay === null || valueUsd === null || !(valueUsd > 0) ? null : (usdPerDay * 365) / valueUsd;
+  const vol = riskVolOf(live);
+  const daysIn = expectedDaysInRange(live.tick, position.tickLower, position.tickUpper, vol);
+  const yieldOf = inRange && apr !== null && valueUsd !== null
+    ? netYield({ apr, tick: live.tick, lower: position.tickLower, upper: position.tickUpper, dailyVol: vol, costFraction: rebalanceCostOf(live, valueUsd).total, delayDays: plan.delayDays })
+    : null;
+  return {
+    pair: q.pair, quoteLabel: q.label, low: edges[0], high: edges[1], now,
+    toLow: edges[0] / now - 1, toHigh: edges[1] / now - 1,
+    width: rangeLabel(live, [position.tickLower, position.tickUpper]), inRange,
+    valueUsd, share, projected: !position.staked, aeroPerDay, usdPerDay, apr, daysIn, vol, yield: yieldOf, stakedSeconds,
+  };
+}

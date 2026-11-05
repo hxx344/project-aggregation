@@ -7,6 +7,7 @@ import type { RebalancePlan } from './aero-market-math';
 import type { NetYield } from './aero-market-math';
 import { dates, days, message, pct, tokenAmount, usd } from './aero-market-format';
 import type { MarketLiquidity, MarketPool, MarketPoolHistory } from './aero-market-types';
+import AeroSafePanel from './AeroSafePanel';
 
 const ROOT = '/api/research/aero-market';
 // width 为 -1 表示全范围；其余与列表的区间宽度一致（以当前 tick 为中心、对齐到 tickSpacing）。
@@ -351,6 +352,8 @@ export default function AeroPoolDetail({ pool, chainName, aeroUsd, initialWidth,
       </table></div>
       <p className="am-note">推荐区间按 tickSpacing 粒度以当前价居中搜索，在预计在区间不短于列表「最短在区间」的居中区间中取净年化最高者，与列表的净年化列一致；预设区间以当前价为中心；排放年化按当前价位的质押流动性稀释，与列表同一口径（假设全程在区间内并质押），净年化 = 排放 − 无常损失 − 停摆损失 − 调仓成本，按自动调仓估算：单次成本 = gas + 换半个仓位的池子手续费与价格冲击（按本池当前价位流动性近似，未计跨 tick 后流动性变化），停摆与最短在区间取列表的设置。流动性分布按 tick 链上读数还原，浅色为全部流动性、深色为其中已质押的部分，只读取当前价 ÷4 至 ×4 内最近的至多 1500 个已初始化 tick。</p>
     </section>
+
+    {pool.chain === 'base' ? <AeroSafePanel pool={pool} range={range} onExpired={onExpired} /> : null}
 
     {children ? <section className="panel am-facts-panel" aria-label="池子数据">{children}</section> : null}
   </div>;

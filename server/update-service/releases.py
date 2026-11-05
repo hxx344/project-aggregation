@@ -47,7 +47,8 @@ DEPLOY_TAG = re.compile(r'deploy-([a-f0-9]{40})')
 DISPLAY_ZONE = timezone(timedelta(hours=8))
 RELEASE_CACHE_TTL = 30 * 60
 MAX_RETRY_DELAY = 24 * 60 * 60
-# Per socket operation; one retry only when no HTTP response arrived.
+# Per socket operation; connection failures and temporary HTTP responses share
+# one retry. Server wait instructions always defer to the check scheduler.
 REQUEST_TIMEOUT = 15
 CONNECTION_ATTEMPTS = 2
 CONNECTION_RETRY_DELAY = 1
@@ -62,10 +63,12 @@ RELEASE_PROBES = ThreadPoolExecutor(max_workers=4, thread_name_prefix='release-p
 
 
 class ReleaseError(Exception):
-    def __init__(self, message='正式版本检查失败，请稍后重新检查', *, retry_at=None, transient=False):
+    def __init__(self, message='正式版本检查失败，请稍后重新检查', *, retry_at=None, transient=False, retryable=False):
         super().__init__(message)
         self.retry_at = retry_at
         self.transient = transient
+        # Cache retention (transient) alone must never authorize an immediate retry.
+        self.retryable = retryable
 
 
 def retry_deadline(headers, now):
@@ -164,12 +167,13 @@ class Network:
         for attempt in range(1, CONNECTION_ATTEMPTS + 1):
             try:
                 return self._open(request, maximum, method, final_url, authenticated)
+            except ReleaseError as error:
+                if method not in ('GET', 'HEAD') or not error.retryable or attempt == CONNECTION_ATTEMPTS:
+                    raise
             except (OSError, TimeoutError, urllib.error.URLError):
-                # _open converts every HTTP response, including 5xx with
-                # Retry-After, so only a missing response gets another attempt.
                 if attempt == CONNECTION_ATTEMPTS:
                     raise ReleaseError(f'无法连接{endpoint_name(url)}，请检查服务器网络', transient=True) from None
-                time.sleep(CONNECTION_RETRY_DELAY)
+            time.sleep(CONNECTION_RETRY_DELAY)
 
     def _open(self, request, maximum, method, final_url, authenticated):
         try:
@@ -204,7 +208,10 @@ class Network:
                     reason = '拒绝访问，请检查服务器的 GitHub 网络访问'
                 raise ReleaseError(f'{endpoint}{reason}（HTTP {error.code}）', retry_at=deadline, transient=True) from None
             raise ReleaseError(f'{endpoint}暂时不可用（HTTP {error.code}）',
-                               retry_at=deadline, transient=500 <= error.code < 600) from None
+                               retry_at=deadline, transient=500 <= error.code < 600,
+                               retryable=(error.code in (502, 503, 504) and deadline is None and
+                                          headers.get('Retry-After') is None and
+                                          headers.get('X-RateLimit-Remaining') != '0')) from None
 
 
 def decode_json(data):

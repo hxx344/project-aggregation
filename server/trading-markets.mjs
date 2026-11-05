@@ -5,6 +5,8 @@ export const EXECUTION_MARKETS = Object.freeze({
   oil: Object.freeze({ name: '原油', symbols: Object.freeze(['CLUSDT', 'BZUSDT']) }),
   hynix: Object.freeze({ name: '海力士', symbols: Object.freeze(['SKHYUSDT', 'SKHYNIXUSDT']) }),
 });
+/** SK hynix positions are observed with the read-only accounts; their funding and PnL stay out of the oil ledger. */
+export const TRADING_HYNIX_SYMBOLS = EXECUTION_MARKETS.hynix.symbols;
 export const EXECUTION_ALL_SYMBOLS = Object.freeze(Object.values(EXECUTION_MARKETS).flatMap(market => market.symbols));
 /** Symbols an account snapshot reads; omitted means every execution symbol. Returns null when invalid. */
 export function executionSymbols(value) {

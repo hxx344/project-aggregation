@@ -99,6 +99,24 @@ test('freshness advances from server servedAt and elapsed time, independently of
   read(cache, state()); assert.equal(cache.latest().failed, false);
 });
 
+test('SK hynix positions age on the position threshold, keep rows and tolerate servers without the section', () => {
+  const cache = createTradingCache(), data = state();
+  data.hynix = { accounts: [{ exchange: 'binance', state: 'live', fetchedAt: time, error: null }, { exchange: 'bybit', state: 'error', fetchedAt: null, error: 'failed' }],
+    legs: [{ id: 'binance:SKHYUSDT', exchange: 'binance', symbol: 'SKHYUSDT', state: 'live', fetchedAt: time, positions: [{ quantity: '100' }] }] };
+  read(cache, data); const entry = cache.latest();
+  const fresh = ageTradingData(entry, Date.parse(time) + 75_000).hynix;
+  assert.equal(fresh.accounts[0].state, 'live'); assert.equal(fresh.legs[0].state, 'live');
+  const aged = ageTradingData(entry, Date.parse(time) + 75_001).hynix;
+  assert.deepEqual(aged.accounts.map(account => account.state), ['stale', 'error']);
+  assert.equal(aged.legs[0].state, 'stale'); assert.equal(aged.legs[0].positions[0].quantity, '100');
+  assert.equal(ageTradingData(entry, Date.parse(time), true).hynix.legs[0].state, 'stale', 'offline marks SK hynix stale');
+  const failed = cache.beginRead(); cache.fail(failed, 7, 0);
+  assert.equal(ageTradingData(entry, Date.parse(time)).hynix.accounts[0].state, 'stale', 'a failed read marks SK hynix stale');
+  assert.equal(entry.data.hynix.legs[0].state, 'live', 'cached payload remains immutable');
+  const legacy = createTradingCache(); read(legacy, state());
+  assert.equal('hynix' in ageTradingData(legacy.latest(), Date.parse(time)), false);
+});
+
 test('position expiry removes the structure conclusion and appends one missing latest PnL sample', () => {
   const cache = createTradingCache(); read(cache, state()); const entry = cache.latest();
   const aged = ageTradingData(entry, Date.parse(time) + 75_001);
