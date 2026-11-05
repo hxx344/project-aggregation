@@ -57,9 +57,14 @@ slot_layout=single
 cutover_from=
 cutover_to=
 cutover_committed=0
+# The rollback pointer before this cutover, including explicit absence.
+cutover_previous=-
+# Set only after an interrupted cutover has finished and passed health checks.
+resumed_cutover_release=
 slot_instance=
 probe_failures=
 activation_scope=
+pending_activation_scope=
 old_environment=
 old_health_url=
 work_dir=
@@ -2687,7 +2692,8 @@ print(value['slot'], value['release'])
 SLOT_RECORD_PY
 }
 write_slot_record() { atomic_record "$APP_DIR/.api-slot" "{\"slot\":\"$1\",\"release\":\"$2\"}"; }
-# "from to release phase" of .api-cutover.
+# "from to release phase [intent previous]" of .api-cutover. The optional
+# fields retain the direction and the rollback pointer before the switch.
 read_cutover() {
   python3 -I - "$APP_DIR/.api-cutover" <<'CUTOVER_PY'
 import json, re, sys
@@ -2699,10 +2705,20 @@ except (OSError, ValueError):
 if not isinstance(value, dict) or {value.get('from'), value.get('to')} != {'a', 'b'} or not isinstance(value.get('release'), str) or \
         not re.fullmatch(r'/\S+', value['release']) or value.get('phase') not in ('candidate', 'switching', 'draining'):
     sys.exit(1)
-print(value['from'], value['to'], value['release'], value['phase'])
+fields = [value[key] for key in ('from', 'to', 'release', 'phase')]
+if 'intent' in value or 'previous' in value:
+    if value.get('intent') not in ('forward', 'rollback', 'legacy') or not isinstance(value.get('previous'), str) or \
+            not re.fullmatch(r'-|/\S+', value['previous']):
+        sys.exit(1)
+    fields.extend((value['intent'], value['previous']))
+print(*fields)
 CUTOVER_PY
 }
-write_cutover() { atomic_record "$APP_DIR/.api-cutover" "{\"from\":\"$1\",\"to\":\"$2\",\"release\":\"$3\",\"phase\":\"$4\"}"; }
+write_cutover() {
+  local context=
+  if [[ -n "${5:-}" ]]; then context=",\"intent\":\"$5\",\"previous\":\"$6\""; fi
+  atomic_record "$APP_DIR/.api-cutover" "{\"from\":\"$1\",\"to\":\"$2\",\"release\":\"$3\",\"phase\":\"$4\"$context}"
+}
 # A JSON field (dotted path) from standard input.
 json_field() {
   python3 -I -c 'import json, sys
@@ -2744,11 +2760,29 @@ wait_slot() {
 }
 # Moves the traffic to slot $1 running release $2 (design doc 3.5). From step
 # 1 the slot starts anew from its link; from step 3 it is taken as it runs.
+# $4 is the intent and $5 the original previous pointer ("-" for none).
+# A forward switch replaces the serving release; a rollback restores the
+# original previous, never the failed candidate in its source slot.
 # Every failure returns, so rollback can call it with errexit off.
 api_cutover() {
-  local to=$1 target=$2 step=${3:-1} from mode=candidate answer recorded attempt
+  local to=$1 target=$2 step=${3:-1} intent=${4:-forward} previous=${5:-} from replaced mode=candidate answer recorded attempt
   from=$(other_slot "$to")
   cutover_from=$from cutover_to=$to
+  case "$intent" in forward|rollback|legacy) ;; *) return 1 ;; esac
+  if [[ -z "$previous" ]]; then
+    previous=-
+    if [[ -L "$APP_DIR/previous" ]]; then previous=$(realpath -e -- "$APP_DIR/previous") || return 1; fi
+  fi
+  [[ "$previous" == - ]] || managed_release "$previous" >/dev/null || return 1
+  cutover_previous=$previous
+  if [[ "$intent" == forward ]]; then
+    replaced=$(realpath -e -- "$APP_DIR/slots/$from") && managed_release "$replaced" >/dev/null || return 1
+    # A template-only restart of the same release must keep the older target.
+    if [[ "$replaced" != "$target" ]]; then previous=$replaced; fi
+  fi
+  # In particular, record a rollback before probing or moving its target:
+  # recovery must continue it even while .api-slot still names the candidate.
+  write_cutover "$from" "$to" "$target" candidate "$intent" "$cutover_previous" || return 1
   if (( step == 1 )); then
     # An interrupted switch may already have recorded this slot (design doc
     # 3.5); it then stays enabled, so a reboot still starts the recorded slot.
@@ -2756,13 +2790,12 @@ api_cutover() {
     systemctl stop "$(slot_unit "$to")" || return 1
     if [[ "$mode" != serving ]]; then systemctl disable "$(slot_unit "$to")" >/dev/null 2>&1 || return 1; fi
     mkdir -p "$APP_DIR/slots" && atomic_link "$target" "$APP_DIR/slots/$to" || return 1
-    write_cutover "$from" "$to" "$target" candidate || return 1
     systemctl start "$(slot_unit "$to")" || return 1
   else
     answer=$(ctl_request "$(slot_ctl "$to")" GET /identity) && mode=$(json_field mode <<< "$answer") || return 1
   fi
   wait_slot "$to" "$target" "$mode" || return 1
-  write_cutover "$from" "$to" "$target" switching || return 1
+  write_cutover "$from" "$to" "$target" switching "$intent" "$cutover_previous" || return 1
   # Enabled before the record moves and the old slot disabled only after the
   # switch, so a reboot at any point starts the recorded slot.
   systemctl enable "$(slot_unit "$to")" >/dev/null 2>&1 || return 1
@@ -2771,7 +2804,7 @@ api_cutover() {
   atomic_link "$target" "$APP_DIR/current" || return 1
   answer=$(ctl_request "$(slot_ctl "$to")" POST /promote '' 90) && [[ $(json_field mode <<< "$answer") == serving ]] || return 1
   ctl_request "$(entry_ctl)" POST /switch "{\"slot\":\"$to\",\"instanceId\":\"$slot_instance\"}" >/dev/null || return 1
-  write_cutover "$from" "$to" "$target" draining || return 1
+  write_cutover "$from" "$to" "$target" draining "$intent" "$cutover_previous" || return 1
   systemctl disable "$(slot_unit "$from")" >/dev/null 2>&1 || return 1
   # The old slot drains (design doc 5.1, at most 75 s). Its pairs in the entry
   # go with it, a paused one within the entry's 30 s stall limit; one still
@@ -2785,6 +2818,11 @@ api_cutover() {
   [[ $(json_field target <<< "$answer") == "$to" ]] || return 1
   [[ $(json_field "connections.$from" <<< "$answer") == 0 ]] || log "旧 API 槽 $from 仍有连接在收尾，由入口按停滞上限释放。"
   wait_healthy || return 1
+  if [[ "$previous" == - ]]; then
+    rm -f -- "$APP_DIR/previous" || return 1
+  elif [[ "$previous" != "$target" ]]; then
+    atomic_link "$previous" "$APP_DIR/previous" || return 1
+  fi
   rm -f -- "$APP_DIR/.api-cutover"
 }
 # Undoes a failed api_cutover (design doc 6.3): before the record moved the old
@@ -2802,23 +2840,37 @@ api_cutover_rollback() {
     # Left behind, the cutover makes the next run stop and disable the candidate.
     systemctl disable "$(slot_unit "$new")" >/dev/null 2>&1 && rm -f -- "$APP_DIR/.api-cutover"
     wait_healthy
-    return
+    # A bare return in an ERR trap inherits the original failure's status.
+    return $?
   fi
   read -r slot old_target <<< "$old_slot_record"
   [[ "$slot" == "$old" && -d "$old_target" ]] || return 1
   cutover_committed=0
-  if systemctl is-active --quiet "$(slot_unit "$old")"; then api_cutover "$old" "$old_target" 3; else api_cutover "$old" "$old_target" 1; fi
+  if systemctl is-active --quiet "$(slot_unit "$old")"; then
+    api_cutover "$old" "$old_target" 3 rollback "$cutover_previous"
+  else
+    api_cutover "$old" "$old_target" 1 rollback "$cutover_previous"
+  fi
 }
 # A cutover an earlier run left behind (design doc 3.5): forward when the
 # record already names its target, otherwise back to the recorded slot.
 resolve_cutover() {
-  local cutover recorded from to target phase
+  local cutover recorded from to target phase intent previous
+  resumed_cutover_release=
   [[ -e "$APP_DIR/.api-cutover" ]] || return 0
   cutover=$(read_cutover) && recorded=$(read_slot_record) || return 1
-  read -r from to target phase <<< "$cutover"
-  if [[ "$recorded" == "$to $target" ]]; then
-    log "上次的 API 槽切换（$phase）已写入记录，继续完成。"
-    if systemctl is-active --quiet "$(slot_unit "$to")"; then api_cutover "$to" "$target" 3; else api_cutover "$to" "$target" 1; fi
+  read -r from to target phase intent previous <<< "$cutover"
+  # Old journals cannot distinguish a forward switch from a rollback. Keep
+  # the existing previous rather than guessing from a possibly failed source.
+  intent=${intent:-legacy}
+  if [[ "$recorded" == "$to $target" || "$intent" == rollback ]]; then
+    log "上次的 API 槽切换（$phase，$intent）继续完成。"
+    if systemctl is-active --quiet "$(slot_unit "$to")"; then
+      api_cutover "$to" "$target" 3 "$intent" "$previous" || return 1
+    else
+      api_cutover "$to" "$target" 1 "$intent" "$previous" || return 1
+    fi
+    resumed_cutover_release=$target
   else
     log "上次的 API 槽切换（$phase）未写入记录，停止候选槽 $to。"
     systemctl stop "$(slot_unit "$to")" && systemctl disable "$(slot_unit "$to")" >/dev/null 2>&1 && rm -f -- "$APP_DIR/.api-cutover"
@@ -2951,6 +3003,9 @@ api_layout_settled() {
 }
 activation_scope() {
   local running key
+  # A full activation may have moved current before stopping/restarting all
+  # units. Finish its original scope before treating it as an API-only update.
+  if [[ "$pending_activation_scope" == full ]]; then printf full; return; fi
   if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$APP_DIR/.runtime-deployment" ]] && api_layout_settled &&
      cmp -s "$work_dir/service" "$UNIT_FILE" && [[ "$(cat -- "$APP_DIR/.runtime-deployment")" == "$(runtime_deployment_key)" ]] &&
      systemctl is-active --quiet "$SERVICE" && running=$(live_runtime_release) &&
@@ -2959,6 +3014,23 @@ activation_scope() {
     printf api
   else
     printf full
+  fi
+}
+# Full and single-API activations have no cutover journal. Preserve the release
+# they replaced until their final bookkeeping is durable; current alone cannot
+# recover that identity after an interruption. A failed activation which
+# restored current does not use this record on its next attempt.
+restore_pending_previous() {
+  local target previous scope extra
+  pending_activation_scope=
+  [[ -e "$APP_DIR/.pending-previous" ]] || return 0
+  read -r target previous scope extra < "$APP_DIR/.pending-previous" || return 1
+  [[ -z "$extra" && ( "$scope" == full || "$scope" == api ) ]] || return 1
+  managed_release "$target" >/dev/null || return 1
+  [[ "$previous" == - ]] || managed_release "$previous" >/dev/null || return 1
+  if [[ "$target" == "$release" && "$old_release" == "$release" ]]; then
+    previous_release=${previous#-}
+    pending_activation_scope=$scope
   fi
 }
 # Whether the admitted scope covers the activation: an api-scope update never widens.
@@ -3216,7 +3288,7 @@ main() {
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
   if [[ ( "$PROJECT_DEPLOY_MODE" == ci || "$PROJECT_DEPLOY_TESTS" == 0 ) && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
-        "$deployed_state" == "$commit $deployment_key" && ! -e "$APP_DIR/.api-cutover" ]] &&
+        "$deployed_state" == "$commit $deployment_key" && ! -e "$APP_DIR/.api-cutover" && ! -e "$APP_DIR/.pending-previous" ]] &&
       { [[ "$PROJECT_DEPLOY_MODE" != source ]] || source_runtime_dependencies_ready "$old_release"; } && healthy; then
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
@@ -3247,7 +3319,8 @@ main() {
   prepare_aster_runtime "$release"
   write_unit
   deployment_key=$({ cat "$ENV_FILE"; layout_units | xargs -d '\n' cat --; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
-  if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" && ! -e "$APP_DIR/.api-cutover" ]] && healthy; then
+  if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" &&
+        ! -e "$APP_DIR/.api-cutover" && ! -e "$APP_DIR/.pending-previous" ]] && healthy; then
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
     log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
@@ -3273,14 +3346,21 @@ main() {
     resolve_cutover || log '上次未完成的 API 槽切换无法就地恢复；本次整体重启。'
     cutover_from= cutover_to= cutover_committed=0
     old_slot_record=$(read_slot_record) || old_slot_record=
-    # A switch carried through moved current: that release is now the one to restore.
-    if [[ -L "$APP_DIR/current" && "$(realpath -e "$APP_DIR/current")" != "$old_release" ]]; then
+    # Refresh both pointers even when current had moved before the interruption.
+    # A recovered cutover persisted the previous pointer for its intent.
+    if [[ -L "$APP_DIR/current" ]]; then
       old_release=$(realpath -e "$APP_DIR/current")
       [[ "$old_release" == "$APP_DIR/releases/"* && -f "$old_release/.managed-release" ]] || fail 'current 指向未知目录，停止更新。'
-      # Resumed onto this run's release, the release it replaced stays previous.
-      if [[ "$old_release" != "$release" ]]; then previous_release=$old_release; fi
+      if [[ "$old_release" != "$release" ]]; then
+        previous_release=$old_release
+      elif [[ -L "$APP_DIR/previous" ]]; then
+        previous_release=$(realpath -e "$APP_DIR/previous")
+      else
+        previous_release=
+      fi
     fi
   fi
+  restore_pending_previous || fail '未完成激活的回滚版本记录无效，停止更新。'
   activation_scope=$(activation_scope)
   if ! scope_admitted "$activation_scope"; then
     # Nothing is activated yet: rollback only closes progress and exits.
@@ -3288,14 +3368,24 @@ main() {
     scope_refused=1
     rollback "$SCOPE_REFUSED"
   fi
+  if [[ "$activation_scope" != api || "$slot_layout" != dual ]]; then
+    atomic_record "$APP_DIR/.pending-previous" "$release ${previous_release:--} $activation_scope"
+  fi
   activation_started=1
   if [[ "$activation_scope" == api && "$slot_layout" == dual ]]; then
-    log '运行时代码、服务配置和环境未变化：只切换 API 槽，入口、模块与采集保持运行。'
-    if ! cmp -s "$work_dir/slot.service" "$SLOT_UNIT_FILE"; then
-      install -m 0644 "$work_dir/slot.service" "$SLOT_UNIT_FILE"
-      systemctl daemon-reload
+    if [[ "$resumed_cutover_release" == "$release" ]] && cmp -s "$work_dir/slot.service" "$SLOT_UNIT_FILE"; then
+      # Recovery already committed this activation. Only its bookkeeping is
+      # left; a later record failure must not start another slot transition.
+      activation_started=0
+      log '上次的 API 槽切换已完成，保持当前槽并补齐部署记录。'
+    else
+      log '运行时代码、服务配置和环境未变化：只切换 API 槽，入口、模块与采集保持运行。'
+      if ! cmp -s "$work_dir/slot.service" "$SLOT_UNIT_FILE"; then
+        install -m 0644 "$work_dir/slot.service" "$SLOT_UNIT_FILE"
+        systemctl daemon-reload
+      fi
+      api_cutover "$(other_slot "${old_slot_record%% *}")" "$release" || fail 'API 槽切换未完成。'
     fi
-    api_cutover "$(other_slot "${old_slot_record%% *}")" "$release" || fail 'API 槽切换未完成。'
   elif [[ "$activation_scope" == api ]]; then
     log '运行时代码、服务配置和环境未变化：只重启 API，模块与采集保持运行。'
     if [[ "$release" != "$old_release" ]]; then atomic_link "$release" "$APP_DIR/current"; fi
@@ -3327,11 +3417,12 @@ main() {
   if [[ "$activation_scope" == full ]]; then
     atomic_record "$APP_DIR/.runtime-deployment" "$(runtime_deployment_key)" || log '无法记录运行时的部署配置；下次安装会整体重启。'
   fi
+  if [[ -n "$old_release" && "$old_release" != "$release" ]]; then remember_previous_python_paths "$old_release"; fi
+  if [[ -n "$previous_release" && "$previous_release" != "$release" ]]; then atomic_link "$previous_release" "$APP_DIR/previous"; fi
+  rm -f -- "$APP_DIR/.pending-previous"
   atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
   atomic_record "$release/.install-ready" "$application_key"
   atomic_record "$APP_DIR/.node-path" "$NODE_BIN"
-  if [[ -n "$old_release" && "$old_release" != "$release" ]]; then remember_previous_python_paths "$old_release"; fi
-  if [[ -n "$previous_release" && "$previous_release" != "$release" ]]; then atomic_link "$previous_release" "$APP_DIR/previous"; fi
   # Activated or superseded: a release prepared earlier no longer needs protection.
   rm -f -- "$APP_DIR/.prepared-release"
   finish_update_service "$release"
