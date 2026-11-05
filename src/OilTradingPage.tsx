@@ -9,6 +9,7 @@ import TradingPnlChart from './TradingPnlChart';
 import TradingExecution from './TradingExecution';
 import TradingSpread from './TradingSpread';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPair, TradingPosition, TradingReadState, TradingState } from './trading-types';
+type PositionLeg = Pick<TradingLeg, 'id' | 'exchange' | 'state'> & { symbol: string };
 import './trading.css';
 
 const exchangeNames = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
@@ -42,7 +43,7 @@ const PositionDetails = memo(function PositionDetails({ position }: { position: 
     <div><dt>交易所仓位变更时间</dt><dd>{position.sourceUpdatedAt ? formatDate(position.sourceUpdatedAt) : '交易所未提供'}</dd></div>
   </dl></details>;
 });
-const PositionRow = memo(function PositionRow({ leg, position, first }: { leg: TradingLeg; position: TradingPosition | null; first: boolean }) {
+const PositionRow = memo(function PositionRow({ leg, position, first }: { leg: PositionLeg; position: TradingPosition | null; first: boolean }) {
   return <tr className={first ? 'trading-leg-start' : ''} data-leg={leg.id}>
     <th scope="row" className="trading-leg-name"><strong>{position?.instrumentId ?? leg.symbol}</strong><span>{exchangeNames[leg.exchange]}</span>{first ? <ReadStatus state={leg.state} /> : <small>同一合约的另一仓位</small>}</th>
     <td data-label="方向">{position ? <span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span> : <span className="trading-muted">{leg.state === 'live' ? '无持仓' : '暂无仓位数据'}</span>}</td>
@@ -54,6 +55,9 @@ const PositionRow = memo(function PositionRow({ leg, position, first }: { leg: T
     <td className="trading-details-cell">{position ? <PositionDetails position={position} /> : null}</td>
   </tr>;
 });
+function PositionTable({ legs, label }: { legs: (PositionLeg & { positions: TradingPosition[] })[]; label?: string }) {
+  return <div className="trading-position-scroll"><table className="trading-position-table" aria-label={label}><thead><tr><th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">合约数量</th><th scope="col">开仓均价<small>USDT/底层单位</small></th><th scope="col">标记价格<small>USDT/底层单位</small></th><th scope="col">名义价值<small>USDT</small></th><th scope="col">未实现盈亏<small>USDT</small></th><th scope="col"><span className="visually-hidden">仓位详情</span></th></tr></thead><tbody>{legs.flatMap(leg => leg.positions.length ? leg.positions.map((position, index) => <PositionRow key={`${leg.id}-${position.id}`} leg={leg} position={position} first={index === 0} />) : [<PositionRow key={leg.id} leg={leg} position={null} first />])}</tbody></table></div>;
+}
 function AccountConnection({ account, busy, mutate, sources, sourcesLoading, importAccount }: {
   account: TradingAccount; busy: boolean;
   mutate: (exchange: TradingExchange, method: 'PUT' | 'DELETE', body: object) => Promise<boolean>;
@@ -100,7 +104,7 @@ function AccountConnection({ account, busy, mutate, sources, sourcesLoading, imp
       {choices.filter(choice => !choice.available && choice.source.status === 'ready').map(choice => <p key={choice.source.projectId} className="trading-import-detail">{choice.source.name}：{choice.description}</p>)}
       <button className="button secondary" type="button" disabled={busy || sourcesLoading || !chosen} onClick={() => void importSelected()}><Link2 size={16} />{account.connected ? '从 Asset 导入并替换' : '从 Asset 导入'}</button>
     </div>
-    <p>{account.connected ? '填写新的只读密钥可替换当前连接。' : '连接后读取 CLUSDT、BZUSDT 仓位和资金费账单。'}</p>
+    <p>{account.connected ? '填写新的只读密钥可替换当前连接。' : '连接后读取原油 CLUSDT、BZUSDT 的仓位和资金费账单，以及海力士 SKHYUSDT、SKHYNIXUSDT 的仓位。'}</p>
     <label htmlFor={`trading-key-${account.exchange}`}>API Key<input id={`trading-key-${account.exchange}`} type="password" autoComplete="off" spellCheck={false} value={apiKey} onChange={event => setApiKey(event.target.value)} required disabled={busy} /></label>
     <label htmlFor={`trading-secret-${account.exchange}`}>API Secret<input id={`trading-secret-${account.exchange}`} type="password" autoComplete="off" spellCheck={false} value={apiSecret} onChange={event => setApiSecret(event.target.value)} required disabled={busy} /></label>
     {account.exchange === 'okx' ? <label htmlFor="trading-passphrase-okx">Passphrase<input id="trading-passphrase-okx" type="password" autoComplete="off" spellCheck={false} value={apiPassphrase} onChange={event => setApiPassphrase(event.target.value)} required disabled={busy} /></label> : null}
@@ -305,10 +309,17 @@ export default function OilTradingPage({ cache, onExpired }: { cache: TradingCac
         <div className="trading-account-statuses">{selectedAccounts.map(account => <div className="trading-account-status" key={account.exchange}><div><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.positions.state} />{account.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div><p>仓位读取：{formatDate(account.positions.fetchedAt)}{account.positions.fetchedAt ? '（北京时间）' : ''}</p>{account.positions.error ? <p className="trading-warning">{account.positions.error}</p> : null}</div>)}</div>
         {!connected ? <div className="trading-connect-empty"><ShieldCheck size={27} /><h3>连接账户，查看四腿的真实仓位</h3><p>使用所选两家交易所的只读密钥。连接后，这里会显示持仓方向、名义价值和资金费账单。</p><button className="button primary" onClick={openConnections}>连接只读账户</button></div> : null}
         <div className={`trading-structure ${data.structure.state}`}><span>跨所方向</span><strong>{data.structure.message}</strong></div>
-        <div className="trading-position-scroll"><table className="trading-position-table"><thead><tr><th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">合约数量</th><th scope="col">开仓均价<small>USDT/底层单位</small></th><th scope="col">标记价格<small>USDT/底层单位</small></th><th scope="col">名义价值<small>USDT</small></th><th scope="col">未实现盈亏<small>USDT</small></th><th scope="col"><span className="visually-hidden">仓位详情</span></th></tr></thead><tbody>{data.legs.flatMap(leg => leg.positions.length ? leg.positions.map((position, index) => <PositionRow key={`${leg.id}-${position.id}`} leg={leg} position={position} first={index === 0} />) : [<PositionRow key={leg.id} leg={leg} position={null} first />])}</tbody></table></div>
+        <PositionTable legs={data.legs} />
         <details className="trading-leg-totals"><summary>查看每腿名义价值与资金费</summary><div className="trading-table-scroll" tabIndex={0} role="region" aria-label="每腿汇总"><table><thead><tr><th scope="col">合约 / 交易所</th><th scope="col">总名义价值 · USDT</th><th scope="col">净名义价值 · USDT</th><th scope="col">区间资金费净额 · USDT</th><th scope="col">资金费记录</th></tr></thead><tbody>{data.legs.map(leg => <tr key={leg.id}><th scope="row">{exchangeNames[leg.exchange]} {leg.symbol}</th><td>{amount(leg.grossNotional)}</td><td>{amount(leg.netNotional, true)}</td><td className={polarity(leg.fundingNet)}>{amount(leg.fundingNet, true)}</td><td>{leg.fundingComplete ? '完整' : '部分 / 尚未获取'}</td></tr>)}</tbody></table></div></details>
         <p className="trading-footnote">方向仅反映当前持仓结构；不同交易所的合约数量不直接等同，不代表完全对冲。</p>
       </section>
+
+      {data.hynix ? <section className="trading-panel trading-positions trading-hynix-positions" aria-labelledby="trading-hynix-title">
+        <div className="trading-panel-heading"><div><h2 id="trading-hynix-title">海力士仓位</h2><p>SKHYUSDT（ADR）与 SKHYNIXUSDT（正股）· 与原油共用只读账户 · OKX 数量为张</p></div></div>
+        <div className="trading-account-statuses">{data.hynix.accounts.map(account => <div className="trading-account-status" key={account.exchange}><div><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.state} /></div><p>仓位读取：{formatDate(account.fetchedAt)}{account.fetchedAt ? '（北京时间）' : ''}</p>{account.error ? <p className="trading-warning">{account.error}</p> : null}</div>)}</div>
+        <PositionTable legs={data.hynix.legs} label="海力士仓位明细" />
+        <p className="trading-footnote">仅显示仓位，不计入下方原油总盈亏与资金费；ADR 与正股的数量不直接等同，请按名义价值核对对冲。</p>
+      </section> : null}
 
       <section className="trading-panel trading-pnl" aria-labelledby="trading-pnl-title">
         <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">原油四腿总盈亏</h2><p>持仓浮盈亏＋区间累计已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>

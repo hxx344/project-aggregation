@@ -32,12 +32,13 @@ async function fixture(t, overrides = {}) {
     bybit: [position('bybit', 'CLUSDT', 'short'), position('bybit', 'BZUSDT', 'long')],
     okx: [position('okx', 'CLUSDT', 'short', { marginMode: 'cross', contractSize: '0.1' }), position('okx', 'BZUSDT', 'long', { marginMode: 'cross', contractSize: '0.01' })],
   };
-  const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'funding'].map(method => [method, async (secret, options) => {
+  const hynixRows = { binance: [], bybit: [], okx: [] };
+  const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'hynixPositions', 'funding'].map(method => [method, async (secret, options) => {
     calls.push({ exchange, method, secret, ...options });
     if (handlers[exchange][method]) return handlers[exchange][method](secret, options);
     return method === 'funding'
       ? { fetchedAt: stamp(clock), events: [], coverage: [{ start: options.start, end: options.end }], complete: true, error: null }
-      : { fetchedAt: stamp(clock), positions: rows[exchange] };
+      : { fetchedAt: stamp(clock), positions: method === 'hynixPositions' ? hynixRows[exchange] : rows[exchange] };
   }]));
   const options = { dataDir, initialPassword: PASSWORD, refreshInterval: 0, assetSyncIntervalMs: 0,
     tradingRefreshIntervalMs: 0, tradingClientFactory: clientFactory, tradingNow: () => clock,
@@ -72,7 +73,7 @@ async function fixture(t, overrides = {}) {
     try { return db.prepare('SELECT * FROM trading_accounts WHERE exchange=?').get(exchange); } finally { db.close(); }
   }
   return { get app() { return app; }, get now() { return clock; }, get origin() { return origin; },
-    advance: amount => { clock += amount; }, rows, handlers, calls, request, login, connect, stored, dataDir,
+    advance: amount => { clock += amount; }, rows, hynixRows, handlers, calls, request, login, connect, stored, dataDir,
     async reopen() { if (!closed) await app.close(); closed = true; await open(); },
     async close() { await app.close(); closed = true; },
   };
@@ -227,7 +228,7 @@ test('portfolio margin mode persists across restart and governs every verificati
   assert.deepEqual(f.stored('binance'), previous);
   assert.equal(f.app.trading.state().accounts[0].accountMode, 'portfolio-margin');
   f.advance(6000); await f.app.trading.refresh({ force: true });
-  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['funding', 'positions', 'verify']);
+  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['funding', 'hynixPositions', 'positions', 'verify']);
   assert.ok(f.calls.every(row => row.accountMode === 'portfolio-margin'));
 });
 
@@ -277,6 +278,58 @@ test('four-leg structure follows observed positions, preserves both hedge sides 
   assert.equal(f.app.trading.state().structure.state, 'unknown');
   assert.equal(f.app.trading.state().legs[0].state, 'stale');
   assert.equal(f.app.trading.state().legs[0].fetchedAt, empty.legs[0].fetchedAt);
+});
+
+test('SK hynix positions use the read-only accounts outside oil legs and PnL, fail on their own and survive restarts', async t => {
+  const f = await fixture(t); await f.login();
+  f.hynixRows.binance = [position('binance', 'SKHYUSDT', 'long', { quantity: '100', entryPrice: '37', markPrice: '38.25', notional: '3825', unrealizedPnl: '125' })];
+  f.hynixRows.bybit = [position('bybit', 'SKHYNIXUSDT', 'short', { quantity: '10', entryPrice: '380', markPrice: '382.5', notional: '3825', unrealizedPnl: '-25' })];
+  await f.connect('binance'); await f.connect('bybit');
+  const { data } = await f.request('/api/trading');
+  assert.deepEqual(data.hynix.accounts.map(account => [account.exchange, account.state, account.error]), [['binance', 'live', null], ['bybit', 'live', null]]);
+  assert.deepEqual(data.hynix.legs.map(leg => [leg.id, leg.positions.length, leg.grossNotional, leg.netNotional, leg.unrealizedPnl]), [
+    ['binance:SKHYUSDT', 1, '3825', '3825', '125'], ['binance:SKHYNIXUSDT', 0, '0', '0', '0'],
+    ['bybit:SKHYUSDT', 0, '0', '0', '0'], ['bybit:SKHYNIXUSDT', 1, '3825', '-3825', '-25']]);
+  assert.ok(data.legs.every(leg => ['CLUSDT', 'BZUSDT'].includes(leg.symbol) && leg.positions.every(row => row.symbol === leg.symbol)));
+  assert.equal(data.structure.state, 'opposed');
+  assert.equal(data.pnl.latest.unrealizedPnl, '0', 'SK hynix unrealized PnL stays out of the oil curve');
+  assert.ok(f.calls.filter(call => call.method === 'hynixPositions').every(call => call.secret.apiKey.includes(call.exchange)));
+
+  f.handlers.bybit.hynixPositions = async () => { throw Object.assign(new Error('upstream detail'), { diagnostic: { version: 1, exchange: 'bybit', operation: 'positions', accountMode: 'unified', code: 'http', httpStatus: 400, providerCode: 10001 } }); };
+  f.advance(31000); await f.app.trading.refresh();
+  const failed = (await f.request('/api/trading')).data, bybit = failed.hynix.accounts.find(account => account.exchange === 'bybit');
+  assert.equal(bybit.state, 'stale'); assert.match(bybit.error, /^Bybit 仓位读取失败（HTTP 400，Bybit 10001）/); assert.ok(!JSON.stringify(failed).includes('upstream detail'));
+  assert.equal(failed.hynix.legs[3].positions.length, 1, 'the last observed SK hynix rows stay visible as stale data');
+  assert.deepEqual(failed.accounts.filter(account => account.exchange !== 'okx').map(account => [account.positions.state, account.positions.error]), [['live', null], ['live', null]]);
+  assert.equal(failed.structure.state, 'opposed');
+
+  await f.reopen();
+  assert.match(f.app.trading.state().hynix.accounts[1].error, /^Bybit 仓位读取失败/);
+  assert.equal(f.app.trading.state().hynix.legs[0].positions[0].quantity, '100');
+
+  await f.close();
+  const db = new DatabaseSync(path.join(f.dataDir, 'hub.sqlite'));
+  try {
+    for (const exchange of ['binance', 'bybit']) {
+      const value = JSON.parse(db.prepare('SELECT snapshot FROM trading_accounts WHERE exchange=?').get(exchange).snapshot);
+      if (exchange === 'binance') delete value.hynix;
+      else value.hynix = { ...value.hynix, rows: [position('bybit', 'CLUSDT', 'short')] };
+      db.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=?').run(JSON.stringify(value), exchange);
+    }
+  } finally { db.close(); }
+  await f.reopen();
+  const legacy = f.app.trading.state();
+  assert.equal(legacy.structure.state, 'opposed', 'missing or damaged SK hynix sections keep the oil ledger');
+  assert.deepEqual(legacy.legs.map(leg => leg.positions.length), [1, 1, 1, 1]);
+  assert.deepEqual(legacy.accounts.filter(account => account.exchange !== 'okx').map(account => account.positions.error), [null, null]);
+  assert.ok(legacy.hynix.legs.every(leg => !leg.positions.length && leg.grossNotional === null));
+  assert.ok(legacy.hynix.legs.filter(leg => leg.exchange === 'binance').every(leg => leg.state === 'loading'));
+  assert.deepEqual(legacy.hynix.accounts.map(account => account.error), [null, '本地海力士仓位缓存无效，请刷新重新读取']);
+  delete f.handlers.bybit.hynixPositions; await f.app.trading.refresh();
+  assert.deepEqual(f.app.trading.state().hynix.legs.map(leg => leg.positions.length), [1, 0, 0, 1]);
+
+  f.app.trading.disconnect('binance', 1);
+  assert.ok(f.app.trading.state().hynix.legs.filter(leg => leg.exchange === 'binance').every(leg => leg.state === 'unconfigured' && !leg.positions.length && leg.grossNotional === null));
 });
 
 test('settled funding is exact, deduplicated per exchange, clipped to 7/30 days and grouped at Beijing midnight', async t => {
@@ -346,15 +399,20 @@ test('accounts connected seconds apart share a funding window and can both repor
 
 test('disconnect cancels only that account and late funding or positions cannot recreate its state', async t => {
   const f = await fixture(t); await f.connect('binance'); await f.connect('bybit');
-  const positions = deferred(), funding = deferred();
+  const positions = deferred(), funding = deferred(), hynix = deferred();
   f.handlers.binance.positions = () => positions.promise;
   f.handlers.binance.funding = () => funding.promise;
+  f.handlers.binance.hynixPositions = () => hynix.promise;
   f.rows.bybit = [position('bybit', 'CLUSDT', 'short', { quantity: '3' })];
+  f.hynixRows.bybit = [position('bybit', 'SKHYNIXUSDT', 'short', { quantity: '4' })];
   f.advance(6000); const refreshing = f.app.trading.refresh({ force: true }); await nextTurn();
-  const active = f.calls.filter(row => row.exchange === 'binance' && row.method !== 'verify').slice(-2);
+  const active = f.calls.filter(row => row.exchange === 'binance' && ['positions', 'funding'].includes(row.method)).slice(-2);
+  const activeHynix = f.calls.filter(row => row.exchange === 'binance' && row.method === 'hynixPositions').at(-1);
   f.app.trading.disconnect('binance', 1); await refreshing;
   assert.ok(active.every(row => row.signal.aborted));
+  assert.ok(activeHynix.signal.aborted, 'the in-flight SK hynix read is cancelled with the account');
   positions.resolve({ fetchedAt: stamp(f.now), positions: [position('binance')] });
+  hynix.resolve({ fetchedAt: stamp(f.now), positions: [position('binance', 'SKHYUSDT', 'long', { quantity: '999' })] });
   funding.resolve({ fetchedAt: stamp(f.now), events: [receipt('binance', 'late', '1000', f.now - 1)], coverage: [{ start: f.now - 30 * DAY, end: f.now }], complete: true });
   await nextTurn();
   const state = f.app.trading.state();
@@ -363,6 +421,8 @@ test('disconnect cancels only that account and late funding or positions cannot 
   assert.equal(state.legs[0].positions.length, 0);
   assert.equal(state.legs[2].positions[0].quantity, '3');
   assert.equal(state.funding.events.some(row => row.exchange === 'binance'), false);
+  assert.ok(state.hynix.legs.filter(leg => leg.exchange === 'binance').every(leg => leg.state === 'unconfigured' && !leg.positions.length));
+  assert.equal(state.hynix.legs.find(leg => leg.id === 'bybit:SKHYNIXUSDT').positions[0].quantity, '4');
   assert.equal(f.stored('binance').snapshot, null);
 });
 
@@ -373,17 +433,23 @@ test('successful mode switch clears the old ledger and cancels older position an
   const late = deferred(), oldFunding = deferred(), newFunding = deferred();
   f.handlers.binance.positions = () => late.promise;
   f.handlers.binance.funding = (_secret, { accountMode }) => accountMode === 'standard' ? oldFunding.promise : newFunding.promise;
+  const oldHynix = deferred();
+  f.handlers.binance.hynixPositions = async (_secret, { accountMode }) => accountMode === 'standard' ? oldHynix.promise
+    : { fetchedAt: stamp(f.now), positions: [position('binance', 'SKHYNIXUSDT', 'long', { quantity: '5' })] };
   f.advance(6000); const refreshing = f.app.trading.refresh({ force: true }); await nextTurn();
-  const staleCalls = f.calls.filter(row => row.exchange === 'binance' && row.method !== 'verify').slice(-2);
+  const staleCalls = f.calls.filter(row => row.exchange === 'binance' && ['positions', 'funding'].includes(row.method)).slice(-2);
+  const staleHynix = f.calls.filter(row => row.exchange === 'binance' && row.method === 'hynixPositions').at(-1);
   f.rows.binance = [position('binance', 'BZUSDT', 'long', { quantity: '9' })];
   await f.app.trading.connect('binance', { revision: 1, ...credentials('new_account'), accountMode: 'portfolio-margin' });
   await refreshing; await nextTurn();
   assert.ok(staleCalls.every(row => row.accountMode === 'standard' && row.signal.aborted));
+  assert.ok(staleHynix.accountMode === 'standard' && staleHynix.signal.aborted, 'the old account SK hynix read is cancelled');
   assert.equal(f.app.trading.state().funding.events.length, 0);
   assert.equal(f.app.trading.state().funding.net, null);
   assert.deepEqual(JSON.parse(f.stored('binance').snapshot).funding.coverage, []);
   late.resolve({ fetchedAt: stamp(f.now), positions: [position('binance', 'CLUSDT', 'short', { quantity: '999' })] });
   oldFunding.resolve({ fetchedAt: stamp(f.now), events: [receipt('binance', 'late-ledger', '999', f.now - 1)], coverage: [{ start: f.now - 30 * DAY, end: f.now }], complete: true });
+  oldHynix.resolve({ fetchedAt: stamp(f.now), positions: [position('binance', 'SKHYUSDT', 'short', { quantity: '999' })] });
   await nextTurn();
   const state = f.app.trading.state();
   assert.equal(state.accounts[0].revision, 2);
@@ -398,6 +464,9 @@ test('successful mode switch clears the old ledger and cancels older position an
   newFunding.resolve({ fetchedAt: stamp(f.now), events: [receipt('binance', 'new-ledger', '0.3', incoming.end - 1)], coverage: [{ start: incoming.start, end: incoming.end }], complete: true });
   await f.app.trading.refresh();
   assert.deepEqual(f.app.trading.state().funding.events.map(row => row.id), ['new-ledger']);
+  const hynixLegs = f.app.trading.state().hynix.legs.filter(leg => leg.exchange === 'binance');
+  assert.deepEqual(hynixLegs.map(leg => leg.positions.map(row => row.quantity)), [[], ['5']], 'a late old-account SK hynix result never replaces the new account');
+  assert.deepEqual(JSON.parse(f.stored('binance').snapshot).hynix.rows.map(row => [row.symbol, row.quantity]), [['SKHYNIXUSDT', '5']]);
 });
 
 test('disconnect during verification cancels its save and concurrent verification cannot overwrite it', async t => {
@@ -428,7 +497,7 @@ test('overlapping refresh requests share work and enforce the manual refresh coo
   waiting.resolve({ fetchedAt: stamp(f.now), positions: f.rows.binance }); await Promise.all([first, second]);
   const completedCount = f.calls.length; await f.app.trading.refresh({ force: true }); assert.equal(f.calls.length, completedCount);
   f.advance(31000); await f.app.trading.refresh();
-  assert.ok(f.calls.slice(completedCount).every(row => row.method === 'positions'));
+  assert.ok(f.calls.slice(completedCount).every(row => ['positions', 'hynixPositions'].includes(row.method)));
 });
 
 test('one timed-out exchange preserves its old timestamp while the other completes, and close aborts outstanding reads', async t => {

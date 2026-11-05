@@ -520,6 +520,21 @@ test('OKX execution trades SK hynix share contracts while the read-only ledger s
   assert.deepEqual([...new Set(readOnly.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['CL-USDT-SWAP', 'BZ-USDT-SWAP']);
 });
 
+test('OKX read-only SK hynix positions use share contracts and recheck the read-only permission', async () => {
+  const hynixRule = instId => rule(instId, { ctValCcy: instId.split('-')[0], ctVal: '1', tickSz: instId.startsWith('SKHYNIX-') ? '0.1' : '0.01', lotSz: '0.001', minSz: '0.001' });
+  const h = harness({ readOnly: true, handler: call => call.url.pathname.endsWith('/instruments') ? [hynixRule(call.parameters.instId)]
+    : !call.url.pathname.endsWith('/positions') ? undefined
+      : call.parameters.instId === 'SKHY-USDT-SWAP' ? [position('SKHY-USDT-SWAP', { pos: '100', markPx: '38.25', avgPx: '37', upl: '125', ccy: '' })]
+        : [position('SKHYNIX-USDT-SWAP', { pos: '-9.999', markPx: '382.5', upl: '-12.5' })] });
+  const result = await h.client.hynixPositions(credentials);
+  assert.deepEqual(result.positions.map(row => [row.symbol, row.instrumentId, row.side, row.quantity, row.contractSize, row.notional]),
+    [['SKHYUSDT', 'SKHY-USDT-SWAP', 'long', '100', '1', '3825'], ['SKHYNIXUSDT', 'SKHYNIX-USDT-SWAP', 'short', '9.999', '1', '3824.6175']]);
+  assert.equal(h.calls[0].url.pathname, '/api/v5/account/config');
+  assert.ok(!h.calls.some(call => call.url.pathname.endsWith('/bills-archive')));
+  h.state.config.perm = 'read_only,trade';
+  await assert.rejects(h.client.hynixPositions(credentials), error => error instanceof TradingExchangeError && error.code === 'permissions');
+});
+
 test('OKX market legs send ordType market without a price, are read back as market and never amended', async () => {
   const market = { ...spec, orderType: 'market', stopPrice: null };
   const h = harness();

@@ -2,6 +2,7 @@ import { createHmac } from 'node:crypto';
 import { decimal, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createOkxTradingClient } from './trading-okx-readonly.mjs';
+import { TRADING_HYNIX_SYMBOLS } from './trading-markets.mjs';
 
 const SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
 const BYBIT_BASE_COINS = Object.freeze({ CLUSDT: 'CL', BZUSDT: 'BZ' });
@@ -142,7 +143,7 @@ function normalizePosition(exchange, row, symbol, accountMode) {
     if ((row.positionSide === 'LONG' && compareDecimals(signed, '0') < 0) || (row.positionSide === 'SHORT' && compareDecimals(signed, '0') > 0)) throw invalidData();
     quantity = absolute(signed);
     if (quantity === '0') return null;
-    // PAPI UM omits marginAsset. Its fixed CLUSDT/BZUSDT requests identify the
+    // PAPI UM omits marginAsset. Its fixed per-symbol USDT requests identify the
     // USDT contract; an explicitly conflicting asset must still be rejected.
     if (accountMode === 'portfolio-margin' ? Object.hasOwn(row, 'marginAsset') && row.marginAsset !== 'USDT' : row.marginAsset !== 'USDT') throw invalidData();
     side = compareDecimals(signed, '0') > 0 ? 'long' : 'short';
@@ -319,9 +320,9 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     }
   }
 
-  async function readPositions(credentials, signal, accountMode) {
+  async function readPositions(credentials, signal, accountMode, symbols = SYMBOLS) {
     const positions = [], ids = new Set(), modes = new Map();
-    for (const symbol of SYMBOLS) {
+    for (const symbol of symbols) {
       let cursor = '';
       const cursors = new Set();
       let pages = 0;
@@ -379,6 +380,13 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     const accountMode = modeOf(requestedMode);
     await permissions(credentials, signal, undefined, accountMode);
     try { return await readPositions(credentials, signal, accountMode); }
+    catch (error) { throw withDiagnostic(error, 'positions', accountMode); }
+  }
+
+  async function hynixPositions(credentials, { signal, accountMode: requestedMode } = {}) {
+    const accountMode = modeOf(requestedMode);
+    await permissions(credentials, signal, undefined, accountMode);
+    try { return await readPositions(credentials, signal, accountMode, TRADING_HYNIX_SYMBOLS); }
     catch (error) { throw withDiagnostic(error, 'positions', accountMode); }
   }
 
@@ -449,5 +457,5 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     return snapshot(diagnostic === null, diagnostic);
   }
 
-  return Object.freeze({ verify, positions, funding });
+  return Object.freeze({ verify, positions, hynixPositions, funding });
 }

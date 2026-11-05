@@ -118,13 +118,17 @@ export function ageTradingData(entry: TradingCacheEntry, now: number, unavailabl
     return { ...leg, state: age(leg.state, leg.fetchedAt, 75_000), fundingComplete,
       fundingNet: !fundingComplete && noReceipts ? null : leg.fundingNet };
   });
+  const hynix = data.hynix && {
+    accounts: data.hynix.accounts.map(account => ({ ...account, state: age(account.state, account.fetchedAt, 75_000) })),
+    legs: data.hynix.legs.map(leg => ({ ...leg, state: age(leg.state, leg.fetchedAt, 75_000) })),
+  };
   const allFundingFresh = selectedAccounts.length === 2 && selectedAccounts.every(account => account.funding.state === 'live');
   const complete = data.funding.complete && selectedAccounts.length === 2 && selectedAccounts.every(account => account.funding.complete);
   const last = data.pnl?.latest;
   const expiredPnl = last && (unavailable || entry.failed || now - last.time > 75_000) && (last.unrealizedPnl !== null || last.totalPnl !== null);
   const gap = expiredPnl ? { time: Math.max(now, last.time + 1), unrealizedPnl: null, fundingPnl: null, totalPnl: null } : null;
   return {
-    ...data, accounts, legs,
+    ...data, accounts, legs, ...(hynix ? { hynix } : {}),
     structure: selectedAccounts.length !== 2 || selectedAccounts.some(account => account.positions.state !== 'live') || legs.some(leg => leg.state !== 'live')
       ? { state: 'unknown', message: '等待两所最新仓位，暂不判断四腿结构' } : data.structure,
     funding: { ...data.funding, complete,
