@@ -297,7 +297,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (url.search) throw new HttpError(400, '市场接口不接受查询参数');
       const action = pathname === '/api/research/aero-market/config' && method === 'PUT' ? 'save'
         : pathname === '/api/research/aero-market/refresh' && method === 'POST' ? 'refresh'
-          : pathname === '/api/research/aero-market/favorites' && method === 'PUT' ? 'favorites' : null;
+          : pathname === '/api/research/aero-market/favorites' && method === 'PUT' ? 'favorites'
+            : pathname === '/api/research/aero-market/replay' && method === 'POST' ? 'replay' : null;
       if (!action) throw new HttpError(404, '市场接口不存在');
       const body = await bodyOf();
       const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
@@ -306,6 +307,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供扫描配置');
         return reply(200, await aeroMarket.save(body.config, authorize));
       }
+      if (action === 'replay') return reply(200, await aeroMarket.replay(body));
       if (action === 'favorites') {
         if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'favorites')) throw new HttpError(400, '请提供收藏列表');
         return reply(200, await aeroMarket.saveFavorites(body.favorites, authorize));

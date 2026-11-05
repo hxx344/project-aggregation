@@ -203,6 +203,38 @@ test('each scan records hourly samples for gauge pools, served per window and on
   await reopened.close();
 });
 
+test('replay runs the recommended cells over hourly samples and skips short, unknown or disabled pools', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  onlyBase(dir);
+  const fake = fakeChain(), clock = timers();
+  const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
+  t.after(() => market.close());
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const body = (pools, extra = {}) => ({ window: '7d', deposit: 1000, delayMin: 5, pools, ...extra });
+  const pools = [['base', POOL_WETH, 10], ['base', POOL_AERO, 0], ['base', `0x${'9'.repeat(40)}`, 3]];
+  assert.deepEqual((await market.replay(body(pools))).pools, {}, 'one hourly sample is not enough');
+  for (let h = 0; h < 7; h++) {
+    fake.chain.t += 3600;
+    while (clock.pending()[0]?.ms === 30_000) { await clock.fire(); await settle(market); }
+    await clock.fire(); await settle(market);
+  }
+  const result = await market.replay(body(pools));
+  assert.equal(result.available, true);
+  assert.deepEqual(Object.keys(result.pools).sort(), [`base:${POOL_AERO}`, `base:${POOL_WETH}`].sort(), 'unknown pools are skipped');
+  const weth = result.pools[`base:${POOL_WETH}`];
+  assert.ok(weth.hours >= 6 && weth.emission > 0, JSON.stringify(weth));
+  // 响应按 5 位有效数字取整，恒等式按最大分量的精度核对。
+  assert.ok(Math.abs(weth.net - (weth.emission - weth.impermanent - weth.cost)) <= 1e-4 * Math.max(Math.abs(weth.emission), Math.abs(weth.impermanent), weth.cost, 1e-9), JSON.stringify(weth));
+  for (const bad of [body(pools, { window: '1y' }), body(pools, { deposit: 0 }), body(pools, { delayMin: 2000 }), body([['base', POOL_WETH.toUpperCase(), 1]]), body([['base', POOL_WETH, 1.5]]),
+    body([['mars', POOL_WETH, 1]]), body(Array.from({ length: 251 }, () => ['base', POOL_WETH, 1])), { ...body(pools), extra: 1 }]) {
+    await assert.rejects(market.replay(bad), (e) => e.status === 400);
+  }
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, enabled: false } } });
+  assert.deepEqual((await market.replay(body(pools))).pools, {}, 'disabled chains are not replayed');
+});
+
 test('favorites are validated, persisted in order and survive a restart; a broken file falls back with a notice', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   onlyBase(dir);

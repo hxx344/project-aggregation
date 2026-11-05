@@ -32,6 +32,7 @@
 .am-detail-facts dt{font-size:.6875rem;color:var(--text-tertiary);margin-bottom:2px}
 .am-detail-facts dd{margin:0;font-size:.75rem;overflow-wrap:anywhere}
 .am-detail-facts dd small{display:block;color:var(--text-tertiary);font-size:.625rem;margin-top:2px}
+.am-detail-facts dd.up{color:var(--emerald)}.am-detail-facts dd.down{color:var(--error)}
 .am-detail-facts code{font-size:.6875rem}
 /* 池子详情页 */
 .am-pool-cell{display:flex;align-items:center;gap:8px}

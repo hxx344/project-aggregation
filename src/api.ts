@@ -7,7 +7,7 @@ export class ApiError extends Error {
 export async function api<T>(url: string, { timeoutMs = 15_000, ...options }: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
   const controller = new AbortController();
   const checking = /\/check$/.test(url);
-  const writing = options.method && !['GET', 'HEAD'].includes(options.method) && !/\/(?:check|launch|login|logout)$/.test(url);
+  const writing = options.method && !['GET', 'HEAD'].includes(options.method) && !/\/(?:check|launch|login|logout|replay)$/.test(url);
   const timeout = () => new DOMException(checking ? '连接检查超时，请检查该项目服务后重试。' : writing ? '请求超时，保存结果尚未确认；请先刷新核对。' : '数据读取超时，请稍后重试。', 'TimeoutError');
   const abort = () => controller.abort(options.signal?.reason?.name === 'TimeoutError' ? timeout() : options.signal?.reason);
   if (options.signal?.aborted) abort();

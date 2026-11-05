@@ -124,3 +124,34 @@ test('an unreadable or newer sample database disables averages without throwing 
   assert.ok(check.prepare("SELECT name FROM sqlite_master WHERE name = 'keep'").get());
   check.close();
 });
+
+test('replay series load from the database in batches, then follow new records, completions and pruning', async (t) => {
+  const { clock, open } = fixture(t);
+  const start = clock.t;
+  const first = open();
+  for (let h = 0; h < 20; h++) recordAt(first, start + h * HOUR, h);
+  first.close();
+  const samples = open(); t.after(() => samples.close());
+  clock.t = start + 19 * HOUR;
+  const store = await samples.series();
+  const s = store.get('base:0xp');
+  assert.equal(s.slots.length, 20);
+  assert.deepEqual(s.ticks.slice(0, 3), [0, 1, 2]);
+  assert.equal(s.emission[0], 0.1 * 0.5, 'emission in USD per second');
+  assert.equal(s.vol[0], 0.02, 'larger of the 24h and 7d daily volatility');
+  assert.equal(await samples.series(), store, 'loaded once');
+  // 新整点追加；先缺排放的整点由同一整点的后续读数补上，已完整的不再改。
+  clock.t += HOUR;
+  samples.record('base', clock.t, [row('0xp', { tick: 500, emissionPerSec: null })], 0.5);
+  assert.equal(s.ticks.at(-1), 500); assert.ok(Number.isNaN(s.emission.at(-1)));
+  samples.record('base', clock.t + 60, [row('0xp', { tick: 501 })], 0.5);
+  samples.record('base', clock.t + 120, [row('0xp', { tick: 502 })], 0.5);
+  assert.equal(s.ticks.at(-1), 501); assert.equal(s.slots.length, 21);
+  // 保留期外的整点随库一起清理。
+  clock.t = start + SAMPLE_RETENTION_SEC + 5 * HOUR;
+  samples.record('base', clock.t, [row('0xp', { tick: 9 })], 0.5);
+  assert.ok(s.slots[0] >= clock.t - SAMPLE_RETENTION_SEC - HOUR);
+  assert.equal(s.ticks.at(-1), 9);
+});
+
+function recordAt(samples, at, tick) { samples.record('base', at, [row('0xp', { tick })], 0.5); }
