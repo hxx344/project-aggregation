@@ -4,18 +4,23 @@ async (page) => {
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const base = Date.parse('2026-11-05T02:00:00Z');
   const errors = [], writes = [], reads = [], detailReads = [], held = [], heldDetails = [], saveAcks = [], archivedReports = new Map();
-  let elapsed = 0, state = 'stopped', session = 1, reportPresent = true, unresolved = false, interrupted = false;
+  let elapsed = 0, state = 'stopped', session = 1, reportPresent = true, hasExposure = false, interrupted = false;
   let frozenAt = null, stale = false, failRead = false, rejectSave = false, holdRead = false, holdSave = false, unknownStop = false, expire = false;
   let sourceLeadMs = null, lighterChannelState = 'connected', sampleValid = true;
-  let holdDetail = false, detailFailure = 0;
+  let holdDetail = false, detailFailure = 0, valuationValid = true;
   let serverClock = null;
   const updateServerClock = async () => {
     if (serverClock) elapsed = serverClock.elapsed + await page.evaluate(() => performance.now()) - serverClock.mono;
   };
-  const archives = [];
+  const legacySession = { schema: 1, sessionId: 'cost-legacy-1', startedAt: base - 120000, updatedAt: base - 60000, stopped: true, interrupted: true, completed: 2, unresolved: 1, exposures: [{ id: 'BTC:buy:300', symbol: 'BTC', binanceQuantity: 0.02, lighterQuantity: -0.01, residualQuantity: 0.01 }] };
+  const legacyReport = { schema: 1, sessionId: legacySession.sessionId, scenarios: [{ id: 'BTC:buy:300', direction: 'buy', recentRounds: [{ id: 'legacy-round', outcome: 'unresolved' }] }] };
+  archivedReports.set(legacySession.sessionId, legacyReport);
+  const archives = [{ schema: 1, sessionId: 'cost-legacy-archive', startedAt: base - 180000, endedAt: base - 120000, completed: 3, unresolved: 1, interrupted: true }];
+  archivedReports.set('cost-legacy-archive', { ...legacyReport, sessionId: 'cost-legacy-archive' });
   let config = {
-    schema: 1, symbols: ['BTC', 'ETH'], notionalPerLeg: 1000, latencyScenarios: [300, 600, 1000],
-    makerWaitMs: 15000, holdMs: 5000, hedgeWaitMs: 2000, cooldownMs: 3000,
+    schema: 2, symbols: ['BTC', 'ETH'], orderNotional: 1000, latencyScenarios: [300, 600, 1000],
+    maxInventoryNotional: 5000, maxUnhedgedNotional: 2000, quoteOffsetBps: 0, inventorySkewBps: 2,
+    quoteRefreshMs: 1000, quoteMaxAgeMs: 15000, hedgeWaitMs: 2000,
     maxBookAgeMs: 1000, maxSourceAgeMs: 2000, maxPairSkewMs: 750, maxHedgeSlippageBps: 5,
     queueMultiplier: 1, binanceMakerFeeBps: 0, lighterTakerFeeBps: 0, fundingCostBpsPerHour: null,
   };
@@ -23,18 +28,25 @@ async (page) => {
   const report = () => {
     if (!reportPresent) return null;
     const at = base + (frozenAt ?? elapsed), age = stale ? 60000 : 100;
-    const scenarios = sessionConfig.symbols.flatMap(symbol => ['buy', 'sell'].flatMap(direction => sessionConfig.latencyScenarios.map(latencyMs => {
-      const open = unresolved && symbol === 'BTC' && direction === 'buy' && latencyMs === sessionConfig.latencyScenarios[0];
-      const id = `${symbol}:${direction}:${latencyMs}`;
-      return { id, symbol, direction, latencyMs, status: open ? 'unresolved' : state === 'running' ? 'waiting' : 'stopped', reason: open ? 'hedge_depth_insufficient' : null,
-        task: open ? { id: 'open-task', startedAt: base - 20000, phase: 'unresolved', targetQuantity: 0.01, binanceQuantity: 0.01, lighterQuantity: -0.004, residualQuantity: 0.006, maker: null, pendingHedges: [] } : null,
-        stats: { attempts: 4, completed: 2, unfilled: 1, unresolved: open ? 1 : 0, binanceTurnover: open ? 5000 : 4000, closedBinanceTurnover: 4000, fees: open ? 0.4 : 0.3, closedFees: 0.3, tradingPnl: 1.1, tradingCost: -0.8, costPer10000: -2, fundingScenarioCost: sessionConfig.fundingCostBpsPerHour === null ? null : 0.2, modeledCostPer10000: sessionConfig.fundingCostBpsPerHour === null ? null : -1.5 },
-        recentRounds: [{ id: `${id}:round`, startedAt: base - 15000, endedAt: base - 5000, outcome: 'completed', reason: null, quantity: 0.01, binanceTurnover: 2000, fees: 0.15, tradingPnl: 0.55, tradingCost: -0.4, costPer10000: -2, fundingScenarioCost: null, modeledCostPer10000: null,
-          fills: [{ id: 'fill-1', venue: 'binance', side: 'buy', phase: 'entry', quantity: 0.01, price: 100000, notional: 1000, fee: 0, at: base - 14000, sourceAt: base - 14050, model: 'maker_queue_proxy' }] }],
-        history: [-5, -4, null, -3, -2].map((value, index) => ({ at: base - 20000 + index * 4000, costPer10000: value, modeledCostPer10000: null })),
+    const scenarios = sessionConfig.symbols.flatMap(symbol => sessionConfig.latencyScenarios.map((latencyMs, index) => {
+      const retained = hasExposure && symbol === 'BTC' && index === 0;
+      const active = state === 'running', mark = symbol === 'BTC' ? 100000 : 3000;
+      const bn = retained ? 0.01 : active ? [0, 0.01, -0.01][index] : 0;
+      const pendingHedge = active && symbol === 'ETH' && index === 1;
+      const lighter = retained ? -0.004 : pendingHedge ? -bn + 0.003 : -bn;
+      const id = `${symbol}-inventory-${latencyMs}`;
+      const quote = side => ({ id: `${id}-${side}`, side, price: mark + (side === 'buy' ? -3 : 3) - bn * 200, quantity: (1000 / mark) * (side === 'buy' ? 1 - bn * mark / 5000 : 1 + bn * mark / 5000), remainingQuantity: (1000 / mark) * (side === 'buy' ? 1 - bn * mark / 5000 : 1 + bn * mark / 5000), queueAhead: 0.1, submittedAt: at - 500 });
+      return { id, symbol, latencyMs, status: pendingHedge ? 'hedging' : active ? 'quoting' : 'stopped', reason: null,
+        inventory: { binanceQuantity: bn, lighterQuantity: lighter, residualQuantity: bn + lighter, projectedResidualQuantity: pendingHedge ? 0 : bn + lighter, binanceAveragePrice: bn ? mark - 5 : null, lighterAveragePrice: lighter ? mark - 4 : null, binanceNotional: valuationValid ? bn * mark : null, utilization: valuationValid ? bn * mark / 5000 : null, limitNotional: 5000 },
+        quotes: { buy: active ? quote('buy') : null, sell: active ? quote('sell') : null }, hedge: pendingHedge ? { id: `${id}-hedge`, side: 'sell', quantity: 0.003, dueAt: at + latencyMs, attempt: 1 } : null,
+        stats: { quoteUpdates: 8, makerFills: 4, hedgeFills: 3, hedgeFailures: 1, binanceTurnover: 4000, lighterTurnover: 3000, fees: 0.3, realizedPnl: 0.6, unrealizedPnl: valuationValid ? 0.5 : null, netPnl: valuationValid ? 0.8 : null, markedCost: valuationValid ? -0.8 : null, costPer10000: valuationValid ? -2 : null, fundingScenarioCost: sessionConfig.fundingCostBpsPerHour === null ? null : 0.2, modeledCostPer10000: valuationValid && sessionConfig.fundingCostBpsPerHour !== null ? -1.5 : null },
+        valuation: { at: valuationValid ? at : null, valid: valuationValid, reason: valuationValid ? null : 'valuation_unavailable', binanceMark: valuationValid ? mark : null, lighterMark: valuationValid ? mark : null },
+        recentFills: [{ id: `${id}-fill`, venue: 'binance', side: 'buy', phase: 'quote', quantity: 0.01, price: mark, notional: mark * 0.01, fee: 0, at: base - 14000, sourceAt: base - 14050, model: 'maker_queue_proxy' }],
+        history: [-5, -4, null, -3, -2].map((value, i) => ({ at: base - 20000 + i * 4000, costPer10000: value, modeledCostPer10000: null, binanceQuantity: bn, residualQuantity: bn + lighter })),
+        events: [{ at: base - 10000, type: 'quoting', reason: null }],
       };
-    })));
-    return { schema: 1, sessionId: `cost-fixture-${session}`, startedAt: base - 60000, updatedAt: at, stopped: state === 'stopped', interrupted, mode: 'paper', sessionConfig: structuredClone(sessionConfig), markets: [],
+    }));
+    return { schema: 2, strategy: 'inventory_quotes', sessionId: `cost-fixture-${session}`, startedAt: base - 60000, updatedAt: at, stopped: state === 'stopped', interrupted, mode: 'paper', sessionConfig: structuredClone(sessionConfig), markets: [],
       books: sessionConfig.symbols.flatMap(symbol => ['binance', 'lighter'].map(venue => ({ venue, symbol, nativeSymbol: venue === 'binance' ? `${symbol}USDC` : symbol, bid: symbol === 'BTC' ? 99999 : 3000, ask: symbol === 'BTC' ? 100001 : 3001, sourceAt: at - age, receivedAt: at - age, ageMs: age, valid: sampleValid,
         ...(venue === 'lighter' && sourceLeadMs !== null ? { sourceAt: at + sourceLeadMs, sourceClockDeltaMs: -age - sourceLeadMs, sourceClockUncertain: true } : {}),
       }))),
@@ -43,8 +55,8 @@ async (page) => {
   };
   const snapshot = () => {
     const summary = report();
-    if (summary) { summary.detailLevel = 'summary'; summary.scenarios = summary.scenarios.map(scenario => ({ ...scenario, recentRounds: [], history: [] })); }
-    return { schema: 1, state, enabled: state === 'running' || state === 'starting', error: null, serverNow: base + elapsed, config: structuredClone(config), report: summary, archives: structuredClone(archives), execution: { mode: 'paper', liveAvailable: false, version: 1 } };
+    if (summary) { summary.detailLevel = 'summary'; summary.scenarios = summary.scenarios.map(scenario => ({ ...scenario, recentFills: [], history: [], events: [] })); }
+    return { schema: 2, state, enabled: state === 'running' || state === 'starting', error: null, serverNow: base + elapsed, config: structuredClone(config), report: summary, archives: structuredClone(archives), legacySession: structuredClone(legacySession), execution: { mode: 'paper', liveAvailable: false, version: 2 } };
   };
   page.on('pageerror', error => errors.push(error.message));
   await page.clock.install({ time: new Date(base) });
@@ -107,8 +119,8 @@ async (page) => {
     if (path === `${root}/start`) { state = 'running'; sessionConfig = structuredClone(config); reportPresent = true; return send(snapshot()); }
     if (path === `${root}/archive`) {
       archivedReports.set(`cost-fixture-${session}`, report());
-      archives.push({ sessionId: `cost-fixture-${session}`, startedAt: base - 60000, endedAt: base + elapsed, completed: 24, unresolved: unresolved ? 1 : 0, interrupted });
-      session++; reportPresent = false; unresolved = false; interrupted = false; return send(snapshot());
+      archives.push({ schema: 2, sessionId: `cost-fixture-${session}`, startedAt: base - 60000, endedAt: base + elapsed, makerFills: 24, hasExposure, interrupted });
+      session++; reportPresent = false; hasExposure = false; interrupted = false; return send(snapshot());
     }
     throw new Error(`Unexpected research request: ${request.method()} ${path}`);
   });
@@ -123,37 +135,60 @@ async (page) => {
   serverClock = { elapsed, mono: await page.evaluate(() => performance.now()) };
   assert((await page.locator('.breadcrumb').innerText()).includes('监控'), 'the native route is in monitoring');
   assert(await page.getByRole('heading', { name: '对冲成本研究', exact: true }).count() === 1, 'native cost-lab route renders the research page');
-  assert(await page.locator('.blc-scenarios tbody tr').count() === 12, 'BTC/ETH buy/sell times three delays remain independent rows');
+  assert(await page.locator('.blc-scenarios tbody tr').count() === 6, 'BTC/ETH times three delays remain independent inventory accounts');
   assert((await page.locator('.blc-identity').innerText()).includes('真实订单 0'), 'simulation and qualification boundaries remain visible');
-  assert((await page.locator('.blc-scenarios').innerText()).includes('模拟收益'), 'negative costs are labeled simulated gains');
+  assert((await page.locator('.blc-scenarios').innerText()).includes('模拟盯市收益'), 'negative costs are labeled simulated gains');
   await page.locator('.blc-diagnostics>summary').click();
   assert((await page.locator('.blc-diagnostics').innerText()).includes('公开合约信息待恢复'), 'public collection diagnostics expose bounded failure facts');
   await page.locator('.blc-diagnostics>summary').click();
   await page.locator('.blc-chart .recharts-line-curve').first().waitFor();
   const path = await page.locator('.blc-chart .recharts-line-curve').first().getAttribute('d');
   assert((path.match(/M/g) || []).length >= 2, 'null samples break the cost line');
-  assert(snapshot().report.scenarios.every(scenario => scenario.history.length === 0 && scenario.recentRounds.length === 0), 'state reads carry summary arrays only');
-  assert(detailReads.length === 1 && detailReads[0].scenarioId === 'BTC:buy:300', 'initial page requests only the selected scenario detail');
-  await page.locator('.blc-selected-detail .blc-records>summary').click();
-  assert(await page.locator('.blc-selected-detail .blc-records tbody tr').count() === 1, 'the selected detail restores round records omitted by summary');
+  assert(snapshot().report.scenarios.every(scenario => scenario.history.length === 0 && scenario.recentFills.length === 0), 'state reads carry summary arrays only');
+  assert(detailReads.length === 1 && detailReads[0].scenarioId === 'BTC-inventory-300', 'initial page requests only the selected scenario detail');
+  assert((await page.locator('.blc-legacy').innerText()).includes('0.02 BTC'), 'legacy exposures remain separate from inventory scenarios');
+  const legacyDownload = page.waitForEvent('download'); await page.getByRole('button', { name: '下载旧版报告', exact: true }).click();
+  assert((await legacyDownload).suggestedFilename().includes('cost-legacy-1'), 'legacy report downloads with its original session identity');
+  await page.waitForTimeout(25);
+  assert(await page.evaluate(() => window.__costDownloads.at(-1).report.schema === 1 && window.__costDownloads.at(-1).report.scenarios[0].recentRounds[0].id === 'legacy-round'), 'legacy report is not relabeled or converted into schema 2');
+  await page.locator('.blc-selected-detail .blc-fills>summary').click();
+  assert(await page.locator('.blc-selected-detail .blc-fills tbody tr').count() === 1, 'the selected detail restores fill records omitted by summary');
+  assert((await page.locator('.blc-selected-detail .blc-fills').innerText()).includes('双边报价成交'), 'individual fills use quote and hedge phases');
+  await page.locator('.blc-events>summary').click();
+  assert(await page.locator('.blc-events li').count() === 1, 'bounded strategy events are available on demand');
+  await page.locator('.blc-events>summary').click();
   holdDetail = true; await refresh(); await page.waitForTimeout(25);
   assert(heldDetails.length === 1, 'a selected detail refresh is held');
   const inFlightDetails = detailReads.length; await refresh(); await advance(5000);
   assert(detailReads.length === inFlightDetails, 'multiple summary refreshes coalesce behind one detail request');
   assert(await page.locator('.blc-chart .recharts-line-curve').count() > 0, 'summary empty arrays cannot erase the last selected history');
   await page.locator('.blc-scenario-select').nth(1).click();
-  await page.locator('.blc-selected-detail[data-scenario-id="BTC:buy:600"] .recharts-line-curve').first().waitFor();
+  await page.locator('.blc-selected-detail[data-scenario-id="BTC-inventory-600"] .recharts-line-curve').first().waitFor();
   await heldDetails.shift()(); await page.waitForTimeout(25);
-  assert(await page.locator('.blc-selected-detail').getAttribute('data-scenario-id') === 'BTC:buy:600', 'late previous-scenario detail cannot replace the new selection');
+  assert(await page.locator('.blc-selected-detail').getAttribute('data-scenario-id') === 'BTC-inventory-600', 'late previous-scenario detail cannot replace the new selection');
   detailFailure = 503; await refresh(); await page.getByText(/详情读取失败：fixture detail failed/).waitFor();
   assert(await page.locator('.blc-chart .recharts-line-curve').count() > 0, 'detail transport failure retains matching historical records with its timestamp');
   detailFailure = 409; await refresh(); await page.getByText(/详情读取失败：会话或情景已变化/).waitFor();
   assert(await page.locator('.blc-chart .recharts-line-curve').count() === 0, 'server session conflict discards obsolete detail');
   detailFailure = 0; await page.locator('.blc-scenario-select').first().click();
-  await page.locator('.blc-selected-detail[data-scenario-id="BTC:buy:300"] .recharts-line-curve').first().waitFor();
+  await page.locator('.blc-selected-detail[data-scenario-id="BTC-inventory-300"] .recharts-line-curve').first().waitFor();
   await overflow();
   await page.getByRole('button', { name: '启动模拟', exact: true }).click();
   await page.locator('.blc-state.running').waitFor();
+  assert(await page.locator('.blc-buy-quote strong').count() === 6 && await page.locator('.blc-sell-quote strong').count() === 6, 'all six independent scenarios display buy and sell quotes simultaneously');
+  assert((await page.locator('.blc-inventory tbody tr').nth(0).innerText()).includes('零库存'), 'zero inventory is visible without an opening-direction model');
+  const longRow = page.locator('.blc-inventory tbody tr').nth(1), shortRow = page.locator('.blc-inventory tbody tr').nth(2);
+  assert((await longRow.locator('.blc-binance-inventory').innerText()).includes('多仓') && (await shortRow.locator('.blc-binance-inventory').innerText()).includes('空仓'), 'positive and negative BN inventory retain directional labels');
+  assert((await longRow.locator('.blc-buy-quote').innerText()).includes('0.008') && (await longRow.locator('.blc-sell-quote').innerText()).includes('0.012'), 'long inventory displays smaller buy and larger sell quantities');
+  assert((await shortRow.locator('.blc-buy-quote').innerText()).includes('0.012') && (await shortRow.locator('.blc-sell-quote').innerText()).includes('0.008'), 'short inventory displays larger buy and smaller sell quantities');
+  assert((await page.locator('.blc-inventory tbody tr').nth(4).innerText()).includes('卖出 0.003 ETH'), 'one pending net hedge is displayed with its remaining demand');
+  assert(await page.locator('.blc-stopped-exposure').count() === 0, 'normal active inventory does not appear as an unresolved-error warning');
+  valuationValid = false; await refresh();
+  assert(await page.getByText('估值未知 · 缺少合格估值价格', { exact: true }).count() === 6, 'missing valuation is explicit for all affected scenarios');
+  assert((await page.locator('.blc-marked-cost').first().innerText()).startsWith('—'), 'unknown valuation cannot appear as zero cost');
+  assert((await page.locator('.blc-scenarios tbody tr').first().innerText()).includes('0.3 / —'), 'known fees survive missing unrealized and net PnL');
+  assert((await longRow.locator('.blc-binance-inventory').innerText()).includes('名义额 — / 上限 5,000') && (await longRow.innerText()).includes('有向库存占比 —'), 'unknown inventory mark never becomes zero exposure');
+  valuationValid = true; await refresh();
   assert(await page.locator('.blc-quality.good').count() === 4, 'current valid market samples meet strict single-leg timing');
   for (const lead of [40, 90, 250]) {
     sourceLeadMs = lead; await refresh();
@@ -179,7 +214,7 @@ async (page) => {
   sampleValid = true;
   lighterChannelState = 'connected'; await refresh(); await page.getByText('公开数据源连接', { exact: true }).click();
   await page.locator('.blc-config>summary').click();
-  const notional = page.getByLabel('每腿模拟名义额（USDC）', { exact: true });
+  const notional = page.getByLabel('单侧基础报价名义额（USDC）', { exact: true });
   assert(await notional.isDisabled(), 'active configuration is read only');
   frozenAt = elapsed; await refresh(); await advance(3100);
   assert(await page.locator('.blc-quality.good').count() === 0, 'an old browser snapshot cannot assert current validity');
@@ -192,6 +227,7 @@ async (page) => {
   await advance(13000); await refresh();
   await page.getByText('研究报告超过 15 秒未更新', { exact: true }).waitFor();
   assert(await page.getByText('历史采样时有效', { exact: true }).count() === 4, 'a stopped report is explicitly historical, not a current healthy claim');
+  assert((await page.locator('.blc-exposures .panel-heading').innerText()).includes('历史报告'), 'frozen quote and inventory evidence is visibly historical');
   frozenAt = null; await refresh();
   holdRead = true; await page.getByRole('button', { name: '刷新状态', exact: true }).click(); await page.waitForTimeout(25);
   assert(held.length === 1, 'slow network response is held'); await advance(2500); await held.shift()(); await page.waitForTimeout(25);
@@ -209,7 +245,7 @@ async (page) => {
   await page.getByRole('button', { name: '停止模拟', exact: true }).click(); await page.locator('.blc-state.stopped').waitFor();
   const beforeValidation = writes.length;
   await notional.fill(''); await page.getByRole('button', { name: '保存配置', exact: true }).click();
-  await page.getByText('每腿模拟名义额（USDC）须为 10–100000 之间的数字。', { exact: true }).waitFor();
+  await page.getByText('单侧基础报价名义额（USDC）须为 10–100000 之间的数字。', { exact: true }).waitFor();
   assert(writes.length === beforeValidation, 'blank required numeric input is not converted to zero');
   await notional.fill('250');
   const latency = page.getByLabel('情景 1 延迟（ms）', { exact: true });
@@ -217,18 +253,29 @@ async (page) => {
   await page.getByText('Lighter 延迟（ms）须为 300–10000 之间的整数。', { exact: true }).waitFor();
   await latency.fill('300.5'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
   assert(writes.length === beforeValidation, 'latency floor and integer constraints match the backend');
-  await latency.fill('300'); rejectSave = true;
+  await latency.fill('300');
+  const inventoryLimit = page.getByLabel('BN 库存名义额上限（USDC）', { exact: true });
+  await inventoryLimit.fill('200'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByText('BN 库存名义额上限不得小于单侧基础报价名义额。', { exact: true }).waitFor();
+  await inventoryLimit.fill('5000');
+  const quoteRefresh = page.getByLabel('最短重报间隔（ms）', { exact: true }), quoteAge = page.getByLabel('挂单最长寿命（ms）', { exact: true });
+  await quoteRefresh.fill('999'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByText('最短重报间隔（ms）须为 1000–60000 之间的整数。', { exact: true }).waitFor();
+  await quoteRefresh.fill('2000'); await quoteAge.fill('1000'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByText('挂单最长寿命不得小于最短重报间隔。', { exact: true }).waitFor();
+  assert(writes.length === beforeValidation, 'inventory reservation and refresh lifetime constraints reject before submitting');
+  await quoteRefresh.fill('1000'); await quoteAge.fill('15000'); rejectSave = true;
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('fixture save rejected', { exact: true }).waitFor();
   assert(await notional.inputValue() === '250' && await page.getByRole('button', { name: '保存配置', exact: true }).isEnabled(), 'explicit rejection retains draft and allows corrected retry');
   rejectSave = false; holdRead = true; await advance(5000); assert(held.length === 1, 'pre-save GET is held');
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('配置已保存。', { exact: true }).waitFor();
   await held.shift()(); await page.waitForTimeout(25);
-  assert(await notional.inputValue() === '250' && config.notionalPerLeg === 250, 'late old GET cannot roll back a confirmed save');
+  assert(await notional.inputValue() === '250' && config.orderNotional === 250, 'late old GET cannot roll back a confirmed save');
   await notional.fill('300'); holdSave = true;
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.waitForTimeout(25);
   assert(saveAcks.length === 1, 'save response is held'); await notional.fill('350');
   await saveAcks.shift()(); await page.getByText('配置已保存。', { exact: true }).waitFor();
-  assert(await notional.inputValue() === '350' && config.notionalPerLeg === 300, 'edits during a save retain the newer draft');
+  assert(await notional.inputValue() === '350' && config.orderNotional === 300, 'edits during a save retain the newer draft');
   assert(await page.getByRole('button', { name: '保存配置', exact: true }).isEnabled(), 'newer draft remains visibly unsaved');
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('配置已保存。', { exact: true }).waitFor();
   const oldSession = await page.locator('.blc-session').innerText();
@@ -242,26 +289,27 @@ async (page) => {
   assert(await page.getByRole('button', { name: '停止模拟', exact: true }).isDisabled(), 'an unrelated successful GET cannot release an unknown operation');
   state = 'stopped'; unknownStop = false; await refresh();
   await page.getByText('已读取并核对操作结果。', { exact: true }).waitFor();
-  unresolved = true; interrupted = true; await refresh();
-  assert((await page.locator('.blc-exposures').innerText()).includes('0.006'), 'unresolved residual remains visible after stopping');
-  assert(await page.getByRole('button', { name: '启动模拟', exact: true }).isDisabled(), 'unresolved prior session blocks a new session until archive');
+  hasExposure = true; interrupted = true; await refresh();
+  assert((await page.locator('.blc-exposures').innerText()).includes('0.006'), 'retained residual remains visible after stopping');
+  assert(await page.getByRole('button', { name: '启动模拟', exact: true }).isDisabled(), 'retained inventory blocks a new session until archive');
   const downloadEvent = page.waitForEvent('download'); await page.getByRole('button', { name: '导出报告', exact: true }).click();
   assert((await downloadEvent).suggestedFilename().startsWith('binance-lighter-cost-'), 'the report exports as JSON');
   await page.waitForTimeout(25);
-  assert(await page.evaluate(() => window.__costDownloads.at(-1).report.scenarios.every(scenario => scenario.recentRounds.length > 0 && scenario.history.length > 0)), 'full report export retains every scenario history and fill record');
+  assert(await page.evaluate(() => window.__costDownloads.at(-1).report.scenarios.every(scenario => scenario.recentFills.length > 0 && scenario.history.length > 0)), 'full report export retains every scenario history and fill record');
   holdDetail = true; await refresh(); await page.waitForTimeout(25);
   assert(heldDetails.length === 1, 'pre-archive detail is held');
   await page.getByRole('button', { name: '归档当前会话', exact: true }).click(); await page.getByText('会话已归档，可启动新的独立会话。', { exact: true }).waitFor();
   await heldDetails.shift()(); await page.waitForTimeout(25);
   assert(await page.locator('.blc-selected-detail').count() === 0, 'a late archived-session detail is never rendered under the empty or next session');
   await page.locator('.blc-archives>summary').click();
+  assert((await page.locator('.blc-archives tbody tr').first().innerText()).includes('旧版单轮 · v1') && (await page.locator('.blc-archives tbody tr').first().innerText()).includes('1 条旧版未决'), 'v1 archives keep round and unresolved semantics');
   assert((await page.locator('.blc-archives tbody').innerText()).includes('cost-fixture-1'), 'archive preserves prior session identity');
-  assert((await page.locator('.blc-archives tbody tr td').nth(2).innerText()) === '1', 'archive retains the unresolved count');
-  assert((await page.locator('.blc-archives tbody tr td').nth(3).innerText()) === '曾中断', 'interruption is shown independently and never added to the unresolved count');
-  const archivedDownload = page.waitForEvent('download'); await page.getByRole('button', { name: '下载归档', exact: true }).click();
+  assert((await page.locator('.blc-archives tbody tr').last().locator('td').nth(2).innerText()) === '库存保留', 'v2 archive retains exposure without inventing unresolved rounds');
+  assert((await page.locator('.blc-archives tbody tr').last().locator('td').nth(3).innerText()) === '曾中断', 'interruption is shown independently of exposure');
+  const archivedDownload = page.waitForEvent('download'); await page.getByRole('button', { name: '下载归档', exact: true }).last().click();
   assert((await archivedDownload).suggestedFilename().includes('cost-fixture-1'), 'archived full report downloads by server-provided session identity');
   await page.waitForTimeout(25);
-  assert(await page.evaluate(() => window.__costDownloads.at(-1).report.scenarios[0].recentRounds[0].fills.length === 1), 'archived report export keeps full round fill evidence');
+  assert(await page.evaluate(() => window.__costDownloads.at(-1).report.scenarios[0].recentFills.length === 1), 'archived report export keeps fill evidence');
   await page.getByRole('button', { name: '启动模拟', exact: true }).click(); await page.locator('.blc-state.running').waitFor();
   await page.evaluate(() => { window.__costHidden = true; document.dispatchEvent(new Event('visibilitychange')); });
   const hiddenReads = reads.length, hiddenDetailReads = detailReads.length, hiddenWrites = writes.length; await advance(20000);
@@ -286,5 +334,5 @@ async (page) => {
   assert(errors.length === 0, `no browser errors: ${errors.join('; ')}`);
   assert(writes.every(write => ['/start', '/stop', '/config', '/archive'].some(suffix => write.path === root + suffix)), 'only paper research state is mutated');
   await page.clock.resume();
-  return { checks: 'native-route, summary/detail, selected-only, coalesced-detail, detail-switch-race, detail-error-retention, detail-session-conflict, full-export, separate-archive-interruption, independent-scenarios, signed-costs, chart-gaps, stop-save-start, numeric-validation, rejected-save, stale-GET-save-race, save-draft-preservation, frozen-session, monotonic-freshness, server-clock, source-clock-tolerance, channel-labels, stale/error, unresolved/archive, unknown-write-latch, hidden/offline/resume, download, mobile-overflow, unmount, session-expiry', writes: writes.length, reads: reads.length, detailReads: detailReads.length };
+  return { checks: 'native-route, summary/detail, selected-only, coalesced-detail, detail-switch-race, detail-error-retention, detail-session-conflict, full-export, separate-archive-interruption, six-inventory-scenarios, simultaneous-quotes, signed-inventory, net-hedge, unknown-valuation, legacy-download, mixed-schema-archives, signed-costs, chart-gaps, stop-save-start, numeric-validation, rejected-save, stale-GET-save-race, save-draft-preservation, frozen-session, monotonic-freshness, server-clock, source-clock-tolerance, channel-labels, stale/error, retained-inventory/archive, unknown-write-latch, hidden/offline/resume, download, mobile-overflow, unmount, session-expiry', writes: writes.length, reads: reads.length, detailReads: detailReads.length };
 }

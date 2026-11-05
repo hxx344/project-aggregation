@@ -1,66 +1,68 @@
-# Binance / Lighter 成本研究
+# Binance / Lighter 双边库存报价成本研究
 
-## 实施范围与风险（2026-11-05）
+从工作台「监控 → 对冲成本研究」进入。使用 BTCUSDC/BTC 与 ETHUSDC/ETH 永续的公开 WebSocket 盘口及 Binance 主动成交，模拟 BN 双边 Maker 报价与 Lighter 净敞口对冲。当前仅模拟，没有真实订单、账户凭据或实盘开关。
 
-风险等级 R3。新增工作台独立研究页、公开行情采集、模拟执行、版本化执行接口与研究 API。首批仅 BTCUSDC/BTC 与 ETHUSDC/ETH 永续合约。当前版本只使用公开行情，不读取交易凭据，不发送真实订单，不允许通过配置启用实盘。
+## 报价与库存
 
-全部实现位于 `server/research/binance-lighter-*`，由工作台 runtime 管理；`server/` 已由正式运行包与应用内容指纹覆盖，不新增独立服务或安装步骤。API 沿用工作台会话、同源、CSRF 和运行时会话复核。前端独立 lazy 路由 `?view=cost-lab`，沿用工作台布局。
+每个「币种 × Lighter 延迟」是独立的模拟账户。默认 BTC/ETH 与 300/600/1000ms，共六个情景；买卖报价共享该情景的 BN 库存，不能把情景结果相加为一个账户收益。
 
-从工作台「监控 → 对冲成本研究」进入。保存币种、单腿名义金额、挂单等待时间及对冲延迟后启动；运行中配置只读，关闭页面仍继续模拟。停止后可导出或归档本会话，再开始新的研究。首次启动和工作台重启后均不会自动开始模拟。
+BN 目标净库存为零。初始同时挂买单和卖单；多仓增加时，买价后移、买量缩小，卖价更积极、卖量增加；空仓增加时反过来。报价以 BN 盘口为基准，按库存比例偏移，遵守 tick、数量步长、最小额与 Post-only 条件。达到库存上限后，只保留符合风险额度的方向。
 
-失败时停止新增模拟，保留已模拟成交、未决敞口和已完成记录。停止或重启不能将未平模拟改成零仓或已结算。回滚：停止新研究，回退上一正式版本；保留 `DATA_DIR/binance-lighter-cost`，不修改已有账户、数据库结构或其他模块配置。
+库存额度包括已持有数量及同侧挂单剩余数量，不以另一侧可能成交来抵消。净敞口还同时考虑当前 BN + Lighter 和在途对冲全部成交后的状态。默认基础单侧报价额 1,000 USDC、BN 库存上限 5,000 USDC、未对冲上限 2,000 USDC，均为可调整的模拟参数。
 
-## 计算口径
+报价有最小刷新间隔和最长寿命。相同价格、数量的挂单保留排队进度；换价或改量重新排队。挂单到期只是刷新报价，不触发定时平仓，也不会因此把情景永久终止。
 
-- Binance Maker 由公开主动成交消耗挂单时可见队列的代理模型驱动；盘口触价、撤单缩量不等于成交。不能证明真实排队位置或真实成交概率。部分模拟成交按数量安排对冲。
-- Lighter 使用 Standard 普通 Taker 模型。延迟至少 300ms，延迟结束后只使用新收到且合格的盘口，按真实档位扫单；不足或超时保留未对冲数量，不补造足量成交。
-- 盘口与逐笔成交流的健康状态独立，盘口更新不能证明成交流恢复。任何必要通道重连预算耗尽时停止本会话；临时断档也会撤销旧队列依据。
-- 对冲同时要求单调接收时间超过到期点、来源时间晚于上一帧且不早于到期墙钟减 250ms 的时钟容差；单纯晚到的旧帧不作为延迟成交证据。序列号在任何大整数运算前限制为最多 40 位。
-- 同时运行的币种、买卖方向与延迟情景互相独立，不把它们相加为可实现账户总收益。
-- 四腿成交现金流计算价格盈亏；盘口滑点和延迟影响已在成交价内，不再重复扣除。费用锁定于本会话配置；默认零费是公开优惠假设，不代表账户实际费率已核验。
-- 计价为 USDC 名义结算单位，不是 USD 法币估值。Lighter 原生参考价格单位 USD 与其 USDC 线性 PnL 分别保留。
-- 成本指标只用同一情景中已完成开平的成本除以这些开平的 Binance 模拟名义额；Lighter 成交额不进入分母，未完成头寸不稀释已完成成本。
-- 实际资金费未核验时保持未知。可另填每小时净资金费支出情景（正值成本，负值收益），按名义额和持有时长估计，不把它称为已结算资金费。活动资格、有效成交额和奖励保持未知。
+Maker 成交使用公开主动成交消耗可见队列的代理模型；盘口触价、撤单缩量不代表成交。先让新成交消息作用于此前已存在的订单，再依最新库存调整报价；新订单不能消耗创建它的同一条成交。超出可见深度不能假定前方队列为零。这些假设不能证明真实排队位置或成交概率。
 
-## 界面与数据设计
+## 净敞口对冲与恢复
 
-分析任务是比较执行成本及观察实时数据质量。主视图为情景比较表、逐笔模拟记录与按真实时间绘制的成本折线；沿用 React/Recharts，单页一张图，最多 300 点，不逐盘口重绘。断流和未知值显示缺口而不是零。数字可直接读取，窄屏表格内部滚动，支持键盘和文本状态。配色与字号沿用工作台变量，状态不用单一颜色表达。页面只轮询聚合快照，关闭页面不会停止服务器采集。
+Lighter 对冲目标是该情景的净数量 BN + Lighter = 0。每个情景最多一个在途 IOC；其等待期间 BN 的双边成交只改变最新净需求，原 IOC 终态后再按实际已成交数量重算残差，不同时发送反向对冲。
 
-服务器持续用 WebSocket 接收盘口和逐笔成交，网页每 5 秒读取报告。盘口表将报告采样时的严格校验结果与当前页面快照年龄分开：采样合格但页面快照变旧时显示中性待更新，不据此判定服务器行情失效；服务端报告的校验失败、真正旧样本和源时钟异常仍明确提示。报告超过 15 秒不更新时单独提示。此显示口径不放宽任何模拟执行门槛。
+延迟至少 300ms。对冲只能使用延迟结束后新收到且合格的 Lighter 盘口，并按可见深度和滑点限制模拟成交。单调接收时间、来源时间与序列校验沿用原有要求；旧帧、重复帧和定时器不能制造成交。部分成交只记录实际数量，零成交、部分成交及超时共用有界尝试预算；重试有新的订单身份与新的延迟。达到上限后撤下报价，保留库存、费用和未对冲数量。
 
-## 接口契约 v1
+短暂行情失效撤下报价并保留库存，恢复须由各必要通道自己的新数据证明健康，再重新排队。小于对冲最小量的残差保持可见，在额度内等待后续净额累积。合约规则语义变化、处理或持久化失败、行情重连预算耗尽仍停止新增模拟。
 
-入口 `/api/research/binance-lighter-cost`：GET 轻量状态；GET `/scenario/<sessionId>/<scenarioId>` 按需读取当前会话某个情景的完整逐笔与曲线；PUT `/config` 保存 `{config}`；POST `/start`、`/stop`、`/archive` 接受空对象；GET `/report` 导出当前完整报告及归档摘要；GET `/report/<sessionId>` 下载指定归档。配置只接受已知字段，不能传入 URL、路径、密钥或执行模式。归档仅针对停止的模拟，保留原记录。新会话与旧详情请求严格隔离，过期会话 ID 返回 409。
+关闭页面不会停止服务器模拟。手动停止不模拟强制平仓；工作台服务重启后恢复历史报告并保持停止，不恢复丢失的排队位置。带库存或中断的会话归档后才能新建独立研究。
 
-配置：`schema:1`，`symbols:['BTC','ETH']`，`notionalPerLeg:1000`，`latencyScenarios:[300,600,1000]`，`makerWaitMs:15000`，`holdMs:5000`，`hedgeWaitMs:2000`，`cooldownMs:3000`，`maxBookAgeMs:1000`，`maxSourceAgeMs:2000`，`maxPairSkewMs:750`，`maxHedgeSlippageBps:5`，`queueMultiplier:1`，`binanceMakerFeeBps:0`，`lighterTakerFeeBps:0`，`fundingCostBpsPerHour:null`。
+## 成本口径
 
-状态：`{schema:1,state:'stopped'|'starting'|'running'|'fault',enabled,error,serverNow,config,report,archives,execution:{mode:'paper',liveAvailable:false,version:1}}`。
+两场所分别维护精确数量、平均成本及已实现价格盈亏。反向成交先减少已有库存，超过原库存的部分建立反向库存。手续费独立累计，成交价已包含的滑点和延迟影响不重复扣除。
 
-报告：`{schema:1,sessionId,sessionConfig,startedAt,updatedAt,stopped,interrupted,mode:'paper',detailLevel,markets,books,channels,scenarios,diagnostics,assumptions}`。常规状态的 `detailLevel='summary'` 不携带历史曲线和逐笔，空数组不是「无历史」；单情景接口返回 `{sessionId,updatedAt,scenario}`，完整导出保留原记录。这一路由按 `Accept-Encoding` 协商 gzip，保留 `no-store` 和 `Vary: Accept-Encoding`，不压缩其它会话或凭据接口。
+主指标为 **每万 BN 模拟成交额的盯市成本**：
 
-每行情摘要：`{venue,symbol,nativeSymbol,bid,ask,sourceAt,receivedAt,ageMs,valid}`；连接状态：`{venue,channel,symbol?,state,reason?,at}`。`ageMs` 为报告产生时的单调接收年龄，浏览器叠加读取耗时与本地单调经过时间，不以页面刷新替代源更新。
+- 净盈亏 = 两场所已实现价格盈亏 + 未实现价格盈亏 − 全部手续费。
+- 盯市成本 = −净盈亏。
+- 每万成本 = 盯市成本 ÷ 全部 BN 模拟成交额 × 10,000。
 
-每情景：`{id,symbol,direction:'buy'|'sell',latencyMs,status,reason,task,stats,recentRounds,history}`。`task` 为 null 或 `{id,startedAt,phase,targetQuantity,binanceQuantity,lighterQuantity,residualQuantity,maker,pendingHedges}`；`maker` 含 `{side,price,remainingQuantity,queueAhead}`；`pendingHedges` 含 `{id,phase,side,quantity,dueAt}`。
+未实现价格盈亏使用各场所合格的中间价；缺少有效双腿估值时留空，已知库存、已实现盈亏、手续费和成交额仍保留。盯市成本包含未平库存估值，不等于已经兑现的收益。两场所的已实现盈亏分别记账后相加，不称为「配对已完成收益」。Lighter 成交额不进入 BN 成本分母。
 
-`stats`：`{attempts,completed,unfilled,unresolved,binanceTurnover,closedBinanceTurnover,fees,closedFees,tradingPnl,tradingCost,costPer10000,fundingScenarioCost,modeledCostPer10000}`。`binanceTurnover` 包含已发生的模拟成交；`closed*` 与成本指标仅含已完成开平。缺少资金费情景时相应值为 null。
+计价为 USDC 名义结算单位，不是 USD 法币估值；Lighter 原生 USD 参考价及 USDC 线性盈亏分别标注。默认零手续费是模拟假设，不代表账户实际费率已核验。
 
-`recentRounds`：`{id,startedAt,endedAt,outcome,reason,quantity,binanceTurnover,fees,tradingPnl,tradingCost,costPer10000,fundingScenarioCost,modeledCostPer10000,fills}`；`fills`：`{id,venue,side,phase,quantity,price,notional,fee,at,sourceAt,model}`。`history`：`{at,costPer10000,modeledCostPer10000}`。归档摘要含 `{sessionId,startedAt,endedAt,unresolved,completed,interrupted}`，中断标记不重复计入未决情景数。所有时间为毫秒。
+实际资金费保持未知。可配置每小时净资金费支出情景，按 BN 库存的绝对平均成本名义额和时间积分；正值为支出、负值为收益，另列含资金费情景成本。活动资格、有效成交额和奖励仍未确认。
 
-## 实盘扩展边界
+## 记录、旧版兼容与接口
 
-`binance-lighter-execution.mjs` 的 `EXECUTION_CONTRACT` v1 定义订单意图、`clientOrderId`、查询/取消和成交事件身份；当前工厂只返回 `PaperExecutionAdapter`。成本计算与市场数据不负责签名或网络写入。以后接实盘必须另行实现账户授权、共享写入准入、发送前持久化、未知订单核对与实际手续费/资金费入账，再接入真实适配器；不能只在本模块增加一个 `live` 开关。当前代码没有真实订单传输实现。
+新模型报告和配置使用 schema 2，策略标识为 inventory_quotes。累计统计覆盖当前会话；每情景仅保留最近 200 笔成交、300 个曲线点和 30 条事件，导出明确是滚动明细加全会话累计统计。
 
-## 验证计划
+新文件位于 DATA_DIR/binance-lighter-cost 的 config-v2.json、session-v2.json、archives-v2.json 和 archives-v2/。旧版配置只迁移适用字段；旧当前会话与旧归档保持原文件、原统计口径及敞口，可单独下载。旧版的买卖方向轮次不转换成新库存策略，也不与新结果混算。
 
-独立验证纯计算/状态机、公开协议与序列、持久恢复及 API 权限；完成根前端类型检查和生产构建，新实际页面启停、保存竞态、过期与未决状态、窄屏验收。短时真实公开接口采集只证明连接与协议，不证明策略收益。发布前复用现有 Linux CI；禁止 WSL，不自动部署服务器。
+入口 /api/research/binance-lighter-cost 沿用工作台会话、同源、CSRF 和 runtime 会话复核：
 
-## 来源
+| 方法与相对路径 | 用途 |
+| --- | --- |
+| GET / | 轻量状态、六情景摘要、旧会话摘要和归档列表 |
+| GET /scenario/<sessionId>/<scenarioId> | 当前单情景曲线、逐笔及事件；新情景 ID 如 BTC-inventory-300 |
+| PUT /config | 保存 {config}，运行时不可修改 |
+| POST /start、/stop、/archive | 空对象控制请求 |
+| GET /report | 当前报告及归档摘要 |
+| GET /report/<sessionId> | 原样下载指定新旧记录 |
 
-- [Binance 深度流](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/public)
-- [Binance 聚合成交流与普通成交量 nq](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/ws-streams/market)
-- [Lighter WebSocket](https://docs.lighter.xyz/api/websocket)
-- [Lighter 时间字段](https://docs.lighter.xyz/developers/reference/timestamps)
-- [Lighter 费率](https://docs.lighter.xyz/trading/trading-fees)
-- [Lighter PnL](https://docs.lighter.xyz/trading/pnl-and-total-account-value)
-- [Binance USDC 永续优惠](https://www.binance.com/en/support/announcement/detail/03180947641b414ebcb9a6c407fe80e2)
-- [币安社区回馈活动](https://www.binance.com/zh-CN/support/announcement/detail/dad3f7336cd343fd9752c63b21f8d52a)
+摘要不返回逐笔、曲线和事件；缺失这些明细不表示没有历史。详情严格绑定会话身份，旧会话请求不得覆盖新会话。配置只接受已知字段，不接收 URL、路径、密钥或执行模式。JSON 继续协商 gzip，保持 no-store 与 Vary: Accept-Encoding。
+
+页面每 5 秒读取聚合报告，服务端持续消费行情。盘口显示区分「报告采样时有效」与「当前页面等待更新」，不把网页旧快照当作服务器 WS 失效；真实无效样本和报告停更仍提示。
+
+## 实盘扩展与回滚
+
+模拟执行接口 v2 使用 quote/hedge 阶段、唯一订单及成交身份，工厂只产生 paper 适配器。未来实盘须另行完成账户授权、共享写入准入、发送前持久化、撤单确认和未知订单核对，以及实际手续费/资金费入账，不能只增加一个 live 开关。
+
+本次 R3 影响面、数据字段与验证范围见 [实施设计](binance-lighter-inventory-design.md)。回滚前停止研究并导出记录，再回退上一正式版本；保留全部 v1/v2 数据。旧版本只读取自己的原文件，不擦除新库存记录。正式发布不等于服务器部署。

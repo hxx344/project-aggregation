@@ -11,19 +11,53 @@ const LIMIT = 8 * 1024 * 1024;
 const MAX_ARCHIVES = 50;
 const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const EXECUTION = Object.freeze({ mode: 'paper', liveAvailable: false, version: 1 });
+const EXECUTION = Object.freeze({ mode: 'paper', liveAvailable: false, version: 2 });
 const clone = value => structuredClone(value);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const finite = value => typeof value === 'number' && Number.isFinite(value);
+const count = value => Number.isSafeInteger(value) && value >= 0;
+const nonzero = value => finite(value) && value !== 0;
+const SCENARIO = /^(BTC|ETH)-inventory-\d{3,5}$/;
+const LEGACY_FIELDS = ['schema', 'symbols', 'notionalPerLeg', 'latencyScenarios', 'makerWaitMs', 'holdMs', 'hedgeWaitMs',
+  'cooldownMs', 'maxBookAgeMs', 'maxSourceAgeMs', 'maxPairSkewMs', 'maxHedgeSlippageBps', 'queueMultiplier',
+  'binanceMakerFeeBps', 'lighterTakerFeeBps', 'fundingCostBpsPerHour'];
+
+function legacyConfig(value) {
+  if (!object(value) || value.schema !== 1 || Object.keys(value).length !== LEGACY_FIELDS.length
+    || Object.keys(value).some(key => !LEGACY_FIELDS.includes(key))
+    || !Array.isArray(value.symbols) || !value.symbols.length || value.symbols.length > 2
+    || new Set(value.symbols).size !== value.symbols.length || value.symbols.some(symbol => !['BTC', 'ETH'].includes(symbol))
+    || !Array.isArray(value.latencyScenarios) || !value.latencyScenarios.length || value.latencyScenarios.length > 3
+    || new Set(value.latencyScenarios).size !== value.latencyScenarios.length
+    || value.latencyScenarios.some(ms => !Number.isInteger(ms) || ms < 300 || ms > 10000)) throw new Error('invalid_legacy_config');
+  for (const [name, low, high, integer] of [
+    ['notionalPerLeg', 10, 100000], ['makerWaitMs', 1000, 120000, true], ['holdMs', 0, 3600000, true],
+    ['hedgeWaitMs', 100, 10000, true], ['cooldownMs', 0, 60000, true], ['maxBookAgeMs', 100, 5000, true],
+    ['maxSourceAgeMs', 100, 10000, true], ['maxPairSkewMs', 0, 5000, true], ['maxHedgeSlippageBps', 0, 100],
+    ['queueMultiplier', 1, 10], ['binanceMakerFeeBps', 0, 100], ['lighterTakerFeeBps', 0, 100],
+  ]) if (!finite(value[name]) || value[name] < low || value[name] > high || integer && !Number.isInteger(value[name])) throw new Error('invalid_legacy_config');
+  if (value.fundingCostBpsPerHour !== null && (!finite(value.fundingCostBpsPerHour) || Math.abs(value.fundingCostBpsPerHour) > 100)) throw new Error('invalid_legacy_config');
+  return value;
+}
+function migrateConfig(value) {
+  legacyConfig(value);
+  const next = clone(DEFAULT_COST_CONFIG);
+  for (const key of LEGACY_FIELDS) if (key !== 'schema' && Object.hasOwn(next, key)) next[key] = clone(value[key]);
+  next.orderNotional = value.notionalPerLeg;
+  // An old order larger than the new default limit remains a valid bounded order.
+  next.maxInventoryNotional = Math.max(next.maxInventoryNotional, next.orderNotional);
+  return validateCostConfig(next);
+}
 
 function regular(file, limit) {
-  if (!existsSync(file)) return null;
-  const info = lstatSync(file);
+  let info;
+  try { info = lstatSync(file); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
   if (!info.isFile() || info.isSymbolicLink() || info.size > limit) throw new Error('invalid_research_file');
   return info;
 }
 function read(file, limit = LIMIT) {
-  return regular(file, limit) ? JSON.parse(readFileSync(file, 'utf8')) : null;
+  return regular(file, limit) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
 }
 function atomic(file, value, limit = LIMIT) {
   regular(file, limit);
@@ -42,35 +76,88 @@ function atomic(file, value, limit = LIMIT) {
     if (existsSync(temporary)) unlinkSync(temporary);
   }
 }
-function validReport(value) {
-  if (!object(value) || value.schema !== 1 || value.mode !== 'paper' || !UUID.test(value.sessionId)
+function validReport(value, schema = 2) {
+  if (!object(value) || value.schema !== schema || value.mode !== 'paper' || typeof value.sessionId !== 'string' || !UUID.test(value.sessionId)
     || !finite(value.startedAt) || !finite(value.updatedAt) || !Array.isArray(value.scenarios) || value.scenarios.length > 12
+    || typeof value.stopped !== 'boolean' || typeof value.interrupted !== 'boolean'
+    || !['markets', 'books', 'assumptions'].every(key => Array.isArray(value[key]))
+    || ['channels', 'diagnostics'].some(key => value[key] !== undefined && !Array.isArray(value[key]))
+    || new Set(value.scenarios.map(row => row?.id)).size !== value.scenarios.length
     || value.scenarios.some(row => !object(row) || !object(row.stats))) throw new Error('invalid_research_report');
+  if (schema === 1) {
+    legacyConfig(value.sessionConfig);
+    if (value.scenarios.some(row => !/^(BTC|ETH)-(buy|sell)-\d{3,5}$/.test(row.id)
+      || !count(row.stats.completed) || !count(row.stats.unresolved)
+      || row.task != null && (!object(row.task) || !['binanceQuantity', 'lighterQuantity', 'residualQuantity'].every(key => finite(row.task[key]))))) throw new Error('invalid_legacy_report');
+    return value;
+  }
   validateCostConfig(value.sessionConfig);
+  if (value.strategy !== 'inventory_quotes' || value.scenarios.length > 6) throw new Error('invalid_research_report');
+  for (const row of value.scenarios) {
+    if (!SCENARIO.test(row.id) || !value.sessionConfig.symbols.includes(row.symbol)
+      || !value.sessionConfig.latencyScenarios.includes(row.latencyMs) || row.id !== `${row.symbol}-inventory-${row.latencyMs}`
+      || !['waiting', 'quoting', 'hedging', 'recovering', 'blocked', 'stopped'].includes(row.status)
+      || !object(row.inventory) || !object(row.quotes)
+      || !['binanceQuantity', 'lighterQuantity', 'residualQuantity', 'projectedResidualQuantity', 'limitNotional'].every(key => finite(row.inventory[key]))
+      || !['binanceAveragePrice', 'lighterAveragePrice', 'binanceNotional', 'utilization'].every(key => row.inventory[key] === null || finite(row.inventory[key]))
+      || !['quoteUpdates', 'makerFills', 'hedgeFills', 'hedgeFailures'].every(key => count(row.stats[key]))
+      || !['binanceTurnover', 'lighterTurnover', 'fees', 'realizedPnl'].every(key => finite(row.stats[key]))
+      || !['unrealizedPnl', 'netPnl', 'markedCost', 'costPer10000', 'fundingScenarioCost', 'modeledCostPer10000'].every(key => row.stats[key] === null || finite(row.stats[key]))) throw new Error('invalid_research_scenario');
+    if (!object(row.valuation) || row.valuation.at !== null && !finite(row.valuation.at) || typeof row.valuation.valid !== 'boolean'
+      || !['binanceMark', 'lighterMark'].every(key => row.valuation[key] === null || finite(row.valuation[key]))) throw new Error('invalid_research_valuation');
+    for (const side of ['buy', 'sell']) {
+      const quote = row.quotes[side];
+      if (quote !== null && (!object(quote) || typeof quote.id !== 'string' || quote.side !== side
+        || !['price', 'quantity', 'remainingQuantity', 'queueAhead', 'submittedAt'].every(key => finite(quote[key]))
+        || quote.price <= 0 || quote.quantity <= 0 || quote.remainingQuantity < 0 || quote.remainingQuantity > quote.quantity || quote.queueAhead < 0)) throw new Error('invalid_research_quote');
+    }
+    if (row.hedge !== null && (!object(row.hedge) || typeof row.hedge.id !== 'string' || !['buy', 'sell'].includes(row.hedge.side)
+      || !finite(row.hedge.quantity) || row.hedge.quantity <= 0 || !finite(row.hedge.dueAt) || !count(row.hedge.attempt))) throw new Error('invalid_research_hedge');
+    for (const [key, limit] of [['recentFills', 200], ['history', 300], ['events', 30]]) {
+      if (!Array.isArray(row[key]) || row[key].length > limit) throw new Error('invalid_research_history');
+    }
+    if (row.recentFills.some(fill => !object(fill) || typeof fill.id !== 'string'
+      || !['binance', 'lighter'].includes(fill.venue) || fill.symbol !== row.symbol || !['buy', 'sell'].includes(fill.side)
+      || !['quote', 'hedge'].includes(fill.phase) || !['quantity', 'price', 'notional', 'fee', 'at', 'sourceAt'].every(key => finite(fill[key]))
+      || fill.quantity <= 0 || fill.price <= 0)
+      || row.history.some(point => !object(point) || !['at', 'binanceQuantity', 'residualQuantity'].every(key => finite(point[key]))
+        || !['costPer10000', 'modeledCostPer10000'].every(key => point[key] === null || finite(point[key])))
+      || row.events.some(event => !object(event) || !finite(event.at) || typeof event.type !== 'string'
+        || event.reason !== null && typeof event.reason !== 'string')) throw new Error('invalid_research_history');
+  }
   return value;
 }
+const legacyUnresolved = row => row.status === 'unresolved' || row.stats.unresolved > 0
+  || row.task && (nonzero(row.task.binanceQuantity) || nonzero(row.task.lighterQuantity));
+const hasExposure = row => Boolean(row.inventory && (nonzero(row.inventory.binanceQuantity) || nonzero(row.inventory.lighterQuantity)
+  || nonzero(row.inventory.residualQuantity) || nonzero(row.inventory.projectedResidualQuantity)));
 export function hasUnresolvedCostReport(report) {
-  return Boolean(report && (report.interrupted || !report.stopped || report.scenarios.some(row => row.status === 'unresolved'
-    || row.task && (Math.abs(row.task.binanceQuantity || 0) > 1e-12 || Math.abs(row.task.lighterQuantity || 0) > 1e-12)
-    || row.stats.unresolved > 0)));
+  return Boolean(report && (report.interrupted || !report.stopped || report.scenarios.some(row => report.schema === 2
+    ? row.status === 'blocked' || row.hedge != null || hasExposure(row) : legacyUnresolved(row))));
 }
 const marketIdentity = markets => JSON.stringify(markets.map(({ observedAt, ...row }) => row));
 function projectReport(report, { summary = false, scenarioId } = {}) {
   const selected = scenarioId === undefined ? report.scenarios : report.scenarios.filter(row => row.id === scenarioId);
   return { ...report, detailLevel: summary ? 'summary' : scenarioId === undefined ? 'full' : 'scenario',
-    scenarios: summary ? selected.map(row => ({ ...row, recentRounds: [], history: [] })) : selected };
+    scenarios: summary ? selected.map(row => report.schema === 2 ? ({ ...row, recentFills: [], history: [], events: [] })
+      : ({ ...row, recentRounds: [], history: [] })) : selected };
 }
 
 export function createBinanceLighterCost({ dataDir, log = console, now = Date.now, mono = () => performance.now(),
   discover = discoverCostMarkets, connect = startCostFeeds, engineFactory = (config, options) => new CostLabEngine(config, options),
   tickMs = 50, snapshotMs = 1000, metadataMs = 10 * 60_000, stopWaitMs = 3000, write = atomic } = {}) {
   const directory = path.join(dataDir, 'binance-lighter-cost');
-  const archiveDirectory = path.join(directory, 'archives');
-  const configPath = path.join(directory, 'config.json');
-  const sessionPath = path.join(directory, 'session.json');
-  const archivesPath = path.join(directory, 'archives.json');
+  const archiveDirectory = path.join(directory, 'archives-v2');
+  const configPath = path.join(directory, 'config-v2.json');
+  const sessionPath = path.join(directory, 'session-v2.json');
+  const archivesPath = path.join(directory, 'archives-v2.json');
+  const legacyArchiveDirectory = path.join(directory, 'archives');
+  const legacyConfigPath = path.join(directory, 'config.json');
+  const legacySessionPath = path.join(directory, 'session.json');
+  const legacyArchivesPath = path.join(directory, 'archives.json');
   const cooldownPath = path.join(directory, 'cooldowns.json');
-  let config = clone(DEFAULT_COST_CONFIG), storedReport = null, engine = null, archives = [], initialized = false, closed = false;
+  let config = clone(DEFAULT_COST_CONFIG), storedReport = null, legacyReport = null, legacyClean = true;
+  let engine = null, archives = [], initialized = false, closed = false;
   let configValid = true, enabled = false, phase = 'stopped', failure = null, generation = 0, streamGeneration = 0;
   let controller = null, feeds = null, launchTask = null, tickTimer = null, snapshotTimer = null, metadataTimer = null;
   let controls = Promise.resolve(), dirty = false, metadataIdentity = null, cooldownJson = '{}';
@@ -89,7 +176,7 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
   }
   function persist(clean = !enabled) {
     const report = currentReport();
-    write(sessionPath, { schema: 1, clean, report });
+    write(sessionPath, { schema: 2, clean, report });
     storedReport = report;
     dirty = false;
   }
@@ -135,8 +222,18 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
       if (dirty) persist(false);
     } catch { fault('成本研究处理或记录失败，已停止新增模拟', 'processing_failed'); }
   }
-  const state = () => ({ schema: 1, state: phase, enabled, error: failure, serverNow: now(), config: clone(config),
-    report: currentReport({ summary: true }), archives: clone(archives), execution: { ...EXECUTION } });
+  function legacySummary() {
+    if (!legacyReport) return null;
+    return { schema: 1, sessionId: legacyReport.sessionId, startedAt: legacyReport.startedAt, updatedAt: legacyReport.updatedAt,
+      stopped: true, interrupted: !legacyClean || !legacyReport.stopped || legacyReport.interrupted,
+      completed: legacyReport.scenarios.reduce((sum, row) => sum + row.stats.completed, 0),
+      unresolved: legacyReport.scenarios.filter(legacyUnresolved).length,
+      exposures: legacyReport.scenarios.filter(row => row.task && (nonzero(row.task.binanceQuantity) || nonzero(row.task.lighterQuantity)))
+        .map(row => ({ id: row.id, symbol: row.symbol || row.id.split('-')[0], binanceQuantity: row.task.binanceQuantity,
+          lighterQuantity: row.task.lighterQuantity, residualQuantity: row.task.residualQuantity })) };
+  }
+  const state = () => ({ schema: 2, state: phase, enabled, error: failure, serverNow: now(), config: clone(config),
+    report: currentReport({ summary: true }), legacySession: legacySummary(), archives: clone(archives), execution: { ...EXECUTION } });
 
   async function waitStop(source) {
     if (!source) return;
@@ -217,22 +314,34 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
     if (!report) return;
     validReport(report);
     if (archives.some(item => item.sessionId === report.sessionId)) return;
-    if (archives.length >= MAX_ARCHIVES) throw new HttpError(409, '研究归档已达到 50 个会话，请先导出并整理数据目录');
+    const currentArchives = archives.filter(item => item.schema === 2);
+    if (currentArchives.length >= MAX_ARCHIVES) throw new HttpError(409, '新版研究归档已达到 50 个会话，请先导出并整理数据目录');
     const body = JSON.stringify(report);
-    const total = archives.reduce((sum, item) => sum + (regular(path.join(archiveDirectory, `${item.sessionId}.json`), LIMIT)?.size || 0), 0);
+    const total = currentArchives.reduce((sum, item) => sum + (regular(path.join(archiveDirectory, `${item.sessionId}.json`), LIMIT)?.size || 0), 0);
     if (total + Buffer.byteLength(body) > MAX_ARCHIVE_BYTES) throw new HttpError(409, '研究归档已达到容量上限，请先导出并整理数据目录');
     write(path.join(archiveDirectory, `${report.sessionId}.json`), report);
-    const summary = { sessionId: report.sessionId, startedAt: report.startedAt, endedAt: report.updatedAt,
-      unresolved: report.scenarios.filter(row => row.status === 'unresolved' || row.stats.unresolved > 0 || row.task && (Math.abs(row.task.binanceQuantity || 0) > 1e-12 || Math.abs(row.task.lighterQuantity || 0) > 1e-12)).length,
+    const summary = { schema: 2, sessionId: report.sessionId, startedAt: report.startedAt, endedAt: report.updatedAt,
+      hasExposure: report.scenarios.some(hasExposure),
       interrupted: Boolean(report.interrupted),
-      completed: report.scenarios.reduce((sum, row) => sum + (row.stats.completed || 0), 0) };
+      makerFills: report.scenarios.reduce((sum, row) => sum + row.stats.makerFills, 0) };
     const next = [...archives, summary];
-    write(archivesPath, { schema: 1, sessions: next }, 64 * 1024);
+    write(archivesPath, { schema: 2, sessions: next.filter(item => item.schema === 2) }, 64 * 1024);
     archives = next;
   }
   function publicConfig(value) {
     try { return clone(validateCostConfig(value)); }
     catch (error) { throw new HttpError(400, error instanceof Error ? error.message : '研究配置无效'); }
+  }
+  function readIndex(file, schema) {
+    const index = read(file, 64 * 1024);
+    if (index === undefined) return [];
+    if (!object(index) || index.schema !== schema || !Array.isArray(index.sessions) || index.sessions.length > MAX_ARCHIVES
+      || index.sessions.some(item => !object(item) || typeof item.sessionId !== 'string' || !UUID.test(item.sessionId) || !finite(item.startedAt) || !finite(item.endedAt)
+        || item.schema !== undefined && item.schema !== schema
+        || (schema === 1 ? !count(item.unresolved) || !count(item.completed) : !count(item.makerFills) || typeof item.hasExposure !== 'boolean')
+        || item.interrupted !== undefined && typeof item.interrupted !== 'boolean')
+      || new Set(index.sessions.map(item => item.sessionId)).size !== index.sessions.length) throw new Error('invalid_archive_index');
+    return index.sessions.map(item => ({ ...item, schema }));
   }
   async function halt(reason = 'stopped') {
     enabled = false; generation += 1; streamGeneration += 1;
@@ -257,35 +366,45 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
         if (!lstatSync(folder).isDirectory() || lstatSync(folder).isSymbolicLink()) throw new Error('invalid_research_directory');
       }
       try {
-        const savedConfig = read(configPath, 64 * 1024);
-        if (savedConfig) config = publicConfig(savedConfig);
-        const index = read(archivesPath, 64 * 1024);
-        if (index) {
-          if (index.schema !== 1 || !Array.isArray(index.sessions) || index.sessions.length > MAX_ARCHIVES
-            || index.sessions.some(item => !object(item) || !UUID.test(item.sessionId) || !finite(item.startedAt) || !finite(item.endedAt)
-              || !Number.isSafeInteger(item.unresolved) || item.unresolved < 0 || !Number.isSafeInteger(item.completed) || item.completed < 0
-              || item.interrupted !== undefined && typeof item.interrupted !== 'boolean')
-            || new Set(index.sessions.map(item => item.sessionId)).size !== index.sessions.length) throw new Error('invalid_archive_index');
-          archives = index.sessions;
+        if (existsSync(legacyArchiveDirectory) && (!lstatSync(legacyArchiveDirectory).isDirectory()
+          || lstatSync(legacyArchiveDirectory).isSymbolicLink())) throw new Error('invalid_legacy_directory');
+        // Read and validate every legacy source before publishing migration. Legacy
+        // reports are never loaded into the inventory engine or written back.
+        const oldConfig = read(legacyConfigPath, 64 * 1024);
+        if (oldConfig !== undefined) legacyConfig(oldConfig);
+        archives = [...readIndex(legacyArchivesPath, 1), ...readIndex(archivesPath, 2)];
+        if (new Set(archives.map(item => item.sessionId)).size !== archives.length) throw new Error('duplicate_session_identity');
+        const legacy = read(legacySessionPath);
+        if (legacy !== undefined) {
+          if (legacy.schema !== 1 || typeof legacy.clean !== 'boolean') throw new Error('invalid_legacy_session');
+          legacyReport = legacy.report === null ? null : validReport(legacy.report, 1);
+          legacyClean = legacy.clean;
         }
+        const savedConfig = read(configPath, 64 * 1024);
+        config = savedConfig !== undefined ? publicConfig(savedConfig) : oldConfig !== undefined ? migrateConfig(oldConfig) : clone(DEFAULT_COST_CONFIG);
         const savedCooldowns = read(cooldownPath, 16 * 1024);
-        if (savedCooldowns) {
+        if (savedCooldowns !== undefined) {
           if (!object(savedCooldowns) || Object.entries(savedCooldowns).some(([key, value]) => !['binance', 'lighter'].includes(key) || !Number.isSafeInteger(value) || value < 0)) throw new Error('invalid_cooldowns');
           Object.assign(cooldowns, savedCooldowns); cooldownJson = JSON.stringify(cooldowns);
         }
         const saved = read(sessionPath);
-        if (saved) {
-          if (saved.schema !== 1 || typeof saved.clean !== 'boolean') throw new Error('invalid_session_file');
+        if (saved !== undefined) {
+          if (saved.schema !== 2 || typeof saved.clean !== 'boolean') throw new Error('invalid_session_file');
           storedReport = saved.report === null ? null : validReport(saved.report);
+          if (storedReport && (legacyReport?.sessionId === storedReport.sessionId
+            || archives.some(item => item.schema === 1 && item.sessionId === storedReport.sessionId))) throw new Error('duplicate_session_identity');
           if (storedReport && (!saved.clean || !storedReport.stopped)) {
             // Preserve the original session, metrics and last known exposure.
             // No recovery mark can prove the missing tail of a crashed process.
-            storedReport = { ...storedReport, stopped: true, interrupted: true };
+            storedReport = { ...storedReport, stopped: true, interrupted: true,
+              scenarios: storedReport.scenarios.map(row => ({ ...row, quotes: { buy: null, sell: null },
+                status: row.status === 'blocked' ? 'blocked' : 'stopped', reason: 'service_interrupted' })) };
             failure = '上次模拟未正常结束，已保留最后记录；归档前不会开始新会话';
           }
         }
+        if (savedConfig === undefined) write(configPath, config, 64 * 1024);
       } catch {
-        configValid = false; phase = 'fault'; failure = '研究配置或记录无法校验，原文件已保留，请检查数据目录';
+        configValid = false; phase = 'fault'; failure = '研究配置、旧版记录或新版记录无法校验或保存，原文件已保留，请检查数据目录';
       }
     },
     save: (value, authorize = () => {}) => serial(() => {
@@ -303,12 +422,12 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
       if (!configValid) throw new HttpError(409, '研究配置或记录无效，请先检查保留的数据文件');
       if (enabled) return state();
       const previous = currentReport();
-      if (hasUnresolvedCostReport(previous)) throw new HttpError(409, '上次模拟存在未决或中断记录，请先停止并归档后再开始新会话');
+      if (hasUnresolvedCostReport(previous)) throw new HttpError(409, '上次模拟存在库存、对冲、阻断或中断记录，请先停止并归档后再开始新会话');
       archiveReport(previous);
       const candidate = engineFactory(config, { now, mono, sessionId: randomUUID(), emit: () => { dirty = true; } });
-      const initial = { ...candidate.report(), channels: [], diagnostics: [] };
+      const initial = validReport({ ...candidate.report(), channels: [], diagnostics: [] });
       // Persist the unclean marker before any public feeds can drive a model.
-      write(sessionPath, { schema: 1, clean: false, report: initial });
+      write(sessionPath, { schema: 2, clean: false, report: initial });
       channels.clear(); diagnostics.length = 0;
       engine = candidate; storedReport = initial; dirty = false;
       phase = 'starting'; enabled = true; failure = null; metadataIdentity = null;
@@ -328,21 +447,30 @@ export function createBinanceLighterCost({ dataDir, log = console, now = Date.no
       if (enabled) throw new HttpError(409, '请先停止模拟，再归档会话');
       const report = currentReport();
       archiveReport(report);
-      write(sessionPath, { schema: 1, clean: true, report: null });
+      write(sessionPath, { schema: 2, clean: true, report: null });
       engine = null; storedReport = null;
       phase = 'stopped'; failure = null;
       return state();
     }),
     report(sessionId) {
       if (sessionId !== undefined) {
-        if (!UUID.test(sessionId) || !archives.some(item => item.sessionId === sessionId)) throw new HttpError(404, '研究归档不存在');
-        try { return { report: validReport(read(path.join(archiveDirectory, `${sessionId}.json`))), archives: clone(archives) }; }
+        if (!UUID.test(sessionId)) throw new HttpError(404, '研究归档不存在');
+        if (legacyReport?.sessionId === sessionId) return { report: clone(legacyReport), archives: clone(archives) };
+        const current = currentReport();
+        if (current?.sessionId === sessionId) return { report: current, archives: clone(archives) };
+        const item = archives.find(row => row.sessionId === sessionId);
+        if (!item) throw new HttpError(404, '研究归档不存在');
+        try {
+          const report = validReport(read(path.join(item.schema === 1 ? legacyArchiveDirectory : archiveDirectory, `${sessionId}.json`)), item.schema);
+          if (report.sessionId !== sessionId) throw new Error('archive_identity_mismatch');
+          return { report, archives: clone(archives) };
+        }
         catch { throw new HttpError(503, '研究归档暂时无法读取，原文件已保留'); }
       }
       return { report: currentReport(), archives: clone(archives), execution: { ...EXECUTION } };
     },
     scenario(sessionId, scenarioId) {
-      if (!UUID.test(sessionId) || typeof scenarioId !== 'string' || !/^(BTC|ETH)-(buy|sell)-\d{3,5}$/.test(scenarioId)) throw new HttpError(404, '研究情景不存在');
+      if (!UUID.test(sessionId) || typeof scenarioId !== 'string' || !SCENARIO.test(scenarioId)) throw new HttpError(404, '研究情景不存在');
       const report = currentReport({ scenarioId });
       if (!report || report.sessionId !== sessionId) throw new HttpError(409, '研究会话已改变，请刷新后查看');
       const scenario = report.scenarios.find(row => row.id === scenarioId);

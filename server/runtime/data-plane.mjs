@@ -238,7 +238,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       const base = '/api/research/binance-lighter-cost';
       if (pathname === base && method === 'GET') return reply(200, costResearch.state());
       if (pathname === `${base}/report` && method === 'GET') return reply(200, costResearch.report());
-      const scenario = pathname.match(/^\/api\/research\/binance-lighter-cost\/scenario\/([0-9a-f-]{36})\/((?:BTC|ETH)-(?:buy|sell)-\d{3,5})$/);
+      const scenario = pathname.match(/^\/api\/research\/binance-lighter-cost\/scenario\/([0-9a-f-]{36})\/((?:BTC|ETH)-inventory-\d{3,5})$/);
       if (scenario && method === 'GET') return reply(200, costResearch.scenario(scenario[1], scenario[2]));
       const archive = pathname.match(/^\/api\/research\/binance-lighter-cost\/report\/([0-9a-f-]{36})$/);
       if (archive && method === 'GET') return reply(200, costResearch.report(archive[1]));
