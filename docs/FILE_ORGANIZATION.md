@@ -62,6 +62,7 @@ project_aggregation/
 ### tools/ 目录
 不随工作台模块发布的独立工具：
 - `options-backtest/` - BTC 期权回测引擎与 parquet 数据工具，用法与口径见其 `README.md`
+- `aero-roles/` - Aero 实盘 Safe + Zodiac Roles 权限：生成部署批次、签名前本地校验与 Base 分叉验收，见其 `README.md`
 
 随工作台运行时发布的工具（运行文件登记在 `deploy/package-release.py` 与 `deploy/install.sh`）：
 - `entropy-lighter-lab/` - Entropy / Lighter 行情采集，由 `server/research/entropy-lighter.mjs` 管理

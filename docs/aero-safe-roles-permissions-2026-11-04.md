@@ -1,6 +1,8 @@
-# Aero 市场实盘：Safe + Zodiac Roles 权限清单（草案 v0.1）
+# Aero 市场实盘：Safe + Zodiac Roles 权限清单（v0.2）
 
-日期：2026-11-04　状态：设计草案，未实现、未部署、未在 fork 上验证。
+日期：2026-11-04　状态：首版工具已实现（`tools/aero-roles/`），Base fork 验收 71/71 通过（第 8 节）；未在主网部署，工作台执行器尚未接入（第 9 节）。
+
+v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版不授权 `increaseLiquidity`；Safe 必须设置 CompatibilityFallbackHandler；额度键与部署步骤改为 `tools/aero-roles` 的实际实现。
 
 ## 0. 结论与范围
 
@@ -25,6 +27,11 @@
 ## 2. 已核实地址（Base，chainId 8453）
 
 核实方式：「源」= 官方仓库部署清单；「链」= 2026-11-04 用 `mainnet.base.org` 读取到合约代码，以及表中所列的关联读数；「选择器」= 第 3 节用到的函数选择器均出现在链上字节码中。
+
+`plan` 会把下表协议合约的运行时字节码与 `tools/aero-roles/addresses.mjs` 中的哈希逐一比对：
+- 这些合约都不是可升级代理，比对的是不可变代码。Aero 换地址重新部署时 `plan` 会拒绝，需要重新核实。
+- 比对不覆盖治理可改的状态，例如 CLFactory 的手续费模块、Voter 治理或 emergencyCouncil 停用 gauge、NPM 的 tokenDescriptor。这些改动不会在 Roles 授权范围内打开转出路径，但属于信任前提。
+- 代币不比对。USDC 本身是可升级代理（FiatTokenProxy），对它的信任来自发行方。
 
 ### 2.1 Safe 与 Roles
 
@@ -74,7 +81,7 @@
 | 函数 | 选择器 | 参数条件 |
 | --- | --- | --- |
 | `mint(MintParams)` | `0xb5007d1f` | `token0/token1/tickSpacing` ∈ 池白名单；`recipient` EqualToAvatar；`amount0Desired` ≤ 额度[token0]，`amount1Desired` ≤ 额度[token1]；`sqrtPriceX96` = 0（非 0 会顺带创建新池） |
-| `increaseLiquidity(params)` | `0x219f5d17` | `tokenId` OwnedByAvatar；`amount0Desired/amount1Desired` 计入额度（需按 tokenId 所属池的代币取额度键，见第 5 节说明） |
+| ~~`increaseLiquidity(params)`~~ | `0x219f5d17` | 首版不授权（第 5 节）：调仓一律平仓 + 新开仓 |
 | `decreaseLiquidity(params)` | `0x0c49ccbe` | `tokenId` OwnedByAvatar（取出的代币记在仓位上，靠 `collect` 领取） |
 | `collect(params)` | `0xfc6f7865` | `tokenId` OwnedByAvatar；`recipient` EqualToAvatar |
 | `burn(uint256)` | `0x42966c68` | `tokenId` OwnedByAvatar |
@@ -121,15 +128,16 @@
 | 用途 | token0 / token1 | tickSpacing | 池 / gauge |
 | --- | --- | --- | --- |
 | 奖励卖出（swap） | AERO → USDC | 200 | `0xD0Ac…6816` / `0x4A3B…60D5` |
-| 做市池 | 待定：由 Aero 市场页的推荐结果选出后逐个加入 | | |
+| 做市池 | 待定：由 Aero 市场页的推荐结果选出后逐个加入（`config.example.json` 与 fork 验收用 RSGP/USDC ts100 作示例） | | |
 
 加池由管理钱包签一笔 Safe 交易，同时更新：NPM `mint` 的池白名单 `Or`、新 gauge 目标、新代币目标、`NPM.approve` 的 gauge 列表、必要的兑换路径。bot 无权自行扩大白名单。
 
 ## 5. 额度（Roles `WithinAllowance`）
 
-- 每个代币一个额度键，例如 `turnover-USDC`、`turnover-AERO`，mint/increase 的 desired 金额与 swap 的 `amountIn` 共用同一个键，按 24 小时补充。池白名单的每个 `Or` 分支固定了代币地址，分支内的金额字段直接挂对应代币的额度键。
+- 每个代币一个额度键（实现为 `keccak256("aero-roles:turnover:" + 小写代币地址)`），mint 的 desired 金额与 swap 的 `amountIn` 共用同一个键，按 24 小时补充。池白名单的每个 `Or` 分支固定了代币地址，分支内的金额字段直接挂对应代币的额度键。
 - `mint` 的 desired 是上限，实际投入可能更少，额度按 desired 扣，偏保守。
-- `increaseLiquidity` 的参数里没有代币地址，无法按代币取额度键：首版要么不授权 `increaseLiquidity`（调仓一律"平仓 + 新开仓"），要么给它单独一个按池分开的小额度。建议首版不授权。
+- `increaseLiquidity` 的参数里没有代币地址，无法按代币取额度键：首版不授权（已定），调仓一律"平仓 + 新开仓"。
+- 补充规则：从部署时刻起每满 24 小时整段补满，不是滚动窗口；跨过补充时刻前后各花一次，短时间内最多用掉 2 × 日额度，第 6 节的损失上限按此计。
 - 上限取预期日周转额的 2 倍左右；超限时 bot 交易 revert，策略停在当前状态，等管理钱包调额度或次日补充。
 - 可选：`CallWithinAllowance` 限制每日 swap 笔数，防止"小额多次"消耗。
 
@@ -137,7 +145,7 @@
 
 | 风险 | 上限 / 缓解 |
 | --- | --- |
-| 白名单池内不利成交：swap 设 `amountOutMinimum = 0` 后被夹，或先操纵价格再 mint / decrease | 损失上限 ≈ 当日额度 × 价格偏离；只放深池；出账与成交偏离告警。Roles v2 不能直接比对预言机价格，链上价格校验需另写自定义条件合约并审计，首版不做 |
+| 白名单池内不利成交：swap 设 `amountOutMinimum = 0` 后被夹，或先操纵价格再 mint / decrease | 损失上限 ≈ 2 × 日额度 × 价格偏离（补充边界前后各用一次，第 5 节）；只放深池；出账与成交偏离告警。Roles v2 不能直接比对预言机价格，链上价格校验需另写自定义条件合约并审计，首版不做 |
 | 打乱策略：反复开平仓、解押损失排放、`emergencyWithdraw` | 只损失收益和 bot 自己的 gas，本金仍在 Safe；发现后撤销角色 |
 | bot EOA 里的 ETH | 只放够几天 gas 的量 |
 | Roles 配置错误（例如漏了某个 `EqualToAvatar`） | 第 8 节的反向用例在 fork 上逐条验证后才启用；清单与配置从同一份 JSON 生成 |
@@ -145,7 +153,7 @@
 
 ## 7. 管理钱包操作（只由 Safe owner 签）
 
-- 部署：创建 Safe → 经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 按 JSON 下发 scope 与额度（用 `zodiac-roles-sdk` 4.x 生成差异调用）→ `assignRoles(bot, [roleKey], [true])`。
+- 部署：在 Safe{Wallet} 用硬件钱包创建 1/1 Safe（v1.4.1，界面默认带 CompatibilityFallbackHandler；gauge 解押用 `safeTransferFrom` 退回 NFT，没有 handler 时解押会失败）→ `node tools/aero-roles/cli.mjs plan` 链上核对并生成 Transaction Builder 批次 → 管理钱包在 Safe 界面导入、核对、签名。批次一笔完成：经 ModuleProxyFactory 部署 Roles 代理（owner / avatar / target = Safe）→ `enableModule` → 注册 MultiSendUnwrapper → 下发 scope 与额度 → `assignRoles(bot, [roleKey], [true])`。权限与额度由 `tools/aero-roles/permissions.mjs` 从配置 JSON 生成，不依赖 `zodiac-roles-sdk`；之后改池或额度另生成差异批次（尚未实现）。
 - 日常：加删池子、调额度、从 Safe 直接提走利润或本金。
 - 紧急停止：`assignRoles(bot, [roleKey], [false])`，或 `disableModule(Roles)`，一笔交易生效，不依赖服务器；必要时再撤销代币授权。
 - 换 bot 私钥：先给新地址分配角色，再撤销旧地址。
@@ -162,6 +170,17 @@
 - 非白名单池的 `mint` / swap；`sqrtPriceX96 ≠ 0`；超额度；`value > 0`；delegatecall 到 MultiSend 以外的地址；MultiSend 内层 delegatecall。
 - 撤销角色后，bot 的任意调用。
 
+结果（2026-11-04，Base 区块 53533394，`node tools/aero-roles/fork-test.mjs`，anvil 只监听 127.0.0.1）：71/71 通过。
+- 配置为示例池 RSGP/USDC ts100 再加 AERO/USDC ts200，`mint` 与 `NPM.approve` 的条件是两分支 `Or`，两个分支都在链上执行过；另加只用于兑换的 WETH→USDC，WETH 只能授权给 Router，授权给 NPM 被拒（`ParameterNotAllowed`）。
+- `plan` 通过真实 Safe 的核对，并拒绝：没有 fallback handler、owner 不是指定硬件钱包、已启用其他模块、设置了 guard、singleton 不是 SafeL2、代理字节码非标准、固定合约字节码被替换（后四项在分叉上改状态模拟，改完复原后 `plan` 再次通过）。`factory.getPool` 与 `gauge.pool()` 不一致的拒绝路径没有分叉用例。
+- 额度：多分支 `Or` 下链上只报 `OrViolation`，超额用例另断言本地在第几笔、因超额拒绝；同批两笔 300 USDC 合计超额前先模拟证明单笔 300 能通过。`Or` 分支扣额度后失败的回滚、同一笔内同一额度用两次、嵌套 `Matches` 的累计由单元测试覆盖。
+- 部署批次经 MultiSendCallOnly 一次执行；Roles 实际地址与 `plan` 预测一致。
+- 上列正向流程全部成功（两个池各开一仓、质押、两种 `claimEmissions`、解押、同批平两仓、AERO→USDC）；`mint` 按 `amount1Desired` 扣减额度；`claimEmissions` 到账的是 AERO。
+- 上列反向用例与额外用例（非成员地址、Safe / Roles 自身函数、MultiSend 夹带禁止调用、同批两笔 mint 合计超额、已质押 tokenId 的 `decreaseLiquidity`、`claimReferralEmissions`、3 参数 `claimEmissions` 的外部 recipient）全部由 Roles 以写明的期望原因拒绝（`ConditionViolation` 的具体 status / `NoMembership` / `NotAuthorized`），不是下游合约自身失败；本地签名前校验对每个用例的结论与链上一致。
+- 发现：经 Roles 执行兑换时，按 gas 估算值原样发送曾在链上 revert，加 30% 余量后通过（原因未确认）；执行器需给 gas 留余量。
+- 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测（含 Safe{Wallet} 在 Base 上能否建 1.4.1 版本）、链上额度跨日补充（本地折算公式有单元测试）。
+- 登记（不影响安全）：calldata 里 int24 / uint160 带高位脏位时，本地按规范化值放行、链上按原始字比较拒绝；`plan` 只用一个 RPC，多 RPC 交叉核对由人工换 RPC 重跑。
+
 ## 9. 工作台侧改动（实施时另立任务）
 
 - 执行器：交易改为经 Roles 代理以 Safe 名义执行；签名前本地校验保留，与 Roles 配置读同一份白名单 JSON，作为第二道防线。
@@ -171,7 +190,7 @@
 
 ## 10. 待决策
 
-1. 管理钱包形态：单个硬件钱包 1/1（简单），还是 2/3 多签（防单把丢失或泄露）。
+1. ~~管理钱包形态~~：已定单个硬件钱包 1/1（2026-11-04）。硬件钱包丢失即失去 Safe 控制，助记词离线备份是唯一恢复手段；以后可由同一 Safe 加 owner 升级为多签，不需要迁移资产。
 2. 首批做市池与每日额度。
 3. Aero LP 是否同步迁到 Safe + Roles（结构相同，白名单只含 RSGP/USDC 一个池）。
 4. AERO 奖励自动卖成 USDC，还是留在 Safe 由管理钱包处理。
