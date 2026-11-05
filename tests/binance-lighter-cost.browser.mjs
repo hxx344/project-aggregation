@@ -7,7 +7,7 @@ async (page) => {
   let elapsed = 0, state = 'stopped', session = 1, reportPresent = true, hasExposure = false, interrupted = false;
   let frozenAt = null, stale = false, failRead = false, rejectSave = false, holdRead = false, holdSave = false, unknownStop = false, expire = false;
   let sourceLeadMs = null, lighterChannelState = 'connected', sampleValid = true;
-  let holdDetail = false, detailFailure = 0, valuationValid = true;
+  let holdDetail = false, detailFailure = 0, valuationValid = true, omitResidualNotional = false;
   let serverClock = null;
   const updateServerClock = async () => {
     if (serverClock) elapsed = serverClock.elapsed + await page.evaluate(() => performance.now()) - serverClock.mono;
@@ -18,8 +18,8 @@ async (page) => {
   const archives = [{ schema: 1, sessionId: 'cost-legacy-archive', startedAt: base - 180000, endedAt: base - 120000, completed: 3, unresolved: 1, interrupted: true }];
   archivedReports.set('cost-legacy-archive', { ...legacyReport, sessionId: 'cost-legacy-archive' });
   let config = {
-    schema: 2, symbols: ['BTC', 'ETH'], orderNotional: 1000, latencyScenarios: [300, 600, 1000],
-    maxInventoryNotional: 5000, maxUnhedgedNotional: 2000, quoteOffsetBps: 0, inventorySkewBps: 2,
+    schema: 2, symbols: ['BTC'], orderNotional: 1000, latencyScenarios: [300, 600, 1000],
+    maxInventoryNotional: 5000, maxUnhedgedNotional: 2000, hedgeThresholdNotional: 1000, quoteOffsetBps: 0, inventorySkewBps: 2,
     quoteRefreshMs: 1000, quoteMaxAgeMs: 15000, hedgeWaitMs: 2000,
     maxBookAgeMs: 1000, maxSourceAgeMs: 2000, maxPairSkewMs: 750, maxHedgeSlippageBps: 5,
     queueMultiplier: 1, binanceMakerFeeBps: 0, lighterTakerFeeBps: 0, fundingCostBpsPerHour: null,
@@ -29,16 +29,16 @@ async (page) => {
     if (!reportPresent) return null;
     const at = base + (frozenAt ?? elapsed), age = stale ? 60000 : 100;
     const scenarios = sessionConfig.symbols.flatMap(symbol => sessionConfig.latencyScenarios.map((latencyMs, index) => {
-      const retained = hasExposure && symbol === 'BTC' && index === 0;
+      const retained = hasExposure && index === 0;
       const active = state === 'running', mark = symbol === 'BTC' ? 100000 : 3000;
       const bn = retained ? 0.01 : active ? [0, 0.01, -0.01][index] : 0;
-      const pendingHedge = active && symbol === 'ETH' && index === 1;
-      const lighter = retained ? -0.004 : pendingHedge ? -bn + 0.003 : -bn;
+      const pendingHedge = active && index === 2;
+      const lighter = retained ? -0.004 : pendingHedge ? -0.002 : active && index === 1 ? -0.004 : -bn;
       const id = `${symbol}-inventory-${latencyMs}`;
       const quote = side => ({ id: `${id}-${side}`, side, price: mark + (side === 'buy' ? -3 : 3) - bn * 200, quantity: (1000 / mark) * (side === 'buy' ? 1 - bn * mark / 5000 : 1 + bn * mark / 5000), remainingQuantity: (1000 / mark) * (side === 'buy' ? 1 - bn * mark / 5000 : 1 + bn * mark / 5000), queueAhead: 0.1, submittedAt: at - 500 });
-      return { id, symbol, latencyMs, status: pendingHedge ? 'hedging' : active ? 'quoting' : 'stopped', reason: null,
-        inventory: { binanceQuantity: bn, lighterQuantity: lighter, residualQuantity: bn + lighter, projectedResidualQuantity: pendingHedge ? 0 : bn + lighter, binanceAveragePrice: bn ? mark - 5 : null, lighterAveragePrice: lighter ? mark - 4 : null, binanceNotional: valuationValid ? bn * mark : null, utilization: valuationValid ? bn * mark / 5000 : null, limitNotional: 5000 },
-        quotes: { buy: active ? quote('buy') : null, sell: active ? quote('sell') : null }, hedge: pendingHedge ? { id: `${id}-hedge`, side: 'sell', quantity: 0.003, dueAt: at + latencyMs, attempt: 1 } : null,
+      return { id, symbol, latencyMs, status: pendingHedge ? 'hedging' : active ? 'quoting' : 'stopped', reason: active && index === 1 && !stale && valuationValid ? 'below_hedge_threshold' : null,
+        inventory: { binanceQuantity: bn, lighterQuantity: lighter, residualQuantity: bn + lighter, projectedResidualQuantity: pendingHedge ? 0 : bn + lighter, ...(omitResidualNotional ? {} : { residualNotional: valuationValid && !stale ? Math.abs(bn + lighter) * mark : null }), binanceAveragePrice: bn ? mark - 5 : null, lighterAveragePrice: lighter ? mark - 4 : null, binanceNotional: valuationValid ? bn * mark : null, utilization: valuationValid ? bn * mark / 5000 : null, limitNotional: 5000 },
+        quotes: { buy: active ? quote('buy') : null, sell: active ? quote('sell') : null }, hedge: pendingHedge ? { id: `${id}-hedge`, side: 'buy', quantity: 0.012, dueAt: at + latencyMs, attempt: 1 } : null,
         stats: { quoteUpdates: 8, makerFills: 4, hedgeFills: 3, hedgeFailures: 1, binanceTurnover: 4000, lighterTurnover: 3000, fees: 0.3, realizedPnl: 0.6, unrealizedPnl: valuationValid ? 0.5 : null, netPnl: valuationValid ? 0.8 : null, markedCost: valuationValid ? -0.8 : null, costPer10000: valuationValid ? -2 : null, fundingScenarioCost: sessionConfig.fundingCostBpsPerHour === null ? null : 0.2, modeledCostPer10000: valuationValid && sessionConfig.fundingCostBpsPerHour !== null ? -1.5 : null },
         valuation: { at: valuationValid ? at : null, valid: valuationValid, reason: valuationValid ? null : 'valuation_unavailable', binanceMark: valuationValid ? mark : null, lighterMark: valuationValid ? mark : null },
         recentFills: [{ id: `${id}-fill`, venue: 'binance', side: 'buy', phase: 'quote', quantity: 0.01, price: mark, notional: mark * 0.01, fee: 0, at: base - 14000, sourceAt: base - 14050, model: 'maker_queue_proxy' }],
@@ -135,7 +135,11 @@ async (page) => {
   serverClock = { elapsed, mono: await page.evaluate(() => performance.now()) };
   assert((await page.locator('.breadcrumb').innerText()).includes('监控'), 'the native route is in monitoring');
   assert(await page.getByRole('heading', { name: '对冲成本研究', exact: true }).count() === 1, 'native cost-lab route renders the research page');
-  assert(await page.locator('.blc-scenarios tbody tr').count() === 6, 'BTC/ETH times three delays remain independent inventory accounts');
+  assert(await page.locator('.blc-scenarios tbody tr').count() === 3, 'BTC times three delays remain independent inventory accounts');
+  assert((await page.locator('.blc-heading').innerText()).includes('BTC 永续') && !(await page.locator('.blc-heading').innerText()).includes('ETH'), 'new research is visibly limited to BTC');
+  assert(await page.locator('.blc-config input[type="checkbox"]').count() === 0, 'new configuration has no symbol selector');
+  assert(await page.getByLabel('对冲阈值（USDC）', { exact: true }).inputValue() === '1000', 'the saved default threshold is 1000 USDC');
+  assert((await page.locator('.blc-session-threshold').innerText()).includes('1,000 USDC'), 'the report discloses its locked threshold');
   assert((await page.locator('.blc-identity').innerText()).includes('真实订单 0'), 'simulation and qualification boundaries remain visible');
   assert((await page.locator('.blc-scenarios').innerText()).includes('模拟盯市收益'), 'negative costs are labeled simulated gains');
   await page.locator('.blc-diagnostics>summary').click();
@@ -173,33 +177,50 @@ async (page) => {
   detailFailure = 0; await page.locator('.blc-scenario-select').first().click();
   await page.locator('.blc-selected-detail[data-scenario-id="BTC-inventory-300"] .recharts-line-curve').first().waitFor();
   await overflow();
+  session = 90; sessionConfig = { ...structuredClone(config), symbols: ['ETH'] }; delete sessionConfig.hedgeThresholdNotional;
+  hasExposure = true; omitResidualNotional = true; await refresh();
+  assert((await page.locator('.blc-status').innerText()).includes('cost-fixture-90'), 'a historical ETH session retains its identity');
+  assert((await page.locator('.blc-inventory tbody tr').first().innerText()).includes('0.01 ETH'), 'historical ETH inventory remains visible');
+  assert((await page.locator('.blc-session-threshold').innerText()).includes('旧版即时对冲') && !(await page.locator('.blc-session-threshold').innerText()).includes('1,000'), 'a missing historical threshold is never filled from current configuration');
+  assert((await page.locator('.blc-residual-inventory').first().innerText()).includes('净敞口名义额：未知'), 'missing historical residual notional stays unknown despite visible quantity and prices');
+  const oldEthDownload = page.waitForEvent('download'); await page.getByRole('button', { name: '导出报告', exact: true }).click();
+  assert((await oldEthDownload).suggestedFilename().includes('cost-fixture-90'), 'historical ETH export keeps the original session identity');
+  await page.waitForTimeout(25);
+  assert(await page.evaluate(() => {
+    const oldReport = window.__costDownloads.at(-1).report;
+    return oldReport.sessionConfig.symbols[0] === 'ETH' && !('hedgeThresholdNotional' in oldReport.sessionConfig) && oldReport.scenarios[0].symbol === 'ETH' && oldReport.scenarios[0].inventory.binanceQuantity === 0.01;
+  }), 'historical ETH download preserves symbol, inventory and absent threshold');
+  session = 1; sessionConfig = structuredClone(config); hasExposure = false; omitResidualNotional = false; await refresh();
   await page.getByRole('button', { name: '启动模拟', exact: true }).click();
   await page.locator('.blc-state.running').waitFor();
-  assert(await page.locator('.blc-buy-quote strong').count() === 6 && await page.locator('.blc-sell-quote strong').count() === 6, 'all six independent scenarios display buy and sell quotes simultaneously');
+  assert(await page.locator('.blc-buy-quote strong').count() === 3 && await page.locator('.blc-sell-quote strong').count() === 3, 'all three independent scenarios display buy and sell quotes simultaneously');
   assert((await page.locator('.blc-inventory tbody tr').nth(0).innerText()).includes('零库存'), 'zero inventory is visible without an opening-direction model');
   const longRow = page.locator('.blc-inventory tbody tr').nth(1), shortRow = page.locator('.blc-inventory tbody tr').nth(2);
   assert((await longRow.locator('.blc-binance-inventory').innerText()).includes('多仓') && (await shortRow.locator('.blc-binance-inventory').innerText()).includes('空仓'), 'positive and negative BN inventory retain directional labels');
   assert((await longRow.locator('.blc-buy-quote').innerText()).includes('0.008') && (await longRow.locator('.blc-sell-quote').innerText()).includes('0.012'), 'long inventory displays smaller buy and larger sell quantities');
   assert((await shortRow.locator('.blc-buy-quote').innerText()).includes('0.012') && (await shortRow.locator('.blc-sell-quote').innerText()).includes('0.008'), 'short inventory displays larger buy and smaller sell quantities');
-  assert((await page.locator('.blc-inventory tbody tr').nth(4).innerText()).includes('卖出 0.003 ETH'), 'one pending net hedge is displayed with its remaining demand');
+  assert((await shortRow.innerText()).includes('买入 0.012 BTC'), 'a pending hedge displays the full residual demand rather than just the amount above threshold');
+  assert((await longRow.innerText()).includes('低于对冲阈值，继续报价') && (await longRow.innerText()).includes('双边报价中') && (await longRow.innerText()).includes('无在途对冲'), 'below-threshold inventory remains quoting without a pending hedge');
+  assert((await longRow.locator('.blc-residual-inventory').innerText()).includes('净敞口名义额：600 USDC') && (await shortRow.locator('.blc-residual-inventory').innerText()).includes('净敞口名义额：1,200 USDC'), 'positive and negative residuals display absolute USDC notionals');
   assert(await page.locator('.blc-stopped-exposure').count() === 0, 'normal active inventory does not appear as an unresolved-error warning');
   valuationValid = false; await refresh();
-  assert(await page.getByText('估值未知 · 缺少合格估值价格', { exact: true }).count() === 6, 'missing valuation is explicit for all affected scenarios');
+  assert(await page.getByText('估值未知 · 缺少合格估值价格', { exact: true }).count() === 3, 'missing valuation is explicit for all affected scenarios');
   assert((await page.locator('.blc-marked-cost').first().innerText()).startsWith('—'), 'unknown valuation cannot appear as zero cost');
   assert((await page.locator('.blc-scenarios tbody tr').first().innerText()).includes('0.3 / —'), 'known fees survive missing unrealized and net PnL');
   assert((await longRow.locator('.blc-binance-inventory').innerText()).includes('名义额 — / 上限 5,000') && (await longRow.innerText()).includes('有向库存占比 —'), 'unknown inventory mark never becomes zero exposure');
+  assert((await longRow.locator('.blc-residual-inventory').innerText()).includes('净敞口名义额：未知'), 'unknown residual valuation is never recalculated in the browser');
   valuationValid = true; await refresh();
-  assert(await page.locator('.blc-quality.good').count() === 4, 'current valid market samples meet strict single-leg timing');
+  assert(await page.locator('.blc-quality.good').count() === 2, 'current valid BTC samples cover both venues with strict single-leg timing');
   for (const lead of [40, 90, 250]) {
     sourceLeadMs = lead; await refresh();
-    assert(await page.locator('.blc-quality.good').count() === 4, `source clock ${lead}ms ahead remains within the same 250ms backend tolerance`);
-    assert(await page.getByText(`源时钟超前 ${lead} ms（容差内）`, { exact: true }).count() === 2, 'the current source-clock lead is disclosed independently of admission');
+    assert(await page.locator('.blc-quality.good').count() === 2, `source clock ${lead}ms ahead remains within the same 250ms backend tolerance`);
+    assert(await page.getByText(`源时钟超前 ${lead} ms（容差内）`, { exact: true }).count() === 1, 'the current source-clock lead is disclosed independently of admission');
   }
   sourceLeadMs = 251; await refresh();
-  assert(await page.locator('.blc-quality.good').count() === 2, 'a source clock more than 250ms ahead remains ineligible');
-  assert(await page.getByText('采样时源时钟超前超过容差', { exact: true }).count() === 2, 'excessive clock lead has a specific sampling exclusion reason');
+  assert(await page.locator('.blc-quality.good').count() === 1, 'a source clock more than 250ms ahead remains ineligible');
+  assert(await page.getByText('采样时源时钟超前超过容差', { exact: true }).count() === 1, 'excessive clock lead has a specific sampling exclusion reason');
   frozenAt = elapsed; await advance(1100);
-  assert(await page.getByText('采样时源时钟超前超过容差', { exact: true }).count() === 2, 'an invalid source clock at sampling cannot heal merely because browser time passes');
+  assert(await page.getByText('采样时源时钟超前超过容差', { exact: true }).count() === 1, 'an invalid source clock at sampling cannot heal merely because browser time passes');
   frozenAt = null;
   sourceLeadMs = null; lighterChannelState = 'live'; await refresh();
   await page.getByText('公开数据源连接', { exact: true }).click();
@@ -208,9 +229,9 @@ async (page) => {
   assert(await page.getByText('行情更新滞后', { exact: true }).count() === 1, 'stale channel status has a Chinese label');
   lighterChannelState = 'disconnected'; sampleValid = false; await refresh();
   assert(await page.getByText('已断开', { exact: true }).count() === 1, 'a known WS disconnect remains visible independently of sample timing');
-  assert(await page.getByText('采样时未通过校验', { exact: true }).count() === 4, 'small ages cannot override a server-side invalid result');
+  assert(await page.getByText('采样时未通过校验', { exact: true }).count() === 2, 'small ages cannot override a server-side invalid result');
   await advance(2100);
-  assert(await page.locator('.blc-quality.stale').count() === 4, 'browser aging cannot hide a server-reported failure behind a neutral waiting state');
+  assert(await page.locator('.blc-quality.stale').count() === 2, 'browser aging cannot hide a server-reported failure behind a neutral waiting state');
   sampleValid = true;
   lighterChannelState = 'connected'; await refresh(); await page.getByText('公开数据源连接', { exact: true }).click();
   await page.locator('.blc-config>summary').click();
@@ -219,26 +240,27 @@ async (page) => {
   frozenAt = elapsed; await refresh(); await advance(3100);
   assert(await page.locator('.blc-quality.good').count() === 0, 'an old browser snapshot cannot assert current validity');
   assert(await page.locator('.blc-quality.stale').count() === 0, 'normal sampling delay is not mislabeled as a server-side stale book');
-  assert(await page.getByText('采样时有效 · 当前待更新', { exact: true }).count() === 4, 'three-second-old samples retain their past validity with a neutral current-time state');
+  assert(await page.getByText('采样时有效 · 当前待更新', { exact: true }).count() === 2, 'three-second-old samples retain their past validity with a neutral current-time state');
   const oldAge = await page.locator('.blc-book-age').first().innerText(); await refresh();
   assert(await page.locator('.blc-quality.good').count() === 0, 'a fresh HTTP GET cannot refresh a frozen market observation');
   const ageSeconds = text => Number.parseFloat(text.replaceAll(',', ''));
   assert(ageSeconds(await page.locator('.blc-book-age').first().innerText()) >= ageSeconds(oldAge), `frozen report age cannot move backwards across rereads: ${oldAge} -> ${await page.locator('.blc-book-age').first().innerText()}`);
   await advance(13000); await refresh();
   await page.getByText('研究报告超过 15 秒未更新', { exact: true }).waitFor();
-  assert(await page.getByText('历史采样时有效', { exact: true }).count() === 4, 'a stopped report is explicitly historical, not a current healthy claim');
+  assert(await page.getByText('历史采样时有效', { exact: true }).count() === 2, 'a stopped report is explicitly historical, not a current healthy claim');
   assert((await page.locator('.blc-exposures .panel-heading').innerText()).includes('历史报告'), 'frozen quote and inventory evidence is visibly historical');
   frozenAt = null; await refresh();
   holdRead = true; await page.getByRole('button', { name: '刷新状态', exact: true }).click(); await page.waitForTimeout(25);
   assert(held.length === 1, 'slow network response is held'); await advance(2500); await held.shift()(); await page.waitForTimeout(25);
   assert(await page.locator('.blc-quality.good').count() === 0, 'transport delay is included in book age before a response is accepted');
   assert(await page.locator('.blc-quality.stale').count() === 0, 'slow HTTP transport does not fabricate a WS-data failure');
-  assert(await page.getByText('采样时有效 · 当前待更新', { exact: true }).count() === 4, 'slow transport shows waiting for current information');
+  assert(await page.getByText('采样时有效 · 当前待更新', { exact: true }).count() === 2, 'slow transport shows waiting for current information');
   await page.clock.setSystemTime(new Date(base + elapsed + 3600000)); await refresh();
-  assert(await page.locator('.blc-quality.good').count() === 4, 'browser wall clock skew cannot age server observations');
+  assert(await page.locator('.blc-quality.good').count() === 2, 'browser wall clock skew cannot age server observations');
   await page.clock.setSystemTime(new Date(base + elapsed));
   stale = true; await refresh();
   assert((await page.locator('.blc-quality').first().innerText()).includes('接收年龄超限'), 'source age and receipt age do not become fresh when read');
+  assert((await longRow.locator('.blc-residual-inventory').innerText()).includes('净敞口名义额：未知'), 'stale backend residual valuation remains unknown even with a prior fresh price');
   failRead = true; await refresh(); await page.getByText(/研究数据读取失败：fixture read failed/).waitFor();
   assert(await page.locator('.blc-chart .recharts-line-curve').count() > 0, 'read failure preserves historical costs');
   failRead = false; stale = false; await refresh();
@@ -264,13 +286,28 @@ async (page) => {
   await quoteRefresh.fill('2000'); await quoteAge.fill('1000'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
   await page.getByText('挂单最长寿命不得小于最短重报间隔。', { exact: true }).waitFor();
   assert(writes.length === beforeValidation, 'inventory reservation and refresh lifetime constraints reject before submitting');
-  await quoteRefresh.fill('1000'); await quoteAge.fill('15000'); rejectSave = true;
+  await quoteRefresh.fill('1000'); await quoteAge.fill('15000');
+  const threshold = page.getByLabel('对冲阈值（USDC）', { exact: true });
+  await threshold.fill('1e-100'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByText('正对冲阈值不能低于 1e-18 USDC。', { exact: true }).waitFor();
+  assert(writes.length === beforeValidation, 'unrepresentable thresholds are rejected before submitting a request');
+  for (const invalidThreshold of ['', '-1']) {
+    await threshold.fill(invalidThreshold); await page.getByRole('button', { name: '保存配置', exact: true }).click();
+    await page.getByText('对冲阈值（USDC）须为 0–1000000 之间的数字。', { exact: true }).waitFor();
+  }
+  await threshold.fill('2001'); await page.getByRole('button', { name: '保存配置', exact: true }).click();
+  await page.getByText('对冲阈值不得大于净敞口名义额上限。', { exact: true }).waitFor();
+  assert(writes.length === beforeValidation, 'missing, negative and above-cap thresholds are rejected before submitting');
+  await threshold.fill('0'); rejectSave = true;
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('fixture save rejected', { exact: true }).waitFor();
   assert(await notional.inputValue() === '250' && await page.getByRole('button', { name: '保存配置', exact: true }).isEnabled(), 'explicit rejection retains draft and allows corrected retry');
   rejectSave = false; holdRead = true; await advance(5000); assert(held.length === 1, 'pre-save GET is held');
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('配置已保存。', { exact: true }).waitFor();
   await held.shift()(); await page.waitForTimeout(25);
   assert(await notional.inputValue() === '250' && config.orderNotional === 250, 'late old GET cannot roll back a confirmed save');
+  assert(await threshold.inputValue() === '0' && config.hedgeThresholdNotional === 0, 'zero threshold is saved and survives late pre-save state');
+  assert(config.symbols.length === 1 && config.symbols[0] === 'BTC', 'configuration writes always select BTC only');
+  assert((await page.locator('.blc-session-threshold').innerText()).includes('1,000 USDC'), 'saving a zero threshold does not rewrite a stopped session');
   await notional.fill('300'); holdSave = true;
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.waitForTimeout(25);
   assert(saveAcks.length === 1, 'save response is held'); await notional.fill('350');
@@ -279,10 +316,12 @@ async (page) => {
   assert(await page.getByRole('button', { name: '保存配置', exact: true }).isEnabled(), 'newer draft remains visibly unsaved');
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('配置已保存。', { exact: true }).waitFor();
   const oldSession = await page.locator('.blc-session').innerText();
+  await threshold.fill('1500');
   await page.getByLabel('Binance Maker 费率（bps）', { exact: true }).fill('2');
   await page.getByRole('button', { name: '保存配置', exact: true }).click(); await page.getByText('配置已保存。', { exact: true }).waitFor();
-  assert(await page.locator('.blc-session').innerText() === oldSession, 'new configuration cannot rewrite stopped session fee assumptions');
+  assert(await page.locator('.blc-session').innerText() === oldSession, 'new configuration cannot rewrite stopped session fee or threshold assumptions');
   await page.getByRole('button', { name: '启动模拟', exact: true }).click(); await page.locator('.blc-state.running').waitFor();
+  assert((await page.locator('.blc-session-threshold').innerText()).includes('1,500 USDC') && await threshold.isDisabled(), 'the next session locks the saved threshold and makes it read only');
   unknownStop = true; const beforeUnknown = writes.length;
   await page.getByRole('button', { name: '停止模拟', exact: true }).click(); await page.getByText('操作结果尚未确认，正在读取核对；确认前不会重复提交。', { exact: true }).waitFor();
   await advance(5000); assert(writes.length === beforeUnknown + 1, 'unknown stop results are never automatically retried');
@@ -334,5 +373,5 @@ async (page) => {
   assert(errors.length === 0, `no browser errors: ${errors.join('; ')}`);
   assert(writes.every(write => ['/start', '/stop', '/config', '/archive'].some(suffix => write.path === root + suffix)), 'only paper research state is mutated');
   await page.clock.resume();
-  return { checks: 'native-route, summary/detail, selected-only, coalesced-detail, detail-switch-race, detail-error-retention, detail-session-conflict, full-export, separate-archive-interruption, six-inventory-scenarios, simultaneous-quotes, signed-inventory, net-hedge, unknown-valuation, legacy-download, mixed-schema-archives, signed-costs, chart-gaps, stop-save-start, numeric-validation, rejected-save, stale-GET-save-race, save-draft-preservation, frozen-session, monotonic-freshness, server-clock, source-clock-tolerance, channel-labels, stale/error, retained-inventory/archive, unknown-write-latch, hidden/offline/resume, download, mobile-overflow, unmount, session-expiry', writes: writes.length, reads: reads.length, detailReads: detailReads.length };
+  return { checks: 'native-route, summary/detail, selected-only, coalesced-detail, detail-switch-race, detail-error-retention, detail-session-conflict, full-export, separate-archive-interruption, BTC-only-three-scenarios, simultaneous-quotes, signed-inventory, net-hedge, below-threshold-quoting, threshold-validation-zero-cap, frozen-session-threshold, historical-ETH-missing-threshold-export, missing-stale-residual-notional, unknown-valuation, legacy-download, mixed-schema-archives, signed-costs, chart-gaps, stop-save-start, numeric-validation, rejected-save, stale-GET-save-race, save-draft-preservation, frozen-session, monotonic-freshness, server-clock, source-clock-tolerance, channel-labels, stale/error, retained-inventory/archive, unknown-write-latch, hidden/offline/resume, download, mobile-overflow, unmount, session-expiry', writes: writes.length, reads: reads.length, detailReads: detailReads.length };
 }

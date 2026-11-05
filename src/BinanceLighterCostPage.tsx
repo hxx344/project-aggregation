@@ -8,7 +8,6 @@ import './binance-lighter-cost.css';
 
 const ROOT = '/api/research/binance-lighter-cost';
 const SOURCE_CLOCK_TOLERANCE_MS = 250;
-const SYMBOLS: CostSymbol[] = ['BTC', 'ETH'];
 const numbers = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 8 });
 const durationNumbers = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 });
 const tinyNumbers = new Intl.NumberFormat('zh-CN', { notation: 'scientific', maximumFractionDigits: 4 });
@@ -21,6 +20,7 @@ const reasonLabels: Record<string, string> = {
   invalid_book: '盘口校验未通过', book_time_regression: '盘口时间回退', feed_unavailable: '行情源暂不可用', below_market_minimum: '数量或名义额低于合约下限',
   hedge_timeout: '等待对冲盘口超时', hedge_ioc_partial_or_slippage: '对冲深度不足或滑点超限', hedge_retries_exhausted: '对冲重试已耗尽',
   unhedgeable_remainder: '剩余数量无法满足对冲下限', inventory_limit: '库存达到限制', unhedged_limit: '净敞口达到限制', valuation_unavailable: '缺少合格估值价格',
+  below_hedge_threshold: '低于对冲阈值，继续报价',
   stopped: '会话已停止', sequence_gap: '盘口序列缺失', disconnected: '公开行情连接中断',
 };
 function reasonText(reason: string) { return reasonLabels[reason] || reason; }
@@ -39,6 +39,7 @@ const fields: NumericField[] = [
   { key: 'orderNotional', label: '单侧基础报价名义额（USDC）', min: 10, max: 100000 },
   { key: 'maxInventoryNotional', label: 'BN 库存名义额上限（USDC）', min: 10, max: 1000000 },
   { key: 'maxUnhedgedNotional', label: '净敞口名义额上限（USDC）', min: 10, max: 1000000 },
+  { key: 'hedgeThresholdNotional', label: '对冲阈值（USDC）', min: 0, max: 1000000, hint: '默认 1,000。低于阈值继续报价；达到或超过时对冲完整净敞口。0 表示即时对冲。' },
   { key: 'quoteOffsetBps', label: '基础报价偏移（bps）', min: 0, max: 100 },
   { key: 'inventorySkewBps', label: '库存调价幅度（bps）', min: 0, max: 100 },
   { key: 'quoteRefreshMs', label: '最短重报间隔（ms）', min: 1000, max: 60000, integer: true },
@@ -53,9 +54,9 @@ const fields: NumericField[] = [
   { key: 'maxHedgeSlippageBps', label: '最大对冲滑点（bps）', min: 0, max: 100 },
   { key: 'queueMultiplier', label: '可见排队量倍数', min: 1, max: 10, hint: '排队代理假设，不能证明真实排队位置。' },
 ];
-type Draft = { symbols: CostSymbol[]; values: Record<NumberKey, string>; latencies: string[] };
+type Draft = { values: Record<NumberKey, string>; latencies: string[] };
 function draftOf(config: CostConfig): Draft {
-  return { symbols: [...config.symbols], values: Object.fromEntries(fields.map(field => [field.key, config[field.key] === null ? '' : String(config[field.key])])) as Record<NumberKey, string>, latencies: config.latencyScenarios.map(String) };
+  return { values: Object.fromEntries(fields.map(field => [field.key, config[field.key] === null ? '' : String(config[field.key])])) as Record<NumberKey, string>, latencies: config.latencyScenarios.map(String) };
 }
 function parseNumber(raw: string, label: string, min: number, max: number, integer = false) {
   const value = raw.trim() === '' ? NaN : Number(raw);
@@ -63,11 +64,12 @@ function parseNumber(raw: string, label: string, min: number, max: number, integ
   return value;
 }
 function configOf(draft: Draft, current: CostConfig): CostConfig {
-  if (!draft.symbols.length) throw new Error('请至少选择一个模拟标的。');
-  const result: CostConfig = { ...current, symbols: [...draft.symbols], latencyScenarios: draft.latencies.map(value => parseNumber(value, 'Lighter 延迟（ms）', 300, 10000, true)) };
+  const result: CostConfig = { ...current, symbols: ['BTC'], latencyScenarios: draft.latencies.map(value => parseNumber(value, 'Lighter 延迟（ms）', 300, 10000, true)) };
   if (new Set(result.latencyScenarios).size !== result.latencyScenarios.length) throw new Error('各个延迟情景不能重复。');
   for (const field of fields) Object.assign(result, { [field.key]: field.nullable && !draft.values[field.key].trim() ? null : parseNumber(draft.values[field.key], field.label, field.min, field.max, field.integer) });
   if (result.maxInventoryNotional < result.orderNotional) throw new Error('BN 库存名义额上限不得小于单侧基础报价名义额。');
+  if (result.hedgeThresholdNotional > result.maxUnhedgedNotional) throw new Error('对冲阈值不得大于净敞口名义额上限。');
+  if (result.hedgeThresholdNotional > 0 && result.hedgeThresholdNotional < 1e-18) throw new Error('正对冲阈值不能低于 1e-18 USDC。');
   if (result.quoteMaxAgeMs < result.quoteRefreshMs) throw new Error('挂单最长寿命不得小于最短重报间隔。');
   return result;
 }
@@ -75,10 +77,10 @@ function configOf(draft: Draft, current: CostConfig): CostConfig {
 function Configuration({ draft, onChange, disabled, dirty, busy, onSave, onReset }: { draft: Draft; onChange: (value: Draft) => void; disabled: boolean; dirty: boolean; busy: boolean; onSave: (event: FormEvent) => void; onReset: () => void }) {
   const inputs = (list: NumericField[]) => list.map(field => <label className="blc-field" key={field.key}><span>{field.label}</span><input type="number" aria-label={field.label} inputMode="decimal" min={field.min} max={field.max} step={field.integer ? 1 : 'any'} value={draft.values[field.key]} onChange={event => onChange({ ...draft, values: { ...draft.values, [field.key]: event.target.value } })} />{field.hint ? <small>{field.hint}</small> : null}</label>);
   return <details className="panel blc-config"><summary>模拟配置<span>{disabled ? '停止后可编辑' : dirty ? '有未保存的修改' : '已同步'}</span></summary><form noValidate onSubmit={onSave}>
-    <fieldset disabled={disabled}><div className="blc-config-intro"><p>费用与延迟在启动时锁定，修改只用于下一会话。默认零费为公开优惠假设，未核验账户实际费率。</p><div className="blc-symbols">{SYMBOLS.map(symbol => <label key={symbol}><input type="checkbox" checked={draft.symbols.includes(symbol)} onChange={event => onChange({ ...draft, symbols: event.target.checked ? [...draft.symbols, symbol] : draft.symbols.filter(value => value !== symbol) })} />{symbol}</label>)}</div></div>
-      <div className="blc-form-grid">{inputs(fields.slice(0, 11))}</div>
+    <fieldset disabled={disabled}><div className="blc-config-intro"><p>新会话仅支持 BTC 永续。费用、延迟与对冲阈值在启动时锁定，修改只用于下一会话。默认零费为公开优惠假设，未核验账户实际费率。</p></div>
+      <div className="blc-form-grid">{inputs(fields.slice(0, 12))}</div>
       <div className="blc-latencies"><h3>Lighter 延迟情景</h3><p>Standard 普通 Taker 至少 300 ms；最多 3 个独立情景，默认 300 / 600 / 1000 ms。</p><div>{draft.latencies.map((latency, index) => <label className="blc-field" key={index}><span>情景 {index + 1} 延迟（ms）</span><input type="number" aria-label={'情景 ' + (index + 1) + ' 延迟（ms）'} min={300} max={10000} step={1} value={latency} onChange={event => onChange({ ...draft, latencies: draft.latencies.map((value, i) => i === index ? event.target.value : value) })} /><button type="button" className="button secondary" disabled={draft.latencies.length === 1} onClick={() => onChange({ ...draft, latencies: draft.latencies.filter((_, i) => i !== index) })}>移除情景 {index + 1}</button></label>)}</div><button type="button" className="button secondary" disabled={draft.latencies.length >= 3} onClick={() => onChange({ ...draft, latencies: [...draft.latencies, '1000'] })}>添加延迟情景</button></div>
-      <details className="blc-advanced"><summary>盘口时效与排队假设</summary><div className="blc-form-grid">{inputs(fields.slice(11))}</div></details>
+      <details className="blc-advanced"><summary>盘口时效与排队假设</summary><div className="blc-form-grid">{inputs(fields.slice(12))}</div></details>
     </fieldset><div className="blc-form-actions"><span>{disabled ? '运行或操作待确认时配置只读。' : '保存不会改写已完成的历史结果。'}</span><div><button type="button" className="button secondary" disabled={!dirty || disabled || busy} onClick={onReset}>恢复已保存配置</button><button type="submit" className="button primary" disabled={!dirty || disabled || busy}>{busy ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存配置</button></div></div>
   </form></details>;
 }
@@ -89,14 +91,14 @@ function Quote({ quote, symbol }: { quote: CostQuote | null; symbol: CostSymbol 
 
 const InventoryTable = memo(function InventoryTable({ scenarios, selected, onSelect, snapshotLabel }: { scenarios: CostScenario[]; selected: string; onSelect: (id: string) => void; snapshotLabel: string }) {
   return <section className="panel blc-section blc-exposures"><div className="panel-heading"><h2>BN 双边报价与库存</h2><span className="muted">{snapshotLabel}</span></div>
-    <p className="blc-note">目标 BN 净库存为 0。多仓降低买价和买量、降低卖价并提高卖量；空仓反向调整。Lighter 按净敞口对冲，每个情景最多一笔在途 IOC。</p>
+    <p className="blc-note">目标 BN 净库存为 0。多仓降低买价和买量、降低卖价并提高卖量；空仓反向调整。净敞口名义额为 |BN + Lighter 净数量| × 新鲜 Lighter 中间价。Lighter 按会话阈值对冲完整净敞口，每个情景最多一笔在途 IOC；已提交的 IOC 不因敞口低于阈值而取消。</p>
     <div className="blc-table-scroll"><table className="blc-table blc-inventory"><caption>每个标的 × 延迟为独立账户；报价和库存为报告采样记录，非真实委托。</caption><thead><tr><th>标的 / 延迟</th><th>采样状态</th><th>BN 净库存 / 均价</th><th>BN 买单</th><th>BN 卖单</th><th>Lighter 净库存 / 均价</th><th>净敞口 / 对冲后预计</th><th>Lighter 在途对冲</th></tr></thead><tbody>{scenarios.length ? scenarios.map(scenario => <tr key={scenario.id} data-scenario-id={scenario.id} className={selected === scenario.id ? 'selected' : ''}>
       <th scope="row"><button type="button" className="blc-scenario-select" aria-pressed={selected === scenario.id} onClick={() => onSelect(scenario.id)}>{scenario.symbol}<small>{scenario.latencyMs} ms</small></button></th>
       <td>{phaseLabels[scenario.status]}{scenario.reason ? <small>{reasonText(scenario.reason)}</small> : null}</td>
       <td className="blc-binance-inventory"><strong>{num(scenario.inventory.binanceQuantity)} {scenario.symbol}</strong><small>{scenario.inventory.binanceQuantity > 0 ? '多仓' : scenario.inventory.binanceQuantity < 0 ? '空仓' : '零库存'} · 均价 {num(scenario.inventory.binanceAveragePrice)} USDC<br />名义额 {num(scenario.inventory.binanceNotional)} / 上限 {num(scenario.inventory.limitNotional)} USDC<br />有向库存占比 {scenario.inventory.utilization === null ? '—' : num(scenario.inventory.utilization * 100) + '%'}</small></td>
       <td className="blc-buy-quote"><Quote quote={scenario.quotes.buy} symbol={scenario.symbol} /></td><td className="blc-sell-quote"><Quote quote={scenario.quotes.sell} symbol={scenario.symbol} /></td>
       <td>{num(scenario.inventory.lighterQuantity)} {scenario.symbol}<small>均价 {num(scenario.inventory.lighterAveragePrice)} USD 参考价</small></td>
-      <td>{num(scenario.inventory.residualQuantity)} {scenario.symbol}<small>在途对冲全部成交后：<br />{num(scenario.inventory.projectedResidualQuantity)} {scenario.symbol}</small></td>
+      <td className="blc-residual-inventory">{num(scenario.inventory.residualQuantity)} {scenario.symbol}<small>净敞口名义额：{typeof scenario.inventory.residualNotional === 'number' && Number.isFinite(scenario.inventory.residualNotional) ? `${num(scenario.inventory.residualNotional)} USDC` : '未知'}<br />在途对冲全部成交后：<br />{num(scenario.inventory.projectedResidualQuantity)} {scenario.symbol}</small></td>
       <td>{scenario.hedge ? <>{scenario.hedge.side === 'buy' ? '买入' : '卖出'} {num(scenario.hedge.quantity)} {scenario.symbol}<small>最早执行 {time(scenario.hedge.dueAt)}<br />第 {scenario.hedge.attempt} 次尝试</small></> : '无在途对冲'}</td>
     </tr>) : <tr><td colSpan={8} className="blc-empty">尚无库存策略会话。启动后按标的与延迟独立模拟双边报价。</td></tr>}</tbody></table></div>
   </section>;
@@ -289,7 +291,7 @@ export default function BinanceLighterCostPage({ onExpired }: { onExpired: () =>
   const exposures = scenarios.filter(scenario => scenario.inventory.binanceQuantity !== 0 || scenario.inventory.lighterQuantity !== 0 || scenario.hedge !== null);
   const snapshotLabel = report ? `${historical ? '历史报告' : reportElapsed > report.sessionConfig.maxBookAgeMs ? '报告采样 · 当前待更新' : '报告采样'} ${time(report.updatedAt)}` : '尚无会话';
   const writeDisabled = !!busy || uncertain || offline || !snapshot;
-  return <div className="blc-page"><div className="blc-heading"><div><h1>对冲成本研究</h1><p>BN 双边库存报价 × Lighter 净对冲 · BTC / ETH 永续</p></div><div className="blc-toolbar"><button className="button secondary" disabled={loading || !!busy || offline} onClick={() => void read(true)}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新状态</button><button className="button secondary" disabled={!!busy || offline || !snapshot || (!report && !snapshot.archives.length)} onClick={() => void execute('download')}><Download size={15} />导出报告</button>{active ? <button className="button secondary" disabled={writeDisabled} onClick={() => void execute('stop')}><Square size={15} />停止模拟</button> : <button className="button primary" disabled={writeDisabled || dirty || exposures.length > 0 || !!report?.interrupted} onClick={() => void execute('start')}><Play size={15} />启动模拟</button>}</div></div>
+  return <div className="blc-page"><div className="blc-heading"><div><h1>对冲成本研究</h1><p>BN 双边库存报价 × Lighter 净对冲 · BTC 永续</p></div><div className="blc-toolbar"><button className="button secondary" disabled={loading || !!busy || offline} onClick={() => void read(true)}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新状态</button><button className="button secondary" disabled={!!busy || offline || !snapshot || (!report && !snapshot.archives.length)} onClick={() => void execute('download')}><Download size={15} />导出报告</button>{active ? <button className="button secondary" disabled={writeDisabled} onClick={() => void execute('stop')}><Square size={15} />停止模拟</button> : <button className="button primary" disabled={writeDisabled || dirty || exposures.length > 0 || !!report?.interrupted} onClick={() => void execute('start')}><Play size={15} />启动模拟</button>}</div></div>
     <div className="blc-identity"><strong>仅模拟 · 真实订单 0</strong><span>活动资格、有效成交额与奖励待确认；不作为真实成交证明。</span></div>
     {loadError ? <div className="blc-callout warning" role="alert">研究数据读取失败：{loadError} 历史记录仍保留。</div> : null}
     {actionError ? <div className="blc-callout warning" role="alert">{actionError}</div> : null}
@@ -301,7 +303,7 @@ export default function BinanceLighterCostPage({ onExpired }: { onExpired: () =>
     <ScenarioTable scenarios={scenarios} selected={selected?.id || ''} snapshotLabel={snapshotLabel} />
     <ScenarioDetails scenario={selected} detail={selectedDetail} loading={detailLoading} error={detailError?.key === detailKey ? detailError.message : ''} stale={detailStale || historical} />
     {report ? <Books books={report.books} report={report} serverNow={serverNow} elapsed={reportElapsed} historical={historical} /> : null}
-    {report ? <section className="panel blc-session"><div><h2>会话假设与归档</h2><p>本会话费用：Binance Maker {num(report.sessionConfig.binanceMakerFeeBps)} bps / Lighter Taker {num(report.sessionConfig.lighterTakerFeeBps)} bps；每小时净资金费支出情景 {report.sessionConfig.fundingCostBpsPerHour === null ? '未设置' : `${num(report.sessionConfig.fundingCostBpsPerHour)} bps`}。</p><p>公开主动成交消耗可见队列仅为 Maker 成交代理；触价、撤单缩量不代表真实成交。Lighter 延迟结束后按新到合格盘口扫单，深度不足保留未对冲量。</p></div><button className="button secondary" disabled={writeDisabled || active} onClick={() => void execute('archive')}><Archive size={15} />归档当前会话</button></section> : null}
+    {report ? <section className="panel blc-session"><div><h2>会话假设与归档</h2><p>本会话标的：{report.sessionConfig.symbols.join(' / ')}。{report.sessionConfig.symbols.includes('ETH') ? 'ETH 历史记录保留原始标的与假设；新会话仅支持 BTC。' : ''}</p><p className="blc-session-threshold">{report.sessionConfig.hedgeThresholdNotional === undefined ? '本会话对冲规则：旧版即时对冲（原报告未设置阈值）。' : `本会话对冲阈值：${num(report.sessionConfig.hedgeThresholdNotional)} USDC。低于阈值继续报价；达到或超过阈值时对冲完整净敞口。`}</p><p>本会话费用：Binance Maker {num(report.sessionConfig.binanceMakerFeeBps)} bps / Lighter Taker {num(report.sessionConfig.lighterTakerFeeBps)} bps；每小时净资金费支出情景 {report.sessionConfig.fundingCostBpsPerHour === null ? '未设置' : `${num(report.sessionConfig.fundingCostBpsPerHour)} bps`}。</p><p>公开主动成交消耗可见队列仅为 Maker 成交代理；触价、撤单缩量不代表真实成交。Lighter 延迟结束后按新到合格盘口扫单，深度不足保留未对冲量。</p></div><button className="button secondary" disabled={writeDisabled || active} onClick={() => void execute('archive')}><Archive size={15} />归档当前会话</button></section> : null}
     {draft ? <Configuration draft={draft} onChange={changeDraft} disabled={active || uncertain || (busy !== '' && busy !== 'save')} dirty={dirty} busy={!!busy} onSave={save} onReset={() => { if (snapshot) { setDraft(draftOf(snapshot.config)); dirtyRef.current = false; setDirty(false); draftRevision.current++; } }} /> : null}
     {snapshot?.legacySession ? <section className="panel blc-section blc-legacy"><div className="panel-heading"><h2>旧版单轮会话 · 只读保留</h2><button className="button secondary" disabled={!!busy || offline} onClick={() => void execute('download', undefined, snapshot.legacySession!.sessionId)}><Download size={15} />下载旧版报告</button></div><p className="blc-note">{snapshot.legacySession.sessionId} · {time(snapshot.legacySession.startedAt, true)} 开始 · 已完成 {snapshot.legacySession.completed} / 未决 {snapshot.legacySession.unresolved}{snapshot.legacySession.interrupted ? ' · 曾中断' : ''}。这是旧版开平轮次记录，未转换为库存策略结果，以下数量均为历史记录。</p>{snapshot.legacySession.exposures.length ? <div className="blc-table-scroll"><table className="blc-table"><thead><tr><th>旧情景</th><th>BN 数量</th><th>Lighter 数量</th><th>未对冲数量</th></tr></thead><tbody>{snapshot.legacySession.exposures.map(exposure => <tr key={exposure.id}><th scope="row">{exposure.id}</th><td>{num(exposure.binanceQuantity)} {exposure.symbol}</td><td>{num(exposure.lighterQuantity)} {exposure.symbol}</td><td>{num(exposure.residualQuantity)} {exposure.symbol}</td></tr>)}</tbody></table></div> : <p className="blc-note">旧版摘要无保留敞口。</p>}</section> : null}
     {snapshot?.archives.length ? <details className="panel blc-records blc-archives"><summary>历史归档（{snapshot.archives.length}）</summary><p className="blc-note">库存策略与旧版单轮记录分别保留原口径，归档不消除历史敞口。</p><div className="blc-table-scroll"><table className="blc-table"><thead><tr><th>会话 / 模型</th><th>开始 / 结束</th><th>成交摘要</th><th>库存或旧版未决</th><th>中断状态</th><th>原始报告</th></tr></thead><tbody>{snapshot.archives.map(archive => <tr key={`${archive.schema}:${archive.sessionId}`}><th scope="row">{archive.sessionId}<small>{archive.schema === 2 ? '库存策略 · v2' : '旧版单轮 · v1'}</small></th><td>{time(archive.startedAt, true)}<small>{time(archive.endedAt, true)}</small></td><td>{archive.schema === 2 ? `${archive.makerFills} 笔 Maker 成交` : `${archive.completed} 轮已完成`}</td><td>{archive.schema === 2 ? archive.hasExposure ? '库存保留' : '无库存' : `${archive.unresolved} 条旧版未决`}</td><td>{archive.interrupted === true ? '曾中断' : archive.interrupted === false ? '正常结束' : '未记录'}</td><td><button className="button secondary" disabled={!!busy || offline} onClick={() => void execute('download', undefined, archive.sessionId)}>下载归档</button></td></tr>)}</tbody></table></div></details> : null}
