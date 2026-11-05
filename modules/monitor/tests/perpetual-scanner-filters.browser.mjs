@@ -111,7 +111,15 @@ async page => {
     check(await field('开仓价差最小值').inputValue() === '0', 'Legacy default threshold is explicitly migrated');
     const layout = await filterPanel.locator('fieldset').evaluateAll(elements => elements.map(element => ({ x: element.getBoundingClientRect().x, y: element.getBoundingClientRect().y })));
     check(layout.length === 4 && layout.every(item => Math.abs(item.y - layout[0].y) < 2) && layout.every((item, index) => !index || item.x > layout[index - 1].x), 'Desktop filter groups share one four-column row');
-    check(await filterPanel.evaluate(element => getComputedStyle(element).backgroundColor) === 'rgb(36, 35, 31)', 'The expanded panel uses the scanner dark background');
+    // Compare with the live scanner token instead of a literal: the shared workbench palette defines the colour.
+    const surface = await filterPanel.evaluate(element => {
+      const probe = document.createElement('div'); probe.style.backgroundColor = 'var(--scanner-bg)';
+      element.closest('.perp-scanner').append(probe);
+      const token = getComputedStyle(probe).backgroundColor; probe.remove();
+      return { panel: getComputedStyle(element).backgroundColor, token };
+    });
+    const channels = surface.panel.match(/\d+(\.\d+)?/g)?.map(Number) ?? [];
+    check(surface.panel === surface.token && channels.length === 3 && Math.max(...channels) < 64, `The expanded panel uses the scanner dark background (${surface.panel}, token ${surface.token})`);
     check(await filterPanel.getByRole('textbox').evaluateAll(inputs => new Set(inputs.map(input => input.name)).size === 20 && inputs.every(input => input.name)), 'All range inputs have unique form names');
     await filterPanel.screenshot({ path: 'output/playwright/scanner-layout-ranges-desktop.png' });
     await filterPanel.getByRole('button', { name: '收起', exact: true }).click();

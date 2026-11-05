@@ -10,6 +10,7 @@ import { HttpError } from '../http-common.mjs';
 import { AERO_BASE, AERO_CHAINS, chainById } from './aero-market-chains.mjs';
 import { emissionRate, liquiditySegments, priceChange, realizedVol, solvePrices, tvlUsd } from './aero-market-core.mjs';
 import * as chainReads from './aero-market-rpc.mjs';
+import { scrubRpcMessage } from './aero-market-rpc.mjs';
 import { openMarketSamples, SAMPLE_WINDOWS } from './aero-market-samples.mjs';
 
 const HOUR = 3600;
@@ -20,6 +21,23 @@ const BACKFILL_PER_CYCLE = 24;
 // 回填未完成时不等常规间隔：每批之间只歇这么久，7 天历史几分钟补齐，而不是按 15 分钟一批拖近 2 小时。
 const BACKFILL_FOLLOW_SEC = 30;
 const RETRY_SEC = [60, 120, 300, 600];
+// 整轮（发现、当前读数与回填）限时 5 分钟，到期取消在途请求；当前读取失败按失败退避，回填到期保留已发布的当前数据。
+// 重新发现到期后优先占用本轮，成功结果同时更新当前快照；预算耗尽不计节点失败，下一轮强制只刷新当前数据，最多让位一轮。
+// 单次请求最坏 20 秒 × 2 次加 0.8 秒间隔约 41 秒，预算容纳约 7 次连续最坏请求。
+const CYCLE_DEADLINE_MS = 5 * 60_000;
+// 发现时每批读这么多个池子的地址与静态信息（约 3 + 9 次 eth_call、4–5 轮串行），每批读完即记入草稿：
+// 单批在单次超时 20 秒的慢节点上也远小于整轮预算，首次发现可以跨轮完成。
+const DISCOVERY_POOL_BATCH = 250;
+// 首次发现（还没有池子列表，没有旧数据要保护）整轮预算放大到 3 倍，即 15 分钟、等于默认刷新间隔：发现后半段（gauge、全部池子状态）
+// 必须一轮读完，约 3000 个池子时约 90 轮串行请求，按每轮 10 秒估算；放在普通 5 分钟预算里，慢节点上静态信息读完后仍每轮被截止。
+const FIRST_DISCOVERY_DEADLINE_FACTOR = 3;
+// 重新发现的真实请求错误从 30 分钟起翻倍退避，最长 6 小时。预算耗尽不计节点错误：
+// 连续 3 次发现尝试没有新增可续读的池子/代币时，另行按相同范围退避，防止动态阶段反复耗尽整轮预算。
+// 普通当前刷新不清零无进展次数；草稿有新增进展、发现成功或更换 RPC/TVL 门槛时清零。
+const REDISCOVERY_RETRY_SEC = 30 * 60;
+const REDISCOVERY_STALL_LIMIT = 3;
+// 池子列表超过这么久未更新，页面提示：说明重新发现已连续错过至少一次常规间隔。
+const DISCOVERY_STALE_SEC = 2 * DISCOVERY_SEC;
 const MANUAL_MIN_GAP_MS = 30_000;
 const LIMITS = { registry: 8 * 1024 * 1024, history: 32 * 1024 * 1024, snapshot: 8 * 1024 * 1024, config: 64 * 1024, favorites: 64 * 1024 };
 // 详情页流动性分布按需读链：同一池子 60 秒内复用结果（并发请求共用一次读取），失败不缓存；
@@ -127,7 +145,7 @@ export function buildRows({ chain, registry, snapshot, prev, history }) {
   }).filter(Boolean);
 }
 
-export function createAeroMarket({ dataDir, enabledByDefault = true, log = console, now = Date.now, reads = chainReads, createRpc = chainReads.createRpc, setTimer = setTimeout, clearTimer = clearTimeout, openSamples = openMarketSamples } = {}) {
+export function createAeroMarket({ dataDir, enabledByDefault = true, log = console, now = Date.now, reads = chainReads, createRpc = chainReads.createRpc, setTimer = setTimeout, clearTimer = clearTimeout, openSamples = openMarketSamples, cycleDeadlineMs = CYCLE_DEADLINE_MS, discoveryBatch = DISCOVERY_POOL_BATCH } = {}) {
   const directory = path.join(dataDir, 'aero-market');
   const configPath = path.join(directory, 'config.json');
   const favoritesPath = path.join(directory, 'favorites.json');
@@ -141,15 +159,14 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   // 样本版本每次启动从 0 计：标签带上本次启动的随机标识，重启后不会与浏览器缓存里的旧标签撞号。
   const boot = randomUUID().slice(0, 8);
   const abort = new AbortController();
-  const runtimes = new Map(AERO_CHAINS.map((c) => [c.id, { registry: null, snapshot: null, prev: null, history: { schema: 1, points: [] }, rows: [], rpc: null, rpcUrl: '',
-    status: 'idle', backfillPending: 0, rediscover: false, error: null, errorAt: null, checkedAt: null, nextAt: null, running: null, timer: null, failures: 0, lastStart: 0, archive: null, writes: Promise.resolve() }]));
+  // backfillPhase：catching_up 按短间隔追批、backoff 出错后等常规轮次（或归档读取暂停到 backfillRetryAt）、complete 已补齐；null 为尚未回填。
+  // discoveryDraft：未完成的发现已读到的池子静态信息与代币（只增不变的数据），下一轮从这里续读；发现成功后清空。
+  // rediscoverFailures / rediscoverError / rediscoverRetryAt：已有池子列表时重新发现的连续失败次数、最近错误与退避结束时间（毫秒）。
+  // generation/configAbort 隔离 RPC + TVL 门槛的每次变更（含改回原值）；refreshPending 保证未完成发现后先更新一次当前快照。
+  const runtimes = new Map(AERO_CHAINS.map((c) => [c.id, { registry: null, snapshot: null, prev: null, history: { schema: 1, points: [] }, rows: [], discoveryDraft: null,
+    generation: 0, configAbort: new AbortController(), rediscoverPhase: 'idle', refreshPending: false, rediscoverStalls: 0, rediscoverFailures: 0, rediscoverError: null, rediscoverRetryAt: null,
+    status: 'idle', backfillPending: 0, backfillPhase: null, backfillRetryAt: null, rediscover: false, error: null, errorAt: null, checkedAt: null, nextAt: null, running: null, timer: null, failures: 0, lastStart: 0, archive: null, writes: Promise.resolve() }]));
   const changed = () => { revision += 1; };
-
-  function rpcFor(id) {
-    const rt = runtimes.get(id), url = config.chains[id].rpcUrl;
-    if (!rt.rpc || rt.rpcUrl !== url) { rt.rpc = createRpc({ url, chainId: chainById.get(id).chainId, signal: abort.signal }); rt.rpcUrl = url; }
-    return rt.rpc;
-  }
 
   function schedule(id, delaySec) {
     const rt = runtimes.get(id);
@@ -160,24 +177,48 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     rt.timer?.unref?.();
   }
 
-  async function discover(id, rpc, block) {
+  function assertGeneration(rt, generation) {
+    if (closed || rt.generation !== generation) throw new Error('扫描已关闭或配置已更新');
+  }
+
+  // 地址、门槛和代次在整轮开始时一起捕获，取消不被遵守时也不能让旧尝试写回。
+  async function discover(id, rpc, block, { rpcUrl, minTvlUsd, generation }) {
     const chain = chainById.get(id), rt = runtimes.get(id);
+    assertGeneration(rt, generation);
     const prior = rt.registry?.factory === chain.clFactory ? rt.registry : null;
-    const registry = prior ? structuredClone(prior) : { schema: 1, factory: chain.clFactory, poolCount: 0, pools: [], tokens: {}, active: [], discoveredAt: 0, blockTime: null };
-    const { total, added } = await reads.readPoolAddresses(rpc, chain.clFactory, registry.poolCount);
-    const statics = await reads.readPoolStatics(rpc, added);
-    statics.forEach((s, i) => registry.pools.push(s ?? { address: added[i], invalid: true }));
-    registry.poolCount = total;
+    // 未发布草稿随工厂、RPC 或门槛代次失效；已发布列表中的静态信息仍可复用，gauge 和当前状态每次重新核验。
+    let draft = rt.discoveryDraft;
+    if (!draft || draft.factory !== chain.clFactory || draft.generation !== generation) {
+      draft = { factory: chain.clFactory, rpcUrl, generation, poolCount: prior?.poolCount ?? 0, pools: structuredClone(prior?.pools ?? []), tokens: structuredClone(prior?.tokens ?? {}) };
+      rt.discoveryDraft = draft;
+    }
+    for (;;) {
+      const { total, added } = await reads.readPoolAddresses(rpc, chain.clFactory, draft.poolCount, discoveryBatch);
+      assertGeneration(rt, generation);
+      const statics = added.length ? await reads.readPoolStatics(rpc, added) : [];
+      assertGeneration(rt, generation);
+      statics.forEach((s, i) => draft.pools.push(s ?? { address: added[i], invalid: true }));
+      draft.poolCount += added.length;
+      if (!added.length || draft.poolCount >= total) break;
+    }
+    const missing = [...new Set(draft.pools.filter((p) => !p.invalid).flatMap((p) => [p.token0, p.token1]))].filter((t) => !draft.tokens[t]);
+    if (missing.length) {
+      const tokens = await reads.readTokens(rpc, missing);
+      assertGeneration(rt, generation);
+      tokens.forEach((t, i) => { if (t) draft.tokens[missing[i]] = { symbol: t.symbol, decimals: t.decimals }; });
+    }
+    // gauge、当前状态与跟踪集合每次发现都重读，在草稿的副本上进行：中途失败时草稿里的 gauge 仍是上次发布的值，替换检测不受影响。
+    const registry = { schema: 1, factory: chain.clFactory, poolCount: draft.poolCount, pools: structuredClone(draft.pools), tokens: structuredClone(draft.tokens), active: [], discoveredAt: 0, blockTime: prior?.blockTime ?? null };
     const valid = registry.pools.filter((p) => !p.invalid);
     // gauge 可能在建池之后才创建，也可能被替换：每次发现都重读。
     const gauges = await reads.readGauges(rpc, valid.map((p) => p.address));
+    assertGeneration(rt, generation);
     // gauge 被替换后累计排放份额换了基准，旧的历史排放点不能再和新读数相减。
     const replaced = [];
     valid.forEach((p, i) => { if (p.gauge !== undefined && p.gauge && p.gauge !== gauges[i]) replaced.push(p.address); p.gauge = gauges[i]; });
-    const missing = [...new Set(valid.flatMap((p) => [p.token0, p.token1]))].filter((t) => !registry.tokens[t]);
-    if (missing.length) (await reads.readTokens(rpc, missing)).forEach((t, i) => { if (t) registry.tokens[missing[i]] = { symbol: t.symbol, decimals: t.decimals }; });
     const known = valid.filter((p) => registry.tokens[p.token0] && registry.tokens[p.token1]);
     const full = await reads.readPoolStates(rpc, known, block);
+    assertGeneration(rt, generation);
     const states = Object.fromEntries(known.map((p, i) => [p.address, full.states[i]]).filter(([, s]) => s));
     const tokens = new Map(Object.entries(registry.tokens));
     const pools = known.filter((p) => states[p.address]).map((p) => ({ ...p, state: states[p.address] }));
@@ -185,7 +226,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     registry.active = pools.filter((p) => {
       if (p.gauge && BigInt(p.state.liquidity) > 0n) return true;
       const tvl = tvlUsd(p.state, tokens.get(p.token0), tokens.get(p.token1), prices.get(p.token0), prices.get(p.token1));
-      return tvl !== null && tvl >= config.minTvlUsd;
+      return tvl !== null && tvl >= minTvlUsd;
     }).map((p) => p.address);
     const span = Math.min(10_000, block - 1);
     if (span > 100) { const [a, b] = await Promise.all([rpc.blockTimestamp(block - span), rpc.blockTimestamp(block)]); registry.blockTime = (b - a) / span; }
@@ -203,39 +244,47 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     return slots;
   }
 
-  async function backfill(id, rpc, active, block, nowSec) {
+  async function backfill(id, rpc, active, block, nowSec, signal, generation, rpcUrl) {
     const rt = runtimes.get(id);
-    rt.backfillPending = 0;
-    if (!rt.registry.blockTime || rt.archive?.failedAt && nowSec - rt.archive.failedAt < DISCOVERY_SEC) return false;
+    const current = () => !closed && rt.generation === generation;
+    if (!current()) return false;
+    rt.backfillPending = 0; rt.backfillRetryAt = null;
+    if (!rt.registry.blockTime) { rt.backfillPhase = 'complete'; return false; }
+    if (rt.archive?.failedAt && nowSec - rt.archive.failedAt < DISCOVERY_SEC) { rt.backfillPhase = 'backoff'; rt.backfillRetryAt = (rt.archive.failedAt + DISCOVERY_SEC) * 1000; return false; }
     const points = rt.history.points;
     // 早于创世区块的整点读不到，不计入待补数，否则会一直追批。
     const targetOf = (slot) => block - Math.round((nowSec - slot) / rt.registry.blockTime);
     const slots = missingSlots(rt, nowSec, (slot) => targetOf(slot) >= 1);
     rt.backfillPending = slots.length;
     for (const slot of slots.slice(0, BACKFILL_PER_CYCLE)) {
-      if (closed) return false;
+      if (!current()) return false;
+      if (signal.aborted) { rt.backfillPhase = 'backoff'; return false; }
       const target = targetOf(slot);
-      rt.backfillPending--;
       try {
         const read = await reads.readPoolHistory(rpc, active, target, slot >= nowSec - RATE_HISTORY_SEC);
+        if (!current()) return false;
         const rows = {};
         read.states.forEach((s, i) => { if (s) rows[active[i].address] = s.rewardShare === undefined ? [s.tick] : fullRow(s); });
         points.push({ t: read.timestamp, slot, block: target, rows });
+        // 在途读取仍算待补；确认结果属于当前代次并写入后才扣减，取消无需回滚计数。
+        rt.backfillPending--;
         rt.archive = { ok: true };
       } catch (error) {
-        rt.backfillPending++;
-        if (closed) return false;
+        if (!current()) return false;
         // 节点明确拒绝历史状态（非归档节点）时停止回填，6 小时后再试并改用本机样本；
         // 超时、限流等瞬时错误只结束本轮回填，下一轮继续。都不影响本轮当前数据。
         if (error?.kind === 'node') {
-          rt.archive = { ok: false, failedAt: nowSec, error: error.message };
-          log.warn?.({ type: 'aero-market', chain: id, err: error.message }, 'Aero 历史区块读取失败，改用本机累计样本');
+          rt.archive = { ok: false, failedAt: nowSec, error: scrubRpcMessage(error?.message || error, rpcUrl) };
+          rt.backfillRetryAt = (nowSec + DISCOVERY_SEC) * 1000;
+          log.warn?.({ type: 'aero-market', chain: id, err: rt.archive.error }, 'Aero 历史区块读取失败，改用本机累计样本');
           rt.backfillPending = 0;
         }
-        // 出错（含限流、超时）后按常规间隔再试，不连续追批。
+        // 出错（含限流、超时、整轮到期）后按常规间隔再试，不连续追批。
+        rt.backfillPhase = 'backoff';
         return false;
       }
     }
+    rt.backfillPhase = rt.backfillPending > 0 ? 'catching_up' : 'complete';
     return rt.backfillPending > 0;
   }
 
@@ -245,30 +294,91 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     for (const p of rt.history.points) if (p.t < nowSec - RATE_HISTORY_SEC) for (const [k, row] of Object.entries(p.rows)) if (row.length > 1) p.rows[k] = [row[0]];
   }
 
-  async function cycle(id) {
+  const activeOf = (registry) => { const byAddress = new Map(registry.pools.map((p) => [p.address, p])); return registry.active.map((a) => byAddress.get(a)).filter(Boolean); };
+
+  // 发现结果已含当前读数，每轮只发布一次，上一轮快照保留为 prev。
+  function publish(id, registry, snapshot, replaced) {
     const rt = runtimes.get(id), chain = chainById.get(id);
-    const rpc = rpcFor(id);
-    const block = await rpc.blockNumber();
-    let snapshot, registry = rt.registry;
-    const stale = rt.rediscover || !registry || registry.factory !== chain.clFactory || (now() / 1000) - registry.discoveredAt > DISCOVERY_SEC;
-    let replaced = [];
-    if (stale) { rt.rediscover = false; ({ registry, snapshot, replaced } = await discover(id, rpc, block)); }
-    const byAddress = new Map(registry.pools.map((p) => [p.address, p]));
-    const active = registry.active.map((a) => byAddress.get(a)).filter(Boolean);
-    if (!snapshot) {
-      const read = await reads.readPoolStates(rpc, active, block);
-      snapshot = { t: read.timestamp, block, states: Object.fromEntries(active.map((p, i) => [p.address, read.states[i]]).filter(([, s]) => s)) };
-    }
-    if (closed) return;
-    rt.registry = registry; rt.prev = rt.snapshot; rt.snapshot = snapshot;
+    rt.registry = registry; rt.prev = rt.snapshot; rt.snapshot = snapshot; rt.refreshPending = false;
     for (const address of replaced) {
       for (const point of rt.history.points) { const row = point.rows[address]; if (row?.length > 1) point.rows[address] = [row[0]]; }
       if (rt.prev?.states[address]) rt.prev.states[address] = { ...rt.prev.states[address], rewardShare: null };
     }
-    const nowSec = snapshot.t;
-    // 先发布本轮当前数据，再回填历史：回填一批要十几秒，不能挡住价格、TVL 和排放的更新。
     rt.rows = buildRows({ chain, registry, snapshot, prev: rt.prev, history: rt.history }); changed();
-    const follow = chain.archive ? await backfill(id, rpc, active, block, nowSec) : false;
+  }
+
+  // 调用前已核对配置代次，只有当前代次的成功才能清除请求和错误。
+  function discovered(rt) {
+    rt.discoveryDraft = null; rt.rediscover = false; rt.rediscoverPhase = 'idle';
+    rt.rediscoverStalls = 0; rt.rediscoverFailures = 0; rt.rediscoverError = null; rt.rediscoverRetryAt = null;
+  }
+
+  const usableRegistry = (id) => { const rt = runtimes.get(id); return rt.registry?.factory === chainById.get(id).clFactory ? rt.registry : null; };
+  // 只计算下轮真正可复用的进展；重读 gauge/状态而未完成整次发现不能算作进展。
+  const discoveryProgress = (rt) => { const saved = rt.discoveryDraft ?? rt.registry; return (saved?.poolCount ?? 0) + Object.keys(saved?.tokens ?? {}).length; };
+  const rediscoveryDelay = (attempt) => Math.min(REDISCOVERY_RETRY_SEC * 2 ** (attempt - 1), DISCOVERY_SEC) * 1000;
+
+  // 读取已完整返回的结果照常发布，即使整轮已到期：到期只用来取消仍在途的读取，后续回填据此停止。
+  async function cycle(id, signal, attempt) {
+    const rt = runtimes.get(id), chain = chainById.get(id), { rpcUrl, generation } = attempt;
+    const current = () => !closed && rt.generation === generation;
+    const rpc = createRpc({ url: rpcUrl, chainId: chain.chainId, signal });
+    const block = await rpc.blockNumber();
+    if (!current()) return;
+    let registry = usableRegistry(id);
+    if (!registry) {
+      // 首次发现：没有可用的池子列表，发现失败或到期就整轮失败，已读进度留在草稿里。
+      const found = await discover(id, rpc, block, attempt);
+      if (!current()) return;
+      registry = found.registry;
+      publish(id, registry, found.snapshot, found.replaced);
+      discovered(rt);
+    } else {
+      // 到期后先发现，避免慢速当前读取永久吃掉发现预算；上轮未能更新快照时，本轮必须先完成当前读取。
+      let refreshed = false;
+      const stale = rt.rediscover || (now() / 1000) - registry.discoveredAt > DISCOVERY_SEC;
+      if (stale && !rt.refreshPending && (rt.rediscoverRetryAt === null || now() >= rt.rediscoverRetryAt) && !signal.aborted) {
+        const progress = discoveryProgress(rt);
+        rt.rediscoverPhase = 'running'; changed();
+        try {
+          const found = await discover(id, rpc, block, attempt);
+          if (!current()) return;
+          registry = found.registry;
+          publish(id, registry, found.snapshot, found.replaced);
+          discovered(rt);
+          refreshed = true;
+        } catch (error) {
+          if (!current()) return;
+          rt.refreshPending = true;
+          if (signal.aborted) {
+            rt.rediscoverPhase = 'pending'; rt.rediscoverRetryAt = null;
+            rt.rediscoverStalls = discoveryProgress(rt) > progress ? 0 : rt.rediscoverStalls + 1;
+            if (rt.rediscoverStalls >= REDISCOVERY_STALL_LIMIT) {
+              rt.rediscoverPhase = 'budget_backoff';
+              rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverStalls - REDISCOVERY_STALL_LIMIT + 1);
+            }
+            if (rt.backfillPhase === 'catching_up') rt.backfillPhase = 'backoff';
+            return false;
+          }
+          rt.rediscoverStalls = 0;
+          rt.rediscoverPhase = 'backoff'; rt.rediscoverFailures += 1;
+          rt.rediscoverError = `重新发现失败：${scrubRpcMessage(error?.message || error, rpcUrl, 200)}`;
+          rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverFailures);
+          log.warn?.({ type: 'aero-market', chain: id, err: rt.rediscoverError, failures: rt.rediscoverFailures }, 'Aero 池子重新发现未完成，沿用上次池子列表，退避后再试');
+        }
+      }
+      if (!refreshed) {
+        const active = activeOf(registry);
+        const read = await reads.readPoolStates(rpc, active, block);
+        if (!current()) return;
+        publish(id, registry, { t: read.timestamp, block, states: Object.fromEntries(active.map((p, i) => [p.address, read.states[i]]).filter(([, s]) => s)) }, []);
+      }
+    }
+    const snapshot = rt.snapshot, active = activeOf(registry);
+    const nowSec = snapshot.t;
+    // 当前数据已在上面发布，再回填历史：回填一批要十几秒，不能挡住价格、TVL 和排放的更新。
+    const follow = chain.archive ? await backfill(id, rpc, active, block, nowSec, signal, generation, rpcUrl) : false;
+    if (!current()) return;
     // 非归档链（或回填失败时）用本轮读数作为小时样本。
     const last = rt.history.points.at(-1);
     if ((!chain.archive || rt.archive?.ok === false) && (!last || nowSec - last.t >= 3000)) rt.history.points.push({ t: nowSec, block, rows: Object.fromEntries(Object.entries(snapshot.states).map(([a, s]) => [a, fullRow(s)])) });
@@ -295,16 +405,27 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     if (closed || rt.running || !config.enabled || !config.chains[id].enabled) return rt.running;
     rt.lastStart = now(); rt.status = rt.snapshot ? rt.status : 'loading'; changed();
     rt.running = (async () => {
+      const attempt = { generation: rt.generation, rpcUrl: config.chains[id].rpcUrl, minTvlUsd: config.minTvlUsd };
+      const deadlineMs = usableRegistry(id) ? cycleDeadlineMs : cycleDeadlineMs * FIRST_DISCOVERY_DEADLINE_FACTOR;
+      const deadline = AbortSignal.timeout(deadlineMs);
       try {
-        const follow = await cycle(id);
+        const follow = await cycle(id, AbortSignal.any([abort.signal, deadline, rt.configAbort.signal]), attempt);
+        if (closed || rt.generation !== attempt.generation) return;
         rt.status = 'ok'; rt.error = null; rt.errorAt = null; rt.failures = 0;
         schedule(id, follow ? Math.min(BACKFILL_FOLLOW_SEC, config.intervalMin * 60) : config.intervalMin * 60);
       } catch (error) {
-        if (closed) return;
-        rt.status = 'error'; rt.error = String(error?.message || error).slice(0, 240); rt.errorAt = now();
+        if (closed || rt.generation !== attempt.generation) return;
+        rt.status = 'error'; rt.errorAt = now();
+        rt.error = deadline.aborted ? `本轮扫描超过 ${deadlineMs / 60_000} 分钟未完成，已取消，${rt.registry ? '保留上次数据' : '已读的池子进度保留，下一轮继续'}` : scrubRpcMessage(error?.message || error, attempt.rpcUrl);
+        if (rt.backfillPhase === 'catching_up') rt.backfillPhase = 'backoff';
         log.warn?.({ type: 'aero-market', chain: id, err: rt.error }, 'Aero 市场扫描失败，保留上次数据');
         schedule(id, Math.min(RETRY_SEC[Math.min(rt.failures++, RETRY_SEC.length - 1)], config.intervalMin * 60));
-      } finally { rt.checkedAt = now(); rt.running = null; changed(); }
+      } finally {
+        rt.running = null;
+        if (rt.generation !== attempt.generation) schedule(id, 2);
+        else rt.checkedAt = now();
+        changed();
+      }
     })();
     return rt.running;
   }
@@ -320,7 +441,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       if (history?.schema === 1 && Array.isArray(history.points)) rt.history = { schema: 1, points: history.points.filter((p) => Number.isFinite(p?.t) && plainObject(p.rows)) };
       if (rt.snapshot) rt.rows = buildRows({ chain, registry: rt.registry, snapshot: rt.snapshot, prev: rt.prev, history: rt.history });
       // 重启后按已存历史估算待补整点，让未补完的回填继续按短间隔追批。
-      if (chain.archive && rt.registry?.blockTime) rt.backfillPending = missingSlots(rt, now() / 1000).length;
+      if (chain.archive && rt.registry?.blockTime) { rt.backfillPending = missingSlots(rt, now() / 1000).length; rt.backfillPhase = rt.backfillPending > 0 ? 'catching_up' : 'complete'; }
     } catch (error) {
       log.warn?.({ type: 'aero-market', chain: id, err: error.message }, 'Aero 市场缓存无法读取，将重新扫描');
       rt.registry = null; rt.snapshot = null; rt.prev = null; rt.history = { schema: 1, points: [] }; rt.rows = [];
@@ -352,10 +473,16 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       chains: AERO_CHAINS.map((c) => {
         const rt = runtimes.get(c.id), cfg = config.chains[c.id];
         const points = rt.history.points;
+        const phase = c.archive && config.enabled && cfg.enabled ? rt.backfillPhase : 'disabled';
+        // 下次尝试：追批或退避时为下一次排定的轮次；归档读取暂停时不早于暂停结束。
+        // 轮次进行中没有“下次”：排定的时刻已过去。
+        const backfillAt = !rt.running && (phase === 'catching_up' || phase === 'backoff') ? Math.max(rt.nextAt ?? 0, rt.backfillRetryAt ?? 0) || null : null;
         return { id: c.id, name: c.name, enabled: config.enabled && cfg.enabled, rpcHost: rpcHost(cfg.rpcUrl), status: config.enabled && cfg.enabled ? rt.running ? 'loading' : rt.status : 'disabled',
-          updatedAt: rt.snapshot ? rt.snapshot.t * 1000 : null, checkedAt: rt.checkedAt, nextAt: rt.nextAt, error: rt.error, errorAt: rt.errorAt,
+          updatedAt: rt.snapshot ? rt.snapshot.t * 1000 : null, checkedAt: rt.checkedAt, nextAt: rt.running ? null : rt.nextAt, error: rt.error, errorAt: rt.errorAt,
           poolCount: rt.registry?.poolCount ?? null, activeCount: rt.registry?.active.length ?? null, gaugeCount: rt.registry ? rt.registry.pools.filter((p) => p.gauge).length : null,
-          history: { points: points.length, from: points.length ? points[0].t * 1000 : null, archive: c.archive ? rt.archive?.ok === false ? 'unavailable' : 'archive' : 'local', pending: rt.backfillPending } };
+          history: { points: points.length, from: points.length ? points[0].t * 1000 : null, archive: c.archive ? rt.archive?.ok === false ? 'unavailable' : 'archive' : 'local', pending: rt.backfillPending, phase, nextAt: backfillAt },
+          discovery: { at: rt.registry ? rt.registry.discoveredAt * 1000 : null, stale: !!rt.registry && now() / 1000 - rt.registry.discoveredAt > DISCOVERY_STALE_SEC,
+            failures: rt.rediscoverFailures, error: rt.rediscoverError, retryAt: rt.rediscoverRetryAt, phase: rt.rediscoverPhase, refreshPending: rt.refreshPending, stalledAttempts: rt.rediscoverStalls } };
       }),
       pools: AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).flatMap((c) => runtimes.get(c.id).rows),
       samples: samples ? samples.status() : { available: false, error: null, version: 0 },
@@ -383,11 +510,12 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       const row = rt && /^0x[0-9a-f]{40}$/.test(key) ? rt.rows.find((r) => r.address === key) : null;
       if (!row) throw new HttpError(404, '没有这个池子的数据');
       if (!config.enabled || !config.chains[chainId].enabled) throw new HttpError(409, `${chain.name} 扫描已停用，无法读取流动性分布`);
-      // 缓存只在 60 秒内且池子读数未变（没有新一轮扫描改变价格或流动性）时复用，避免当前价与分布来自不同区块。
+      // 仅复用同一 RPC、60 秒内且池子读数未变的结果；更换节点还会移除在途缓存条目。
+      const rpcUrl = config.chains[chainId].rpcUrl;
       const id = `${chainId}:${key}`, hit = liquidityCache.get(id), state = `${row.sqrtPriceX96}:${row.liquidity}:${row.stakedLiquidity}`;
-      if (hit && hit.state === state && (hit.pending || now() - hit.at < LIQUIDITY_TTL_MS)) return hit.promise;
-      const rpc = createRpc({ url: config.chains[chainId].rpcUrl, chainId: chain.chainId, timeoutMs: LIQUIDITY_RPC_TIMEOUT_MS, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(LIQUIDITY_DEADLINE_MS)]) });
-      const entry = { at: now(), state, pending: true, promise: null };
+      if (hit && hit.rpcUrl === rpcUrl && hit.state === state && (hit.pending || now() - hit.at < LIQUIDITY_TTL_MS)) return hit.promise;
+      const rpc = createRpc({ url: rpcUrl, chainId: chain.chainId, timeoutMs: LIQUIDITY_RPC_TIMEOUT_MS, signal: AbortSignal.any([abort.signal, AbortSignal.timeout(LIQUIDITY_DEADLINE_MS)]) });
+      const entry = { at: now(), rpcUrl, state, pending: true, promise: null };
       entry.promise = (async () => {
         try {
           const read = await reads.readPoolLiquidity(rpc, { address: key, tickSpacing: row.tickSpacing });
@@ -395,7 +523,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
             from: read.from, to: read.to, initialized: read.ticks.length, segments: liquiditySegments(read) };
         } catch (reason) {
           if (liquidityCache.get(id) === entry) liquidityCache.delete(id);
-          throw new HttpError(502, `读取流动性分布失败：${String(reason?.message || reason).slice(0, 200)}`);
+          throw new HttpError(502, `读取流动性分布失败：${scrubRpcMessage(reason?.message || reason, rpcUrl, 200)}`);
         } finally { entry.pending = false; entry.at = now(); }
       })();
       liquidityCache.delete(id); liquidityCache.set(id, entry);
@@ -444,9 +572,25 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       await atomicWrite(configPath, next);
       const before = config;
       config = next; configError = null;
-      // 正在发现的轮次可能已按旧门槛筛完：用标志让下一轮重新发现。
-      if (before.minTvlUsd !== next.minTvlUsd) for (const rt of runtimes.values()) rt.rediscover = true;
-      for (const c of AERO_CHAINS) { const rt = runtimes.get(c.id); if (!rt.running) { clearTimer(rt.timer); rt.timer = null; } }
+      for (const c of AERO_CHAINS) {
+        const rt = runtimes.get(c.id);
+        const rpcChanged = before.chains[c.id].rpcUrl !== next.chains[c.id].rpcUrl;
+        const discoveryChanged = before.minTvlUsd !== next.minTvlUsd || rpcChanged;
+        if (discoveryChanged) {
+          rt.generation++; rt.configAbort.abort(); rt.configAbort = new AbortController();
+          rt.discoveryDraft = null; rt.rediscover = true; rt.rediscoverPhase = 'pending';
+          rt.rediscoverStalls = 0; rt.rediscoverFailures = 0; rt.rediscoverError = null; rt.rediscoverRetryAt = null;
+          rt.status = rt.snapshot ? 'ok' : 'idle'; rt.error = null; rt.errorAt = null; rt.failures = 0;
+        }
+        if (rpcChanged) {
+          // 归档能力和历史退避属于旧节点；TVL 阈值不改变节点能力，不清除此结论。
+          rt.archive = null; rt.backfillRetryAt = null;
+          rt.backfillPending = c.archive && rt.registry?.blockTime ? missingSlots(rt, now() / 1000).length : 0;
+          rt.backfillPhase = rt.backfillPending ? 'catching_up' : null;
+          for (const key of liquidityCache.keys()) if (key.startsWith(`${c.id}:`)) liquidityCache.delete(key);
+        }
+        if (!rt.running) { clearTimer(rt.timer); rt.timer = null; if (discoveryChanged) schedule(c.id, 2); }
+      }
       startAll(); changed();
       return state();
     },

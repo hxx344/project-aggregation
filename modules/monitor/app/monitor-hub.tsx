@@ -64,8 +64,9 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil" }: {
   const enabled = (id: string) => controls.runtime[id]?.enabled !== false && !controls.runtime[id]?.error;
   const [active, setActive] = useState<string>(initialMonitor);
   const [perpetualVisited, setPerpetualVisited] = useState(initialMonitor === "perpetual");
-  const [oil, setOil] = useState(() => initialSummaries(initial).oil);
-  const [hynix, setHynix] = useState(() => initialSummaries(initial).hynix);
+  const [initialSummary] = useState(() => initialSummaries(initial));
+  const [oil, setOil] = useState(initialSummary.oil);
+  const [hynix, setHynix] = useState(initialSummary.hynix);
   const [alertStates, setAlertStates] = useState<Record<string, AlertViewState>>({});
   const reportAlertView = useCallback((id: string, state: AlertViewState) => setAlertStates(previous => previous[id]?.view === state.view && previous[id]?.loadError === state.loadError ? previous : { ...previous, [id]: state }), []);
   const [alertOpenRequests, setAlertOpenRequests] = useState<Record<string, number>>({});

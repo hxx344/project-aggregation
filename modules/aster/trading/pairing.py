@@ -195,11 +195,7 @@ class PairManager:
             if not flat and not reduction_recovery and snapshot.equity <= 0:
                 raise TradingError("启用配对组前需要子账户具有正的 USD1 权益")
             if not market_recovery:
-                orders = snapshot.open_orders
-                if isinstance(broker, LiveBroker):
-                    orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40)
-                if not isinstance(orders, list) or orders:
-                    raise TradingError("配对组启用或绑定前需确认两个子账户都没有未完成挂单")
+                self._require_no_orders(broker, snapshot)
             return snapshot, guard
 
         with ThreadPoolExecutor(max_workers=2, thread_name_prefix="pair-check") as pool:
@@ -222,6 +218,15 @@ class PairManager:
         if snapshots[0].pair(symbol)[0].leverage != snapshots[1].pair(symbol)[0].leverage:
             raise TradingError(f"两个子账户的 {symbol} 实际杠杆必须相同")
         return dict(zip(("long", "short"), snapshots)), guards
+
+    @staticmethod
+    def _require_no_orders(broker, snapshot, *, timeout=None):
+        orders = snapshot.open_orders
+        if isinstance(broker, LiveBroker):
+            options = {"timeout": timeout} if timeout is not None else {}
+            orders = broker.api.call("GET", "/fapi/v3/openOrders", signed=True, weight=40, **options)
+        if not isinstance(orders, list) or orders:
+            raise TradingError("配对组启用或绑定前需确认两个子账户都没有未完成挂单")
 
     @contextmanager
     def _current_members(self, guards):
@@ -382,7 +387,8 @@ class PairManager:
             reason=(f"交易标的已从 {pair['symbol']} 切换为 {updated['symbol']}，已核验并采纳实际底仓："
                     f"多 {owned['LONG']}、空 {owned['SHORT']}；配对组保持暂停，请核对设置后启动"),
             updated_at=time.time())
-        require_archived_orders_clear(self.engine, updated, state=runtime, brokers=brokers, read_only=True)
+        require_archived_orders_clear(self.engine, updated, state=runtime, brokers=brokers, read_only=True,
+            member_read=(snapshots, guards))
 
         def check_current():
             # Account configuration and bindings are compared inside the writer
@@ -449,7 +455,8 @@ class PairManager:
                 snapshots, guards = self._read_members(pair, adopt=True, startup=True)
                 if original_runtime.get("recovery_watch") is not None:
                     from .pair_recovery import require_archived_orders_clear
-                    require_archived_orders_clear(self.engine, pair, state=original_runtime)
+                    require_archived_orders_clear(self.engine, pair, state=original_runtime,
+                        member_read=(snapshots, guards))
                     for key, side, index in (("long", "LONG", 0), ("short", "SHORT", 1)):
                         if snapshots[key].pair(pair["symbol"])[index].qty != dec(original_runtime["owned"][side]):
                             raise TradingError("人工归档后实际仓位发生变化；请点击“核对并采纳当前底仓”，核对旧订单后确认当前持仓，再启动")
@@ -706,6 +713,8 @@ class PairManager:
                 self.store.delete_pair(pair_id, expected_pair=pair, expected_runtime=runtime,
                     expected_margin=margin, accounts=accounts, check_current=check_current,
                     watch_evidence=evidence)
+            from .pair_recovery import clear_history_wait
+            clear_history_wait(self.store, pair_id)
             self.store.event(pair_id, "pair", "已核实本组仓位为空并解除绑定，其他仓位及历史执行记录保留")
             self._changed(pair)
 
@@ -718,6 +727,10 @@ class PairManager:
             pair = self.store.pair(pair_id)
             original = self._idle(pair)
             snapshots, guards = self._read_members(pair, flat=True)
+            from .pair_recovery import require_history_times
+            # A zero read older than a known fill may predate it; clearing the
+            # baseline from that read would adopt a lagging position.
+            require_history_times(self.store, pair, original, snapshots)
             from .engine import snapshot_json
             from .store import dumps
             zeros = {"LONG": "0", "SHORT": "0"}

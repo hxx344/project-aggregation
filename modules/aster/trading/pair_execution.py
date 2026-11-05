@@ -38,6 +38,7 @@ class PairTrader:
         self.engine, self.store, self.market = engine, engine.store, engine.market
         self._ordinary_observations = {}
         self._margin_identity = ContextVar("aster_margin_identity", default=None)
+        self._history_read = ContextVar("aster_pair_history_read", default=None)
 
     def _ordinary_wait(self, pair, state, identities, margin_state):
         """Reuse recent reads only to reject work, never to authorize a write."""
@@ -316,8 +317,28 @@ class PairTrader:
         if actual != identities:
             raise PairPositionError("配对组账户身份发生变化，禁止写入")
         if opening:
-            from .pair_recovery import require_archived_orders_clear
-            require_archived_orders_clear(self.engine, current)
+            from .pair_recovery import require_archived_orders_clear, require_history_times
+            read = self._history_read.get()
+            if read is None:
+                require_archived_orders_clear(self.engine, current)
+            elif read[1] is not None:
+                require_archived_orders_clear(self.engine, current, member_read=read, check_member_orders=True)
+            else:
+                # Original-ID queries completed before preparation. Recheck
+                # newly recorded fills against the actual sizing snapshots
+                # without replacing them or rereading after the other leg sends.
+                require_history_times(self.store, current,
+                    self.store.get("pair_runtime:" + current["id"], {}), read[0])
+
+    def _config_guard_for_read(self, pair, identities, snapshots, *, opening, brokers=None, guards=None):
+        member_guards = ({pair[key + "_account_id"]:
+            (brokers[key]._snapshot_lock if isinstance(brokers[key], LiveBroker) else None, guard)
+            for key, guard in guards.items()} if guards is not None else None)
+        token = self._history_read.set((snapshots, member_guards))
+        try:
+            self._config_guard(pair, identities, opening=opening)
+        finally:
+            self._history_read.reset(token)
 
     @protected_pair
     def tick(self, pair, *, margin_result=None):
@@ -538,7 +559,7 @@ class PairTrader:
         state["symbol"] = symbol
         opening = plan.phase == "open"
         identities = state["identities"]
-        self._config_guard(pair, identities, opening=opening)
+        self._config_guard_for_read(pair, identities, snapshots, opening=opening, brokers=brokers, guards=guards)
         for guard in guards.values():
             guard()
         before = self._expected(state)
@@ -561,7 +582,7 @@ class PairTrader:
         self._save(pair, state)
         try:
             # Persist the original IDs before the final authorization checks.
-            self._config_guard(pair, identities, opening=opening)
+            self._config_guard_for_read(pair, identities, snapshots, opening=opening)
             for guard in guards.values():
                 guard()
             require_quantities(snapshots, symbol, before)
@@ -581,7 +602,7 @@ class PairTrader:
             self._save(pair, state)
             self._recover(pair, state, brokers)
             return
-        self._dispatch(pair, state, brokers, legs, guards=guards, reconciliation=not opening)
+        self._dispatch(pair, state, brokers, legs, guards=guards, snapshots=snapshots, reconciliation=not opening)
         self._recover(pair, state, brokers)
 
     @staticmethod
@@ -605,7 +626,8 @@ class PairTrader:
                 evidence["retry_after"] = delay
         return evidence
 
-    def _dispatch(self, pair, state, brokers, legs, *, guards=None, reconciliation=False, paired_guards=False):
+    def _dispatch(self, pair, state, brokers, legs, *, guards=None, snapshots=None,
+                  reconciliation=False, paired_guards=False):
         require_runtime_symbols(pair, state)
         if any(leg.get("order", {}).get("symbol") != pair["symbol"] for leg in legs):
             raise PairPositionError("待发送订单标的与配对组不一致，停止交易并等待核对")
@@ -645,8 +667,13 @@ class PairTrader:
             evidence = {"kind": "unknown"}
             try:
                 try:
-                    self._config_guard(pair, state["identities"],
-                                       opening=pending.get("phase") == "open" and not reconciliation)
+                    opening = pending.get("phase") == "open" and not reconciliation
+                    if snapshots is None:
+                        if opening and state.get("recovery_watch") is not None:
+                            raise RequestNotSent("历史订单核查缺少本次开仓快照，未发送请求")
+                        self._config_guard(pair, state["identities"], opening=opening)
+                    else:
+                        self._config_guard_for_read(pair, state["identities"], snapshots, opening=opening)
                     if paired_error is not None:
                         raise paired_error
                     if guards:
@@ -1200,11 +1227,14 @@ class PairTrader:
     def _leverage(self, pair, state, brokers, snapshots, guards, target):
         symbol = pair["symbol"]
         require_runtime_symbols(pair, state)
-        self._config_guard(pair, state["identities"], opening=True)
+        self._config_guard_for_read(pair, state["identities"], snapshots,
+            opening=True, brokers=brokers, guards=guards)
         for guard in guards.values():
             guard()
         before = self._expected(state)
         def check_capacity(current, *, equal_leverage):
+            from .pair_recovery import require_history_times
+            require_history_times(self.store, pair, self.store.get("pair_runtime:" + pair["id"], {}), current)
             held = require_quantities(current, symbol, before, equal_leverage=equal_leverage)
             book = self.market.book(symbol)
             book.require_fresh()
@@ -1224,9 +1254,15 @@ class PairTrader:
         def send(key):
             broker = brokers[key]
             try:
-                self._config_guard(pair, pending["identities"], opening=True)
+                try:
+                    self._config_guard_for_read(pair, pending["identities"], snapshots, opening=True)
+                except TradingError as exc:
+                    # This guard runs before any leverage request is attempted.
+                    raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
                 def check(snapshot):
                     try:
+                        if isinstance(broker, LiveBroker):
+                            broker.require_snapshot_current(snapshot)
                         # The broker may have refreshed its account snapshot.
                         # Revalue both holdings against the latest public quota.
                         check_capacity({**snapshots, key: snapshot}, equal_leverage=False)

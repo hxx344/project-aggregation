@@ -1,13 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
-import { readCache, writeCache } from './aero-market-cache';
+import { clearCache, readCache, writeCache } from './aero-market-cache';
 import { message } from './aero-market-format';
 import type { MarketSnapshot, MarketUnchanged } from './aero-market-types';
 
 export const AERO_MARKET_ROOT = '/api/research/aero-market';
 
-// 本地缓存不存 RPC 地址（可能带密钥）；显示缓存期间扫描设置不可用，等服务器的完整数据。
-const forCache = (data: MarketSnapshot): MarketSnapshot => ({ ...data, config: { ...data.config, chains: Object.fromEntries(Object.entries(data.config.chains).map(([id, c]) => [id, { ...c, rpcUrl: '' }])) } });
+// 本地缓存不存 RPC 地址或节点诊断文本；显示缓存期间扫描设置不可用，等服务器的完整数据。
+const forCache = (data: MarketSnapshot): MarketSnapshot => ({
+  ...data, config: { ...data.config, chains: Object.fromEntries(Object.entries(data.config.chains).map(([id, c]) => [id, { ...c, rpcUrl: '' }])) },
+  chains: data.chains.map((c) => ({ ...c, error: null, discovery: c.discovery ? { ...c.discovery, error: null } : undefined })),
+});
 const usableSnapshot = (data: unknown): data is MarketSnapshot => {
   const d = data as MarketSnapshot | null;
   return !!d && d.schema === 1 && Array.isArray(d.pools) && Array.isArray(d.chains) && !!d.config && typeof d.config.chains === 'object' && !!d.aero;
@@ -44,7 +47,9 @@ export function useAeroMarket(onExpired: () => void) {
     // 先显示本机缓存，服务器的数据到了再替换；服务器先到（revision 已有值）时缓存直接作废。
     void readCache<MarketSnapshot>('snapshot').then((hit) => {
       if (!hit || controller.signal.aborted || revision.current !== null || !usableSnapshot(hit.data)) return;
-      setSnapshot(hit.data); setCachedAt(hit.savedAt);
+      // 旧版缓存可能已含节点回显。清空该副本，保留内存里的去诊断投影，下一次服务器返回再缓存。
+      if (hit.data.chains.some((c) => c.error || c.discovery?.error) || Object.values(hit.data.config.chains).some((c) => c.rpcUrl)) void clearCache();
+      setSnapshot(forCache(hit.data)); setCachedAt(hit.savedAt);
     });
     void read();
     const poll = setInterval(() => { if (!document.hidden) void read(); }, 30_000);

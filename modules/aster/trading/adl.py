@@ -126,9 +126,14 @@ def imbalances(snapshots, symbols):
     return result
 
 
-def plan_reduction(snapshots, symbols, rules, batch_notional=BATCH_NOTIONAL):
-    """Pick one strictly reducing batch; never round across equality."""
+def plan_reductions(snapshots, symbols, rules, batch_notional=BATCH_NOTIONAL):
+    """Plan every symbol independently; never round across equality.
+
+    Returns one strictly reducing batch for the first executable symbol and
+    the reason for each symbol whose fresh residual has no legal reduction.
+    """
     batch_notional = positive(batch_notional, field="ADL 单批金额上限")
+    planned, blocked = None, {}
     for symbol in sorted(symbols):
         holdings = [(aid, p) for aid, snapshot in snapshots.items() for p in snapshot.positions if p.symbol == symbol]
         totals = {side: sum((Fraction(p.quantity) for _, p in holdings if p.side == side), Fraction(0)) for side in ("LONG", "SHORT")}
@@ -139,7 +144,7 @@ def plan_reduction(snapshots, symbols, rules, batch_notional=BATCH_NOTIONAL):
         rule = rules[symbol]
         candidates = sorted(((aid, p) for aid, p in holdings if p.side == direction),
                             key=lambda item: (-item[1].quantity, item[0], item[1].position_side))
-        cap_blocked = False
+        cap_blocked = executable = False
         for aid, position in candidates:
             # Never enlarge a batch to meet the exchange's minimum order size.
             # The hard nominal cap uses this freshly verified position mark.
@@ -148,18 +153,65 @@ def plan_reduction(snapshots, symbols, rules, batch_notional=BATCH_NOTIONAL):
             qty = floor_step(min(abs(excess), Fraction(position.quantity), Fraction(rule.max_qty), cap), rule.step)
             if qty < rule.min_qty:
                 continue
-            order = {"symbol": symbol, "positionSide": position.position_side,
-                     "side": "SELL" if direction == "LONG" else "BUY", "type": "MARKET", "quantity": wire(qty),
-                     "newClientOrderId": "adl_" + uuid.uuid4().hex[:28], "newOrderRespType": "RESULT"}
-            if position.position_side == "BOTH":
-                order["reduceOnly"] = "true"
-            return {"account_id": aid, "order": order, "position_before": wire(position.quantity),
-                    "direction": direction, "excess_before": wire(abs(excess))}
+            executable = True
+            if planned is None:
+                order = {"symbol": symbol, "positionSide": position.position_side,
+                         "side": "SELL" if direction == "LONG" else "BUY", "type": "MARKET", "quantity": wire(qty),
+                         "newClientOrderId": "adl_" + uuid.uuid4().hex[:28], "newOrderRespType": "RESULT"}
+                if position.position_side == "BOTH":
+                    order["reduceOnly"] = "true"
+                planned = {"account_id": aid, "order": order, "position_before": wire(position.quantity),
+                           "direction": direction, "excess_before": wire(abs(excess))}
+            break
+        if executable:
+            continue
         if cap_blocked:
-            raise TradingError(f"{symbol} 单批金额上限 {wire(batch_notional)} {rule.quote_asset} "
-                               "不足以满足最小市价数量或步长，已停止减仓并保留现场")
-        raise TradingError(f"{symbol} 剩余差额 {wire(abs(excess))} 小于可执行市价数量，已停止减仓并保留现场")
-    return None
+            blocked[symbol] = (f"{symbol} 单批金额上限 {wire(batch_notional)} {rule.quote_asset} "
+                               "不足以满足最小市价数量或步长")
+        else:
+            blocked[symbol] = f"{symbol} 剩余差额 {wire(abs(excess))} 小于可执行市价数量"
+    return planned, blocked
+
+
+def blocked_reason(blocked):
+    return "；".join(blocked[symbol] for symbol in sorted(blocked)) + "，已停止减仓并保留现场"
+
+
+def plan_reduction(snapshots, symbols, rules, batch_notional=BATCH_NOTIONAL):
+    """Pick one strictly reducing batch; fail only when no symbol is executable."""
+    planned, blocked = plan_reductions(snapshots, symbols, rules, batch_notional)
+    if planned is None and blocked:
+        raise TradingError(blocked_reason(blocked))
+    return planned
+
+
+def symbol_progress(symbols, residuals, planned=None, blocked=None, *, checked_at, unresolved="pending"):
+    """Per-symbol progress from one fresh scene; it never authorizes an order."""
+    blocked = blocked or {}
+    result = {}
+    for symbol in symbols:
+        net = residuals.get(symbol, 0)
+        if not net:
+            entry = {"status": "balanced", "residual": "0"}
+        else:
+            status = ("blocked" if symbol in blocked
+                      else "reducing" if planned and planned["order"]["symbol"] == symbol else unresolved)
+            entry = {"status": status, "residual": wire(abs(net)), "direction": "LONG" if net > 0 else "SHORT"}
+            if symbol in blocked:
+                entry["reason"] = blocked[symbol]
+        entry["checked_at"] = checked_at
+        result[symbol] = entry
+    return result
+
+
+def hold_progress(incident, reason):
+    """A scene-wide stop leaves no symbol reducing or queued for reduction."""
+    progress = incident.get("symbol_progress")
+    if not isinstance(progress, dict):
+        return
+    for entry in progress.values():
+        if isinstance(entry, dict) and entry.get("status") in ("reducing", "pending"):
+            entry.update(status="held", reason=reason)
 
 
 class AdlController:
@@ -813,6 +865,12 @@ class AdlController:
                 adl_notifications.enqueue(db, incident, "completed")
 
     def _blocked(self, incident, reason, *, halt=False, retry_after=10):
+        # Keep the original stop cause even when a later scene read fails.
+        # Legacy incidents stored that cause only in reason.
+        if incident.get("halted"):
+            incident.setdefault("halt_reason", incident["reason"])
+        elif halt:
+            incident["halt_reason"] = reason
         changed = incident.get("reason") != reason or incident["status"] != "blocked"
         incident.update(status="blocked", reason=reason, retry_at=time.time() + retry_after)
         if halt:
@@ -841,6 +899,9 @@ class AdlController:
     @protected_pair
     def tick(self, pair):
         incident = self.store.get("adl_pair:" + pair["id"])
+        if incident and incident.get("halted"):
+            # Migrate before receipt recovery can replace and persist reason.
+            incident.setdefault("halt_reason", incident["reason"])
         accounts, brokers, identities = self._context(pair)
         for aid, account in accounts.items():
             self._flush(account, brokers[aid], pair)
@@ -922,29 +983,57 @@ class AdlController:
                         raise TradingError("成交回执尚未反映在真实持仓，等待新的现场，禁止继续减仓")
             residuals = imbalances(snapshots, incident["symbols"])
             if not residuals:
+                incident["symbol_progress"] = symbol_progress(incident["symbols"], residuals, checked_at=time.time())
                 self._complete(pair, incident, accounts, brokers, snapshots)
                 return self._runtime(pair, incident)
             if not config["enabled"]:
+                incident["symbol_progress"] = symbol_progress(incident["symbols"], residuals, checked_at=time.time(),
+                                                              unresolved="manual")
                 self._blocked(incident, "自动减仓已关闭；配对策略保持暂停，仅核实实际持仓并等待手工平衡")
                 return self._runtime(pair, incident)
             if any(not snapshot.can_trade for snapshot in snapshots.values()):
                 raise TradingError("ADL 账户没有交易权限，已保存现场")
-            rules = {symbol: adl_exchange.reduction_rule(self.engine.market, symbol) for symbol in residuals}
-            batch = plan_reduction(snapshots, incident["symbols"], rules, config["batch_notional"])
+            rules, unavailable = {}, {}
+            for symbol in residuals:
+                try:
+                    rules[symbol] = adl_exchange.reduction_rule(self.engine.market, symbol)
+                except adl_exchange.SymbolUnavailable as exc:
+                    unavailable[symbol] = str(exc)
+            # A symbol without a legal lot or tradable MARKET rule keeps its
+            # residual and reason, but does not stop other symbols' independent
+            # reductions. Scene-wide uncertainty, including a failed or malformed
+            # rule read, is raised before this point and blocks every symbol.
+            batch, blocked = plan_reductions(snapshots, [symbol for symbol in incident["symbols"] if symbol not in unavailable],
+                                             rules, config["batch_notional"])
+            blocked.update(unavailable)
+            incident["symbol_progress"] = symbol_progress(incident["symbols"], residuals, batch, blocked,
+                                                          checked_at=time.time())
+            if batch is None:
+                raise TradingError(blocked_reason(blocked))
             if incident.get("halted"):
+                hold_progress(incident, incident.setdefault("halt_reason", incident["reason"]))
+                self._save(incident)
                 return self._runtime(pair, incident)
             if incident["batches"] and incident["batches"][-1].get("rejected"):
+                hold_progress(incident, incident["batches"][-1]["error"])
                 self._blocked(incident, incident["batches"][-1]["error"], halt=True)
                 return self._runtime(pair, incident)
             sent_batches = [item for item in incident["batches"] if not item.get("not_sent")]
             if time.time() - incident["created_at"] > MAX_SECONDS or len(sent_batches) >= MAX_BATCHES:
-                self._blocked(incident, "ADL 自动减仓达到处理时限或批次数上限，已保留剩余仓位与完整记录", halt=True)
+                reason = "ADL 自动减仓达到处理时限或批次数上限，已保留剩余仓位与完整记录"
+                hold_progress(incident, reason)
+                self._blocked(incident, reason, halt=True)
                 return self._runtime(pair, incident)
             recent = sent_batches[-3:]
             if len(recent) == 3 and all(item["state"] == "terminal" and not dec((item.get("receipt") or {}).get("executedQty", "0")) for item in recent):
-                self._blocked(incident, "连续三批未成交，已停止自动重试并保留现场", halt=True)
+                reason = "连续三批未成交，已停止自动重试并保留现场"
+                hold_progress(incident, reason)
+                self._blocked(incident, reason, halt=True)
                 return self._runtime(pair, incident)
-            incident.update(status="active", reason=f"正在分批市价关闭 {batch['order']['symbol']} 多余的 {batch['direction']} 仓位", retry_at=0)
+            reason = f"正在分批市价关闭 {batch['order']['symbol']} 多余的 {batch['direction']} 仓位"
+            if blocked:
+                reason += "；受阻合约保留现场：" + "；".join(blocked[symbol] for symbol in sorted(blocked))
+            incident.update(status="active", reason=reason, retry_at=0)
             self._send(pair, incident, accounts, brokers, snapshots, batch)
         except AdlStateConflict:
             raise
@@ -959,5 +1048,6 @@ class AdlController:
                 # Invalid account identity or new ADL evidence permits neither
                 # receipt adoption nor trading. Preserve the original failure.
                 pass
+            hold_progress(incident, str(exc))
             self._blocked(incident, str(exc), retry_after=_retry_delay(exc))
         return self._runtime(pair, incident)
