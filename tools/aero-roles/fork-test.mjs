@@ -6,25 +6,33 @@
 // 用法：node tools/aero-roles/fork-test.mjs [--fork-url https://mainnet.base.org] [--fork-block <n>]；需要 anvil 在 PATH（或 ANVIL_BIN）。
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { Contract, Interface, JsonRpcProvider, JsonRpcSigner, MaxUint256, Network, Wallet, ZeroAddress, getAddress, parseEther, parseUnits, solidityPacked, toBeHex } from 'ethers';
-import { AERO, SAFE } from './addresses.mjs';
+import { Contract, Interface, JsonRpcProvider, JsonRpcSigner, MaxUint256, Network, Wallet, ZeroAddress, getAddress, parseEther, parseUnits, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
+import { AERO, ROLES, SAFE } from './addresses.mjs';
 import { verifyOnChain } from './cli.mjs';
 import { buildPermissions } from './permissions.mjs';
 import { accruedAllowance, checkTransactions } from './policy.mjs';
-import { MODULES_SENTINEL, ROLES_ABI, SAFE_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress, prevalidatedSignature, toTransactionBuilderJson } from './roles-calls.mjs';
+import { GUARD_SLOT, MODULES_SENTINEL, ROLES_ABI, SAFE_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress, prevalidatedSignature, toTransactionBuilderJson } from './roles-calls.mjs';
 
 const opts = Object.fromEntries(process.argv.slice(2).reduce((acc, v, i, all) => (i % 2 === 0 ? [...acc, [v.replace(/^--/, ''), all[i + 1]]] : acc), []));
 const FORK_URL = opts['fork-url'] ?? 'https://mainnet.base.org';
 const PORT = 20000 + Math.floor(Math.random() * 20000);
 // 示例配置再加一个 AERO/USDC 池：mint 与 NPM.approve 的条件变成多分支 Or，正式配置加池后走的就是这条路径。
+// 再加一条只用于兑换的 WETH→USDC：验证不做市的代币只能授权给 Router、不能授权给 NPM。
 const example = JSON.parse(readFileSync(new URL('./config.example.json', import.meta.url), 'utf8'));
-const config = { ...example, pools: [...example.pools, { name: 'AERO/USDC ts200', token0: '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee', token1: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', tickSpacing: 200, gauge: '0x4A3B6A77B545584d870D4A6de446AAc4610c60D5' }] };
+const WETH = '0x4200000000000000000000000000000000000006';
+const config = {
+  ...example,
+  pools: [...example.pools, { name: 'AERO/USDC ts200', token0: '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee', token1: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', tickSpacing: 200, gauge: '0x4A3B6A77B545584d870D4A6de446AAc4610c60D5' }],
+  swaps: [...example.swaps, { tokenIn: WETH, tokenOut: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', tickSpacing: 100 }],
+  allowances: [...example.allowances, { token: WETH, symbol: 'WETH', perDay: '1000000000000000000' }],
+};
 
 const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const RSGP = '0x44B63aF715D5ef02CC3646a6CE96875e11d69E85';
 const AERO_TOKEN = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee';
 const RSGP_POOL = getAddress('0x8e859b6cf564c4ac2b848693c85c496e81dbf6c8');
 const AERO_USDC_POOL = '0xD0Acf293547457Fb4fE9eE32CA93e89497626816';
+const SAFE_141_NON_L2 = '0x41675C099F32341bf84BFc5382aF534df5C7461a'; // Safe 1.4.1 非 L2 singleton
 const GAUGE = getAddress(config.pools[0].gauge);
 const GAUGE2 = getAddress(config.pools[1].gauge);
 
@@ -125,6 +133,20 @@ async function run(rpc) {
   await execSafe(safe, SAFE_ABI.encodeFunctionData('enableModule', [outsider.address]));
   await planCase('plan 拒绝已启用其他模块的 Safe', { safe, roles }, /已启用模块/);
   await execSafe(safe, SAFE_ABI.encodeFunctionData('disableModule', [MODULES_SENTINEL, outsider.address]));
+  // 以下直接改分叉状态模拟异常 Safe / 被替换的固定合约，每项改完立即复原。
+  const word = (a) => zeroPadValue(a, 32);
+  const tamper = async (name, pattern, change, restore) => { await change(); try { await planCase(name, { safe, roles }, pattern); } finally { await restore(); } };
+  await tamper('plan 拒绝设置了 guard 的 Safe', /设置了 guard/,
+    () => rpc.send('anvil_setStorageAt', [safe, GUARD_SLOT, word(outsider.address)]), () => rpc.send('anvil_setStorageAt', [safe, GUARD_SLOT, word(ZeroAddress)]));
+  await tamper('plan 拒绝 singleton 不是 SafeL2 的 Safe（非 L2 版 1.4.1）', /不是 v1\.4\.1 SafeL2/,
+    () => rpc.send('anvil_setStorageAt', [safe, '0x0', word(SAFE_141_NON_L2)]), () => rpc.send('anvil_setStorageAt', [safe, '0x0', word(SAFE.singletonL2)]));
+  const proxyCode = await rpc.getCode(safe);
+  await tamper('plan 拒绝非标准代理（字节码多 1 字节，读数照常）', /标准 SafeProxy/,
+    () => rpc.send('anvil_setCode', [safe, proxyCode + '00']), () => rpc.send('anvil_setCode', [safe, proxyCode]));
+  const unwrapperCode = await rpc.getCode(ROLES.multiSendUnwrapper);
+  await tamper('plan 拒绝固定合约字节码被替换（MultiSendUnwrapper）', /字节码与固定哈希不符/,
+    () => rpc.send('anvil_setCode', [ROLES.multiSendUnwrapper, '0x00']), () => rpc.send('anvil_setCode', [ROLES.multiSendUnwrapper, unwrapperCode]));
+  await planCase('plan 复原后再次通过', { safe, roles });
 
   // 与 Safe{Wallet} 执行 Transaction Builder 批次相同：导出 JSON → MultiSendCallOnly delegatecall。
   const batch = toTransactionBuilderJson({ safe, transactions, name: 'fork', description: 'fork' });
@@ -174,10 +196,12 @@ async function run(rpc) {
     }
   }
   // expect：期望的拒绝原因（ConditionViolation 的 status 名，或 NoMembership / NotAuthorized），防止换了原因仍误判为通过。
-  async function denied(name, expect, txs, { data = roleCall(txs), from = bot.address } = {}) {
+  // localIndex / localReason：额外断言本地在第几笔、因什么拒绝（多分支 Or 下链上只报 OrViolation，分辨不出原因）。
+  async function denied(name, expect, txs, { data = roleCall(txs), from = bot.address, localIndex, localReason } = {}) {
     if (txs) {
       const local = await checkTransactions(permissions, txs, ctx);
       if (local.ok) return record('deny', name, false, '本地放行');
+      if ((localIndex != null && local.index !== localIndex) || (localReason && !localReason.test(local.reason))) return record('deny', name, false, `本地拒绝位置或原因不符：第 ${local.index} 笔，${local.reason}`);
     }
     try {
       await rpc.call({ from, to: roles, data });
@@ -190,6 +214,13 @@ async function run(rpc) {
   }
   const now = async () => BigInt((await rpc.getBlock('latest')).timestamp) + 3600n;
   const tx = (to, iface, fn, args, value) => ({ to, data: iface.encodeFunctionData(fn, args), ...(value ? { value } : {}) });
+  // 只模拟不发送：本地与链上都必须放行。
+  async function passes(name, txs) {
+    const local = await checkTransactions(permissions, txs, ctx);
+    if (!local.ok) return record('allow', name, false, `本地拒绝：${local.reason}`);
+    try { await rpc.call({ from: bot.address, to: roles, data: roleCall(txs) }); record('allow', name, true, 'eth_call 通过'); } catch (error) { record('allow', name, false, `链上拒绝：${error.shortMessage || error.message}`); }
+  }
+  const OVER = /exceeds remaining allowance/;
   const raw = (to, value, data, operation) => ROLES_ABI.encodeFunctionData('execTransactionWithRole', [to, value, data, operation, roleKey, true]);
   const CLAIM2 = 'claimEmissions(address,address)', CLAIM3 = 'claimEmissions(address,address,uint256[])';
 
@@ -200,9 +231,11 @@ async function run(rpc) {
   await denied('AERO transfer 给外部地址', 'FunctionNotAllowed', [tx(AERO_TOKEN, ERC20_I, 'transfer', [outsider.address, 1n])]);
   await denied('USDC approve 给外部地址', 'OrViolation', [tx(USDC, ERC20_I, 'approve', [outsider.address, MaxUint256])]);
   await denied('RSGP approve 给 gauge（非 NPM / Router）', 'OrViolation', [tx(RSGP, ERC20_I, 'approve', [GAUGE, MaxUint256])]);
-  await allowed('approve RSGP/USDC/AERO→NPM、AERO→Router（MultiSend）', [
+  await denied('只用于兑换的 WETH approve 给 NPM', 'ParameterNotAllowed', [tx(WETH, ERC20_I, 'approve', [AERO.nft, MaxUint256])]);
+  await allowed('approve RSGP/USDC/AERO→NPM、AERO/WETH→Router（MultiSend）', [
     tx(RSGP, ERC20_I, 'approve', [AERO.nft, MaxUint256]), tx(USDC, ERC20_I, 'approve', [AERO.nft, MaxUint256]),
     tx(AERO_TOKEN, ERC20_I, 'approve', [AERO.nft, MaxUint256]), tx(AERO_TOKEN, ERC20_I, 'approve', [AERO.swapRouter, MaxUint256]),
+    tx(WETH, ERC20_I, 'approve', [AERO.swapRouter, MaxUint256]),
   ]);
 
   // ---- 建仓（两个白名单池，mint 条件是两个分支的 Or）----
@@ -221,7 +254,7 @@ async function run(rpc) {
   await denied('mint recipient 填外部地址', 'OrViolation', [await mint({ recipient: outsider.address })]);
   await denied('mint sqrtPriceX96 ≠ 0（顺带建池）', 'OrViolation', [await mint({ sqrtPriceX96: 1n << 96n })]);
   await denied('mint 非白名单池（AERO/USDC ts100）', 'OrViolation', [await mint({ token0: AERO_TOKEN, token1: USDC, tickSpacing: 100 })]);
-  await denied('mint USDC 超日额度', 'OrViolation', [await mint({ amount1Desired: BigInt(config.allowances[0].perDay) + 1n })]);
+  await denied('mint USDC 超日额度', 'OrViolation', [await mint({ amount1Desired: BigInt(config.allowances[0].perDay) + 1n })], { localIndex: 0, localReason: OVER });
   const mintTx = await mint();
   await denied('mint 附带 value > 0', 'SendNotAllowed', [{ ...mintTx, value: 1n }], { data: raw(mintTx.to, 1n, mintTx.data, 0) });
   const usdcBefore = await allowanceOf(keyOf(USDC));
@@ -231,7 +264,9 @@ async function run(rpc) {
   const usdcAfter = await allowanceOf(keyOf(USDC));
   record('allow', `mint 扣减 USDC 额度 = amount1Desired（tokenId ${tokenId}）`, usdcBefore - usdcAfter === parseUnits('500', 6), `${usdcBefore} → ${usdcAfter}`);
   // 剩余 500 USDC：单笔 300 都在额度内，同批两笔合计 600 超额，链上与本地都必须按合计拒绝。
-  await denied('MultiSend 两笔 mint 合计超日额度', 'OrViolation', [await mint({ amount1Desired: parseUnits('300', 6) }), await mint({ amount1Desired: parseUnits('300', 6) })]);
+  const mint300 = await mint({ amount1Desired: parseUnits('300', 6) });
+  await passes('单笔 mint 300 USDC 在剩余额度内（只模拟）', [mint300]);
+  await denied('MultiSend 两笔 mint 合计超日额度', 'OrViolation', [mint300, mint300], { localIndex: 1, localReason: OVER });
 
   const aeroRange = await rangeOf(AERO_USDC_POOL, 200);
   const mint2Receipt = await allowed('mint AERO/USDC（Or 第二分支），recipient = Safe', [await mint({ token0: AERO_TOKEN, token1: USDC, tickSpacing: 200, ...aeroRange, amount0Desired: parseUnits('20', 18), amount1Desired: parseUnits('50', 6) })]);
@@ -296,7 +331,7 @@ async function run(rpc) {
   await denied('exactInputSingle recipient 填外部地址', 'OrViolation', [await swap({ recipient: outsider.address })]);
   await denied('swap 非白名单方向（USDC→AERO）', 'OrViolation', [await swap({ tokenIn: USDC, tokenOut: AERO_TOKEN, amountIn: 1_000_000n })]);
   await denied('swap 非白名单 tickSpacing（AERO→USDC ts100）', 'OrViolation', [await swap({ tickSpacing: 100 })]);
-  await denied('swap AERO 超日额度', 'OrViolation', [await swap({ amountIn: BigInt(config.allowances[2].perDay) + 1n })]);
+  await denied('swap AERO 超日额度', 'OrViolation', [await swap({ amountIn: BigInt(config.allowances[2].perDay) + 1n })], { localIndex: 0, localReason: OVER });
   const usdcSwap0 = await balanceOf(USDC);
   await allowed('exactInputSingle AERO→USDC，recipient = Safe', [await swap()]);
   record('allow', '兑换所得 USDC 到 Safe', (await balanceOf(USDC)) > usdcSwap0);

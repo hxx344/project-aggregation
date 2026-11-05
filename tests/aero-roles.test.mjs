@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { Interface, MaxUint256, Wallet, getAddress } from 'ethers';
 import { AERO, ROLES, SAFE } from '../tools/aero-roles/addresses.mjs';
-import { AbiType, Operator, c, flatten } from '../tools/aero-roles/conditions.mjs';
+import { AbiType, Operator, c, evaluate, flatten } from '../tools/aero-roles/conditions.mjs';
 import { buildPermissions, normalizeConfig } from '../tools/aero-roles/permissions.mjs';
 import { accruedAllowance, checkTransactions } from '../tools/aero-roles/policy.mjs';
 import { ROLES_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress } from '../tools/aero-roles/roles-calls.mjs';
@@ -112,6 +112,24 @@ test('allowance is required and consumption accumulates across a batch', async (
     assert.equal(result.ok, false);
     assert.match(result.reason, /allowance unknown/);
   }
+});
+
+test('allowance consumption: Or keeps only the matching branch, one key used twice adds up, nested Matches add up', async () => {
+  const key = '0x' + 'ab'.repeat(32);
+  const ctx = { allowance: async () => 10n };
+  // 第一个分支先扣 6 再因第二个字段失败：扣减随分支丢弃，第二个分支看到完整额度，只计 6。
+  const branchy = c.oneOf([c.tuple(c.allowance(key), c.equal('uint256', 1n)), c.tuple(c.allowance(key), c.pass())]);
+  assert.deepEqual(await evaluate(branchy, [6n, 2n], ctx), { ok: true, consumed: [[key, 6n]] });
+  // 同一笔交易里两个字段用同一个额度：第二个字段只剩 4。
+  const twice = await evaluate(c.calldata(c.allowance(key), c.allowance(key)), [6n, 6n], ctx);
+  assert.equal(twice.ok, false);
+  assert.match(twice.reason, /exceeds remaining allowance 4/);
+  // 三层嵌套：内层的消耗对外层后面的字段可见，且不重复计数。
+  const nested = c.calldata(c.tuple(c.tuple(c.allowance(key)), c.allowance(key)), c.allowance(key));
+  assert.deepEqual(await evaluate(nested, [[[3n], 3n], 4n], ctx), { ok: true, consumed: [[key, 3n], [key, 3n], [key, 4n]] });
+  const over = await evaluate(nested, [[[3n], 3n], 5n], ctx);
+  assert.equal(over.ok, false);
+  assert.match(over.reason, /exceeds remaining allowance 4/);
 });
 
 test('accruedAllowance follows the Roles refill rule', () => {

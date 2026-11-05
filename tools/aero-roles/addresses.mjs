@@ -37,4 +37,13 @@ export const CODEHASH = {
   [ROLES.moduleProxyFactory]: '0x01623cbcf010a1c326230f1b2d5f48a66b440232ee49096102bc84967dc5f21e',
   [ROLES.multiSendUnwrapper]: '0x1f6e088be5e6ef9d0fbe0547d3fa9a9e40d823433fd8a4449215b5663209a1eb',
   [ROLES.avatarIsOwnerOfErc721]: '0x0ddd815113052bfe0318baabf72fccd8edad78181cb484e4879a7e3c7bab36f6',
+  [AERO.nft]: '0xb2d0d8278354542651e2db288b71292635d9fd7bd28784f736373da801974599',
+  [AERO.swapRouter]: '0x5edc4df75bb36d8911c289163797022bb8d0d834a163f5a854a7834d62e215c6',
+  [AERO.clFactory]: '0x6c09090837ace0aefe6bfa24a3bc772d13a9775b7e3109c9fece534a0ce053a6',
+  [AERO.voter]: '0x363145d181429cc6f7b7c55a7b332fedb5a06b44da5371acee8a94d34d140f35',
+  [AERO.gaugeImplementation]: '0xfdb516e0cf5b1c3f42789c4d7607a16e16b0ae5e73894e21e52a29c93b1ecee3',
 };
+
+// SafeProxy 1.4.1 的运行时代码与 singleton 无关（singleton 存在槽 0），所有 Safe 相同；171 字节。
+// 由 proxyFactory.proxyCreationCode() + singleton 参数做一次创建 eth_call 取得，两个 RPC 结果一致。
+export const SAFE_PROXY_CODEHASH = '0xd7d408ebcd99b2b70be43e20253d6d92a8ea8fab29bd3be7f55b10032331fb4c';
