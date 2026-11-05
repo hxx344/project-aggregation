@@ -10,6 +10,7 @@ import { snapshotOutputs, outputsIntact } from '../deploy/pipeline/digest.mjs';
 import { acquireLock, LockError, readLock } from '../deploy/pipeline/state.mjs';
 import { createLogger } from '../deploy/pipeline/logger.mjs';
 import { compareVersion } from '../deploy/pipeline/stages.mjs';
+import { resolveInvocation } from '../deploy/pipeline/exec.mjs';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const tempDir = () => mkdtempSync(path.join(tmpdir(), 'pipeline-test-'));
@@ -230,4 +231,37 @@ test('工具链版本比较支持精确版本与最低版本', () => {
   assert.equal(compareVersion('24.16.0', '>=24.15.0'), true);
   assert.equal(compareVersion('22.22.2', '>=24.15.0'), false);
   assert.equal(compareVersion('11.25.0', '>=11.0.0'), true);
+});
+
+test('模块构建脚本与流水线使用同一份原生可执行文件判断', () => {
+  // scripts/modules.mjs 由安装器单独提取，不能导入流水线模块，只能各写一份。
+  const body = file => readFileSync(path.join(root, file), 'utf8').match(/function isNativeExecutable\(file\) \{[\s\S]*?\n\}/)?.[0];
+  const pipelineBody = body('deploy/pipeline/exec.mjs');
+  assert.ok(pipelineBody);
+  assert.equal(body('scripts/modules.mjs'), pipelineBody);
+});
+
+test('pnpm 的 JavaScript 入口交给当前 Node，原生可执行文件直接启动', () => {
+  const dir = tempDir();
+  try {
+    const files = {
+      'pnpm.cjs': Buffer.from('#!/usr/bin/env node\n'),
+      'pnpm.exe': Buffer.from([0x4d, 0x5a, 0x90, 0x00]),
+      'pnpm-elf': Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02]),
+      'pnpm-macho': Buffer.from([0xcf, 0xfa, 0xed, 0xfe]),
+      'pnpm-short': Buffer.from('M'),
+    };
+    for (const [name, content] of Object.entries(files)) writeFileSync(path.join(dir, name), content);
+    const resolve = name => resolveInvocation({ cmd: 'pnpm', args: ['run', 'build'] }, { npmExecPath: path.join(dir, name), execPath: '/pinned/node' });
+    assert.deepEqual(resolve('pnpm.cjs'), { cmd: '/pinned/node', args: [path.join(dir, 'pnpm.cjs'), 'run', 'build'] });
+    assert.deepEqual(resolve('pnpm-short'), { cmd: '/pinned/node', args: [path.join(dir, 'pnpm-short'), 'run', 'build'] });
+    for (const name of ['pnpm.exe', 'pnpm-elf', 'pnpm-macho']) {
+      assert.deepEqual(resolve(name), { cmd: path.join(dir, name), args: ['run', 'build'] }, name);
+    }
+    assert.deepEqual(resolveInvocation({ cmd: 'git', args: ['status'] }, { npmExecPath: path.join(dir, 'pnpm.exe') }), { cmd: 'git', args: ['status'] });
+    mkdirSync(path.join(dir, 'pnpm-dir'));
+    assert.deepEqual(resolve('pnpm-dir'), { cmd: '/pinned/node', args: [path.join(dir, 'pnpm-dir'), 'run', 'build'] }, '读不了文件头时保持原来的 Node 启动');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

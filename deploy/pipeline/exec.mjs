@@ -3,10 +3,11 @@
  *
  * pnpm 优先通过当前 Node 执行其 JavaScript 入口（npm_execpath），
  * 不把 shell 包装器交给 Node；这是项目里已经踩过的坑（LESSONS L018）。
+ * npm_execpath 是原生可执行文件（pnpm 11 独立发行版的 pnpm.exe）时直接启动。
  */
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { createWriteStream, existsSync, mkdirSync } from 'node:fs';
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CHILD_FORCED_MARKER } from './constants.mjs';
@@ -28,6 +29,8 @@ export function resolveInvocation(command, { platform = process.platform, npmExe
   const args = command.args ?? [];
   if (command.cmd !== 'pnpm') return { cmd: command.cmd, args };
   if (npmExecPath && existsSync(npmExecPath) && /pnpm/i.test(npmExecPath)) {
+    // pnpm 11 独立发行版的 npm_execpath 是原生可执行文件（如 pnpm.exe），Node 无法加载，直接启动。
+    if (isNativeExecutable(npmExecPath)) return { cmd: npmExecPath, args };
     return { cmd: execPath, args: [npmExecPath, ...args] };
   }
   if (platform === 'win32') {
@@ -36,6 +39,17 @@ export function resolveInvocation(command, { platform = process.platform, npmExe
     return { cmd: process.env.ComSpec || 'cmd.exe', args: ['/d', '/s', '/c', line] };
   }
   return { cmd: 'pnpm', args };
+}
+
+// 与 scripts/modules.mjs 同一判断；该脚本由安装器单独提取，不能依赖本文件。
+export function isNativeExecutable(file) {
+  const header = Buffer.alloc(4);
+  let fd;
+  try { fd = openSync(file, 'r'); readSync(fd, header, 0, 4, 0); } catch { return false; } finally { if (fd !== undefined) closeSync(fd); }
+  const magic = header.readUInt32BE(0);
+  return header[0] === 0x4d && header[1] === 0x5a // PE（MZ）
+    || magic === 0x7f454c46 // ELF
+    || [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe].includes(magic); // Mach-O
 }
 
 function quoteWindowsArgument(value) {
