@@ -1406,7 +1406,7 @@ rollback() {
     # and the Python paths are those of the earlier release and stay as they are.
     log '新版本 API 启动失败，正在恢复之前的 API；运行时与模块未受影响。'
     if [[ -n "$old_api_unit_backup" && -f "$old_api_unit_backup" ]]; then cp -- "$old_api_unit_backup" "$API_UNIT_FILE"; fi
-    if [[ -n "$old_release" && -d "$old_release" ]]; then atomic_link "$old_release" "$APP_DIR/current" && rm -f -- "$APP_DIR/.pending-previous"; fi
+    if [[ -n "$old_release" && -d "$old_release" ]]; then atomic_link "$old_release" "$APP_DIR/current" && drop_pending_previous; fi
     systemctl daemon-reload
     systemctl restart "$API_SERVICE" || true
     if wait_healthy; then log '已恢复之前的 API；运行时与持久数据保持原样。'; else log '之前的 API 尚未恢复健康，请查看服务日志。'; fi
@@ -1459,9 +1459,7 @@ rollback() {
         log '无法保留候选配置或恢复上次成功配置；未再次重启服务，请检查配置文件和磁盘空间。'
         exit "$exit_code"
       fi
-      # The restored current and untouched previous link are the pre-activation
-      # state; a leftover record would only block the next no-op check.
-      atomic_link "$old_release" "$APP_DIR/current" && rm -f -- "$APP_DIR/.pending-previous"
+      atomic_link "$old_release" "$APP_DIR/current" && drop_pending_previous
       systemctl daemon-reload
       systemctl restart "$SERVICE" || true
       if wait_healthy; then log '已恢复上次成功的程序和配置；持久数据保持原样。'; else log '旧版本尚未恢复健康，请查看服务日志。'; fi
@@ -3020,8 +3018,8 @@ activation_scope() {
 }
 # Full and single-API activations have no cutover journal. Preserve the release
 # they replaced until their final bookkeeping is durable; current alone cannot
-# recover that identity after an interruption. A failed activation which
-# restored current does not use this record on its next attempt.
+# recover that identity after an interruption. A failed activation drops the
+# record it wrote itself (drop_pending_previous).
 restore_pending_previous() {
   local target previous scope extra
   pending_activation_scope=
@@ -3034,6 +3032,14 @@ restore_pending_previous() {
     previous_release=${previous#-}
     pending_activation_scope=$scope
   fi
+}
+# After a rollback restored current to where this run found it. A record this
+# run wrote describes only the failed attempt, and a leftover copy would only
+# block the next no-op check. A record inherited from an interrupted activation (current was
+# already the candidate, so the rollback restored only the candidate) is the
+# sole copy of the release it replaced and stays for the next attempt.
+drop_pending_previous() {
+  [[ -n "$pending_activation_scope" ]] || rm -f -- "$APP_DIR/.pending-previous"
 }
 # Whether the admitted scope covers the activation: an api-scope update never widens.
 scope_admitted() {
