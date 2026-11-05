@@ -124,7 +124,7 @@ test("summaries without freshness metadata retain the generic interval fallback"
 test("first-render oil summary uses the persisted quote source-age budget", () => {
   const leg = { markPx: 100, fundingRate: 0, fundingIntervalHours: 4, nextFundingAt: '2026-09-11T08:00:00Z' };
   const oil = { source: 'Binance', currency: 'USDT', fetchedAt, status: 'live', brent: { ...leg, coin: 'BZUSDT' }, wti: { ...leg, coin: 'CLUSDT' }, collection: { maxAgeMs: 35_000 } };
-  const summary = initialSummaries({ renderedAt: Date.parse(fetchedAt) + 29_000, hynix: { quote: null, history: null }, oil: { quote: oil } }).oil;
+  const summary = initialSummaries({ renderedAt: Date.parse(fetchedAt) + 29_000, hynix: { quote: null, trend: null }, oil: { quote: oil } }).oil;
   assert.equal(summary.staleAfterMs, 35_000);
   assert.equal(summary.fetchedAt, fetchedAt);
   assert.equal(summaryExpired(summary, 30_000, Date.parse(fetchedAt) + 35_001), true);

@@ -9,7 +9,7 @@ const [oilCandles, oilArchive] = await Promise.all(['/oil/data/binance-15m.json'
   if (!response.ok) throw Error('浏览器测试行情夹具读取失败');
   return response.json();
 }));
-const initial = { renderedAt: Date.now(), oil: { quote: oilArchive.market, candles: oilCandles }, hynix: { quote: null, history: null } } as unknown as InitialMarketData;
+const initial = { renderedAt: Date.now(), oil: { quote: oilArchive.market, candles: oilCandles }, hynix: { quote: null, trend: null } } as unknown as InitialMarketData;
 function Fixture() {
   const hub = useHubBridge('monitor');
   return <OilPanel initial={initial} active={hub.active} summaryActive={false} tradesActive={hub.active}/>;

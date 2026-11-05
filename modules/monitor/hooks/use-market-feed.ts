@@ -13,22 +13,20 @@ async function request<T>(path: string, signal: AbortSignal): Promise<T> {
   return response.json();
 }
 
-export function useMarketFeed(initial?: InitialMarketData["hynix"], initialReadAt?: number, active = true) {
-  const [data,setData] = useState<MarketData | null>(initial?.history ?? null);
+export function useMarketFeed(initial?: InitialMarketData["hynix"], active = true) {
+  // The first render only embeds the overview trend; the full history always comes from the API.
+  const [data,setData] = useState<MarketData | null>(null);
   const [quote,setQuote] = useState<LiveQuote | null>(initial?.quote ?? null);
-  const [historyLoading,setHistoryLoading] = useState(!initial?.history);
+  const [historyLoading,setHistoryLoading] = useState(true);
   const [quoteLoading,setQuoteLoading] = useState(!initial?.quote);
   const [error,setError] = useState("");
   const [quoteError,setQuoteError] = useState(initial?.quote?.status === "snapshot" ? retainedQuote : "");
   const controls = useRef<{ refresh: () => void } | null>(null);
-  const hydrated = useRef({ history: Boolean(initial?.history), readAt: initialReadAt ?? 0 });
-  const activated = useRef(false);
 
   useEffect(() => {
     if (!active) return;
     const history = startActivityPolling({
       intervalMs: HISTORY_REFRESH_MS,
-      immediate: activated.current || !hydrated.current.history || Date.now() - hydrated.current.readAt >= HISTORY_REFRESH_MS,
       load: async signal => {
         const next = await request<MarketData>("/api/monitors/hynix/history",signal);
         if (!next.points?.length) throw new Error("暂时没有可对齐的历史行情。");
@@ -46,7 +44,6 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], initialReadA
       onSettled: () => setQuoteLoading(false),
     });
     controls.current = { refresh: () => { void history.refresh(); void live.refresh(); } };
-    activated.current = true;
     return () => { controls.current = null; history.stop(); live.stop(); };
   },[active]);
 
