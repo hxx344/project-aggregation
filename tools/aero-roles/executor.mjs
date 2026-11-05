@@ -52,8 +52,9 @@ export const ERC20_I = new Interface([
   'function symbol() view returns (string)',
 ]);
 export const POOL_I = new Interface([
-  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16, uint16, uint16, bool)',
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16, bool)',
   'function fee() view returns (uint24)',
+  'function observe(uint32[] secondsAgos) view returns (int56[] tickCumulatives, uint160[] secondsPerLiquidityCumulativeX128s)',
   'function gauge() view returns (address)',
 ]);
 const FACTORY_I = new Interface(['function getPool(address, address, int24) view returns (address)']);
@@ -289,6 +290,7 @@ export async function resolvePending(ctx, pending) {
 // 经 Roles 发一笔（单笔 call 或 MultiSendCallOnly 批次）。hooks：
 //   halted() 为真时不签名；pending() 返回尚未结清的上一笔（同 nonce 时按替换提价）；resolvePrior() 结清 nonce 已被消耗的上一笔；
 //   persistPending(entry) 签名后、广播前持久化，抛错则不广播；settle(entry, receipt) 回执落定后调用；log(event)。
+//   可选：moving(stage) 在兑换/开仓那一笔签名前调用；swapped({ amount0, amount1 }) 开仓前配平兑换确认后调用；minted(tokenId) 开仓确认后调用。
 // 广播失败或回执超时都按结果未知抛出（signed: true），待确认记录保留，由 resolvePending 结清。
 export async function sendRoleTx(ctx, hooks, label, transactions) {
   if (!ctx.signer) throw new ExecError('未配置 bot 私钥');
@@ -356,6 +358,25 @@ async function ensureApprovals(ctx, hooks, pairs) {
 }
 
 const balanceOf = async (ctx, token) => (await read('Safe 余额', () => call(ctx.rpc, ERC20_I, token, 'balanceOf', [ctx.safe])))[0];
+export const safeBalances = (ctx, tokens) => Promise.all(tokens.map((token) => balanceOf(ctx, token)));
+
+// 现价 tick 与过去 seconds 秒的时间加权 tick（向负无穷取整）。观测槽只有 1 个时 observe 会用现价外推，TWAP 等于现价、没有意义，按不可用处理；
+// 历史不足 seconds 秒时 observe 回滚（OLD），同样不可用。
+export async function poolTwap(ctx, poolAddress, seconds) {
+  const pool = poolOf(ctx, poolAddress);
+  const slot0 = await read(`池子 ${pool.name}`, () => call(ctx.rpc, POOL_I, pool.address, 'slot0'));
+  const cardinality = Number(slot0.observationCardinality);
+  if (cardinality < 2) return { tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, twap: null, cardinality, reason: `池子只有 ${cardinality} 个价格观测槽，无法核对 TWAP` };
+  let cumulatives;
+  try { [cumulatives] = await call(ctx.rpc, POOL_I, pool.address, 'observe', [[seconds, 0]]); } catch (error) {
+    if (isRevert(error)) return { tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, twap: null, cardinality, reason: `池子的价格观测不足 ${seconds} 秒，无法核对 TWAP` };
+    throw new ExecError(`读取 TWAP 失败：${errorText(error)}`);
+  }
+  const delta = BigInt(cumulatives[1]) - BigInt(cumulatives[0]), span = BigInt(seconds);
+  let twap = delta / span;
+  if (delta < 0n && delta % span !== 0n) twap -= 1n;
+  return { tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, twap: Number(twap), cardinality, reason: null };
+}
 
 function swapRoute(ctx, tokenIn, tokenOut) {
   const route = ctx.permissions.swaps.find((s) => s.tokenIn === getAddress(tokenIn) && s.tokenOut === getAddress(tokenOut));
@@ -381,6 +402,7 @@ export async function swap(ctx, hooks, { tokenIn, tokenOut, amountIn, slippageBp
   if (amountOut === 0n) throw new ExecError('兑换报价为 0，未发送');
   const before = await balanceOf(ctx, route.tokenOut);
   const symbol = (t) => ctx.tokens.get(t)?.symbol ?? t;
+  hooks.moving?.('swap'); // 下一笔签名的是会挪动资金的兑换（自动调仓据此记录"已签名、结果未落定"）
   await sendRoleTx(ctx, hooks, `兑换 ${symbol(route.tokenIn)} → ${symbol(route.tokenOut)}`, [tx(AERO.swapRouter, ROUTER_I, 'exactInputSingle', [{ ...params, amountOutMinimum: minusBps(amountOut, slippageBps) }])]);
   const received = (await balanceOf(ctx, route.tokenOut)) - before;
   return { amountIn, quoted: amountOut, received: received > 0n ? received : 0n };
@@ -393,13 +415,15 @@ function checkRange(pool, tickLower, tickUpper) {
 }
 
 // 开仓前预览：按比例取 Safe 余额，算出配平兑换并报价，不签名。
-export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance }) {
+// amounts（原始单位）给出时按它投入（不超过 Safe 余额），不再按 shareBps 取比例：自动调仓只投入本次平仓收回的币，不动 Safe 里的其他余额。
+export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts = null }) {
   const pool = poolOf(ctx, poolAddress);
   checkRange(pool, tickLower, tickUpper);
   const [slot0, [feePips], b0, b1] = await read('池子与余额', () => Promise.all([
     call(ctx.rpc, POOL_I, pool.address, 'slot0'), call(ctx.rpc, POOL_I, pool.address, 'fee'), balanceOf(ctx, pool.token0), balanceOf(ctx, pool.token1),
   ]));
-  const amount0 = (b0 * BigInt(shareBps)) / 10_000n, amount1 = (b1 * BigInt(shareBps)) / 10_000n;
+  const capped = (want, held) => (want > held ? held : want < 0n ? 0n : want);
+  const amount0 = amounts ? capped(amounts.amount0, b0) : (b0 * BigInt(shareBps)) / 10_000n, amount1 = amounts ? capped(amounts.amount1, b1) : (b1 * BigInt(shareBps)) / 10_000n;
   const plan = rebalance ? balanceSwap({ sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, feePips }) : null;
   let swapPlan = null;
   if (plan) {
@@ -426,15 +450,17 @@ export function checkExpectation(preview, expect) {
 
 // 开仓：配平兑换（可选）→ 授权 NPM → 以 Safe 身份报价后 mint（最小量 = 报价 × (1 − 滑点)）→ NPM.approve + gauge.deposit 一批质押。
 // 中途失败时已完成的步骤保留在链上（例如已兑换未开仓），页面按 Safe 现状显示，可再次开仓或手动处理。
-export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, slippageBps, stake = true, expect = null }) {
+export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, slippageBps, stake = true, expect = null, amounts = null }) {
   const pool = poolOf(ctx, poolAddress);
-  const preview = await previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance });
+  const preview = await previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts });
+  if (preview.amount0 === 0n && preview.amount1 === 0n) throw new ExecError('可投入的数量为 0，未发送');
   if (expect) checkExpectation(preview, expect);
   let amount0 = preview.amount0, amount1 = preview.amount1;
   if (preview.swap) {
     hooks.step?.('配平兑换');
     const result = await swap(ctx, hooks, { tokenIn: preview.swap.tokenIn, tokenOut: preview.swap.tokenOut, amountIn: preview.swap.amountIn, slippageBps });
     if (preview.swap.tokenIn === pool.token0) { amount0 -= result.amountIn; amount1 += result.received; } else { amount1 -= result.amountIn; amount0 += result.received; }
+    hooks.swapped?.({ amount0, amount1 });
   }
   hooks.step?.('开仓');
   await ensureApprovals(ctx, hooks, [{ token: pool.token0, spender: AERO.nft, amount: amount0 }, { token: pool.token1, spender: AERO.nft, amount: amount1 }]);
@@ -442,6 +468,7 @@ export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, t
   let quote;
   try { quote = await call(ctx.rpc, NPM_I, AERO.nft, 'mint', [params], ctx.safe); } catch (error) { throw new ExecError(`开仓报价失败：${errorText(error)}`); }
   if (quote.liquidity === 0n) throw new ExecError('开仓报价的流动性为 0，未发送');
+  hooks.moving?.('mint');
   const receipt = await sendRoleTx(ctx, hooks, `开仓 ${pool.name} [${tickLower}, ${tickUpper}]`, [tx(AERO.nft, NPM_I, 'mint', [{ ...params, amount0Min: minusBps(quote.amount0, slippageBps), amount1Min: minusBps(quote.amount1, slippageBps) }])]);
   const minted = receipt.logs.filter((l) => getAddress(l.address) === AERO.nft).map((l) => { try { return NPM_I.parseLog(l); } catch { return null; } })
     .find((e) => e?.name === 'Transfer' && BigInt(e.args.from) === 0n && getAddress(e.args.to) === ctx.safe);
@@ -517,13 +544,15 @@ export async function claimRewards(ctx, hooks) {
 }
 
 // 把 Safe 里的 AERO 按白名单兑换路径卖出，数量不超过当日剩余额度；低于 minAmount 或没有卖出路径时跳过。
-export async function sellRewards(ctx, hooks, { slippageBps, minAmount }) {
+// maxAmount 给出时最多卖这么多（自动调仓只卖本次平仓领到的 AERO）。
+export async function sellRewards(ctx, hooks, { slippageBps, minAmount, maxAmount = null }) {
   const route = ctx.permissions.swaps.find((s) => s.tokenIn === REWARD_TOKEN);
   if (!route) return { sold: false, reason: 'no_route' };
   let amount = await balanceOf(ctx, REWARD_TOKEN);
   const key = allowanceFor(ctx, REWARD_TOKEN)?.key;
   const remaining = key ? (await remainingAllowances(ctx)).allowances.get(key)?.remaining ?? 0n : 0n;
   if (amount > remaining) amount = remaining;
+  if (maxAmount !== null && amount > maxAmount) amount = maxAmount;
   if (amount < minAmount || amount === 0n) return { sold: false, reason: 'below_min', amount };
   return { sold: true, ...(await swap(ctx, hooks, { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amountIn: amount, slippageBps })) };
 }

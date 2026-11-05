@@ -16,6 +16,7 @@
 | `executor.mjs` | 工作台执行器：按 Safe 读状态，经 Roles 配平兑换、开仓质押、解押平仓、领奖卖出；签名后先落盘再广播 |
 | `cli.mjs` | `plan` 命令：链上核对并生成部署批次 |
 | `fork-test.mjs` | Base 分叉验收（正向流程 + 全部反向用例） |
+| `fork-rebalance.mjs` | Base 分叉演练：用工作台服务端跑一次完整的自动调仓（TWAP 拦截、平仓重开、只投入收回的币） |
 | `config.example.json` | 示例配置；池子与额度是示例值，首批做市池与额度尚待决定 |
 
 ## 部署步骤（主网，等执行器接入后再做）
@@ -40,6 +41,7 @@
 ```bash
 node --test tests/aero-roles.test.mjs          # 单元测试，不联网
 PATH=$HOME/.foundry/bin:$PATH node tools/aero-roles/fork-test.mjs   # 需要 anvil；分叉 mainnet.base.org，只监听 127.0.0.1
+PATH=$HOME/.foundry/bin:$PATH node tools/aero-roles/fork-rebalance.mjs   # 自动调仓演练，同样只监听 127.0.0.1
 ```
 
 分叉验收在示例配置上再加一个 AERO/USDC 池（让 mint 与 NPM.approve 走多分支 Or）和一条只用于兑换的 WETH→USDC，建一个 1/1 Safe，执行与 `plan` 相同的批次，再以 bot 身份跑完整流程和文档第 8 节的反向用例。每个反向用例写明期望的 Roles 拒绝原因，原因不符即失败；本地校验结论必须与链上一致。
@@ -55,4 +57,4 @@ PATH=$HOME/.foundry/bin:$PATH node tools/aero-roles/fork-test.mjs   # 需要 anv
 - 兑换的最小成交量只来自同一 RPC 的报价，没有按池子现价设价格冲击上限：薄池大额兑换或 RPC 返回偏低报价时照单成交，损失上限是 Roles 每日额度。RPC 应使用自己信任的节点。
 - 开仓确认基于服务端预览（2 分钟内有效）：执行时 Safe 余额偏离预览超过 1%、或配平兑换量超出预览 10%、或配平方向改变时不签名。
 - 同一 nonce 上最多追溯 16 笔替换交易；未质押头寸只读 Safe NFT 索引最靠后的 40 个（任何人都能向 Safe 转入粉尘头寸），另外总是读取本系统开出的头寸（`aero-safe/minted.json`，最多 100 个；`ownerOf` 带 revert 数据、且首次判定满 60 秒并跨过新区块后再次判定仍如此才视为已销毁并移除，节点错误照常报读取失败）；已质押头寸全部读取。
-- `executor.mjs` 与它依赖的 `addresses`、`conditions`、`permissions`、`policy`、`roles-calls` 随工作台运行时打包（`deploy/package-release.py` 的 `AERO_ROLES_RUNTIME_FILES`）；`cli.mjs`、`fork-test.mjs` 与文档不进发布包。
+- `executor.mjs` 与它依赖的 `addresses`、`conditions`、`permissions`、`policy`、`roles-calls` 随工作台运行时打包（`deploy/package-release.py` 的 `AERO_ROLES_RUNTIME_FILES`）；`cli.mjs`、`fork-test.mjs`、`fork-rebalance.mjs` 与文档不进发布包。
