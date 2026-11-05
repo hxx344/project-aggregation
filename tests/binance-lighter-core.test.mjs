@@ -11,7 +11,7 @@ function fixture(patch = {}, marketPatch = {}, readyTrades = true) {
   let time = 0, sequence = 0;
   const events = [];
   const config = { ...structuredClone(DEFAULT_COST_CONFIG), symbols: ['BTC'], latencyScenarios: [300], orderNotional: 100,
-    maxInventoryNotional: 500, maxUnhedgedNotional: 300, maxBookAgeMs: 5000, maxSourceAgeMs: 10000, maxPairSkewMs: 5000, ...patch };
+    maxInventoryNotional: 500, maxUnhedgedNotional: 300, hedgeThresholdNotional: 0, maxBookAgeMs: 5000, maxSourceAgeMs: 10000, maxPairSkewMs: 5000, ...patch };
   const markets = ['binance', 'lighter'].map(venue => ({ venue, symbol: 'BTC', nativeSymbol: venue === 'binance' ? 'BTCUSDC' : 'BTC',
     marketId: venue === 'lighter' ? 1 : null, quote: 'USDC', priceUnit: venue === 'binance' ? 'USDC' : 'USD', settlement: 'USDC',
     status: 'active', multiplier: 1, tickSize: 0.01, quantityStep: 0.01, minQuantity: 0.01, minNotional: 1, observedAt: BASE,
@@ -35,20 +35,27 @@ function freshBoth(f, at) { f.set(at); f.sendBook('binance'); f.sendBook('lighte
 
 test('schema 2 configuration is strict, cloned, and cannot enable live execution or inject transports', () => {
   const input = structuredClone(DEFAULT_COST_CONFIG), result = validateCostConfig(input);
-  result.symbols.pop(); assert.equal(input.symbols.length, 2);
+  result.symbols.pop(); assert.equal(input.symbols.length, 1);
   for (const patch of [{ schema: 1 }, { mode: 'live' }, { url: 'https://example.com' }, { symbols: [] }, { latencyScenarios: [299] },
     { latencyScenarios: [300, 300] }, { quoteRefreshMs: 999 }, { quoteMaxAgeMs: 999 }, { orderNotional: NaN },
-    { maxInventoryNotional: 999 }, { queueMultiplier: 0.9 }, { fundingCostBpsPerHour: 101 }]) {
+    { maxInventoryNotional: 999 }, { queueMultiplier: 0.9 }, { fundingCostBpsPerHour: 101 },
+    { symbols: ['BTC', 'ETH'] }, { symbols: ['ETH'] }, { hedgeThresholdNotional: -1 }, { hedgeThresholdNotional: 2000.01 },
+    { hedgeThresholdNotional: 1e-100 }, { hedgeThresholdNotional: 1e-79 }, { hedgeThresholdNotional: 1e-19 }]) {
     assert.throws(() => validateCostConfig({ ...input, ...patch }), /invalid_cost_config/);
   }
-  assert.doesNotThrow(() => validateCostConfig({ ...input, maxUnhedgedNotional: 10 }));
+  assert.doesNotThrow(() => validateCostConfig({ ...input, maxUnhedgedNotional: 10, hedgeThresholdNotional: 0 }));
+  const missingThreshold = { ...input }; delete missingThreshold.hedgeThresholdNotional;
+  assert.throws(() => validateCostConfig(missingThreshold), /invalid_cost_config/);
   assert.throws(() => createCostExecution({ mode: 'live' }), /live_execution_unavailable/);
   assert.throws(() => createCostExecution({ request: () => {} }), /live_execution_unavailable/);
   assert.equal(EXECUTION_CONTRACT.version, 2); assert.equal(EXECUTION_CONTRACT.liveAvailable, false);
+  const smallest = fixture({ hedgeThresholdNotional: 1e-18 }); fillBuy(smallest);
+  assert.equal(smallest.scenario().hedge.quantity, 1, 'the smallest positive fixed-point threshold stays executable');
 });
 
-test('default six accounts each quote both sides simultaneously and never create a timed exit', () => {
-  assert.equal(new CostLabEngine().scenarios.length, 6);
+test('default three BTC accounts each quote both sides simultaneously and never create a timed exit', () => {
+  assert.equal(new CostLabEngine().scenarios.length, 3);
+  assert.deepEqual(DEFAULT_COST_CONFIG.symbols, ['BTC']); assert.equal(DEFAULT_COST_CONFIG.hedgeThresholdNotional, 1000);
   const f = fixture(); const first = f.scenario();
   assert.equal(first.id, 'BTC-inventory-300'); assert.equal(first.status, 'quoting');
   assert.equal(first.quotes.buy.price, 100); assert.equal(first.quotes.sell.price, 101);
@@ -264,6 +271,81 @@ test('partial IOC records actual quantities and retries only remaining demand wi
   const s = f.scenario(); assert.equal(s.status, 'blocked'); assert.equal(s.reason, 'hedge_retries_exhausted');
   assert.equal(s.stats.hedgeFailures, 3); assert.equal(s.stats.hedgeFills, 3); assert.equal(s.inventory.lighterQuantity, -0.3);
   assert.equal(s.inventory.residualQuantity, 0.7); assert.equal(s.hedge, null); assert.equal(s.quotes.buy, null); assert.equal(f.engine.execution.orders.size, 0);
+});
+
+test('positive and negative net exposures trigger the full hedge only at or above the exact notional threshold', () => {
+  for (const side of ['buy', 'sell']) for (const [threshold, expected] of [[50.250001, false], [50.25, true], [50.249999, true]]) {
+    const f = fixture({ hedgeThresholdNotional: threshold });
+    f.set(1); f.sendTrade({ buyerMaker: side === 'buy', price: side === 'buy' ? 100 : 101, quantity: 0.6 });
+    const row = f.scenario();
+    assert.equal(row.inventory.residualNotional, 50.25); assert.equal(Boolean(row.hedge), expected);
+    assert.equal(row.inventory.residualQuantity, side === 'buy' ? 0.5 : -0.5);
+    if (expected) { assert.equal(row.hedge.quantity, 0.5); assert.equal(row.hedge.side, side === 'buy' ? 'sell' : 'buy'); }
+    else {
+      assert.equal(row.status, 'quoting'); assert.equal(row.reason, 'below_hedge_threshold');
+      assert.equal(row.stats.hedgeFailures, 0); assert.ok(row.quotes.buy); assert.ok(row.quotes.sell);
+    }
+  }
+});
+
+test('fresh hedge-venue price movement can cross the threshold without another Maker fill', () => {
+  const f = fixture({ hedgeThresholdNotional: 60 }); fillBuy(f, 1, 0.6);
+  assert.equal(f.scenario().hedge, null);
+  f.engine.invalidate({ venue: 'binance', channel: 'book', symbol: 'BTC', reason: 'disconnected' });
+  f.set(2); f.sendBook('lighter', { bids: [[119, 10]], asks: [[121, 10]] });
+  assert.equal(f.scenario().inventory.residualNotional, 60);
+  assert.equal(f.scenario().hedge.quantity, 0.5); assert.equal(f.scenario().stats.makerFills, 1);
+});
+
+test('below-threshold reverse fills do not cancel an immutable in-flight IOC', () => {
+  const f = fixture({ hedgeThresholdNotional: 40 }); fillBuy(f, 1, 0.6); const pending = f.scenario().hedge;
+  f.set(2); f.sendTrade({ buyerMaker: false, price: 101, quantity: 0.3 });
+  assert.equal(f.scenario().inventory.residualQuantity, 0.3); assert.deepEqual(f.scenario().hedge, pending);
+  f.set(302); f.sendBook('lighter');
+  assert.equal(f.scenario().inventory.lighterQuantity, -0.5); assert.equal(f.scenario().inventory.residualQuantity, -0.2);
+  assert.equal(f.scenario().hedge, null); assert.equal(f.scenario().reason, 'below_hedge_threshold');
+});
+
+test('stale hedge valuation cannot retire a failed attempt or claim the residual is below threshold', () => {
+  const f = fixture({ hedgeThresholdNotional: 40, hedgeWaitMs: 100 }); fillBuy(f, 1, 0.6);
+  f.set(2); f.sendTrade({ buyerMaker: false, price: 101, quantity: 0.59 });
+  assert.equal(f.scenario().inventory.residualQuantity, 0.01);
+  f.engine.invalidate({ venue: 'lighter', channel: 'book', symbol: 'BTC', reason: 'disconnected' });
+  f.set(402); f.engine.tick();
+  assert.equal(f.scenario().hedge, null); assert.equal(f.scenario().stats.hedgeFailures, 1);
+  assert.equal(f.engine.scenarios[0].hedgeAttempts, 1); assert.equal(f.scenario().inventory.residualNotional, null);
+  assert.equal(f.scenario().status, 'recovering');
+  f.set(403); f.sendBook('lighter');
+  assert.equal(f.engine.scenarios[0].hedgeAttempts, 0); assert.equal(f.scenario().hedge, null);
+  assert.equal(f.scenario().stats.hedgeFailures, 1); assert.equal(f.scenario().reason, 'below_hedge_threshold');
+});
+
+test('third partial IOC can finish below threshold without blocking and a later crossing starts a new budget', () => {
+  const f = fixture({ hedgeThresholdNotional: 75 }); fillBuy(f);
+  for (const [attempt, at] of [[1, 302], [2, 1603], [3, 2904]]) {
+    if (attempt > 1) { freshBoth(f, at - 301); assert.equal(f.scenario().hedge.attempt, attempt); }
+    f.set(at); f.sendBook('lighter', { bids: [[100, 0.1]], asks: [[101, 10]] });
+  }
+  const row = f.scenario();
+  assert.equal(row.stats.hedgeFailures, 3); assert.equal(row.stats.hedgeFills, 3);
+  assert.equal(row.inventory.residualQuantity, 0.7); assert.equal(row.inventory.residualNotional, 70.35);
+  assert.equal(row.hedge, null); assert.equal(row.status, 'quoting'); assert.equal(row.reason, 'below_hedge_threshold');
+  assert.equal(f.engine.scenarios[0].hedgeAttempts, 0);
+  freshBoth(f, 4000); const quote = f.scenario().quotes.buy;
+  f.set(4001); f.sendTrade({ price: quote.price, quantity: quote.queueAhead + 0.2 });
+  assert.equal(f.scenario().hedge.attempt, 1); assert.equal(f.scenario().stats.hedgeFailures, 3);
+});
+
+test('risk and quantity limits may restrict new quotes below threshold but never authorize an early hedge', () => {
+  const f = fixture({ maxUnhedgedNotional: 100, hedgeThresholdNotional: 100 }); fillBuy(f);
+  assert.equal(f.scenario().inventory.residualQuantity, 0.99); assert.equal(f.scenario().hedge, null);
+  freshBoth(f, 1000);
+  assert.equal(f.scenario().quotes.buy, null); assert.ok(f.scenario().quotes.sell);
+  assert.equal(f.scenario().reason, 'below_hedge_threshold');
+  const small = fixture({ hedgeThresholdNotional: 0.5 }, { lighter: { minNotional: 10 } });
+  fillBuy(small, 1, 0.11);
+  assert.equal(small.scenario().inventory.residualQuantity, 0.01); assert.equal(small.scenario().hedge, null);
+  assert.equal(small.scenario().stats.hedgeFailures, 0);
 });
 
 test('slippage failures never invent fill price and timeouts keep retrying while Maker data is unavailable', () => {

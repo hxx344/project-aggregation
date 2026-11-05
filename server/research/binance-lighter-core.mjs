@@ -3,8 +3,8 @@ import { cashUnits, createCostExecution, decimalOf, feeUnits, numberOf, units, v
 import { applyInventoryFill, createInventoryLedger, inventoryUnrealized } from './binance-lighter-ledger.mjs';
 
 export const DEFAULT_COST_CONFIG = Object.freeze({
-  schema: 2, symbols: Object.freeze(['BTC', 'ETH']), latencyScenarios: Object.freeze([300, 600, 1000]),
-  orderNotional: 1000, maxInventoryNotional: 5000, maxUnhedgedNotional: 2000,
+  schema: 2, symbols: Object.freeze(['BTC']), latencyScenarios: Object.freeze([300, 600, 1000]),
+  orderNotional: 1000, maxInventoryNotional: 5000, maxUnhedgedNotional: 2000, hedgeThresholdNotional: 1000,
   quoteOffsetBps: 0, inventorySkewBps: 2, quoteRefreshMs: 1000, quoteMaxAgeMs: 15000,
   hedgeWaitMs: 2000, maxBookAgeMs: 1000, maxSourceAgeMs: 2000, maxPairSkewMs: 750,
   maxHedgeSlippageBps: 5, queueMultiplier: 1, binanceMakerFeeBps: 0, lighterTakerFeeBps: 0,
@@ -38,19 +38,22 @@ export function validateCostConfig(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== Object.keys(DEFAULT_COST_CONFIG).length
     || Object.keys(value).some(key => !Object.hasOwn(DEFAULT_COST_CONFIG, key))) fail('fields');
   if (value.schema !== 2) fail('schema');
-  if (!Array.isArray(value.symbols) || !value.symbols.length || value.symbols.length > 2 || new Set(value.symbols).size !== value.symbols.length
-    || value.symbols.some(symbol => !['BTC', 'ETH'].includes(symbol))) fail('symbols');
+  if (!Array.isArray(value.symbols) || value.symbols.length !== 1 || value.symbols[0] !== 'BTC') fail('symbols');
   if (!Array.isArray(value.latencyScenarios) || !value.latencyScenarios.length || value.latencyScenarios.length > 3
     || new Set(value.latencyScenarios).size !== value.latencyScenarios.length
     || value.latencyScenarios.some(ms => !Number.isInteger(ms) || ms < 300 || ms > 10000)) fail('latencyScenarios');
   for (const [name, low, high, integer] of [
-    ['orderNotional', 10, 100000], ['maxInventoryNotional', 10, 1000000], ['maxUnhedgedNotional', 10, 1000000],
+    ['orderNotional', 10, 100000], ['maxInventoryNotional', 10, 1000000], ['maxUnhedgedNotional', 10, 1000000], ['hedgeThresholdNotional', 0, 1000000],
     ['quoteOffsetBps', 0, 100], ['inventorySkewBps', 0, 100], ['quoteRefreshMs', 1000, 60000, true], ['quoteMaxAgeMs', 1000, 120000, true],
     ['hedgeWaitMs', 100, 10000, true], ['maxBookAgeMs', 100, 5000, true], ['maxSourceAgeMs', 100, 10000, true],
     ['maxPairSkewMs', 0, 5000, true], ['maxHedgeSlippageBps', 0, 100], ['queueMultiplier', 1, 10],
     ['binanceMakerFeeBps', 0, 100], ['lighterTakerFeeBps', 0, 100],
   ]) if (!finite(value[name]) || value[name] < low || value[name] > high || integer && !Number.isInteger(value[name])) fail(name);
   if (value.maxInventoryNotional < value.orderNotional) fail('maxInventoryNotional');
+  if (value.hedgeThresholdNotional > value.maxUnhedgedNotional) fail('hedgeThresholdNotional');
+  try {
+    if (value.hedgeThresholdNotional > 0 && units(value.hedgeThresholdNotional) === 0n) fail('hedgeThresholdNotional');
+  } catch { fail('hedgeThresholdNotional'); }
   if (value.quoteMaxAgeMs < value.quoteRefreshMs) fail('quoteMaxAgeMs');
   if (value.fundingCostBpsPerHour !== null && (!finite(value.fundingCostBpsPerHour) || Math.abs(value.fundingCostBpsPerHour) > 100)) fail('fundingCostBpsPerHour');
   return structuredClone(value);
@@ -215,6 +218,10 @@ export class CostLabEngine {
       && quantity % units(market.quantityStep) === 0n;
   }
   residual(scenario) { return scenario.ledgers.binance.quantity + scenario.ledgers.lighter.quantity; }
+  residualNotional(scenario, wall = this.now(), mono = this.mono()) {
+    if (this.bookQuality('lighter', scenario.symbol, wall, mono)) return null;
+    return abs(this.residual(scenario)) * midUnits(this.books.get(keyOf('lighter', scenario.symbol))) / SCALE;
+  }
   projected(scenario) { return this.residual(scenario) + (scenario.hedge ? sign(scenario.hedge.side) * scenario.hedge.quantity : 0n); }
   quoteCapacity(scenario, side, price) {
     const book = this.books.get(keyOf('binance', scenario.symbol));
@@ -301,13 +308,22 @@ export class CostLabEngine {
   }
   hedgeFailure(scenario, reason) {
     scenario.stats.hedgeFailures++; this.event('hedge_failed', scenario, reason);
-    if (scenario.hedgeAttempts >= MAX_HEDGE_ATTEMPTS) { this.block(scenario, 'hedge_retries_exhausted'); return; }
     scenario.nextHedgeMono = this.mono() + HEDGE_RETRY_MS;
   }
   scheduleHedge(scenario) {
     if (scenario.status === 'blocked' || scenario.hedge) return;
     const residual = this.residual(scenario);
     if (!residual) { scenario.hedgeAttempts = 0; scenario.nextHedgeMono = 0; return; }
+    const notional = this.residualNotional(scenario), threshold = units(this.config.hedgeThresholdNotional);
+    // Unknown valuation cannot prove a small exposure or retire its retry budget.
+    // A zero threshold retains the earlier immediate-hedge recovery behavior.
+    if (threshold > 0n && notional === null) return;
+    if (notional !== null && notional < threshold) {
+      scenario.hedgeAttempts = 0; scenario.nextHedgeMono = 0; return;
+    }
+    // Judge the remaining demand before exhausting retries: the third partial
+    // IOC may already have brought the account below its configured threshold.
+    if (scenario.hedgeAttempts >= MAX_HEDGE_ATTEMPTS) { this.block(scenario, 'hedge_retries_exhausted'); return; }
     if (this.mono() < scenario.nextHedgeMono) return;
     if (this.bookQuality('lighter', scenario.symbol)) {
       scenario.hedgeAttempts++; this.hedgeFailure(scenario, 'hedge_book_unavailable'); return;
@@ -389,7 +405,10 @@ export class CostLabEngine {
           if (failure) { this.cancelQuotes(scenario); this.setStatus(scenario, scenario.rules ? 'recovering' : 'waiting', failure); }
           else {
             this.refreshQuotes(scenario);
-            this.setStatus(scenario, scenario.hedge || this.residual(scenario) ? 'hedging' : 'quoting');
+            const notional = this.residualNotional(scenario);
+            const below = this.residual(scenario) !== 0n && notional !== null && notional < units(this.config.hedgeThresholdNotional);
+            this.setStatus(scenario, scenario.hedge || this.residual(scenario) && !below ? 'hedging' : 'quoting',
+              !scenario.hedge && below ? 'below_hedge_threshold' : null);
           }
         }
       }
@@ -422,10 +441,12 @@ export class CostLabEngine {
         sourceClockUncertain: book.sourceAt > book.receivedAt, valid: !this.bookQuality(book.venue, book.symbol, wall, mono) })), channels: [], diagnostics: [],
       scenarios: this.scenarios.filter(scenario => scenarioId === undefined || scenario.id === scenarioId).map(scenario => {
         const valuation = this.valuation(scenario, wall, mono), bn = scenario.ledgers.binance, lt = scenario.ledgers.lighter;
+        const residualNotional = this.residualNotional(scenario, wall, mono);
         const bnBook = this.books.get(keyOf('binance', scenario.symbol));
         const notional = !this.bookQuality('binance', scenario.symbol, wall, mono) ? bn.quantity * midUnits(bnBook) / SCALE : null;
         return { id: scenario.id, symbol: scenario.symbol, latencyMs: scenario.latencyMs, status: scenario.status, reason: scenario.reason,
           inventory: { binanceQuantity: numberOf(bn.quantity), lighterQuantity: numberOf(lt.quantity), residualQuantity: numberOf(this.residual(scenario)),
+            residualNotional: residualNotional === null ? null : numberOf(residualNotional),
             projectedResidualQuantity: numberOf(this.projected(scenario)), binanceAveragePrice: bn.quantity ? numberOf(bn.cost * SCALE / abs(bn.quantity)) : null,
             lighterAveragePrice: lt.quantity ? numberOf(lt.cost * SCALE / abs(lt.quantity)) : null, binanceNotional: notional === null ? null : numberOf(notional),
             utilization: notional === null ? null : numberOf(notional * SCALE / units(this.config.maxInventoryNotional)), limitNotional: this.config.maxInventoryNotional },
@@ -446,6 +467,7 @@ export class CostLabEngine {
         '资金费为独立可选情景：按 abs(BN库存) × 平均成本价 × 持有时间积分；实际资金费未知。',
         '来源时钟允许最多超前本机250毫秒；对冲延迟至少300毫秒，按本机单调接收时间及新来源证据共同核验。',
         '每情景最多一个在途IOC；失败最多尝试3次，重试间隔1000毫秒，耗尽保留库存并阻止报价。',
+        '净敞口按Lighter新鲜中间价计算USDC名义额；低于会话阈值不提交新的对冲，达到阈值后对冲完整净数量，已提交IOC保持原参数。',
         '逐笔成交仅保留最近200条、曲线300点、事件30条；累计成交额、费用和盈亏保留完整会话。',
       ] };
   }

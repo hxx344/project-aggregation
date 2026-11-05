@@ -60,18 +60,17 @@ function fakeSockets({ autoOpen = true } = {}) {
   return { sockets, FakeSocket };
 }
 
-test('metadata selects BTC/ETH only, checks identity and uses real LOT_SIZE instead of precision', () => {
+test('metadata selects only BTC, checks identity and uses real LOT_SIZE instead of precision', () => {
   const rows = parseCostMarkets('binance', { symbols: [...binanceBody.symbols, { symbol: 'UNRELATED', filters: null }] }, AT);
   assert.equal(rows[0].quantityStep, 0.001);
   assert.equal(rows[0].tickSize, 0.1);
   assert.equal(rows[0].minNotional, 50);
-  assert.equal(rows[1].minNotional, 20);
+  assert.equal(rows.length, 1);
   assert.equal(rows[0].settlement, 'USDC');
   const lighter = parseCostMarkets('lighter', lighterBody, AT);
   assert.equal(lighter[0].marketId, 1);
-  assert.equal(lighter[1].marketId, 0);
+  assert.equal(lighter.length, 1);
   assert.equal(lighter[0].quantityStep, 0.00001);
-  assert.equal(lighter[1].quantityStep, 0.0001);
   assert.equal(lighter[0].priceUnit, 'USD');
   assert.equal(lighter[0].quote, 'USDC');
   assert.equal(lighter[0].multiplier, 1);
@@ -99,7 +98,7 @@ test('discovery uses only fixed unauthenticated GET endpoints and fails closed o
   const result = await discoverCostMarkets({ cooldowns: {}, fetchImpl: async (url, options) => {
     calls.push({ url, options }); return jsonResponse(bodyFor(url));
   } });
-  assert.equal(result.length, 4);
+  assert.equal(result.length, 2); assert.ok(result.every(row => row.symbol === 'BTC'));
   assert.deepEqual(calls.map(row => row.url).sort(), [
     'https://fapi.binance.com/fapi/v1/exchangeInfo', 'https://mainnet.zklighter.elliot.ai/api/v1/orderBookDetails',
   ]);
@@ -107,6 +106,18 @@ test('discovery uses only fixed unauthenticated GET endpoints and fails closed o
     && row.options.credentials === 'omit' && row.options.headers === undefined));
   await assert.rejects(discoverCostMarkets({ cooldowns: {}, fetchImpl: async url => jsonResponse(url.includes('binance') ? { symbols: [] } : lighterBody) }),
     error => error instanceof CostFeedError && error.code === 'missing_market' && error.venue === 'binance');
+});
+
+test('missing or malformed ETH metadata cannot block BTC discovery and explicit ETH input is rejected before networking', async () => {
+  for (const body of [{ symbols: [binanceBody.symbols[0]] }, { symbols: [binanceBody.symbols[0], { symbol: 'ETHUSDC', filters: null }] }]) {
+    assert.equal(parseCostMarkets('binance', body, AT)[0].symbol, 'BTC');
+  }
+  for (const body of [{ order_book_details: [lighterBody.order_book_details[0]] },
+    { order_book_details: [lighterBody.order_book_details[0], { symbol: 'ETH', market_id: 1 }] }]) {
+    assert.equal(parseCostMarkets('lighter', body, AT)[0].marketId, 1);
+  }
+  await assert.rejects(discoverCostMarkets({ symbols: ['ETH'], fetchImpl: () => assert.fail('ETH must not issue a metadata request') }), /markets_invalid/);
+  assert.throws(() => startCostFeeds({ markets: [{ ...markets[0], symbol: 'ETH', nativeSymbol: 'ETHUSDC' }] }), /markets_invalid/);
 });
 
 test('HTTP retries only transport/5xx, with bounded attempts and body failures classified', async t => {
@@ -121,7 +132,7 @@ test('HTTP retries only transport/5xx, with bounded attempts and body failures c
     return jsonResponse(bodyFor(url));
   } });
   await flush(); await tick(t, 250); await tick(t, 500);
-  assert.equal((await work).length, 4);
+  assert.equal((await work).length, 2);
   assert.deepEqual(counts, { binance: 3, lighter: 3 });
   let refused = 0;
   await assert.rejects(discoverCostMarkets({ cooldowns: {}, fetchImpl: async url => {
@@ -353,9 +364,9 @@ test('three fixed sockets route books/trades independently and stop synchronousl
     onBook: row => books.push(row), onTrade: row => trades.push(row), onStatus: row => statuses.push(row) });
   await flush();
   assert.equal(sockets.length, 3);
-  assert.match(sockets[0].url, /^wss:\/\/fstream\.binance\.com\/public\/stream\?streams=btcusdc@depth20@100ms\/ethusdc@depth20@100ms$/);
-  assert.match(sockets[1].url, /^wss:\/\/fstream\.binance\.com\/market\/stream\?streams=btcusdc@aggTrade\/ethusdc@aggTrade$/);
-  assert.deepEqual(sockets[2].sent, [{ type: 'subscribe', channel: 'order_book/1' }, { type: 'subscribe', channel: 'order_book/0' }]);
+  assert.match(sockets[0].url, /^wss:\/\/fstream\.binance\.com\/public\/stream\?streams=btcusdc@depth20@100ms$/);
+  assert.match(sockets[1].url, /^wss:\/\/fstream\.binance\.com\/market\/stream\?streams=btcusdc@aggTrade$/);
+  assert.deepEqual(sockets[2].sent, [{ type: 'subscribe', channel: 'order_book/1' }]);
   sockets[0].message(depth()); sockets[1].message(trade()); sockets[2].message(snapshot());
   assert.equal(books.length, 2); assert.equal(trades.length, 1);
   const lateHandler = sockets[0].onmessage;
@@ -448,7 +459,7 @@ test('Binance trade exhaustion rejects the whole feed set even while both venues
   const lighterBook = sockets.find(ws => ws.url.includes('zklighter'));
   let nonce = 100, tradeFailures = 0;
   for (let second = 0; second <= 20; second++) {
-    for (const symbol of ['BTC', 'ETH']) {
+    for (const symbol of ['BTC']) {
       binanceBook.message(depth({ s: `${symbol}USDC`, u: nonce, pu: nonce - 1, T: Date.now() }));
       const frame = second === 0 ? snapshot({ nonce, channel: `order_book:${symbol === 'BTC' ? 1 : 0}`, time: Date.now() * 1000 })
         : lighterFrame({ nonce, begin: nonce - 1, channel: `order_book:${symbol === 'BTC' ? 1 : 0}`, time: Date.now() * 1000 });
@@ -480,8 +491,8 @@ test('stop during venue cooldown clears connecting status without opening a sock
     cooldowns: { lighter: Date.now() + 60_000 }, onStatus: row => statuses.push(row) });
   await feeds.stop();
   assert.equal(sockets.length, 0);
-  assert.deepEqual(statuses.slice(-2).map(row => [row.symbol, row.state, row.reason]),
-    [['BTC', 'disconnected', 'stopped'], ['ETH', 'disconnected', 'stopped']]);
+  assert.deepEqual(statuses.filter(row => row.state === 'disconnected').map(row => [row.symbol, row.state, row.reason]),
+    [['BTC', 'disconnected', 'stopped']]);
 });
 
 test('consumer callback failures terminate all feed tasks instead of becoming market-data retries', async () => {

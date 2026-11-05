@@ -13,6 +13,27 @@ const silent = { info() {}, warn() {}, error() {}, debug() {} };
 const clone = value => structuredClone(value);
 const base = Date.parse('2026-11-05T06:00:00Z');
 const config = () => clone(DEFAULT_COST_CONFIG);
+function oldV2Config(symbols = ['BTC', 'ETH'], maxUnhedgedNotional = 2000) {
+  const result = { ...config(), symbols, maxUnhedgedNotional };
+  delete result.hedgeThresholdNotional;
+  return result;
+}
+function oldV2Report(symbol = 'ETH') {
+  const engine = new CostLabEngine(config(), { now: () => base, mono: () => 100 });
+  engine.stop();
+  const report = engine.report();
+  report.sessionConfig = oldV2Config([symbol]);
+  for (const row of report.scenarios) {
+    row.symbol = symbol; row.id = `${symbol}-inventory-${row.latencyMs}`;
+    row.inventory.binanceQuantity = 0.4; row.inventory.lighterQuantity = -0.3;
+    row.inventory.residualQuantity = 0.1; row.inventory.projectedResidualQuantity = 0.1;
+    delete row.inventory.residualNotional;
+    row.stats.fees = 0.16; row.stats.binanceTurnover = 1200; row.stats.makerFills = 1;
+    row.recentFills = [{ id: `${row.id}:fill`, venue: 'binance', symbol, side: 'buy', phase: 'quote',
+      quantity: 0.4, price: 3000, notional: 1200, fee: 0.16, at: base, sourceAt: base }];
+  }
+  return report;
+}
 const legacyConfig = () => ({ schema: 1, symbols: ['BTC', 'ETH'], notionalPerLeg: 1500, latencyScenarios: [300, 600, 1000],
   makerWaitMs: 15000, holdMs: 5000, hedgeWaitMs: 2000, cooldownMs: 3000, maxBookAgeMs: 1000,
   maxSourceAgeMs: 2000, maxPairSkewMs: 750, maxHedgeSlippageBps: 5, queueMultiplier: 1,
@@ -37,7 +58,7 @@ function fakeEngine(settings, { sessionId, emit }) {
     onBook(value) { view.books = [value]; },
     onTrade() {
       view.scenarios = [{ id: 'BTC-inventory-300', symbol: 'BTC', latencyMs: 300, status: 'hedging', reason: null,
-        inventory: { binanceQuantity: 0.01, lighterQuantity: 0, residualQuantity: 0.01, projectedResidualQuantity: 0,
+        inventory: { binanceQuantity: 0.01, lighterQuantity: 0, residualQuantity: 0.01, residualNotional: null, projectedResidualQuantity: 0,
           binanceAveragePrice: 80000, lighterAveragePrice: null, binanceNotional: 800, utilization: 0.16, limitNotional: 5000 },
         quotes: { buy: null, sell: null }, hedge: { id: 'hedge', side: 'sell', quantity: 0.01, dueAt: base + 300, attempt: 1 },
         stats: { quoteUpdates: 1, makerFills: 1, hedgeFills: 0, hedgeFailures: 0, binanceTurnover: 800, lighterTurnover: 0,
@@ -164,6 +185,12 @@ test('failed durable start or save cannot change runtime intent or saved config'
     denied = 'session-v2.json'; f.sources[0].callbacks.onTrade({});
     assert.equal(manager.state().enabled, false); assert.equal(manager.state().state, 'fault');
     assert.equal(manager.state().report.scenarios[0].inventory.residualQuantity, 0.01);
+    denied = '';
+    await manager.save({ ...config(), orderNotional: 700 });
+    assert.equal(manager.state().state, 'stopped');
+    assert.equal(manager.state().config.orderNotional, 700);
+    assert.equal(JSON.parse(readFileSync(join(manager.directory, 'config-v2.json'))).orderNotional, 700);
+    assert.equal(manager.state().report.scenarios[0].inventory.residualQuantity, 0.01);
   } finally { denied = ''; await manager.close(); f.cleanup(); }
 });
 
@@ -235,10 +262,13 @@ test('invalid reports are retained, and live/config path overrides are rejected'
     writeFileSync(join(manager.directory, 'session-v2.json'), damaged);
     manager = f.create(); await manager.initialize();
     assert.equal(manager.state().state, 'fault');
+    const savedConfig = readFileSync(join(manager.directory, 'config-v2.json'));
+    await assert.rejects(manager.save({ ...config(), orderNotional: 700 }), error => error.status === 409);
     await assert.rejects(manager.start(), error => error.status === 409);
     await assert.rejects(manager.stop(), error => error.status === 409);
     await assert.rejects(manager.archive(), error => error.status === 409);
     assert.equal(readFileSync(join(manager.directory, 'session-v2.json'), 'utf8'), damaged);
+    assert.deepEqual(readFileSync(join(manager.directory, 'config-v2.json')), savedConfig);
   } finally { await manager.close(); f.cleanup(); }
 });
 
@@ -271,6 +301,8 @@ test('legacy config migration is idempotent and every legacy file remains byte-i
     await manager.initialize();
     assert.equal(manager.state().schema, 2); assert.equal(manager.state().report, null);
     assert.equal(manager.state().config.orderNotional, 1500);
+    assert.deepEqual(manager.state().config.symbols, ['BTC']);
+    assert.equal(manager.state().config.hedgeThresholdNotional, 1000);
     assert.equal(manager.state().config.binanceMakerFeeBps, 0.1);
     for (const key of ['notionalPerLeg', 'makerWaitMs', 'holdMs', 'cooldownMs']) assert.equal(Object.hasOwn(manager.state().config, key), false);
     assert.equal(manager.state().legacySession.interrupted, true);
@@ -312,6 +344,169 @@ test('legacy corruption blocks migration before publishing v2 config and never o
       assert.equal(readFileSync(join(manager.directory, file), 'utf8'), body);
     } finally { await manager.close(); f.cleanup(); }
   }
+});
+
+test('old v2 config migrates BTC and a bounded threshold without changing saved risk limits', async () => {
+  for (const [symbols, limit] of [[['BTC', 'ETH'], 2000], [['ETH'], 500], [['BTC'], 10]]) {
+    const f = fixture(); let manager = f.create();
+    try {
+      mkdirSync(manager.directory, { recursive: true });
+      const original = oldV2Config(symbols, limit), body = JSON.stringify(original, null, 2) + '\n';
+      const configFile = join(manager.directory, 'config-v2.json');
+      writeFileSync(configFile, body);
+      await manager.initialize();
+      const migrated = manager.state().config;
+      assert.equal(manager.state().state, 'stopped');
+      assert.deepEqual(migrated, { ...original, symbols: ['BTC'], hedgeThresholdNotional: Math.min(1000, limit) });
+      assert.deepEqual(JSON.parse(readFileSync(configFile)), migrated);
+      const backupFile = join(manager.directory, 'threshold-migration-backup.json'), backupBytes = readFileSync(backupFile);
+      assert.deepEqual(JSON.parse(backupBytes), { schema: 1, migration: 'btc-hedge-threshold', createdAt: base,
+        files: { 'config-v2.json': body, 'session-v2.json': null, 'archives-v2.json': null } });
+      await manager.close(); manager = f.create(); await manager.initialize();
+      assert.deepEqual(manager.state().config, migrated); assert.deepEqual(readFileSync(backupFile), backupBytes);
+      await manager.close();
+      // Retrying a rolled-back config must keep the very first recovery copy.
+      writeFileSync(configFile, JSON.stringify({ ...original, quoteOffsetBps: 3 }));
+      manager = f.create(); await manager.initialize();
+      assert.equal(manager.state().config.quoteOffsetBps, 3);
+      assert.deepEqual(readFileSync(backupFile), backupBytes);
+    } finally { await manager.close(); f.cleanup(); }
+  }
+});
+
+test('old ETH inventory and archives retain their exact config, fees and downloads after migration', async () => {
+  const f = fixture(); let manager = f.create();
+  try {
+    mkdirSync(join(manager.directory, 'archives-v2'), { recursive: true });
+    const current = oldV2Report(), archived = oldV2Report('BTC');
+    const files = {
+      'config-v2.json': JSON.stringify(oldV2Config(), null, 2) + '\n',
+      'session-v2.json': JSON.stringify({ schema: 2, clean: true, report: current }, null, 2),
+      'archives-v2.json': JSON.stringify({ schema: 2, sessions: [{ schema: 2, sessionId: archived.sessionId,
+        startedAt: archived.startedAt, endedAt: archived.updatedAt, makerFills: 3, hasExposure: true, interrupted: false }] }),
+    };
+    for (const [file, body] of Object.entries(files)) writeFileSync(join(manager.directory, file), body);
+    const archivedPath = join(manager.directory, 'archives-v2', `${archived.sessionId}.json`);
+    const archivedBytes = JSON.stringify(archived, null, 2); writeFileSync(archivedPath, archivedBytes);
+    await manager.initialize();
+    assert.equal(manager.state().state, 'stopped');
+    assert.deepEqual(manager.state().config.symbols, ['BTC']);
+    assert.deepEqual(manager.report().report, current);
+    assert.deepEqual(manager.report(current.sessionId).report, current);
+    assert.deepEqual(manager.report(archived.sessionId).report, archived);
+    assert.deepEqual(JSON.parse(readFileSync(join(manager.directory, 'threshold-migration-backup.json'))).files, files);
+    await assert.rejects(manager.start(), error => error.status === 409);
+    await manager.close(); manager = f.create(); await manager.initialize();
+    assert.deepEqual(manager.report().report, current);
+    await assert.rejects(manager.start(), error => error.status === 409);
+    assert.equal(readFileSync(join(manager.directory, 'session-v2.json'), 'utf8'), files['session-v2.json']);
+    assert.equal(readFileSync(archivedPath, 'utf8'), archivedBytes);
+    await manager.archive();
+    assert.deepEqual(manager.report(current.sessionId).report, current);
+    await manager.start(); await until(() => f.sources.length === 1);
+    assert.deepEqual(manager.report().report.sessionConfig.symbols, ['BTC']);
+    assert.equal(manager.report().report.sessionConfig.hedgeThresholdNotional, 1000);
+  } finally { await manager.close(); f.cleanup(); }
+});
+
+test('migration backup and config write failures preserve source data and allow a safe retry', async () => {
+  for (const denied of ['threshold-migration-backup.json', 'config-v2.json']) {
+    const f = fixture(); let manager = f.create({ write(file, value) {
+      if (file.endsWith(denied)) throw new Error('fixture_migration_write_failed');
+      writeFileSync(file, JSON.stringify(value));
+    } });
+    try {
+      mkdirSync(manager.directory, { recursive: true });
+      const files = { 'config-v2.json': JSON.stringify(oldV2Config(), null, 2),
+        'session-v2.json': JSON.stringify({ schema: 2, clean: true, report: oldV2Report() }),
+        'archives-v2.json': JSON.stringify({ schema: 2, sessions: [] }) };
+      for (const [file, body] of Object.entries(files)) writeFileSync(join(manager.directory, file), body);
+      await manager.initialize();
+      assert.equal(manager.state().state, 'fault');
+      await assert.rejects(manager.start(), error => error.status === 409);
+      await assert.rejects(manager.save({ ...config(), orderNotional: 700 }), error => error.status === 409);
+      await manager.close();
+      for (const [file, body] of Object.entries(files)) assert.equal(readFileSync(join(manager.directory, file), 'utf8'), body);
+      const backupFile = join(manager.directory, 'threshold-migration-backup.json');
+      assert.equal(existsSync(backupFile), denied === 'config-v2.json');
+      const backup = existsSync(backupFile) ? readFileSync(backupFile) : null;
+      manager = f.create(); await manager.initialize();
+      assert.equal(manager.state().state, 'stopped');
+      assert.deepEqual(JSON.parse(readFileSync(backupFile)).files, files);
+      if (backup) assert.deepEqual(readFileSync(backupFile), backup);
+    } finally { await manager.close(); f.cleanup(); }
+  }
+});
+
+test('migration validates all initialization sources and existing recovery copy before any writes', async () => {
+  for (const [badFile, badBody] of [
+    ['config-v2.json', '{broken'], ['config-v2.json', JSON.stringify({ ...oldV2Config(), mode: 'live' })],
+    ['session-v2.json', '{broken'], ['session-v2.json', JSON.stringify({ schema: 2, clean: true, report: {} })],
+    ['archives-v2.json', '{broken'], ['archives-v2.json', JSON.stringify({ schema: 2, sessions: [{}] })],
+    ['cooldowns.json', '{broken'], ['cooldowns.json', JSON.stringify({ other: 123 })],
+    ['threshold-migration-backup.json', '{broken'], ['threshold-migration-backup.json', JSON.stringify({ schema: 1 })],
+    ['threshold-migration-backup.json', JSON.stringify({ schema: 1, migration: 'btc-hedge-threshold', createdAt: base,
+      files: { 'config-v2.json': JSON.stringify(oldV2Config()), 'session-v2.json': 'null', 'archives-v2.json': null } })],
+  ]) {
+    let writes = 0;
+    const f = fixture({ write() { writes += 1; throw new Error('unexpected_write'); } }); const manager = f.create();
+    try {
+      mkdirSync(manager.directory, { recursive: true });
+      const configFile = join(manager.directory, 'config-v2.json'), body = JSON.stringify(oldV2Config());
+      writeFileSync(configFile, body); writeFileSync(join(manager.directory, badFile), badBody);
+      await manager.initialize();
+      assert.equal(manager.state().state, 'fault', badFile); assert.equal(writes, 0, badFile);
+      await assert.rejects(manager.save(config()), error => error.status === 409);
+      assert.equal(writes, 0, badFile);
+      assert.equal(readFileSync(join(manager.directory, badFile), 'utf8'), badBody);
+      assert.equal(readFileSync(configFile, 'utf8'), badFile === 'config-v2.json' ? badBody : body);
+    } finally { await manager.close(); f.cleanup(); }
+  }
+});
+
+test('current threshold is preserved on history reads and ETH config migration', async () => {
+  for (const threshold of [0, 400]) {
+    const f = fixture(); const manager = f.create();
+    try {
+      mkdirSync(manager.directory, { recursive: true });
+      const savedConfig = { ...config(), symbols: ['ETH'], hedgeThresholdNotional: threshold };
+      const report = oldV2Report(); report.sessionConfig = savedConfig;
+      for (const row of report.scenarios) row.inventory.residualNotional = null;
+      writeFileSync(join(manager.directory, 'config-v2.json'), JSON.stringify(savedConfig));
+      writeFileSync(join(manager.directory, 'session-v2.json'), JSON.stringify({ schema: 2, clean: true, report }));
+      await manager.initialize();
+      assert.equal(manager.state().state, 'stopped');
+      assert.deepEqual(manager.state().config, { ...savedConfig, symbols: ['BTC'] });
+      assert.deepEqual(manager.report().report, report);
+    } finally { await manager.close(); f.cleanup(); }
+  }
+});
+
+test('report inventory valuation accepts explicit unknown but rejects missing or invalid new values', async () => {
+  for (const [residualNotional, accepted] of [[null, true], [0, true], [120, true], [undefined, false], ['120', false], [-1, false]]) {
+    const f = fixture(); const manager = f.create();
+    try {
+      mkdirSync(manager.directory, { recursive: true });
+      const report = oldV2Report('BTC'); report.sessionConfig = config();
+      for (const row of report.scenarios) row.inventory.residualNotional = residualNotional;
+      const file = join(manager.directory, 'session-v2.json');
+      const body = JSON.stringify({ schema: 2, clean: true, report }); writeFileSync(file, body);
+      await manager.initialize();
+      assert.equal(manager.state().state, accepted ? 'stopped' : 'fault');
+      assert.equal(readFileSync(file, 'utf8'), body);
+      if (accepted) assert.deepEqual(manager.report().report, report);
+    } finally { await manager.close(); f.cleanup(); }
+  }
+});
+
+test('initial discovery and metadata refresh request only configured BTC markets', async () => {
+  const requests = [];
+  const f = fixture({ metadataMs: 5, discover: async options => { requests.push(clone(options.symbols)); return []; } });
+  const manager = f.create();
+  try {
+    await manager.initialize(); await manager.start(); await until(() => requests.length >= 2); await manager.stop();
+    assert.ok(requests.every(symbols => JSON.stringify(symbols) === '["BTC"]'));
+  } finally { await manager.close(); f.cleanup(); }
 });
 
 test('stopped inventory, hedge, blocked and interrupted states all require explicit archival', () => {
@@ -359,7 +554,7 @@ test('real inventory fills persist mid-hedge and dirty restart preserves origina
   try {
     await manager.initialize();
     await manager.save({ ...config(), symbols: ['BTC'], latencyScenarios: [300], orderNotional: 100, maxInventoryNotional: 500,
-      maxUnhedgedNotional: 500, binanceMakerFeeBps: 1 });
+      maxUnhedgedNotional: 500, hedgeThresholdNotional: 0, binanceMakerFeeBps: 1 });
     await manager.start(); await until(() => f.sources.length === 1);
     const source = f.sources[0].callbacks;
     for (const venue of ['binance', 'lighter']) source.onBook({ venue, symbol: 'BTC', nativeSymbol: venue === 'binance' ? 'BTCUSDC' : 'BTC',
@@ -415,6 +610,11 @@ test('actual workbench route enforces session, origin, CSRF and exact paper conf
     assert.equal((await request('/start', 'POST', { mode: 'live' })).status, 400);
     assert.equal((await request('/config', 'PUT', { config: { ...config(), mode: 'live' } })).status, 400);
     assert.equal((await request('/config', 'PUT', { config: { ...config(), orderNotional: '' } })).status, 400);
+    for (const invalid of [oldV2Config(['BTC']), { ...config(), symbols: ['ETH'] }, { ...config(), symbols: ['BTC', 'ETH'] },
+      { ...config(), hedgeThresholdNotional: -1 }, { ...config(), hedgeThresholdNotional: 2001 }, { ...config(), hedgeThresholdNotional: 1e-100 },
+      { ...config(), hedgeThresholdNotional: '1000' }, { ...config(), endpoint: 'https://other.invalid' }]) {
+      assert.equal((await request('/config', 'PUT', { config: invalid })).status, 400);
+    }
     const updated = await request('/config', 'PUT', { config: { ...config(), orderNotional: 500 } });
     assert.equal(updated.status, 200); assert.equal((await updated.json()).config.orderNotional, 500);
     assert.equal((await request('/stop', 'POST', {})).status, 200);
@@ -443,19 +643,22 @@ test('actual status stays small while per-scenario details and full exports nego
       scenario.events = Array.from({ length: 30 }, (_, i) => ({ at: base + i, type: 'quote', reason: 'inventory_refresh' }));
     }
     const fullBytes = Buffer.byteLength(JSON.stringify(report));
-    assert.ok(fullBytes > 500_000 && fullBytes < 8 * 1024 * 1024, `expected realistic bounded report, got ${fullBytes}`);
+    assert.ok(fullBytes > 250_000 && fullBytes < 8 * 1024 * 1024, `expected realistic bounded report, got ${fullBytes}`);
     const directory = join(dataDir, 'binance-lighter-cost'); mkdirSync(directory);
     writeFileSync(join(directory, 'session-v2.json'), JSON.stringify({ schema: 2, clean: true, report }));
     const legacy = legacyReport(), archivedLegacy = { ...legacyReport(), stopped: true };
-    const archivedNew = { ...clone(report), sessionId: randomUUID() };
+    const archivedNew = { ...clone(report), sessionId: randomUUID() }, archivedOldV2 = oldV2Report();
     mkdirSync(join(directory, 'archives')); mkdirSync(join(directory, 'archives-v2'));
     writeFileSync(join(directory, 'session.json'), JSON.stringify({ schema: 1, clean: false, report: legacy }));
     writeFileSync(join(directory, 'archives.json'), JSON.stringify({ schema: 1, sessions: [{ sessionId: archivedLegacy.sessionId,
       startedAt: archivedLegacy.startedAt, endedAt: archivedLegacy.updatedAt, completed: 2, unresolved: 1, interrupted: false }] }));
     writeFileSync(join(directory, 'archives', `${archivedLegacy.sessionId}.json`), JSON.stringify(archivedLegacy));
     writeFileSync(join(directory, 'archives-v2.json'), JSON.stringify({ schema: 2, sessions: [{ schema: 2, sessionId: archivedNew.sessionId,
-      startedAt: archivedNew.startedAt, endedAt: archivedNew.updatedAt, makerFills: 600, hasExposure: false, interrupted: false }] }));
+      startedAt: archivedNew.startedAt, endedAt: archivedNew.updatedAt, makerFills: report.scenarios.length * 100, hasExposure: false, interrupted: false },
+      { schema: 2, sessionId: archivedOldV2.sessionId, startedAt: archivedOldV2.startedAt, endedAt: archivedOldV2.updatedAt,
+        makerFills: archivedOldV2.scenarios.length, hasExposure: true, interrupted: false }] }));
     writeFileSync(join(directory, 'archives-v2', `${archivedNew.sessionId}.json`), JSON.stringify(archivedNew));
+    writeFileSync(join(directory, 'archives-v2', `${archivedOldV2.sessionId}.json`), JSON.stringify(archivedOldV2));
     app = await createApp({ dataDir, initialPassword: 'cost-research-payload-fixture', refreshInterval: 0, assetSyncIntervalMs: 0,
       tradingRefreshIntervalMs: 0, executionIntervalMs: 0, baselineIntervalMs: 0, warmupEnabled: false, logger: silent });
     await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
@@ -470,8 +673,8 @@ test('actual status stays small while per-scenario details and full exports nego
     const summaryView = JSON.parse(summaryText);
     assert.equal(summaryView.error, null);
     assert.equal(summaryView.report.detailLevel, 'summary');
-    assert.equal(summaryView.report.scenarios.length, 6);
-    assert.deepEqual(summaryView.archives.map(row => row.schema), [1, 2]);
+    assert.equal(summaryView.report.scenarios.length, 3);
+    assert.deepEqual(summaryView.archives.map(row => row.schema), [1, 2, 2]);
     assert.equal(summaryView.legacySession.sessionId, legacy.sessionId);
     assert.ok(summaryView.report.scenarios.every(row => row.history.length === 0 && row.recentFills.length === 0 && row.events.length === 0));
     const id = report.scenarios[0].id;
@@ -491,7 +694,7 @@ test('actual status stays small while per-scenario details and full exports nego
     const exported = await request('/report'); assert.equal(exported.headers.get('content-encoding'), 'gzip');
     const exportedView = await exported.json();
     assert.deepEqual(exportedView.report, report, 'full export retains every recorded fill, history gap and event');
-    for (const source of [legacy, archivedLegacy, archivedNew]) {
+    for (const source of [legacy, archivedLegacy, archivedNew, archivedOldV2]) {
       const downloaded = await request(`/report/${source.sessionId}`);
       assert.equal(downloaded.status, 200); assert.equal(downloaded.headers.get('cache-control'), 'no-store');
       assert.deepEqual((await downloaded.json()).report, source);
