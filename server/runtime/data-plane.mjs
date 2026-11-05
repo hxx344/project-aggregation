@@ -24,6 +24,7 @@ import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
+import { createEventLoopLag } from './event-loop-lag.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
 
 const respond = errorResponder([HttpError, TradingError, ExecutionError, UpdateError, RuntimeError]);
@@ -356,10 +357,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await feishuDigest[action]());
     }
-    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery') {
+    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/event-loop') {
       if (method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
       if (pathname === '/api/system/metrics') return reply(200, baseline.read());
+      if (pathname === '/api/system/event-loop') return reply(200, eventLoop.read());
       if (pathname === '/api/system/accounts') return reply(200, { schemaVersion: 1, enabled: !!sharedAccountWriter, ...(sharedAccountWriter?.snapshot() || { accounts: [], bindings: [], operations: [], isolations: [] }) });
       if (pathname === '/api/system/recovery') return reply(200, { schemaVersion: 1, enabled: !!sharedAccountWriter, recovery: sharedAccountWriter?.snapshot().recovery ?? null });
       const controller = new AbortController(); controllers.add(controller);
@@ -462,8 +464,10 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // Recomputes the projection, so freshness changes reach subscribers without a new check.
   const heartbeat = setInterval(publish, 15000); heartbeat.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
+  // All collectors, WS feeds and research share this process's single thread.
+  const eventLoop = createEventLoopLag(); eventLoop.start();
 
-  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); }
+  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); }
   return {
     trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle,
     get baseline() { return baseline; },

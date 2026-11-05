@@ -8,6 +8,21 @@ export type HostStatus = {
   uptimeSeconds: number;
 };
 
+export type EventLoopWindow = { maxMs: number | null; stalls: number };
+export type EventLoopStatus = {
+  schemaVersion: 1;
+  generatedAt: string;
+  monitoring: boolean;
+  since: string | null;
+  tickMs: number;
+  stallThresholdMs: number;
+  lastMinute: EventLoopWindow;
+  lastFiveMinutes: EventLoopWindow;
+  recentStalls: { endedAt: string; durationMs: number }[];
+};
+
+// 1 s is the cost research's book-age gate: a stall that long alone invalidates fresh quotes.
+export const lagLevel = (ms: number | null | undefined, stallMs: number) => ms == null ? '' : ms >= 1000 ? 'alert' : ms >= stallMs ? 'warn' : '';
 export const hostLevel = (value: number | null | undefined) => value == null ? '' : value >= 90 ? 'alert' : value >= 75 ? 'warn' : '';
 export function formatBytes(bytes: number | undefined) {
   if (bytes === undefined || !Number.isFinite(bytes)) return '—';
