@@ -11,7 +11,7 @@ import { buildUpdateBatch, conditionUsage, toTransactionBuilderJson } from '../.
 import * as executor from '../../tools/aero-roles/executor.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
-import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, readAutoState, strictAutoConfig, stuckReason } from './aero-auto.mjs';
+import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, POOL_CAP_NONE, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolCapOf, poolRoom, readAutoState, roomFullText, roomShortText, storedAutoConfig, strictAutoConfig, stuckReason } from './aero-auto.mjs';
 
 const PRIVATE_KEY_PATTERN = /^(0x)?[0-9a-fA-F]{64}$/;
 const EVENT_LIMIT = 50;
@@ -34,8 +34,9 @@ const DEFAULTS = Object.freeze({ rpcUrl: 'https://mainnet.base.org', slippageBps
 const ACTIONS = new Set(['open', 'close', 'stake', 'unstake', 'claim', 'sell', 'swap']);
 const actionLabels = { open: '开仓', close: '平仓', stake: '质押', unstake: '解押', claim: '领取排放', sell: '卖出 AERO', swap: '兑换', rebalance: '自动调仓' };
 const AUTO_TICK_MS = 30_000;
-// 这些失败不停用自动调仓，下一轮重试：维护或隔离恢复暂停了签名、TWAP 偏离或不可用。
-const AUTO_RETRY_CODES = new Set(['halted', 'twap']);
+// 这些失败不停用自动调仓，下一轮重试：维护或隔离恢复暂停了签名、TWAP 偏离或不可用、单池上限因缺价或读链失败暂时核对不了。
+const AUTO_RETRY_CODES = new Set(['halted', 'twap', 'cap']);
+const autoFile = (auto) => ({ schema: 1, ...auto, config: storedAutoConfig(auto.config) });
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;
@@ -230,7 +231,8 @@ function migratePoolPlan(saved) {
     batch: { createdAt: saved.createdAt, baseline: saved.baseline, permissions: saved.permissions, transactions: p.transactions, pools: [p.name], allowances: p.allowances ?? [] } });
 }
 
-export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = () => false, readAdmission = () => true, log = console, now = Date.now,
+// readPrices：行情扫描的 Base 代币美元价 { at, usd: { 小写地址: 美元价 } } 或 null，只用于按总资产比例核对单池上限。
+export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = () => false, readAdmission = () => true, readPrices = () => null, log = console, now = Date.now,
   chain = executor, makeProvider = executor.provider } = {}) {
   const directory = path.join(dataDir, 'aero-safe');
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
@@ -488,7 +490,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   // ---- 自动调仓 ----
   // 返回是否写入成功。写不进去时停用：进度与次数统计只在内存里，重启会丢。
   function saveAuto() {
-    try { atomicJson(autoPath, { schema: 1, ...auto }); autoError = null; return true; } catch (error) {
+    try { atomicJson(autoPath, autoFile(auto)); autoError = null; return true; } catch (error) {
       log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录写入失败');
       autoError = `自动调仓记录写入失败：${error.code ?? error.message}`;
       if (auto.config.enabled && !auto.halted) auto.halted = { at: now(), reason: autoError };
@@ -504,7 +506,27 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     if (off > auto.config.maxTwapDeviationBps) throw new chain.ExecError(`现价偏离 ${auto.config.twapSeconds / 60} 分钟 TWAP ${off / 100}%（上限 ${auto.config.maxTwapDeviationBps / 100}%），本轮不调仓`, { code: 'twap' });
     return t.tick;
   }
-  // 调仓：核对 TWAP → 记一次并落盘"平仓中"（计入次数与冷却）→ 平仓 → 按余额变化落盘"待重开" → 卖出本次领到的 AERO 并计入 → 再核对 TWAP → 居中重开并质押。
+  // 单池上限：按最新链上状态（平仓收回的币已回到 Safe，总资产基本不变）与行情价算出本池还能放多少，把重开数量等比缩进去，余下的留在 Safe。
+  // 没设上限时返回 null。缺价、价格过期或读链失败时下一轮重试（code 'cap'），本池其他头寸已占满上限时停用等人工处理。
+  async function fitPoolCap(ctx, h, pool, amounts, closed) {
+    const capBps = poolCapOf(auto.config, pool.address);
+    if (capBps >= POOL_CAP_NONE) return null;
+    h.step('核对单池上限');
+    let fresh, prices = null;
+    try { fresh = serialize(await withBudget(chain.readState(ctx, { knownIds: minted }), REFRESH_BUDGET_MS, '读取链上状态'), ctx); } catch (error) {
+      throw new chain.ExecError(`核对单池上限时读取链上状态失败（${error.message}），暂不重开`, { code: 'cap' });
+    }
+    try { prices = readPrices(); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 行情价格读取失败'); }
+    const room = poolRoom({ chain: fresh, prices, pool: pool.address, capBps, exclude: closed, now: now() });
+    if (room.error) throw new chain.ExecError(`${room.error}，暂不重开`, { code: 'cap' });
+    const fit = fitToRoom({ ...amounts, token0: pool.token0, token1: pool.token1, room, valueOf: room.valueOf });
+    const short = roomShortText(room, fit.valueUsd);
+    if (short) throw new chain.ExecError(`${short}，未重开，收回的币留在 Safe。可调高上限后重新启用，或放弃待重开记录`);
+    if (fit.amount0 === 0n && fit.amount1 === 0n) throw new chain.ExecError('按单池上限缩减后数量过小，未重开，收回的币留在 Safe');
+    if (fit.capped) h.log({ event: 'auto_pool_capped', pool: pool.address, capBps, totalUsd: Math.round(room.totalUsd), roomUsd: Math.round(room.roomUsd), valueUsd: Math.round(fit.valueUsd), ...(room.unpriced.length ? { unpriced: room.unpriced } : {}) });
+    return fit;
+  }
+  // 调仓：核对 TWAP → 记一次并落盘"平仓中"（计入次数与冷却）→ 平仓 → 按余额变化落盘"待重开" → 卖出本次领到的 AERO 并计入 → 按单池上限缩减 → 再核对 TWAP → 居中重开并质押。
   // 每一步的进度都先落盘：兑换确认后记下兑换后的数量，开仓签名前记下"开仓结果未定"，开出后记下新头寸；重试按进度续做，不重复挪动 Safe 的币。
   async function rebalance(ctx, h, params, sellAfter) {
     const poolOf = (address) => ctx.pools.find((p) => p.address.toLowerCase() === address.toLowerCase());
@@ -555,15 +577,19 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const target = auto.reopen;
     const pool = poolOf(target.pool);
     if (!pool) throw new chain.ExecError('待重开的池子已不在白名单里');
-    let opened, tickLower, tickUpper;
+    let opened, tickLower, tickUpper, capped = false;
     if (target.minted) {
       // 新头寸已开出，上次在质押前停下：只做质押。
       h.step('质押');
       await chain.stakePosition(ctx, h, { tokenId: BigInt(target.minted) });
       opened = target.minted;
     } else {
-      const amounts = { amount0: BigInt(target.amount0), amount1: BigInt(target.amount1) };
+      let amounts = { amount0: BigInt(target.amount0), amount1: BigInt(target.amount1) };
       if (amounts.amount0 === 0n && amounts.amount1 === 0n) throw new chain.ExecError('平仓没有收回任何代币，未重开');
+      const fit = await fitPoolCap(ctx, h, pool, amounts, target.closed);
+      if (fit) amounts = { amount0: fit.amount0, amount1: fit.amount1 };
+      // 兑换确认后待重开记下的是缩减后的数量，重试时不会再被判为缩减：标记随兑换结果一起落盘并沿用。
+      capped = fit?.capped === true || target.capped === true;
       h.step('核对 TWAP');
       const tick = await checkTwap(ctx, pool.address);
       [tickLower, tickUpper] = centeredRange(tick, pool.tickSpacing, target.cells);
@@ -578,12 +604,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
           // 待确认记录写不进去时交易不会广播：撤回"结果未定"，免得误判为已签名。
           try { return h.persistPending(entry); } catch (error) { if (target.inflight) { target.inflight = null; saveAuto(); } throw error; }
         },
-        swapped: ({ amount0, amount1 }) => { Object.assign(target, { amount0: String(amount0), amount1: String(amount1), inflight: null }); saveAuto(); },
+        swapped: ({ amount0, amount1 }) => { Object.assign(target, { amount0: String(amount0), amount1: String(amount1), inflight: null, ...(capped ? { capped: true } : {}) }); saveAuto(); },
         minted: (tokenId) => {
           h.minted(tokenId);
           Object.assign(target, { minted: String(tokenId), inflight: null });
           const entry = [...auto.history].reverse().find((x) => x.closed === target.closed);
-          if (entry) Object.assign(entry, { opened: String(tokenId), tickLower, tickUpper });
+          if (entry) Object.assign(entry, { opened: String(tokenId), tickLower, tickUpper, ...(capped ? { capped: true } : {}) });
           saveAuto();
         },
       };
@@ -594,7 +620,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const last = [...auto.history].reverse().find((x) => x.closed === target.closed);
     if (last) last.opened = opened;
     saveAuto();
-    const done = { closed: target.closed, opened, tickLower: last?.tickLower ?? tickLower ?? null, tickUpper: last?.tickUpper ?? tickUpper ?? null };
+    const done = { closed: target.closed, opened, tickLower: last?.tickLower ?? tickLower ?? null, tickUpper: last?.tickUpper ?? tickUpper ?? null, capped: last?.capped === true || capped };
     record({ event: 'auto_rebalanced', ...done });
     return done;
   }
@@ -616,7 +642,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       await refresh(); // 也会结清上一笔已签名交易
       if (pending) { autoNote = `等待上一笔交易（${pending.label}）结清`; return; }
       if (!snapshot || snapshotError) { autoNote = `链上读取失败：${snapshotError ?? '尚无数据'}`; return; }
-      const result = evaluateAuto({ config: auto.config, chain: snapshot, outSince, history: auto.history, reopen: auto.reopen, closing: auto.closing, now: now() });
+      let prices = null;
+      try { prices = readPrices(); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 行情价格读取失败'); }
+      const result = evaluateAuto({ config: auto.config, chain: snapshot, outSince, history: auto.history, reopen: auto.reopen, closing: auto.closing, prices, now: now() });
       outSince = result.outSince; autoWatch = result.watch; autoNote = result.note;
       if (!result.due) return;
       const ctx = await connection();
@@ -698,7 +726,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (next.enabled && stuck) throw new HttpError(409, stuck);
       const previous = auto;
       auto = { ...auto, config: next, halted: next.enabled ? null : auto.halted };
-      try { atomicJson(autoPath, { schema: 1, ...auto }); autoError = null; } catch (error) {
+      try { atomicJson(autoPath, autoFile(auto)); autoError = null; } catch (error) {
         auto = previous;
         log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓设置保存失败');
         throw new HttpError(500, '自动调仓设置保存失败，请检查数据目录权限后重试');
@@ -718,7 +746,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const previous = auto;
       const dropped = auto.closing ? { closing: auto.closing } : { reopen: auto.reopen };
       auto = { ...auto, closing: null, reopen: null };
-      try { atomicJson(autoPath, { schema: 1, ...auto }); autoError = null; } catch (error) {
+      try { atomicJson(autoPath, autoFile(auto)); autoError = null; } catch (error) {
         auto = previous;
         log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录保存失败');
         throw new HttpError(500, '自动调仓记录保存失败，请检查数据目录权限后重试');

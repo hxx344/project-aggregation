@@ -104,6 +104,23 @@ function reopenCoins(state: AeroSafeState | null) {
   const t0 = pool ? tokenOf(chain, pool.token0) : null, t1 = pool ? tokenOf(chain, pool.token1) : null;
   return t0 && t1 ? `${units(r.amount0, t0.decimals)} ${t0.symbol} + ${units(r.amount1, t1.decimals)} ${t1.symbol}` : `${r.amount0} + ${r.amount1}（原始单位）`;
 }
+// 单池上限（基点 ↔ 百分比文本）。10000 即不限。
+const CAP_NONE = 10_000;
+const capText = (bps: number) => String(bps / 100);
+function capBpsOf(text: string): number | null {
+  const t = text.trim();
+  if (!/^\d+(\.\d{1,2})?$/.test(t)) return null;
+  const bps = Math.round(Number(t) * 100);
+  return bps >= 1 && bps <= CAP_NONE ? bps : null;
+}
+// 自动调仓状态与启用确认里的上限说明；全部不限时为空串。
+function capSummary(config: AeroAutoConfig, chain: AeroSafeState['chain']) {
+  const caps = Object.entries(config.poolCaps ?? {}), base = config.poolCapBps ?? CAP_NONE;
+  if (base >= CAP_NONE && caps.every(([, v]) => v >= CAP_NONE)) return '';
+  const name = (address: string) => chain?.pools.find((p) => same(p.address, address))?.name ?? short(address);
+  const each = caps.map(([k, v]) => `${name(k)} ${v >= CAP_NONE ? '不限' : `${capText(v)}%`}`).join('、');
+  return `单池上限：${base >= CAP_NONE ? '默认不限' : `默认 ${capText(base)}%`}${each ? `（${each}）` : ''}，按「行情」美元价估算总资产，重开时超出部分的币留在 Safe，缺价或价格超过 60 分钟未更新时不调仓`;
+}
 function AutoStatus({ state, onConfig }: { state: AeroSafeState; onConfig: () => void }) {
   const auto = state.auto;
   if (!auto || !state.configured) return null;
@@ -116,10 +133,10 @@ function AutoStatus({ state, onConfig }: { state: AeroSafeState; onConfig: () =>
       {auto.reopen ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已平仓 #{auto.reopen.closed ?? '—'}（{time(auto.reopen.at)}），待重开：{reopenCoins(state)}，宽度 {auto.reopen.cells} 格{auto.reopen.minted ? `；新头寸 #${auto.reopen.minted} 已开出，待质押` : ''}{auto.reopen.inflight ? `；${auto.reopen.inflight === 'swap' ? '配平兑换' : '开仓'}交易结果未确认` : ''}。</span></div> : null}
       {auto.error && auto.error !== auto.halted?.reason ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{auto.error}</span></div> : null}
       <p className="as-muted">{c.enabled
-        ? `已质押头寸连续出区间 ${c.triggerMinutes} 分钟后平仓，把收回的币以现价为中心按原宽度重开并质押；现价偏离 ${c.twapSeconds / 60} 分钟 TWAP 超过 ${c.maxTwapDeviationBps / 100}% 时不动；同池冷却 ${c.cooldownMinutes} 分钟，24 小时最多 ${c.maxPerDay} 次；${c.acceptPenalty ? '罚没期内也会解押' : '罚没期内等待'}。`
+        ? `已质押头寸连续出区间 ${c.triggerMinutes} 分钟后平仓，把收回的币以现价为中心按原宽度重开并质押；现价偏离 ${c.twapSeconds / 60} 分钟 TWAP 超过 ${c.maxTwapDeviationBps / 100}% 时不动；同池冷却 ${c.cooldownMinutes} 分钟，24 小时最多 ${c.maxPerDay} 次；${c.acceptPenalty ? '罚没期内也会解押' : '罚没期内等待'}。${capSummary(c, state.chain) ? `${capSummary(c, state.chain)}。` : ''}`
         : '未开启：出区间的头寸只提示，不会自动平仓。'}{c.enabled && auto.checkedAt ? ` 上次检查 ${time(auto.checkedAt)}${auto.note ? `：${auto.note}` : ''}。` : ''}</p>
       {auto.history.length ? <div className="lp-table-scroll"><table className="lp-table"><thead><tr><th>时间</th><th>平仓</th><th>重开</th><th className="num">新区间 tick</th></tr></thead><tbody>
-        {auto.history.map((h, i) => <tr key={`${h.at}:${i}`}><td>{time(h.at)}</td><td>#{h.closed ?? '—'}</td><td className={h.opened ? 'as-in' : 'as-out'}>{h.opened ? `#${h.opened}` : auto.reopen && auto.reopen.closed === h.closed ? '待重开' : '未完成'}</td><td className="num">{h.tickLower !== null && h.tickUpper !== null ? `${h.tickLower} 至 ${h.tickUpper}` : '—'}</td></tr>)}
+        {auto.history.map((h, i) => <tr key={`${h.at}:${i}`}><td>{time(h.at)}</td><td>#{h.closed ?? '—'}</td><td className={h.opened ? 'as-in' : 'as-out'}>{h.opened ? `#${h.opened}${h.capped ? '（按上限缩减）' : ''}` : auto.reopen && auto.reopen.closed === h.closed ? '待重开' : '未完成'}</td><td className="num">{h.tickLower !== null && h.tickUpper !== null ? `${h.tickLower} 至 ${h.tickUpper}` : '—'}</td></tr>)}
       </tbody></table></div> : null}
     </div>
   </section>;
@@ -240,10 +257,13 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
   </>;
 }
 
-type AutoDraft = Record<Exclude<keyof AeroAutoConfig, 'enabled' | 'acceptPenalty'>, string> & { enabled: boolean; acceptPenalty: boolean };
+type AutoNumberKey = 'triggerMinutes' | 'cooldownMinutes' | 'maxPerDay' | 'twapSeconds' | 'maxTwapDeviationBps';
+// poolCap / poolCaps 为百分比文本；poolCaps 按池子地址（小写），留空即用 poolCap。
+type AutoDraft = Record<AutoNumberKey, string> & { enabled: boolean; acceptPenalty: boolean; poolCap: string; poolCaps: Record<string, string> };
 const autoDraftOf = (c: AeroAutoConfig): AutoDraft => ({ enabled: c.enabled, acceptPenalty: c.acceptPenalty, triggerMinutes: String(c.triggerMinutes), cooldownMinutes: String(c.cooldownMinutes),
-  maxPerDay: String(c.maxPerDay), twapSeconds: String(c.twapSeconds), maxTwapDeviationBps: String(c.maxTwapDeviationBps) });
-const AUTO_FIELDS: { key: Exclude<keyof AutoDraft, 'enabled' | 'acceptPenalty'>; label: string; hint: string; min: number; max: number }[] = [
+  maxPerDay: String(c.maxPerDay), twapSeconds: String(c.twapSeconds), maxTwapDeviationBps: String(c.maxTwapDeviationBps),
+  poolCap: capText(c.poolCapBps ?? CAP_NONE), poolCaps: Object.fromEntries(Object.entries(c.poolCaps ?? {}).map(([k, v]) => [k.toLowerCase(), capText(v)])) });
+const AUTO_FIELDS: { key: AutoNumberKey; label: string; hint: string; min: number; max: number }[] = [
   { key: 'triggerMinutes', label: '出区间等待（分钟）', hint: '连续出区间满这么久才调仓，1–1440', min: 1, max: 1440 },
   { key: 'cooldownMinutes', label: '同池冷却（分钟）', hint: '两次调仓的最短间隔，0–1440', min: 0, max: 1440 },
   { key: 'maxPerDay', label: '24 小时最多（次）', hint: '1–48，防止来回震荡反复调仓', min: 1, max: 48 },
@@ -261,15 +281,31 @@ function AutoForm({ safe }: { safe: AeroSafe }) {
   useEffect(() => { if (auto && !dirty) setDraft(autoDraftOf(auto.config)); }, [auto, dirty]);
   if (!auto || !draft) return null;
   const change = (patch: Partial<AutoDraft>) => { setDraft({ ...draft, ...patch }); setDirty(true); setNotice(''); };
+  // 可单独设上限的池子：链上快照里的池子，加上已设上限但快照里没有的地址（保留设置，可清空删除）。
+  const capPools = [...(state?.chain?.pools ?? []).map((p) => ({ address: p.address.toLowerCase(), name: p.name })),
+    ...Object.keys(draft.poolCaps).filter((k) => !state?.chain?.pools.some((p) => same(p.address, k))).map((k) => ({ address: k, name: short(k) }))];
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const value: AeroAutoConfig = { enabled: draft.enabled, acceptPenalty: draft.acceptPenalty } as AeroAutoConfig;
     for (const f of AUTO_FIELDS) {
       const text = draft[f.key].trim(), n = Number(text);
       if (!/^\d+$/.test(text) || n < f.min || n > f.max) { setActionError(`${f.label}须为 ${f.min} 到 ${f.max} 的整数。`); return; }
-      (value as Record<string, number | boolean>)[f.key] = n;
+      value[f.key] = n;
     }
-    if (value.enabled && (!auto.config.enabled || auto.halted) && !window.confirm(`启用自动调仓？\n\n已质押头寸连续出区间 ${value.triggerMinutes} 分钟后，bot 会经 Roles 自动：解押 → 平仓 → ${state?.config?.autoSellRewards ? '卖出本次领到的 AERO → ' : ''}把收回的币以现价为中心按原宽度配平兑换并重开 → 质押。\n每一步仍受 Roles 白名单与每日额度限制；任何异常都会停用自动调仓，等你核对。${auto.reopen ? (auto.reopen.minted ? `\n\n启用后先质押已开出的新头寸 #${auto.reopen.minted}。` : `\n\n启用后先用 Safe 的 ${reopenCoins(state)} 重开（上次平仓收回的币）。如果这些币已经手动用掉，请先放弃待重开记录。`) : ''}`)) return;
+    const poolCapBps = capBpsOf(draft.poolCap);
+    if (poolCapBps === null) { setActionError('单池上限须为 0.01 到 100 的百分比（最多两位小数），100 即不限。'); return; }
+    const poolCaps: Record<string, number> = {};
+    for (const [address, text] of Object.entries(draft.poolCaps)) {
+      if (!text.trim()) continue;
+      const bps = capBpsOf(text);
+      if (bps === null) { setActionError(`${capPools.find((p) => p.address === address)?.name ?? short(address)} 的上限须为 0.01 到 100 的百分比（最多两位小数），留空即用默认值。`); return; }
+      poolCaps[address] = bps;
+    }
+    value.poolCapBps = poolCapBps; value.poolCaps = poolCaps;
+    const capNote = capSummary(value, state?.chain ?? null);
+    if (value.enabled && (!auto.config.enabled || auto.halted) && !window.confirm(`启用自动调仓？\n\n已质押头寸连续出区间 ${value.triggerMinutes} 分钟后，bot 会经 Roles 自动：解押 → 平仓 → ${state?.config?.autoSellRewards ? '卖出本次领到的 AERO → ' : ''}把收回的币以现价为中心按原宽度配平兑换并重开 → 质押。${capNote ? `
+${capNote}。` : ''}
+每一步仍受 Roles 白名单与每日额度限制；任何异常都会停用自动调仓，等你核对。${auto.reopen ? (auto.reopen.minted ? `\n\n启用后先质押已开出的新头寸 #${auto.reopen.minted}。` : `\n\n启用后先用 Safe 的 ${reopenCoins(state)} 重开（上次平仓收回的币）。如果这些币已经手动用掉，请先放弃待重开记录。`) : ''}`)) return;
     const data = await call('auto', '/auto', 'PUT', { auto: value });
     if (data?.auto) { setDirty(false); setDraft(autoDraftOf(data.auto.config)); setNotice(value.enabled ? '自动调仓已启用，每 30 秒检查一次。' : '自动调仓已关闭。'); }
   };
@@ -286,8 +322,10 @@ function AutoForm({ safe }: { safe: AeroSafe }) {
         <label className="lp-field as-check"><span>启用自动调仓</span><input type="checkbox" checked={draft.enabled} onChange={(e) => change({ enabled: e.target.checked })} /></label>
         <label className="lp-field as-check"><span>罚没期内也解押</span><input type="checkbox" checked={draft.acceptPenalty} onChange={(e) => change({ acceptPenalty: e.target.checked })} /></label>
         {AUTO_FIELDS.map((f) => <label key={f.key} className="lp-field"><span>{f.label}</span><input value={draft[f.key]} inputMode="numeric" onChange={(e) => change({ [f.key]: e.target.value })} /><small>{f.hint}</small></label>)}
+        <label className="lp-field"><span>单池上限（占总资产 %）</span><input value={draft.poolCap} inputMode="decimal" onChange={(e) => change({ poolCap: e.target.value })} /><small>0.01–100，100 即不限；下面没单独设置的池子用这个值</small></label>
+        {capPools.map((p) => <label key={p.address} className="lp-field"><span>{p.name} 上限（%）</span><input value={draft.poolCaps[p.address] ?? ''} placeholder={`默认 ${draft.poolCap.trim() || '—'}`} inputMode="decimal" onChange={(e) => change({ poolCaps: { ...draft.poolCaps, [p.address]: e.target.value } })} /><small>留空用默认值</small></label>)}
       </div>
-      <p className="as-muted">只管理已质押的头寸；新区间以现价为中心、宽度与原头寸相同，只投入这次平仓收回的币（{state?.config?.autoSellRewards ? '含卖出本次领到的 AERO 所得' : '不含 AERO'}），Safe 里的其他余额不动。今日额度不够时不平仓。</p>
+      <p className="as-muted">只管理已质押的头寸；新区间以现价为中心、宽度与原头寸相同，只投入这次平仓收回的币（{state?.config?.autoSellRewards ? '含卖出本次领到的 AERO 所得' : '不含 AERO'}），Safe 里的其他余额不动。今日额度不够时不平仓。单池上限按「行情」美元价估算：总资产 = Safe 白名单代币余额 + 全部头寸（含未领手续费，不含未领 AERO 与 bot 的 gas），重开后本池全部头寸不超过总资产的这个比例，超出部分的币留在 Safe；本池其他头寸已占满时不平仓，缺价或价格超过 60 分钟未更新时等待。</p>
     </fieldset>
     {auto.closing || auto.reopen ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>{auto.stuck ?? (auto.closing ? `平仓中断：#${auto.closing.tokenId}` : `有待重开的币：${reopenCoins(state)}${auto.reopen?.minted ? `，新头寸 #${auto.reopen.minted} 待质押` : ''}；如已手动处理，请放弃这条记录`)}。</span>
       <button type="button" className="button secondary" disabled={!!busy || state?.job?.status === 'running' || !!state?.pending} title={state?.pending ? '上一笔交易尚未结清' : undefined} onClick={() => void discard()}>{busy === 'discard' ? <LoaderCircle size={15} className="spin" /> : null}放弃这条记录</button></div> : null}

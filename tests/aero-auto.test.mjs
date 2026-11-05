@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Wallet, getAddress } from 'ethers';
 import * as executor from '../tools/aero-roles/executor.mjs';
-import { AUTO_DEFAULTS, centeredRange, deviationBps, evaluateAuto, readAutoState, reopenBudget, strictAutoConfig } from '../server/automation/aero-auto.mjs';
+import { AUTO_DEFAULTS, POOL_CAP_NONE, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolCapOf, poolRoom, readAutoState, reopenBudget, roomFullText, storedAutoConfig, strictAutoConfig } from '../server/automation/aero-auto.mjs';
 import { createAeroSafe } from '../server/automation/aero-safe.mjs';
 import { centeredRange as pageCenteredRange } from '../src/aero-market-math.ts';
 
@@ -125,7 +125,8 @@ test('the TWAP rounds toward negative infinity like the pool oracle library', as
 });
 
 // ---- 服务端流程（假链）----
-function autoChain({ tick = 1000, twap = 1000, cardinality = 900, openError = null } = {}) {
+// priced：Safe 余额与代币信息按 state.balances 返回（单池上限要估总资产）；默认与旧测试一样不带代币。
+function autoChain({ tick = 1000, twap = 1000, cardinality = 900, openError = null, priced = false } = {}) {
   const calls = [];
   const state = { tick, twap, cardinality, openError, positions: [position()], balances: [10n, 20n, 7n] };
   let counter = 0;
@@ -136,8 +137,8 @@ function autoChain({ tick = 1000, twap = 1000, cardinality = 900, openError = nu
   };
   const chain = {
     calls, state, ExecError: executor.ExecError, REWARD_TOKEN: executor.REWARD_TOKEN,
-    connect: async ({ signer }) => ({ signer, pools: [{ address: POOL, token0: T0, token1: T1, tickSpacing: 100, name: 'T0/T1' }], tokens: new Map(), now: Date.now }),
-    readState: async () => ({ blockNumber: 100, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {},
+    connect: async ({ signer }) => ({ signer, pools: [{ address: POOL, token0: T0, token1: T1, tickSpacing: 100, name: 'T0/T1' }], tokens: priced ? new Map([[T0, { address: T0, symbol: 'T0', decimals: 0 }], [T1, { address: T1, symbol: 'T1', decimals: 0 }]]) : new Map(), now: Date.now }),
+    readState: async () => ({ blockNumber: 100, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: priced ? { [T0]: state.balances[0], [T1]: state.balances[1] } : {},
       allowances: [{ token: T0, symbol: 'T0', perDay: 1n, remaining: 10n ** 15n, maxRefill: 1n, refillAt: null }, { token: T1, symbol: 'T1', perDay: 1n, remaining: 10n ** 15n, maxRefill: 1n, refillAt: null }],
       pools: [{ name: 'T0/T1', address: POOL, gauge: POOL, token0: T0, token1: T1, tickSpacing: 100, sqrtPriceX96: sqrt(state.tick), tick: state.tick, feePips: 500, earned: 0n,
         penalty: { minStakeBlocks: 0n, penaltyRate: 0n }, positions: state.positions.map((p) => ({ ...p, tokenId: BigInt(p.tokenId), liquidity: BigInt(p.liquidity), tokensOwed0: 0n, tokensOwed1: 0n, depositBlock: 1n, penaltyUntilBlock: null })) }] }),
@@ -169,10 +170,10 @@ function autoChain({ tick = 1000, twap = 1000, cardinality = 900, openError = nu
   };
   return chain;
 }
-async function managed(chain, clock) {
+async function managed(chain, clock, { readPrices } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'aero-auto-'));
   const manager = createAeroSafe({ dataDir: directory, encrypt: (v) => `enc:${Buffer.from(v).toString('base64')}`, decrypt: (v) => Buffer.from(v.slice(4), 'base64').toString(),
-    log: silent, chain, makeProvider: () => ({}), now: () => clock.at });
+    log: silent, chain, makeProvider: () => ({}), now: () => clock.at, ...(readPrices ? { readPrices } : {}) });
   await manager.initialize();
   await manager.save({ rpcUrl: 'https://rpc.example', safe: SAFE, roles: ROLES, permissions: permissionsConfig });
   await manager.setKey(KEY);
@@ -495,5 +496,235 @@ test('a reopen record cannot be discarded while its transaction is still unsettl
     await due(manager, clock);
     assert.ok(manager.state().pending);
     await assert.rejects(manager.discardAuto(), /尚未结清/);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+// ---- 单池上限（按总资产比例）----
+const USD1 = (at) => ({ at, usd: { [T0.toLowerCase()]: 1, [T1.toLowerCase()]: 1 } });
+const withTokens = (chain, balances = ['10', '20']) => ({ ...chain, tokens: [{ address: T0, symbol: 'T0', decimals: 0, balance: balances[0] }, { address: T1, symbol: 'T1', decimals: 0, balance: balances[1] }] });
+const outOfRange = new Map([['7', 0]]);
+const capped = (bps, patch = {}) => run({ config: { ...AUTO_DEFAULTS, enabled: true, poolCapBps: bps }, chain: withTokens(snapshot()), prices: USD1(10 * MIN), outSince: outOfRange, ...patch });
+
+test('pool caps are validated, keyed by lower-case address, and left out of auto.json at their defaults', () => {
+  assert.equal(AUTO_DEFAULTS.poolCapBps, POOL_CAP_NONE);
+  assert.throws(() => strictAutoConfig({ poolCapBps: 0 }), /单池上限/);
+  assert.throws(() => strictAutoConfig({ poolCapBps: 10_001 }), /单池上限/);
+  assert.throws(() => strictAutoConfig({ poolCaps: [] }), /单池上限/);
+  assert.throws(() => strictAutoConfig({ poolCaps: { '0x12': 100 } }), /地址无效/);
+  assert.throws(() => strictAutoConfig({ poolCaps: { [POOL]: 0 } }), /上限/);
+  assert.throws(() => strictAutoConfig({ poolCaps: { [POOL]: 1.5 } }), /上限/);
+  assert.throws(() => strictAutoConfig({ poolCaps: { [getAddress('0x' + 'ab'.repeat(20))]: 100, ['0x' + 'ab'.repeat(20)]: 200 } }), /重复/);
+  assert.throws(() => strictAutoConfig({ poolCaps: Object.fromEntries(Array.from({ length: 51 }, (_, i) => [`0x${String(i).padStart(40, '0')}`, 100])) }), /最多/);
+  const c = strictAutoConfig({ poolCapBps: 2500, poolCaps: { [POOL]: 4000 } });
+  assert.deepEqual(c.poolCaps, { [POOL.toLowerCase()]: 4000 });
+  assert.equal(poolCapOf(c, POOL), 4000);
+  assert.equal(poolCapOf(c, T0), 2500);
+  // 回滚兼容：没用上限时写出的记录与旧版本一致（旧版本拒绝未知配置项）
+  assert.deepEqual(Object.keys(storedAutoConfig(strictAutoConfig({}))).sort(), ['acceptPenalty', 'cooldownMinutes', 'enabled', 'maxPerDay', 'maxTwapDeviationBps', 'triggerMinutes', 'twapSeconds']);
+  assert.deepEqual(storedAutoConfig(c).poolCaps, { [POOL.toLowerCase()]: 4000 });
+  assert.equal(storedAutoConfig(c).poolCapBps, 2500);
+  assert.deepEqual(readAutoState({ config: storedAutoConfig(c) }).config, c);
+});
+
+test('the pool room counts Safe balances and every position, and shrinking never adds coins', () => {
+  const chain = withTokens(snapshot({ positions: [position(), position({ tokenId: '8', tickLower: 900, tickUpper: 1100, amount0: 100, amount1: 200, tokensOwed0: '1', tokensOwed1: '0' })] }));
+  const room = poolRoom({ chain, prices: USD1(0), pool: POOL, capBps: 5000, exclude: '7', now: 0 });
+  assert.equal(room.error, null);
+  assert.equal(room.totalUsd, 30 + 2_000_005 + 301);
+  assert.equal(room.inPoolUsd, 301);
+  assert.equal(room.roomUsd, room.totalUsd / 2 - 301);
+  const fit = fitToRoom({ amount0: 300n, amount1: 4000n, token0: T0, token1: T1, room: { roomUsd: 1000 }, valueOf: room.valueOf });
+  assert.deepEqual([fit.amount0, fit.amount1, fit.capped], [69n, 930n, true]); // 1000/4300，向下取整
+  const kept = fitToRoom({ amount0: 300n, amount1: 4000n, token0: T0, token1: T1, room: { roomUsd: 5000 }, valueOf: room.valueOf });
+  assert.deepEqual([kept.amount0, kept.amount1, kept.capped], [300n, 4000n, false]);
+  // 余额或头寸数量未读到时不猜
+  assert.match(poolRoom({ chain: withTokens(snapshot(), [null, '20']), prices: USD1(0), pool: POOL, capBps: 5000, now: 0 }).error, /T0 余额未读到/);
+  assert.match(poolRoom({ chain: withTokens(snapshot({ positions: [position({ amount0: null })] })), prices: USD1(0), pool: POOL, capBps: 5000, now: 0 }).error, /数量未读到/);
+});
+
+test('a capped pool waits without prices, with stale or missing prices, or when its other positions already fill the cap', () => {
+  assert.equal(run({ outSince: outOfRange }).due?.kind, 'rebalance'); // 不限时不需要价格
+  for (const [patch, reason] of [
+    [{ prices: null }, /没有 Aero 行情价格/],
+    [{ prices: USD1(10 * MIN - 61 * MIN) }, /61 分钟未更新/],
+    [{ prices: { at: 10 * MIN, usd: { [T0.toLowerCase()]: 1 } } }, /没有 T1 的美元价/],
+  ]) {
+    const r = capped(5000, patch);
+    assert.equal(r.due, null);
+    assert.match(r.watch[0].blocked, reason);
+  }
+  const full = capped(5000, { chain: withTokens(snapshot({ positions: [position(), position({ tokenId: '8', staked: false, tickLower: 900, tickUpper: 1100, amount0: 3_000_000, amount1: 0 })] })) });
+  assert.equal(full.due, null);
+  assert.match(full.watch[0].blocked, /已达上限.*50%.*不调仓/);
+  // 别的地址设了不限，本池仍按默认上限
+  const perPool = run({ config: { ...AUTO_DEFAULTS, enabled: true, poolCapBps: 5000, poolCaps: { [T0.toLowerCase()]: POOL_CAP_NONE } }, chain: withTokens(snapshot()), prices: null, outSince: outOfRange });
+  assert.match(perPool.watch[0].blocked, /没有 Aero 行情价格/);
+});
+
+test('the allowance check uses the amounts already shrunk to the cap', () => {
+  const [tickLower, tickUpper] = centeredRange(1000, 100, 10);
+  const full = reopenBudget({ sqrtPriceX96: sqrt(1000), feePips: 500, tickLower, tickUpper, amount0: 0n, amount1: 2_000_005n });
+  const remaining = String((full.need0 > full.need1 ? full.need0 : full.need1) - 1n);
+  const chain = withTokens(snapshot({ remaining }));
+  assert.match(run({ chain, outSince: outOfRange }).watch[0].blocked, /额度不足/);
+  assert.equal(capped(1000, { chain }).due?.kind, 'rebalance');
+});
+
+test('a capped reopen invests only up to the pool cap and leaves the rest in the Safe', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  chain.state.positions = [position({ amount0: 300, amount1: 4000 })];
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => USD1(clock.at) });
+  try {
+    await manager.setAuto({ enabled: true, poolCapBps: 2000, poolCaps: { [POOL]: 5000 } }); await settled(manager);
+    assert.deepEqual(saved().config.poolCaps, { [POOL.toLowerCase()]: 5000 });
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    const s = manager.state();
+    assert.equal(s.job.status, 'done', s.job.error);
+    // 平仓后总资产 310 + 4020 = 4330，本池上限 50% 即 2165；收回的 300 + 4000 按 2165/4300 缩减
+    assert.deepEqual(chain.calls.find((c) => c[0] === 'open')[3], { amount0: 151n, amount1: 2013n });
+    assert.equal(s.job.result.capped, true);
+    assert.equal(saved().history[0].capped, true);
+    assert.equal(saved().reopen, null);
+    assert.ok(s.events.some((e) => e.event === 'auto_pool_capped'));
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a capped reopen retried after its balancing swap is still recorded as capped', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  chain.state.positions = [position({ amount0: 300, amount1: 4000 })];
+  chain.state.swap = true;
+  chain.state.afterSwapError = new executor.ExecError('开仓：工作台正在维护或隔离恢复，未签名', { code: 'halted' });
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => USD1(clock.at) });
+  try {
+    await manager.setAuto({ enabled: true, poolCapBps: 5000 }); await settled(manager);
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().auto.halted, null);
+    assert.deepEqual([saved().reopen.amount0, saved().reopen.amount1, saved().reopen.capped], ['51', '2263', true]);
+    // 重试时总资产变多，兑换后的数量已在上限内，不会再被判为缩减
+    chain.state.balances = [chain.state.balances[0], chain.state.balances[1] + 1000n, chain.state.balances[2]];
+    chain.state.afterSwapError = null; chain.state.swap = false; chain.calls.length = 0;
+    await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().job.status, 'done', manager.state().job.error);
+    assert.deepEqual(chain.calls.find((c) => c[0] === 'open')?.[3], { amount0: 51n, amount1: 2263n });
+    assert.equal(manager.state().job.result.capped, true);
+    assert.equal(saved().history[0].capped, true);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a pool with only a sliver of room is not closed; other unpriced tokens count as zero', () => {
+  const other = (amount0) => withTokens(snapshot({ positions: [position(), position({ tokenId: '8', staked: false, tickLower: 900, tickUpper: 1100, amount0, amount1: 0 })] }));
+  // 总资产约 3,800,040 的 50% 减去本池其他头寸约 1,800,005，剩约 100,015，不到可重开 2,000,005 的 10%
+  const sliver = capped(5000, { chain: other(1_800_000) });
+  assert.equal(sliver.due, null);
+  assert.match(sliver.watch[0].blocked, /剩余空间约 \$100,015，不到.*\$2,000,005 的 10%.*不调仓/);
+  assert.equal(capped(5000, { chain: other(1_500_000) }).due?.kind, 'rebalance');
+  const X = getAddress('0x' + 'cd'.repeat(20));
+  const chain = withTokens(snapshot());
+  chain.tokens = [...chain.tokens, { address: X, symbol: 'X', decimals: 0, balance: '1000' }];
+  const room = poolRoom({ chain, prices: USD1(0), pool: POOL, capBps: 5000, now: 0 });
+  assert.equal(room.error, null);
+  assert.equal(room.totalUsd, 30 + 2_000_005);
+  assert.deepEqual(room.unpriced, ['X']);
+  assert.match(roomFullText({ ...room, inPoolUsd: room.capUsd }), /X 无行情价，按 0 计入总资产/);
+});
+
+test('a capped reopen that never swapped is not marked capped once the cap is lifted', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  chain.state.positions = [position({ amount0: 300, amount1: 4000 })];
+  const close = chain.closePosition;
+  chain.closePosition = async (...args) => { const r = await close(...args); chain.state.twap = 0; return r; };
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => USD1(clock.at) });
+  try {
+    await manager.setAuto({ enabled: true, poolCapBps: 5000 }); await settled(manager);
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    assert.match(manager.state().job.error, /TWAP/);
+    assert.ok(manager.state().events.some((e) => e.event === 'auto_pool_capped')); // 第一轮确实缩减过
+    assert.equal('capped' in saved().reopen, false);
+    chain.state.twap = 1000; chain.calls.length = 0;
+    await manager.setAuto({ enabled: true, poolCapBps: POOL_CAP_NONE }); await settled(manager);
+    await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().job.status, 'done', manager.state().job.error);
+    assert.deepEqual(chain.calls.find((c) => c[0] === 'open')?.[3], { amount0: 300n, amount1: 4000n });
+    assert.equal(manager.state().job.result.capped, false);
+    assert.equal(saved().history[0].capped, undefined);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a reopen left with only a sliver of room halts with the coins kept in the Safe', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  chain.state.positions = [position({ amount0: 300, amount1: 4000 })];
+  const close = chain.closePosition;
+  // 平仓后同池有人手动开了 3,600 的头寸：上限 (4330 + 3600) × 50% − 3600 ≈ 365，不到可重开 4300 的 10%
+  chain.closePosition = async (...args) => { const r = await close(...args); chain.state.positions = [position({ tokenId: '8', staked: false, tickLower: 900, tickUpper: 1100, amount0: 3600, amount1: 0 })]; return r; };
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => USD1(clock.at) });
+  try {
+    await manager.setAuto({ enabled: true, poolCapBps: 5000 }); await settled(manager);
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().job.status, 'failed');
+    assert.match(manager.state().auto.halted.reason, /剩余空间约 \$365，不到.*未重开，收回的币留在 Safe/);
+    assert.ok(saved().reopen);
+    assert.equal(chain.calls.some((c) => c[0] === 'open'), false);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a pending reopen of a capped pool waits for prices instead of starting a job', () => {
+  const reopen = { pool: POOL, cells: 10, amount0: '300', amount1: '4000', closed: '7', at: 0, minted: null, inflight: null };
+  const chain = withTokens(snapshot({ positions: [] }));
+  const waiting = capped(5000, { chain, reopen, prices: null });
+  assert.equal(waiting.due, null);
+  assert.match(waiting.note, /没有 Aero 行情价格.*暂不重开/);
+  assert.equal(capped(5000, { chain, reopen }).due?.kind, 'reopen');
+  assert.equal(capped(5000, { chain, reopen: { ...reopen, minted: '9' }, prices: null }).due?.kind, 'reopen'); // 已开出，只差质押
+  assert.equal(run({ chain, reopen, prices: null }).due?.kind, 'reopen'); // 不限时不需要价格
+  assert.equal(capped(5000, { chain, reopen: { ...reopen, pool: T0 }, prices: null }).due?.kind, 'reopen'); // 池子已移出白名单：交给执行停用
+  assert.equal(readAutoState({ reopen: { ...reopen, capped: true } }).reopen.capped, true);
+  assert.equal('capped' in readAutoState({ reopen }).reopen, false);
+});
+
+test('without a cap the saved auto record keeps the old keys', async () => {
+  const clock = { at: 1_000_000 };
+  const { manager, directory, saved } = await managed(autoChain(), clock);
+  try {
+    await manager.setAuto({ enabled: false, poolCapBps: POOL_CAP_NONE, poolCaps: {} });
+    assert.equal('poolCapBps' in saved().config, false);
+    assert.equal('poolCaps' in saved().config, false);
+    assert.equal(manager.state().auto.config.poolCapBps, POOL_CAP_NONE);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a missing price after closing keeps auto on and the reopen pending; a full pool halts with the coins left in the Safe', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  chain.state.positions = [position({ amount0: 300, amount1: 4000 })];
+  let prices = true;
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => (prices ? USD1(clock.at) : null) });
+  const close = chain.closePosition;
+  chain.closePosition = async (...args) => { const r = await close(...args); prices = false; return r; };
+  try {
+    await manager.setAuto({ enabled: true, poolCapBps: 5000 }); await settled(manager);
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().job.status, 'failed');
+    assert.match(manager.state().job.error, /没有 Aero 行情价格.*暂不重开/);
+    assert.equal(manager.state().auto.halted, null);
+    assert.equal(manager.state().job.signed, true); // 平仓已签名，重开缺价仍只是等待
+    assert.deepEqual([saved().reopen.amount0, saved().reopen.amount1], ['300', '4000']);
+    assert.equal(chain.calls.some((c) => c[0] === 'open'), false);
+    // 价格没恢复时只更新状态说明，不再启动注定失败的任务
+    const events = manager.state().events.length;
+    await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().events.length, events);
+    assert.match(manager.state().auto.note, /没有 Aero 行情价格.*暂不重开/);
+    // 价格恢复前有人在同池手动开了大头寸：本池已满，停用等人工处理，币留在 Safe
+    prices = true;
+    chain.state.positions = [position({ tokenId: '8', staked: false, tickLower: 900, tickUpper: 1100, amount0: 100_000, amount1: 0 })];
+    await manager.tickAuto(); await settled(manager);
+    assert.equal(manager.state().job.status, 'failed');
+    assert.match(manager.state().auto.halted.reason, /已达上限.*收回的币留在 Safe/);
+    assert.ok(saved().reopen);
+    assert.equal(chain.calls.some((c) => c[0] === 'open'), false);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });

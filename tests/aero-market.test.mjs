@@ -126,6 +126,10 @@ test('scan builds rows with prices, emission and backfilled volatility, then ret
   // 首轮最多回填 24 个小时点，波动率 24h 已可用、7d 样本不足。
   assert.equal(fake.chain.historyBlocks.length, 24);
   assert.ok(weth.vol24h?.daily > 0); assert.equal(weth.vol7d, null);
+  // 实盘单池上限用的代币美元价与页面行同源，带快照时间。
+  const prices = market.tokenPrices();
+  assert.equal(prices.usd[weth.token0.address.toLowerCase()], weth.token0.usd);
+  assert.ok(Number.isFinite(prices.at) && prices.at <= fake.chain.t * 1000);
   assert.equal(base.history.archive, 'archive');
   const next = clock.pending()[0];
   assert.equal(base.history.pending, 168 - 1 - 24, '7 天整点中还有这些没补');
