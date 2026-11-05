@@ -28,6 +28,11 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 核实方式：「源」= 官方仓库部署清单；「链」= 2026-11-04 用 `mainnet.base.org` 读取到合约代码，以及表中所列的关联读数；「选择器」= 第 3 节用到的函数选择器均出现在链上字节码中。
 
+`plan` 会把下表协议合约的运行时字节码与 `tools/aero-roles/addresses.mjs` 中的哈希逐一比对：
+- 这些合约都不是可升级代理，比对的是不可变代码。Aero 换地址重新部署时 `plan` 会拒绝，需要重新核实。
+- 比对不覆盖治理可改的状态，例如 CLFactory 的手续费模块、Voter 治理或 emergencyCouncil 停用 gauge、NPM 的 tokenDescriptor。这些改动不会在 Roles 授权范围内打开转出路径，但属于信任前提。
+- 代币不比对。USDC 本身是可升级代理（FiatTokenProxy），对它的信任来自发行方。
+
 ### 2.1 Safe 与 Roles
 
 | 合约 | 地址 | 核实 |

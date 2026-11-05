@@ -29,6 +29,7 @@ export const AERO = {
 export const MULTISEND_SELECTOR = '0x8d80ff0a';
 
 // 运行时字节码哈希：2026-11-04 由 mainnet.base.org 与 base-rpc.publicnode.com 分别读取，结果一致。plan 逐个核对。
+// 均非可升级代理，钉的是不可变代码；不覆盖治理可改参数，代币（USDC 为可升级代理）不在此列（文档第 2 节）。
 export const CODEHASH = {
   [SAFE.singletonL2]: '0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff',
   [SAFE.multiSendCallOnly]: '0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939',
