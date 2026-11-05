@@ -620,6 +620,14 @@ test('a batch goes stale when the config changes; removing a pool drops its new-
     await manager.buildChangeBatch();
     await manager.save({ ...baseConfig, slippageBps: 80 }); // execution settings only: permissions unchanged, batch still valid
     assert.equal(manager.state().changes.batch.stale, false);
+    // 换 Roles：旧批次失效，重新生成的每笔都发往新 Roles（预览缓存不能沿用旧地址）。
+    const ROLES2 = new Wallet('0x' + 'bb'.repeat(32)).address;
+    await manager.save({ ...baseConfig, roles: ROLES2 });
+    assert.equal(manager.state().changes.batch.stale, true);
+    await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /重新生成/.test(error.message));
+    const rebuilt = await manager.buildChangeBatch();
+    assert.ok(rebuilt.transactions.length && rebuilt.transactions.every((t) => getAddress(t.to) === ROLES2), 'rebuilt batch targets the new Roles');
+    assert.equal(manager.state().changes.batch.stale, false);
     await manager.save({ ...baseConfig, permissions: { ...permissionsConfig, allowances: permissionsConfig.allowances.map((a, i) => (i === 0 ? { ...a, perDay: '7' } : a)) } });
     assert.equal(manager.state().changes.batch.stale, true);
     await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /重新生成/.test(error.message));

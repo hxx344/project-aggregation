@@ -32,7 +32,8 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
   const batch = changes?.batch ?? null;
   const pendingCount = (changes?.pools.length ?? 0) + (changes?.allowances.length ?? 0);
   const generate = async () => {
-    if (batch && !batch.stale && !window.confirm('已有一份未核对启用的批次。它如已在 Safe 执行，请先点「已执行，核对并启用」；新批次会重复其中的额度设置，再执行会把相关代币当天额度重置为满额。\n\n仍要重新生成？')) return;
+    if (batch && !window.confirm(batch.stale ? '已有一份批次因 Safe 配置变化而失效。它如已在 Safe 执行，新批次会重复其中的额度设置，再执行会把相关代币当天额度重置为满额。\n\n仍要重新生成？'
+      : '已有一份未核对启用的批次。它如已在 Safe 执行，请先点「已执行，核对并启用」；新批次会重复其中的额度设置，再执行会把相关代币当天额度重置为满额。\n\n仍要重新生成？')) return;
     const data = await buildBatch();
     if (data) setBuilt(data);
   };
@@ -60,7 +61,7 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
           <td className="num">{amountOf(r.remaining, r.decimals, r.symbol)}</td>
           <td className="num"><input aria-label={`${r.symbol} 新每日额度`} inputMode="decimal" value={inputs[r.token] ?? ''} disabled={r.decimals === null || !!busy || running}
             title={r.decimals === null ? '代币精度尚未读取，请先刷新链上状态' : undefined} onChange={(e) => setInputs((prev) => ({ ...prev, [r.token]: e.target.value.trim() }))} />
-            {r.pending !== null && r.current !== null ? <small className="as-muted"> 待改，原 {exactUnits(r.current, r.decimals ?? 0)}</small> : null}</td>
+            {r.pending !== null && r.current !== null ? <small className="as-muted"> 待改，原 {r.decimals === null ? '—' : exactUnits(r.current, r.decimals)}</small> : null}</td>
         </tr>)}
       </tbody></table></div>
       <div className="as-form">

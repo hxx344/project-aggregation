@@ -216,7 +216,8 @@ function readChanges(saved) {
     const b = saved.batch;
     if (typeof b.baseline !== 'string' || !Number.isFinite(b.createdAt) || !Number.isInteger(b.transactions)) throw new Error('批次格式不符');
     buildPermissions(b.permissions);
-    batch = { createdAt: b.createdAt, baseline: b.baseline, permissions: b.permissions, transactions: b.transactions,
+    if (b.target !== undefined && typeof b.target !== 'string') throw new Error('批次格式不符');
+    batch = { createdAt: b.createdAt, baseline: b.baseline, ...(b.target === undefined ? {} : { target: b.target }), permissions: b.permissions, transactions: b.transactions,
       pools: (b.pools ?? []).map(String), allowances: (b.allowances ?? []).map((a) => ({ symbol: String(a.symbol), perDay: String(a.perDay), decimals: Number(a.decimals) })) };
   }
   return { schema: 1, pools, allowances, batch };
@@ -276,7 +277,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   }
   // 待变更合成后的权限、批次笔数与条件节点用量；按配置与待变更缓存，不在每次轮询时重算。
   function changesNext() {
-    const key = JSON.stringify([config?.permissions ?? null, changes.pools, changes.allowances]);
+    // 批次每笔发往 config.roles、由 config.safe 执行：二者也是缓存键的一部分。
+    const key = JSON.stringify([config ? batchTarget(config) : null, config?.permissions ?? null, changes.pools, changes.allowances]);
     if (changesPreview?.key === key) return changesPreview;
     let out = { key, permissions: null, transactions: [], usage: [], error: null };
     if (config && (changes.pools.length || changes.allowances.length)) {
@@ -290,6 +292,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     changesPreview = out;
     return out;
   }
+  // 批次生成时的 Safe 与 Roles；换了任一个，旧批次不能再核对。上一版迁移来的批次没有记录，只比权限。
+  function batchTarget(cfg) { return `${cfg.safe.toLowerCase()}|${cfg.roles.toLowerCase()}`; }
+  function batchStale(batch) {
+    return !config || batch.baseline !== JSON.stringify(config.permissions) || (batch.target !== undefined && batch.target !== batchTarget(config));
+  }
   function changesView() {
     const next = changesNext(), batch = changes.batch;
     const current = (token) => config?.permissions.allowances.find((a) => sameAddress(a.token, token))?.perDay ?? null;
@@ -297,7 +304,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       pools: structuredClone(changes.pools), allowances: changes.allowances.map((a) => ({ ...a, current: current(a.token) })),
       preview: { transactions: next.transactions.length, usage: next.usage, error: next.error },
       batch: batch && { createdAt: batch.createdAt, transactions: batch.transactions, pools: [...batch.pools], allowances: structuredClone(batch.allowances),
-        stale: !config || batch.baseline !== JSON.stringify(config.permissions),
+        stale: batchStale(batch),
         behind: Boolean(next.permissions) && JSON.stringify(next.permissions) !== JSON.stringify(batch.permissions) },
     };
   }
@@ -807,7 +814,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (!next.permissions || !next.transactions.length) throw new HttpError(409, '没有待变更');
       const createdAt = now();
       const label = (a) => ({ symbol: a.symbol, perDay: a.perDay, decimals: a.decimals });
-      const batch = { createdAt, baseline: JSON.stringify(config.permissions), permissions: next.permissions, transactions: next.transactions.length,
+      const batch = { createdAt, baseline: JSON.stringify(config.permissions), target: batchTarget(config), permissions: next.permissions, transactions: next.transactions.length,
         pools: changes.pools.map((p) => p.name), allowances: changes.allowances.map(label) };
       saveChanges({ ...changes, batch });
       const names = batch.pools.length ? batch.pools.join('、') : '调整额度';
@@ -823,7 +830,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
       const batch = changes.batch;
       if (!batch) throw new HttpError(409, '还没有生成 Safe 批次');
-      if (!config || batch.baseline !== JSON.stringify(config.permissions)) throw new HttpError(409, 'Safe 配置在生成批次后已变化，请重新生成批次');
+      if (batchStale(batch)) throw new HttpError(409, 'Safe 配置在生成批次后已变化，请重新生成批次');
       if (!wallet) throw new HttpError(409, '请先填写 bot 私钥：生效核对以 bot 身份模拟');
       let result;
       try {
