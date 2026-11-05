@@ -77,6 +77,16 @@ for file in cli.mjs core.mjs chain.mjs config.example.json; do
   [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
   capture
 done
+# The Safe + Roles executor is imported by the runtime unit as well.
+mkdir -p "$source_dir/tools/aero-roles"
+for file in addresses.mjs conditions.mjs executor.mjs permissions.mjs policy.mjs roles-calls.mjs; do
+  embedded_before=$embedded_key
+  runtime_component_before=$runtime_component_key
+  echo roles > "$source_dir/tools/aero-roles/$file"; refresh; compare 0 0 1 0 1
+  compare_module_inputs 0 0 0 0
+  [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
+  capture
+done
 runtime_component_before=$runtime_component_key
 echo frontend >> "$source_dir/src/app.ts"; refresh; compare 0 1 1 1 1
 [[ $runtime_component_key == "$runtime_component_before" ]]

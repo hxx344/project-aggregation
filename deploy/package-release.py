@@ -21,6 +21,8 @@ MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
 IMPORTERS = ('.', 'modules/monitor', 'modules/asset', 'modules/crossex')
 LAB_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')
 AERO_LP_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'chain.mjs', 'config.example.json')
+# Safe + Roles executor the runtime unit imports (server/automation/aero-safe.mjs); the CLI, fork test and docs stay out.
+AERO_ROLES_RUNTIME_FILES = ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs')
 EXCLUDED = {'node_modules', '.git', '.venv', '.venv-aster', '.vinext', '.wrangler', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',
             '.mypy_cache', 'tests', 'test-results', 'output', 'runtime-data', '.data',
             '.env', '.env.local', '.env.production', '.env.production.local', '.env.linux'}
@@ -290,11 +292,12 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
                 raise ValueError('Runtime directory cannot be a link: ' + relative)
             shutil.copytree(source / relative, stage / relative, ignore=checked_ignore({'__pycache__'}))
         shutil.copy2(source / 'package.json', stage / 'package.json')
-        for relative in ('tools', 'tools/entropy-lighter-lab', 'tools/aero-lp'):
+        for relative in ('tools', 'tools/entropy-lighter-lab', 'tools/aero-lp', 'tools/aero-roles'):
             origin = source / relative
             if not origin.is_dir() or is_link(origin):
                 raise ValueError('Missing trusted research runtime directory: ' + relative)
-        for lab, names in ((Path('tools/entropy-lighter-lab'), LAB_RUNTIME_FILES), (Path('tools/aero-lp'), AERO_LP_RUNTIME_FILES)):
+        for lab, names in ((Path('tools/entropy-lighter-lab'), LAB_RUNTIME_FILES), (Path('tools/aero-lp'), AERO_LP_RUNTIME_FILES),
+                           (Path('tools/aero-roles'), AERO_ROLES_RUNTIME_FILES)):
             (stage / lab).mkdir(parents=True)
             for name in names:
                 origin = source / lab / name
@@ -326,7 +329,7 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
     shutil.copy2(diagnostic, stage / 'deploy/diagnose-aster-margin.py')
 
 
-APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'tools/entropy-lighter-lab', 'tools/aero-lp', 'scripts/modules.mjs',
+APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'tools/entropy-lighter-lab', 'tools/aero-lp', 'tools/aero-roles', 'scripts/modules.mjs',
                       'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
                       'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
                       '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',

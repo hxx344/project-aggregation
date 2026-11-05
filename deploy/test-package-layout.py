@@ -173,11 +173,17 @@ class RuntimeDependencyTests(unittest.TestCase):
             shutil.copy2(repository / 'tools/aero-lp' / name, lp / name)
         (lp / 'config.json').write_text('private configuration must not ship')
         (lp / 'README.md').write_text('documentation must not ship')
+        roles = self.source / 'tools/aero-roles'
+        roles.mkdir(parents=True)
+        for name in module.AERO_ROLES_RUNTIME_FILES:
+            shutil.copy2(repository / 'tools/aero-roles' / name, roles / name)
+        (roles / 'cli.mjs').write_text('operator CLI must not ship')
 
     def assert_research_tool_runs(self, root):
         directory = root / 'tools/entropy-lighter-lab'
         self.assertEqual(set(module.LAB_RUNTIME_FILES), {path.name for path in directory.iterdir()})
         self.assertEqual(set(module.AERO_LP_RUNTIME_FILES), {path.name for path in (root / 'tools/aero-lp').iterdir()})
+        self.assertEqual(set(module.AERO_ROLES_RUNTIME_FILES), {path.name for path in (root / 'tools/aero-roles').iterdir()})
         result = subprocess.run(['node', str(directory / 'cli.mjs'), 'check'], cwd=root,
                                 capture_output=True, text=True, check=True)
         self.assertIn('Configuration valid', result.stdout)
@@ -186,7 +192,8 @@ class RuntimeDependencyTests(unittest.TestCase):
         from unittest.mock import patch
         self.prepare_five_modules()
         self.prepare_research_tool()
-        for name in [*(f'tools/entropy-lighter-lab/{name}' for name in module.LAB_RUNTIME_FILES), *(f'tools/aero-lp/{name}' for name in module.AERO_LP_RUNTIME_FILES)]:
+        for name in [*(f'tools/entropy-lighter-lab/{name}' for name in module.LAB_RUNTIME_FILES), *(f'tools/aero-lp/{name}' for name in module.AERO_LP_RUNTIME_FILES),
+                     *(f'tools/aero-roles/{name}' for name in module.AERO_ROLES_RUNTIME_FILES)]:
             with self.subTest(name=name):
                 file = self.source / name
                 content = file.read_bytes(); file.unlink()
@@ -276,7 +283,8 @@ class RuntimeDependencyTests(unittest.TestCase):
             application = changed
         for relative in ('server/app.mjs', 'server/api-helpers.mjs', 'server/runtime/main.mjs', 'modules/greeks/main.py', 'package.json', 'tsconfig.json',
                          *(f'tools/entropy-lighter-lab/{name}' for name in module.LAB_RUNTIME_FILES),
-                         *(f'tools/aero-lp/{name}' for name in module.AERO_LP_RUNTIME_FILES)):
+                         *(f'tools/aero-lp/{name}' for name in module.AERO_LP_RUNTIME_FILES),
+                         *(f'tools/aero-roles/{name}' for name in module.AERO_ROLES_RUNTIME_FILES)):
             changed, other = commit(relative, relative + ' changed')
             self.assertNotEqual(changed, application, relative)
             self.assertNotEqual(other, runtime, relative)
