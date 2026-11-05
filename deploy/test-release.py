@@ -81,12 +81,6 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         for name in names:
             shutil.copy2(ROOT / 'tools/entropy-lighter-lab' / name, lab / name)
         (lab / 'config.json').write_text('private configuration must not ship')
-        lp = source / 'tools/aero-lp'
-        lp.mkdir(parents=True)
-        lp_names = ('cli.mjs', 'core.mjs', 'chain.mjs', 'config.example.json')
-        for name in lp_names:
-            shutil.copy2(ROOT / 'tools/aero-lp' / name, lp / name)
-        (lp / 'README.md').write_text('documentation must not ship')
         roles = source / 'tools/aero-roles'
         roles.mkdir(parents=True)
         roles_names = ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs')
@@ -108,7 +102,7 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
             capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual(set(names), {path.name for path in (publish / 'tools/entropy-lighter-lab').iterdir()})
-        self.assertEqual(set(lp_names), {path.name for path in (publish / 'tools/aero-lp').iterdir()})
+        self.assertFalse((publish / 'tools/aero-lp').exists())
         self.assertEqual(set(roles_names), {path.name for path in (publish / 'tools/aero-roles').iterdir()})
         result = subprocess.run(['node', str(publish / 'tools/entropy-lighter-lab/cli.mjs'), 'check'],
                                 cwd=publish, capture_output=True, text=True)

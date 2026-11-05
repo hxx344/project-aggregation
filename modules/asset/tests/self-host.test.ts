@@ -7,24 +7,29 @@ import { openDatabase } from '../lib/sqlite.ts';
 import { createSession, validSession, verifyPassword, SESSION_SECONDS } from '../lib/auth-core.ts';
 import { configure } from '../scripts/configure.mjs';
 
-test('SQLite upgrades preserve data, isolate owners and roll back a failed batch', async () => {
+test('SQLite upgrades preserve data, drop removed Aero LP rows, isolate owners and roll back a failed batch', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'ledger-database-'));
   let database;
   try {
     const filename = join(dir, 'ledger.sqlite'), previous = join(dir, 'previous-migrations');
-    // Start from the schema before fill_cache and lock tokens existed, as an installed ledger would.
-    cpSync(resolve('drizzle'), previous, { recursive: true, filter: source => !source.endsWith('0002_fill_cache.sql') && !source.endsWith('0003_sync_lock_token.sql') });
+    // Start from the schema before fill_cache, lock tokens and the Aero LP cleanup existed, as an installed ledger would.
+    cpSync(resolve('drizzle'), previous, { recursive: true, filter: source => !['0002_fill_cache.sql', '0003_sync_lock_token.sql', '0004_remove_aero_lp.sql'].some(name => source.endsWith(name)) });
     database = openDatabase(filename, previous);
     await database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-1', '{"value":123}').run();
     await database.prepare('INSERT INTO sync_locks(owner,expires) VALUES (?,?)').bind('owner', 1).run();
+    await database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-9', '{"mode":"aero","value":5}').run();
+    await database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-8', 'not json').run();
+    await database.prepare('INSERT INTO settings VALUES (?,?,?)').bind('owner', 'aero-lp', 'null').run();
+    await database.prepare('INSERT INTO settings VALUES (?,?,?)').bind('owner', 'last-attempt', '1').run();
     await assert.rejects(database.batch([
       database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('other', 'row-2', '{}'),
       database.prepare('INSERT INTO assets VALUES (?,?,?)').bind('owner', 'row-1', '{}'),
     ]));
     assert.equal(await database.prepare('SELECT data FROM assets WHERE owner=?').bind('other').first(), null);
     database.close(); database = openDatabase(filename, resolve('drizzle'));
-    assert.deepEqual({ ...await database.prepare('SELECT data FROM assets WHERE owner=?').bind('owner').first() }, { data: '{"value":123}' });
-    assert.equal((await database.prepare('SELECT * FROM _schema_migrations').all()).results.length, 4);
+    assert.deepEqual((await database.prepare('SELECT id FROM assets WHERE owner=? ORDER BY id').bind('owner').all()).results.map(row => row.id), ['row-1', 'row-8'], 'Only the synced Aero LP row is removed');
+    assert.deepEqual((await database.prepare('SELECT key FROM settings WHERE owner=?').bind('owner').all()).results.map(row => row.key), ['last-attempt']);
+    assert.equal((await database.prepare('SELECT * FROM _schema_migrations').all()).results.length, 5);
     assert.deepEqual({ ...await database.prepare('SELECT * FROM sync_locks').first() }, { owner: 'owner', expires: 1, token: '' }, 'A lock left by the old version expires normally');
     assert.deepEqual((await database.prepare('SELECT * FROM fill_cache').all()).results, []);
   } finally { database?.close(); rmSync(dir, { recursive: true }); }

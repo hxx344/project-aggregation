@@ -13,8 +13,6 @@ cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-ar
 cp "$repository/scripts/install-hooks.mjs" "$fixture/source/scripts/install-hooks.mjs"
 mkdir -p "$fixture/source/tools/entropy-lighter-lab"
 cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$fixture/source/tools/entropy-lighter-lab/"
-mkdir -p "$fixture/source/tools/aero-lp"
-cp "$repository"/tools/aero-lp/{cli.mjs,core.mjs,chain.mjs,config.example.json} "$fixture/source/tools/aero-lp/"
 mkdir -p "$fixture/source/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$fixture/source/tools/aero-roles/"
 printf '{"name":"fixture","version":"1.0.0","type":"module","scripts":{"prepare":"node scripts/install-hooks.mjs"}}\n' > "$fixture/source/package.json"

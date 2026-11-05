@@ -18,7 +18,6 @@ const digits = value => {
 };
 const signed = value => { const number = numeric(value); return number === null ? MISSING : `${number > 0 ? '+' : ''}${digits(number)}`; };
 const amount = (value, unit = '') => { const number = numeric(value); return number === null ? MISSING : `${digits(number)}${unit}`; };
-const percent = value => { const number = numeric(value); return number === null ? MISSING : `${digits(number * 100)}%`; };
 const metric = (key, label, text) => ({ key, label, text });
 const rows = (key, label, lines, total = lines.length) => ({ key, label, text: total ? `${total} 项` : '无', lines: total > lines.length ? [...lines, `其余 ${total - lines.length} 项请到工作台查看`] : lines });
 // Upstream error text can quote a request URL, and a group chat is a wider audience than the workbench.
@@ -103,28 +102,6 @@ export function executionSection(state) {
       rows('jobs', '进行中任务', active.slice(0, ROW_LIMIT).map(label), active.length)] });
 }
 
-const AERO_STATES = { starting: '正在启动', running: '运行中', stopping: '正在停止', stopped: '已停止', fault: '异常' };
-const RANGE = { in: '区间内', below: '低于下沿', above: '高于上沿' };
-export function aeroSection(state, now) {
-  const id = 'hub:aero-lp', name = 'Aero LP', status = state.paused ? '暂停执行' : AERO_STATES[state.state] ?? state.state;
-  if (!state.enabled && state.state === 'stopped') return section(id, name, 'idle', status);
-  const cycle = state.lastCycle, live = cycle?.positions.filter(position => position.liquidity !== '0') ?? [];
-  const position = live.find(item => item.staked) ?? live[0], rewards = cycle?.rewards, quote = cycle?.symbols?.[1] ?? '';
-  const asOf = stamp(cycle?.at), limit = Math.max(600, (state.config?.intervalSec ?? 60) * 3) * 1000;
-  const late = state.state === 'running' && !state.paused && asOf !== null && now - asOf > limit;
-  const issues = [...(state.error ? [state.error] : []), ...(late ? ['最近一轮检查已过期'] : [])];
-  const level = state.state === 'fault' ? 'alert' : issues.length ? 'warn' : state.state === 'running' && !state.paused ? 'ok' : 'notice';
-  const total = rewards?.dailyTotal;
-  const daily = amount(total?.perDay);
-  const dailyBasis = total?.scenario === 'same-lower' ? '（同下沿估计，假设其他活跃流动性不变）'
-    : ['different-lower', 'mixed-ranges'].includes(total?.reason) ? '（逐仓独立估计，不合计）' : '';
-  return section(id, name, level, status, { asOf, issues, metrics: [
-    metric('price', '现价', cycle ? `${amount(cycle.price)} ${quote}`.trim() : MISSING), metric('range', '头寸位置', position ? RANGE[position.state] ?? MISSING : '暂无头寸'),
-    metric('value', '头寸价值', typeof position?.value === 'number' ? `${amount(position.value)} ${quote}`.trim() : MISSING), metric('apr', 'AERO 年化', percent(position?.apr)),
-    metric('aeroPerDay', '预估每日 AERO', `${daily}${dailyBasis}`), metric('feeApr', '手续费年化（不质押）', percent(position?.feeApr)),
-    metric('pending', '待领取 AERO', amount(rewards?.pending)), metric('reward', '累计领取 AERO', amount(state.ledger?.reward)), metric('gas', '累计 Gas', state.ledger ? `${amount(state.ledger.gasEth)} ETH` : MISSING)] });
-}
-
 const LAB_STATES = { starting: '正在启动', running: '运行中', stopped: '已停止', fault: '异常' };
 export function researchSection(state) {
   const id = 'hub:research', name = 'Entropy / Lighter', status = LAB_STATES[state.state] ?? state.state;
@@ -146,12 +123,11 @@ function guarded(id, name, read, log) {
     return section(id, name, 'warn', '读取失败', { issues: ['本次读取失败，请到工作台查看'] });
   }).finally(() => clearTimeout(timer));
 }
-export async function collectSections({ overview, positions, funding, execution, aero, research, log = console, now = Date.now }) {
+export async function collectSections({ overview, positions, funding, execution, research, log = console, now = Date.now }) {
   const hub = await Promise.all([
     guarded('hub:positions', '交易所持仓', async () => positionsSection(await positions()), log),
     guarded('hub:funding', '原油四腿', () => fundingSection(funding()), log),
     guarded('hub:execution', '原生执行', () => executionSection(execution()), log),
-    guarded('hub:aero-lp', 'Aero LP', () => aeroSection(aero(), now()), log),
     guarded('hub:research', 'Entropy / Lighter', () => researchSection(research()), log),
   ]);
   const projects = overview().projects.filter(snapshot => snapshot.project.adapter !== 'link').map(snapshot => projectSection(snapshot, now()));

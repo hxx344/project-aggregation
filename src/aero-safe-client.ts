@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
-import type { AeroSafeAction, AeroSafeChain, AeroSafePreview, AeroSafeState } from './aero-safe-types';
+import type { AeroSafeAction, AeroSafeChain, AeroSafePoolPlan, AeroSafePreview, AeroSafeState } from './aero-safe-types';
 
 export const AERO_SAFE_ROOT = '/api/automation/aero-safe';
 const message = (reason: unknown) => (reason instanceof Error ? reason.message : '请求失败，请重试。');
@@ -68,7 +68,17 @@ export function useAeroSafe(onExpired: () => void) {
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);
-  return { state, loadError, busy, actionError, setActionError, read, call, execute, preview };
+  // 加池批次：成功时同步最新状态并返回批次；失败放进 actionError 返回 null。
+  const planPool = useCallback(async (body: { pool: string; allowances: Record<string, string> }): Promise<AeroSafePoolPlan | null> => {
+    const signal = lifetime.current?.signal;
+    if (busyRef.current || !signal || signal.aborted) return null;
+    busyRef.current = 'plan'; setBusy('plan'); setActionError('');
+    generation.current++;
+    try { const data = await api<AeroSafePoolPlan>(`${AERO_SAFE_ROOT}/pools/plan`, { method: 'POST', body: JSON.stringify(body), signal, timeoutMs: 120_000 }); if (!signal.aborted) setState(data.state); return data; }
+    catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
+    finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
+  }, [fail]);
+  return { state, loadError, busy, actionError, setActionError, read, call, execute, preview, planPool };
 }
 export type AeroSafe = ReturnType<typeof useAeroSafe>;
 

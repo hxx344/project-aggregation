@@ -10,8 +10,6 @@ mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" 
 cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-artifact-cache.py"
 mkdir -p "$fixture/source/tools/entropy-lighter-lab"
 cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$fixture/source/tools/entropy-lighter-lab/"
-mkdir -p "$fixture/source/tools/aero-lp"
-cp "$repository"/tools/aero-lp/{cli.mjs,core.mjs,chain.mjs,config.example.json} "$fixture/source/tools/aero-lp/"
 mkdir -p "$fixture/source/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$fixture/source/tools/aero-roles/"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
@@ -184,7 +182,6 @@ contents = {'.release-commit': commit, '.release-application-key': key,
             'package.json': '{"type":"module"}', 'dist/index.html': '<html>' + sys.argv[3] + '</html>',
             'node_modules/ws/package.json': '{}', 'node_modules/decimal.js/package.json': '{}'}
 for relative in [*('tools/entropy-lighter-lab/' + name for name in ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')),
-                 *('tools/aero-lp/' + name for name in ('cli.mjs', 'core.mjs', 'chain.mjs', 'config.example.json')),
                  *('tools/aero-roles/' + name for name in ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs'))]:
     contents[relative] = subprocess.check_output(['git', '-C', str(root / 'source'), 'show', commit + ':' + relative], text=True)
 with tarfile.open(root / 'package.tar.gz', 'w:gz') as archive:

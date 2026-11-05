@@ -22,9 +22,7 @@ import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execut
 import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
 import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
-import { createAeroLp } from '../automation/aero-lp.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
-import { aeroLpValuation } from '../automation/aero-lp-valuation.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
 
@@ -64,9 +62,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const costResearch = createBinanceLighterCost({ dataDir, log });
   // 只读链上行情；测试、非内置实例与 AERO_MARKET_SCAN=false 时默认不扫描，避免启动即访问公共 RPC；页面保存的配置优先。
   const aeroMarket = createAeroMarket({ dataDir, enabledByDefault: aeroMarketEnabledByDefault, log });
-  const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
-    readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
-  // Aero 市场实盘：bot 经 Safe 的 Roles 模块执行，与 LP 调仓共用维护与隔离恢复闸门。
+  // Aero 实盘：bot 经 Safe 的 Roles 模块执行，受维护与隔离恢复闸门约束。
   const aeroSafe = createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
     readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
@@ -136,7 +132,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const assetFillsByMarket = Object.fromEntries(Object.keys(FILL_MARKETS).map(market => [market, createAssetFills({ market, listTargets: assetTargets, request: assetFillsRequest,
     cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
-    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), aero: () => aeroLp.state(), research: () => research.state() }) });
+    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
     close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),
@@ -317,33 +313,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '刷新不接受额外参数');
       return reply(200, aeroMarket.refresh(authorize));
     }
-    if (pathname === '/api/automation/aero-lp' || pathname.startsWith('/api/automation/aero-lp/')) {
-      if (url.search) throw new HttpError(400, 'LP 接口不接受查询参数');
-      if (pathname === '/api/automation/aero-lp' && method === 'GET') return reply(200, aeroLp.state());
-      const action = pathname === '/api/automation/aero-lp/config' && method === 'PUT' ? 'save'
-        : pathname === '/api/automation/aero-lp/wallet' && method === 'PUT' ? 'setKey'
-          : pathname === '/api/automation/aero-lp/wallet/clear' && method === 'POST' ? 'clearKey'
-            : pathname === '/api/automation/aero-lp/start' && method === 'POST' ? 'start'
-              : pathname === '/api/automation/aero-lp/stop' && method === 'POST' ? 'stop' : null;
-      if (!action) throw new HttpError(404, 'LP 接口不存在');
-      const body = await bodyOf();
-      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
-      authorize();
-      if (action === 'save') {
-        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供 LP 参数');
-        return reply(200, await aeroLp.save(body.config, authorize));
-      }
-      if (action === 'setKey') {
-        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'privateKey')) throw new HttpError(400, '请提供钱包私钥');
-        return reply(200, await aeroLp.setKey(body.privateKey, authorize));
-      }
-      if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
-      return reply(200, await aeroLp[action](authorize));
-    }
     if (pathname === '/api/automation/aero-safe' || pathname.startsWith('/api/automation/aero-safe/')) {
       if (url.search) throw new HttpError(400, 'Aero 实盘接口不接受查询参数');
       if (pathname === '/api/automation/aero-safe' && method === 'GET') return reply(200, aeroSafe.state());
-      const routes = { 'PUT /config': 'save', 'PUT /wallet': 'setKey', 'POST /wallet/clear': 'clearKey', 'POST /refresh': 'refresh', 'POST /preview': 'preview', 'POST /execute': 'execute', 'PUT /auto': 'setAuto', 'POST /auto/discard': 'discardAuto' };
+      const routes = { 'PUT /config': 'save', 'PUT /wallet': 'setKey', 'POST /wallet/clear': 'clearKey', 'POST /refresh': 'refresh', 'POST /preview': 'preview', 'POST /execute': 'execute', 'PUT /auto': 'setAuto', 'POST /auto/discard': 'discardAuto',
+        'POST /pools/plan': 'planPool', 'POST /pools/apply': 'applyPool', 'POST /pools/discard': 'discardPoolPlan' };
       const action = routes[`${method} ${pathname.slice('/api/automation/aero-safe'.length)}`];
       if (!action) throw new HttpError(404, 'Aero 实盘接口不存在');
       const body = await bodyOf();
@@ -355,6 +329,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize)); }
       if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize)); }
       if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize)); }
+      if (action === 'planPool') { only('pool', 'allowances'); return reply(200, await aeroSafe.planPool(body, authorize)); }
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await aeroSafe[action](authorize));
     }
@@ -460,9 +435,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   assetSync = createAssetSync({
     listTargets: () => projects.all().filter(row => !embeddedModules || moduleIds.includes(row.id)).map(row => ({ project: publicProject(row), credentials: embeddedModules ? null : decrypt(row.credentials), revision: projectRevision(row.id) })),
     intervalMs: assetSyncIntervalMs > 0 ? assetSyncIntervalMs : 60000,
-    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader, // Until the LP manager has read its wallet file (not yet initialized, or the file is unreadable), state() reads as
-    // "no wallet"; omit the field so Asset keeps the row instead of removing it.
-    syncBody: () => aeroLp.walletKnown() ? { aeroLp: aeroLpValuation(aeroLp.state()) } : {},
+    autoStart: assetSyncIntervalMs > 0, syncReader: assetSyncReader,
     onComplete: async (id, revision, status) => { if (!closed && projectRevision(id) === revision && ['success', 'partial'].includes(status.state)) await check(id); },
   });
   async function refresh(dueOnly = false) { await Promise.allSettled(getProjects().filter(project => {
@@ -495,8 +468,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
-    prepareStop: async () => { await aeroLp.prepareStop(); await aeroSafe.prepareStop(); },
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroLp.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); },
+    prepareStop: async () => { await aeroSafe.prepareStop(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -508,6 +481,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroLp.close(); await aeroSafe.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

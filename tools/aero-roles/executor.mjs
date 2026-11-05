@@ -16,7 +16,7 @@ const GAS_MARGIN_PCT = 130n;
 // 同一 nonce 重发须把费用提高至少 10% 才会替换内存池里的旧交易，这里取 25%。
 const REPLACE_BUMP_PCT = 125n;
 const MAX_UINT128 = (1n << 128n) - 1n;
-// gauge 排放到账的是合并后的新 AERO（与 tools/aero-lp/chain.mjs 一致）。
+// gauge 排放到账的是合并后的新 AERO（xAERO 经转换器销毁后 1:1 铸给领取地址）。
 export const REWARD_TOKEN = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee';
 
 export const NPM_I = new Interface([
@@ -89,7 +89,7 @@ async function read(label, fn) {
       if (attempt < READ_ATTEMPTS) await new Promise((r) => setTimeout(r, 1000));
     }
   }
-  throw new ExecError(`读取 ${label} 失败：${errorText(last)}`);
+  throw new ExecError(`读取 ${label} 失败：${errorText(last)}`, { code: 'rpc' });
 }
 
 // 把 Roles 的拒绝原因还原成可读文字；不是 Roles 错误时返回节点原文。
@@ -178,6 +178,110 @@ export async function connect({ rpc, signer = null, safe, roles, config, now = D
     pools.push({ ...p, address: getAddress(address), gaugeFactory: getAddress(gaugeFactory) });
   }
   return { rpc, signer, safe, roles, permissions, pools, tokens, now };
+}
+
+const CL_POOL_I = new Interface(['function token0() view returns (address)', 'function token1() view returns (address)', 'function tickSpacing() view returns (int24)', 'function gauge() view returns (address)', 'function factory() view returns (address)']);
+const GAUGE_META_I = new Interface(['function pool() view returns (address)', 'function nft() view returns (address)', 'function voter() view returns (address)']);
+const GAUGE_PROBE_I = new Interface(['function deposit(uint256)', 'function withdraw(uint256)', 'function emergencyWithdraw(uint256)', 'function claimEmissions(address,address)', 'function claimEmissions(address,address,uint256[])']);
+const NPM_INDEX_I = new Interface(['function tokenByIndex(uint256) view returns (uint256)']);
+const GAUGE_CLONE = `0x363d3d373d3d3d363d73${AERO.gaugeImplementation.slice(2).toLowerCase()}5af43d82803e903d91602b57fd5bf3`;
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+const SYMBOL_MAX = 24;
+
+// 加入白名单前核验任意池子（与 cli.mjs plan 的池子核对相同）：池子由 Aero CL 工厂按 (token0, token1, tickSpacing) 登记，
+// 有 gauge，gauge 是已审实现的 EIP-1167 克隆、与池子互相指向，且 NFT 与 voter 是固定地址。任何一项不符都拒绝。
+export async function inspectPool(rpc, address) {
+  address = getAddress(address);
+  const chainId = await read('chainId', () => rpc.send('eth_chainId', []));
+  if (Number(chainId) !== BASE_CHAIN_ID) throw new ExecError(`RPC 不是 Base 主网（chainId ${Number(chainId)}）`);
+  if ((await read('池子字节码', () => rpc.getCode(address))) === '0x') throw new ExecError(`${address} 不是合约`);
+  const [[t0], [t1], [spacing], [gauge], [factory]] = await read('池子', () => Promise.all(['token0', 'token1', 'tickSpacing', 'gauge', 'factory'].map((m) => call(rpc, CL_POOL_I, address, m))));
+  if (getAddress(factory) !== AERO.clFactory) throw new ExecError('不是 Aero Slipstream（CL 工厂）的池子');
+  const token0 = getAddress(t0), token1 = getAddress(t1), tickSpacing = Number(spacing);
+  const [registered] = await read('getPool', () => call(rpc, FACTORY_I, AERO.clFactory, 'getPool', [token0, token1, tickSpacing]));
+  if (getAddress(registered) !== address) throw new ExecError('CL 工厂没有登记这个池子');
+  if (getAddress(gauge) === ZERO_ADDRESS) throw new ExecError('这个池子没有 gauge（没有排放），不能加入白名单');
+  const gaugeAddress = getAddress(gauge);
+  const [code, [gaugePool], [nft], [voter]] = await read('gauge', () => Promise.all([rpc.getCode(gaugeAddress), ...['pool', 'nft', 'voter'].map((m) => call(rpc, GAUGE_META_I, gaugeAddress, m))]));
+  if (code.toLowerCase() !== GAUGE_CLONE) throw new ExecError(`gauge ${gaugeAddress} 不是已审实现 ${AERO.gaugeImplementation} 的克隆`);
+  if (getAddress(gaugePool) !== address) throw new ExecError(`gauge ${gaugeAddress} 不指向这个池子`);
+  if (getAddress(nft) !== AERO.nft || getAddress(voter) !== AERO.voter) throw new ExecError(`gauge ${gaugeAddress} 的 NFT / voter 与固定地址不符`);
+  const token = async (a) => {
+    const [[decimals], [symbol]] = await read(`代币 ${a}`, () => Promise.all([call(rpc, ERC20_I, a, 'decimals'), call(rpc, ERC20_I, a, 'symbol')]));
+    return { address: a, decimals: Number(decimals), symbol: String(symbol).replace(/[^\x20-\x7e]/g, '').trim().slice(0, SYMBOL_MAX) || a.slice(0, 8) };
+  };
+  return { address, gauge: gaugeAddress, tickSpacing, token0: await token(token0), token1: await token(token1) };
+}
+
+// 以 bot 身份 eth_call Roles.execTransactionWithRole（shouldRevert）只判权限：返回 Roles 的结论名。
+// 'Ok' 表示内层调用也成功；'ModuleTransactionFailed' 表示权限已放行、内层调用自身失败；其余为 Roles 拒绝的原因。
+// 节点或网络错误重试一次后抛出；不是 Roles 错误的回滚原样抛出，不当作通过。
+async function rolesProbe(rpc, { roles, bot, roleKeyBytes }, transaction) {
+  const data = encodeRoleExecution(roleKeyBytes, [transaction]);
+  let last;
+  for (let attempt = 1; attempt <= READ_ATTEMPTS; attempt++) {
+    try { await rpc.call({ from: bot, to: roles, data }); return 'Ok'; } catch (error) {
+      const raw = error?.data ?? error?.info?.error?.data ?? error?.error?.data;
+      if (typeof raw === 'string' && raw.length >= 10) {
+        let parsed = null;
+        try { parsed = ROLES_ERRORS.parseError(raw); } catch {}
+        if (parsed?.name === 'ConditionViolation') return STATUS[Number(parsed.args.status)] ?? `status ${parsed.args.status}`;
+        if (parsed) return parsed.name;
+      }
+      if (error?.code === 'CALL_EXCEPTION') throw new ExecError(`模拟调用回滚，原因不是 Roles 权限：${errorText(error)}`);
+      last = error;
+      if (attempt < READ_ATTEMPTS) await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  throw new ExecError(`模拟调用失败：${errorText(last)}`);
+}
+
+// 加池批次执行后的生效核对：current / next 为 buildPermissions 的结果。对新增的池子、兑换路径与代币授权逐项以 bot 身份模拟，
+// Roles 放行才算生效（金额一律为 0，不会动资产）；新代币的额度直接读 Roles.allowances，须与计划完全一致。
+// 返回 { ok, checks: [{ label, ok, status }] }。
+export async function verifyActive({ rpc, safe, roles, bot, current, next, now = Date.now }) {
+  safe = getAddress(safe); roles = getAddress(roles); bot = getAddress(bot);
+  const probe = { roles, bot, roleKeyBytes: next.roleKeyBytes };
+  const known = (list, keyOf) => new Set(list.map(keyOf));
+  const poolKey = (p) => p.gauge, swapKey = (s) => `${s.tokenIn}/${s.tokenOut}/${s.tickSpacing}`;
+  const oldPools = known(current.pools, poolKey), oldSwaps = known(current.swaps, swapKey), oldKeys = known(current.allowances, (a) => a.key);
+  const pools = next.pools.filter((p) => !oldPools.has(poolKey(p))), swaps = next.swaps.filter((s) => !oldSwaps.has(swapKey(s)));
+  const end = BigInt(Math.floor(now() / 1000) + 3600);
+  // NFT 授权的条件含"头寸归 Safe 所有"：用链上第一个已存在的 tokenId 模拟，gauge 参数通过而归属不符时 Roles 报 CustomConditionViolation。
+  const [sample] = await read('NPM tokenByIndex', () => call(rpc, NPM_INDEX_I, AERO.nft, 'tokenByIndex', [0n]));
+  const symbolOf = (token) => next.allowances.find((a) => a.token === token)?.symbol ?? token.slice(0, 8);
+  const cases = [];
+  const spenders = new Map();
+  const approveOf = (token, spender) => { const key = `${token}/${spender}`; if (!spenders.has(key)) spenders.set(key, { token, spender }); };
+  for (const p of pools) {
+    cases.push({ label: `NPM.mint ${p.name}`, tx: tx(AERO.nft, NPM_I, 'mint', [{ token0: p.token0, token1: p.token1, tickSpacing: p.tickSpacing, tickLower: 0, tickUpper: p.tickSpacing,
+      amount0Desired: 0n, amount1Desired: 0n, amount0Min: 0n, amount1Min: 0n, recipient: safe, deadline: end, sqrtPriceX96: 0n }]) });
+    cases.push({ label: `NPM.approve → gauge ${p.name}`, tx: tx(AERO.nft, NPM_I, 'approve', [p.gauge, sample]), accept: ['CustomConditionViolation'] });
+    for (const [label, method, args] of [['deposit', 'deposit', [0n]], ['withdraw', 'withdraw', [0n]], ['emergencyWithdraw', 'emergencyWithdraw', [0n]],
+      ['claimEmissions', 'claimEmissions(address,address)', [safe, safe]], ['claimEmissions(tokenIds)', 'claimEmissions(address,address,uint256[])', [safe, safe, []]]]) {
+      cases.push({ label: `gauge ${p.name}.${label}`, tx: tx(p.gauge, GAUGE_PROBE_I, method, args) });
+    }
+    approveOf(p.token0, AERO.nft); approveOf(p.token1, AERO.nft);
+  }
+  for (const s of swaps) {
+    cases.push({ label: `Router 兑换 ${symbolOf(s.tokenIn)} → ${symbolOf(s.tokenOut)} ts${s.tickSpacing}`, tx: tx(AERO.swapRouter, ROUTER_I, 'exactInputSingle', [{ tokenIn: s.tokenIn, tokenOut: s.tokenOut,
+      tickSpacing: s.tickSpacing, recipient: safe, deadline: end, amountIn: 0n, amountOutMinimum: 0n, sqrtPriceLimitX96: 0n }]) });
+    approveOf(s.tokenIn, AERO.swapRouter);
+  }
+  for (const { token, spender } of spenders.values()) {
+    cases.push({ label: `${symbolOf(token)}.approve → ${spender === AERO.nft ? 'NPM' : 'Router'}`, tx: tx(token, ERC20_I, 'approve', [spender, 0n]) });
+  }
+  const checks = [];
+  for (const item of cases) {
+    const status = await rolesProbe(rpc, probe, item.tx);
+    checks.push({ label: item.label, status, ok: status === 'Ok' || status === 'ModuleTransactionFailed' || (item.accept ?? []).includes(status) });
+  }
+  for (const a of next.allowances.filter((x) => !oldKeys.has(x.key))) {
+    const r = await read(`额度 ${a.symbol}`, () => call(rpc, ROLES_VIEW_I, roles, 'allowances', [a.key]));
+    const ok = r.refill === a.perDay && r.maxRefill === a.perDay && r.period === BigInt(next.allowancePeriod);
+    checks.push({ label: `额度 ${a.symbol}`, status: ok ? 'Ok' : `链上为每 ${r.period} 秒补 ${r.refill}、上限 ${r.maxRefill}`, ok });
+  }
+  return { ok: checks.every((c) => c.ok), checks };
 }
 
 const poolOf = (ctx, address) => {
