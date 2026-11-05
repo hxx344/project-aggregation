@@ -13,9 +13,10 @@ trap 'rm -rf -- "$fixture"' EXIT
 trap 'echo "Failed at line $LINENO." >&2; tail -n 40 "$fixture/last.log" >&2 2>/dev/null || true; tail -n 60 "$fixture/new.calls" >&2 2>/dev/null || true' ERR
 export FIXTURE_ROOT=$fixture
 mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/deploy" "$fixture/runtime" "$fixture/updater"
-mkdir -p "$fixture/source/tools/entropy-lighter-lab" "$fixture/source/tools/aero-lp"
+mkdir -p "$fixture/source/tools/entropy-lighter-lab" "$fixture/source/tools/aero-lp" "$fixture/source/tools/aero-roles"
 cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$fixture/source/tools/entropy-lighter-lab/"
 cp "$repository"/tools/aero-lp/{cli.mjs,core.mjs,chain.mjs,config.example.json} "$fixture/source/tools/aero-lp/"
+cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$fixture/source/tools/aero-roles/"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
 printf 'frontend\n' > "$fixture/source/src/app.ts"
 printf 'backend\n' > "$fixture/source/server/index.mjs"
@@ -370,7 +371,8 @@ contents = {'.release-commit': commit, '.release-application-key': key,
             'package.json': '{"type":"module"}', 'dist/index.html': '<html>' + sys.argv[3] + '</html>',
             'node_modules/ws/package.json': '{}', 'node_modules/decimal.js/package.json': '{}'}
 for relative in [*('tools/entropy-lighter-lab/' + name for name in ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')),
-                 *('tools/aero-lp/' + name for name in ('cli.mjs', 'core.mjs', 'chain.mjs', 'config.example.json'))]:
+                 *('tools/aero-lp/' + name for name in ('cli.mjs', 'core.mjs', 'chain.mjs', 'config.example.json')),
+                 *('tools/aero-roles/' + name for name in ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs'))]:
     contents[relative] = subprocess.check_output(['git', '-C', str(root / 'source'), 'show', commit + ':' + relative], text=True)
 with tarfile.open(root / 'package.tar.gz', 'w:gz') as archive:
     for name, value in contents.items():
