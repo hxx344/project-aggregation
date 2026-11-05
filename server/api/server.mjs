@@ -2,11 +2,13 @@ import http from 'node:http';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { promisify } from 'node:util';
+import { gzip } from 'node:zlib';
 import { validateUrl, validateAuthOrigin } from '../adapters.mjs';
 import { createPortal } from '../portal.mjs';
 import { loginForPortal } from '../portal-auth.mjs';
 import { createOverviewEncoder } from '../overview-stream.mjs';
-import { createReleaseAssetLookup, createStaticResponder } from '../static-response.mjs';
+import { acceptsGzip, createReleaseAssetLookup, createStaticResponder } from '../static-response.mjs';
 import { createUpdateClient, createUpdateCoordinator, validateUpdateBody, UpdateError } from '../updates.mjs';
 import { createUpdateStream } from '../update-stream.mjs';
 import { moduleIds } from '../modules/catalog.mjs';
@@ -26,6 +28,23 @@ import { createHostStatus } from '../host-status.mjs';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
 const SESSION_AGE = 7 * 24 * 60 * 60 * 1000;
+const gzipJson = promisify(gzip);
+
+// Research replies contain public market evidence and modeled parameters, not
+// session tokens or credentials. Scope compression to this exact route family.
+async function sendCostResearch(req, res, status, data) {
+  let body = Buffer.from(JSON.stringify(data));
+  const headers = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', Vary: 'Accept-Encoding' };
+  if (body.length >= 1024 && acceptsGzip(req.headers['accept-encoding'])) {
+    try {
+      const compressed = await gzipJson(body);
+      if (compressed.length < body.length) { body = compressed; headers['Content-Encoding'] = 'gzip'; }
+    } catch { /* A compression failure still serves the original JSON. */ }
+  }
+  if (res.destroyed || res.writableEnded) return;
+  headers['Content-Length'] = body.length;
+  res.writeHead(status, headers); res.end(body);
+}
 
 // Login rate limits; createApp resolves them before opening any file.
 export function resolveLoginLimits({ loginWindowMs = 15 * 60000, accountLockoutMs = 30 * 60000 } = {}) {
@@ -227,10 +246,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   const bodyOf = req => readJson(req.headers['content-type'], req);
   // The target is the normalized path and query this API matched, not the raw request line.
   const receivedAt = new WeakMap();
-  async function forward(req, res, url, current, { body = req, contentType = req.headers['content-type'] } = {}) {
+  async function forward(req, res, url, current, { body = req, contentType = req.headers['content-type'], costResearch = false } = {}) {
     const deadline = (receivedAt.get(req) ?? Date.now()) + REQUEST_TIMEOUT_MS;
     const reply = await runtime.forward({ method: req.method, target: url.pathname + url.search, sessionId: current.id, contentType, deadline, body });
-    send(res, reply.status, reply.body);
+    if (costResearch) await sendCostResearch(req, res, reply.status, reply.body);
+    else send(res, reply.status, reply.body);
   }
   async function api(req, res, url) {
     const pathname = url.pathname;
@@ -353,6 +373,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
         return;
       }
       throw new HttpError(404, '更新接口不存在');
+    }
+    if (pathname === '/api/research/binance-lighter-cost' || pathname.startsWith('/api/research/binance-lighter-cost/')) {
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取成本研究数据');
+      if (req.headers.origin) sameOrigin(req);
+      await forward(req, res, url, current, { costResearch: true }); return;
     }
     if (pathname === '/api/research/entropy-lighter' || pathname.startsWith('/api/research/entropy-lighter/')) {
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取研究数据');
