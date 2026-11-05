@@ -17,7 +17,7 @@ export async function openStore(directory) {
     if (![1, 2].includes(state.version) || !Number.isInteger(state.revision) || !Array.isArray(state.history) || !state.ruleStates || !state.status) throw new Error("Invalid state");
     state.config = validateConfig(state.config, undefined, { requireWebhook: state.version === 1 });
     for (const value of Object.values(state.ruleStates)) {
-      if (typeof value.armed !== "boolean" || ![value.lastSentAt, value.lastAttemptAt].every(time => time === null || (Number.isFinite(time) && time >= 0))) throw new Error("Invalid rule state");
+      if (typeof value.armed !== "boolean" || (value.sides !== undefined && (typeof value.sides?.above !== "boolean" || typeof value.sides?.below !== "boolean")) || ![value.lastSentAt, value.lastAttemptAt].every(time => time === null || (Number.isFinite(time) && time >= 0))) throw new Error("Invalid rule state");
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw new Error(`无法读取告警状态文件 ${file}，请修复文件或从备份恢复。`, { cause: error });

@@ -7,6 +7,8 @@ export const DEFAULT_CONFIG = {
   rules: [],
 };
 
+export const DIRECTIONS = ["above", "below", "both"];
+
 export function validateWebhook(value) {
   let url;
   try { url = new URL(value); } catch { throw new Error("请输入有效的飞书机器人 Webhook 地址。"); }
@@ -25,7 +27,7 @@ export function validateConfig(input, previous = DEFAULT_CONFIG, { requireWebhoo
   if (!Array.isArray(rules) || rules.length > 20) throw new Error("最多可设置 20 档阈值。");
   const ids = new Set();
   const cleanRules = rules.map(rule => {
-    if (!rule || typeof rule.id !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(rule.id) || ids.has(rule.id) || typeof rule.name !== "string" || !rule.name.trim() || rule.name.length > 40 || !["above", "below"].includes(rule.direction) || typeof rule.enabled !== "boolean" || typeof rule.threshold !== "number" || !Number.isFinite(rule.threshold) || rule.threshold < -100 || rule.threshold > 10000) {
+    if (!rule || typeof rule.id !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(rule.id) || ids.has(rule.id) || typeof rule.name !== "string" || !rule.name.trim() || rule.name.length > 40 || !DIRECTIONS.includes(rule.direction) || typeof rule.enabled !== "boolean" || typeof rule.threshold !== "number" || !Number.isFinite(rule.threshold) || rule.threshold < -100 || rule.threshold > 10000) {
       throw new Error("每档需有唯一编号、名称、方向和有效阈值（-100% 至 10000%）。");
     }
     ids.add(rule.id);
@@ -51,14 +53,26 @@ export function validateConfig(input, previous = DEFAULT_CONFIG, { requireWebhoo
   return { enabled, webhookUrl, signingSecret, cooldownSeconds, hysteresis, rules: cleanRules };
 }
 
-export const freshRuleState = () => ({ armed: true, lastSentAt: null, lastAttemptAt: null });
+// A two-way tier alerts on crossings only: each side arms after the premium leaves its reset band,
+// so saving a tier never reports the side the market is already on.
+export const freshRuleState = direction => direction === "both"
+  ? { armed: false, sides: { above: false, below: false }, lastSentAt: null, lastAttemptAt: null }
+  : { armed: true, lastSentAt: null, lastAttemptAt: null };
+
+export const ruleLabel = rule => rule.side ? `${rule.name}（${rule.side === "above" ? "向上穿越" : "向下穿越"}）` : rule.name;
+
+export function markDelivered(state, rule, at) {
+  if (rule.side && state.sides) state.sides[rule.side] = false;
+  else state.armed = false;
+  state.lastSentAt = at;
+}
 
 export function reconcileRuleStates(previous, config, states) {
   const wasEnabled = previous.enabled;
   return Object.fromEntries(config.rules.map(rule => {
     const old = previous.rules.find(item => item.id === rule.id);
     const unchanged = old && old.direction === rule.direction && old.threshold === rule.threshold && old.enabled === rule.enabled && !(config.enabled && !wasEnabled);
-    return [rule.id, unchanged && states[rule.id] ? { ...states[rule.id] } : freshRuleState()];
+    return [rule.id, unchanged && states[rule.id] ? structuredClone(states[rule.id]) : freshRuleState(rule.direction)];
   }));
 }
 
@@ -75,15 +89,23 @@ export function evaluateRules(config, states, premium, now) {
   const compare = (left, right) => Math.abs(left - right) <= Number.EPSILON * 8 * Math.max(1, Math.abs(left), Math.abs(right)) ? 0 : Math.sign(left - right);
   for (const rule of config.rules) {
     if (!rule.enabled) continue;
-    const state = next[rule.id] ??= freshRuleState();
+    const state = next[rule.id] ??= freshRuleState(rule.direction);
     const hysteresis = rule.hysteresis ?? config.hysteresis;
     const cooldownSeconds = rule.cooldownSeconds ?? config.cooldownSeconds;
-    const reset = rule.direction === "above" ? compare(premium, rule.threshold - hysteresis) < 0 : compare(premium, rule.threshold + hysteresis) > 0;
-    if (!state.armed && reset) state.armed = true;
-    const reached = rule.direction === "above" ? premium >= rule.threshold : premium <= rule.threshold;
+    const reset = side => side === "above" ? compare(premium, rule.threshold - hysteresis) < 0 : compare(premium, rule.threshold + hysteresis) > 0;
+    const reached = side => side === "above" ? premium >= rule.threshold : premium <= rule.threshold;
     const cooled = state.lastSentAt === null || now - state.lastSentAt >= cooldownSeconds * 1000;
     const retryReady = state.lastAttemptAt === null || (state.lastSentAt !== null && state.lastSentAt >= state.lastAttemptAt) || now - state.lastAttemptAt >= 30_000;
-    if (state.armed && reached && cooled && retryReady) triggered.push(rule);
+    if (rule.direction === "both") {
+      const sides = state.sides ??= { above: false, below: false };
+      for (const side of ["above", "below"]) {
+        if (!sides[side] && reset(side)) sides[side] = true;
+        if (sides[side] && reached(side) && cooled && retryReady) triggered.push({ ...rule, direction: side, side });
+      }
+      continue;
+    }
+    if (!state.armed && reset(rule.direction)) state.armed = true;
+    if (state.armed && reached(rule.direction) && cooled && retryReady) triggered.push(rule);
   }
   return { states: next, triggered };
 }

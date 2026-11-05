@@ -28,7 +28,7 @@ export class FileStore {
     if (data.schemaVersion !== 1 || !Number.isSafeInteger(data.revision) || data.revision < 0 || !data.states || typeof data.states !== 'object' || Array.isArray(data.states) || !Array.isArray(data.events)) throw new Error('持久化数据格式无效；请从备份恢复 monitor.json');
     data.config = this.validate(data.config);
     for (const state of Object.values(data.states)) {
-      if (!state || typeof state.active !== 'boolean' || typeof state.alerted !== 'boolean' || (state.lastSentAt !== null && (!Number.isFinite(state.lastSentAt) || state.lastSentAt < 0)) || !Number.isFinite(state.nextAttemptAt) || state.nextAttemptAt < 0 || (state.eventId != null && typeof state.eventId !== 'string')) throw new Error('告警状态损坏；请从备份恢复 monitor.json');
+      if (!state || typeof state.active !== 'boolean' || typeof state.alerted !== 'boolean' || (state.lastSentAt !== null && (!Number.isFinite(state.lastSentAt) || state.lastSentAt < 0)) || !Number.isFinite(state.nextAttemptAt) || state.nextAttemptAt < 0 || (state.eventId != null && typeof state.eventId !== 'string') || (state.sides !== undefined && !['gte', 'lte'].every(side => typeof state.sides?.[side]?.active === 'boolean' && typeof state.sides[side].alerted === 'boolean' && (state.sides[side].eventId == null || typeof state.sides[side].eventId === 'string') && Number.isFinite(state.sides[side].nextAttemptAt) && state.sides[side].nextAttemptAt >= 0))) throw new Error('告警状态损坏；请从备份恢复 monitor.json');
     }
     if (data.events.length > 100 || data.events.some(event => !event || !['sending', 'sent', 'failed'].includes(event.status) || !Array.isArray(event.rules))) throw new Error('告警记录损坏；请从备份恢复 monitor.json');
     return data;

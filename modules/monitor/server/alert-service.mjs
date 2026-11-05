@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { loadQuote } from "../lib/quote-service.ts";
-import { evaluateRules, isFreshQuote, publicState, reconcileRuleStates, validateConfig } from "./alert-engine.mjs";
+import { evaluateRules, isFreshQuote, markDelivered, publicState, reconcileRuleStates, ruleLabel, validateConfig } from "./alert-engine.mjs";
 import { formatAlert, sendFeishu } from "./feishu.mjs";
 
 export function createAlertService(store, { getQuote = loadQuote, deliver = sendFeishu, clock = Date.now, notifications } = {}) {
@@ -86,17 +86,17 @@ export function createAlertService(store, { getQuote = loadQuote, deliver = send
       await serial(async () => {
         const state = store.get();
         // Only tiers still holding this attempt take its result; an edited tier starts fresh.
-        const attempted = rules.map(rule => state.ruleStates[rule.id]).filter(ruleState => ruleState?.lastAttemptAt === now);
+        const attempted = rules.filter(rule => state.ruleStates[rule.id]?.lastAttemptAt === now);
         if (!failure) {
-          for (const ruleState of attempted) { ruleState.armed = false; ruleState.lastSentAt = clock(); }
-          record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "sent", premium: quote.premium, rules: rules.map(rule => rule.name), error: "" });
+          for (const rule of attempted) markDelivered(state.ruleStates[rule.id], rule, clock());
+          record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "sent", premium: quote.premium, rules: rules.map(ruleLabel), error: "" });
         } else {
           // An uncertain delivery may already have posted: wait for a re-entry beyond hysteresis instead of resending.
           // It counts as sent for the cooldown, so a quick re-entry is not a second message within it.
-          if (failure.uncertain) for (const ruleState of attempted) { ruleState.armed = false; ruleState.lastSentAt = clock(); }
+          if (failure.uncertain) for (const rule of attempted) markDelivered(state.ruleStates[rule.id], rule, clock());
           const message = failure.uncertain ? "飞书投递结果不确定（可能已发出），不再重发；溢价回到回差以外后再次达标才会提醒。" : failure.message;
           state.status.lastError = message;
-          record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "failed", premium: quote.premium, rules: rules.map(rule => rule.name), error: message });
+          record(state, { time: new Date(clock()).toISOString(), kind: "alert", status: "failed", premium: quote.premium, rules: rules.map(ruleLabel), error: message });
         }
         await persist(state);
       });

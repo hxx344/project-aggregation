@@ -1,5 +1,5 @@
 import { createHmac } from "node:crypto";
-import { validateWebhook } from "./alert-engine.mjs";
+import { ruleLabel, validateWebhook } from "./alert-engine.mjs";
 
 export function createFeishuPayload(text, secret = "", now = Date.now()) {
   const payload = { msg_type: "text", content: { text } };
@@ -40,7 +40,7 @@ export function formatAlert(quote, rules) {
   return [
     "海力士价差告警",
     `当前 ADR 溢价率：${quote.premium.toFixed(2)}%`,
-    ...rules.map(rule => `${rule.name}：${rule.direction === "above" ? "≥" : "≤"} ${rule.threshold}%`),
+    ...rules.map(rule => `${ruleLabel(rule)}：${rule.direction === "above" ? "≥" : "≤"} ${rule.threshold}%`),
     `ADR：$${quote.adr.toFixed(2)} ｜ 正股 ÷ 10：$${quote.equivalent.toFixed(2)}`,
     `每份价差：$${quote.spread.toFixed(2)}`,
     `报价获取时间：${quote.fetchedAt}（UTC）`,

@@ -2,13 +2,15 @@
 import { hubChanged } from "../lib/hub-bridge";
 
 import { memo, useEffect, useRef, useState, type FormEvent } from "react";
-import { Bell, ChevronDown, Plus, Save, Trash2 } from "lucide-react";
+import { Bell, ChevronDown, Layers, Plus, Save, Trash2 } from "lucide-react";
+import { applyAlertGrid, gridDefaults, gridPreview, type AlertGrid } from "../lib/alert-grid";
 import type { MonitorAlertAdapter, MonitorAlertDraft, MonitorAlertRule, MonitorAlertView } from "../lib/monitor-alerts";
 import { startActivityPolling } from "../lib/polling";
 import { loadSettings } from "../lib/settings-load";
 
 const time = (value: string | null) => value == null ? "尚无记录" : `${new Date(value).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false })} 北京时间`;
 const numberValue = (value: number) => Number.isFinite(value) ? value : "";
+const directionOptions = <><option value="above">向上 ≥</option><option value="below">向下 ≤</option><option value="both">双向穿越</option></>;
 
 export type AlertViewState = { view: MonitorAlertView | null; loadError: string };
 
@@ -24,6 +26,7 @@ function AlertSettings({ monitorId, title, adapter, active = true, onView, openR
   const [error, setError] = useState("");
   const [loadError, setLoadError] = useState("");
   const [message, setMessage] = useState("");
+  const [grid, setGrid] = useState<AlertGrid | null>(null);
   const dirtyRef = useRef(false), busyRef = useRef(false), latestRevision = useRef(0), generation = useRef(0);
   const refresh = useRef<() => Promise<void>>(async () => {});
   const mutation = useRef<AbortController | null>(null);
@@ -95,6 +98,18 @@ function AlertSettings({ monitorId, title, adapter, active = true, onView, openR
       if (!controller.signal.aborted) { setBusy(false); void refresh.current(); }
     }
   }
+  const editGrid = (values: Partial<AlertGrid>) => setGrid(current => current && { ...current, ...values });
+  let gridLevels: number[] = [], gridError = "";
+  if (grid) { try { gridLevels = gridPreview(draft, grid, adapter); } catch (cause) { gridError = cause instanceof Error ? cause.message : "范围无效。"; } }
+  const gridMetric = adapter.metrics.find(metric => metric.id === grid?.metric) ?? adapter.metrics[0];
+  const generate = () => {
+    if (!grid) return;
+    try {
+      const next = applyAlertGrid(draft, grid, adapter);
+      edit(next);
+      setMessage(`已生成 ${gridLevels.length} 档${gridMetric.label}梯度，保存配置后生效。`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "生成失败，草稿未改变。"); }
+  };
   const connected = view?.available === true;
   const summary = loadError ? "连接异常" : !view ? "连接后台中…" : !connected ? "Linux 后台未连接" : view.draft.enabled ? `已启用 · ${view.draft.rules.filter(rule => rule.enabled).length} 档` : "未启用";
   const bodyId = `monitor-alerts-${monitorId}-body`;
@@ -105,9 +120,32 @@ function AlertSettings({ monitorId, title, adapter, active = true, onView, openR
     {open && <div id={bodyId} className="alert-body">
       <div className="alert-definitions"><p><strong>冷却</strong>两次成功提醒之间的最短间隔。</p><p><strong>回差</strong>再次允许提醒前，需要离开阈值的幅度。</p></div>
       <p className="alert-help">持续满足阈值只提醒一次；再次提醒须同时满足重新越过阈值和冷却结束。{adapter.example}</p>
+      <p className="alert-help">双向穿越：向上穿过阈值或向下穿过阈值都会提醒。保存后需先离开阈值超过回差，才开始判断穿越，不会因为当前已在阈值某一侧而立即提醒。</p>
       {!connected ? <p className="alert-help" role="status">{loadError || view?.reason || "正在连接告警后台…"}</p> : <>
         <p className="alert-help">{view.webhookConfigured ? "使用整个面板的统一飞书机器人。" : "尚未配置共用机器人，可先保存梯度。"}关闭网页后，后台仍会检查并发送告警。 <button className="shared-settings-link" type="button" onClick={() => window.dispatchEvent(new Event("open-feishu-settings"))}>打开统一设置</button></p>
         {adapter.notice?.(draft) && <p className="alert-feedback failure" role="status">{adapter.notice(draft)}</p>}
+        {/* Outside the save form: unapplied generator inputs must not block saving the draft. */}
+        <fieldset disabled={busy} className="alert-fields">
+          <details className="monitor-alert-grid" onToggle={event => { if (event.currentTarget.open && !grid) setGrid(gridDefaults(draft, adapter)); }}>
+            <summary><Layers size={15}/>按范围批量生成档位</summary>
+            {grid && <>
+              <p className="alert-help">从下限到上限每隔一个步长生成一档，替换该指标现有的档位；其他指标的档位保留。阈值相同且方向相同的档位沿用原编号和发送状态。</p>
+              <div className="monitor-alert-rule-fields">
+                <label>监控指标<select aria-label="批量生成的监控指标" value={grid.metric} onChange={event => editGrid({ metric: event.target.value })}>{adapter.metrics.map(metric => <option value={metric.id} key={metric.id}>{metric.label}</option>)}</select></label>
+                <label>触发方向<select aria-label="批量生成的触发方向" value={grid.direction} onChange={event => editGrid({ direction: event.target.value as AlertGrid["direction"] })}>{directionOptions}</select></label>
+                <label>下限（{gridMetric.unit}）<input type="number" step="any" aria-label="批量生成的下限" value={numberValue(grid.from)} onChange={event => editGrid({ from: event.target.valueAsNumber })}/></label>
+                <label>上限（{gridMetric.unit}）<input type="number" step="any" aria-label="批量生成的上限" value={numberValue(grid.to)} onChange={event => editGrid({ to: event.target.valueAsNumber })}/></label>
+                <label>步长（{gridMetric.hysteresisUnit}）<input type="number" step="any" min="0" aria-label="批量生成的步长" value={numberValue(grid.step)} onChange={event => editGrid({ step: event.target.valueAsNumber })}/></label>
+                <label>冷却（分钟）<input type="number" step="any" min="0" max={adapter.cooldownMax} aria-label="批量生成的冷却" value={numberValue(grid.cooldownMinutes)} onChange={event => editGrid({ cooldownMinutes: event.target.valueAsNumber })}/></label>
+                <label>回差（{gridMetric.hysteresisUnit}）<input type="number" step="any" min="0" max={adapter.hysteresisMax} aria-label="批量生成的回差" value={numberValue(grid.hysteresis)} onChange={event => editGrid({ hysteresis: event.target.valueAsNumber })}/></label>
+              </div>
+              <div className="monitor-alert-grid-actions">
+                <span className={gridError ? "negative" : "alert-summary"} role="status">{gridError || `将生成 ${gridLevels.length} 档：${gridLevels.join("、")}`}</span>
+                <button type="button" className="alert-button" disabled={Boolean(gridError)} onClick={generate}><Layers size={14}/>生成并替换该指标档位</button>
+              </div>
+            </>}
+          </details>
+        </fieldset>
         <form onSubmit={(event: FormEvent) => { event.preventDefault(); void mutate(false); }}>
           <fieldset disabled={busy} className="alert-fields">
             <div className="alert-rules-heading"><h3>梯度设置 <span className="alert-summary">{draft.rules.length} / {adapter.maxRules} 档</span></h3><button type="button" className="alert-button" disabled={draft.rules.length >= adapter.maxRules} onClick={() => edit({ ...draft, rules: [...draft.rules, adapter.newRule(draft)] })}><Plus size={15}/>添加梯度</button></div>
@@ -118,7 +156,7 @@ function AlertSettings({ monitorId, title, adapter, active = true, onView, openR
                 <div className="monitor-alert-rule-fields">
                   <label>档位名称<input value={rule.name} required maxLength={adapter.nameMaxLength} onChange={event => editRule(rule.id, { name: event.target.value })}/></label>
                   <label>监控指标<select aria-label="监控指标" value={rule.metric} onChange={event => editRule(rule.id, { metric: event.target.value })}>{adapter.metrics.map(metric => <option value={metric.id} key={metric.id}>{metric.label}</option>)}</select></label>
-                  <label>触发方向<select aria-label="触发方向" value={rule.direction} onChange={event => editRule(rule.id, { direction: event.target.value as MonitorAlertRule["direction"] })}><option value="above">向上 ≥</option><option value="below">向下 ≤</option></select></label>
+                  <label>触发方向<select aria-label="触发方向" value={rule.direction} onChange={event => editRule(rule.id, { direction: event.target.value as MonitorAlertRule["direction"] })}>{directionOptions}</select></label>
                   <label>阈值（{metric.unit}）<input type="number" step="any" min={metric.min} max={metric.max} required placeholder="输入阈值" value={numberValue(rule.threshold)} onChange={event => editRule(rule.id, { threshold: event.target.valueAsNumber })}/></label>
                   <label>冷却（分钟）<input type="number" step="any" min="0" max={adapter.cooldownMax} required value={numberValue(rule.cooldownMinutes)} onChange={event => editRule(rule.id, { cooldownMinutes: event.target.valueAsNumber })}/></label>
                   <label>回差（{metric.hysteresisUnit}）<input type="number" step="any" min="0" max={adapter.hysteresisMax} required value={numberValue(rule.hysteresis)} onChange={event => editRule(rule.id, { hysteresis: event.target.valueAsNumber })}/></label>

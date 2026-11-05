@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { METRICS, evaluateRule, marketValues, ruleFingerprint, validateConfig } from './config.mjs';
+import { METRICS, beginAttempt, evaluateRule, markAlerted, marketValues, ruleFingerprint, validateConfig } from './config.mjs';
 import { staleMarketReason } from '../market-stale.mjs';
 
 const oilDefinition = {
   service: 'oil-spread-monitor', validateConfig, marketValues, testTitle: '原油阈值告警',
   message: (market, values, due) => ['原油阈值告警', `采集时间：${market.fetchedAt}（UTC）`, '价格口径：Binance BZUSDT / CLUSDT 标记价，USDT/桶；价差＝布伦特 − WTI',
-    ...due.map(({ rule, value, id }) => `【${rule.label}】${METRICS[rule.metric]} ${value.toFixed(4)} ${rule.operator === 'gte' ? '≥' : '≤'} ${rule.threshold} USDT/桶\n事件 ${id}`),
+    ...due.map(({ rule, value, id, operator }) => `【${rule.label}${rule.operator === 'both' ? (operator === 'gte' ? '（向上穿越）' : '（向下穿越）') : ''}】${METRICS[rule.metric]} ${value.toFixed(4)} ${operator === 'gte' ? '≥' : '≤'} ${rule.threshold} USDT/桶\n事件 ${id}`),
     `布伦特 ${values.brent.toFixed(4)} · WTI ${values.wti.toFixed(4)} · 价差 ${values.spread.toFixed(4)} USDT/桶`].join('\n'),
 };
 
@@ -59,12 +59,11 @@ export class Monitor {
       const now = this.clock(), next = structuredClone(this.data), due = [];
       for (const rule of next.config.rules) {
         if (!rule.enabled) continue;
-        const { state, shouldSend } = evaluateRule(rule, next.states[rule.id], values[rule.metric], now);
+        const { state, shouldSend, operator } = evaluateRule(rule, next.states[rule.id], values[rule.metric], now);
         next.states[rule.id] = state;
         // One batch at a time: a later tick still tracks state but waits for the in-flight result.
         if (shouldSend && next.config.enabled && this.notificationConfigured() && !this.delivery) {
-          state.eventId ||= randomUUID(); state.nextAttemptAt = now + 60_000;
-          due.push({ rule, value: values[rule.metric], id: state.eventId });
+          due.push({ rule, value: values[rule.metric], id: beginAttempt(state, operator, now, randomUUID), operator });
         }
       }
       if (!due.length) {
@@ -73,7 +72,7 @@ export class Monitor {
       }
       // Persist attempt IDs before external I/O; an uncertain retry retains its ID.
       const batchId = randomUUID();
-      next.events.unshift({ id: batchId, source: this.definition.source ?? 'binance', time: new Date(now).toISOString(), status: 'sending', rules: due.map(item => ({ id: item.id, label: item.rule.label, metric: item.rule.metric, operator: item.rule.operator, threshold: item.rule.threshold, value: item.value })) });
+      next.events.unshift({ id: batchId, source: this.definition.source ?? 'binance', time: new Date(now).toISOString(), status: 'sending', rules: due.map(item => ({ id: item.id, label: item.rule.label, metric: item.rule.metric, operator: item.operator, threshold: item.rule.threshold, value: item.value })) });
       next.events = next.events.slice(0, 100);
       await this.persist(next);
       let finish;
@@ -100,7 +99,7 @@ export class Monitor {
           const state = delivered.states[item.rule.id], current = delivered.config.rules.find(rule => rule.id === item.rule.id);
           // A rule edited meanwhile starts its own episode; the same rule keeps the delivered cooldown.
           if (!state || !current || ruleFingerprint(current) !== ruleFingerprint(item.rule)) continue;
-          if (state.eventId === item.id) state.alerted = true;
+          markAlerted(state, item.operator, item.id);
           state.lastSentAt = this.clock();
         }
         await this.persist(delivered);

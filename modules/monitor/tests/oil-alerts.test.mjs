@@ -86,6 +86,69 @@ test('downward and negative thresholds, zero hysteresis, and inclusive equality 
   assert.equal(evaluateRule(r, result.state, -2.1, 4000).shouldSend, true);
 });
 
+test('two-way rules report each crossing with its own side and never the starting side', async () => {
+  const r = rule({ operator: 'both', cooldownMinutes: 0 });
+  assert.equal(validateConfig({ enabled: true, rules: [r] }).rules[0].operator, 'both');
+  let result = evaluateRule(r, {}, 6, 1000);
+  assert.equal(result.shouldSend, false, 'starting above the level reports nothing');
+  result = evaluateRule(r, result.state, 5, 2000);
+  assert.equal(result.shouldSend, true); assert.equal(result.operator, 'lte');
+  assert.equal(evaluateRule(r, {}, 5, 1000).shouldSend, false);
+
+  const f = fixture({ rules: [r] });
+  f.prices(85); await f.monitor.tick(); assert.equal(f.messages.length, 0);
+  f.prices(84.7); await f.monitor.tick(); assert.equal(f.messages.length, 0, 'leaving the band only arms the upward side');
+  f.prices(85.1); await f.monitor.tick();
+  assert.equal(f.messages.length, 1); assert.match(f.messages[0], /【价差一级（向上穿越）】价差（布伦特 − WTI） 5.1000 ≥ 5 USDT\/桶/);
+  assert.equal(f.persisted.events[0].rules[0].operator, 'gte');
+  f.prices(85.15); await f.monitor.tick(); assert.equal(f.messages.length, 1, 'staying above does not repeat');
+  f.prices(85.3); await f.monitor.tick(); assert.equal(f.messages.length, 1);
+  f.prices(84.9); await f.monitor.tick();
+  assert.equal(f.messages.length, 2); assert.match(f.messages[1], /【价差一级（向下穿越）】价差（布伦特 − WTI） 4.9000 ≤ 5 USDT\/桶/);
+  assert.equal(f.persisted.events[0].rules[0].operator, 'lte');
+  assert.notEqual(f.persisted.events[0].rules[0].id, f.persisted.events[1].rules[0].id, 'each crossing has its own event ID');
+  const restarted = fixture({ data: f.persisted }); restarted.prices(84.9); await restarted.monitor.tick();
+  assert.equal(restarted.messages.length, 0);
+});
+
+test('a failed two-way crossing retries with the same event ID and is dropped once the price leaves that side', async () => {
+  let attempts = 0;
+  const f = fixture({ rules: [rule({ operator: 'both', cooldownMinutes: 0 })], send: async () => { if (++attempts <= 2) throw new Error('飞书 HTTP 503'); } });
+  f.prices(84.7); await f.monitor.tick();
+  f.prices(85); await f.monitor.tick(); assert.equal(f.messages.length, 1);
+  const eventId = f.persisted.states['test-rule'].sides.gte.eventId;
+  f.advance(60_000); await f.monitor.tick(); assert.equal(f.messages.length, 2);
+  assert.equal(f.persisted.states['test-rule'].sides.gte.eventId, eventId);
+  f.prices(84.7); f.advance(60_000); await f.monitor.tick(); assert.equal(f.messages.length, 2, 'withdrawn upward crossing is not sent');
+  assert.equal(f.persisted.states['test-rule'].sides.gte.eventId, null);
+  f.prices(85); await f.monitor.tick(); assert.equal(f.messages.length, 3); assert.match(f.messages[2], /向上穿越/);
+});
+
+test('a reverse crossing between retries keeps the pending side’s event ID and 60-second retry spacing', async () => {
+  const f = fixture({ rules: [rule({ operator: 'both', cooldownMinutes: 0 })], send: async () => { throw new Error('飞书 HTTP 503'); } });
+  f.prices(84.7); await f.monitor.tick();
+  f.advance(10_000); f.prices(85.3); await f.monitor.tick(); assert.equal(f.messages.length, 1);
+  const upward = f.persisted.states['test-rule'].sides.gte.eventId;
+  f.advance(10_000); f.prices(84.9); await f.monitor.tick(); assert.equal(f.messages.length, 2); assert.match(f.messages[1], /向下穿越/);
+  f.advance(10_000); f.prices(85.1); await f.monitor.tick(); assert.equal(f.messages.length, 2, 'the upward retry still waits for its own 60 seconds');
+  f.advance(30_000); await f.monitor.tick(); assert.equal(f.messages.length, 2);
+  f.advance(10_000); await f.monitor.tick();
+  assert.equal(f.messages.length, 3); assert.match(f.messages[2], new RegExp(`向上穿越[\\s\\S]*事件 ${upward}`));
+});
+
+test('two-way crossings in both directions during one cooldown are each reported once it ends', async () => {
+  const f = fixture({ rules: [rule({ operator: 'both', cooldownMinutes: 1 })] });
+  f.prices(84.7); await f.monitor.tick();
+  f.prices(85.3); await f.monitor.tick(); assert.equal(f.messages.length, 1);
+  for (const price of [84.7, 85.3]) { f.advance(10_000); f.prices(price); await f.monitor.tick(); }
+  assert.equal(f.messages.length, 1, 'cooldown holds both later crossings');
+  f.advance(40_000); f.prices(85); await f.monitor.tick();
+  assert.equal(f.messages.length, 2); assert.match(f.messages[1], /向上穿越/);
+  f.advance(60_000); await f.monitor.tick();
+  assert.equal(f.messages.length, 3); assert.match(f.messages[2], /向下穿越/);
+  f.advance(60_000); await f.monitor.tick(); assert.equal(f.messages.length, 3);
+});
+
 test('cooldown spans separate episodes and a pending episode sends after cooldown', () => {
   const r = rule({ cooldownMinutes: 1 });
   let state = { ...evaluateRule(r, {}, 5, 1000).state, alerted: true, lastSentAt: 1000 };
@@ -223,6 +286,12 @@ test('file persistence survives reopen; overlapping writers and corrupt files fa
     await store.write(data); await store.release();
     await other.acquire(); assert.equal((await other.read()).revision, 7); assert.equal((await other.read()).config.rules[0].threshold, 9);
     assert.equal(JSON.parse(await readFile(path.join(directory, 'monitor.json'), 'utf8')).revision, 7);
+    const crossing = { ...emptyStore(), config: { enabled: true, rules: [rule({ operator: 'both' })] }, states: { 'test-rule': { active: false, alerted: false, lastSentAt: null, nextAttemptAt: 0, eventId: null, eventSide: null, sides: { gte: { active: true, alerted: true, eventId: 'event-1', nextAttemptAt: 0 }, lte: { active: false, alerted: false, eventId: null, nextAttemptAt: 0 } } } } };
+    await writeFile(path.join(directory, 'monitor.json'), JSON.stringify(crossing));
+    assert.equal((await other.read()).states['test-rule'].sides.lte.active, false);
+    crossing.states['test-rule'].sides = { gte: { active: true } };
+    await writeFile(path.join(directory, 'monitor.json'), JSON.stringify(crossing));
+    await assert.rejects(other.read(), /告警状态损坏/);
     await writeFile(path.join(directory, 'monitor.json'), '{bad'); await assert.rejects(other.read());
   } finally { await store.release(); await other.release(); await rm(directory, { recursive: true, force: true }); }
 });

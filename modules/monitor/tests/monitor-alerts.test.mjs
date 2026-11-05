@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { hynixAlerts, hynixDraft, hynixConfig, oilAlerts, oilDraft, oilConfig, monitorAlertAdapters } from "../lib/monitor-alerts.ts";
 import { monitors } from "../lib/monitors.ts";
+import { applyAlertGrid, gridDefaults, gridThresholds } from "../lib/alert-grid.ts";
 
 const signal = () => new AbortController().signal;
 const hynix = { enabled: true, cooldownSeconds: 100, hysteresis: 0.5, rules: [{ id: "original", name: "原有梯度", direction: "above", threshold: 40, enabled: true }] };
@@ -45,6 +46,75 @@ test("oil rules use the absolute spread; old percentage events keep their own un
   const draft = { ...oilDraft(oil), rules: [...oilDraft(oil).rules, { ...fresh, ...converted }] };
   assert.match(oilAlerts.notice(draft), /有 1 档原百分比规则/);
   assert.equal(oilAlerts.notice({ ...draft, rules: draft.rules.map(rule => ({ ...rule, enabled: true })) }), null, 'notice clears once re-enabled');
+});
+
+test("two-way tiers roundtrip through both editors", () => {
+  const twoWay = { ...oil, rules: [{ ...oil.rules[0], operator: "both" }] };
+  assert.equal(oilDraft(twoWay).rules[0].direction, "both");
+  assert.deepEqual(oilConfig(oilDraft(twoWay)), twoWay);
+  const hynixTwoWay = { ...hynix, rules: [{ ...hynix.rules[0], direction: "both" }] };
+  assert.deepEqual(hynixConfig(hynixDraft(hynixTwoWay)), hynixTwoWay);
+});
+
+test("range generator produces exact decimal levels and enforces the tier limit", () => {
+  assert.deepEqual(gridThresholds(0.1, 0.3, 0.1, 50), [0.1, 0.2, 0.3]);
+  assert.deepEqual(gridThresholds(3, 5, 0.5, 50), [3, 3.5, 4, 4.5, 5]);
+  assert.deepEqual(gridThresholds(-1, 1.2, 1, 50), [-1, 0, 1], "the last level never passes the upper bound");
+  assert.deepEqual(gridThresholds(4, 4, 1, 50), [4]);
+  assert.deepEqual(gridThresholds(0, 2e-9, 1e-9, 50), [0, 1e-9, 2e-9], "exponent-notation steps keep their precision");
+  assert.deepEqual(gridThresholds(1.25e-7, 3.75e-7, 1.25e-7, 50), [1.25e-7, 2.5e-7, 3.75e-7]);
+  assert.deepEqual(gridThresholds(123.456, 123.456006, 0.000003, 50), [123.456, 123.456003, 123.456006], "the upper bound is reached despite binary rounding");
+  assert.throws(() => gridThresholds(0, 2e-21, 1e-21, 50), /20 位小数/);
+  assert.throws(() => gridThresholds(123.456, 123.45600000000006, 1.5e-14, 50), /有效数字过多/, "levels a number would round cannot be restored later");
+  assert.throws(() => gridThresholds(0, 100, 0.001, 50), /100001 档.*50 档/);
+  for (const [from, to, step] of [[1, 0, 1], [0, 1, 0], [0, 1, -1], [NaN, 1, 1], [0, Infinity, 1]]) assert.throws(() => gridThresholds(from, to, step, 50));
+});
+
+test("range generator replaces only the chosen metric's tiers and keeps matching tier IDs", () => {
+  const draft = oilDraft({ enabled: true, rules: [
+    { id: "keep-4", label: "旧 4", metric: "spread", operator: "both", threshold: 4, cooldownMinutes: 30, hysteresis: 0.1, enabled: false },
+    { id: "drop-9", label: "旧 9", metric: "spread", operator: "gte", threshold: 9, cooldownMinutes: 30, hysteresis: 0.1, enabled: true },
+    { id: "brent", label: "布伦特", metric: "brent", operator: "lte", threshold: 80, cooldownMinutes: 30, hysteresis: 0.1, enabled: true },
+  ] });
+  const grid = { metric: "spread", from: 3, to: 5, step: 0.5, direction: "both", cooldownMinutes: 15, hysteresis: 0.05 };
+  const next = applyAlertGrid(draft, grid, oilAlerts);
+  assert.deepEqual(next.rules.map(rule => [rule.metric, rule.threshold, rule.direction, rule.name, rule.enabled]), [
+    ["brent", 80, "below", "布伦特", true],
+    ["spread", 3, "both", "双向 3 USDT/桶", true], ["spread", 3.5, "both", "双向 3.5 USDT/桶", true], ["spread", 4, "both", "双向 4 USDT/桶", true],
+    ["spread", 4.5, "both", "双向 4.5 USDT/桶", true], ["spread", 5, "both", "双向 5 USDT/桶", true],
+  ]);
+  assert.equal(next.rules.find(rule => rule.threshold === 4).id, "keep-4");
+  assert.ok(next.rules.every(rule => rule.metric !== "spread" || (rule.cooldownMinutes === 15 && rule.hysteresis === 0.05)));
+  assert.equal(new Set(next.rules.map(rule => rule.id)).size, next.rules.length);
+  assert.doesNotThrow(() => oilConfig(next));
+  assert.deepEqual(draft.rules.map(rule => rule.id), ["keep-4", "drop-9", "brent"], "the source draft is not mutated");
+  assert.throws(() => applyAlertGrid(draft, { ...grid, step: 0.01 }, oilAlerts), /49 档/, "other metrics' tiers count toward the limit");
+  assert.throws(() => applyAlertGrid(draft, { ...grid, hysteresis: -1 }, oilAlerts), /回差/);
+  assert.throws(() => applyAlertGrid(hynixDraft(hynix), { metric: "premium", from: -200, to: -100, step: 50, direction: "below", cooldownMinutes: 5, hysteresis: 0.5 }, hynixAlerts), /超出/);
+  const hynixGrid = applyAlertGrid(hynixDraft(hynix), { metric: "premium", from: 30, to: 50, step: 10, direction: "above", cooldownMinutes: 5, hysteresis: 0.5 }, hynixAlerts);
+  assert.deepEqual(hynixConfig(hynixGrid).rules.map(rule => [rule.name, rule.direction, rule.threshold, rule.cooldownSeconds]), [["向上 30%", "above", 30, 300], ["向上 40%", "above", 40, 300], ["向上 50%", "above", 50, 300]]);
+  assert.equal(hynixGrid.rules[1].id, "original", "the existing upward 40% tier keeps its ID");
+});
+
+test("range generator starts from evenly spaced tiers already in the draft, else the monitor default", () => {
+  const spaced = applyAlertGrid(oilDraft(oil), { metric: "spread", from: 2, to: 4, step: 0.5, direction: "above", cooldownMinutes: 10, hysteresis: 0.1 }, oilAlerts);
+  assert.deepEqual(gridDefaults(spaced, oilAlerts), { metric: "spread", from: 2, to: 4, step: 0.5, direction: "above", cooldownMinutes: 10, hysteresis: 0.1 });
+  assert.deepEqual(gridDefaults({ enabled: false, rules: [] }, oilAlerts), { metric: "spread", from: 3, to: 5, step: 0.5, direction: "both", cooldownMinutes: 30, hysteresis: 0.1 });
+  assert.deepEqual(gridDefaults(hynixDraft(hynix), hynixAlerts), { metric: "premium", from: 40, to: 40, step: 5, direction: "above", cooldownMinutes: 100 / 60, hysteresis: 0.5 }, "a single tier restores its own level");
+  assert.deepEqual(gridDefaults(hynixDraft({ ...hynix, rules: [] }), hynixAlerts), { metric: "premium", from: 30, to: 50, step: 5, direction: "both", cooldownMinutes: 100 / 60, hysteresis: 0.5 });
+  const uneven = { enabled: true, rules: [2, 3, 5].map((threshold, index) => ({ ...spaced.rules[0], id: `u${index}`, threshold })) };
+  assert.equal(gridDefaults(uneven, oilAlerts).step, 0.5, "unevenly spaced tiers fall back to the default range");
+});
+
+test("tiny steps survive generate, reload defaults and regenerate with the same thresholds and IDs", () => {
+  for (const [from, to, step] of [[0, 2.42e-9, 1.21e-9], [0, 2e-11, 1e-11], [0, 0.3, 0.1], [123.456, 123.456003, 0.000003], [0.1, 0.10000000242, 1.21e-9], [-0.3, 0.3, 0.1], [2, 2, 1], [2, 2.4, 1]]) {
+    const grid = { metric: "spread", from, to, step, direction: "both", cooldownMinutes: 10, hysteresis: 0 };
+    const first = applyAlertGrid({ enabled: true, rules: [] }, grid, oilAlerts);
+    const restored = gridDefaults(first, oilAlerts);
+    if (first.rules.length > 1) assert.deepEqual(restored, grid);
+    const again = applyAlertGrid(first, restored, oilAlerts);
+    assert.deepEqual(again.rules.map(rule => [rule.id, rule.threshold]), first.rules.map(rule => [rule.id, rule.threshold]));
+  }
 });
 
 test("web-only oil availability does not request Linux-only configuration or events", async () => {

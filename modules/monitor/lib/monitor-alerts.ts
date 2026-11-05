@@ -2,7 +2,7 @@ import { oilSpread } from '../modules/oil/spread.mjs';
 import type { AlertConfig, AlertView } from "./alert-types";
 
 export type MonitorAlertRule = {
-  id: string; name: string; metric: string; direction: "above" | "below";
+  id: string; name: string; metric: string; direction: "above" | "below" | "both";
   threshold: number; cooldownMinutes: number; hysteresis: number; enabled: boolean;
 };
 export type MonitorAlertDraft = {
@@ -23,6 +23,8 @@ type Fetcher = typeof fetch;
 export interface MonitorAlertAdapter {
   metrics: readonly AlertMetric[]; maxRules: number; nameMaxLength: number;
   cooldownMax: number; hysteresisMax: number; example: string;
+  /** Initial range for the tier generator when the draft has no evenly spaced tiers to reuse. */
+  grid: { from: number; to: number; step: number };
   /** Optional warning derived from the current draft (oil: converted percentage rules still off). */
   notice?: (draft: MonitorAlertDraft) => string | null;
   newRule: (draft: MonitorAlertDraft) => MonitorAlertRule;
@@ -37,8 +39,9 @@ async function request<T>(url: string, signal: AbortSignal, fetcher: Fetcher, bo
   if (!response.ok) throw new Error(response.status === 409 ? "另一页面已更新配置。你的修改仍保留，请放弃修改并重载后再编辑。" : result.error || `后台请求失败（${response.status}）。`);
   return result;
 }
+export const newRuleId = () => globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const baseRule = (draft: MonitorAlertDraft, metric: string, cooldownMinutes: number, hysteresis: number): MonitorAlertRule => ({
-  id: globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`, name: `档位 ${draft.rules.length + 1}`, metric, direction: "above", threshold: Number.NaN, cooldownMinutes, hysteresis, enabled: true,
+  id: newRuleId(), name: `档位 ${draft.rules.length + 1}`, metric, direction: "above", threshold: Number.NaN, cooldownMinutes, hysteresis, enabled: true,
 });
 export function hynixDraft(config: AlertConfig): MonitorAlertDraft {
   return { enabled: config.enabled, defaults: { cooldownSeconds: config.cooldownSeconds, hysteresis: config.hysteresis }, rules: config.rules.map(rule => ({ id: rule.id, name: rule.name, direction: rule.direction, enabled: rule.enabled, threshold: rule.threshold, metric: "premium", cooldownMinutes: (rule.cooldownSeconds ?? config.cooldownSeconds) / 60, hysteresis: rule.hysteresis ?? config.hysteresis })) };
@@ -55,7 +58,7 @@ export function hynixConfig(draft: MonitorAlertDraft): AlertConfig {
   }) };
 }
 export const hynixAlerts: MonitorAlertAdapter = {
-  metrics: [{ id: "premium", label: "ADR 溢价率", unit: "%", hysteresisUnit: "百分点", min: -100, max: 10000 }], maxRules: 20, nameMaxLength: 40, cooldownMax: 1440, hysteresisMax: 100,
+  metrics: [{ id: "premium", label: "ADR 溢价率", unit: "%", hysteresisUnit: "百分点", min: -100, max: 10000 }], maxRules: 20, nameMaxLength: 40, cooldownMax: 1440, hysteresisMax: 100, grid: { from: 30, to: 50, step: 5 },
   example: "例如向上阈值为 40%、回差为 0.5 个百分点：触发后需回落到 39.5% 以下，再次达到 40% 且冷却结束，才会再次提醒。",
   newRule: draft => baseRule(draft, "premium", (draft.defaults?.cooldownSeconds ?? 300) / 60, draft.defaults?.hysteresis ?? 0.5),
   async load(signal, fetcher = fetch) {
@@ -72,17 +75,17 @@ export const hynixAlerts: MonitorAlertAdapter = {
   },
 };
 
-type OilConfig = { enabled: boolean; rules: { id: string; label: string; metric: string; operator: "gte" | "lte"; threshold: number; cooldownMinutes: number; hysteresis: number; enabled: boolean }[] };
+type OilConfig = { enabled: boolean; rules: { id: string; label: string; metric: string; operator: "gte" | "lte" | "both"; threshold: number; cooldownMinutes: number; hysteresis: number; enabled: boolean }[] };
 type OilStatus = { available: boolean; reason?: string; webhookConfigured: boolean; lastAttemptAt: string | null; lastSuccessAt: string | null; stale: boolean; error?: string; deliveryError?: string; market?: { brent: { markPx: number }; wti: { markPx: number } } };
 type OilEvent = { source?: string; id: string; time: string; status: MonitorAlertEvent["status"]; test?: boolean; error?: string; rules: { label: string; metric: string; operator: string; threshold: number; value: number }[] };
 // Must match server/oil/config.mjs LEGACY_PERCENT_SUFFIX.
 const LEGACY_PERCENT_SUFFIX = "（原百分比）";
 // `spreadPercent` only appears in alert history recorded before the switch to the absolute spread.
 const oilMetricLabel: Record<string, string> = { spreadPercent: "百分比价差（已停用）", spread: "价差", brent: "布伦特", wti: "WTI" };
-export const oilDraft = (config: OilConfig): MonitorAlertDraft => ({ enabled: config.enabled, rules: config.rules.map(rule => ({ id: rule.id, name: rule.label, metric: rule.metric, direction: rule.operator === "gte" ? "above" : "below", threshold: rule.threshold, cooldownMinutes: rule.cooldownMinutes, hysteresis: rule.hysteresis, enabled: rule.enabled })) });
-export const oilConfig = (draft: MonitorAlertDraft): OilConfig => ({ enabled: draft.enabled, rules: draft.rules.map(rule => ({ id: rule.id, label: rule.name, metric: rule.metric, operator: rule.direction === "above" ? "gte" : "lte", threshold: rule.threshold, cooldownMinutes: rule.cooldownMinutes, hysteresis: rule.hysteresis, enabled: rule.enabled })) });
+export const oilDraft = (config: OilConfig): MonitorAlertDraft => ({ enabled: config.enabled, rules: config.rules.map(rule => ({ id: rule.id, name: rule.label, metric: rule.metric, direction: rule.operator === "both" ? "both" : rule.operator === "gte" ? "above" : "below", threshold: rule.threshold, cooldownMinutes: rule.cooldownMinutes, hysteresis: rule.hysteresis, enabled: rule.enabled })) });
+export const oilConfig = (draft: MonitorAlertDraft): OilConfig => ({ enabled: draft.enabled, rules: draft.rules.map(rule => ({ id: rule.id, label: rule.name, metric: rule.metric, operator: rule.direction === "both" ? "both" : rule.direction === "above" ? "gte" : "lte", threshold: rule.threshold, cooldownMinutes: rule.cooldownMinutes, hysteresis: rule.hysteresis, enabled: rule.enabled })) });
 export const oilAlerts: MonitorAlertAdapter = {
-  metrics: [{ id: "spread", label: "价差 · 布伦特 − WTI", unit: "USDT/桶", hysteresisUnit: "USDT/桶", min: -1e6, max: 1e6 }, { id: "brent", label: "布伦特价格", unit: "USDT/桶", hysteresisUnit: "USDT/桶", min: 0, max: 1e6 }, { id: "wti", label: "WTI 价格", unit: "USDT/桶", hysteresisUnit: "USDT/桶", min: 0, max: 1e6 }], maxRules: 50, nameMaxLength: 60, cooldownMax: 10080, hysteresisMax: 1e6,
+  metrics: [{ id: "spread", label: "价差 · 布伦特 − WTI", unit: "USDT/桶", hysteresisUnit: "USDT/桶", min: -1e6, max: 1e6 }, { id: "brent", label: "布伦特价格", unit: "USDT/桶", hysteresisUnit: "USDT/桶", min: 0, max: 1e6 }, { id: "wti", label: "WTI 价格", unit: "USDT/桶", hysteresisUnit: "USDT/桶", min: 0, max: 1e6 }], maxRules: 50, nameMaxLength: 60, cooldownMax: 10080, hysteresisMax: 1e6, grid: { from: 3, to: 5, step: 0.5 },
   example: "价差＝布伦特 − WTI，单位 USDT/桶。阈值 4、回差 0.1：触发后需回落到 3.9 以下，再次达到 4 且冷却结束才提醒。",
   notice(draft) {
     const count = draft.rules.filter(rule => !rule.enabled && rule.name.endsWith(LEGACY_PERCENT_SUFFIX)).length;

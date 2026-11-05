@@ -35,6 +35,75 @@ test("threshold boundaries support both directions and combine all crossed tiers
   assert.equal(evaluateRules({ ...cfg, enabled: false }, {}, 30, 1000).triggered.length, 0);
 });
 
+test("two-way tiers alert on each crossing, never on the side the premium starts on", async t => {
+  const cfg = { ...config([rule("cross-40", 40, "both")]), hysteresis: 0.5, cooldownSeconds: 0 };
+  assert.equal(validateConfig(cfg).rules[0].direction, "both");
+  let result = evaluateRules(cfg, {}, 45, 1000);
+  assert.equal(result.triggered.length, 0, "starting above 40 reports nothing");
+  result = evaluateRules(cfg, result.states, 40, 2000);
+  assert.deepEqual(result.triggered.map(item => [item.id, item.side, item.direction]), [["cross-40", "below", "below"]]);
+  assert.equal(evaluateRules(cfg, {}, 40, 1000).triggered.length, 0, "a fresh tier inside the reset band waits for a side");
+  assert.equal(evaluateRules(cfg, {}, 39.6, 1000).triggered.length, 0);
+
+  let now = 100000, premium = 45;
+  const sent = [];
+  const directory = await temporary(t), store = await openStore(directory);
+  const service = createAlertService(store, { clock: () => now, getQuote: async () => point(premium, now), deliver: async (_config, text) => { sent.push(text); } });
+  await service.update({ ...cfg, revision: 0 });
+  await service.check(); assert.equal(sent.length, 0);
+  now += 10000; premium = 39.9; await service.check();
+  assert.equal(sent.length, 1); assert.match(sent[0], /cross-40（向下穿越）：≤ 40%/);
+  now += 10000; premium = 39.6; await service.check(); assert.equal(sent.length, 1, "staying below does not repeat");
+  now += 10000; premium = 39.4; await service.check(); assert.equal(sent.length, 1, "leaving the band only rearms the upward side");
+  now += 10000; premium = 40.2; await service.check();
+  assert.equal(sent.length, 2); assert.match(sent[1], /cross-40（向上穿越）：≥ 40%/);
+  assert.deepEqual(service.view().history.map(item => item.rules[0]), ["cross-40（向上穿越）", "cross-40（向下穿越）"]);
+  assert.deepEqual(service.view().ruleStates["cross-40"].sides, { above: false, below: false });
+  const restarted = createAlertService(await openStore(directory), { clock: () => now, getQuote: async () => point(premium, now), deliver: async (_config, text) => { sent.push(text); } });
+  now += 10000; await restarted.check(); assert.equal(sent.length, 2, "restart keeps both sides' delivery state");
+  await restarted.update({ ...cfg, rules: [rule("cross-40", 40)], revision: 1 });
+  assert.deepEqual(restarted.view().ruleStates["cross-40"], freshRuleState(), "changing direction starts a fresh one-way tier");
+});
+
+test("two-way tiers: both directions crossed during cooldown, uncertain delivery and re-enabling", async () => {
+  let now = 100000, premium = 39;
+  const sent = [];
+  let failure = null;
+  const cfg = { ...config([rule("cross", 40, "both")]), hysteresis: 0.5, cooldownSeconds: 60 };
+  const service = createAlertService(memoryStore(), { clock: () => now, getQuote: async () => point(premium, now), deliver: async (_config, text) => { sent.push(text); if (failure) throw failure; } });
+  await service.update({ ...cfg, revision: 0 });
+  await service.check();
+  now += 10000; premium = 40.6; await service.check(); assert.equal(sent.length, 1);
+  for (const value of [39.4, 40.6]) { now += 10000; premium = value; await service.check(); }
+  assert.equal(sent.length, 1, "cooldown holds both later crossings");
+  now += 40000; premium = 40; await service.check();
+  assert.equal(sent.length, 2); assert.match(sent[1], /向上穿越/); assert.match(sent[1], /向下穿越/);
+
+  failure = Object.assign(new Error("timeout"), { uncertain: true });
+  now += 60000; premium = 39.4; await service.check();
+  now += 10000; premium = 40.1; await service.check();
+  assert.equal(sent.length, 3); assert.deepEqual(service.view().ruleStates.cross.sides, { above: false, below: false }, "an uncertain send counts as delivered");
+  now += 60000; premium = 40.6; await service.check(); assert.equal(sent.length, 3, "no resend while the premium stays above");
+  assert.deepEqual(service.view().ruleStates.cross.sides, { above: false, below: true }, "the other side still arms independently");
+
+  failure = null;
+  await service.update({ ...cfg, enabled: false, revision: 1 });
+  await service.update({ ...cfg, revision: 2 });
+  now += 60000; premium = 39; await service.check(); assert.equal(sent.length, 3, "re-enabling starts fresh and reports nothing on the current side");
+});
+
+test("two-way rule state on disk must keep boolean sides", async t => {
+  const directory = await temporary(t), store = await openStore(directory);
+  const state = initialState();
+  state.config = config([rule("cross", 40, "both")]);
+  state.ruleStates = { cross: { ...freshRuleState("both"), sides: { above: true } } };
+  await store.save(state);
+  await assert.rejects(openStore(directory), /无法读取告警状态文件/);
+  state.ruleStates.cross.sides.below = false;
+  await store.save(state);
+  assert.deepEqual((await openStore(directory)).get().ruleStates.cross.sides, { above: true, below: false });
+});
+
 test("delivered tiers rearm only beyond hysteresis and respect cooldown", () => {
   const cfg = { ...config([rule("up", 40)]), hysteresis: 0.5, cooldownSeconds: 60 };
   const states = { up: { armed: false, lastSentAt: 1000, lastAttemptAt: 1000 } };
