@@ -1228,3 +1228,118 @@ test('four-leg per-leg opens balance each symbol across venues so one venue unit
   const preview = await f.preview(intent({ preset: 'four-leg', batchCount: 1, legs: legs('20', '200') }));
   assert.match(preview.notes[0], /逐腿数量：多头合计 4 桶，空头合计 4 桶。/);
 });
+
+// Recorded history from an earlier version: the table predates any index.
+function historyFixture(t, finished, { cached = false } = {}) {
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL)');
+  const leg = (id, exchange, side) => ({ id, exchange, symbol: 'CLUSDT', side, orderSide: side === 'long' ? 'buy' : 'sell', quantity: '20', stopPrice: side === 'long' ? '90' : '50', batchQuantities: Array(20).fill('1') });
+  const job = (id, status, at) => ({ id, status, createdAt: new Date(baseTime + at).toISOString(), updatedAt: new Date(baseTime + at).toISOString(), deadlineAt: new Date(baseTime + at + 60_000).toISOString(),
+    batchIndex: 20, phase: 0, totals: [leg('a', 'binance', 'long'), leg('b', 'bybit', 'short')], plan: { market: 'oil', preset: 'cross-exchange', action: 'open', batchCount: 20, legs: [leg('a', 'binance', 'long'), leg('b', 'bybit', 'short')] },
+    events: Array.from({ length: 40 }, (_, i) => ({ time: new Date(baseTime + at).toISOString(), message: `history event ${i}` })) });
+  const insert = db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)');
+  // Unfinished jobs are the oldest rows and share timestamps with history, so a shared cap or an unstable order would surface.
+  insert.run('paused-old', JSON.stringify(job('paused-old', 'paused', 0)));
+  insert.run('legacy-status', JSON.stringify(job('legacy-status', 'legacy-unknown', 0)));
+  insert.run('missing-status', JSON.stringify(job('missing-status', undefined, 0)));
+  insert.run('attention-old', JSON.stringify(job('attention-old', 'attention', 0)));
+  for (let i = 0; i < finished; i++) insert.run(`done-${i}`, JSON.stringify(job(`done-${i}`, i % 3 ? 'completed' : 'stopped', Math.floor(i / 2))));
+  let rows = 0;
+  const count = (statement, method) => (...args) => { const value = statement[method](...args); rows += Array.isArray(value) ? value.length : value ? 1 : 0; return value; };
+  const stmt = { prepare(sql) {
+    const statement = db.prepare(sql);
+    return /^\s*SELECT[\s\S]*FROM execution_jobs/i.test(sql) ? { all: count(statement, 'all'), get: count(statement, 'get'), run: (...args) => statement.run(...args) } : statement;
+  } };
+  const service = createTradingExecution({ db, stmt: cached ? undefined : stmt, now: () => baseTime + 3_600_000, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: () => ({}) });
+  t.after(async () => { await service.close(); db.close(); });
+  return { db, service, read(fn) { rows = 0; const value = fn(); return { value, rows }; } };
+}
+
+test('tick and state read only unfinished jobs and the newest finished page however long the history grows', async t => {
+  const results = [];
+  for (const finished of [200, 400]) {
+    const f = historyFixture(t, finished);
+    const all = f.db.prepare('SELECT json FROM execution_jobs').all().map(row => JSON.parse(row.json));
+    const sorted = all.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const expected = [...sorted.filter(job => !['completed', 'stopped'].includes(job.status)), ...sorted.filter(job => ['completed', 'stopped'].includes(job.status)).slice(0, 30)].map(job => job.id);
+    const before = f.read(() => f.service.state());
+    assert.deepEqual(before.value.jobs.map(job => job.id), expected, `${finished} finished jobs`);
+    assert.equal(before.value.jobs.find(job => job.id === 'missing-status')?.status, undefined);
+    assert.ok(before.value.jobs.some(job => job.id === 'missing-status'), 'a missing JSON status is unfinished through the IS NULL branch');
+    const tick = f.read(() => f.service.tick()); await tick.value;
+    // The attention job is still reconciled: it settles with no open orders.
+    const after = f.service.state().jobs;
+    assert.equal(after.find(job => job.id === 'attention-old').status, 'paused');
+    assert.deepEqual(after.filter(job => !['completed', 'stopped'].includes(job.status)).map(job => job.id).sort(), ['attention-old', 'legacy-status', 'missing-status', 'paused-old']);
+    results.push({ state: before.rows, tick: tick.rows, indexes: f.db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='index' AND tbl_name='execution_jobs' AND sql IS NOT NULL").get().n });
+  }
+  assert.equal(results[0].state, results[1].state, 'state reads do not grow with finished history');
+  assert.equal(results[0].tick, results[1].tick, 'tick reads do not grow with finished history');
+  assert.ok(results[1].state <= 4 + 30 + 4, `state read ${results[1].state} job rows`);
+  assert.ok(results[1].tick <= 4 + 20, `tick read ${results[1].tick} job rows`);
+  assert.ok(results.every(result => result.indexes >= 2), 'startup adds the history indexes to an existing table');
+});
+
+test('indexed job reads recreate a missing index for both cached and freshly prepared statements', async t => {
+  for (const cached of [false, true]) await t.test(cached ? 'cached' : 'fresh', async t => {
+    const f = historyFixture(t, 40, { cached });
+    const expected = f.service.state().jobs.map(job => job.id), exec = f.db.exec;
+    let repairs = 0;
+    f.db.exec = sql => { if (/CREATE INDEX IF NOT EXISTS execution_jobs_/.test(sql)) repairs++; return exec.call(f.db, sql); };
+    try {
+      for (const index of ['execution_jobs_unfinished', 'execution_jobs_finished']) {
+        f.db.exec(`DROP INDEX ${index}`);
+        assert.deepEqual(f.service.state().jobs.map(job => job.id), expected);
+        assert.ok(f.db.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(index), index);
+      }
+      assert.equal(repairs, 2, 'each missing index triggers one idempotent repair');
+      await f.service.tick();
+    } finally { f.db.exec = exec; }
+  });
+});
+
+test('missing job index recovery retries only once and leaves other database errors untouched', t => {
+  const f = historyFixture(t, 40), prepare = f.db.prepare, exec = f.db.exec;
+  let failure = new Error('no such index: execution_jobs_unfinished'), reads = 0, repairs = 0;
+  f.db.prepare = sql => {
+    if (sql.includes('INDEXED BY execution_jobs_unfinished')) { reads++; throw failure; }
+    return prepare.call(f.db, sql);
+  };
+  f.db.exec = sql => { if (/CREATE INDEX IF NOT EXISTS execution_jobs_/.test(sql)) repairs++; return exec.call(f.db, sql); };
+  try {
+    assert.throws(() => f.service.state(), error => error === failure);
+    assert.equal(reads, 2); assert.equal(repairs, 1);
+    failure = new Error('disk I/O error'); reads = 0; repairs = 0;
+    assert.throws(() => f.service.state(), error => error === failure);
+    assert.equal(reads, 1); assert.equal(repairs, 0);
+  } finally { f.db.prepare = prepare; f.db.exec = exec; }
+});
+
+test('close releases its lease even when either unfinished job query fails', async t => {
+  for (const failAt of [1, 2]) await t.test(`query ${failAt}`, async t => {
+    const f = historyFixture(t, 0), prepare = f.db.prepare, failure = new Error('job read failed');
+    let reads = 0;
+    f.db.prepare = sql => {
+      if (sql.includes('INDEXED BY execution_jobs_unfinished') && ++reads === failAt) throw failure;
+      return prepare.call(f.db, sql);
+    };
+    try { await assert.rejects(f.service.close(), error => error === failure); }
+    finally { f.db.prepare = prepare; }
+    assert.equal(f.db.prepare('SELECT count(*) AS n FROM execution_lease').get().n, 0);
+    await f.service.close();
+  });
+});
+
+test('lease takeover clears every finished job lock and preserves unfinished or orphan locks', async t => {
+  const f = await fixture(t), old = f.service;
+  const insertJob = f.db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)');
+  for (const [id, status] of [['done', 'completed'], ['stopped', 'stopped'], ['paused', 'paused'], ['legacy', 'legacy-unknown'], ['missing-status', undefined]]) insertJob.run(id, JSON.stringify({ id, status }));
+  const insertLock = f.db.prepare('INSERT INTO execution_locks(resource,job_id) VALUES (?,?)');
+  for (const [resource, job] of [['done-a', 'done'], ['done-b', 'done'], ['stopped', 'stopped'], ['paused', 'paused'], ['legacy', 'legacy'], ['missing-status', 'missing-status'], ['orphan', 'orphan']]) insertLock.run(resource, job);
+  f.db.prepare('UPDATE execution_lease SET expires=0').run();
+  f.service = f.create();
+  assert.deepEqual(f.db.prepare('SELECT resource FROM execution_locks ORDER BY resource').all().map(row => row.resource), ['legacy', 'missing-status', 'orphan', 'paused']);
+  const successor = f.db.prepare('SELECT owner FROM execution_lease').get().owner;
+  await old.close();
+  assert.equal(f.db.prepare('SELECT owner FROM execution_lease').get().owner, successor, 'the former owner cannot release the successor lease');
+});

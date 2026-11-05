@@ -22,6 +22,15 @@ const VENUE_CLOCK_TOLERANCE_MS = 300_000;
 const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
 // Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
 const CONNECT_SYMBOLS = EXECUTION_MARKETS.oil.symbols;
+// Finished jobs are history. Every other status, including a missing or
+// unknown one, is unfinished and always read in full for recovery.
+const JOB_STATUS = "json_extract(json,'$.status')", JOB_CREATED = "json_extract(json,'$.createdAt')";
+const FINAL_SQL = [...FINAL].map(status => `'${status}'`).join(',');
+const UNFINISHED_JOB = `(${JOB_STATUS} IS NULL OR ${JOB_STATUS} NOT IN (${FINAL_SQL}))`, FINISHED_JOB = `${JOB_STATUS} IN (${FINAL_SQL})`;
+const FINISHED_JOB_PAGE = 30;
+const JOB_INDEXES_SQL = `
+  CREATE INDEX IF NOT EXISTS execution_jobs_unfinished ON execution_jobs(${JOB_CREATED}) WHERE ${UNFINISHED_JOB};
+  CREATE INDEX IF NOT EXISTS execution_jobs_finished ON execution_jobs(${JOB_CREATED}) WHERE ${FINISHED_JOB};`;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
 const validRevision = value => Number.isSafeInteger(value) && value >= 0;
@@ -40,6 +49,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   db.exec(`
     CREATE TABLE IF NOT EXISTS execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT);
     CREATE TABLE IF NOT EXISTS execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL);
+    ${JOB_INDEXES_SQL}
     CREATE TABLE IF NOT EXISTS execution_orders (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS execution_orders_job ON execution_orders(job_id);
     CREATE TABLE IF NOT EXISTS execution_previews (id TEXT PRIMARY KEY, session TEXT NOT NULL, expires INTEGER NOT NULL, json TEXT NOT NULL, consumed TEXT);
@@ -66,6 +76,20 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     return stmt.prepare('SELECT * FROM execution_accounts WHERE exchange=?').get(exchange);
   };
   const jobs = () => stmt.prepare('SELECT json FROM execution_jobs').all().map(row => JSON.parse(row.json));
+  // SQLite otherwise favours a rowid table scan to preserve insertion order,
+  // evaluating JSON status across all history. INDEXED BY forces the partial
+  // indexes; rowid ordering still keeps tick and restart processing stable.
+  const indexedJobRows = (sql, ...args) => {
+    const read = () => stmt.prepare(sql).all(...args);
+    try { return read(); }
+    catch (error) {
+      if (!/^no such index: execution_jobs_(unfinished|finished)$/.test(error?.message)) throw error;
+      db.exec(JOB_INDEXES_SQL);
+      return read();
+    }
+  };
+  const unfinishedJobs = () => indexedJobRows(`SELECT json FROM execution_jobs INDEXED BY execution_jobs_unfinished WHERE ${UNFINISHED_JOB} ORDER BY rowid`).map(row => JSON.parse(row.json));
+  const finishedJobs = limit => indexedJobRows(`SELECT json FROM execution_jobs INDEXED BY execution_jobs_finished WHERE ${FINISHED_JOB} ORDER BY ${JOB_CREATED} DESC, rowid LIMIT ?`, limit).map(row => JSON.parse(row.json));
   const jobFor = id => { const row = stmt.prepare('SELECT json FROM execution_jobs WHERE id=?').get(id); if (!row) throw new ExecutionError(404, '执行任务不存在'); return JSON.parse(row.json); };
   const accountIdentity = (exchange, id) => id ? { authority: exchange, environment: 'mainnet', accountId: id } : null;
   const jobExchanges = job => [...new Set([...(job.totals || []), ...job.plan.legs].map(leg => leg.exchange))];
@@ -230,8 +254,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       stmt.prepare('INSERT INTO execution_lease(id,owner,expires) VALUES (1,?,?) ON CONFLICT(id) DO UPDATE SET owner=excluded.owner,expires=excluded.expires').run(owner, now() + LEASE_TTL);
       heldLease = true;
       if (!wasLeader || (row && row.expires <= now())) {
-        for (const job of jobs()) if (ACTIVE.has(job.status)) pause(job.id, '服务恢复：已暂停后续下单，正在核对并撤销未结束委托');
-        for (const job of jobs()) if (FINAL.has(job.status)) stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(job.id);
+        for (const job of unfinishedJobs()) if (ACTIVE.has(job.status)) pause(job.id, '服务恢复：已暂停后续下单，正在核对并撤销未结束委托');
+        for (const { job_id: jobId } of stmt.prepare('SELECT DISTINCT job_id FROM execution_locks').all()) {
+          const row = stmt.prepare('SELECT json FROM execution_jobs WHERE id=?').get(jobId);
+          if (row && FINAL.has(JSON.parse(row.json).status)) stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(jobId);
+        }
       }
       return true;
     });
@@ -293,7 +320,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (!row.snapshot) return [];
       const snapshot = JSON.parse(row.snapshot);
       return snapshot.account.positions.map(position => ({ exchange: row.exchange, ...position, fetchedAt: snapshot.symbolsAt?.[position.symbol] ?? snapshot.at }));
-    }), jobs: (() => { const sorted = jobs().sort((a, b) => b.createdAt.localeCompare(a.createdAt)); return [...sorted.filter(job => !FINAL.has(job.status)), ...sorted.filter(job => FINAL.has(job.status)).slice(0, 30)].map(publicJob); })() };
+    }), jobs: [...unfinishedJobs().sort((a, b) => b.createdAt.localeCompare(a.createdAt)), ...finishedJobs(FINISHED_JOB_PAGE)].map(publicJob) };
   }
   function checkAvailable(exchange, revision) {
     writable();
@@ -791,7 +818,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (!acquire()) return Promise.resolve();
     // Unconfirmed jobs are re-read at a low rate until every order settles.
     const due = job => ACTIVE.has(job.status) || job.status === 'attention' && now() - (attentionChecks.get(job.id) ?? 0) >= ATTENTION_RETRY_MS;
-    const selected = jobs().filter(due);
+    const selected = unfinishedJobs().filter(due);
     for (const job of selected) if (job.status === 'attention') attentionChecks.set(job.id, now());
     ticking = Promise.allSettled(selected.map(job => runJob(job.id))).finally(() => { ticking = null; });
     return ticking;
@@ -832,11 +859,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       let ownsLease = false;
       try { requireLease(); ownsLease = true; } catch { /* The current owner handles recovery. */ }
-      if (ownsLease) for (const job of jobs()) if (ACTIVE.has(job.status)) { try { pause(job.id, '服务关闭：暂停后续交易并撤销余单'); } catch (error) { if (!accountWriter) throw error; } }
       const timeout = setTimeout(() => { for (const controller of controllers) controller.abort(); }, 8000); timeout.unref?.();
       try {
+        if (ownsLease) for (const job of unfinishedJobs()) if (ACTIVE.has(job.status)) { try { pause(job.id, '服务关闭：暂停后续交易并撤销余单'); } catch (error) { if (!accountWriter) throw error; } }
         await Promise.allSettled([...(ticking ? [ticking] : []), ...pending]);
-        if (ownsLease) await Promise.allSettled(jobs().filter(job => job.status === 'stopping').map(job => runJob(job.id)));
+        if (ownsLease) await Promise.allSettled(unfinishedJobs().filter(job => job.status === 'stopping').map(job => runJob(job.id)));
       } finally { clearTimeout(timeout); closed = true; writerTickets.clear(); recoveredWriterJobs.clear(); stmt.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner); }
     } };
 }
