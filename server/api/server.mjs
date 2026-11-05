@@ -320,7 +320,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
-    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/modules' || pathname === '/api/system/host') {
+    if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/modules' || pathname === '/api/system/host' || pathname === '/api/system/event-loop') {
       if (req.method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取基线');

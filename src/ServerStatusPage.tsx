@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { CircleAlert, Clock, Cpu, HardDrive, LoaderCircle, MemoryStick, RefreshCw } from 'lucide-react';
+import { Activity, CircleAlert, Clock, Cpu, HardDrive, LoaderCircle, MemoryStick, RefreshCw } from 'lucide-react';
 import { api, ApiError } from './api';
-import type { HostStatus } from './server-status-types';
-import { formatBytes, formatUptime, hostLevel } from './server-status-types';
+import type { EventLoopStatus, HostStatus } from './server-status-types';
+import { formatBytes, formatUptime, hostLevel, lagLevel } from './server-status-types';
 import './aero-lp.css';
 import './server-status.css';
 
@@ -23,10 +23,31 @@ function Card({ icon, title, percent, suffix, children }: { icon: ReactNode; tit
   </section>;
 }
 const Row = ({ label, value }: { label: string; value: ReactNode }) => <><dt>{label}</dt><dd>{value}</dd></>;
+const ms = (value: number | null) => value == null ? '—' : `${value.toLocaleString('zh-CN')} ms`;
+
+function EventLoopCard({ status, error }: { status: EventLoopStatus | null; error: string }) {
+  const title = '数据面卡顿';
+  const stallMs = status?.stallThresholdMs ?? 200;
+  const tone = lagLevel(status?.lastMinute.maxMs, stallMs);
+  return <section className={`panel ss-card ${tone}`} aria-label={title}>
+    <div className="ss-title"><Activity size={16} />{title}</div>
+    {!status ? <span className="ss-unavailable">{error ? `读取失败：${error}` : '正在读取'}</span> : <>
+      <div className="ss-value">{ms(status.lastMinute.maxMs)}<small>最近 1 分钟最大</small></div>
+      <dl className="ss-details">
+        <Row label="最近 5 分钟最大" value={ms(status.lastFiveMinutes.maxMs)} />
+        <Row label={`最近 5 分钟 ≥ ${stallMs} ms`} value={`${status.lastFiveMinutes.stalls} 次`} />
+        {status.recentStalls.slice(0, 3).map(stall => <Row key={stall.endedAt + stall.durationMs} label={`${time.format(Date.parse(stall.endedAt))} 结束`} value={ms(stall.durationMs)} />)}
+      </dl>
+      <p className="ss-note">采集、行情 WS 与研究共用数据面一个线程，卡顿期间收到的行情和请求都要排队。{error ? `最新读取失败：${error}，显示上次结果。` : ''}</p>
+    </>}
+  </section>;
+}
 
 export default function ServerStatusPage({ onExpired }: { onExpired: () => void }) {
   const [status, setStatus] = useState<HostStatus | null>(null);
   const [error, setError] = useState('');
+  const [loop, setLoop] = useState<EventLoopStatus | null>(null);
+  const [loopError, setLoopError] = useState('');
   const [loading, setLoading] = useState(false);
   const lifetime = useRef<AbortController | null>(null);
   // Bound to the lifetime that started it, so a remount (StrictMode) is not blocked by the aborted read.
@@ -35,8 +56,17 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
     const signal = lifetime.current?.signal;
     if (!signal || signal.aborted || inFlight.current === signal) return;
     inFlight.current = signal; setLoading(true);
-    try { const data = await api<HostStatus>('/api/system/host', { signal, timeoutMs: 10_000 }); if (!signal.aborted) { setStatus(data); setError(''); } }
-    catch (reason) { if (!signal.aborted) { if (reason instanceof ApiError && reason.status === 401) onExpired(); else setError(message(reason)); } }
+    // The data plane answers the event-loop read; host status still shows while it is down.
+    const [host, lag] = await Promise.allSettled([
+      api<HostStatus>('/api/system/host', { signal, timeoutMs: 10_000 }),
+      api<EventLoopStatus>('/api/system/event-loop', { signal, timeoutMs: 10_000 }),
+    ]);
+    try {
+      if (signal.aborted) return;
+      if ([host, lag].some(result => result.status === 'rejected' && result.reason instanceof ApiError && result.reason.status === 401)) { onExpired(); return; }
+      if (host.status === 'fulfilled') { setStatus(host.value); setError(''); } else setError(message(host.reason));
+      if (lag.status === 'fulfilled') { setLoop(lag.value); setLoopError(''); } else setLoopError(message(lag.reason));
+    }
     finally { if (inFlight.current === signal) inFlight.current = null; if (!signal.aborted) setLoading(false); }
   }, [onExpired]);
   useEffect(() => {
@@ -50,7 +80,7 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
 
   const swap = status?.memory.swap;
   return <div className="lp-page">
-    <header className="lp-heading"><div><h1>服务器状态</h1><p>工作台所在服务器的 CPU、内存与磁盘，页面打开时每 5 秒刷新</p></div><div className="lp-toolbar">
+    <header className="lp-heading"><div><h1>服务器状态</h1><p>工作台所在服务器的 CPU、内存、磁盘与数据面卡顿，页面打开时每 5 秒刷新</p></div><div className="lp-toolbar">
       {status ? <span className="ss-meta">读取于 {time.format(Date.parse(status.generatedAt))}</span> : null}
       <button className="button secondary" disabled={loading} onClick={() => void read()}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
     </div></header>
@@ -69,6 +99,7 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
         : <Card key={disk.id} icon={<HardDrive size={16} />} title={disk.label} percent={disk.usedPercent} suffix={`已用 · 剩余 ${formatBytes(disk.availableBytes)}`}>
           <Row label="已用 / 总量" value={`${formatBytes(disk.usedBytes)} / ${formatBytes(disk.totalBytes)}`} />
         </Card>)}
+      <EventLoopCard status={loop} error={loopError} />
       <section className="panel ss-card" aria-label="运行时间"><div className="ss-title"><Clock size={16} />运行时间</div>
         <div className="ss-value">{formatUptime(status.uptimeSeconds)}</div>
         <dl className="ss-details"><Row label="开机于" value={bootTime.format(Date.parse(status.generatedAt) - status.uptimeSeconds * 1000)} /></dl>
