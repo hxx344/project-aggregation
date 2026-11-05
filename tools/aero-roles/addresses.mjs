@@ -1,6 +1,6 @@
 // Base 主网上 Safe、Zodiac Roles v2 与 Aero Slipstream（新工厂）的固定地址。
-// 来源与核实记录见 docs/aero-safe-roles-permissions-2026-11-04.md 第 2 节：签名目标与授权对象只取自这里，
-// 不从 RPC 或配置文件读取，RPC 被篡改时也不会把权限授给别的合约。
+// 来源与核实记录见 docs/aero-safe-roles-permissions-2026-11-04.md 第 2 节。协议合约（NPM、Router、Roles、MultiSend）只取自这里；
+// gauge 与代币地址来自配置，plan 靠 RPC 读回的字节码与关联读数判断真伪，所以 plan 必须用可信 RPC。
 export const BASE_CHAIN_ID = 8453;
 
 export const SAFE = {
@@ -27,3 +27,14 @@ export const AERO = {
 };
 
 export const MULTISEND_SELECTOR = '0x8d80ff0a';
+
+// 运行时字节码哈希：2026-11-04 由 mainnet.base.org 与 base-rpc.publicnode.com 分别读取，结果一致。plan 逐个核对。
+export const CODEHASH = {
+  [SAFE.singletonL2]: '0xb1f926978a0f44a2c0ec8fe822418ae969bd8c3f18d61e5103100339894f81ff',
+  [SAFE.multiSendCallOnly]: '0xecd5bd14a08c5d2122379900b2f272bdf107a7e92423c10dd5fe3254386c9939',
+  [SAFE.fallbackHandler]: '0x7c6007a5d711cea8dfd5d91f5940ec29c7f200fe511eb1fc1397b367af3c42f9',
+  [ROLES.mastercopy]: '0x471d8b3b419f1eb955230c0326c8812176df49bf3c7b414a563fda5a3c6c10b6',
+  [ROLES.moduleProxyFactory]: '0x01623cbcf010a1c326230f1b2d5f48a66b440232ee49096102bc84967dc5f21e',
+  [ROLES.multiSendUnwrapper]: '0x1f6e088be5e6ef9d0fbe0547d3fa9a9e40d823433fd8a4449215b5663209a1eb',
+  [ROLES.avatarIsOwnerOfErc721]: '0x0ddd815113052bfe0318baabf72fccd8edad78181cb484e4879a7e3c7bab36f6',
+};

@@ -1,6 +1,6 @@
 # Aero 市场实盘：Safe + Zodiac Roles 权限清单（v0.2）
 
-日期：2026-11-04　状态：首版工具已实现（`tools/aero-roles/`），Base fork 验收 56/56 通过（第 8 节）；未在主网部署，工作台执行器尚未接入（第 9 节）。
+日期：2026-11-04　状态：首版工具已实现（`tools/aero-roles/`），Base fork 验收 64/64 通过（第 8 节）；未在主网部署，工作台执行器尚未接入（第 9 节）。
 
 v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版不授权 `increaseLiquidity`；Safe 必须设置 CompatibilityFallbackHandler；额度键与部署步骤改为 `tools/aero-roles` 的实际实现。
 
@@ -132,6 +132,7 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 - 每个代币一个额度键（实现为 `keccak256("aero-roles:turnover:" + 小写代币地址)`），mint 的 desired 金额与 swap 的 `amountIn` 共用同一个键，按 24 小时补充。池白名单的每个 `Or` 分支固定了代币地址，分支内的金额字段直接挂对应代币的额度键。
 - `mint` 的 desired 是上限，实际投入可能更少，额度按 desired 扣，偏保守。
 - `increaseLiquidity` 的参数里没有代币地址，无法按代币取额度键：首版不授权（已定），调仓一律"平仓 + 新开仓"。
+- 补充规则：从部署时刻起每满 24 小时整段补满，不是滚动窗口；跨过补充时刻前后各花一次，短时间内最多用掉 2 × 日额度，第 6 节的损失上限按此计。
 - 上限取预期日周转额的 2 倍左右；超限时 bot 交易 revert，策略停在当前状态，等管理钱包调额度或次日补充。
 - 可选：`CallWithinAllowance` 限制每日 swap 笔数，防止"小额多次"消耗。
 
@@ -139,7 +140,7 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 | 风险 | 上限 / 缓解 |
 | --- | --- |
-| 白名单池内不利成交：swap 设 `amountOutMinimum = 0` 后被夹，或先操纵价格再 mint / decrease | 损失上限 ≈ 当日额度 × 价格偏离；只放深池；出账与成交偏离告警。Roles v2 不能直接比对预言机价格，链上价格校验需另写自定义条件合约并审计，首版不做 |
+| 白名单池内不利成交：swap 设 `amountOutMinimum = 0` 后被夹，或先操纵价格再 mint / decrease | 损失上限 ≈ 2 × 日额度 × 价格偏离（补充边界前后各用一次，第 5 节）；只放深池；出账与成交偏离告警。Roles v2 不能直接比对预言机价格，链上价格校验需另写自定义条件合约并审计，首版不做 |
 | 打乱策略：反复开平仓、解押损失排放、`emergencyWithdraw` | 只损失收益和 bot 自己的 gas，本金仍在 Safe；发现后撤销角色 |
 | bot EOA 里的 ETH | 只放够几天 gas 的量 |
 | Roles 配置错误（例如漏了某个 `EqualToAvatar`） | 第 8 节的反向用例在 fork 上逐条验证后才启用；清单与配置从同一份 JSON 生成 |
@@ -164,12 +165,15 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 - 非白名单池的 `mint` / swap；`sqrtPriceX96 ≠ 0`；超额度；`value > 0`；delegatecall 到 MultiSend 以外的地址；MultiSend 内层 delegatecall。
 - 撤销角色后，bot 的任意调用。
 
-结果（2026-11-04，Base 区块约 53532400，`node tools/aero-roles/fork-test.mjs`，anvil 只监听 127.0.0.1）：56/56 通过。
-- 部署批次 27 笔经 MultiSendCallOnly 一次执行（gas 约 265 万）；Roles 实际地址与 `plan` 预测一致；`plan` 拒绝没有 fallback handler 的 Safe。
-- 上列正向流程全部成功（示例池 RSGP/USDC ts100、AERO→USDC ts200）；`mint` 按 `amount1Desired` 扣减额度。
-- 上列反向用例与额外用例（非成员地址、Safe / Roles 自身函数、MultiSend 夹带禁止调用、已质押 tokenId 的 `decreaseLiquidity`、`claimReferralEmissions`）全部由 Roles 权限拒绝（`ConditionViolation` / `NoMembership` / `NotAuthorized`），不是下游合约自身失败；本地签名前校验对每个用例的结论与链上一致。
+结果（2026-11-04，Base 区块 53532961，`node tools/aero-roles/fork-test.mjs`，anvil 只监听 127.0.0.1）：64/64 通过。
+- 配置为示例池 RSGP/USDC ts100 再加 AERO/USDC ts200，`mint` 与 `NPM.approve` 的条件是两分支 `Or`，两个分支都在链上执行过。
+- `plan` 通过真实 Safe 的核对，并拒绝：没有 fallback handler、owner 不是指定硬件钱包、已启用其他模块的 Safe。
+- 部署批次经 MultiSendCallOnly 一次执行；Roles 实际地址与 `plan` 预测一致。
+- 上列正向流程全部成功（两个池各开一仓、质押、两种 `claimEmissions`、解押、同批平两仓、AERO→USDC）；`mint` 按 `amount1Desired` 扣减额度；`claimEmissions` 到账的是 AERO。
+- 上列反向用例与额外用例（非成员地址、Safe / Roles 自身函数、MultiSend 夹带禁止调用、同批两笔 mint 合计超额、已质押 tokenId 的 `decreaseLiquidity`、`claimReferralEmissions`、3 参数 `claimEmissions` 的外部 recipient）全部由 Roles 以写明的期望原因拒绝（`ConditionViolation` 的具体 status / `NoMembership` / `NotAuthorized`），不是下游合约自身失败；本地签名前校验对每个用例的结论与链上一致。
 - 发现：经 Roles 执行兑换时，按 gas 估算值原样发送曾在链上 revert，加 30% 余量后通过（原因未确认）；执行器需给 gas 留余量。
-- 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测、额度跨日补充。
+- 未覆盖：真实硬件钱包签名与 Safe 界面导入批次（JSON 未带 checksum，界面会提示无法校验）、主网小额实测、链上额度跨日补充（本地折算公式有单元测试）。
+- 登记（不影响安全）：calldata 里 int24 / uint160 带高位脏位时，本地按规范化值放行、链上按原始字比较拒绝；`plan` 只用一个 RPC，多 RPC 交叉核对由人工换 RPC 重跑。
 
 ## 9. 工作台侧改动（实施时另立任务）
 

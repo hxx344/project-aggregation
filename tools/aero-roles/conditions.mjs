@@ -46,23 +46,28 @@ export function flatten(root) {
 }
 
 // 本地求值，作为签名前的第二道防线；与链上 Roles 的语义保持一致，任何不认识的节点都判为不通过。
-// ctx：{ avatar, ownerOf(to, tokenId) => Promise<address>, allowance?(key) => Promise<bigint | null> }（null 表示不在本地校验额度）
+// ctx：{ avatar, ownerOf(to, tokenId) => Promise<address>, allowance(key) => Promise<bigint>, spent?: Map<key, bigint> }
+// allowance 返回链上当前可用额度（已按补充规则折算）；缺失或返回 null 判为不通过。spent 为同批次前面几笔已占用的额度。
+// 通过时返回 { ok: true, consumed: [[key, amount]] }，Or 只保留命中分支的消耗，与链上一致。
 export async function evaluate(node, value, ctx, to) {
   switch (node.operator) {
     case Operator.Matches: {
       const fields = Array.from(value);
       if (fields.length !== node.children.length) return fail('field count mismatch');
+      const spent = new Map(ctx.spent ?? []);
+      const consumed = [];
       for (let i = 0; i < fields.length; i++) {
-        const result = await evaluate(node.children[i], fields[i], ctx, to);
+        const result = await evaluate(node.children[i], fields[i], { ...ctx, spent }, to);
         if (!result.ok) return result;
+        for (const [key, amount] of result.consumed) { spent.set(key, (spent.get(key) ?? 0n) + amount); consumed.push([key, amount]); }
       }
-      return OK;
+      return { ok: true, consumed };
     }
     case Operator.Or: {
       const reasons = [];
       for (const child of node.children) {
         const result = await evaluate(child, value, ctx, to);
-        if (result.ok) return OK;
+        if (result.ok) return result;
         reasons.push(result.reason);
       }
       return fail(`no option matched (${reasons.join('; ')})`);
@@ -79,15 +84,17 @@ export async function evaluate(node, value, ctx, to) {
       return same(owner, ctx.avatar) ? OK : fail(`token ${value} is owned by ${owner}, not the Safe`);
     }
     case Operator.WithinAllowance: {
-      const remaining = await ctx.allowance?.(node.compValue);
-      if (remaining == null) return OK;
-      return BigInt(value) <= remaining ? OK : fail(`${value} exceeds remaining allowance ${remaining}`);
+      const remaining = ctx.allowance ? await ctx.allowance(node.compValue) : null;
+      if (remaining == null) return fail('allowance unknown');
+      const available = remaining - (ctx.spent?.get(node.compValue) ?? 0n);
+      const amount = BigInt(value);
+      return amount <= available ? { ok: true, consumed: [[node.compValue, amount]] } : fail(`${value} exceeds remaining allowance ${available}`);
     }
     default:
       return fail(`unsupported operator ${node.operator}`);
   }
 }
 
-const OK = Object.freeze({ ok: true });
+const OK = Object.freeze({ ok: true, consumed: Object.freeze([]) });
 const fail = (reason) => ({ ok: false, reason });
 const same = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();

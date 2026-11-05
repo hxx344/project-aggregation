@@ -22,6 +22,7 @@ export const SAFE_ABI = new Interface([
   'function disableModule(address prevModule, address module)',
   'function isModuleEnabled(address module) view returns (bool)',
   'function getOwners() view returns (address[])',
+  'function getModulesPaginated(address start, uint256 pageSize) view returns (address[] array, address next)',
   'function getThreshold() view returns (uint256)',
   'function VERSION() view returns (string)',
   'function nonce() view returns (uint256)',
@@ -31,6 +32,9 @@ const FACTORY_ABI = new Interface(['function deployModule(address masterCopy, by
 const MULTISEND_ABI = new Interface(['function multiSend(bytes transactions)']);
 // Safe 的 fallback handler 存储槽：keccak256("fallback_manager.handler.address")。
 export const FALLBACK_HANDLER_SLOT = '0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5';
+// Safe 的 guard 存储槽：keccak256("guard_manager.guard.address")。
+export const GUARD_SLOT = '0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8';
+export const MODULES_SENTINEL = '0x0000000000000000000000000000000000000001';
 
 export function rolesInitializer(safe) {
   const params = coder.encode(['address', 'address', 'address'], [safe, safe, safe]); // owner, avatar, target

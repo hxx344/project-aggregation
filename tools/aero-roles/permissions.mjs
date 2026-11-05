@@ -42,7 +42,8 @@ export function normalizeConfig(config) {
   for (const [i, entry] of (config.allowances ?? []).entries()) {
     const token = getAddress(entry.token);
     if (allowances.has(token)) throw new Error(`allowances[${i}]: duplicate token ${token}`);
-    if (!/^[1-9]\d*$/.test(String(entry.perDay))) throw new Error(`allowances[${i}]: perDay must be a positive integer string`);
+    // 必须是字符串：JSON 数字超过 2^53 会先丢精度再通过格式检查。
+    if (typeof entry.perDay !== 'string' || !/^[1-9]\d*$/.test(entry.perDay)) throw new Error(`allowances[${i}]: perDay must be a positive integer string`);
     const perDay = BigInt(entry.perDay);
     if (perDay >= 1n << 128n) throw new Error(`allowances[${i}]: perDay exceeds uint128`);
     allowances.set(token, { token, symbol: String(entry.symbol ?? token.slice(0, 8)), perDay, key: allowanceKey(token) });

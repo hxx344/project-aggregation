@@ -3,15 +3,25 @@
 import { Interface, getAddress } from 'ethers';
 import { evaluate } from './conditions.mjs';
 
-// transactions: [{ to, value?, data }]；ctx: { avatar, ownerOf(to, tokenId), allowance?(key) }
-// 返回 { ok: true } 或 { ok: false, index, reason }。
+// transactions: [{ to, value?, data }]；ctx: { avatar, ownerOf(to, tokenId), allowance(key) }（见 conditions.mjs evaluate）。
+// 同一批次各笔的额度消耗累计计算，与链上 MultiSend 拆包后的校验一致。返回 { ok: true } 或 { ok: false, index, reason }。
 export async function checkTransactions(permissions, transactions, ctx) {
   if (!Array.isArray(transactions) || transactions.length === 0) return { ok: false, index: -1, reason: 'no transactions' };
+  const spent = new Map();
   for (const [index, tx] of transactions.entries()) {
-    const result = await checkOne(permissions, tx, ctx);
+    const result = await checkOne(permissions, tx, { ...ctx, spent });
     if (!result.ok) return { ok: false, index, reason: result.reason };
+    for (const [key, amount] of result.consumed ?? []) spent.set(key, (spent.get(key) ?? 0n) + amount);
   }
   return { ok: true };
+}
+
+// 链上当前可用额度：与 Roles AllowanceTracker._accruedAllowance 相同，每满一个 period 补 refill，最多补到 maxRefill。
+// allowance 为 Roles.allowances(key) 的读数，now 为区块时间（秒），均为 bigint。
+export function accruedAllowance({ refill, maxRefill, period, balance, timestamp }, now) {
+  if (period === 0n || now < timestamp + period || balance >= maxRefill) return balance;
+  const refilled = balance + refill * ((now - timestamp) / period);
+  return refilled < maxRefill ? refilled : maxRefill;
 }
 
 async function checkOne(permissions, tx, ctx) {
@@ -25,7 +35,7 @@ async function checkOne(permissions, tx, ctx) {
   const selector = data.slice(0, 10).toLowerCase();
   const fn = target.functions.find((f) => f.selector === selector);
   if (!fn) return { ok: false, reason: `function ${selector} is not allowed on ${target.label}` };
-  if (!fn.condition) return { ok: true };
+  if (!fn.condition) return { ok: true, consumed: [] };
   let args;
   try { args = new Interface([`function ${fn.signature}`]).decodeFunctionData(fn.signature.slice(0, fn.signature.indexOf('(')), data); } catch (error) {
     return { ok: false, reason: `calldata does not decode as ${fn.signature}: ${error.shortMessage || error.message}` };

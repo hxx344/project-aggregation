@@ -10,13 +10,15 @@ import { Contract, Interface, JsonRpcProvider, JsonRpcSigner, MaxUint256, Networ
 import { AERO, SAFE } from './addresses.mjs';
 import { verifyOnChain } from './cli.mjs';
 import { buildPermissions } from './permissions.mjs';
-import { checkTransactions } from './policy.mjs';
-import { ROLES_ABI, SAFE_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress, prevalidatedSignature, toTransactionBuilderJson } from './roles-calls.mjs';
+import { accruedAllowance, checkTransactions } from './policy.mjs';
+import { MODULES_SENTINEL, ROLES_ABI, SAFE_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress, prevalidatedSignature, toTransactionBuilderJson } from './roles-calls.mjs';
 
 const opts = Object.fromEntries(process.argv.slice(2).reduce((acc, v, i, all) => (i % 2 === 0 ? [...acc, [v.replace(/^--/, ''), all[i + 1]]] : acc), []));
 const FORK_URL = opts['fork-url'] ?? 'https://mainnet.base.org';
 const PORT = 20000 + Math.floor(Math.random() * 20000);
-const config = JSON.parse(readFileSync(new URL('./config.example.json', import.meta.url), 'utf8'));
+// 示例配置再加一个 AERO/USDC 池：mint 与 NPM.approve 的条件变成多分支 Or，正式配置加池后走的就是这条路径。
+const example = JSON.parse(readFileSync(new URL('./config.example.json', import.meta.url), 'utf8'));
+const config = { ...example, pools: [...example.pools, { name: 'AERO/USDC ts200', token0: '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee', token1: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', tickSpacing: 200, gauge: '0x4A3B6A77B545584d870D4A6de446AAc4610c60D5' }] };
 
 const USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const RSGP = '0x44B63aF715D5ef02CC3646a6CE96875e11d69E85';
@@ -24,6 +26,7 @@ const AERO_TOKEN = '0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee';
 const RSGP_POOL = getAddress('0x8e859b6cf564c4ac2b848693c85c496e81dbf6c8');
 const AERO_USDC_POOL = '0xD0Acf293547457Fb4fE9eE32CA93e89497626816';
 const GAUGE = getAddress(config.pools[0].gauge);
+const GAUGE2 = getAddress(config.pools[1].gauge);
 
 const NPM_I = new Interface([
   'function mint((address token0,address token1,int24 tickSpacing,int24 tickLower,int24 tickUpper,uint256 amount0Desired,uint256 amount1Desired,uint256 amount0Min,uint256 amount1Min,address recipient,uint256 deadline,uint160 sqrtPriceX96))',
@@ -44,7 +47,7 @@ const GAUGE_I = new Interface([
   'function deposit(uint256 tokenId)', 'function withdraw(uint256 tokenId)',
   'function depositFor(uint256 tokenId, address owner)', 'function withdrawFrom(uint256 tokenId, address account)',
   'function approve(address operator, uint256 tokenId)', 'function setApprovalForAll(address operator, bool approved)',
-  'function approveForClaim(address operator, bool approved)', 'function claimEmissions(address account, address recipient)',
+  'function approveForClaim(address operator, bool approved)', 'function claimEmissions(address account, address recipient)', 'function claimEmissions(address account, address recipient, uint256[] tokenIds)',
   'function claimReferralEmissions(address referral, address recipient)', 'function stakedContains(address depositor, uint256 tokenId) view returns (bool)',
 ]);
 const ERC20_I = new Interface(['function transfer(address to, uint256 amount) returns (bool)', 'function approve(address spender, uint256 amount) returns (bool)', 'function balanceOf(address) view returns (uint256)']);
@@ -106,19 +109,25 @@ async function run(rpc) {
   const roleKey = permissions.roleKeyBytes;
   const saltNonce = 1n;
   const { roles, transactions } = buildSetupBatch({ permissions, safe, bot: bot.address, saltNonce });
+  const execSafe = (to, data, operation = 0) => send(owner, safe, SAFE_ABI.encodeFunctionData('execTransaction', [to, 0, data, operation, 0, 0, 0, ZeroAddress, ZeroAddress, prevalidatedSignature(owner.address)]));
 
-  try {
-    const lines = await verifyOnChain(rpc, { permissions, safe, bot: bot.address, roles });
-    record('plan', 'plan 链上核对通过（真实 Safe、池子、gauge、代币）', true, `${lines.length} 行摘要`);
-  } catch (error) { record('plan', 'plan 链上核对通过', false, error.message); }
-  try {
-    await verifyOnChain(rpc, { permissions, safe: bareSafe, bot: bot.address, roles: predictRolesAddress(bareSafe, saltNonce) });
-    record('plan', 'plan 拒绝没有 fallback handler 的 Safe', false, '未报错');
-  } catch (error) { record('plan', 'plan 拒绝没有 fallback handler 的 Safe', /fallback handler/.test(error.message), error.message.split('\n')[1]); }
+  const planCase = async (name, args, pattern) => {
+    try {
+      const lines = await verifyOnChain(rpc, { permissions, owner: owner.address, bot: bot.address, ...args });
+      record('plan', name, !pattern, pattern ? '未报错' : `${lines.length} 行摘要`);
+    } catch (error) {
+      record('plan', name, Boolean(pattern?.test(error.message)), error.message.split('\n').slice(1).join(' '));
+    }
+  };
+  await planCase('plan 链上核对通过（真实 Safe、池子、gauge、代币、固定合约字节码）', { safe, roles });
+  await planCase('plan 拒绝没有 fallback handler 的 Safe', { safe: bareSafe, roles: predictRolesAddress(bareSafe, saltNonce) }, /fallback handler/);
+  await planCase('plan 拒绝 owner 不是指定硬件钱包的 Safe', { safe, roles, owner: outsider.address }, /唯一 owner/);
+  await execSafe(safe, SAFE_ABI.encodeFunctionData('enableModule', [outsider.address]));
+  await planCase('plan 拒绝已启用其他模块的 Safe', { safe, roles }, /已启用模块/);
+  await execSafe(safe, SAFE_ABI.encodeFunctionData('disableModule', [MODULES_SENTINEL, outsider.address]));
 
   // 与 Safe{Wallet} 执行 Transaction Builder 批次相同：导出 JSON → MultiSendCallOnly delegatecall。
   const batch = toTransactionBuilderJson({ safe, transactions, name: 'fork', description: 'fork' });
-  const execSafe = (to, data, operation = 0) => send(owner, safe, SAFE_ABI.encodeFunctionData('execTransaction', [to, 0, data, operation, 0, 0, 0, ZeroAddress, ZeroAddress, prevalidatedSignature(owner.address)]));
   const setupReceipt = await execSafe(SAFE.multiSendCallOnly, encodeMultiSend(batch.transactions), 1);
   const rolesContract = new Contract(roles, [...ROLES_ABI.fragments, ...ROLES_VIEW.fragments], rpc);
   const safeContract = new Contract(safe, SAFE_ABI, rpc);
@@ -139,7 +148,8 @@ async function run(rpc) {
   await fund(AERO_TOKEN, AERO_USDC_POOL, parseUnits('100', 18));
   const balanceOf = async (token, who = safe) => ERC20_I.decodeFunctionResult('balanceOf', await rpc.call({ to: token, data: ERC20_I.encodeFunctionData('balanceOf', [who]) }))[0];
   const ownerOf = async (to, tokenId) => { try { return getAddress(NPM_I.decodeFunctionResult('ownerOf', await rpc.call({ to, data: NPM_I.encodeFunctionData('ownerOf', [tokenId]) }))[0]); } catch { return ZeroAddress; } };
-  const allowanceOf = async (key) => (await rolesContract.allowances(key)).balance;
+  const allowanceOf = async (key) => accruedAllowance(await rolesContract.allowances(key), BigInt((await rpc.getBlock('latest')).timestamp));
+  const keyOf = (token) => permissions.allowances.find((a) => a.token === token).key;
   const ctx = { avatar: safe, ownerOf, allowance: allowanceOf };
 
   // 本地与链上各判一次。txs 为 null 的用例只能在链上表达（操作类型），本地不参与。
@@ -163,7 +173,8 @@ async function run(rpc) {
       return null;
     }
   }
-  async function denied(name, txs, data = roleCall(txs), from = bot.address) {
+  // expect：期望的拒绝原因（ConditionViolation 的 status 名，或 NoMembership / NotAuthorized），防止换了原因仍误判为通过。
+  async function denied(name, expect, txs, { data = roleCall(txs), from = bot.address } = {}) {
     if (txs) {
       const local = await checkTransactions(permissions, txs, ctx);
       if (local.ok) return record('deny', name, false, '本地放行');
@@ -173,119 +184,136 @@ async function run(rpc) {
       record('deny', name, false, '链上放行');
     } catch (error) {
       const parsed = error.data ? ROLES_ERRORS.parseError(error.data) : null;
-      if (!parsed && error.data) error.shortMessage = `${error.shortMessage} ${error.data}`;
-      const isPermission = parsed && (['NoMembership', 'NotAuthorized', 'ConditionViolation'].includes(parsed.name));
-      const label = parsed?.name === 'ConditionViolation' ? `ConditionViolation(${STATUS[Number(parsed.args.status)]})` : parsed?.name ?? (error.shortMessage || error.message);
-      record('deny', name, Boolean(isPermission), isPermission ? label : `不是权限拒绝：${label}`);
+      const reason = parsed?.name === 'ConditionViolation' ? STATUS[Number(parsed.args.status)] : parsed?.name;
+      record('deny', name, reason === expect, reason === expect ? reason : `期望 ${expect}，实际 ${reason ?? `${error.shortMessage || error.message} ${error.data ?? ''}`}`);
     }
   }
   const now = async () => BigInt((await rpc.getBlock('latest')).timestamp) + 3600n;
   const tx = (to, iface, fn, args, value) => ({ to, data: iface.encodeFunctionData(fn, args), ...(value ? { value } : {}) });
   const raw = (to, value, data, operation) => ROLES_ABI.encodeFunctionData('execTransactionWithRole', [to, value, data, operation, roleKey, true]);
+  const CLAIM2 = 'claimEmissions(address,address)', CLAIM3 = 'claimEmissions(address,address,uint256[])';
 
-  await denied('非成员地址调用', null, roleCall([tx(RSGP, ERC20_I, 'approve', [AERO.nft, 1n])]), outsider.address);
+  await denied('非成员地址调用', 'NotAuthorized', null, { data: roleCall([tx(RSGP, ERC20_I, 'approve', [AERO.nft, 1n])]), from: outsider.address });
 
   // ---- 授权 ----
-  await denied('USDC transfer 给外部地址', [tx(USDC, ERC20_I, 'transfer', [outsider.address, 1n])]);
-  await denied('AERO transfer 给外部地址', [tx(AERO_TOKEN, ERC20_I, 'transfer', [outsider.address, 1n])]);
-  await denied('USDC approve 给外部地址', [tx(USDC, ERC20_I, 'approve', [outsider.address, MaxUint256])]);
-  await denied('AERO approve 给 NPM（AERO 不是做市币）', [tx(AERO_TOKEN, ERC20_I, 'approve', [AERO.nft, MaxUint256])]);
-  await allowed('approve RSGP/USDC→NPM、AERO→Router（MultiSend）', [
-    tx(RSGP, ERC20_I, 'approve', [AERO.nft, MaxUint256]), tx(USDC, ERC20_I, 'approve', [AERO.nft, MaxUint256]), tx(AERO_TOKEN, ERC20_I, 'approve', [AERO.swapRouter, MaxUint256]),
+  await denied('USDC transfer 给外部地址', 'FunctionNotAllowed', [tx(USDC, ERC20_I, 'transfer', [outsider.address, 1n])]);
+  await denied('AERO transfer 给外部地址', 'FunctionNotAllowed', [tx(AERO_TOKEN, ERC20_I, 'transfer', [outsider.address, 1n])]);
+  await denied('USDC approve 给外部地址', 'OrViolation', [tx(USDC, ERC20_I, 'approve', [outsider.address, MaxUint256])]);
+  await denied('RSGP approve 给 gauge（非 NPM / Router）', 'OrViolation', [tx(RSGP, ERC20_I, 'approve', [GAUGE, MaxUint256])]);
+  await allowed('approve RSGP/USDC/AERO→NPM、AERO→Router（MultiSend）', [
+    tx(RSGP, ERC20_I, 'approve', [AERO.nft, MaxUint256]), tx(USDC, ERC20_I, 'approve', [AERO.nft, MaxUint256]),
+    tx(AERO_TOKEN, ERC20_I, 'approve', [AERO.nft, MaxUint256]), tx(AERO_TOKEN, ERC20_I, 'approve', [AERO.swapRouter, MaxUint256]),
   ]);
 
-  // ---- 建仓 ----
-  const [, tick] = POOL_I.decodeFunctionResult('slot0', await rpc.call({ to: RSGP_POOL, data: POOL_I.encodeFunctionData('slot0') }));
-  const lower = Math.floor(Number(tick) / 100) * 100 - 2000;
-  const mintParams = async (overrides = {}) => ({
-    token0: RSGP, token1: USDC, tickSpacing: 100, tickLower: lower, tickUpper: lower + 4000,
+  // ---- 建仓（两个白名单池，mint 条件是两个分支的 Or）----
+  const rangeOf = async (pool, spacing) => {
+    const [, tick] = POOL_I.decodeFunctionResult('slot0', await rpc.call({ to: pool, data: POOL_I.encodeFunctionData('slot0') }));
+    const lower = Math.floor(Number(tick) / spacing) * spacing - spacing * 20;
+    return { tickLower: lower, tickUpper: lower + spacing * 40 };
+  };
+  const rsgpRange = await rangeOf(RSGP_POOL, 100);
+  const mint = async (o = {}) => tx(AERO.nft, NPM_I, 'mint', [{
+    token0: RSGP, token1: USDC, tickSpacing: 100, ...rsgpRange,
     amount0Desired: parseUnits('100000', 18), amount1Desired: parseUnits('500', 6), amount0Min: 0n, amount1Min: 0n,
-    recipient: safe, deadline: await now(), sqrtPriceX96: 0n, ...overrides,
-  });
-  const mint = async (o) => tx(AERO.nft, NPM_I, 'mint', [await mintParams(o)]);
-  await denied('mint recipient 填外部地址', [await mint({ recipient: outsider.address })]);
-  await denied('mint sqrtPriceX96 ≠ 0（顺带建池）', [await mint({ sqrtPriceX96: 1n << 96n })]);
-  await denied('mint 非白名单池（AERO/USDC ts200）', [await mint({ token0: AERO_TOKEN, token1: USDC, tickSpacing: 200 })]);
-  await denied('mint USDC 超日额度', [await mint({ amount1Desired: BigInt(config.allowances[0].perDay) + 1n })]);
+    recipient: safe, deadline: await now(), sqrtPriceX96: 0n, ...o,
+  }]);
+  const mintedId = (receipt) => receipt.logs.map((l) => (getAddress(l.address) === AERO.nft ? NPM_I.parseLog(l) : null)).find((e) => e?.name === 'Transfer' && getAddress(e.args.to) === safe).args.tokenId;
+  await denied('mint recipient 填外部地址', 'OrViolation', [await mint({ recipient: outsider.address })]);
+  await denied('mint sqrtPriceX96 ≠ 0（顺带建池）', 'OrViolation', [await mint({ sqrtPriceX96: 1n << 96n })]);
+  await denied('mint 非白名单池（AERO/USDC ts100）', 'OrViolation', [await mint({ token0: AERO_TOKEN, token1: USDC, tickSpacing: 100 })]);
+  await denied('mint USDC 超日额度', 'OrViolation', [await mint({ amount1Desired: BigInt(config.allowances[0].perDay) + 1n })]);
   const mintTx = await mint();
-  await denied('mint 附带 value > 0', [{ ...mintTx, value: 1n }], raw(mintTx.to, 1n, mintTx.data, 0));
-  const usdcBefore = await allowanceOf(permissions.allowances.find((a) => a.token === USDC).key);
-  const mintReceipt = await allowed('mint 白名单池，recipient = Safe', [mintTx]);
+  await denied('mint 附带 value > 0', 'SendNotAllowed', [{ ...mintTx, value: 1n }], { data: raw(mintTx.to, 1n, mintTx.data, 0) });
+  const usdcBefore = await allowanceOf(keyOf(USDC));
+  const mintReceipt = await allowed('mint RSGP/USDC，recipient = Safe', [mintTx]);
   if (!mintReceipt) throw new Error('mint failed, cannot continue');
-  const tokenId = mintReceipt.logs.map((l) => (getAddress(l.address) === AERO.nft ? NPM_I.parseLog(l) : null)).find((e) => e?.name === 'Transfer' && getAddress(e.args.to) === safe).args.tokenId;
-  const usdcAfter = await allowanceOf(permissions.allowances.find((a) => a.token === USDC).key);
+  const tokenId = mintedId(mintReceipt);
+  const usdcAfter = await allowanceOf(keyOf(USDC));
   record('allow', `mint 扣减 USDC 额度 = amount1Desired（tokenId ${tokenId}）`, usdcBefore - usdcAfter === parseUnits('500', 6), `${usdcBefore} → ${usdcAfter}`);
+  // 剩余 500 USDC：单笔 300 都在额度内，同批两笔合计 600 超额，链上与本地都必须按合计拒绝。
+  await denied('MultiSend 两笔 mint 合计超日额度', 'OrViolation', [await mint({ amount1Desired: parseUnits('300', 6) }), await mint({ amount1Desired: parseUnits('300', 6) })]);
+
+  const aeroRange = await rangeOf(AERO_USDC_POOL, 200);
+  const mint2Receipt = await allowed('mint AERO/USDC（Or 第二分支），recipient = Safe', [await mint({ token0: AERO_TOKEN, token1: USDC, tickSpacing: 200, ...aeroRange, amount0Desired: parseUnits('20', 18), amount1Desired: parseUnits('50', 6) })]);
+  const tokenId2 = mint2Receipt ? mintedId(mint2Receipt) : null;
 
   // 找一个不属于 Safe 的现存 tokenId。
   let foreign = tokenId - 1n;
   while ((await ownerOf(AERO.nft, foreign)) === ZeroAddress) foreign -= 1n;
 
   // ---- NFT 转出路径 ----
-  await denied('NPM transferFrom 给外部地址', [tx(AERO.nft, NPM_I, 'transferFrom', [safe, outsider.address, tokenId])]);
-  await denied('NPM safeTransferFrom 给外部地址', [tx(AERO.nft, NPM_I, 'safeTransferFrom', [safe, outsider.address, tokenId])]);
-  await denied('NPM setApprovalForAll', [tx(AERO.nft, NPM_I, 'setApprovalForAll', [outsider.address, true])]);
-  await denied('NPM approve 给非白名单地址', [tx(AERO.nft, NPM_I, 'approve', [outsider.address, tokenId])]);
-  await denied('NPM multicall', [tx(AERO.nft, NPM_I, 'multicall', [[NPM_I.encodeFunctionData('burn', [tokenId])]])]);
-  await denied('NPM sweepToken', [tx(AERO.nft, NPM_I, 'sweepToken', [USDC, 0n, outsider.address])]);
-  await denied('collect recipient 填外部地址', [tx(AERO.nft, NPM_I, 'collect', [{ tokenId, recipient: outsider.address, amount0Max: (1n << 128n) - 1n, amount1Max: (1n << 128n) - 1n }])]);
-  await denied(`decreaseLiquidity 非 Safe 的 tokenId ${foreign}`, [tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ tokenId: foreign, liquidity: 1n, amount0Min: 0n, amount1Min: 0n, deadline: await now() }])]);
-  await denied(`collect 非 Safe 的 tokenId ${foreign}`, [tx(AERO.nft, NPM_I, 'collect', [{ tokenId: foreign, recipient: safe, amount0Max: 1n, amount1Max: 1n }])]);
+  await denied('NPM transferFrom 给外部地址', 'FunctionNotAllowed', [tx(AERO.nft, NPM_I, 'transferFrom', [safe, outsider.address, tokenId])]);
+  await denied('NPM safeTransferFrom 给外部地址', 'FunctionNotAllowed', [tx(AERO.nft, NPM_I, 'safeTransferFrom', [safe, outsider.address, tokenId])]);
+  await denied('NPM setApprovalForAll', 'FunctionNotAllowed', [tx(AERO.nft, NPM_I, 'setApprovalForAll', [outsider.address, true])]);
+  await denied('NPM approve 给非白名单地址', 'OrViolation', [tx(AERO.nft, NPM_I, 'approve', [outsider.address, tokenId])]);
+  await denied('NPM multicall', 'FunctionNotAllowed', [tx(AERO.nft, NPM_I, 'multicall', [[NPM_I.encodeFunctionData('burn', [tokenId])]])]);
+  await denied('NPM sweepToken', 'FunctionNotAllowed', [tx(AERO.nft, NPM_I, 'sweepToken', [USDC, 0n, outsider.address])]);
+  await denied('collect recipient 填外部地址', 'ParameterNotAllowed', [tx(AERO.nft, NPM_I, 'collect', [{ tokenId, recipient: outsider.address, amount0Max: (1n << 128n) - 1n, amount1Max: (1n << 128n) - 1n }])]);
+  await denied(`decreaseLiquidity 非 Safe 的 tokenId ${foreign}`, 'CustomConditionViolation', [tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ tokenId: foreign, liquidity: 1n, amount0Min: 0n, amount1Min: 0n, deadline: await now() }])]);
+  await denied(`collect 非 Safe 的 tokenId ${foreign}`, 'CustomConditionViolation', [tx(AERO.nft, NPM_I, 'collect', [{ tokenId: foreign, recipient: safe, amount0Max: 1n, amount1Max: 1n }])]);
 
-  // ---- 质押 ----
+  // ---- 质押（两个 gauge，NPM.approve 的 spender 是两个 gauge 的 Or）----
   await allowed('NPM.approve(gauge) + gauge.deposit（MultiSend）', [tx(AERO.nft, NPM_I, 'approve', [GAUGE, tokenId]), tx(GAUGE, GAUGE_I, 'deposit', [tokenId])]);
+  if (tokenId2) await allowed('NPM.approve(gauge2) + gauge2.deposit（Or 第二分支）', [tx(AERO.nft, NPM_I, 'approve', [GAUGE2, tokenId2]), tx(GAUGE2, GAUGE_I, 'deposit', [tokenId2])]);
   const staked = GAUGE_I.decodeFunctionResult('stakedContains', await rpc.call({ to: GAUGE, data: GAUGE_I.encodeFunctionData('stakedContains', [safe, tokenId]) }))[0];
   record('allow', 'gauge 记录 Safe 质押了该 tokenId', staked);
-  await denied('decreaseLiquidity 已质押（NFT 在 gauge）的 tokenId', [tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ tokenId, liquidity: 1n, amount0Min: 0n, amount1Min: 0n, deadline: await now() }])]);
-  await denied('gauge depositFor', [tx(GAUGE, GAUGE_I, 'depositFor', [tokenId, outsider.address])]);
-  await denied('gauge withdrawFrom', [tx(GAUGE, GAUGE_I, 'withdrawFrom', [tokenId, outsider.address])]);
-  await denied('gauge approve', [tx(GAUGE, GAUGE_I, 'approve', [outsider.address, tokenId])]);
-  await denied('gauge setApprovalForAll', [tx(GAUGE, GAUGE_I, 'setApprovalForAll', [outsider.address, true])]);
-  await denied('gauge approveForClaim', [tx(GAUGE, GAUGE_I, 'approveForClaim', [outsider.address, true])]);
-  await denied('claimEmissions recipient 填外部地址', [tx(GAUGE, GAUGE_I, 'claimEmissions', [safe, outsider.address])]);
-  await denied('claimEmissions account 填外部地址', [tx(GAUGE, GAUGE_I, 'claimEmissions', [outsider.address, safe])]);
-  await denied('gauge claimReferralEmissions', [tx(GAUGE, GAUGE_I, 'claimReferralEmissions', [safe, outsider.address])]);
+  await denied('decreaseLiquidity 已质押（NFT 在 gauge）的 tokenId', 'CustomConditionViolation', [tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ tokenId, liquidity: 1n, amount0Min: 0n, amount1Min: 0n, deadline: await now() }])]);
+  await denied('gauge depositFor', 'FunctionNotAllowed', [tx(GAUGE, GAUGE_I, 'depositFor', [tokenId, outsider.address])]);
+  await denied('gauge withdrawFrom', 'FunctionNotAllowed', [tx(GAUGE, GAUGE_I, 'withdrawFrom', [tokenId, outsider.address])]);
+  await denied('gauge approve', 'FunctionNotAllowed', [tx(GAUGE, GAUGE_I, 'approve', [outsider.address, tokenId])]);
+  await denied('gauge setApprovalForAll', 'FunctionNotAllowed', [tx(GAUGE, GAUGE_I, 'setApprovalForAll', [outsider.address, true])]);
+  await denied('gauge approveForClaim', 'FunctionNotAllowed', [tx(GAUGE, GAUGE_I, 'approveForClaim', [outsider.address, true])]);
+  await denied('claimEmissions recipient 填外部地址', 'ParameterNotAllowed', [tx(GAUGE, GAUGE_I, CLAIM2, [safe, outsider.address])]);
+  await denied('claimEmissions account 填外部地址', 'ParameterNotAllowed', [tx(GAUGE, GAUGE_I, CLAIM2, [outsider.address, safe])]);
+  await denied('claimEmissions(tokenIds) recipient 填外部地址', 'ParameterNotAllowed', [tx(GAUGE, GAUGE_I, CLAIM3, [safe, outsider.address, [tokenId]])]);
+  await denied('gauge claimReferralEmissions', 'FunctionNotAllowed', [tx(GAUGE, GAUGE_I, 'claimReferralEmissions', [safe, outsider.address])]);
 
   await rpc.send('evm_increaseTime', [3600]);
   await rpc.send('evm_mine', []);
   const aeroBefore = await balanceOf(AERO_TOKEN);
-  await allowed('claimEmissions(Safe, Safe)', [tx(GAUGE, GAUGE_I, 'claimEmissions', [safe, safe])]);
+  await allowed('claimEmissions(Safe, Safe)', [tx(GAUGE, GAUGE_I, CLAIM2, [safe, safe])]);
+  if (tokenId2) await allowed('claimEmissions(Safe, Safe, [tokenId2])', [tx(GAUGE2, GAUGE_I, CLAIM3, [safe, safe, [tokenId2]])]);
   console.log(`  领取 AERO：${(await balanceOf(AERO_TOKEN)) - aeroBefore}（最小单位；gauge 无排放时为 0）`);
   await allowed('gauge.withdraw（NFT 经 safeTransferFrom 回到 Safe）', [tx(GAUGE, GAUGE_I, 'withdraw', [tokenId])]);
-  record('allow', '解押后 NFT 归 Safe 所有', (await ownerOf(AERO.nft, tokenId)) === safe);
+  if (tokenId2) await allowed('gauge2.withdraw', [tx(GAUGE2, GAUGE_I, 'withdraw', [tokenId2])]);
+  record('allow', '解押后 NFT 归 Safe 所有', (await ownerOf(AERO.nft, tokenId)) === safe && (!tokenId2 || (await ownerOf(AERO.nft, tokenId2)) === safe));
 
   // ---- 平仓 ----
-  const { liquidity } = NPM_I.decodeFunctionResult('positions', await rpc.call({ to: AERO.nft, data: NPM_I.encodeFunctionData('positions', [tokenId]) }));
+  const close = async (id) => {
+    const { liquidity } = NPM_I.decodeFunctionResult('positions', await rpc.call({ to: AERO.nft, data: NPM_I.encodeFunctionData('positions', [id]) }));
+    return [
+      tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ tokenId: id, liquidity, amount0Min: 0n, amount1Min: 0n, deadline: await now() }]),
+      tx(AERO.nft, NPM_I, 'collect', [{ tokenId: id, recipient: safe, amount0Max: (1n << 128n) - 1n, amount1Max: (1n << 128n) - 1n }]),
+      tx(AERO.nft, NPM_I, 'burn', [id]),
+    ];
+  };
   const [rsgp0, usdc0] = [await balanceOf(RSGP), await balanceOf(USDC)];
-  await allowed('decreaseLiquidity + collect + burn（MultiSend）', [
-    tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ tokenId, liquidity, amount0Min: 0n, amount1Min: 0n, deadline: await now() }]),
-    tx(AERO.nft, NPM_I, 'collect', [{ tokenId, recipient: safe, amount0Max: (1n << 128n) - 1n, amount1Max: (1n << 128n) - 1n }]),
-    tx(AERO.nft, NPM_I, 'burn', [tokenId]),
-  ]);
+  await allowed('decreaseLiquidity + collect + burn（MultiSend，两个仓位）', [...(await close(tokenId)), ...(tokenId2 ? await close(tokenId2) : [])]);
   record('allow', '平仓资金回到 Safe', (await balanceOf(RSGP)) > rsgp0 || (await balanceOf(USDC)) > usdc0);
 
   // ---- 兑换 ----
   const swap = async (o = {}) => tx(AERO.swapRouter, ROUTER_I, 'exactInputSingle', [{ tokenIn: AERO_TOKEN, tokenOut: USDC, tickSpacing: 200, recipient: safe, deadline: await now(), amountIn: parseUnits('10', 18), amountOutMinimum: 0n, sqrtPriceLimitX96: 0n, ...o }]);
-  await denied('exactInputSingle recipient 填外部地址', [await swap({ recipient: outsider.address })]);
-  await denied('swap 非白名单方向（USDC→AERO）', [await swap({ tokenIn: USDC, tokenOut: AERO_TOKEN, amountIn: 1_000_000n })]);
-  await denied('swap 非白名单 tickSpacing（AERO→USDC ts100）', [await swap({ tickSpacing: 100 })]);
-  await denied('swap AERO 超日额度', [await swap({ amountIn: BigInt(config.allowances[2].perDay) + 1n })]);
+  await denied('exactInputSingle recipient 填外部地址', 'OrViolation', [await swap({ recipient: outsider.address })]);
+  await denied('swap 非白名单方向（USDC→AERO）', 'OrViolation', [await swap({ tokenIn: USDC, tokenOut: AERO_TOKEN, amountIn: 1_000_000n })]);
+  await denied('swap 非白名单 tickSpacing（AERO→USDC ts100）', 'OrViolation', [await swap({ tickSpacing: 100 })]);
+  await denied('swap AERO 超日额度', 'OrViolation', [await swap({ amountIn: BigInt(config.allowances[2].perDay) + 1n })]);
   const usdcSwap0 = await balanceOf(USDC);
   await allowed('exactInputSingle AERO→USDC，recipient = Safe', [await swap()]);
   record('allow', '兑换所得 USDC 到 Safe', (await balanceOf(USDC)) > usdcSwap0);
 
   // ---- 操作类型与组合 ----
   const approveNpm = tx(USDC, ERC20_I, 'approve', [AERO.nft, 0n]);
-  await denied('delegatecall 到 MultiSend 以外的地址', null, raw(approveNpm.to, 0n, approveNpm.data, 1));
+  await denied('delegatecall 到 MultiSend 以外的地址', 'DelegateCallNotAllowed', null, { data: raw(approveNpm.to, 0n, approveNpm.data, 1) });
   const innerDelegate = solidityPacked(['uint8', 'address', 'uint256', 'uint256', 'bytes'], [1, approveNpm.to, 0, (approveNpm.data.length - 2) / 2, approveNpm.data]);
-  await denied('MultiSend 内层 delegatecall', null, raw(SAFE.multiSendCallOnly, 0n, new Interface(['function multiSend(bytes)']).encodeFunctionData('multiSend', [innerDelegate]), 1));
-  await denied('MultiSend 夹带一笔禁止调用', [approveNpm, tx(USDC, ERC20_I, 'transfer', [outsider.address, 1n])]);
-  await denied('经角色调用 Safe.addOwnerWithThreshold', [tx(safe, SAFE_SETUP_I, 'addOwnerWithThreshold', [outsider.address, 1n])]);
-  await denied('经角色调用 Safe.enableModule', [tx(safe, SAFE_ABI, 'enableModule', [outsider.address])]);
-  await denied('经角色调用 Roles.assignRoles', [tx(roles, ROLES_ABI, 'assignRoles', [outsider.address, [roleKey], [true]])]);
+  await denied('MultiSend 内层 delegatecall', 'DelegateCallNotAllowed', null, { data: raw(SAFE.multiSendCallOnly, 0n, new Interface(['function multiSend(bytes)']).encodeFunctionData('multiSend', [innerDelegate]), 1) });
+  await denied('MultiSend 夹带一笔禁止调用', 'FunctionNotAllowed', [approveNpm, tx(USDC, ERC20_I, 'transfer', [outsider.address, 1n])]);
+  await denied('经角色调用 Safe.addOwnerWithThreshold', 'TargetAddressNotAllowed', [tx(safe, SAFE_SETUP_I, 'addOwnerWithThreshold', [outsider.address, 1n])]);
+  await denied('经角色调用 Safe.enableModule', 'TargetAddressNotAllowed', [tx(safe, SAFE_ABI, 'enableModule', [outsider.address])]);
+  await denied('经角色调用 Roles.assignRoles', 'TargetAddressNotAllowed', [tx(roles, ROLES_ABI, 'assignRoles', [outsider.address, [roleKey], [true]])]);
 
   // ---- 撤销 ----
   await execSafe(roles, ROLES_ABI.encodeFunctionData('assignRoles', [bot.address, [roleKey], [false]]));
-  await denied('撤销角色后 bot 的原本允许调用', null, roleCall([approveNpm]));
+  await denied('撤销角色后 bot 的原本允许调用', 'NoMembership', null, { data: roleCall([approveNpm]) });
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });
