@@ -15,7 +15,8 @@ const MARKETS: Record<ExecutionMarket, { name: string; symbols: [ExecutionSymbol
   oil: { name: '原油', symbols: ['CLUSDT', 'BZUSDT'], labels: ['CL', 'BZ'], sizing: '等桶', unit: '桶', hint: '每腿成交相同桶数，按各所每张合约桶数换算原生数量。' },
   hynix: { name: '海力士', symbols: ['SKHYUSDT', 'SKHYNIXUSDT'], labels: ['ADR', '正股'], sizing: '等金额', unit: 'USDT', hint: '每腿按预览盘口折算相同 USDT 名义金额，向下取整到下单步长；10 股 ADR 约对应 1 股正股。' },
 };
-const PRESETS: Record<ExecutionPreset, string> = { 'four-leg': '四腿组合', 'same-exchange': '同所两腿', 'cross-exchange': '跨所两腿' };
+// Same-venue first: it is the usual trade, so it is also the default preset.
+const PRESETS: Record<ExecutionPreset, string> = { 'same-exchange': '同所两腿', 'four-leg': '四腿组合', 'cross-exchange': '跨所两腿' };
 const STATUS: Record<ExecutionJob['status'], string> = { queued: '待执行', running: '执行中', stopping: '正在撤销余单', paused: '已暂停', attention: '待核对', completed: '已全部成交', stopped: '已停止' };
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const date = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? dateFormat.format(Date.parse(value)) : '尚未取得';
@@ -130,7 +131,7 @@ export default function TradingExecution({ pair, onExpired }: { pair: TradingPai
   const [busy, setBusy] = useState(false), [reading, setReading] = useState(false);
   const [readError, setReadError] = useState(''), [writeError, setWriteError] = useState(''), [notice, setNotice] = useState('');
   const [offline, setOffline] = useState(!navigator.onLine), [expiredSession, setExpiredSession] = useState(false);
-  const [preset, setPreset] = useState<ExecutionPreset>('four-leg'), [action, setAction] = useState<ExecutionAction>('open');
+  const [preset, setPreset] = useState<ExecutionPreset>('same-exchange'), [action, setAction] = useState<ExecutionAction>('open');
   const [market, setMarket] = useState<ExecutionMarket>('oil'), [sizeMode, setSizeMode] = useState<'equal' | 'per-leg'>('equal'), [equalSize, setEqualSize] = useState('');
   const [selectedExchange, setSelectedExchange] = useState<TradingExchange>('binance'), [selectedSymbol, setSelectedSymbol] = useState<ExecutionSymbol>('CLUSDT');
   const [orientation, setOrientation] = useState('');

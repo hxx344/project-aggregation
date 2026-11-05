@@ -1228,3 +1228,70 @@ test('four-leg per-leg opens balance each symbol across venues so one venue unit
   const preview = await f.preview(intent({ preset: 'four-leg', batchCount: 1, legs: legs('20', '200') }));
   assert.match(preview.notes[0], /逐腿数量：多头合计 4 桶，空头合计 4 桶。/);
 });
+
+test('display quotes read every venue, report a failed leg alone and share reads briefly', async t => {
+  const f = await fixture(t);
+  f.handlers['okx:market'] = async symbol => { if (symbol === 'SKHYUSDT') throw new ExecutionExchangeError('not_tradable'); return { symbol, bid: '71', ask: '71.02', at: new Date(f.time).toISOString(), rule: {} }; };
+  const before = f.calls.length;
+  const value = await f.service.quotes();
+  assert.equal(value.books.length, 12);
+  assert.deepEqual([...new Set(value.books.map(book => book.exchange))], ['binance', 'bybit', 'okx']);
+  assert.deepEqual(value.books.find(book => book.exchange === 'binance' && book.symbol === 'CLUSDT'), { exchange: 'binance', symbol: 'CLUSDT', bid: '70', ask: '70.01', at: new Date(f.time).toISOString() });
+  assert.deepEqual(value.books.find(book => book.exchange === 'okx' && book.symbol === 'SKHYUSDT'), { exchange: 'okx', symbol: 'SKHYUSDT', error: '合约当前不支持所需的限价交易' });
+  assert.ok(value.books.every(book => !('rule' in book)));
+  assert.ok(f.calls.slice(before).every(call => call.method === 'market' && call.args[1].withRule === false && call.args[1].signal instanceof AbortSignal));
+  assert.equal(f.calls.length - before, 12);
+  await f.service.quotes();
+  assert.equal(f.calls.length - before, 12, 'a read within the cache window is shared');
+  f.advance(2000);
+  await f.service.quotes();
+  assert.equal(f.calls.length - before, 24);
+});
+
+test('a slow display read stays shared past the cache window until it settles', async t => {
+  const f = await fixture(t);
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  f.handlers['okx:market'] = async symbol => { await gate; return { symbol, bid: '71', ask: '71.02', at: new Date(f.time).toISOString(), rule: {} }; };
+  const before = f.calls.length;
+  const first = f.service.quotes();
+  await new Promise(resolve => setImmediate(resolve));
+  f.advance(5000);
+  const second = f.service.quotes();
+  assert.equal(second, first, 'an in-flight read is reused rather than restarted');
+  release();
+  await first;
+  assert.equal(f.calls.length - before, 12);
+  f.advance(1000);
+  await f.service.quotes();
+  assert.equal(f.calls.length - before, 12, 'the window counts from when the read settled');
+  f.advance(1000);
+  await f.service.quotes();
+  assert.equal(f.calls.length - before, 24);
+});
+
+test('a display leg that runs past its timeout is reported as a timeout', async t => {
+  const f = await fixture(t, { quoteTimeoutMs: 20 });
+  f.handlers['bybit:market'] = (symbol, { signal }) => new Promise((resolve, reject) => signal.addEventListener('abort', () => reject(new ExecutionExchangeError('aborted')), { once: true }));
+  const value = await f.service.quotes();
+  assert.ok(value.books.filter(book => book.exchange === 'bybit').every(book => book.error === '交易所请求超时'));
+  assert.ok(value.books.filter(book => book.exchange !== 'bybit').every(book => book.bid && !book.error));
+});
+
+test('a display read stuck past twice the leg timeout is replaced, and its late finish leaves the new read cached', async t => {
+  const f = await fixture(t);
+  const gates = [];
+  f.handlers['okx:market'] = async symbol => { await new Promise(resolve => gates.push(resolve)); return { symbol, bid: '71', ask: '71.02', at: new Date(f.time).toISOString() }; };
+  const before = f.calls.length;
+  const stuck = f.service.quotes();
+  await new Promise(resolve => setImmediate(resolve));
+  f.advance(12_000);
+  const replacement = f.service.quotes();
+  await new Promise(resolve => setImmediate(resolve));
+  gates.forEach(release => release());
+  assert.notEqual(replacement, stuck);
+  assert.equal(f.calls.length - before, 24);
+  await Promise.all([stuck, replacement]);
+  assert.equal(await f.service.quotes(), await replacement, 'the late first read does not displace the replacement');
+  assert.equal(f.calls.length - before, 24);
+});
