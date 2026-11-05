@@ -727,6 +727,10 @@ class PairManager:
             pair = self.store.pair(pair_id)
             original = self._idle(pair)
             snapshots, guards = self._read_members(pair, flat=True)
+            from .pair_recovery import require_history_times
+            # A zero read older than a known fill may predate it; clearing the
+            # baseline from that read would adopt a lagging position.
+            require_history_times(self.store, pair, original, snapshots)
             from .engine import snapshot_json
             from .store import dumps
             zeros = {"LONG": "0", "SHORT": "0"}

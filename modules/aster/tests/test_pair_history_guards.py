@@ -73,6 +73,24 @@ class PairHistoryGuardTests(TestCase):
             mock.start()
             self.addCleanup(mock.stop)
 
+    def set_flat(self, stamp):
+        for key, broker in self.brokers.items():
+            broker.state["positions"][SYMBOL + ":" + key.upper()].update(qty="0", updateTime=stamp)
+            broker.save()
+
+    def test_flat_reconciliation_cannot_clear_ownership_from_a_lagging_snapshot(self):
+        self.store.save_pair({**self.store.pair("gold"), "enabled": False})
+        self.state["owned"] = {"LONG": "1", "SHORT": "1"}
+        self.store.put("pair_runtime:gold", self.state)
+        pairs = self.engine.pairs
+        self.set_flat(self.fill_time - 1)
+        with self.assertRaisesRegex(TradingError, "历史已知成交"):
+            pairs.reconcile_flat("gold")
+        self.assertEqual(self.store.get("pair_runtime:gold")["owned"], {"LONG": "1", "SHORT": "1"})
+        self.set_flat(self.fill_time + 1)
+        pairs.reconcile_flat("gold")
+        self.assertEqual(self.store.get("pair_runtime:gold")["owned"], {"LONG": "0", "SHORT": "0"})
+
     def test_opening_cannot_substitute_a_new_read_for_the_planned_snapshot(self):
         snapshots, guards = self.reads(self.fill_time - 1)
         plan = plan_ordinary(self.pair, snapshots, self.market.book(SYMBOL),
