@@ -1,5 +1,6 @@
 import { oilSpread } from '../../modules/oil/spread.mjs';
 
+export const OPERATORS = ['gte', 'lte', 'both'];
 export const METRICS = Object.freeze({ spread: '价差（布伦特 − WTI）', brent: '布伦特价格', wti: 'WTI 价格' });
 
 export function defaultConfig() {
@@ -48,7 +49,7 @@ export function validateConfig(input, { metrics = METRICS, positiveMetrics = ['b
     if (!rule || typeof rule.id !== 'string' || !/^[a-zA-Z0-9_-]{1,80}$/.test(rule.id) || ['__proto__', 'constructor', 'prototype'].includes(rule.id) || ids.has(rule.id)) throw new Error('梯度 ID 无效或重复');
     ids.add(rule.id);
     if (typeof rule.label !== 'string' || !rule.label.trim() || rule.label.length > 60 || /[\r\n\x00-\x1f]/.test(rule.label)) throw new Error('梯度名称需要 1–60 个字符，不含换行');
-    if (!Object.hasOwn(metrics, rule.metric) || !['gte', 'lte'].includes(rule.operator) || typeof rule.enabled !== 'boolean') throw new Error('监控指标、方向或开关无效');
+    if (!Object.hasOwn(metrics, rule.metric) || !OPERATORS.includes(rule.operator) || typeof rule.enabled !== 'boolean') throw new Error('监控指标、方向或开关无效');
     for (const field of ['threshold', 'cooldownMinutes', 'hysteresis']) if (typeof rule[field] !== 'number' || !Number.isFinite(rule[field])) throw new Error('阈值、冷却时间和回差必须是有效数字');
     if (Math.abs(rule.threshold) > 1e6 || (positiveMetrics.includes(rule.metric) && rule.threshold <= 0)) throw new Error(thresholdError);
     if (rule.cooldownMinutes < 0 || rule.cooldownMinutes > 10080 || rule.hysteresis < 0 || rule.hysteresis > 1e6) throw new Error('冷却时间需在 0–10080 分钟内，回差需在 0–100 万内');
@@ -76,14 +77,52 @@ export function marketValues(market, now = Date.now(), maxAge = 90_000) {
   return { spread, brent, wti };
 }
 
+const compare = (left, right) => Math.abs(left - right) <= Number.EPSILON * 8 * Math.max(1, Math.abs(left), Math.abs(right)) ? 0 : Math.sign(left - right);
+const matches = (operator, value, rule) => operator === 'gte' ? compare(value, rule.threshold) >= 0 : compare(value, rule.threshold) <= 0;
+const resets = (operator, value, rule) => operator === 'gte' ? compare(value, rule.threshold - rule.hysteresis) < 0 : compare(value, rule.threshold + rule.hysteresis) > 0;
+
 // One notification per threshold episode. Cooldown also spans separate episodes.
+// `operator` is the side that would be reported (a two-way rule reports gte or lte).
 export function evaluateRule(rule, previous = {}, value, now) {
+  if (rule.operator === 'both') return evaluateCrossing(rule, previous, value, now);
   const state = { active: false, alerted: false, lastSentAt: null, nextAttemptAt: 0, ...previous };
-  const compare = (left, right) => Math.abs(left - right) <= Number.EPSILON * 8 * Math.max(1, Math.abs(left), Math.abs(right)) ? 0 : Math.sign(left - right);
-  const matched = rule.operator === 'gte' ? compare(value, rule.threshold) >= 0 : compare(value, rule.threshold) <= 0;
-  const reset = rule.operator === 'gte' ? compare(value, rule.threshold - rule.hysteresis) < 0 : compare(value, rule.threshold + rule.hysteresis) > 0;
-  if (state.active && reset) { state.active = false; state.alerted = false; state.eventId = null; state.nextAttemptAt = 0; }
+  const matched = matches(rule.operator, value, rule);
+  if (state.active && resets(rule.operator, value, rule)) { state.active = false; state.alerted = false; state.eventId = null; state.nextAttemptAt = 0; }
   if (!state.active && matched) { state.active = true; state.alerted = false; }
   const cooled = state.lastSentAt === null || now - state.lastSentAt >= rule.cooldownMinutes * 60_000;
-  return { state, shouldSend: rule.enabled && matched && state.active && !state.alerted && cooled && now >= state.nextAttemptAt };
+  return { state, operator: rule.operator, shouldSend: rule.enabled && matched && state.active && !state.alerted && cooled && now >= state.nextAttemptAt };
+}
+
+/**
+ * Two-way rules alert on crossings only. Each side starts as an already-reported episode, so it
+ * needs the value to leave that side's reset band first; saving a tier never reports the side the
+ * market is already on. Each side keeps its own event ID and retry time; only the cooldown is shared.
+ */
+function evaluateCrossing(rule, previous, value, now) {
+  const state = { active: false, alerted: false, lastSentAt: null, nextAttemptAt: 0, ...previous };
+  const side = saved => ({ active: true, alerted: true, eventId: null, nextAttemptAt: 0, ...saved });
+  state.sides = { gte: side(previous.sides?.gte), lte: side(previous.sides?.lte) };
+  const cooled = state.lastSentAt === null || now - state.lastSentAt >= rule.cooldownMinutes * 60_000;
+  let operator = null;
+  for (const name of ['gte', 'lte']) {
+    const current = state.sides[name], matched = matches(name, value, rule);
+    if (current.active && resets(name, value, rule)) Object.assign(current, { active: false, alerted: false, eventId: null, nextAttemptAt: 0 });
+    if (!current.active && matched) { current.active = true; current.alerted = false; }
+    if (operator === null && matched && current.active && !current.alerted && now >= current.nextAttemptAt) operator = name;
+  }
+  state.active = operator !== null;
+  return { state, operator, shouldSend: rule.enabled && operator !== null && cooled };
+}
+
+/** Assign (or keep, for a retry) the reported side's event ID and push back its next attempt. */
+export function beginAttempt(state, operator, now, newId) {
+  const target = state.sides?.[operator] ?? state;
+  target.eventId ||= newId();
+  target.nextAttemptAt = now + 60_000;
+  return target.eventId;
+}
+
+export function markAlerted(state, operator, eventId) {
+  const target = state.sides?.[operator] ?? state;
+  if (target.eventId === eventId) target.alerted = true;
 }
