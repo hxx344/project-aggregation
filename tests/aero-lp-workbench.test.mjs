@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { fork } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -433,6 +433,110 @@ for (const [name, spoil, reason] of lostKeys) {
       assert.equal(savedEnabled(directory), true);
       assert.ok(keyFree(warnings), 'warnings never carry a key');
     } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+}
+
+// A wallet file initialize cannot read at all: the saved run intent is dropped like a lost key,
+// the page names the wallet file, and the LP parameters stay valid.
+const MARKER = 'wallet-file-content-marker';
+const walletFile = (directory) => join(directory, 'aero-lp/wallet.json');
+// blocking: the path cannot be replaced by setKey or removed by clearKey, so the user must move it.
+const badWallets = [
+  ['corrupt JSON', false, (directory) => writeFileSync(walletFile(directory), `{"schema":1,"address":"${MARKER}`)],
+  ['oversized', false, (directory) => writeFileSync(walletFile(directory), JSON.stringify({ schema: 1, address: ADDRESS, pad: MARKER.repeat(4000) }))],
+  ['symbolic link', false, (directory) => {
+    const target = join(directory, 'aero-lp/wallet-target.json');
+    renameSync(walletFile(directory), target); symlinkSync(target, walletFile(directory), 'file');
+  }],
+  ['directory', true, (directory) => { rmSync(walletFile(directory)); mkdirSync(walletFile(directory)); }],
+];
+const symlinkAllowed = (() => {
+  const probe = fixtureDir();
+  try { writeFileSync(join(probe, 'a'), ''); symlinkSync(join(probe, 'a'), join(probe, 'b'), 'file'); return true; }
+  catch { return false; } finally { rmSync(probe, { recursive: true, force: true }); }
+})();
+const contentFree = (value) => !JSON.stringify(value, (key, item) => item instanceof Error ? { message: item.message, ...item } : item).includes(MARKER);
+const persistWarnings = (warnings) => warnings.filter(([, message]) => /启停设置保存失败/.test(message)).length;
+
+for (const [name, blocking, spoil] of badWallets) {
+  const skip = name === 'symbolic link' && !symlinkAllowed && '当前环境无权创建符号链接';
+  const reason = blocking ? /钱包文件.*手动移走/ : /钱包文件无法读取/;
+  test(`a ${name} wallet file at startup stops the saved run and names the wallet file`, { skip }, async () => {
+    const directory = fixtureDir();
+    try {
+      await enabledWithLostKey(directory, spoil);
+      const warnings = [];
+      const run = managerWith(directory, { manager: { log: { ...silent, warn: (...args) => warnings.push(args) } } });
+      try {
+        await run.manager.initialize(); await delay(50);
+        const state = run.manager.state();
+        assert.equal(run.launches.length, 0, 'nothing signs from an unreadable wallet file');
+        assert.equal(state.enabled, false); assert.equal(savedEnabled(directory), false);
+        assert.equal(state.state, 'fault'); assert.match(state.error, reason);
+        if (!blocking) assert.doesNotMatch(state.error, /手动移走/);
+        assert.doesNotMatch(state.error, /配置或运行设置无效/);
+        assert.ok(contentFree(state) && contentFree(warnings), 'the file content is never echoed');
+        assert.ok(keyFree(warnings) && !JSON.stringify(state).includes(KEY.slice(2)));
+        // Diagnosed by a code only: a JSON parse message can quote the file.
+        const read = warnings.filter(([, message]) => /钱包文件无法读取/.test(message));
+        assert.equal(read.length, 1); assert.equal(typeof read[0][0].code, 'string');
+        assert.deepEqual(Object.keys(read[0][0]).sort(), ['code', 'type']);
+        if (blocking) {
+          await assert.rejects(run.manager.setKey(KEY), (error) => error.status === 500 && /钱包保存失败.*手动移走/.test(error.message));
+          await assert.rejects(run.manager.clearKey(), (error) => error.status === 409 && /手动移走/.test(error.message));
+          assert.equal(existsSync(`${walletFile(directory)}.tmp`), false);
+          assert.ok(lstatSync(walletFile(directory)).isDirectory(), 'the program never deletes the directory');
+          assert.equal(run.manager.state().enabled, false); assert.equal(savedEnabled(directory), false);
+          assert.equal(run.launches.length, 0);
+          rmSync(walletFile(directory), { recursive: true });
+        }
+        // The LP parameters were valid: a new key replaces the file and the run starts without saving them.
+        const saved = await run.manager.setKey(KEY);
+        assert.equal(saved.error, null); assert.equal(saved.state, 'stopped'); assert.equal(saved.wallet, ADDRESS);
+        await run.manager.start();
+        assert.equal(run.launches.length, 1);
+      } finally { await run.manager.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test(`a ${name} wallet file whose stop cannot be saved keeps memory matching the disk`, { skip }, async () => {
+    const directory = fixtureDir();
+    try {
+      await enabledWithLostKey(directory, spoil);
+      mkdirSync(join(directory, 'aero-lp/control.json.tmp'));
+      const warnings = [];
+      const run = managerWith(directory, { manager: { log: { ...silent, warn: (...args) => warnings.push(args) } } });
+      try {
+        await run.manager.initialize(); await delay(50);
+        const state = run.manager.state();
+        assert.equal(run.launches.length, 0);
+        assert.equal(state.state, 'fault'); assert.equal(state.enabled, true); assert.equal(savedEnabled(directory), true);
+        assert.match(state.error, reason); assert.match(state.error, /停止设置保存失败/);
+        assert.doesNotMatch(state.error, /配置或运行设置无效/);
+        assert.equal(persistWarnings(warnings), 1);
+        assert.ok(contentFree(state) && contentFree(warnings) && keyFree(warnings));
+      } finally { await run.manager.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  test(`a ${name} wallet file with the run already stopped names the wallet file, also on a manual start`, { skip }, async () => {
+    const directory = fixtureDir();
+    try {
+      await enabledWithLostKey(directory, spoil);
+      writeFileSync(join(directory, 'aero-lp/control.json'), JSON.stringify({ schema: 1, enabled: false }));
+      const run = managerWith(directory);
+      try {
+        await run.manager.initialize();
+        const state = run.manager.state();
+        assert.equal(state.enabled, false); assert.equal(savedEnabled(directory), false); assert.equal(run.launches.length, 0);
+        assert.match(state.error, reason); assert.doesNotMatch(state.error, /配置或运行设置无效/);
+        assert.ok(contentFree(state));
+        const started = await run.manager.start();
+        assert.equal(run.launches.length, 0, 'a manual start signs nothing from the bad file');
+        assert.equal(started.enabled, false); assert.equal(savedEnabled(directory), false);
+        assert.equal(started.state, 'fault'); assert.match(started.error, reason); assert.ok(contentFree(started));
+      } finally { await run.manager.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 }
 

@@ -42,6 +42,9 @@ function withPinnedKeys(saved) {
   return { ...Object.fromEntries(PINNED_KEYS.map((key) => [key, AERO_LP_DEFAULTS[key]])), ...saved };
 }
 
+const WALLET_UNREADABLE = '钱包文件无法读取（已损坏、过大或为符号链接），请重新填写私钥';
+// setKey cannot rename over it and clearKey does not delete a directory: user data is never removed recursively.
+const WALLET_NOT_FILE = '钱包文件路径 aero-lp/wallet.json 不是普通文件，无法自动覆盖或清除，请先手动移走该路径，再重新填写私钥';
 const RECOVERY_HOLD = '账户写入处于隔离恢复状态，LP 调仓暂停，恢复正常后自动启动';
 
 // The private key is write-only: it is stored encrypted with the credential
@@ -91,8 +94,19 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     }
   }
   const send = (message) => { try { if (child?.connected) child.send(message); } catch {} };
+  function walletBlocked() {
+    try { const info = lstatSync(walletPath); return !info.isFile() && !info.isSymbolicLink(); } catch { return false; }
+  }
+  // Only a code is logged: a JSON parse message can quote the file.
+  function walletFileFault(error) {
+    const code = typeof error?.code === 'string' ? error.code : error instanceof SyntaxError ? 'invalid_json' : 'invalid_aero_lp_file';
+    log.warn?.({ type: 'aero-lp', code }, 'LP 钱包文件无法读取');
+    return walletBlocked() ? WALLET_NOT_FILE : WALLET_UNREADABLE;
+  }
+  class WalletFileError extends Error {}
   function readKey() {
-    const saved = readBounded(walletPath, 16 * 1024);
+    let saved;
+    try { saved = readBounded(walletPath, 16 * 1024); } catch (error) { throw new WalletFileError(walletFileFault(error)); }
     if (!saved) return null;
     const key = decrypt(saved.key);
     if (typeof key !== 'string' || !PRIVATE_KEY_PATTERN.test(key) || new Wallet(key).address !== saved.address) throw new Error('invalid_wallet');
@@ -129,7 +143,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     if (readHold() === 'recovery') { heldByRecovery = true; failure = RECOVERY_HOLD; return; }
     heldByRecovery = false; childPaused = false; keyHanded = false;
     let key;
-    try { key = readKey(); } catch { abandonRun('已保存的私钥无法读取，请重新填写'); return; }
+    try { key = readKey(); } catch (error) { abandonRun(error instanceof WalletFileError ? error.message : '已保存的私钥无法读取，请重新填写'); return; }
     if (!key) { abandonRun('请先填写钱包私钥'); return; }
     const env = { ...process.env, NODE_ENV: 'production' };
     delete env.NODE_OPTIONS; delete env.NODE_PATH; delete env.AERO_LP_PRIVATE_KEY;
@@ -236,7 +250,10 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
       try {
         // A file that exists but holds no address (including JSON null or "") is damaged, not an absent wallet.
         const walletPresent = existsSync(walletPath);
-        const savedWallet = readBounded(walletPath, 16 * 1024);
+        // Unreadable (bad JSON, oversized, not a plain file): no key can come from it, which is a wallet
+        // fault, not an invalid configuration; the error and file content are never echoed.
+        let savedWallet = null, walletFault = null;
+        try { savedWallet = readBounded(walletPath, 16 * 1024); } catch (error) { walletFault = walletFileFault(error); }
         address = typeof savedWallet?.address === 'string' && savedWallet.address ? savedWallet.address : null;
         walletKnown = !walletPresent || address !== null;
         const saved = readBounded(configPath, 64 * 1024);
@@ -249,7 +266,8 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
           if (prior.schema !== 1 || typeof prior.enabled !== 'boolean' || Object.keys(prior).some((k) => !['schema', 'enabled'].includes(k))) throw new Error('invalid_control');
           enabled = prior.enabled;
         } else persistWanted();
-        if (enabled) startChild();
+        if (walletFault) { if (enabled) abandonRun(walletFault); else failure = walletFault; }
+        else if (enabled) startChild();
       } catch {
         configValid = false; enabled = false; failure = 'LP 配置或运行设置无效，原文件已保留，请检查后重新保存';
       }
@@ -301,6 +319,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
         failure = null; heldByRecovery = false;
         try { rmSync(`${walletPath}.tmp`, { force: true }); } catch {}
         log.warn?.({ type: 'aero-lp', err: error }, 'LP 钱包保存失败');
+        if (walletBlocked()) throw new HttpError(500, `钱包保存失败，调仓已保持停止：${WALLET_NOT_FILE}`);
         throw new HttpError(500, '钱包保存失败，原钱包未更换，调仓已保持停止，请检查数据目录权限后重试');
       }
       address = wallet; walletKnown = true; failure = null; lastCycle = null;
@@ -309,6 +328,7 @@ export function createAeroLp({ dataDir, encrypt, decrypt, readMaintenance = () =
     clearKey: (authorize = () => {}) => serial(() => {
       authorize();
       requireStopped();
+      if (walletBlocked()) throw new HttpError(409, WALLET_NOT_FILE);
       persistStopped('钱包未清除');
       try { rmSync(walletPath, { force: true }); } catch (error) {
         failure = null; heldByRecovery = false;
