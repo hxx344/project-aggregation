@@ -42,7 +42,8 @@ const MESSAGES = Object.freeze({
 
 export class OkxProtocolError extends Error {
   constructor(code = 'invalid_data', details = {}) {
-    super(MESSAGES[code] ?? MESSAGES.upstream);
+    const base = MESSAGES[code] ?? MESSAGES.upstream;
+    super(typeof details.detail === 'string' && details.detail ? `${base}：${details.detail}` : base);
     this.code = code;
     this.uncertain = details.uncertain === true;
     if (details.notFound) this.notFound = true;
@@ -60,6 +61,8 @@ export function amount(value, options = {}) {
   try { if (typeof value !== 'string') fail(); return decimal(value, options); } catch { fail(); }
 }
 export function optionalAmount(value, options = {}) { return value === '' || value === null || value === undefined ? null : amount(value, options); }
+// Market support is optional: an unparsable maxMktSz disables market legs only.
+function optionalMarketQuantity(value) { try { return optionalAmount(value, { positive: true }); } catch { return null; } }
 export function optionalPrice(value) { const result = optionalAmount(value, { nonnegative: true }); return result === '0' ? null : result; }
 export function absolute(value) { return compareDecimals(value, '0') < 0 ? negateDecimal(value) : value; }
 export function id(value) { if (typeof value !== 'string' || !/^\d{1,30}$/.test(value)) fail(); return value; }
@@ -96,11 +99,20 @@ export function multiple(value, step) { return units(step) > 0n && units(value) 
 
 export function validateConfig(row, { execution = false } = {}) {
   requireObject(row);
-  if (typeof row.perm !== 'string') fail('permissions');
+  if (typeof row.perm !== 'string') fail('permissions', { detail: 'OKX 未返回密钥权限' });
   const permissions = row.perm.split(',');
   const allowed = execution ? ['read_only', 'trade'] : ['read_only'];
   if (permissions.length !== allowed.length || new Set(permissions).size !== allowed.length
-    || allowed.some(value => !permissions.includes(value))) fail('permissions');
+    || allowed.some(value => !permissions.includes(value))) {
+    const names = { read_only: '读取', trade: '交易', withdraw: '提现' };
+    const label = value => Object.hasOwn(names, value) ? names[value] : value.replace(/[\x00-\x1f\x7f]/g, '').slice(0, 64);
+    const missing = allowed.filter(value => !permissions.includes(value));
+    const extra = [...new Set(permissions)].filter(value => value && !allowed.includes(value));
+    const parts = [];
+    if (missing.length) parts.push(`请开启：${missing.map(label).join('、')}`);
+    if (extra.length) parts.push(`请关闭：${extra.map(label).join('、')}`);
+    fail('permissions', { detail: parts.join('；') || `仅允许${allowed.map(label).join('、')}权限` });
+  }
   if (!(execution ? ['2', '3'] : ['2', '3', '4']).includes(row.acctLv)
     || !['net_mode', 'long_short_mode'].includes(row.posMode)
     || row.acctLv === '4' && row.posMode !== 'net_mode') fail('account_mode');
@@ -151,7 +163,7 @@ function providerFailure(raw, httpStatus, mutation) {
   // Unknown, duplicate-id and timeout errors do not prove non-execution. Never
   // infer safety from a range of provider codes, or retry ambiguous mutations.
   const rejected = [50011, 50101, 50103, 50104, 50105, 50106, 50107, 50108, 50109, 50110, 50111, 50113, 50114,
-    51000, 51001, 51004, 51005, 51006, 51007, 51008, 51010, 51020, 51120, 51121, 51122, 51131].includes(providerCode);
+    51000, 51001, 51004, 51005, 51006, 51007, 51008, 51010, 51020, 51120, 51121, 51122, 51131, 51201, 51202].includes(providerCode);
   return new OkxProtocolError(rejected && httpStatus < 500 ? 'rejected' : 'upstream', {
     providerCode, httpStatus, uncertain: mutation && (httpStatus >= 500 || !rejected),
   });
@@ -285,6 +297,8 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
       instrumentId: instId, quantityUnit: '张', contractSize: multiply(amount(row.ctVal, { positive: true }), amount(row.ctMult, { positive: true })),
       tickSize: amount(row.tickSz, { positive: true }), quantityStep: amount(row.lotSz, { positive: true }),
       minQuantity: amount(row.minSz, { positive: true }), maxQuantity: amount(row.maxLmtSz, { positive: true }),
+      // A post_only instrument state rejects market orders.
+      maxMarketQuantity: row.state === 'live' ? optionalMarketQuantity(row.maxMktSz) : null,
       // maxLmtAmt is explicitly USD. Do not label it as the generic USDT
       // maxNotional or silently assume the stablecoin trades at dollar parity.
       minNotional: '0', maxNotional: null, maxNotionalUsd: optionalAmount(row.maxLmtAmt, { positive: true }),
@@ -293,16 +307,17 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
     ruleCache.set(symbol, { value, until: clock() + 60_000 });
     return { ...value };
   }
-  async function market(symbol, { signal, refreshRule = false } = {}) {
+  /** withRule: false reads the book only (display); the tick-size check then needs the rule and is skipped. */
+  async function market(symbol, { signal, refreshRule = false, withRule = true } = {}) {
     const instId = instrumentId(symbol);
-    const [rules, response] = await Promise.all([rule(symbol, signal, refreshRule), request('book', null, { instId, sz: '1' }, { signal })]);
+    const [rules, response] = await Promise.all([withRule ? rule(symbol, signal, refreshRule) : null, request('book', null, { instId, sz: '1' }, { signal })]);
     const book = one(response);
     if (list(book.bids, 1).length !== 1 || list(book.asks, 1).length !== 1
       || list(book.bids[0], 4).length < 2 || list(book.asks[0], 4).length < 2) fail();
     const bid = amount(book.bids[0][0], { positive: true }), ask = amount(book.asks[0][0], { positive: true });
     amount(book.bids[0][1], { positive: true }); amount(book.asks[0][1], { positive: true });
-    if (compareDecimals(bid, ask) >= 0 || !multiple(bid, rules.tickSize) || !multiple(ask, rules.tickSize)) fail('not_tradable');
-    return { symbol, bid, ask, at: iso(book.ts), rule: rules };
+    if (compareDecimals(bid, ask) >= 0 || (rules && (!multiple(bid, rules.tickSize) || !multiple(ask, rules.tickSize)))) fail('not_tradable');
+    return rules ? { symbol, bid, ask, at: iso(book.ts), rule: rules } : { symbol, bid, ask, at: iso(book.ts) };
   }
   return Object.freeze({ request, clock, rule, market, credentialsValid });
 }

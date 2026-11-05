@@ -620,10 +620,10 @@ for (const sink of ['scan', 'discovery', 'history', 'liquidity']) test(`RPC diag
 });
 
 test('browser snapshot cache omits RPC diagnostic text as well as configured URLs', async () => {
-  // 执行页面实际的缓存投影与旧缓存回调；不运行组件、不复制脱敏规则。
+  // 执行共用客户端实际的缓存投影与旧缓存回调；不运行 hook、不复制脱敏规则。
   const ts = await import('typescript');
-  const source = readFileSync(new URL('../src/AeroMarketPage.tsx', import.meta.url), 'utf8');
-  const file = ts.createSourceFile('AeroMarketPage.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const source = readFileSync(new URL('../src/aero-market-client.ts', import.meta.url), 'utf8');
+  const file = ts.createSourceFile('aero-market-client.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const statements = file.statements.filter((row) => ts.isVariableStatement(row) && row.declarationList.declarations.some((d) => ['forCache', 'usableSnapshot'].includes(d.name.getText(file))));
   let restore;
   const visit = (node) => {

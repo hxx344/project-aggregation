@@ -87,6 +87,12 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         for name in lp_names:
             shutil.copy2(ROOT / 'tools/aero-lp' / name, lp / name)
         (lp / 'README.md').write_text('documentation must not ship')
+        roles = source / 'tools/aero-roles'
+        roles.mkdir(parents=True)
+        roles_names = ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs')
+        for name in roles_names:
+            shutil.copy2(ROOT / 'tools/aero-roles' / name, roles / name)
+        shutil.copy2(ROOT / 'tools/aero-roles/cli.mjs', roles / 'cli.mjs')
         for args in (('init', '-q'), ('config', 'core.autocrlf', 'false'), ('config', 'user.name', 'fixture'),
                      ('config', 'user.email', 'fixture@example.invalid'), ('add', '.'), ('commit', '-qm', 'pinned runtime')):
             subprocess.run(['git', '-C', str(source), *args], check=True, capture_output=True)
@@ -103,6 +109,7 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertEqual(set(names), {path.name for path in (publish / 'tools/entropy-lighter-lab').iterdir()})
         self.assertEqual(set(lp_names), {path.name for path in (publish / 'tools/aero-lp').iterdir()})
+        self.assertEqual(set(roles_names), {path.name for path in (publish / 'tools/aero-roles').iterdir()})
         result = subprocess.run(['node', str(publish / 'tools/entropy-lighter-lab/cli.mjs'), 'check'],
                                 cwd=publish, capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)

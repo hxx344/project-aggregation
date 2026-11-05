@@ -222,10 +222,11 @@ test('hedge closes omit Binance reduceOnly but use explicit position side; one-w
   assert.equal(calls.length, 3);
 });
 
-test('Bybit creates only a native chase strategy and signs its exact JSON body', async () => {
+test('Bybit chase legs create a native chase strategy and sign its exact JSON body', async () => {
   const { client, calls } = harness('bybit');
   const close = { ...spec, side: 'sell', positionSide: 'LONG', reduceOnly: true, stopPrice: '70' };
-  assert.deepEqual(await client.create(credentials, { ...close, orderType: 'Market', url: 'https://untrusted.invalid' }), { id: STRATEGY, kind: 'strategy' });
+  await assert.rejects(client.create(credentials, { ...close, orderType: 'Market' }), isError('input'));
+  assert.deepEqual(await client.create(credentials, { ...close, url: 'https://untrusted.invalid' }), { id: STRATEGY, kind: 'strategy' });
   assert.equal(calls.length, 1); authenticatedSignature('bybit', calls[0]);
   assert.equal(calls[0].url.pathname, '/v5/strategy/create'); assert.equal(calls[0].init.method, 'POST');
   assert.deepEqual(calls[0].parameters, { category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Sell', size: '2', strategyType: 'chaseOrder', positionIdx: 1, reduceOnly: true, chaseDistance: '0', maxChasePrice: '70' });
@@ -392,11 +393,19 @@ for (const exchange of ['binance', 'bybit']) {
     const { client, calls } = harness(exchange);
     const result = await client.market('CLUSDT');
     assert.deepEqual(result, { symbol: 'CLUSDT', bid: '80', ask: '80.1', at: new Date(NOW).toISOString(),
-      rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
+      // The Binance fixture's MARKET_LOT_SIZE step differs from LOT_SIZE, so market orders stay unavailable there.
+      rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null, maxMarketQuantity: exchange === 'binance' ? null : '1' } });
     for (const call of calls) { assert.deepEqual(call.init.headers, {}); assert.equal(call.init.method, 'GET'); assert.equal(call.url.searchParams.has('signature'), false); }
     await client.market('CLUSDT');
     assert.equal(calls.filter(call => call.url.pathname.endsWith('exchangeInfo') || call.url.pathname.endsWith('instruments-info')).length, 1);
     assert.equal(calls.filter(call => call.url.pathname.endsWith('bookTicker') || call.url.pathname.endsWith('orderbook')).length, 2);
+  });
+
+  test(`${exchange} display market reads the book only, without downloading rules`, async () => {
+    const { client, calls } = harness(exchange);
+    assert.deepEqual(await client.market('CLUSDT', { withRule: false }), { symbol: 'CLUSDT', bid: '80', ask: '80.1', at: new Date(NOW).toISOString() });
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0].url.pathname.endsWith('bookTicker') || calls[0].url.pathname.endsWith('orderbook'));
   });
 
   test(`${exchange} malformed or crossed market data cannot authorize a trade`, async () => {
@@ -425,6 +434,38 @@ test('Binance permission checks fail closed for missing fields, extra financial 
   await assert.rejects(locked.client.verify(credentials), isError('permissions'));
   const unknownMode = harness('binance', call => call.url.pathname.endsWith('accountConfig') ? { canTrade: true } : undefined);
   await assert.rejects(unknownMode.client.account(credentials), isError('account_mode'));
+});
+
+test('Binance permission errors name the exact checkbox to change', async () => {
+  const cases = [
+    // The reported key: portfolio margin with spot/margin/stock trading enabled.
+    ['portfolio-margin', { ...binancePermission(true), enableSpotAndMarginTrading: true }, '交易密钥权限不符合要求：请关闭：启用现货、杠杆和股票交易'],
+    ['portfolio-margin', { ...binancePermission(true), enablePortfolioMarginTrading: false, enableFutures: false }, '请开启：开启统一账户交易'],
+    ['standard', binancePermission(true), '请将账户模式改为「组合保证金（Portfolio Margin）」'],
+    ['standard', { ...binancePermission(true), enableSpotAndMarginTrading: true }, '请将账户模式改为「组合保证金（Portfolio Margin）」；请关闭：启用现货、杠杆和股票交易'],
+    ['standard', { ...binancePermission(), 'enable\u0007X': true }, '请关闭：enableX'],
+    ['portfolio-margin', binancePermission(false), '请将账户模式改为「普通 U 本位」'],
+    ['standard', { ...binancePermission(), enableReading: false, enableWithdrawals: true, enableFixApiTrade: true }, '请开启：允许读取；请关闭：允许提现、允许 FIX API 交易'],
+    ['standard', { ...binancePermission(), enableMargin: undefined }, 'Binance 未返回权限状态：允许杠杆借贷'],
+    ['standard', { ...binancePermission(), enableFutureUnknownFinancialScope: true }, '请关闭：enableFutureUnknownFinancialScope'],
+  ];
+  for (const [accountMode, permissions, text] of cases) {
+    const { client } = harness('binance', call => call.url.pathname.endsWith('apiRestrictions') ? permissions : undefined);
+    await assert.rejects(client.account(credentials, { accountMode }), error => isError('permissions')(error) && error.message.includes(text));
+  }
+});
+
+test('Bybit permission errors name the scope to change', async () => {
+  const base = bybitPermission();
+  for (const [permissions, text] of [
+    [{ ...base, readOnly: 1 }, '密钥为只读'],
+    [{ ...base, permissions: { ...base.permissions, Spot: ['SpotTrade'] } }, '请关闭：现货 - SpotTrade'],
+    [{ ...base, permissions: { ...base.permissions, ContractTrade: ['Position'] } }, '请开启：合约交易 - 订单'],
+    [{ ...base, permissions: { ...base.permissions, constructor: ['Order'] } }, '请关闭：constructor - Order'],
+  ]) {
+    const { client } = harness('bybit', call => call.url.pathname.endsWith('query-api') ? permissions : undefined);
+    await assert.rejects(client.verify(credentials), error => isError('permissions')(error) && error.message.includes(text));
+  }
 });
 
 test('Binance preflight independently checks conditional orders and never cancels an external order', async () => {
@@ -627,4 +668,91 @@ test('Binance TradFi perpetual rules and SK hynix symbols are tradable; account 
   assert.deepEqual(read, ['SKHYUSDT']);
   assert.deepEqual(Object.keys((await client.account(credentials)).modes), ['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT']);
   for (const symbols of [[], ['ETHUSDT'], 'CLUSDT']) await assert.rejects(client.account(credentials, { symbols }), isError('input'));
+});
+
+const MARKET_ORDER = 'fd4300ae-7847-404e-b947-b46980a4d140';
+const marketSpec = Object.freeze({ ...spec, orderType: 'market', stopPrice: null });
+const bybitOrder = (overrides = {}) => ({ orderId: MARKET_ORDER, orderLinkId: spec.clientId, symbol: 'CLUSDT', side: 'Buy', orderType: 'Market',
+  orderStatus: 'Filled', qty: '2', cumExecQty: '2', avgPrice: '80.12', positionIdx: 0, reduceOnly: false, stopOrderType: '', createdTime: String(NOW), ...overrides });
+
+test('Binance market legs send MARKET without price fields and are inspected but never amended', async () => {
+  const { client, calls } = harness('binance', call => call.init.method === 'GET' && call.url.pathname === '/fapi/v1/order'
+    ? binanceOrder({ type: 'MARKET', timeInForce: 'GTC', price: '0', status: 'FILLED', executedQty: '2', avgPrice: '80.1' }) : undefined);
+  assert.deepEqual(await client.create(credentials, marketSpec), { id: ORDER, kind: 'order' });
+  assert.deepEqual(calls[0].parameters, { symbol: 'CLUSDT', side: 'BUY', positionSide: 'BOTH', type: 'MARKET', quantity: '2', reduceOnly: 'false',
+    newClientOrderId: spec.clientId, newOrderRespType: 'ACK', timestamp: String(NOW), recvWindow: '5000', signature: calls[0].parameters.signature });
+  const inspected = await client.inspect(credentials, { ...marketSpec, id: ORDER });
+  assert.deepEqual([inspected.terminal, inspected.filledQuantity, inspected.price, inspected.averagePrice], [true, '2', null, '80.1']);
+  // A market leg cannot claim a resting GTX order with the same client id, and vice versa.
+  await assert.rejects(client.inspect(credentials, { ...spec, id: ORDER }), isError('invalid_data'));
+  await assert.rejects(client.amend(credentials, { ...marketSpec, id: ORDER }), isError('input'));
+  await assert.rejects(client.create(credentials, { ...marketSpec, stopPrice: '90' }), isError('input'));
+  await assert.rejects(client.create(credentials, { ...spec, orderType: 'MARKET' }), isError('input'));
+});
+
+test('Binance offers market orders only when MARKET_LOT_SIZE shares the limit step', async () => {
+  const sameStep = row => ({ ...row, filters: row.filters.map(filter => filter.filterType === 'MARKET_LOT_SIZE' ? { ...filter, minQty: '0.001', maxQty: '20', stepSize: '0.001' } : filter) });
+  const { client } = harness('binance', call => call.url.pathname === '/fapi/v1/exchangeInfo' ? { symbols: ['CLUSDT', 'BZUSDT'].map(symbol => sameStep(binanceRule(symbol))) } : undefined);
+  assert.equal((await client.market('CLUSDT')).rule.maxMarketQuantity, '20');
+  const noMarket = harness('binance', call => call.url.pathname === '/fapi/v1/exchangeInfo' ? { symbols: ['CLUSDT', 'BZUSDT'].map(symbol => ({ ...sameStep(binanceRule(symbol)), orderTypes: ['LIMIT'] })) } : undefined);
+  assert.equal((await noMarket.client.market('CLUSDT')).rule.maxMarketQuantity, null);
+  // A malformed or stricter market filter disables market legs without breaking the chase rule.
+  for (const change of [{ maxQty: 'abc' }, { minQty: '1' }]) {
+    const odd = harness('binance', call => call.url.pathname === '/fapi/v1/exchangeInfo' ? { symbols: ['CLUSDT', 'BZUSDT'].map(symbol => { const row = sameStep(binanceRule(symbol)); return { ...row, filters: row.filters.map(filter => filter.filterType === 'MARKET_LOT_SIZE' ? { ...filter, ...change } : filter) }; }) } : undefined);
+    const { rule } = await odd.client.market('CLUSDT');
+    assert.deepEqual([rule.maxMarketQuantity, rule.quantityStep], [null, '0.001']);
+  }
+});
+
+test('Bybit treats a malformed maxMktOrderQty as no market support and keeps the chase rule', async () => {
+  for (const maxMktOrderQty of ['0', 'abc']) {
+    const { client } = harness('bybit', call => call.url.pathname === '/v5/market/instruments-info' ? { category: 'linear', list: [{ ...bybitRule(call.url.searchParams.get('symbol')), lotSizeFilter: { ...bybitRule('CLUSDT').lotSizeFilter, maxMktOrderQty } }] } : undefined);
+    const { rule } = await client.market('CLUSDT');
+    assert.deepEqual([rule.maxMarketQuantity, rule.maxQuantity], [null, '100']);
+  }
+});
+
+test('Bybit market legs are linear Market orders keyed by orderLinkId, read from realtime then history, and cancelled as orders', async () => {
+  const { client, calls } = harness('bybit', call => {
+    if (call.url.pathname === '/v5/order/create') return { orderId: MARKET_ORDER, orderLinkId: spec.clientId };
+    if (call.url.pathname === '/v5/order/history') return { category: 'linear', list: [bybitOrder()], nextPageCursor: '' };
+    if (call.url.pathname === '/v5/order/cancel') return { orderId: MARKET_ORDER, orderLinkId: spec.clientId };
+    return undefined;
+  });
+  const close = { ...marketSpec, side: 'sell', positionSide: 'LONG', reduceOnly: true };
+  assert.deepEqual(await client.create(credentials, close), { id: MARKET_ORDER, kind: 'order' });
+  authenticatedSignature('bybit', calls[0]);
+  assert.equal(calls[0].url.pathname, '/v5/order/create');
+  assert.deepEqual(calls[0].parameters, { category: 'linear', symbol: 'CLUSDT', side: 'Sell', orderType: 'Market', qty: '2', positionIdx: 1, reduceOnly: true, orderLinkId: spec.clientId });
+  // Without an id the order is found by orderLinkId; an empty realtime list falls back to history.
+  const found = await client.inspect(credentials, marketSpec);
+  assert.deepEqual([found.id, found.kind, found.terminal, found.childrenSettled, found.filledQuantity, found.positionSide], [MARKET_ORDER, 'order', true, true, '2', 'BOTH']);
+  const reads = calls.filter(call => call.url.pathname === '/v5/order/realtime' || call.url.pathname === '/v5/order/history');
+  assert.deepEqual(reads.map(call => [call.url.pathname, call.parameters.orderLinkId]), [['/v5/order/realtime', spec.clientId], ['/v5/order/history', spec.clientId]]);
+  await client.stop(credentials, { ...marketSpec, id: MARKET_ORDER });
+  assert.deepEqual(calls.at(-1).parameters, { category: 'linear', symbol: 'CLUSDT', orderId: MARKET_ORDER });
+  await assert.rejects(client.amend(credentials, { ...marketSpec, id: MARKET_ORDER }), isError('input'));
+});
+
+test('Bybit market inspection rejects foreign orders and reports an unknown order as not found', async () => {
+  for (const [row, code] of [[bybitOrder({ orderLinkId: 'someone-else' }), 'invalid_data'], [bybitOrder({ orderType: 'Limit' }), 'invalid_data'], [bybitOrder({ orderStatus: 'Untriggered' }), 'invalid_data'], [null, 'not_found']]) {
+    const { client } = harness('bybit', call => call.url.pathname === '/v5/order/realtime' ? { category: 'linear', list: row ? [row] : [], nextPageCursor: '' }
+      : call.url.pathname === '/v5/order/history' ? { category: 'linear', list: [], nextPageCursor: '' } : undefined);
+    await assert.rejects(client.inspect(credentials, marketSpec), error => error instanceof ExecutionExchangeError && error.code === code);
+  }
+  // Created = accepted but not yet matched; it is still working, not malformed.
+  const created = harness('bybit', call => call.url.pathname === '/v5/order/realtime' ? { category: 'linear', list: [bybitOrder({ orderStatus: 'Created', cumExecQty: '0' })], nextPageCursor: '' } : undefined);
+  const working = await created.client.inspect(credentials, marketSpec);
+  assert.deepEqual([working.terminal, working.filledQuantity], [false, '0']);
+  const partial = harness('bybit', call => call.url.pathname === '/v5/order/realtime' ? { category: 'linear', list: [bybitOrder({ orderStatus: 'PartiallyFilledCanceled', cumExecQty: '0.5' })], nextPageCursor: '' } : undefined);
+  const result = await partial.client.inspect(credentials, marketSpec);
+  assert.deepEqual([result.terminal, result.filledQuantity], [true, '0.5']);
+  const mismatch = harness('bybit', call => call.url.pathname === '/v5/order/create' ? { orderId: MARKET_ORDER, orderLinkId: 'other' } : undefined);
+  await assert.rejects(mismatch.client.create(credentials, marketSpec), isError('invalid_data', true));
+});
+
+test('Bybit chase legs without a limit omit maxChasePrice', async () => {
+  const { client, calls } = harness('bybit');
+  assert.deepEqual(await client.create(credentials, { ...spec, stopPrice: null }), { id: STRATEGY, kind: 'strategy' });
+  assert.deepEqual(calls[0].parameters, { category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Buy', size: '2', strategyType: 'chaseOrder', positionIdx: 0, reduceOnly: false, chaseDistance: '0' });
 });

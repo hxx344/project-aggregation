@@ -3,6 +3,7 @@ import {
   optionalPrice, id, milliseconds, iso, instrumentId, validateConfig, positionSize, multiply, checkAbort,
 } from './trading-okx-common.mjs';
 import { compareDecimals } from './trading-decimal.mjs';
+import { TRADING_HYNIX_SYMBOLS } from './trading-markets.mjs';
 
 // Account cash flows come exclusively from authenticated bills, never from
 // public funding-rate history or the current position's cumulative fundingFee.
@@ -35,9 +36,9 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
     if (budget && ++budget.requests > MAX_REQUESTS) fail('page_limit');
     return validateConfig(one(await protocol.request('config', credentials, {}, { signal })));
   }
-  async function readPositions(credentials, snapshot, signal) {
+  async function readPositions(credentials, snapshot, signal, symbols = OKX_SYMBOLS) {
     const positions = [], seen = new Set();
-    for (const symbol of OKX_SYMBOLS) {
+    for (const symbol of symbols) {
       const [rows, rule] = await Promise.all([
         protocol.request('positions', credentials, { instType: 'SWAP', instId: instrumentId(symbol) }, { signal }),
         protocol.rule(symbol, signal),
@@ -103,6 +104,12 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
     try { snapshot = await permissions(credentials, signal); } catch (error) { throw convert(error, 'permissions'); }
     try { return await readPositions(credentials, snapshot, signal); } catch (error) { throw convert(error, 'positions'); }
   }
+  async function hynixPositions(credentials, { signal, accountMode } = {}) {
+    try { modeOf(accountMode); } catch (error) { throw convert(error, 'account'); }
+    let snapshot;
+    try { snapshot = await permissions(credentials, signal); } catch (error) { throw convert(error, 'permissions'); }
+    try { return await readPositions(credentials, snapshot, signal, TRADING_HYNIX_SYMBOLS); } catch (error) { throw convert(error, 'positions'); }
+  }
   async function funding(credentials, { start, end, signal, accountMode, onProgress } = {}) {
     try {
       modeOf(accountMode); checkAbort(signal);
@@ -152,5 +159,5 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
     checkAbort(signal);
     return snapshot(failure === null);
   }
-  return Object.freeze({ verify, positions, funding });
+  return Object.freeze({ verify, positions, hynixPositions, funding });
 }

@@ -8,6 +8,9 @@ export const EXECUTION_SYMBOLS = EXECUTION_ALL_SYMBOLS;
 export const EQUAL_SIZE_UNITS = Object.freeze({ oil: '桶', hynix: 'USDT' });
 export const MAX_BATCHES = 200;
 export const QUOTE_MAX_AGE = 10_000;
+/** Per-leg order type: 'chase' posts passively and follows the book; 'market' takes liquidity once. */
+export const ORDER_TYPES = Object.freeze(['chase', 'market']);
+export const legOrderType = leg => leg.orderType ?? 'chase';
 
 export class ExecutionError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -56,13 +59,18 @@ export function normalizeIntent(body) {
   const equalSize = body.equalSize === undefined ? null : positive(body.equalSize, market === 'oil' ? '每腿桶数' : '每腿名义金额');
   const identities = new Set();
   const legs = body.legs.map(value => {
-    exactKeys(value, ['exchange', 'symbol', 'side', 'quantity', 'stopPrice']);
+    exactKeys(value, ['exchange', 'symbol', 'side', 'quantity', 'orderType', 'stopPrice']);
     if (!EXECUTION_EXCHANGES.includes(value.exchange) || !symbols.includes(value.symbol) || !['long', 'short'].includes(value.side)) throw new ExecutionError(400, '合约、交易所或仓位方向无效');
     const identity = `${value.exchange}:${value.symbol}`;
     if (identities.has(identity)) throw new ExecutionError(400, '同一交易所合约不能重复加入本次交易');
     identities.add(identity);
     if ((equalSize === null) === (value.quantity === undefined)) throw new ExecutionError(400, equalSize === null ? '请填写每腿数量' : '统一数量与逐腿数量只能选择一种');
-    return { exchange: value.exchange, symbol: value.symbol, side: value.side, quantity: equalSize === null ? positive(value.quantity) : null, stopPrice: positive(value.stopPrice, '追价停止价') };
+    // Requests from before the order-type selector are chase orders with a required limit.
+    const orderType = value.orderType ?? 'chase';
+    if (!ORDER_TYPES.includes(orderType)) throw new ExecutionError(400, '下单方式只能是追价限价或市价');
+    const unset = value.stopPrice === undefined || value.stopPrice === null;
+    if (orderType === 'market' && !unset) throw new ExecutionError(400, '市价单不设追价界限');
+    return { exchange: value.exchange, symbol: value.symbol, side: value.side, quantity: equalSize === null ? positive(value.quantity) : null, orderType, stopPrice: unset ? null : positive(value.stopPrice, '追价界限') };
   }).sort((a, b) => legId(a).localeCompare(legId(b)));
   if (body.preset === 'four-leg') {
     const exchanges = [...new Set(legs.map(leg => leg.exchange))];
@@ -97,6 +105,8 @@ export function normalizeMarket(value, symbol, now) {
     rule.instrumentId = value.rule.instrumentId;
   }
   if (value.rule.quantityUnit === '张') rule.quantityUnit = '张';
+  // null: the venue does not offer market orders for this contract.
+  rule.maxMarketQuantity = value.rule.maxMarketQuantity === undefined || value.rule.maxMarketQuantity === null ? null : positive(value.rule.maxMarketQuantity, '合约规则');
   try {
     rule.minNotional = decimal(value.rule.minNotional, { nonnegative: true });
     rule.maxNotional = value.rule.maxNotional === null || value.rule.maxNotional === undefined ? null : decimal(value.rule.maxNotional, { positive: true });
@@ -113,10 +123,16 @@ export function splitQuantity(quantity, count, step) {
   if (compareDecimals(addDecimals(result), quantity) !== 0) throw new ExecutionError(500, '拆批数量校验失败');
   return result;
 }
-export function checkChildQuantity(quantity, market, action) {
-  const { rule } = market;
+/** Largest single order for this leg's order type; market orders have their own venue cap. */
+export function maxOrderQuantity(rule, orderType = 'chase') {
+  if (orderType !== 'market') return rule.maxQuantity;
+  if (!rule.maxMarketQuantity) throw new ExecutionError(409, '该交易所合约不支持市价单');
+  return compareDecimals(rule.maxMarketQuantity, rule.maxQuantity) < 0 ? rule.maxMarketQuantity : rule.maxQuantity;
+}
+export function checkChildQuantity(quantity, market, action, orderType = 'chase') {
+  const { rule } = market, max = maxOrderQuantity(rule, orderType);
   if (!isMultiple(quantity, rule.quantityStep)) throw new ExecutionError(409, `下单数量须按 ${rule.quantityStep} 的步长填写`);
-  if (compareDecimals(quantity, rule.minQuantity) < 0 || compareDecimals(quantity, rule.maxQuantity) > 0) throw new ExecutionError(409, `单批数量须在 ${rule.minQuantity} 至 ${rule.maxQuantity} 之间`);
+  if (compareDecimals(quantity, rule.minQuantity) < 0 || compareDecimals(quantity, max) > 0) throw new ExecutionError(409, `单批${orderType === 'market' ? '市价单' : ''}数量须在 ${rule.minQuantity} 至 ${max} 之间`);
   if (action === 'open' && compareNotional(quantity, market.bid, rule.minNotional, rule.contractSize) < 0n) throw new ExecutionError(409, `单批名义金额低于 ${rule.minNotional} USDT`);
   if (rule.maxNotional !== null && compareNotional(quantity, market.ask, rule.maxNotional, rule.contractSize) > 0n) throw new ExecutionError(409, '单批名义金额超过合约允许值');
 }
@@ -125,7 +141,9 @@ export function checkContract(leg, market) {
   if (!leg.rule?.contractSize || !market.rule.contractSize || leg.rule.instrumentId !== market.rule.instrumentId
     || compareDecimals(leg.rule.contractSize, market.rule.contractSize) !== 0) throw new ExecutionError(409, 'OKX 合约乘数或代码已改变，请重新预览');
 }
+/** A market leg or a chase leg without a limit never stops on price. */
 export function stopReached(leg, market) {
+  if (legOrderType(leg) === 'market' || leg.stopPrice === null || leg.stopPrice === undefined) return false;
   const price = leg.orderSide === 'buy' ? market.bid : market.ask;
   return leg.orderSide === 'buy' ? compareDecimals(price, leg.stopPrice) >= 0 : compareDecimals(price, leg.stopPrice) <= 0;
 }
@@ -180,8 +198,10 @@ export function equalQuantity(intent, leg, market) {
     if (!isMultiple(quantity, rule.quantityStep)) throw new ExecutionError(400, `${name} 每腿桶数须为 ${notional(rule.quantityStep, '1', contractSize)} 桶的整数倍`);
     return quantity;
   }
-  // Size from the passive price the order will post at, rounded down to the venue step.
-  const price = leg.orderSide === 'buy' ? market.bid : market.ask;
+  // Size from the price the order will trade at (passive for chase, taker for
+  // market), rounded down to the venue step.
+  const taker = legOrderType(leg) === 'market';
+  const price = (leg.orderSide === 'buy') !== taker ? market.bid : market.ask;
   const lots = units(intent.equalSize) * SCALE * SCALE / (units(price) * units(contractSize) * units(rule.quantityStep));
   if (lots <= 0n) throw new ExecutionError(400, `${name} 每腿名义金额不足一个下单步长`);
   return fromUnits(lots * units(rule.quantityStep));
@@ -193,14 +213,14 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
     const account = snapshots.get(input.exchange), connection = connections.get(input.exchange);
     if (!connection?.connected) throw new ExecutionError(409, `${input.exchange} 尚未连接实盘账户`);
     const market = normalizeMarket(markets.get(`${input.exchange}:${input.symbol}`), input.symbol, now);
-    const leg = { ...input, id: legId(input), orderSide: orderSide(intent.action, input.side), positionMode: account?.modes?.[input.symbol], accountRevision: connection.revision };
+    const leg = { ...input, id: legId(input), orderType: legOrderType(input), stopPrice: input.stopPrice ?? null, orderSide: orderSide(intent.action, input.side), positionMode: account?.modes?.[input.symbol], accountRevision: connection.revision };
     if (intent.equalSize) leg.quantity = equalQuantity(intent, leg, market);
     const currentQuantity = checkPosition(account, leg, intent.action, leg.quantity);
     ensureNoExternalOrders(account, leg.symbol);
     if (!isMultiple(leg.quantity, market.rule.quantityStep)) throw new ExecutionError(400, `${input.exchange} ${input.symbol} 数量须为 ${market.rule.quantityStep} 的整数倍`);
-    if (!isMultiple(input.stopPrice, market.rule.tickSize)) throw new ExecutionError(400, `${input.exchange} ${input.symbol} 停止价须为 ${market.rule.tickSize} 的整数倍`);
-    if (stopReached(leg, market)) throw new ExecutionError(409, `${input.exchange} ${input.symbol} 当前已达到追价停止价`);
-    const maxLots = units(market.rule.maxQuantity) / units(market.rule.quantityStep);
+    if (leg.stopPrice !== null && !isMultiple(leg.stopPrice, market.rule.tickSize)) throw new ExecutionError(400, `${input.exchange} ${input.symbol} 追价界限须为 ${market.rule.tickSize} 的整数倍`);
+    if (stopReached(leg, market)) throw new ExecutionError(409, `${input.exchange} ${input.symbol} 当前已达到追价界限`);
+    const maxLots = units(maxOrderQuantity(market.rule, leg.orderType)) / units(market.rule.quantityStep);
     if (maxLots <= 0n) throw new ExecutionError(502, '交易所最大数量规则无效');
     const lots = units(leg.quantity) / units(market.rule.quantityStep), required = (lots + maxLots - 1n) / maxLots;
     if (required > BigInt(MAX_BATCHES)) throw new ExecutionError(400, `数量过大，需要超过 ${MAX_BATCHES} 批，请分成多次任务`);
@@ -209,8 +229,8 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
   });
   const legs = prepared.map(({ market, ...leg }) => {
     const batchQuantities = splitQuantity(leg.quantity, count, market.rule.quantityStep);
-    for (const quantity of batchQuantities) checkChildQuantity(quantity, market, intent.action);
-    return { ...leg, batchQuantities, estimatedNotional: notional(leg.quantity, leg.orderSide === 'buy' ? market.bid : market.ask, market.rule.contractSize), bid: market.bid, ask: market.ask, quoteAt: market.at, rule: market.rule };
+    for (const quantity of batchQuantities) checkChildQuantity(quantity, market, intent.action, leg.orderType);
+    return { ...leg, batchQuantities, estimatedNotional: notional(leg.quantity, (leg.orderSide === 'buy') !== (legOrderType(leg) === 'market') ? market.bid : market.ask, market.rule.contractSize), bid: market.bid, ask: market.ask, quoteAt: market.at, rule: market.rule };
   });
   const balance = intent.equalSize ? null : hedgeBalance(intent.market, legs);
   // Per-leg sizes are native units (OKX in contracts). A fresh open where any
@@ -219,11 +239,16 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
   const sizing = balance ? [`逐腿数量：${balance.text}${balance.balanced ? '。' : `；${balance.failed}，两侧不平衡，请确认这是有意的数量。`}`] : intent.market === 'oil'
     ? [`等桶配腿：每腿 ${intent.equalSize} 桶，已按各所每张合约桶数换算为原生数量。`]
     : [`等金额配腿：每腿目标 ${intent.equalSize} USDT，按预览盘口向下取整到下单步长；各腿预估名义金额为 ${legs.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${leg.estimatedNotional}`).join('、')} USDT，成交价变动后实际金额会偏离。`];
+  const chase = legs.filter(leg => leg.orderType === 'chase'), takers = legs.filter(leg => leg.orderType === 'market');
+  const names = group => group.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol}`).join('、');
   return { ...intent, batchCount: count, legs,
     notes: [
       ...sizing,
-      `本次交易所：${[...new Set(legs.map(leg => leg.exchange))].map(exchange => TRADING_NAMES[exchange]).join(' / ')}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量。`,
-      '停止价用于触达后停止追价并撤销余单，不是对所有成交价格的硬保证；不发送市价单，不用市价补齐或回滚。',
+      ...(chase.length ? [`追价限价腿：${names(chase)}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量。`] : []),
+      ...(chase.some(leg => leg.stopPrice !== null) ? ['追价界限用于触达后停止追价并撤销余单，不是对所有成交价格的硬保证。'] : []),
+      ...(chase.some(leg => leg.stopPrice === null) ? [`未设追价界限：${names(chase.filter(leg => leg.stopPrice === null))} 会一直跟随盘口，直到成交、手动停止或达到最长执行时间。`] : []),
+      ...(takers.length ? [`市价腿：${names(takers)}。每批发送一次市价单，按对手盘吃单成交，不设价格界限，成交价可能明显偏离预览盘口；未全部成交（流动性不足或交易所价格保护）时暂停后续批次，不自动补单。`] : []),
+      '失败时不用市价补齐或回滚。',
       '同一批所有腿完成且委托终结后才进入下一批；任一腿失败会暂停后续批次并撤销余单，已成交仓位不会自动撤回。',
       ...(count > intent.batchCount ? [`按交易所单笔数量上限，批次数已从 ${intent.batchCount} 增加至 ${count}，请核对预览。`] : []),
     ] };

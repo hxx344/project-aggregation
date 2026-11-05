@@ -20,8 +20,10 @@ import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
 import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
+import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroLp } from '../automation/aero-lp.mjs';
+import { createAeroSafe } from '../automation/aero-safe.mjs';
 import { aeroLpValuation } from '../automation/aero-lp-valuation.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
@@ -59,9 +61,13 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const { stmt, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
   const research = createEntropyLighterResearch({ dataDir, enabledByDefault: researchEnabledByDefault, log });
+  const costResearch = createBinanceLighterCost({ dataDir, log });
   // 只读链上行情；测试、非内置实例与 AERO_MARKET_SCAN=false 时默认不扫描，避免启动即访问公共 RPC；页面保存的配置优先。
   const aeroMarket = createAeroMarket({ dataDir, enabledByDefault: aeroMarketEnabledByDefault, log });
   const aeroLp = createAeroLp({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
+    readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
+  // Aero 市场实盘：bot 经 Safe 的 Roles 模块执行，与 LP 调仓共用维护与隔离恢复闸门。
+  const aeroSafe = createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
     readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
   const writerDatabase = path.join(dataDir, 'execution-control.sqlite');
@@ -227,6 +233,30 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     const reply = (status, body) => ({ status, body });
     // The API checked the session; it may have ended while the request waited for admission.
     if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+    if (pathname === '/api/research/binance-lighter-cost' || pathname.startsWith('/api/research/binance-lighter-cost/')) {
+      if (url.search) throw new HttpError(400, '成本研究接口不接受查询参数');
+      const base = '/api/research/binance-lighter-cost';
+      if (pathname === base && method === 'GET') return reply(200, costResearch.state());
+      if (pathname === `${base}/report` && method === 'GET') return reply(200, costResearch.report());
+      const scenario = pathname.match(/^\/api\/research\/binance-lighter-cost\/scenario\/([0-9a-f-]{36})\/((?:BTC|ETH)-inventory-\d{3,5})$/);
+      if (scenario && method === 'GET') return reply(200, costResearch.scenario(scenario[1], scenario[2]));
+      const archive = pathname.match(/^\/api\/research\/binance-lighter-cost\/report\/([0-9a-f-]{36})$/);
+      if (archive && method === 'GET') return reply(200, costResearch.report(archive[1]));
+      const action = pathname === `${base}/config` && method === 'PUT' ? 'save'
+        : pathname === `${base}/start` && method === 'POST' ? 'start'
+          : pathname === `${base}/stop` && method === 'POST' ? 'stop'
+            : pathname === `${base}/archive` && method === 'POST' ? 'archive' : null;
+      if (!action) throw new HttpError(404, '成本研究接口不存在');
+      const body = await bodyOf();
+      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
+      authorize();
+      if (action === 'save') {
+        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供研究配置');
+        return reply(200, await costResearch.save(body.config, authorize));
+      }
+      if (Object.keys(body).length) throw new HttpError(400, '研究控制操作不接受额外参数');
+      return reply(200, await costResearch[action](authorize));
+    }
     if (pathname === '/api/research/entropy-lighter' || pathname.startsWith('/api/research/entropy-lighter/')) {
       if (url.search) throw new HttpError(400, '研究接口不接受查询参数');
       if (pathname === '/api/research/entropy-lighter' && method === 'GET') return reply(200, research.state());
@@ -310,6 +340,24 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await aeroLp[action](authorize));
     }
+    if (pathname === '/api/automation/aero-safe' || pathname.startsWith('/api/automation/aero-safe/')) {
+      if (url.search) throw new HttpError(400, 'Aero 实盘接口不接受查询参数');
+      if (pathname === '/api/automation/aero-safe' && method === 'GET') return reply(200, aeroSafe.state());
+      const routes = { 'PUT /config': 'save', 'PUT /wallet': 'setKey', 'POST /wallet/clear': 'clearKey', 'POST /refresh': 'refresh', 'POST /preview': 'preview', 'POST /execute': 'execute', 'PUT /auto': 'setAuto', 'POST /auto/discard': 'discardAuto' };
+      const action = routes[`${method} ${pathname.slice('/api/automation/aero-safe'.length)}`];
+      if (!action) throw new HttpError(404, 'Aero 实盘接口不存在');
+      const body = await bodyOf();
+      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
+      authorize();
+      const only = (...keys) => { if (Object.keys(body).some((key) => !keys.includes(key))) throw new HttpError(400, '请求包含未知字段'); };
+      if (action === 'save') { only('config'); return reply(200, await aeroSafe.save(body.config, authorize)); }
+      if (action === 'setKey') { only('privateKey'); return reply(200, await aeroSafe.setKey(body.privateKey, authorize)); }
+      if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize)); }
+      if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize)); }
+      if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize)); }
+      if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      return reply(200, await aeroSafe[action](authorize));
+    }
     if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {
       if (url.search) throw new HttpError(400, '汇总接口不接受查询参数');
       if (pathname === '/api/automation/feishu-digest' && method === 'GET') return reply(200, feishuDigest.state());
@@ -363,6 +411,12 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // against the durable maintenance flag. Stop and reconcile stay open.
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
       if (pathname === '/api/trading/execution' && method === 'GET') return reply(200, execution.state());
+      if (pathname === '/api/trading/execution/quotes' && method === 'GET') {
+        if (url.search) throw new HttpError(400, '行情接口不接受查询参数');
+        const data = await execution.quotes();
+        if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
+        return reply(200, data);
+      }
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
       const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
       if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));
@@ -441,8 +495,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
-    prepareStop: () => aeroLp.prepareStop(),
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await aeroMarket.initialize(); await aeroLp.initialize(); feishuDigest.initialize(); },
+    prepareStop: async () => { await aeroLp.prepareStop(); await aeroSafe.prepareStop(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroLp.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -454,6 +508,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await aeroMarket.close(); await aeroLp.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroLp.close(); await aeroSafe.close(); await baseline?.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

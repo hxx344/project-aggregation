@@ -89,6 +89,24 @@ for (const exchange of ['binance', 'bybit']) {
   });
 }
 
+for (const exchange of ['binance', 'bybit']) {
+  test(`${exchange} SK hynix positions recheck read-only permission and request only the two SK hynix contracts`, async () => {
+    const { client, calls } = healthy(exchange);
+    const result = await client.hynixPositions(credentials);
+    assert.deepEqual(result.positions.map(row => [row.symbol, row.quantity]), [['SKHYUSDT', '2.5'], ['SKHYNIXUSDT', '2.5']]);
+    assert.ok(calls[0].url.pathname.endsWith(exchange === 'binance' ? 'apiRestrictions' : 'query-api'));
+    const reads = calls.filter(call => call.url.pathname.endsWith(exchange === 'binance' ? 'positionRisk' : 'position/list'));
+    assert.deepEqual(reads.map(call => call.url.searchParams.get('symbol')), ['SKHYUSDT', 'SKHYNIXUSDT']);
+    assert.ok(!calls.some(call => /\/income|transaction-log/.test(call.url.pathname)), 'no funding ledger read');
+    assert.deepEqual((await client.positions(credentials)).positions.map(row => row.symbol), ['CLUSDT', 'BZUSDT']);
+  });
+}
+test('SK hynix position reads stop at a write-enabled key', async () => {
+  const { client, calls } = harness('binance', () => ({ ...permission(), enableFutures: true }));
+  await assert.rejects(client.hynixPositions(credentials), error => error instanceof TradingExchangeError && error.code === 'permissions');
+  assert.equal(calls.length, 1);
+});
+
 test('Binance rejects missing, malformed, or enabled write permissions before business reads', async () => {
   const cases = [{ ...permission(), enableReading: 'true' }, { ...permission(), enableReading: undefined }];
   for (const field of core) for (const value of [true, undefined, 'false', 0]) cases.push({ ...permission(), [field]: value });

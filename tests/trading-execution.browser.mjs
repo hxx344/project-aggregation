@@ -24,13 +24,14 @@ async (page) => {
     if (input.resumeJobId) assert(resume, 'resume references an existing job');
     const plan = resume ? { preset: resume.preset, action: resume.action, legs: resume.legs.map(leg => ({ exchange: leg.exchange, symbol: leg.symbol, side: leg.side, quantity: leg.remainingQuantity, stopPrice: leg.stopPrice })), batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300000 } : input;
     assert([2, 4].includes(plan.legs.length), 'preview has complete preset legs');
-    assert(plan.legs.every(leg => typeof leg.stopPrice === 'string'), 'stop prices remain strings');
+    assert(plan.legs.every(leg => (leg.stopPrice === undefined || leg.stopPrice === null || typeof leg.stopPrice === 'string') && ['chase', 'market', undefined].includes(leg.orderType)), 'optional stop prices remain strings and order types are explicit');
+    assert(plan.legs.every(leg => leg.orderType !== 'market' || leg.stopPrice == null), 'market legs never send a stop price');
     if (plan.equalSize !== undefined) assert(typeof plan.equalSize === 'string' && plan.legs.every(leg => leg.quantity === undefined), 'equal sizing sends one amount and no per-leg quantity');
     else assert(plan.legs.every(leg => typeof leg.quantity === 'string'), 'per-leg quantities remain strings');
     const sized = plan.equalSize === undefined ? plan : { ...plan, legs: plan.legs.map(leg => ({ ...leg, quantity: (plan.market ?? 'oil') === 'oil' ? plan.equalSize : '0.5' })) };
     const result = { ...sized, market: plan.market ?? 'oil', equalSize: plan.equalSize ?? null, id: `fixture-preview-${++previewSequence}`, expiresAt: new Date(Date.now() + 60_000).toISOString(), resumeJobId: input.resumeJobId || null,
       connections: connections.filter(connection => plan.legs.some(leg => leg.exchange === connection.exchange)),
-      legs: sized.legs.map((leg, index) => ({ ...leg, id: `leg-${index}`, orderSide: (plan.action === 'open') === (leg.side === 'long') ? 'buy' : 'sell', positionMode: 'hedge', accountRevision: connections.find(connection => connection.exchange === leg.exchange).revision, currentQuantity: '2', batchQuantities: plan.batchCount === 2 ? ['1', '1'] : [leg.quantity], estimatedNotional: '140.123456789012345678', bid: '70.01', ask: '70.02', quoteAt: stamp() })),
+      legs: sized.legs.map((leg, index) => ({ ...leg, orderType: leg.orderType ?? 'chase', stopPrice: leg.stopPrice ?? null, id: `leg-${index}`, orderSide: (plan.action === 'open') === (leg.side === 'long') ? 'buy' : 'sell', positionMode: 'hedge', accountRevision: connections.find(connection => connection.exchange === leg.exchange).revision, currentQuantity: '2', batchQuantities: plan.batchCount === 2 ? ['1', '1'] : [leg.quantity], estimatedNotional: '140.123456789012345678', bid: '70.01', ask: '70.02', quoteAt: stamp() })),
       notes: ['模拟预览：不会访问交易所。'] };
     previews.set(result.id, structuredClone(result)); return result;
   }
@@ -124,6 +125,10 @@ async (page) => {
     assert(await form.getByLabel(`${name} 实盘 API Secret`, { exact: true }).inputValue() === '', 'saved secret cleared from field');
   }
   await panel.locator('.execution-connections > summary').click();
+  const presets = panel.getByRole('group', { name: '交易预设', exact: true });
+  assert((await presets.getByRole('button').first().textContent()).startsWith('同所两腿'), 'same-venue preset is listed first');
+  assert(await presets.getByRole('button', { name: /^同所两腿/ }).getAttribute('aria-pressed') === 'true', 'same-venue is the default preset');
+  await presets.getByRole('button', { name: /^四腿组合/ }).click();
   await direction('开仓方向', 0);
   assert(await panel.locator('.execution-leg-input').count() === 4, 'four-leg preset exposes four complete legs');
   for (const input of await panel.locator('.execution-leg-input input').all()) assert(await input.inputValue() === '', 'financial inputs start blank');
@@ -228,9 +233,16 @@ async (page) => {
   await choose('数量方式', '等金额');
   await panel.getByLabel(/^每腿名义金额/).fill('1000');
   await fillLegs(false);
+  const hynixLegs = await panel.locator('.execution-leg-input').all();
+  await hynixLegs[0].getByRole('group', { name: '下单方式', exact: true }).getByRole('button', { name: '市价', exact: true }).click();
+  assert(await hynixLegs[0].getByLabel(/^追价[上下]限/).count() === 0 && await hynixLegs[0].getByText(/按对手盘吃单成交/).count() === 1, 'market leg hides the chase limit');
+  await hynixLegs[1].getByLabel(/^追价[上下]限/).fill('');
   await panel.getByRole('button', { name: '预览开仓组合' }).click();
   await panel.getByRole('heading', { name: '确认海力士跨所两腿开仓' }).waitFor();
   const hynixPreview = requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
+  assert(hynixPreview.legs[0].orderType === 'market' && hynixPreview.legs[0].stopPrice === undefined && hynixPreview.legs[1].orderType === 'chase' && hynixPreview.legs[1].stopPrice === undefined, 'market leg and unlimited chase leg omit stop prices');
+  assert(await panel.getByText('不设价格界限').count() >= 1 && await panel.getByText('一直跟随盘口').count() >= 1, 'review shows market and unlimited chase legs');
+  await panel.locator('.execution-review').screenshot({ path: 'output/playwright/trading-execution-market-review.png' });
   assert(hynixPreview.market === 'hynix' && hynixPreview.equalSize === '1000' && hynixPreview.legs.every(leg => leg.symbol === 'SKHYNIXUSDT'), 'SK hynix sends equal notional for share contracts');
   await panel.getByRole('button', { name: '返回修改参数' }).click();
 
