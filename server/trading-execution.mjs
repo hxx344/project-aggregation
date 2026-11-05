@@ -7,6 +7,7 @@ import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL } from './control/execution-jobs.mjs';
 import { immediate } from './control/schema.mjs';
+import { evaluateRule, boundsFor, SPREADS } from './trading-auto.mjs';
 
 const iso = time => new Date(time).toISOString();
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
@@ -28,6 +29,8 @@ const JOB_STATUS = "json_extract(json,'$.status')", JOB_CREATED = "json_extract(
 const FINAL_SQL = [...FINAL].map(status => `'${status}'`).join(',');
 const UNFINISHED_JOB = `(${JOB_STATUS} IS NULL OR ${JOB_STATUS} NOT IN (${FINAL_SQL}))`, FINISHED_JOB = `${JOB_STATUS} IN (${FINAL_SQL})`;
 const FINISHED_JOB_PAGE = 30;
+// Automatic jobs send only from books received within this window of the send decision.
+const AUTO_BOOK_WINDOW_MS = 1500;
 const JOB_INDEXES_SQL = `
   CREATE INDEX IF NOT EXISTS execution_jobs_unfinished ON execution_jobs(${JOB_CREATED}) WHERE ${UNFINISHED_JOB};
   CREATE INDEX IF NOT EXISTS execution_jobs_finished ON execution_jobs(${JOB_CREATED}) WHERE ${FINISHED_JOB};`;
@@ -294,7 +297,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const unsettled = order => !order.settled;
   function publicJob(job) {
     const all = orders(job.id);
-    return { id: job.id, market: job.plan.market ?? 'oil', preset: job.plan.preset, action: job.plan.action, status: job.status,
+    return { id: job.id, market: job.plan.market ?? 'oil', preset: job.plan.preset, action: job.plan.action, status: job.status, ...(job.auto ? { auto: { ruleId: job.auto.ruleId, action: job.auto.action, ...(job.auto.unsent ? { unsent: true } : {}) } } : {}),
       createdAt: job.createdAt, updatedAt: job.updatedAt, deadlineAt: job.deadlineAt, batchIndex: job.batchIndex, batchCount: job.plan.batchCount,
       reason: job.reason, ...(stopRequested(job.id) ? { stopRequested: true } : {}), canResume: job.status === 'paused' && all.every(order => order.settled) && job.totals.some(leg => compareDecimals(totalFilled(all, leg.id), leg.quantity) < 0),
       legs: job.totals.map(leg => {
@@ -370,7 +373,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     return state();
   }
   async function collect(legs) {
-    const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), markets = new Map(), connections = new Map();
+    const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), markets = new Map(), connections = new Map(), received = new Map();
     await Promise.all(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
@@ -387,9 +390,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(mergeSnapshot(ctx.row.snapshot, account, symbols)), exchange, ctx.row.revision);
     }));
     await Promise.all(legs.map(async leg => {
-      const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })); markets.set(`${leg.exchange}:${leg.symbol}`, value);
+      const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })); markets.set(`${leg.exchange}:${leg.symbol}`, value); received.set(`${leg.exchange}:${leg.symbol}`, now());
     }));
-    requireLease(); return { snapshots, markets, connections };
+    requireLease(); return { snapshots, markets, connections, received };
   }
   // Display-only top of book on every venue (same-venue spreads are the main
   // use, so the view does not depend on the selected pair). Public book only
@@ -470,6 +473,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (!publicJob(job).canResume) throw new ExecutionError(409, '任务状态已改变，请重新预览');
         for (const leg of plan.legs) if (compareDecimals(publicJob(job).legs.find(row => row.id === leg.id).remainingQuantity, leg.quantity) !== 0) throw new ExecutionError(409, '已成交数量改变，请重新预览');
         job.plan = plan; job.phase += 1;
+        // A person confirmed the remaining quantity: the rule's threshold no longer holds it back.
+        if (job.auto?.guard) job.auto = { ...job.auto, guard: null };
       } else job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [] };
       Object.assign(job, { status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) });
       protectJob(job, !!plan.resumeJobId);
@@ -482,6 +487,51 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       return state();
     });
   }
+  // Server-side start for a saved automatic rule. It runs the same account,
+  // book, position and lock checks as a preview, then saves the job, its locks
+  // and the caller's own record (commit) in one transaction: a crash can never
+  // leave a job the rule does not know about, and a rule that changed while the
+  // books were read aborts the job instead of trading on old settings.
+  // check sees the books the plan is built from, so a trigger decided on the
+  // shared display cache is confirmed on the same read the orders start from.
+  // accounts pins each venue to a connection revision: a close must reach the
+  // account that opened, not whatever is connected now.
+  async function startAutomatic(body, { auto, commit, check, accounts = null }) {
+    writable();
+    if (!auto || typeof auto.ruleId !== 'string' || !['open', 'close'].includes(auto.action) || typeof commit !== 'function' || typeof check !== 'function' || !auto.guard) throw new ExecutionError(500, '自动任务参数无效');
+    const { market, exchange, direction, openThreshold, closeThreshold } = auto.guard, guard = { market, exchange, direction, openThreshold, closeThreshold };
+    const intent = normalizeIntent(body);
+    if (intent.action !== auto.action) throw new ExecutionError(500, '自动任务参数无效');
+    if (accounts) intent.legs = intent.legs.map(leg => {
+      if (!Number.isSafeInteger(accounts[leg.exchange])) throw new ExecutionError(500, '自动任务参数无效');
+      return { ...leg, accountRevision: accounts[leg.exchange] };
+    });
+    const lockedLeg = () => intent.legs.some(leg => stmt.prepare('SELECT 1 FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`));
+    if (lockedLeg()) throw new ExecutionError(409, '所选合约已有未结束任务');
+    let collected;
+    try { collected = await collect(intent.legs); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
+    check({ books: [...collected.markets].map(([key, market]) => ({ exchange: key.split(':')[0], symbol: market.symbol, bid: market.bid, ask: market.ask, at: market.at })) });
+    const plan = { ...buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()), id: randomUUID(), resumeJobId: null, connections: [...collected.connections.values()] };
+    writable();
+    return transaction(() => {
+      for (const leg of plan.legs) context(leg.exchange, leg.accountRevision);
+      if (lockedLeg()) throw new ExecutionError(409, '所选合约已有未结束任务');
+      const job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [], auto: { ruleId: auto.ruleId, action: auto.action, guard },
+        status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) };
+      commit(job.id);
+      try {
+        protectJob(job);
+        recoveredWriterJobs.add(job.id);
+        event(job, `自动规则触发${auto.action === 'open' ? '开仓' : '平仓'}${auto.trigger ? '：' + String(auto.trigger).slice(0, 200) : ''}`); saveJob(job);
+        for (const leg of plan.legs) stmt.prepare('INSERT INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
+      } catch (error) { writerTickets.delete(job.id); recoveredWriterJobs.delete(job.id); throw error; }
+      return job.id;
+    });
+  }
+  const jobView = id => publicJob(jobFor(id));
+  const jobAccounts = id => (jobFor(id).plan.connections ?? []).map(row => ({ exchange: row.exchange, revision: row.revision, identity: row.identity ?? null }));
+  const connectionOf = exchange => { const row = accountRow(exchange); return { revision: row.revision, connected: !!row.credentials }; };
+  function leading() { try { requireLease(); return !closing; } catch { return false; } }
   function validateInspection(order, value, { explicit = false, cancelRecovery = false } = {}) {
     const reducedOriginal = cancelRecovery && order.exchange === 'okx' && order.remoteId && order.spec.reduceOnly && value && compareDecimals(value.quantity, '0') > 0 && compareDecimals(value.quantity, order.spec.quantity) <= 0;
     if (!value || typeof value.id !== 'string' || !value.id || (order.remoteId && value.id !== order.remoteId) || value.symbol !== order.spec.symbol || value.side !== order.spec.side || value.reduceOnly !== order.spec.reduceOnly || (value.positionSide !== null && value.positionSide !== order.spec.positionSide) || value.kind !== order.kind || !reducedOriginal && compareDecimals(value.quantity, order.spec.quantity) !== 0) throw new ExecutionError(409, '委托身份或数量与本任务不一致，禁止认领或补单');
@@ -690,11 +740,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
             || original.settled || original.remoteId !== order.remoteId || !original.amendPending) throw new NotSubmittedError('任务或原订单已停止，本次追价未发送');
         try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次追价未发送'); }
         if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价界限，本次追价未发送');
+        if (current.auto?.guard && atBound(original, leg, market)) throw new NotSubmittedError('已达到本批价差界限，本次追价未发送');
       };
-      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation, amendSequence: order.amendCount }));
+      // A manual resume drops the automatic guard and continues with the plan's own limit.
+      const target = order.spec.limitPrice ? (jobFor(job.id).auto?.guard ? { limitPrice: leg.orderSide === 'buy' ? market.bid : market.ask } : { limitPrice: null, stopPrice: leg.stopPrice ?? null }) : {};
+      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, ...target, id: order.remoteId }, { ...ctx.options, signal, beforeMutation, amendSequence: order.amendCount }));
       requireLease();
       const current = orderFor(order.localId), filledQuantity = validateInspection(current, value);
-      Object.assign(current, { filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
+      Object.assign(current, { spec: { ...current.spec, ...target }, filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
       finishWrite(operation, 'confirmed', current);
       saveOrder(current);
       if (current.settled && compareDecimals(current.filledQuantity, current.spec.quantity) < 0) throw new ExecutionError(409, '原生追价后订单提前终止且未全部成交，暂停其余交易腿');
@@ -720,8 +773,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (all.some(order => order.legId === leg.id && !order.settled)) throw new ExecutionError(409, '前一委托尚未结束，禁止重复下单');
     const ctx = context(leg.exchange, leg.accountRevision), localId = randomUUID();
     const orderType = legOrderType(leg);
-    const spec = { symbol: leg.symbol, side: leg.orderSide, positionSide: positionSide(leg), quantity, reduceOnly: job.plan.action === 'close', clientId: 'h' + createHash('sha256').update(localId).digest('hex').slice(0, 30), orderType, stopPrice: leg.stopPrice ?? null,
-      ...(leg.exchange === 'okx' ? { contractSize: leg.rule.contractSize, instrumentId: leg.rule.instrumentId } : {}) };
+    const bound = job.auto?.guard && orderType === 'chase' ? job.auto.boundsBatch === job.batchIndex && job.auto.bounds?.[leg.id] : null;
+    if (bound === false || bound === undefined) throw new ExecutionError(409, '自动任务缺少本批价差界限，暂停发送');
+    // Binance QUEUE prices at match time, so an automatic leg there rests at the
+    // explicit maker price already checked against its limit instead.
+    const limitPrice = bound && leg.exchange === 'binance' ? (leg.orderSide === 'buy' ? market.bid : market.ask) : null;
+    const spec = { symbol: leg.symbol, side: leg.orderSide, positionSide: positionSide(leg), quantity, reduceOnly: job.plan.action === 'close', clientId: 'h' + createHash('sha256').update(localId).digest('hex').slice(0, 30), orderType, stopPrice: bound ?? leg.stopPrice ?? null,
+      ...(limitPrice ? { limitPrice } : {}), ...(leg.exchange === 'okx' ? { contractSize: leg.rule.contractSize, instrumentId: leg.rule.instrumentId } : {}) };
     const order = { localId, jobId: job.id, legId: leg.id, exchange: leg.exchange, accountRevision: leg.accountRevision, phase: job.phase, batch: job.batchIndex,
       kind: leg.exchange === 'bybit' && orderType === 'chase' ? 'strategy' : 'order', remoteId: null, spec, state: 'submitting', unknown: true, settled: false, filledQuantity: '0', price: null, lastCheckedAt: null, createdAt: iso(now()), cancelRequestedAt: null };
     // Persist intent before the network call. On restart an unanswered intent is uncertain.
@@ -769,6 +827,51 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       latest.status = 'attention'; latest.reason = '仍有委托结果未确认；已停止后续下单，请核对策略编号或重试撤单'; saveJob(latest);
     }
   }
+  // An automatic job re-checks its rule's threshold on the books each new
+  // batch is sent from. Nothing sent yet: the job ends unsent and the rule
+  // goes back to waiting. A later batch waits for the spread (or the deadline)
+  // so the legs already filled are not added to at a worse spread. A passing
+  // check fixes per-leg chase limits for the batch (boundsFor): every order
+  // and amendment of the batch stays inside them, including a leg re-sent
+  // alone, so fills keep the spread at or beyond the threshold.
+  function guardMet(id, job, candidates, markets, all, received) {
+    const raw = leg => markets.get(`${leg.exchange}:${leg.symbol}`);
+    const books = { books: candidates.map(({ leg }) => { const value = raw(leg); return { exchange: leg.exchange, symbol: value.symbol, bid: value.bid, ask: value.ask, at: value.at }; }) };
+    // Both books must be just read (local receive time, immune to venue clock
+    // skew): a slow leg must not pair a current book with one seconds old.
+    const oldest = Math.min(...candidates.map(({ leg }) => received.get(`${leg.exchange}:${leg.symbol}`) ?? -Infinity));
+    const reading = now() - oldest > AUTO_BOOK_WINDOW_MS ? { error: '两腿盘口读取间隔过长' } : evaluateRule(job.auto.guard, job.plan.action, books, now());
+    const latest = jobFor(id);
+    if (!['queued', 'running'].includes(latest.status)) return false;
+    let bounds = null;
+    if (!reading.error && reading.met) {
+      const premiumSymbol = SPREADS[job.auto.guard.market].premium, book = leg => ({ ...raw(leg), tickSize: raw(leg).rule.tickSize });
+      const premiumLeg = job.plan.legs.find(leg => leg.symbol === premiumSymbol), baseLeg = job.plan.legs.find(leg => leg.symbol !== premiumSymbol);
+      const limits = boundsFor(job.auto.guard, job.plan.action, book(premiumLeg), book(baseLeg));
+      if (limits) bounds = { [premiumLeg.id]: limits.premium, [baseLeg.id]: limits.base };
+      // Every limit is checked before any leg is sent, so no leg can go out alone.
+      if (bounds && job.plan.legs.some(leg => legOrderType(leg) === 'chase' && (compareDecimals(bounds[leg.id], '0') <= 0 || stopReached({ ...leg, stopPrice: bounds[leg.id] }, raw(leg))))) bounds = null;
+    }
+    if (bounds) {
+      if (latest.auto.waiting) event(latest, '可成交价差重新满足阈值，继续发送');
+      latest.auto = { ...latest.auto, waiting: false, bounds, boundsBatch: latest.batchIndex };
+      saveJob(latest);
+      return true;
+    }
+    const why = reading.error ? `盘口不可用（${reading.error}）` : reading.met ? '无法设定有效的价差界限' : '可成交价差已不满足阈值';
+    if (!all.length) {
+      Object.assign(latest, { status: 'stopped', reason: `发送前复核：${why}，未发送任何委托`, auto: { ...latest.auto, unsent: true } });
+      event(latest, latest.reason);
+      transaction(() => { saveJob(latest); stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(id); });
+    } else if (!latest.auto.waiting) { latest.auto = { ...latest.auto, waiting: true }; event(latest, `${why}，暂缓发送下一批`); saveJob(latest); }
+    return false;
+  }
+  const atBound = (order, leg, market) => !!order.spec.stopPrice && stopReached({ ...leg, stopPrice: order.spec.stopPrice }, market);
+  function holdAtBound(id, leg) {
+    const latest = jobFor(id), key = `${latest.batchIndex}:${leg.id}`;
+    if (latest.auto.held === key) return;
+    latest.auto = { ...latest.auto, held: key }; event(latest, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 已到本批价差界限，委托保留原价、不再追价`); saveJob(latest);
+  }
   async function runJob(id) {
     if (busyJobs.has(id)) return; busyJobs.add(id);
     try {
@@ -795,6 +898,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
           const market = normalizeMarket(await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })), leg.symbol, now());
           checkContract(leg, market);
           if (stopReached(leg, market)) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 已达到追价界限`);
+          // An automatic order rests at its last price rather than chase past the batch limit.
+          if (job.auto?.guard && atBound(order, leg, market)) { holdAtBound(id, leg); continue; }
           if (['binance', 'okx'].includes(leg.exchange) && legOrderType(leg) === 'chase' && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= job.plan.repriceIntervalMs
               && (order.price === null || compareDecimals(order.price, leg.orderSide === 'buy' ? market.bid : market.ask) !== 0)) {
             await amendOrder(job, leg, order, market);
@@ -817,7 +922,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (now() < job.nextBatchAt) return;
       const candidates = remaining.filter(item => compareDecimals(item.quantity, '0') > 0 && !all.some(order => order.legId === item.leg.id && !order.settled));
       if (!candidates.length) return;
-      const { snapshots, markets } = await collect(candidates.map(item => item.leg));
+      const { snapshots, markets, received } = await collect(candidates.map(item => item.leg));
       for (const { leg, quantity } of candidates) {
         const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now());
         checkContract(leg, market);
@@ -828,6 +933,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         checkChildQuantity(quantity, market, job.plan.action, legOrderType(leg));
         if (stopReached(leg, market)) throw new ExecutionError(409, '最新盘口已达到追价界限');
       }
+      if (job.auto?.guard && candidates.length === job.plan.legs.length && !guardMet(id, job, candidates, markets, all, received)) return;
       writable(); job = jobFor(id);
       if (!['queued', 'running'].includes(job.status)) return;
       if (now() >= Date.parse(job.deadlineAt)) throw new ExecutionError(409, '执行时间已到，停止追价');
@@ -890,7 +996,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, startAutomatic, jobView, jobAccounts, connectionOf, leading, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       let ownsLease = false;

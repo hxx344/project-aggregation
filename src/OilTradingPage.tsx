@@ -7,6 +7,7 @@ import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
 import TradingPnlChart from './TradingPnlChart';
 import TradingExecution from './TradingExecution';
+import TradingAutoRules from './TradingAutoRules';
 import TradingSpread from './TradingSpread';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPair, TradingPosition, TradingReadState, TradingState } from './trading-types';
 type PositionLeg = Pick<TradingLeg, 'id' | 'exchange' | 'state'> & { symbol: string };
@@ -298,6 +299,7 @@ export default function OilTradingPage({ cache, onExpired }: { cache: TradingCac
     <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div>
     <TradingSpread pair={pair} />
     <TradingExecution pair={pair} onExpired={onExpired} />
+    <TradingAutoRules onExpired={onExpired} />
     {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
     {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}

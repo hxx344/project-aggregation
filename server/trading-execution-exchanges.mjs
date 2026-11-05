@@ -29,14 +29,17 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  * spec = { symbol, side: 'buy' | 'sell', positionSide: 'BOTH' | 'LONG' | 'SHORT',
  *          quantity: decimal string, reduceOnly: boolean, clientId: string <= 32,
  *          orderType?: 'chase' | 'market' (default 'chase'),
- *          stopPrice: positive decimal string | null (chase only; null = no limit) }.
+ *          stopPrice: positive decimal string | null (chase only; null = no limit),
+ *          limitPrice?: positive decimal string (Binance chase only) }.
  *
  * Market legs (orderType 'market') send one ordinary market order and are
  * never amended: Binance MARKET, Bybit linear Market with orderLinkId=clientId
  * (kind 'order', inspected by orderId/orderLinkId like Binance). Market size
  * is capped by rule.maxMarketQuantity (null = market orders unavailable).
  *
- * Binance: LIMIT + GTX + priceMatch=QUEUE; never sends an explicit price.
+ * Binance: LIMIT + GTX + priceMatch=QUEUE, or LIMIT + GTX + price=limitPrice
+ * when the caller needs a hard price bound (it must lie strictly inside
+ * stopPrice, buy below / sell above). Without limitPrice,
  * stopPrice is a strategy stop trigger, NOT a guaranteed execution-price cap;
  * the caller watches prices and periodically amends the same order id with its
  * original total quantity. Each amendment is a single native modify operation,
@@ -423,7 +426,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       || typeof spec.clientId !== 'string' || !/^[.A-Z:/a-z0-9_-]{1,32}$/.test(spec.clientId)) fail('input');
     const orderType = spec.orderType ?? 'chase';
     if (!['chase', 'market'].includes(orderType) || orderType === 'market' && spec.stopPrice !== null && spec.stopPrice !== undefined) fail('input');
-    let quantity, stopPrice = null;
+    let quantity, stopPrice = null, limitPrice = null;
     try {
       if (typeof spec.quantity !== 'string') fail('input');
       quantity = decimal(spec.quantity, { positive: true });
@@ -431,7 +434,12 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
         if (typeof spec.stopPrice !== 'string') fail('input');
         stopPrice = decimal(spec.stopPrice, { positive: true });
       }
+      if (spec.limitPrice !== null && spec.limitPrice !== undefined) {
+        if (exchange !== 'binance' || orderType !== 'chase' || typeof spec.limitPrice !== 'string') fail('input');
+        limitPrice = decimal(spec.limitPrice, { positive: true });
+      }
     } catch { fail('input'); }
+    if (limitPrice !== null && stopPrice !== null && compareDecimals(limitPrice, stopPrice) * (spec.side === 'buy' ? 1 : -1) >= 0) fail('input');
     if (spec.positionSide !== 'BOTH' && spec.reduceOnly !== hedgeClose(spec.side, spec.positionSide)) fail('input');
     // Bybit chase legs are native strategies (UUID); every other leg is an ordinary order.
     const strategy = exchange === 'bybit' && orderType === 'chase';
@@ -443,7 +451,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (exchange === 'binance' && !/^\d{1,30}$/.test(id)) fail('input');
     }
     if (idRequired && strategy && id === null) fail('strategy_id_required');
-    return { symbol: spec.symbol, side: spec.side, positionSide: spec.positionSide, quantity, reduceOnly: spec.reduceOnly, clientId: spec.clientId, orderType, stopPrice, strategy, id };
+    return { symbol: spec.symbol, side: spec.side, positionSide: spec.positionSide, quantity, reduceOnly: spec.reduceOnly, clientId: spec.clientId, orderType, stopPrice, limitPrice, strategy, id };
   }
 
   async function permissionSnapshot(credentials, options) {
@@ -725,7 +733,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     let parameters;
     if (exchange === 'binance') parameters = {
       symbol: spec.symbol, side: spec.side.toUpperCase(), positionSide: spec.positionSide,
-      ...(market ? { type: 'MARKET' } : { type: 'LIMIT', timeInForce: 'GTX', priceMatch: 'QUEUE' }), quantity: spec.quantity,
+      ...(market ? { type: 'MARKET' } : { type: 'LIMIT', timeInForce: 'GTX', ...(spec.limitPrice === null ? { priceMatch: 'QUEUE' } : { price: spec.limitPrice }) }), quantity: spec.quantity,
       ...(spec.positionSide === 'BOTH' ? { reduceOnly: String(spec.reduceOnly) } : {}), newClientOrderId: spec.clientId, newOrderRespType: 'ACK',
     };
     else if (market) parameters = {
@@ -763,7 +771,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     if (spec.id === null || spec.orderType !== 'chase') fail('input');
     const row = await request('amend', credentials, {
       symbol: spec.symbol, side: spec.side.toUpperCase(), orderId: spec.id,
-      quantity: spec.quantity, priceMatch: 'QUEUE',
+      quantity: spec.quantity, ...(spec.limitPrice === null ? { priceMatch: 'QUEUE' } : { price: spec.limitPrice }),
       // FAPI uses this flag only to validate the original order. Hedge closes
       // have no explicit reduceOnly flag, and PAPI does not accept this field.
       ...(options.accountMode === 'standard' && spec.positionSide === 'BOTH' && spec.reduceOnly ? { reduceOnly: 'true' } : {}),
@@ -773,7 +781,8 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (result.id !== spec.id || result.symbol !== spec.symbol || result.side !== spec.side
         || result.positionSide !== spec.positionSide || result.reduceOnly !== spec.reduceOnly
         || result.quantity !== spec.quantity || row.clientOrderId !== spec.clientId
-        || row.type !== 'LIMIT' || row.timeInForce !== 'GTX') fail();
+        || row.type !== 'LIMIT' || row.timeInForce !== 'GTX'
+        || spec.limitPrice !== null && (result.price === null || compareDecimals(result.price, spec.limitPrice) !== 0)) fail();
       return result;
     } catch { fail('invalid_data', { uncertain: true }); }
   }

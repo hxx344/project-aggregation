@@ -171,6 +171,24 @@ for (const mode of ['standard', 'portfolio-margin']) {
   });
 }
 
+test('Binance explicit limit prices are sent as post-only prices and must lie strictly inside the limit', async () => {
+  const { client, calls } = harness('binance', call => call.init.method === 'PUT' ? binanceOrder({ price: '89.5' }) : undefined);
+  await client.create(credentials, { ...spec, limitPrice: '89.9' }, { accountMode: 'standard' });
+  const created = calls[0].parameters;
+  assert.equal(created.type, 'LIMIT'); assert.equal(created.timeInForce, 'GTX'); assert.equal(created.price, '89.9'); assert.equal(Object.hasOwn(created, 'priceMatch'), false);
+  await client.amend(credentials, { ...spec, id: ORDER, limitPrice: '89.5' }, { accountMode: 'standard' });
+  assert.equal(calls[1].parameters.price, '89.5'); assert.equal(Object.hasOwn(calls[1].parameters, 'priceMatch'), false);
+  // An acknowledged amendment at another price is not trusted.
+  await assert.rejects(client.amend(credentials, { ...spec, id: ORDER, limitPrice: '89.4' }, { accountMode: 'standard' }), isError('invalid_data', true));
+  const sent = calls.length;
+  for (const bad of [{ limitPrice: '90' }, { limitPrice: '90.01' }, { side: 'sell', limitPrice: '90' }, { side: 'sell', limitPrice: '89.99' }, { limitPrice: 89 }, { orderType: 'market', stopPrice: null, limitPrice: '89' }])
+    await assert.rejects(client.create(credentials, { ...spec, ...bad }, { accountMode: 'standard' }), isError('input'));
+  assert.equal(calls.length, sent);
+  const bybit = harness('bybit');
+  await assert.rejects(bybit.client.create(credentials, { ...spec, limitPrice: '89' }), isError('input'));
+  assert.equal(bybit.calls.length, 0);
+});
+
 test('native Binance amendment requires an explicit valid order id; Bybit refuses amendment without HTTP', async () => {
   const binance = harness('binance');
   for (const id of [undefined, null, '', 'foreign-id', '-1', '1'.repeat(31)]) {
