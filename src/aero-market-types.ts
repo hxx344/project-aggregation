@@ -13,7 +13,12 @@ export type MarketChain = {
   id: string; name: string; enabled: boolean; rpcHost: string; status: 'idle' | 'loading' | 'ok' | 'error' | 'disabled';
   updatedAt: number | null; checkedAt: number | null; nextAt: number | null; error: string | null; errorAt: number | null;
   poolCount: number | null; activeCount: number | null; gaugeCount: number | null;
-  history: { points: number; from: number | null; archive: 'archive' | 'unavailable' | 'local'; pending: number };
+  // phase：追批中 / 出错后等下次尝试 / 不回填（停用或非归档链）/ 已补齐；null 为尚未回填。nextAt 为下次回填尝试时间。旧版服务端没有这两个字段。
+  history: { points: number; from: number | null; archive: 'archive' | 'unavailable' | 'local'; pending: number; phase?: 'catching_up' | 'backoff' | 'disabled' | 'complete' | null; nextAt?: number | null };
+  // 池子列表：at 为最近一次发现完成时间；stale 为超过 12 小时未更新；failures/error/retryAt 为重新发现的连续失败次数、最近错误与下次尝试时间。旧版服务端没有此字段。
+  // phase 区分发现进行中、待继续、真实失败退避、无进展预算退避与空闲；refreshPending 表示下一轮必须先刷新当前数据。
+  // stalledAttempts 只统计连续预算耗尽且无新增草稿进展的发现尝试，不计入 failures。
+  discovery?: { at: number | null; stale: boolean; failures: number; error: string | null; retryAt: number | null; phase?: 'idle' | 'running' | 'pending' | 'backoff' | 'budget_backoff'; refreshPending?: boolean; stalledAttempts?: number };
 };
 export type MarketSnapshot = {
   schema: 1; revision: number; serverNow: number; unchanged?: false;

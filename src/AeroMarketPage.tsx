@@ -3,7 +3,7 @@ import type { FormEvent } from 'react';
 import { ArrowDown, ArrowLeft, ArrowUp, CircleAlert, LoaderCircle, RefreshCw, RotateCcw, Save, Settings2, SlidersHorizontal, Star } from 'lucide-react';
 import { api, ApiError } from './api';
 import AeroPoolDetail from './AeroPoolDetail';
-import { readCache, writeCache } from './aero-market-cache';
+import { clearCache, readCache, writeCache } from './aero-market-cache';
 import { amount, days, message, pct, signed, usd, when } from './aero-market-format';
 import { bestRange, centeredRange, DEFAULT_PLAN, expectedDaysInRange, fullRange, netYield, quoteOf, rangeApr, rangeLabel, rangeTicks, rebalanceCost, riskVolOf } from './aero-market-math';
 import type { RebalancePlan } from './aero-market-math';
@@ -17,8 +17,35 @@ const DAY = 86400;
 const RANGES = [{ value: 0, label: '最窄（单个 tickSpacing）' }, { value: 0.01, label: '±1%' }, { value: 0.02, label: '±2%' }, { value: 0.05, label: '±5%' }, { value: 0.1, label: '±10%' }, { value: 0.2, label: '±20%' }];
 const STATUS: Record<MarketChain['status'], string> = { idle: '等待首次扫描', loading: '扫描中', ok: '正常', error: '最近一次失败', disabled: '已停用' };
 const HISTORY: Record<MarketChain['history']['archive'], string> = { archive: '历史区块回填', unavailable: '历史区块不可读，本机累计', local: '本机按小时累计' };
-// 本地缓存不存 RPC 地址（可能带密钥）；显示缓存期间扫描设置不可用，等服务器的完整数据。
-const forCache = (data: MarketSnapshot): MarketSnapshot => ({ ...data, config: { ...data.config, chains: Object.fromEntries(Object.entries(data.config.chains).map(([id, c]) => [id, { ...c, rpcUrl: '' }])) } });
+// 回填进度：区分仍按短间隔追批与出错后等下次尝试，剩余小时数单看不出来。
+function backfillText({ enabled, history: h }: MarketChain) {
+  if (!enabled) return '';
+  const at = h.nextAt ? when(h.nextAt) : null;
+  if (h.phase === 'catching_up') return ` · 还差 ${h.pending} 小时，追批中${at ? `（下批 ${at}）` : ''}`;
+  if (h.phase === 'backoff') return h.pending > 0 ? ` · 还差 ${h.pending} 小时，回填出错已暂停${at ? `，${at} 再试` : ''}` : at ? ` · ${at} 再试历史区块` : '';
+  if (h.phase === 'complete') return h.archive === 'archive' ? ' · 7 天已补齐' : '';
+  // 旧版服务端没有 phase。
+  return h.phase === undefined && h.archive === 'archive' && h.pending > 0 ? ` · 还差 ${h.pending} 小时未补` : '';
+}
+// 池子列表长期未更新或重新发现在失败：新池子与被替换的 gauge 读不到，排放可能偏低。
+function discoveryText({ enabled, discovery: d }: MarketChain, serverNow: number) {
+  if (!enabled || !d) return null;
+  const notices = [];
+  if (d.phase === 'running') notices.push('正在重新发现池子，完成后更新当前数据；若未完成，下一轮先刷新当前数据');
+  if (d.phase === 'pending') notices.push(d.refreshPending ? '池子发现待继续，下一轮先刷新当前数据' : '池子发现待继续，后续轮次重新尝试');
+  if (d.phase === 'budget_backoff') notices.push(`重新发现连续 ${d.stalledAttempts ?? 0} 次预算耗尽且无新进展，已暂停${d.retryAt ? `，${when(d.retryAt)} 再试` : ''}；当前数据继续刷新`);
+  if (d.stale || d.failures > 0) {
+    const age = d.at ? `池子列表 ${Math.floor((serverNow - d.at) / 3_600_000)} 小时未更新` : '池子列表未更新';
+    const failed = d.failures > 0 ? `，重新发现连续失败 ${d.failures} 次：${d.error ?? '原因未知'}${d.retryAt ? `，${when(d.retryAt)} 再试` : ''}` : '';
+    notices.push(`${age}${failed}`);
+  }
+  return notices.length ? notices.join('；') : null;
+}
+// 本地缓存不存 RPC 地址或节点诊断文本；显示缓存期间扫描设置不可用，等服务器的完整数据。
+const forCache = (data: MarketSnapshot): MarketSnapshot => ({
+  ...data, config: { ...data.config, chains: Object.fromEntries(Object.entries(data.config.chains).map(([id, c]) => [id, { ...c, rpcUrl: '' }])) },
+  chains: data.chains.map((c) => ({ ...c, error: null, discovery: c.discovery ? { ...c.discovery, error: null } : undefined })),
+});
 const usableSnapshot = (data: unknown): data is MarketSnapshot => {
   const d = data as MarketSnapshot | null;
   return !!d && d.schema === 1 && Array.isArray(d.pools) && Array.isArray(d.chains) && !!d.config && typeof d.config.chains === 'object' && !!d.aero;
@@ -247,7 +274,9 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
     // 先显示本机缓存，服务器的数据到了再替换；服务器先到（revision 已有值）时缓存直接作废。
     void readCache<MarketSnapshot>('snapshot').then((hit) => {
       if (!hit || controller.signal.aborted || revision.current !== null || !usableSnapshot(hit.data)) return;
-      setSnapshot(hit.data); setCachedAt(hit.savedAt);
+      // 旧版缓存可能已含节点回显。清空该副本，保留内存里的去诊断投影，下一次服务器返回再缓存。
+      if (hit.data.chains.some((c) => c.error || c.discovery?.error) || Object.values(hit.data.config.chains).some((c) => c.rpcUrl)) void clearCache();
+      setSnapshot(forCache(hit.data)); setCachedAt(hit.savedAt);
     });
     void read();
     const poll = setInterval(() => { if (!document.hidden) void read(); }, 30_000);
@@ -454,8 +483,9 @@ export default function AeroMarketPage({ onExpired }: { onExpired: () => void })
         <div className="am-chain-head"><strong>{c.name}</strong><span className="am-chain-status">{c.status === 'loading' ? <LoaderCircle size={12} className="spin" /> : null}{stale ? '数据过期' : STATUS[c.status]}</span></div>
         <span>{c.activeCount ?? '—'} 个跟踪 / {c.poolCount ?? '—'} 个池 · {c.gaugeCount ?? '—'} 个有 gauge</span>
         <span>数据 {when(c.updatedAt)}{c.nextAt && c.enabled ? ` · 下次 ${when(c.nextAt)}` : ''}</span>
-        <span title={c.rpcHost}>{HISTORY[c.history.archive]} · {c.history.points} 点{c.enabled && c.history.archive === 'archive' && c.history.pending > 0 ? ` · 还差 ${c.history.pending} 小时未补` : ''}</span>
+        <span title={c.rpcHost}>{HISTORY[c.history.archive]} · {c.history.points} 点{backfillText(c)}</span>
         {c.error ? <span className="lp-error" title={c.error}>{when(c.errorAt)} {c.error}</span> : null}
+        {discoveryText(c, snapshot.serverNow) ? <span className="lp-error">{discoveryText(c, snapshot.serverNow)}</span> : null}
       </div>;
     })}</section>
 
