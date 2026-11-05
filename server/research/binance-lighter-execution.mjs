@@ -2,8 +2,8 @@
 // A future asynchronous adapter must deliver the same cumulative order/fill facts;
 // its authorization, durable submission and reconciliation belong outside the cost math.
 export const EXECUTION_CONTRACT = Object.freeze({
-  version: 1, mode: 'paper', liveAvailable: false,
-  methods: Object.freeze(['submitOrder', 'cancelOrder', 'queryOrder', 'observeTrade', 'executeTaker']),
+  version: 2, mode: 'paper', liveAvailable: false,
+  methods: Object.freeze(['submitOrder', 'cancelOrder', 'queryOrder', 'observeTrade', 'executeTaker', 'forgetOrder']),
   orderIdentity: 'clientOrderId', fillIdentity: 'id',
   capabilities: Object.freeze({ maker: true, partialFills: true, ioc: true, realOrders: false }),
 });
@@ -19,6 +19,7 @@ export function units(value) {
   return match[1] ? -magnitude : magnitude;
 }
 export const numberOf = value => Number(value) / 1e18;
+export const decimalOf = value => `${value < 0n ? '-' : ''}${(value < 0n ? -value : value) / SCALE}.${String((value < 0n ? -value : value) % SCALE).padStart(18, '0')}`;
 export const cashUnits = (quantity, price) => quantity * units(price) / SCALE;
 export const feeUnits = (cash, bps) => cash * units(bps) / (10000n * SCALE);
 const min = (a, b) => a < b ? a : b;
@@ -33,18 +34,18 @@ export function createCostExecution(options = {}) {
 export class PaperExecutionAdapter {
   constructor() { this.orders = new Map(); this.serial = 0; this.capabilities = EXECUTION_CONTRACT; }
   submitOrder(intent) {
-    if (!intent || intent.version !== 1 || typeof intent.clientOrderId !== 'string' || !intent.clientOrderId || intent.clientOrderId.length > 180
+    if (!intent || intent.version !== 2 || typeof intent.clientOrderId !== 'string' || !intent.clientOrderId || intent.clientOrderId.length > 180
       || !['binance', 'lighter'].includes(intent.venue) || !['BTC', 'ETH'].includes(intent.symbol)
-      || !['buy', 'sell'].includes(intent.side) || !['entry', 'exit'].includes(intent.phase)
-      || !positive(intent.quantity) || !positive(intent.limitPrice) || !Number.isFinite(intent.submittedAt)
+      || !['buy', 'sell'].includes(intent.side) || intent.phase !== (intent.venue === 'binance' ? 'quote' : 'hedge')
+      || !positive(Number(intent.quantity)) || !positive(intent.limitPrice) || !Number.isFinite(intent.submittedAt)
       || !Number.isFinite(intent.submittedMono) || !Number.isFinite(intent.sourceAfter)
-      || (intent.venue === 'binance' ? intent.type !== 'limit_maker' : intent.type !== 'ioc')) throw new TypeError('invalid_order_intent');
+      || (intent.venue === 'binance' ? intent.type !== 'limit_maker' || intent.queueAhead === undefined : intent.type !== 'ioc')) throw new TypeError('invalid_order_intent');
     if (this.orders.has(intent.clientOrderId)) throw new Error('duplicate_client_order_id');
     if (this.orders.size >= 1024) throw new Error('paper_order_limit');
     const quantity = units(intent.quantity);
     if (quantity <= 0n) throw new TypeError('invalid_order_quantity');
     const order = { ...structuredClone(intent), quantityUnits: quantity, remaining: quantity, filled: 0n,
-      queue: units(intent.queueAhead || 0), status: 'open', lastSequence: null };
+      queue: units(intent.queueAhead ?? 0), status: 'open', lastSequence: null };
     if (order.queue < 0n) throw new TypeError('invalid_queue');
     this.orders.set(intent.clientOrderId, order);
     return this.queryOrder(intent.clientOrderId);
@@ -88,6 +89,9 @@ export class PaperExecutionAdapter {
   executeTaker(id, book) {
     const order = this.orders.get(id);
     if (!order || order.status !== 'open' || order.type !== 'ioc' || book.venue !== order.venue || book.symbol !== order.symbol) return null;
+    if (!validCostSequence(book.sequence) || !Number.isFinite(book.sourceAt) || !Number.isFinite(book.receivedAt)
+      || !Number.isFinite(book.receivedMono) || book.receivedMono <= order.submittedMono || book.receivedAt <= order.submittedAt
+      || book.sourceAt <= order.sourceAfter) return null;
     let quantity = 0n, cash = 0n;
     const consumedDepth = [];
     for (const [index, [price, size]] of book[order.side === 'buy' ? 'asks' : 'bids'].entries()) {
