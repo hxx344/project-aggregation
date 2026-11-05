@@ -6,8 +6,12 @@ async (page) => {
   const errors = [], writes = [], reads = [], detailReads = [], held = [], heldDetails = [], saveAcks = [], archivedReports = new Map();
   let elapsed = 0, state = 'stopped', session = 1, reportPresent = true, unresolved = false, interrupted = false;
   let frozenAt = null, stale = false, failRead = false, rejectSave = false, holdRead = false, holdSave = false, unknownStop = false, expire = false;
-  let sourceLeadMs = null, lighterChannelState = 'connected';
+  let sourceLeadMs = null, lighterChannelState = 'connected', sampleValid = true;
   let holdDetail = false, detailFailure = 0;
+  let serverClock = null;
+  const updateServerClock = async () => {
+    if (serverClock) elapsed = serverClock.elapsed + await page.evaluate(() => performance.now()) - serverClock.mono;
+  };
   const archives = [];
   let config = {
     schema: 1, symbols: ['BTC', 'ETH'], notionalPerLeg: 1000, latencyScenarios: [300, 600, 1000],
@@ -31,7 +35,7 @@ async (page) => {
       };
     })));
     return { schema: 1, sessionId: `cost-fixture-${session}`, startedAt: base - 60000, updatedAt: at, stopped: state === 'stopped', interrupted, mode: 'paper', sessionConfig: structuredClone(sessionConfig), markets: [],
-      books: sessionConfig.symbols.flatMap(symbol => ['binance', 'lighter'].map(venue => ({ venue, symbol, nativeSymbol: venue === 'binance' ? `${symbol}USDC` : symbol, bid: symbol === 'BTC' ? 99999 : 3000, ask: symbol === 'BTC' ? 100001 : 3001, sourceAt: at - age, receivedAt: at - age, ageMs: age, valid: true,
+      books: sessionConfig.symbols.flatMap(symbol => ['binance', 'lighter'].map(venue => ({ venue, symbol, nativeSymbol: venue === 'binance' ? `${symbol}USDC` : symbol, bid: symbol === 'BTC' ? 99999 : 3000, ask: symbol === 'BTC' ? 100001 : 3001, sourceAt: at - age, receivedAt: at - age, ageMs: age, valid: sampleValid,
         ...(venue === 'lighter' && sourceLeadMs !== null ? { sourceAt: at + sourceLeadMs, sourceClockDeltaMs: -age - sourceLeadMs, sourceClockUncertain: true } : {}),
       }))),
       channels: [{ venue: 'binance', channel: 'depth', state: 'connected', at }, { venue: 'lighter', channel: 'order_book', state: lighterChannelState, at }], scenarios, diagnostics: [{ at, level: 'warn', event: 'metadata', venue: 'lighter', message: '公开合约信息待恢复', reason: 'metadata_unavailable' }], assumptions: ['Paper simulation only.'],
@@ -54,6 +58,9 @@ async (page) => {
     URL.createObjectURL = blob => { void blob.text().then(text => window.__costDownloads.push(JSON.parse(text))); return createObjectURL(blob); };
   });
   await page.route(`${origin}/api/**`, async route => {
+    // A timer can issue a request part-way through runFor(). Timestamp that
+    // response at the actual virtual instant, not at the end of the whole jump.
+    await updateServerClock();
     const request = route.request(), path = new URL(request.url()).pathname;
     const send = (body, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) }).catch(() => {});
     if (path === '/api/session') return send({ authenticated: true, csrfToken: 'cost-fixture-csrf' });
@@ -105,7 +112,7 @@ async (page) => {
     }
     throw new Error(`Unexpected research request: ${request.method()} ${path}`);
   });
-  const advance = async ms => { elapsed += ms; await page.clock.runFor(ms); await page.waitForTimeout(25); };
+  const advance = async ms => { await page.clock.runFor(ms); await updateServerClock(); await page.waitForTimeout(25); };
   const refresh = async () => { const before = reads.length; await page.getByRole('button', { name: '刷新状态', exact: true }).click(); await page.waitForFunction(() => !document.querySelector('.blc-toolbar button')?.disabled); assert(reads.length > before, 'manual refresh fetched status'); };
   const overflow = async () => assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'page has no outer horizontal overflow');
   await page.setViewportSize({ width: 1440, height: 1000 });
@@ -113,6 +120,7 @@ async (page) => {
   await page.locator('.blc-state.stopped').waitFor();
   elapsed = await page.evaluate(() => Date.now()) - base + 50;
   await page.clock.pauseAt(new Date(base + elapsed));
+  serverClock = { elapsed, mono: await page.evaluate(() => performance.now()) };
   assert((await page.locator('.breadcrumb').innerText()).includes('监控'), 'the native route is in monitoring');
   assert(await page.getByRole('heading', { name: '对冲成本研究', exact: true }).count() === 1, 'native cost-lab route renders the research page');
   assert(await page.locator('.blc-scenarios tbody tr').count() === 12, 'BTC/ETH buy/sell times three delays remain independent rows');
@@ -154,26 +162,42 @@ async (page) => {
   }
   sourceLeadMs = 251; await refresh();
   assert(await page.locator('.blc-quality.good').count() === 2, 'a source clock more than 250ms ahead remains ineligible');
-  assert(await page.getByText('源时钟超前超过容差', { exact: true }).count() === 2, 'excessive clock lead has a specific exclusion reason');
+  assert(await page.getByText('采样时源时钟超前超过容差', { exact: true }).count() === 2, 'excessive clock lead has a specific sampling exclusion reason');
+  frozenAt = elapsed; await advance(1100);
+  assert(await page.getByText('采样时源时钟超前超过容差', { exact: true }).count() === 2, 'an invalid source clock at sampling cannot heal merely because browser time passes');
+  frozenAt = null;
   sourceLeadMs = null; lighterChannelState = 'live'; await refresh();
   await page.getByText('公开数据源连接', { exact: true }).click();
   assert(await page.getByText('行情接收中', { exact: true }).count() === 1, 'live channel status has a Chinese label');
   lighterChannelState = 'stale'; await refresh();
   assert(await page.getByText('行情更新滞后', { exact: true }).count() === 1, 'stale channel status has a Chinese label');
+  lighterChannelState = 'disconnected'; sampleValid = false; await refresh();
+  assert(await page.getByText('已断开', { exact: true }).count() === 1, 'a known WS disconnect remains visible independently of sample timing');
+  assert(await page.getByText('采样时未通过校验', { exact: true }).count() === 4, 'small ages cannot override a server-side invalid result');
+  await advance(2100);
+  assert(await page.locator('.blc-quality.stale').count() === 4, 'browser aging cannot hide a server-reported failure behind a neutral waiting state');
+  sampleValid = true;
   lighterChannelState = 'connected'; await refresh(); await page.getByText('公开数据源连接', { exact: true }).click();
   await page.locator('.blc-config>summary').click();
   const notional = page.getByLabel('每腿模拟名义额（USDC）', { exact: true });
   assert(await notional.isDisabled(), 'active configuration is read only');
-  frozenAt = elapsed; await refresh(); await advance(2100);
-  assert(await page.locator('.blc-quality.good').count() === 0, 'local monotonic time expires a book between GETs');
+  frozenAt = elapsed; await refresh(); await advance(3100);
+  assert(await page.locator('.blc-quality.good').count() === 0, 'an old browser snapshot cannot assert current validity');
+  assert(await page.locator('.blc-quality.stale').count() === 0, 'normal sampling delay is not mislabeled as a server-side stale book');
+  assert(await page.getByText('采样时有效 · 当前待更新', { exact: true }).count() === 4, 'three-second-old samples retain their past validity with a neutral current-time state');
   const oldAge = await page.locator('.blc-book-age').first().innerText(); await refresh();
   assert(await page.locator('.blc-quality.good').count() === 0, 'a fresh HTTP GET cannot refresh a frozen market observation');
   const ageSeconds = text => Number.parseFloat(text.replaceAll(',', ''));
-  assert(ageSeconds(await page.locator('.blc-book-age').first().innerText()) >= ageSeconds(oldAge), 'frozen report age cannot move backwards across rereads');
+  assert(ageSeconds(await page.locator('.blc-book-age').first().innerText()) >= ageSeconds(oldAge), `frozen report age cannot move backwards across rereads: ${oldAge} -> ${await page.locator('.blc-book-age').first().innerText()}`);
+  await advance(13000); await refresh();
+  await page.getByText('研究报告超过 15 秒未更新', { exact: true }).waitFor();
+  assert(await page.getByText('历史采样时有效', { exact: true }).count() === 4, 'a stopped report is explicitly historical, not a current healthy claim');
   frozenAt = null; await refresh();
   holdRead = true; await page.getByRole('button', { name: '刷新状态', exact: true }).click(); await page.waitForTimeout(25);
   assert(held.length === 1, 'slow network response is held'); await advance(2500); await held.shift()(); await page.waitForTimeout(25);
   assert(await page.locator('.blc-quality.good').count() === 0, 'transport delay is included in book age before a response is accepted');
+  assert(await page.locator('.blc-quality.stale').count() === 0, 'slow HTTP transport does not fabricate a WS-data failure');
+  assert(await page.getByText('采样时有效 · 当前待更新', { exact: true }).count() === 4, 'slow transport shows waiting for current information');
   await page.clock.setSystemTime(new Date(base + elapsed + 3600000)); await refresh();
   assert(await page.locator('.blc-quality.good').count() === 4, 'browser wall clock skew cannot age server observations');
   await page.clock.setSystemTime(new Date(base + elapsed));
