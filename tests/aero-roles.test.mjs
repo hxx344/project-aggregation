@@ -9,6 +9,7 @@ import { accruedAllowance, checkTransactions } from '../tools/aero-roles/policy.
 import { ROLES_ABI, buildSetupBatch, encodeMultiSend, encodeRoleExecution, predictRolesAddress } from '../tools/aero-roles/roles-calls.mjs';
 
 const config = JSON.parse(readFileSync(new URL('../tools/aero-roles/config.example.json', import.meta.url), 'utf8'));
+const ZERO = '0x0000000000000000000000000000000000000000';
 const SAFE_ADDR = new Wallet('0x' + '22'.repeat(32)).address;
 const BOT = new Wallet('0x' + '33'.repeat(32)).address;
 const OTHER = new Wallet('0x' + '44'.repeat(32)).address;
@@ -56,6 +57,11 @@ test('normalizeConfig rejects configs that would widen or break the role', () =>
   assert.throws(() => normalizeConfig(variant({ allowances: config.allowances.map((a, i) => (i ? a : { ...a, perDay: 1000000000 })) })), /positive integer string/);
   assert.throws(() => normalizeConfig(variant({ pools: [config.pools[0], { ...config.pools[0], name: 'dup' }] })), /duplicate gauge/);
   assert.throws(() => normalizeConfig(variant({ swaps: [{ tokenIn: USDC, tokenOut: USDC, tickSpacing: 100 }] })), /tokenIn equals tokenOut/);
+  // Safe v1.5.0 的 MultiSendCallOnly 把 to = 0 改写为 Safe 自身，任何指向零地址的授权都不允许。
+  assert.throws(() => normalizeConfig(variant({ pools: [{ ...config.pools[0], gauge: '0x0000000000000000000000000000000000000000' }] })), /zero address/);
+  assert.throws(() => normalizeConfig(variant({ allowances: [...config.allowances, { token: '0x0000000000000000000000000000000000000000', symbol: 'Z', perDay: '1' }] })), /zero address/);
+  for (const [field, patch] of [['token0', { token0: ZERO }], ['token1', { token1: ZERO }]]) assert.throws(() => normalizeConfig(variant({ pools: [{ ...config.pools[0], ...patch }] })), new RegExp(`pools\\[0\\]\\.${field}: zero address`));
+  for (const field of ['tokenIn', 'tokenOut']) assert.throws(() => normalizeConfig(variant({ swaps: [{ ...config.swaps[0], [field]: ZERO }] })), new RegExp(`swaps\\[0\\]\\.${field}: zero address`));
 });
 
 test('every permitted function uses plain call options and fits the Roles condition limit', () => {
@@ -152,6 +158,8 @@ test('setup batch deploys, enables, scopes and assigns in order', () => {
   assert.deepEqual([last.args[0], [...last.args[2]]], [BOT, [true]]);
   assert.ok(transactions.slice(2).every((t) => t.to === roles && t.value === '0'));
   assert.throws(() => buildSetupBatch({ permissions, safe: SAFE_ADDR, bot: SAFE_ADDR, saltNonce: 1n }), /bot must not be the Safe/);
+  // 第二道防线：即使 permissions 绕过 normalizeConfig 带入零地址目标，也不生成 scopeTarget(0x0)。
+  assert.throws(() => buildSetupBatch({ permissions: { ...permissions, targets: [{ ...permissions.targets[0], target: ZERO }] }, safe: SAFE_ADDR, bot: BOT, saltNonce: 1n }), /refusing to scope the zero address/);
 });
 
 test('MultiSend packing and role execution encoding', () => {

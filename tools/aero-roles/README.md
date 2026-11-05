@@ -19,7 +19,7 @@
 
 ## 部署步骤（主网，等执行器接入后再做）
 
-1. 在 Safe{Wallet}（app.safe.global，Base 网络）用硬件钱包创建 Safe：1 个 owner、阈值 1、版本 1.4.1（带 CompatibilityFallbackHandler，必需）。不要启用其他模块或 guard。界面若不能选版本、默认建出更新的版本，`plan` 会拒绝；首次主网小额实测时确认。
+1. 在 Safe{Wallet}（app.safe.global，Base 网络）用硬件钱包创建 Safe：1 个 owner、阈值 1，激活方式选 Pay now（立即部署上链；Pay later 要等第一笔交易才部署，`plan` 无法核对）。界面建出的是 v1.5.0 L2，自带 CompatibilityFallbackHandler（必需）。不要启用其他模块、guard 或 module guard。
 2. 准备 bot 地址：一个全新的、只用于此 Safe 的 EOA，不能是 Safe owner。
 3. 复制 `config.example.json`，改成实际的池子、兑换路径和每日额度（`perDay` 用代币最小单位，例如 1000 USDC = `1000000000`）。
 4. 生成批次（只读链）：
@@ -28,7 +28,7 @@
    node tools/aero-roles/cli.mjs plan --config my-config.json --safe <Safe 地址> --owner <硬件钱包地址> --bot <bot 地址> --out batch.json [--rpc <可信 RPC>]
    ```
 
-   命令阻断以下任何一项不符：Safe 地址是标准 SafeProxy 1.4.1 字节码、指向 v1.4.1 SafeL2（核 singleton 存储槽）、唯一 owner 是 `--owner` 且阈值 1、没有任何已启用模块、没有 guard、fallback handler 正确；Roles / MultiSend / 拆包器 / 自定义条件 / Aero NPM、Router、工厂、Voter、gauge 实现等固定合约的字节码哈希；每个池子与 gauge 的链上关系（gauge 是已审实现的克隆，`pool.gauge()`、`factory.getPool()` 互相对应）和代币符号。不符就不输出文件。终端打印的 Roles 地址与每笔交易说明用于下一步核对。
+   命令阻断以下任何一项不符：Safe 地址是标准 SafeProxy 1.5.0 字节码、指向 v1.5.0 SafeL2（核 singleton 存储槽）、唯一 owner 是 `--owner` 且阈值 1、没有任何已启用模块、没有 guard 和 module guard、fallback handler 正确；Roles / MultiSend / 拆包器 / 自定义条件 / Aero NPM、Router、工厂、Voter、gauge 实现等固定合约的字节码哈希；每个池子与 gauge 的链上关系（gauge 是已审实现的克隆，`pool.gauge()`、`factory.getPool()` 互相对应）和代币符号。不符就不输出文件。终端打印的 Roles 地址与每笔交易说明用于下一步核对。
 
    gauge 与代币地址来自配置，真伪靠 RPC 读回的数据判断：用你信任的 RPC（默认 `mainnet.base.org`），有疑问时换一个 RPC 再跑一次，两次输出应一致。
 5. 在 Safe 界面 → Apps → Transaction Builder 导入 `batch.json`。界面会提示批次没有 checksum、无法校验，这是预期的；逐笔核对目标地址与终端输出一致后，用硬件钱包签名执行。

@@ -1,6 +1,6 @@
 // 由策略配置生成角色权限：哪些合约、哪些函数、参数满足什么条件。Roles 默认拒绝，未列出的调用一律不能执行。
 // 清单与理由见 docs/aero-safe-roles-permissions-2026-11-04.md 第 3–5 节；本文件是链上配置与本地签名前校验的唯一来源。
-import { encodeBytes32String, getAddress, id, keccak256, toUtf8Bytes } from 'ethers';
+import { ZeroAddress, encodeBytes32String, getAddress, id, keccak256, toUtf8Bytes } from 'ethers';
 import { AERO } from './addresses.mjs';
 import { c, ExecutionOptions } from './conditions.mjs';
 
@@ -24,23 +24,31 @@ const DAY = 86400;
 
 // config: { roleKey, pools: [{ name, token0, token1, tickSpacing, gauge }], swaps: [{ tokenIn, tokenOut, tickSpacing }],
 //           allowances: [{ token, symbol, perDay }] }，perDay 为代币最小单位的十进制字符串。
+// 地址一律 checksum，并拒绝零地址：Safe v1.5.0 的 MultiSendCallOnly 把内层 to = 0 当作调用 Safe 自身，
+// 而 Roles 按 0x0 判权限；任何指向 0x0 的授权都会变成"以 Safe 身份调 Safe"（加 owner、启用模块）。
+const addr = (value, where) => {
+  const a = getAddress(value);
+  if (a === ZeroAddress) throw new Error(`${where}: zero address is not allowed`);
+  return a;
+};
+
 export function normalizeConfig(config) {
   const roleKey = String(config?.roleKey ?? '');
   if (!roleKey || toUtf8Bytes(roleKey).length > 31) throw new Error('roleKey must be 1–31 bytes');
   const pools = (config.pools ?? []).map((pool, i) => {
-    const token0 = getAddress(pool.token0), token1 = getAddress(pool.token1);
+    const token0 = addr(pool.token0, `pools[${i}].token0`), token1 = addr(pool.token1, `pools[${i}].token1`);
     if (BigInt(token0) >= BigInt(token1)) throw new Error(`pools[${i}]: token0 must sort below token1`);
-    return { name: String(pool.name ?? `pool${i}`), token0, token1, tickSpacing: spacing(pool.tickSpacing, `pools[${i}]`), gauge: getAddress(pool.gauge) };
+    return { name: String(pool.name ?? `pool${i}`), token0, token1, tickSpacing: spacing(pool.tickSpacing, `pools[${i}]`), gauge: addr(pool.gauge, `pools[${i}].gauge`) };
   });
   if (pools.length === 0) throw new Error('at least one pool is required');
   const swaps = (config.swaps ?? []).map((swap, i) => {
-    const tokenIn = getAddress(swap.tokenIn), tokenOut = getAddress(swap.tokenOut);
+    const tokenIn = addr(swap.tokenIn, `swaps[${i}].tokenIn`), tokenOut = addr(swap.tokenOut, `swaps[${i}].tokenOut`);
     if (tokenIn === tokenOut) throw new Error(`swaps[${i}]: tokenIn equals tokenOut`);
     return { tokenIn, tokenOut, tickSpacing: spacing(swap.tickSpacing, `swaps[${i}]`) };
   });
   const allowances = new Map();
   for (const [i, entry] of (config.allowances ?? []).entries()) {
-    const token = getAddress(entry.token);
+    const token = addr(entry.token, `allowances[${i}].token`);
     if (allowances.has(token)) throw new Error(`allowances[${i}]: duplicate token ${token}`);
     // 必须是字符串：JSON 数字超过 2^53 会先丢精度再通过格式检查。
     if (typeof entry.perDay !== 'string' || !/^[1-9]\d*$/.test(entry.perDay)) throw new Error(`allowances[${i}]: perDay must be a positive integer string`);

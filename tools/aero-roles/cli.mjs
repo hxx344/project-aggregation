@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Contract, FetchRequest, JsonRpcProvider, Network, ZeroAddress, formatUnits, getAddress, keccak256 } from 'ethers';
 import { AERO, BASE_CHAIN_ID, CODEHASH, SAFE, SAFE_PROXY_CODEHASH } from './addresses.mjs';
 import { buildPermissions } from './permissions.mjs';
-import { FALLBACK_HANDLER_SLOT, GUARD_SLOT, MODULES_SENTINEL, SAFE_ABI, buildSetupBatch, toTransactionBuilderJson } from './roles-calls.mjs';
+import { FALLBACK_HANDLER_SLOT, GUARD_SLOT, MODULE_GUARD_SLOT, MODULES_SENTINEL, SAFE_ABI, buildSetupBatch, toTransactionBuilderJson } from './roles-calls.mjs';
 
 const RPC_TIMEOUT_MS = 20_000;
 const READ_ATTEMPTS = 3;
@@ -46,18 +46,19 @@ export async function verifyOnChain(rpc, { permissions, ...input }) {
   if (chainId !== BASE_CHAIN_ID) throw new Error(`rpc chainId ${chainId} is not Base`);
   const word = (w) => getAddress('0x' + w.slice(-40));
   const safeContract = new Contract(safe, SAFE_ABI, rpc);
-  const [safeCode, version, owners, threshold, singletonWord, handlerWord, guardWord, [modules], rolesCode, botCode] = await read('safe', () => Promise.all([
+  const [safeCode, version, owners, threshold, singletonWord, handlerWord, guardWord, moduleGuardWord, [modules], rolesCode, botCode] = await read('safe', () => Promise.all([
     rpc.getCode(safe), safeContract.VERSION(), safeContract.getOwners(), safeContract.getThreshold(), rpc.getStorage(safe, 0), rpc.getStorage(safe, FALLBACK_HANDLER_SLOT),
-    rpc.getStorage(safe, GUARD_SLOT), safeContract.getModulesPaginated(MODULES_SENTINEL, 10), rpc.getCode(roles), rpc.getCode(bot),
+    rpc.getStorage(safe, GUARD_SLOT), rpc.getStorage(safe, MODULE_GUARD_SLOT), safeContract.getModulesPaginated(MODULES_SENTINEL, 10), rpc.getCode(roles), rpc.getCode(bot),
   ]));
   lines.push(`Safe ${safe} v${version}，owners ${owners.join(', ')}，阈值 ${threshold}`);
   // 权限模型的前提：只有硬件钱包能签 Safe 交易，Safe 上没有别的模块（模块可绕过 Roles 直接转账），没有能拦住紧急停止的 guard。
   // 以下读数都假定 --safe 是标准 SafeProxy（只转发给槽 0 的 singleton），先核对代理自身的字节码。
-  if (keccak256(safeCode) !== SAFE_PROXY_CODEHASH) problems.push(`${safe} 的字节码不是标准 SafeProxy 1.4.1`);
-  if (version !== '1.4.1' || word(singletonWord) !== getAddress(SAFE.singletonL2)) problems.push(`Safe 不是 v1.4.1 SafeL2（singleton ${word(singletonWord)}，VERSION ${version}）`);
+  if (keccak256(safeCode) !== SAFE_PROXY_CODEHASH) problems.push(`${safe} 的字节码不是标准 SafeProxy ${SAFE.version}`);
+  if (version !== SAFE.version || word(singletonWord) !== getAddress(SAFE.singletonL2)) problems.push(`Safe 不是 v${SAFE.version} SafeL2（singleton ${word(singletonWord)}，VERSION ${version}）`);
   if (owners.length !== 1 || getAddress(owners[0]) !== owner || Number(threshold) !== 1) problems.push(`Safe 必须是 1/1 且唯一 owner 为 ${owner}`);
   if (modules.length) problems.push(`Safe 已启用模块 ${modules.join(', ')}，需先移除`);
   if (word(guardWord) !== ZeroAddress) problems.push(`Safe 设置了 guard ${word(guardWord)}`);
+  if (word(moduleGuardWord) !== ZeroAddress) problems.push(`Safe 设置了 module guard ${word(moduleGuardWord)}`);
   // gauge 解押时用 safeTransferFrom 把 NFT 退回 Safe，Safe 必须有处理 onERC721Received 的 fallback handler。
   if (word(handlerWord) !== getAddress(SAFE.fallbackHandler)) problems.push(`Safe fallback handler 是 ${word(handlerWord)}，需要 CompatibilityFallbackHandler ${SAFE.fallbackHandler}`);
   if (rolesCode !== '0x') problems.push(`Roles 代理地址 ${roles} 已有合约（换一个 --salt）`);

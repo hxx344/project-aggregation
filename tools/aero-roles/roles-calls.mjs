@@ -1,5 +1,5 @@
 // Roles 模块的部署与配置调用（由 Safe owner 签名的批次），以及 bot 经 Roles 执行交易时的编码。
-import { AbiCoder, Interface, concat, getAddress, getCreate2Address, keccak256, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
+import { AbiCoder, Interface, ZeroAddress, concat, getAddress, getCreate2Address, keccak256, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
 import { BASE_CHAIN_ID, MULTISEND_SELECTOR, ROLES, SAFE } from './addresses.mjs';
 import { flatten } from './conditions.mjs';
 
@@ -34,6 +34,8 @@ const MULTISEND_ABI = new Interface(['function multiSend(bytes transactions)']);
 export const FALLBACK_HANDLER_SLOT = '0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5';
 // Safe 的 guard 存储槽：keccak256("guard_manager.guard.address")。
 export const GUARD_SLOT = '0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8';
+// keccak256("module_manager.module_guard.address")：v1.5.0 新增，能拦截模块（Roles）发起的交易。
+export const MODULE_GUARD_SLOT = '0xb104e0b93118902c651344349b610029d694cfdec91c589c91ebafbcd0289947';
 export const MODULES_SENTINEL = '0x0000000000000000000000000000000000000001';
 
 export function rolesInitializer(safe) {
@@ -60,8 +62,9 @@ export function buildSetupBatch({ permissions, safe, bot, saltNonce }) {
   const add = (to, data, description) => txs.push({ to: getAddress(to), value: '0', data, description });
   add(ROLES.moduleProxyFactory, FACTORY_ABI.encodeFunctionData('deployModule', [ROLES.mastercopy, rolesInitializer(safe), saltNonce]), `部署 Roles 代理 ${roles}（owner/avatar/target = Safe）`);
   add(safe, SAFE_ABI.encodeFunctionData('enableModule', [roles]), 'Safe 启用 Roles 模块');
-  add(roles, ROLES_ABI.encodeFunctionData('setTransactionUnwrapper', [SAFE.multiSendCallOnly, MULTISEND_SELECTOR, ROLES.multiSendUnwrapper]), '注册 MultiSendCallOnly 拆包器');
+  add(roles, ROLES_ABI.encodeFunctionData('setTransactionUnwrapper', [SAFE.multiSendCallOnly, MULTISEND_SELECTOR, ROLES.multiSendUnwrapper]), `注册 MultiSendCallOnly ${SAFE.multiSendCallOnly} 的拆包器 ${ROLES.multiSendUnwrapper}`);
   for (const target of permissions.targets) {
+    if (getAddress(target.target) === ZeroAddress) throw new Error('refusing to scope the zero address');
     add(roles, ROLES_ABI.encodeFunctionData('scopeTarget', [roleKey, target.target]), `限定目标 ${target.label} ${target.target}`);
     for (const f of target.functions) {
       const data = f.condition
