@@ -124,6 +124,10 @@ async (page) => {
     assert(await form.getByLabel(`${name} 实盘 API Secret`, { exact: true }).inputValue() === '', 'saved secret cleared from field');
   }
   await panel.locator('.execution-connections > summary').click();
+  const presets = panel.getByRole('group', { name: '交易预设', exact: true });
+  assert((await presets.getByRole('button').first().textContent()).startsWith('同所两腿'), 'same-venue preset is listed first');
+  assert(await presets.getByRole('button', { name: /^同所两腿/ }).getAttribute('aria-pressed') === 'true', 'same-venue is the default preset');
+  await presets.getByRole('button', { name: /^四腿组合/ }).click();
   await direction('开仓方向', 0);
   assert(await panel.locator('.execution-leg-input').count() === 4, 'four-leg preset exposes four complete legs');
   for (const input of await panel.locator('.execution-leg-input input').all()) assert(await input.inputValue() === '', 'financial inputs start blank');

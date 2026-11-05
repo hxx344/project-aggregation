@@ -144,6 +144,45 @@ class ReleaseCacheTests(unittest.TestCase):
         second['manifest']['artifacts'].clear()
         self.assertEqual(self.reader.read(self.module)['manifest'], self.value['manifest'])
 
+    def test_real_transport_recovers_discovery_but_persistent_504_never_returns_cached_success(self):
+        discovery = f'https://github.com/hxx344/{self.module.repository}/releases/latest'
+        failures = [1]
+        attempts = Counter()
+
+        def open_fixture(request, timeout):
+            url, method = request.full_url, request.get_method()
+            attempts[url] += 1
+            if url == discovery and failures[0]:
+                failures[0] -= 1
+                raise urllib.error.HTTPError(url, 504, 'fixture gateway timeout', {}, io.BytesIO())
+            response = unittest.mock.MagicMock()
+            response.__enter__.return_value = response
+            response.headers = {}
+            if url == discovery:
+                response.url = self.network.redirect(url)
+            else:
+                response.url = url
+                response.read.return_value = self.network.request(url, method=method)
+            return response
+
+        network = releases.Network()
+        network.opener = unittest.mock.Mock()
+        network.opener.open.side_effect = open_fixture
+        reader = releases.Releases(network, arch='linux-x64', clock=lambda: self.clock)
+        with patch.object(releases.time, 'sleep') as sleep:
+            self.assertEqual(reader.read(self.module)['commit'], NEW)
+            self.assertEqual(attempts[discovery], 2)
+            sleep.assert_called_once_with(1)
+            failures[0] = 2
+            with self.assertRaisesRegex(releases.ReleaseError, 'HTTP 504'):
+                reader.read(self.module)
+            self.assertEqual(attempts[discovery], 4)
+            # Recovery still probes the current tag, manifest and artifact.
+            counts = self.network.counts()
+            self.assertEqual(reader.read(self.module)['commit'], NEW)
+            self.assertEqual(self.network.counts() - counts, Counter(discovery=1, manifest=1, artifact=1))
+            self.assertEqual(sleep.call_count, 2)
+
     def test_release_notes_preserve_plain_text_and_normalize_controls(self):
         self.value['metadata']['body'] = (' \r\n## 更新内容\r\n- 中文与表情 👩‍💻\r'
                                           '\t<script>alert("text")</script>\n'
@@ -678,7 +717,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(network.opener.open.call_count, releases.CONNECTION_ATTEMPTS)
         sleep.assert_called_once_with(releases.CONNECTION_RETRY_DELAY)
 
-    def test_connection_failure_retries_once_but_http_responses_do_not(self):
+    def test_connection_failure_retries_once_but_non_retryable_http_responses_do_not(self):
         response = unittest.mock.MagicMock()
         response.__enter__.return_value = response
         response.url = 'https://github.com/hxx344/project-aggregation/releases/download/deploy-' + NEW + '/release-manifest.json'
@@ -692,7 +731,7 @@ class TransportTests(unittest.TestCase):
                 with patch.object(releases.time, 'sleep'):
                     self.assertEqual(network.request(response.url), b'{}')
                 self.assertEqual(network.opener.open.call_count, 2)
-        for code, headers in ((404, {}), (429, {'Retry-After': '90'}), (403, {}), (503, {'Retry-After': '120'}), (502, {})):
+        for code, headers in ((401, {}), (404, {}), (429, {'Retry-After': '90'}), (403, {}), (500, {}), (501, {})):
             with self.subTest(code=code), patch.object(releases.time, 'sleep') as sleep:
                 network = releases.Network()
                 network.opener = unittest.mock.Mock()
@@ -704,6 +743,90 @@ class TransportTests(unittest.TestCase):
                     network.request(response.url)
                 self.assertEqual(network.opener.open.call_count, 1)
                 sleep.assert_not_called()
+
+    def test_temporary_http_failure_recovers_get_head_and_discovery_once(self):
+        url = 'https://github.com/hxx344/project-aggregation/releases/latest'
+        final = 'https://github.com/hxx344/project-aggregation/releases/tag/deploy-' + NEW
+        for code in (502, 503, 504):
+            for operation in ('GET', 'HEAD', 'redirect'):
+                with self.subTest(code=code, operation=operation), patch.object(releases.time, 'sleep') as sleep:
+                    body = io.BytesIO(b'private upstream details')
+                    response = unittest.mock.MagicMock()
+                    response.__enter__.return_value = response
+                    response.url, response.headers = final, {}
+                    response.read.return_value = b'{}'
+                    network = releases.Network()
+                    network.opener = unittest.mock.Mock()
+                    network.opener.open.side_effect = [
+                        urllib.error.HTTPError(url, code, 'private reason', Message(), body), response]
+                    if operation == 'redirect':
+                        self.assertEqual(network.redirect(url), final)
+                    else:
+                        self.assertEqual(network.request(url, method=operation), b'{}' if operation == 'GET' else b'')
+                    self.assertEqual(network.opener.open.call_count, 2)
+                    sleep.assert_called_once_with(1)
+                    self.assertTrue(body.closed)
+                    for call in network.opener.open.call_args_list:
+                        self.assertEqual(call.kwargs['timeout'], releases.REQUEST_TIMEOUT)
+                    if operation != 'GET':
+                        response.read.assert_not_called()
+
+    def test_temporary_http_failure_respects_wait_headers_and_read_only_methods(self):
+        url = 'https://github.com/hxx344/project-aggregation/releases/latest'
+        for code in (502, 503, 504):
+            for headers, deadline in (({'Retry-After': '120'}, 1800000120),
+                                      ({'Retry-After': formatdate(1800000300, usegmt=True)}, 1800000300),
+                                      ({'Retry-After': 'invalid'}, None),
+                                      ({'Retry-After': '0'}, None),
+                                      ({'Retry-After': ''}, None),
+                                      ({'X-RateLimit-Remaining': '0', 'X-RateLimit-Reset': '1800000600'}, 1800000600),
+                                      ({'X-RateLimit-Remaining': '0'}, None)):
+                with self.subTest(code=code, headers=headers), patch.object(releases.time, 'sleep') as sleep:
+                    network = releases.Network()
+                    network.opener = unittest.mock.Mock()
+                    network.opener.open.side_effect = urllib.error.HTTPError(url, code, 'reason', headers, io.BytesIO())
+                    with self.assertRaises(releases.ReleaseError) as caught, patch.object(releases.time, 'time', return_value=1800000000):
+                        network.redirect(url)
+                    self.assertEqual(caught.exception.retry_at, deadline)
+                    self.assertTrue(caught.exception.transient)
+                    self.assertEqual(network.opener.open.call_count, 1)
+                    sleep.assert_not_called()
+        network = releases.Network()
+        network.opener = unittest.mock.Mock()
+        network.opener.open.side_effect = urllib.error.HTTPError(url, 504, 'reason', {}, io.BytesIO())
+        with self.assertRaises(releases.ReleaseError), patch.object(releases.time, 'sleep') as sleep:
+            network.request(url, method='POST')
+        self.assertEqual(network.opener.open.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_connection_and_http_failures_share_one_retry_budget(self):
+        url = 'https://github.com/hxx344/project-aggregation/releases/latest?secret=hidden'
+        for kinds in ((504, 504), (502, 503), (None, 504), (504, None)):
+            with self.subTest(kinds=kinds), patch.object(releases.time, 'sleep') as sleep:
+                bodies = []
+                failures = []
+                for code in kinds:
+                    if code is None:
+                        failures.append(urllib.error.URLError('private connection details'))
+                    else:
+                        body = io.BytesIO(b'private upstream details')
+                        bodies.append(body)
+                        failures.append(urllib.error.HTTPError(url, code, 'private reason', {}, body))
+                network = releases.Network()
+                network.opener = unittest.mock.Mock()
+                network.opener.open.side_effect = failures
+                with self.assertRaises(releases.ReleaseError) as caught:
+                    network.redirect(url)
+                self.assertEqual(network.opener.open.call_count, 2)
+                sleep.assert_called_once_with(1)
+                self.assertTrue(all(body.closed for body in bodies))
+                self.assertTrue(caught.exception.transient)
+                self.assertIsNone(caught.exception.retry_at)
+                self.assertNotIn('private', str(caught.exception))
+                self.assertNotIn('secret', str(caught.exception))
+                self.assertIn('GitHub 发布服务', str(caught.exception))
+                if kinds[-1] is not None:
+                    self.assertIn('HTTP ' + str(kinds[-1]), str(caught.exception))
 
     def test_head_discovery_returns_final_url_and_request_remains_bytes(self):
         final = 'https://github.com/hxx344/project-aggregation/releases/tag/deploy-' + NEW

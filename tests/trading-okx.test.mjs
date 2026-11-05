@@ -84,6 +84,14 @@ test('OKX public oil rules preserve different CL/BZ contract sizes and native lo
   assert.ok(calls.every(call => Object.keys(call.init.headers).length === 0));
 });
 
+test('OKX display market reads the book only, without the instrument rule', async () => {
+  const { client, calls } = harness();
+  const market = await client.market('CLUSDT', { withRule: false });
+  assert.equal('rule' in market, false);
+  assert.equal(market.symbol, 'CLUSDT');
+  assert.deepEqual(calls.map(call => call.url.pathname), ['/api/v5/market/books']);
+});
+
 test('OKX refuses unsupported symbols, malformed rules and crossed books before execution', async () => {
   const plain = harness();
   await assert.rejects(plain.client.market('BRNUSDT'), isExecutionError('input'));
