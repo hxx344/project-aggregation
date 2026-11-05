@@ -217,7 +217,9 @@ export type PositionMetrics = {
 };
 
 // live 为用 Safe 链上现价覆盖 tick/sqrtPriceX96 后的行情池子。
-export function positionMetrics(live: MarketPool, position: PositionInput, aeroUsd: number | null, blockNumber: number | null, plan: RebalancePlan = DEFAULT_PLAN): PositionMetrics {
+// chainTime 为 Safe 链上快照的区块时间（秒），snapshotAt 为行情快照的扫描时间（毫秒），用来判断质押流动性里是否已含本头寸。
+export type PositionContext = { aeroUsd: number | null; blockNumber: number | null; chainTime: number | null; snapshotAt: number | null };
+export function positionMetrics(live: MarketPool, position: PositionInput, { aeroUsd, blockNumber, chainTime, snapshotAt }: PositionContext, plan: RebalancePlan = DEFAULT_PLAN): PositionMetrics {
   const q = quoteOf(live);
   const edges = [q.price(position.tickLower), q.price(position.tickUpper)].sort((a, b) => a - b);
   const now = q.price(live.tick);
@@ -226,8 +228,12 @@ export function positionMetrics(live: MarketPool, position: PositionInput, aeroU
   const valueUsd = position.amount0 === null || position.amount1 === null || p0 === null || p1 === null ? null
     : (position.amount0 / 10 ** live.token0.decimals) * p0 + (position.amount1 / 10 ** live.token1.decimals) * p1;
   const mine = Number(position.liquidity) || 0, staked = Math.max(Number(live.stakedLiquidity) || 0, 0);
-  // 已质押时自身已在质押流动性里；快照早于本次质押时 mine 可能大于 staked，按 mine 封顶，份额不超过 1。
-  const share = !live.gauge || !(mine > 0) ? null : position.staked ? mine / Math.max(staked, mine) : mine / (staked + mine);
+  const stakedSeconds = position.staked && position.depositBlock !== null && blockNumber !== null ? Math.max(blockNumber - Number(position.depositBlock), 0) * BASE_BLOCK_SECONDS : null;
+  // 行情快照晚于本次质押时，质押流动性已含本头寸：份额 = mine / staked（按 mine 封顶，不超过 1）；
+  // 快照早于质押、或时间无法判断时按未计入处理：mine / (staked + mine)，偏保守。未质押头寸按质押后加入计算。
+  const stakedAt = stakedSeconds !== null && chainTime !== null ? (chainTime - stakedSeconds) * 1000 : null;
+  const included = position.staked && snapshotAt !== null && stakedAt !== null && snapshotAt >= stakedAt;
+  const share = !live.gauge || !(mine > 0) ? null : included ? mine / Math.max(staked, mine) : mine / (staked + mine);
   const emitting = inRange && share !== null && live.emissionPerSec !== null;
   const aeroPerDay = !inRange ? 0 : emitting ? live.emissionPerSec! * 86_400 * share! : null;
   const usdPerDay = aeroPerDay === null || aeroUsd === null ? null : aeroPerDay * aeroUsd;
@@ -237,7 +243,6 @@ export function positionMetrics(live: MarketPool, position: PositionInput, aeroU
   const yieldOf = inRange && apr !== null && valueUsd !== null
     ? netYield({ apr, tick: live.tick, lower: position.tickLower, upper: position.tickUpper, dailyVol: vol, costFraction: rebalanceCostOf(live, valueUsd).total, delayDays: plan.delayDays })
     : null;
-  const stakedSeconds = position.staked && position.depositBlock !== null && blockNumber !== null ? Math.max(blockNumber - Number(position.depositBlock), 0) * BASE_BLOCK_SECONDS : null;
   return {
     pair: q.pair, quoteLabel: q.label, low: edges[0], high: edges[1], now,
     toLow: edges[0] / now - 1, toHigh: edges[1] / now - 1,

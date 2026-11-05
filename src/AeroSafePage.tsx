@@ -57,7 +57,7 @@ function PositionRow({ pool, position, metrics, market, state, disabled, onActio
     <th scope="row">#{position.tokenId}</th>
     <td className="num">{m ? `${priceText(m.low)} – ${priceText(m.high)}` : `tick ${position.tickLower} 至 ${position.tickUpper}`}<small>{m ? `${m.width} · tick ${position.tickLower} 至 ${position.tickUpper}` : '行情未覆盖，只显示 tick'}</small></td>
     <td className={`num ${inRange ? 'as-in' : 'as-out'}`}>{m ? priceText(m.now) : `tick ${pool.tick}`}
-      <small>{!inRange ? (pool.tick < position.tickLower ? '低于下沿' : '高于上沿') + (m ? `，${m.toLow > 0 ? `需变动 ${signed(m.toLow)} 回到区间` : `需变动 ${signed(m.toHigh)} 回到区间`}` : '') : m ? `距下沿 ${signed(m.toLow)} · 上沿 ${signed(m.toHigh)}` : '区间内'}</small></td>
+      <small>{!inRange ? m ? (m.toLow > 0 ? `低于区间，需上涨 ${signed(m.toLow)} 回到区间` : `高于区间，需下跌 ${signed(m.toHigh)} 回到区间`) : pool.tick < position.tickLower ? 'tick 低于下沿' : 'tick 高于上沿' : m ? `距下沿 ${signed(m.toLow)} · 上沿 ${signed(m.toHigh)}` : '区间内'}</small></td>
     <td className="num">{raw(position.amount0, t0?.decimals)} {t0?.symbol}<small>{raw(position.amount1, t1?.decimals)} {t1?.symbol}</small><small>≈ {usd(m?.valueUsd)}</small></td>
     <YieldCell metrics={m} market={market} />
     <td className="num">{!inRange ? '已出区间' : m ? days(m.daysIn) : '—'}<small>{m ? `日波动 ${pct(m.vol, 2)}` : ''}</small></td>
@@ -112,16 +112,20 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
   const aero = chain?.tokens.find((t) => t.symbol === 'AERO');
   const sellTarget = rewardSellTarget(state);
   // 各头寸的估算，以及按价值加权的合计。
+  const snapshotAt = market.snapshot?.chains.find((c) => c.id === 'base')?.updatedAt ?? null;
   const rows = useMemo(() => (chain?.pools ?? []).map((pool) => {
     const live = livePool(market.snapshot?.pools, pool);
-    return { pool, live, metrics: new Map(pool.positions.map((p) => [p.tokenId, live ? positionMetrics(live, p, aeroUsd, chain?.blockNumber ?? null) : null])) };
-  }), [chain, market.snapshot, aeroUsd]);
+    return { pool, live, metrics: new Map(pool.positions.map((p) => [p.tokenId, live ? positionMetrics(live, p, { aeroUsd, blockNumber: chain?.blockNumber ?? null, chainTime: chain?.timestamp ?? null, snapshotAt }) : null])) };
+  }), [chain, market.snapshot, aeroUsd, snapshotAt]);
   const all = rows.flatMap((r) => [...r.metrics.values()]).filter((m): m is PositionMetrics => !!m);
   const positionCount = rows.reduce((n, r) => n + r.pool.positions.length, 0);
   const totalValue = all.every((m) => m.valueUsd !== null) && all.length === positionCount ? all.reduce((s, m) => s + m.valueUsd!, 0) : null;
-  const perDay = all.filter((m) => !m.projected && m.usdPerDay !== null);
-  const usdPerDay = perDay.length ? perDay.reduce((s, m) => s + m.usdPerDay!, 0) : null;
-  const aeroPerDay = perDay.length ? perDay.reduce((s, m) => s + m.aeroPerDay!, 0) : null;
+  // 只计已质押的头寸（出区间的为 0）；行情未覆盖或缺排放数据的另行说明，不悄悄当作 0。
+  const stakedRows = all.filter((m) => !m.projected);
+  const aeroRows = stakedRows.filter((m) => m.aeroPerDay !== null);
+  const aeroPerDay = aeroRows.length ? aeroRows.reduce((s, m) => s + m.aeroPerDay!, 0) : null;
+  const usdPerDay = aeroRows.length && aeroRows.every((m) => m.usdPerDay !== null) ? aeroRows.reduce((s, m) => s + m.usdPerDay!, 0) : null;
+  const missing = positionCount - all.length + stakedRows.length - aeroRows.length;
   const priced = new Map((market.snapshot?.pools ?? []).filter((p) => p.chain === 'base').flatMap((p) => [p.token0, p.token1]).map((t) => [t.address.toLowerCase(), t.usd]));
   const tokenUsd = (address: string, raw: string | null, decimals: number) => { const p = priced.get(address.toLowerCase()); return p == null || raw === null ? null : (Number(raw) / 10 ** decimals) * p; };
 
@@ -140,7 +144,7 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
       <section className="panel lp-status" aria-label="Safe 状态">
         <dl className="lp-facts">
           <div><dt>仓位总值（估）</dt><dd>{usd(totalValue)}<small>{positionCount} 个头寸</small></dd></div>
-          <div><dt>预计日收益</dt><dd>{usdPerDay === null ? '—' : `${usd(usdPerDay)}/天`}<small>{aeroPerDay === null ? '无在区间的质押头寸' : `${amount(aeroPerDay)} AERO/天${totalValue ? ` · 年化 ${pct((usdPerDay! * 365) / totalValue, 0)}` : ''}`}</small></dd></div>
+          <div><dt>预计日收益</dt><dd>{usdPerDay === null ? '—' : `${usd(usdPerDay)}/天`}<small>{aeroPerDay === null ? (stakedRows.length ? '缺少排放数据' : '没有已质押的头寸') : `${amount(aeroPerDay)} AERO/天${usdPerDay === null ? '（缺 AERO 价格）' : totalValue ? ` · 占全部仓位价值年化 ${pct((usdPerDay * 365) / totalValue, 0)}` : ''}`}{missing ? ` · 另有 ${missing} 个头寸缺行情未计入` : ''}</small></dd></div>
           <div><dt>待领 AERO</dt><dd>{aero ? units(earned.toString(), aero.decimals) : '—'}<small>{aero && aeroUsd !== null ? `≈ ${usd((Number(earned) / 10 ** aero.decimals) * aeroUsd)} · ` : ''}{state.config?.autoSellRewards && sellTarget ? `领取后自动卖成 ${sellTarget}（≥ ${state.config.minRewardSell}）` : '领取后不自动卖出'}</small></dd></div>
           <div><dt>Safe</dt><dd>{short(state.config?.safe)}<small>Roles {short(state.config?.roles)}</small></dd></div>
           <div><dt>bot</dt><dd>{short(state.wallet)}<small>{chain?.botEth != null ? `${units(chain.botEth, 18)} ETH 付 gas` : '未读取'}</small></dd></div>

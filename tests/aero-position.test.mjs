@@ -15,7 +15,7 @@ const pool = (patch = {}) => ({
 const position = (patch = {}) => ({ tickLower: tick - 500, tickUpper: tick + 500, liquidity: '1000000000000000', staked: true, amount0: 1e18, amount1: 3000e6, depositBlock: '100', ...patch });
 
 test('staked in-range position earns its share of staked liquidity', () => {
-  const m = positionMetrics(pool(), position(), 1.2, 100 + 3600);
+  const m = positionMetrics(pool(), position(), { aeroUsd: 1.2, blockNumber: 100 + 3600, chainTime: 1_000_000, snapshotAt: 1_000_000_000 });
   assert.equal(m.inRange, true);
   assert.equal(m.valueUsd, 6000);
   assert.equal(m.share, 0.25);
@@ -30,21 +30,29 @@ test('staked in-range position earns its share of staked liquidity', () => {
   assert.ok(m.low < m.now && m.now < m.high && m.toLow < 0 && m.toHigh > 0);
 });
 
-test('a snapshot older than the stake caps the share at 100%', () => {
-  const m = positionMetrics(pool({ stakedLiquidity: '0' }), position(), 1, null);
-  assert.equal(m.share, 1);
-  assert.equal(m.stakedSeconds, null);
+const ctx = { aeroUsd: 1, blockNumber: 200, chainTime: 1_000_000, snapshotAt: 1_000_000_000 };
+
+test('a market snapshot taken before the stake does not yet include it', () => {
+  // 质押于区块 100、现在 3700：质押时刻 = 1_000_000 − 7200 秒；快照早于它。
+  const early = positionMetrics(pool(), position(), { aeroUsd: 1, blockNumber: 3700, chainTime: 1_000_000, snapshotAt: (1_000_000 - 7300) * 1000 });
+  assert.equal(early.share, 0.2, 'mine / (staked + mine)');
+  // 快照里的质押流动性还小于自身时（不含自身），份额不超过 100%。
+  const empty = positionMetrics(pool({ stakedLiquidity: '0' }), position(), { aeroUsd: 1, blockNumber: null, chainTime: null, snapshotAt: null });
+  assert.equal(empty.share, 1);
+  assert.equal(empty.stakedSeconds, null);
+  const capped = positionMetrics(pool({ stakedLiquidity: '1' }), position(), ctx);
+  assert.equal(capped.share, 1);
 });
 
 test('unstaked position shows the projected share after staking', () => {
-  const m = positionMetrics(pool(), position({ staked: false }), 1, 200, DEFAULT_PLAN);
+  const m = positionMetrics(pool(), position({ staked: false }), { aeroUsd: 1, blockNumber: 200, chainTime: 1_000_000, snapshotAt: 1_000_000_000 }, DEFAULT_PLAN);
   assert.equal(m.projected, true);
   assert.equal(m.share, 0.2);
   assert.equal(m.stakedSeconds, null);
 });
 
 test('out-of-range position earns nothing and has no expected stay', () => {
-  const m = positionMetrics(pool(), position({ tickLower: tick + 100, tickUpper: tick + 600 }), 1, 200);
+  const m = positionMetrics(pool(), position({ tickLower: tick + 100, tickUpper: tick + 600 }), ctx);
   assert.equal(m.inRange, false);
   assert.equal(m.aeroPerDay, 0);
   assert.equal(m.apr, 0);
@@ -54,11 +62,11 @@ test('out-of-range position earns nothing and has no expected stay', () => {
 });
 
 test('missing prices or gauge leave estimates empty', () => {
-  const m = positionMetrics(pool({ gauge: null }), position(), null, 200);
+  const m = positionMetrics(pool({ gauge: null }), position(), { ...ctx, aeroUsd: null });
   assert.equal(m.share, null);
   assert.equal(m.aeroPerDay, null);
   assert.equal(m.apr, null);
-  const n = positionMetrics(pool({ token1: { address: '0xusdc', symbol: 'USDC', decimals: 6, usd: null } }), position(), 1, 200);
+  const n = positionMetrics(pool({ token1: { address: '0xusdc', symbol: 'USDC', decimals: 6, usd: null } }), position(), ctx);
   assert.equal(n.valueUsd, null);
   assert.equal(n.apr, null);
 });
