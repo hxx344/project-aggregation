@@ -22,13 +22,15 @@ export type AeroSafeChain = {
 };
 export type AeroSafeAction = 'open' | 'close' | 'stake' | 'unstake' | 'claim' | 'sell' | 'swap' | 'rebalance';
 // 自动调仓（server/automation/aero-auto.mjs）。
-export type AeroAutoConfig = { enabled: boolean; triggerMinutes: number; cooldownMinutes: number; maxPerDay: number; acceptPenalty: boolean; twapSeconds: number; maxTwapDeviationBps: number };
+export type AeroAutoConfig = { enabled: boolean; triggerMinutes: number; cooldownMinutes: number; maxPerDay: number; acceptPenalty: boolean; twapSeconds: number; maxTwapDeviationBps: number;
+  // 单池上限（基点，10000 即不限）；poolCaps 按池子地址（小写）单独设置。
+  poolCapBps: number; poolCaps: Record<string, number> };
 export type AeroAutoState = {
   config: AeroAutoConfig; defaults: AeroAutoConfig; error: string | null; halted: { at: number; reason: string } | null;
   reopen: { pool: string; cells: number; amount0: string; amount1: string; closed: string | null; at: number; minted: string | null; inflight: 'swap' | 'mint' | null } | null;
   closing: { pool: string; tokenId: string; cells: number; at: number } | null;
   stuck: string | null;
-  history: { at: number; pool: string; closed: string | null; opened: string | null; tickLower: number | null; tickUpper: number | null }[];
+  history: { at: number; pool: string; closed: string | null; opened: string | null; tickLower: number | null; tickUpper: number | null; capped?: boolean }[];
   watch: { tokenId: string; pool: string; outSince: number | null; dueAt: number | null; blocked: string | null }[];
   note: string | null; checkedAt: number | null; intervalMs: number;
 };

@@ -485,6 +485,15 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     return { usd: token?.usd ?? null, at: base.snapshot ? base.snapshot.t * 1000 : null };
   }
 
+  // Base 行情快照里各代币的美元价（小写地址），与页面估值同源；扫描关闭或尚无快照时为 null。供实盘自动调仓按总资产比例核对单池上限。
+  function tokenPrices() {
+    const base = runtimes.get('base');
+    if (!config.enabled || !config.chains.base?.enabled || !base?.snapshot) return null;
+    const usd = {};
+    for (const r of base.rows) for (const t of [r.token0, r.token1]) if (typeof t.usd === 'number' && Number.isFinite(t.usd) && t.usd > 0) usd[t.address.toLowerCase()] = t.usd;
+    return { at: base.snapshot.t * 1000, usd };
+  }
+
   function state({ since } = {}) {
     if (since !== undefined && since === revision) return { schema: 1, revision, unchanged: true, serverNow: now() };
     return {
@@ -510,6 +519,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
 
   return {
     state,
+    tokenPrices,
     pool(chainId, address) {
       const rt = runtimes.get(chainId);
       const key = String(address).toLowerCase();
