@@ -30,7 +30,8 @@ export const AERO = {
 
 export const MULTISEND_SELECTOR = '0x8d80ff0a';
 
-// 运行时字节码哈希：2026-11-04 由 mainnet.base.org 与 base-rpc.publicnode.com 分别读取，结果一致；Safe 四项另与 safe-deployments 记录的 codeHash 一致。plan 逐个核对。
+// 运行时字节码哈希：2026-11-04 由 mainnet.base.org 与 base-rpc.publicnode.com 分别读取，结果一致；Safe 三项另与 safe-deployments 记录的 codeHash 一致。plan 逐个核对。
+// ProxyFactory 不在此列（plan 不经过工厂，代理本身由 SAFE_PROXY_CODEHASH 核对）；其 codehash 0x967dae4c…4529 仅人工核对过。
 // 均非可升级代理，钉的是不可变代码；不覆盖治理可改参数，代币（USDC 为可升级代理）不在此列（文档第 2 节）。
 export const CODEHASH = {
   [SAFE.singletonL2]: '0x180193227186ccb85316c94db1f0d156ed932b14712cfaac78901899178572dc',

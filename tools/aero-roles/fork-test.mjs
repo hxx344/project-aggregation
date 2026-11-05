@@ -343,6 +343,10 @@ async function run(rpc) {
   await denied('delegatecall 到 MultiSend 以外的地址', 'DelegateCallNotAllowed', null, { data: raw(approveNpm.to, 0n, approveNpm.data, 1) });
   const innerDelegate = solidityPacked(['uint8', 'address', 'uint256', 'uint256', 'bytes'], [1, approveNpm.to, 0, (approveNpm.data.length - 2) / 2, approveNpm.data]);
   await denied('MultiSend 内层 delegatecall', 'DelegateCallNotAllowed', null, { data: raw(SAFE.multiSendCallOnly, 0n, new Interface(['function multiSend(bytes)']).encodeFunctionData('multiSend', [innerDelegate]), 1) });
+  // v1.5.0 MultiSendCallOnly 把内层 to = 0 改写为 Safe 自身；Roles 按 0x0 判权限，必须拒绝，Safe 不能被加模块。
+  const selfCall = solidityPacked(['uint8', 'address', 'uint256', 'uint256', 'bytes'], [0, ZeroAddress, 0, (SAFE_ABI.encodeFunctionData('enableModule', [outsider.address]).length - 2) / 2, SAFE_ABI.encodeFunctionData('enableModule', [outsider.address])]);
+  await denied('MultiSend 内层 to = 0（1.5.0 改写为调用 Safe 自身）', 'TargetAddressNotAllowed', null, { data: raw(SAFE.multiSendCallOnly, 0n, new Interface(['function multiSend(bytes)']).encodeFunctionData('multiSend', [selfCall]), 1) });
+  record('deny', 'to = 0 用例后 Safe 未启用额外模块', !(await safeContract.isModuleEnabled(outsider.address)));
   await denied('MultiSend 夹带一笔禁止调用', 'FunctionNotAllowed', [approveNpm, tx(USDC, ERC20_I, 'transfer', [outsider.address, 1n])]);
   await denied('经角色调用 Safe.addOwnerWithThreshold', 'TargetAddressNotAllowed', [tx(safe, SAFE_SETUP_I, 'addOwnerWithThreshold', [outsider.address, 1n])]);
   await denied('经角色调用 Safe.enableModule', 'TargetAddressNotAllowed', [tx(safe, SAFE_ABI, 'enableModule', [outsider.address])]);

@@ -56,6 +56,9 @@ test('normalizeConfig rejects configs that would widen or break the role', () =>
   assert.throws(() => normalizeConfig(variant({ allowances: config.allowances.map((a, i) => (i ? a : { ...a, perDay: 1000000000 })) })), /positive integer string/);
   assert.throws(() => normalizeConfig(variant({ pools: [config.pools[0], { ...config.pools[0], name: 'dup' }] })), /duplicate gauge/);
   assert.throws(() => normalizeConfig(variant({ swaps: [{ tokenIn: USDC, tokenOut: USDC, tickSpacing: 100 }] })), /tokenIn equals tokenOut/);
+  // Safe v1.5.0 的 MultiSendCallOnly 把 to = 0 改写为 Safe 自身，任何指向零地址的授权都不允许。
+  assert.throws(() => normalizeConfig(variant({ pools: [{ ...config.pools[0], gauge: '0x0000000000000000000000000000000000000000' }] })), /zero address/);
+  assert.throws(() => normalizeConfig(variant({ allowances: [...config.allowances, { token: '0x0000000000000000000000000000000000000000', symbol: 'Z', perDay: '1' }] })), /zero address/);
 });
 
 test('every permitted function uses plain call options and fits the Roles condition limit', () => {

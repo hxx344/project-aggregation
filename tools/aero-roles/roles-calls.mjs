@@ -1,5 +1,5 @@
 // Roles 模块的部署与配置调用（由 Safe owner 签名的批次），以及 bot 经 Roles 执行交易时的编码。
-import { AbiCoder, Interface, concat, getAddress, getCreate2Address, keccak256, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
+import { AbiCoder, Interface, ZeroAddress, concat, getAddress, getCreate2Address, keccak256, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
 import { BASE_CHAIN_ID, MULTISEND_SELECTOR, ROLES, SAFE } from './addresses.mjs';
 import { flatten } from './conditions.mjs';
 
@@ -62,8 +62,9 @@ export function buildSetupBatch({ permissions, safe, bot, saltNonce }) {
   const add = (to, data, description) => txs.push({ to: getAddress(to), value: '0', data, description });
   add(ROLES.moduleProxyFactory, FACTORY_ABI.encodeFunctionData('deployModule', [ROLES.mastercopy, rolesInitializer(safe), saltNonce]), `部署 Roles 代理 ${roles}（owner/avatar/target = Safe）`);
   add(safe, SAFE_ABI.encodeFunctionData('enableModule', [roles]), 'Safe 启用 Roles 模块');
-  add(roles, ROLES_ABI.encodeFunctionData('setTransactionUnwrapper', [SAFE.multiSendCallOnly, MULTISEND_SELECTOR, ROLES.multiSendUnwrapper]), '注册 MultiSendCallOnly 拆包器');
+  add(roles, ROLES_ABI.encodeFunctionData('setTransactionUnwrapper', [SAFE.multiSendCallOnly, MULTISEND_SELECTOR, ROLES.multiSendUnwrapper]), `注册 MultiSendCallOnly ${SAFE.multiSendCallOnly} 的拆包器 ${ROLES.multiSendUnwrapper}`);
   for (const target of permissions.targets) {
+    if (getAddress(target.target) === ZeroAddress) throw new Error('refusing to scope the zero address');
     add(roles, ROLES_ABI.encodeFunctionData('scopeTarget', [roleKey, target.target]), `限定目标 ${target.label} ${target.target}`);
     for (const f of target.functions) {
       const data = f.condition

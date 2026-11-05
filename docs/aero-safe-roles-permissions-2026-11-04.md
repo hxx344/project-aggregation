@@ -28,7 +28,7 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 核实方式：「源」= 官方仓库部署清单；「链」= 2026-11-04 用 `mainnet.base.org` 读取到合约代码，以及表中所列的关联读数；「选择器」= 第 3 节用到的函数选择器均出现在链上字节码中。
 
-`plan` 会把下表协议合约的运行时字节码与 `tools/aero-roles/addresses.mjs` 中的哈希逐一比对：
+`plan` 会把下表协议合约的运行时字节码与 `tools/aero-roles/addresses.mjs` 中的哈希逐一比对（SafeProxyFactory、Roles Integrity / Packer 库除外：`plan` 不经过工厂，Safe 代理本身另按 `SAFE_PROXY_CODEHASH` 核对；两个库只在 Roles mastercopy 内部使用，由 mastercopy 的 codehash 间接覆盖）：
 - 这些合约都不是可升级代理，比对的是不可变代码。Aero 换地址重新部署时 `plan` 会拒绝，需要重新核实。
 - 比对不覆盖治理可改的状态，例如 CLFactory 的手续费模块、Voter 治理或 emergencyCouncil 停用 gauge、NPM 的 tokenDescriptor。这些改动不会在 Roles 授权范围内打开转出路径，但属于信任前提。
 - 代币不比对。USDC 本身是可升级代理（FiatTokenProxy），对它的信任来自发行方。
@@ -120,9 +120,11 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 金额不限的理由：NPM 与 Router 只在 Safe 自己发起的调用里从 Safe 拉币，授权额度本身不构成转出路径；真正的资金闸门是第 5 节对 mint / swap 金额的额度。禁止：`transfer`、`transferFrom`、`increaseAllowance`、`permit`。
 
-### 3.5 MultiSendCallOnly `0x9641…02e2`
+### 3.5 MultiSendCallOnly `0xA83c…1836`（v1.5.0）
 
-不给角色授权，改由 Roles owner 注册 `setTransactionUnwrapper(0x9641…02e2, 0x8d80ff0a, 0xB4Cd…efD)`：外层 delegatecall 被拆开，内层每笔按 3.1–3.4 校验，内层 delegatecall 一律不允许。常用批次：`decreaseLiquidity + collect + burn`（平仓）、`approve + mint`、`NPM.approve + gauge.deposit`。
+不给角色授权，改由 Roles owner 注册 `setTransactionUnwrapper(0xA83c…1836, 0x8d80ff0a, 0xB4Cd…efD)`：外层 delegatecall 被拆开，内层每笔按 3.1–3.4 校验，内层 delegatecall 一律不允许。常用批次：`decreaseLiquidity + collect + burn`（平仓）、`approve + mint`、`NPM.approve + gauge.deposit`。
+
+v1.5.0 的 MultiSendCallOnly 会把内层 `to = 0` 改写为 Safe 自身，而 Roles 按 `0x0` 判权限。因此任何授权都不能指向零地址：配置校验与批次生成都拒绝零地址，分叉验收断言内层 `to = 0` 调 `enableModule` 被拒。
 
 ## 4. 池与兑换白名单（初始）
 
@@ -184,9 +186,9 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 
 ## 9. 工作台侧改动（实施时另立任务）
 
-- 执行器：交易改为经 Roles 代理以 Safe 名义执行；签名前本地校验保留，与 Roles 配置读同一份白名单 JSON，作为第二道防线。
+- 执行器：交易改为经 Roles 代理以 Safe 名义执行；签名前本地校验保留，与 Roles 配置读同一份白名单 JSON，作为第二道防线。批量调用必须用 `addresses.mjs` 的 `SAFE.multiSendCallOnly`（拆包器只注册在这个地址上）；SDK 默认的 MultiSend 可能是别的版本，用了会被 Roles 全部拒绝。
 - 读取：持仓、质押、余额、估值改按 Safe 地址（`tokenOfOwnerByIndex(Safe)`、`gauge.stakedValues(Safe)`）。
-- 监控：独立只读进程监听 Safe 的出账和 Roles 配置事件，非预期变化发飞书。
+- 监控：独立只读进程监听 Safe 的出账和 Roles 配置事件，非预期变化发飞书。`plan` 只在部署时核对一次 Safe 状态，之后的变化靠监控：至少监听 `EnabledModule`、`ChangedGuard`、`ChangedModuleGuard`（v1.5.0 新增）、`ChangedFallbackHandler`、`AddedOwner`、`ChangedThreshold`。Safe{Wallet} 的部分功能（如 TWAP）可能把 fallback handler 换成 ExtensibleFallbackHandler，需要 owner 签名，但属于部署后的状态漂移。
 - 工作台只保存 bot 私钥和 Safe / Roles 地址，管理钱包私钥不录入。
 
 ## 10. 待决策
