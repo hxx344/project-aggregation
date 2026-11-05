@@ -1,5 +1,6 @@
 """Explicit review of unresolved opens; never infer fills from positions."""
 from contextlib import ExitStack
+from collections import OrderedDict
 from copy import deepcopy
 from fractions import Fraction
 import math
@@ -7,7 +8,9 @@ import json
 import hashlib
 import re
 import time
+import threading
 import uuid
+from weakref import WeakKeyDictionary
 
 from .exchange import AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, api_wait_notice
 from .exchange_messages import exchange_reason
@@ -85,10 +88,229 @@ def _watch_evidence_key(pair_id, batch):
     return "pair_watch_evidence:" + pair_id + ":" + fingerprint
 
 
+# Audited resolutions that append their batch to recovery_watch.
+WATCH_AUDIT_STATUSES = frozenset({"manual_archived_unresolved", "positions_adopted_unknown", "terminal_positions_adopted"})
+HISTORY_VERSION = 1
+# Exchange timestamps only establish ordering within the account. The bounded
+# wait starts when this process first observes the lag, on its monotonic clock.
+# After expiry the existing quantity/risk checks still decide admission.
+HISTORY_LAG_SECONDS = MIN_AGE
+HISTORY_WAIT_MAX_PAIRS = 128
+_history_waits = WeakKeyDictionary()
+_history_wait_lock = threading.Lock()
+
+
+def _history_waiting(store, pair, state, trailing):
+    """Keep at most two current lag keys per pair, without persisting local clocks."""
+    with _history_wait_lock:
+        waits = _history_waits.setdefault(store, OrderedDict())
+        previous = waits.pop(pair["id"], {})
+        if not trailing:
+            return set()
+        now, current, waiting = time.monotonic(), {}, set()
+        for key, side, known in trailing:
+            identity = (state.get("identities") or {}).get(key) or {"account_id": pair[key + "_account_id"]}
+            token = (json.dumps(identity, sort_keys=True), pair["symbol"], side, known)
+            started = previous.get(token, now)
+            if now < started:
+                started = now
+            current[token] = started
+            if now - started < HISTORY_LAG_SECONDS:
+                waiting.add(side)
+        # Replacing the pair's keys clears resolved directions, old fills,
+        # symbols and identities. Eviction can only restart a full wait.
+        waits[pair["id"]] = current
+        while len(waits) > HISTORY_WAIT_MAX_PAIRS:
+            waits.popitem(last=False)
+        return waiting
+
+
+def clear_history_wait(store, pair_id):
+    with _history_wait_lock:
+        waits = _history_waits.get(store)
+        if waits is not None:
+            waits.pop(pair_id, None)
+
+
+class HistoryTimeError(TradingError):
+    """A direction time still trails the watch's latest known fill."""
+
+
+def _kv_prefix(store, prefix):
+    with store.connect() as db:
+        return {row[0]: json.loads(row[1]) for row in db.execute(
+            "SELECT key,data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))}
+
+
+def _batches_digest(batches):
+    # Only identity-bearing fields: a symbol freeze on edit must not look like
+    # an older build compacting the hot index behind the summary.
+    rows = [[row.get("id"), [leg["order"].get("newClientOrderId") for leg in row.get("legs") or []
+                             if isinstance(leg, dict) and isinstance(leg.get("order"), dict)]]
+            for row in batches if isinstance(row, dict)] if isinstance(batches, list) else None
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()
+
+
+def _known_fills(batch, observed, journals):
+    """One entry per client ID with a positive fill: (symbol, side, updateTime or None)."""
+    receipts = [record.get("receipt") for record in ((observed or {}).get("legs") or {}).values()
+                if isinstance(record, dict)]
+    for journal in journals:
+        if isinstance(journal, dict):
+            receipts += [leg.get("receipt") for leg in (journal.get("legs") or []) + (journal.get("repairs") or [])
+                         if isinstance(leg, dict)]
+    found = {}
+    for row in receipts:
+        if not isinstance(row, dict):
+            continue
+        try:
+            filled = dec(row.get("executedQty")) != 0
+        except TradingError:
+            filled = True
+        if not filled:
+            continue
+        side = row.get("positionSide")
+        symbol = row.get("symbol", batch.get("symbol"))
+        if side not in ("LONG", "SHORT") or not isinstance(symbol, str):
+            raise TradingError("历史归档成交回执缺少方向或标的，不能汇总历史成交")
+        stamp = row.get("updateTime")
+        stamp = (int(stamp) if type(stamp) in (int, float) and math.isfinite(stamp) and stamp > 0
+                 and stamp == int(stamp) else None)
+        cid = row.get("clientOrderId") or id(row)
+        previous = found.get(cid)
+        if previous is None or stamp is not None and (previous[2] is None or stamp > previous[2]):
+            found[cid] = (symbol, side, stamp)
+    return list(found.values())
+
+
+def _batch_fills(store, batch, observed):
+    journal = store.get("pair_batch:" + batch["id"]) if isinstance(batch.get("id"), str) else None
+    return _known_fills(batch, observed, [journal])
+
+
+def _fold(fills, entries):
+    for symbol, side, stamp in entries:
+        cell = fills.setdefault(symbol, {}).setdefault(side, {"count": 0, "time": None, "untimed": 0})
+        cell["count"] += 1
+        if stamp is None:
+            cell["untimed"] += 1
+        elif cell["time"] is None or stamp > cell["time"]:
+            cell["time"] = stamp
+
+
+def _empty_history(batches):
+    return {"version": HISTORY_VERSION, "retired": 0, "fills": {}, "unproven": None,
+            "batches_digest": _batches_digest(batches)}
+
+
+def _migrate_history(store, pair_id, watch):
+    """Rebuild a summary for a watch compacted without one; completeness is diagnostic only."""
+    batches = watch.get("batches") or []
+    evidence = _kv_prefix(store, "pair_watch_evidence:" + pair_id + ":")
+    audits = _kv_prefix(store, "pair_order_recovery:" + pair_id + ":")
+    hot = {row.get("id") for row in batches if isinstance(row, dict)}
+    hot_keys = {_watch_evidence_key(pair_id, row) for row in batches
+                if isinstance(row, dict) and "identities" in row and "legs" in row}
+    retired = {}
+    for key, observed in evidence.items():
+        row = observed.get("retired_batch") if isinstance(observed, dict) else None
+        if isinstance(row, dict) and key not in hot_keys:
+            retired[row.get("id")] = (row, observed)
+    audited = {}
+    for record in audits.values():
+        pending = record.get("pending") if isinstance(record, dict) else None
+        if isinstance(pending, dict) and record.get("status") in WATCH_AUDIT_STATUSES:
+            audited[pending.get("id")] = pending
+    history = _empty_history(batches)
+    for batch_id in set(retired) | (set(audited) - hot):
+        row, observed = retired.get(batch_id, ({"id": batch_id}, None))
+        journal = store.get("pair_batch:" + batch_id) if isinstance(batch_id, str) else None
+        _fold(history["fills"], _known_fills(row, observed, [journal, audited.get(batch_id)]))
+    history["retired"] = len(retired)
+    missing = sorted(str(value) for value in set(audited) - hot - set(retired))
+    unaudited = sorted(str(value) for value in set(retired) - set(audited))
+    absent = bool(watch.get("retired_identities") or watch.get("retired_symbols")) and not (
+        retired or set(audited) - hot)
+    if missing or unaudited or absent:
+        # Recorded for review only; admission uses the known fills that remain.
+        history["unproven"] = {
+            "detected_at": time.time(),
+            "reason": ("旧格式压缩观察无法由审计记录证明完整："
+                       + "；".join(part for part in (
+                           "缺少压缩归档 " + "、".join(missing) if missing else "",
+                           "归档缺少审计 " + "、".join(unaudited) if unaudited else "",
+                           "存在退役标记但找不到退役归档或审计材料" if absent else "") if part)),
+            "missing": missing, "unaudited": unaudited, "retired_material_missing": absent}
+    return history
+
+
+def watch_history(store, pair_id, watch):
+    """Bounded retired-fill summary; legacy or stale summaries migrate once per watch content."""
+    batches = watch.get("batches") or []
+    history = watch.get("history")
+    valid = isinstance(history, dict) and history.get("version") == HISTORY_VERSION
+    if valid and history.get("batches_digest") == _batches_digest(batches):
+        return deepcopy(history)
+    if history is None and watch.get("retired_identities") is None and not watch.get("retired_symbols"):
+        return _empty_history(batches)
+    # Invalidated by any change of the watch itself; retired archives and
+    # audits are append-only and only written together with such a change.
+    key = "pair_watch_history:" + pair_id
+    fingerprint = hashlib.sha256(json.dumps(watch, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()
+    cached = store.get(key)
+    if (isinstance(cached, dict) and cached.get("migration_version") == 2
+            and cached.get("watch") == fingerprint and isinstance(cached.get("history"), dict)):
+        return deepcopy(cached["history"])
+    migrated = _migrate_history(store, pair_id, watch)
+    store.put(key, {"watch": fingerprint, "history": migrated, "migrated_at": time.time(), "migration_version": 2})
+    return deepcopy(migrated)
+
+
+def history_time_status(store, pair, state, snapshots):
+    """Compare the latest known watch fill per direction with the given snapshot's direction time."""
+    watch = state.get("recovery_watch")
+    symbol = pair["symbol"]
+    if not isinstance(watch, dict):
+        clear_history_wait(store, pair["id"])
+        return {"ok": True, "reason": None, "symbol": symbol, "sides": {}}
+    history = watch_history(store, pair["id"], watch)
+    fills = deepcopy(history["fills"])
+    for batch in watch.get("batches") or []:
+        if isinstance(batch, dict) and "identities" in batch and "legs" in batch:
+            _fold(fills, _batch_fills(store, batch, store.get(_watch_evidence_key(pair["id"], batch), {})))
+    sides, trailing, lagging = {}, [], []
+    for index, (key, side) in enumerate(SIDES):
+        cell = fills.get(symbol, {}).get(side) or {"count": 0, "time": None, "untimed": 0}
+        known, update = cell["time"], snapshots[key].pair(symbol)[index].update_time
+        # Missing or zero direction times and untimed fills carry no ordering
+        # evidence; they do not block, as before this summary existed.
+        if update is not None and update > 0 and known is not None and update < known:
+            trailing.append((key, side, known))
+        sides[side] = {"count": cell["count"], "known_time": known, "untimed": cell["untimed"],
+                       "update_time": update, "waiting": False, "lag_expired": False}
+    waiting = _history_waiting(store, pair, state, trailing)
+    for _, side, known in trailing:
+        sides[side].update(waiting=side in waiting, lag_expired=side not in waiting)
+        if side in waiting:
+            lagging.append(f"{'A 多侧' if side == 'LONG' else 'B 空侧'}持仓更新时间 {sides[side]['update_time']} 早于历史已知成交 {known}")
+    reason = ("历史归档已知成交尚未反映到方向持仓：" + "；".join(lagging) + "；等待覆盖历史成交的持仓更新"
+              if lagging else None)
+    return {"ok": not lagging, "reason": reason, "symbol": symbol, "retired": history["retired"],
+            "unproven": deepcopy(history.get("unproven")), "sides": sides}
+
+
+def require_history_times(store, pair, state, snapshots):
+    status = history_time_status(store, pair, state, snapshots)
+    if not status["ok"]:
+        raise HistoryTimeError(status["reason"])
+    return status
+
+
 def _append_watch(store, pair_id, watch, batch):
     result = deepcopy(watch or {"batches": []})
     batches = result["batches"] + [batch]
     dropped = batches[:-MAX_WATCH_BATCHES]
+    history = watch_history(store, pair_id, result) if dropped or result.get("history") is not None else None
     if dropped:
         identities = batch["identities"]
         if (any(row.get("identities") != identities for row in dropped)
@@ -116,10 +338,16 @@ def _append_watch(store, pair_id, watch, batch):
             if observed.get("retired_batch") != row:
                 observed["retired_batch"] = deepcopy(row)
                 store.put(key, observed)
+            _fold(history["fills"], _batch_fills(store, row, observed))
+        history["retired"] += len(dropped)
         result["retired_identities"] = deepcopy(identities)
         result["retired_symbols"] = sorted(set(result.get("retired_symbols", [])) |
             {row.get("symbol", row["legs"][0]["order"]["symbol"]) for row in dropped})
     result["batches"] = batches[-MAX_WATCH_BATCHES:]
+    if history is not None:
+        # Committed with the runtime CAS, so the summary never trails the index.
+        history["batches_digest"] = _batches_digest(result["batches"])
+        result["history"] = history
     return result
 
 
@@ -171,7 +399,8 @@ def _commit_runtime(engine, pair, runtime, *, expected, margin, accounts, identi
             db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data", (key, dumps(value)))
 
 
-def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=False, member_read=None):
+def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=False, member_read=None,
+                  history_check=True):
     from .pair_planning import positions, PairPositionError
     from .pair_execution import PairTrader
     snapshots, guards = member_read if member_read is not None else engine.pairs._read_members(
@@ -181,6 +410,8 @@ def _safe_reality(engine, pair, state, *, reconciliation=True, market_recovery=F
     if (pending and pending["kind"] != "leverage"
             and not PairTrader._receipts_reflected(pending, snapshots, pair["symbol"])):
         PairTrader._require_position_times(pending, snapshots, pair["symbol"])
+    if history_check and state.get("recovery_watch") is not None:
+        require_history_times(engine.store, pair, state, snapshots)
     leverage = held["LONG"].leverage
     require_supported_leverage(leverage)
     risk = PairTrader(engine)._risk_snapshots(pair, snapshots, recovery=True)
@@ -268,7 +499,7 @@ def _publish_archived_diagnostic(engine, pair, watch, accounts, status, message)
 
 def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, read_only=False, deadline=None,
                                  adopt_positions=True, expected_quantities=None, retire_for_deletion=False,
-                                 member_read=None):
+                                 member_read=None, check_member_orders=False):
     """Check durable watches for new writes or a fresh read-only maintenance check."""
     from .pair_execution import PairTrader
     state = engine.store.get("pair_runtime:" + pair["id"], {}) if state is None else state
@@ -390,18 +621,32 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, rea
                     "SELECT key,data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))}
         if needs_reality:
             from .pair_planning import PairPositionError, PairRecoveryConflict
+            if member_read is not None and check_member_orders:
+                # Ordinary planning snapshots have no full-account order
+                # inventory. Preserve this existing reality check without
+                # replacing their positions: one bounded GET per side, no retry;
+                # any failure refuses admission and the original leases recheck below.
+                for key, _ in SIDES:
+                    engine.pairs._require_no_orders(brokers[key], member_read[0][key], timeout=8)
             snapshots, guards, actual, _ = _safe_reality(engine, pair, state, reconciliation=False,
-                member_read=member_read)
+                member_read=member_read, history_check=False)
             if member_read is not None:
                 # Historical queries may revoke the original lease. Reuse that
                 # read only while its guards remain valid; never silently reread.
                 with engine.pairs._current_members(guards):
                     pass
             expected = expected_quantities if expected_quantities is not None else PairTrader._expected(state)
-            if any(dec(actual[side]) != dec(expected[side]) for _, side in SIDES):
-                if (state.get("pending") or has_legacy_cycle(state)
-                        or dec(actual["LONG"]) != dec(actual["SHORT"])):
-                    raise action("历史订单补证后实际仓位仍不平衡或与活动批次不符，停止新增及划转")
+            mismatch = any(dec(actual[side]) != dec(expected[side]) for _, side in SIDES)
+            if mismatch and (state.get("pending") or has_legacy_cycle(state)
+                             or dec(actual["LONG"]) != dec(actual["SHORT"])):
+                raise action("历史订单补证后实际仓位仍不平衡或与活动批次不符，停止新增及划转")
+            # Same snapshot as the adoption or clear decision below.
+            try:
+                require_history_times(engine.store, pair, state, snapshots)
+            except HistoryTimeError as exc:
+                message = str(exc)
+                raise
+            if mismatch:
                 if adopt_positions:
                     persisted = engine.store.get("pair_runtime:" + pair["id"], {})
                     if persisted != state:
@@ -424,6 +669,17 @@ def require_archived_orders_clear(engine, pair, *, state=None, brokers=None, rea
                         isinstance(current[key], LiveBroker) and current[key]._snapshot_lock is not guards[pair[key + "_account_id"]][0]
                         for key, _ in SIDES):
                     raise action("历史观察现实核对期间账户身份变化，停止新增及划转")
+        elif member_read is not None:
+            # Supplying the caller's read must not turn a zero/unknown watch
+            # into a new baseline adoption or a new risk-admission requirement.
+            snapshots, guards = member_read
+            try:
+                require_history_times(engine.store, pair, state, snapshots)
+            except HistoryTimeError as exc:
+                message = str(exc)
+                raise
+            with engine.pairs._current_members(guards):
+                pass
         status, message = "clear", "历史订单已有限补证，当前检查未发现活动挂单或未处理仓位变化"
         return evidence
     finally:
@@ -676,7 +932,8 @@ class PairOrderRecovery:
         if state.get("identities") != identities:
             raise TradingError("归档后的账户身份已变化，不能采纳底仓")
         snapshots, guards = self.manager._read_members(pair, adopt=True, reconciliation=True, startup=True)
-        orders = require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers, adopt_positions=False)
+        orders = require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers,
+            adopt_positions=False, member_read=(snapshots, guards))
         with ExitStack() as budget:
             for broker in brokers.values():
                 if isinstance(broker, LiveBroker):
@@ -1150,7 +1407,8 @@ class PairOrderRecovery:
                 raise TradingError("实际持仓未回到本批开仓前底仓；即使两侧数量相等，也不能归档此未决批次")
             if any(snapshot.pair(symbol)[0].leverage != pending["leverage"] for snapshot in snapshots.values()):
                 raise TradingError("实际杠杆与原批次不一致，不能人工归档")
-            require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers)
+            require_archived_orders_clear(self.engine, pair, state=state, brokers=brokers,
+                member_read=(snapshots, guards))
         if PairTrader(self.engine)._members(pair)[2] != identities:
             raise TradingError("核对期间账户身份变化，请重新核对")
         return {"pair": pair, "state": state, "margin": margin, "accounts": accounts, "identities": identities, "brokers": brokers,
