@@ -17,6 +17,7 @@ from .models import TradingError, dec, positive
 
 
 _RULE_MAX_AGE = 60
+_UNAVAILABLE_MAX_AGE = 10
 _RULE_CACHE_GUARD = threading.Lock()
 # A scoped open-order query is weight 1 per symbol; falling back to the
 # all-symbol request above this count keeps one scene's sequential request
@@ -301,8 +302,22 @@ def reduction_snapshot(broker, *, market_only=False, hedge_mode=None, order_symb
     return snapshot
 
 
+class SymbolUnavailable(TradingError):
+    """A complete exchangeInfo read shows this symbol has no tradable MARKET rule.
+
+    Read failures and malformed responses raise plain TradingError instead,
+    because they cannot prove anything about one symbol.
+    """
+
+
 def reduction_rule(market, symbol):
-    """Load an independent, bounded-age MARKET rule for a native symbol."""
+    """Load an independent, bounded-age MARKET rule for a native symbol.
+
+    Explicit unavailability is cached for 10 seconds from the read's start,
+    only for the same API instance and symbol. Expiry or API replacement
+    discards that refusal; hits never renew its age or authorize an order.
+    Failed, malformed and stale reads are never negative-cache evidence.
+    """
     from .exchange import MarketData
 
     symbol = _name(symbol, "交易代码")
@@ -310,10 +325,16 @@ def reduction_rule(market, symbol):
         if not hasattr(market, "_adl_rule_lock"):
             market._adl_rule_lock = threading.Lock()
             market._adl_rule_cache = {}
+            market._adl_unavailable_cache = {}
     with market._adl_rule_lock:
         started = time.monotonic()
-        cached = market._adl_rule_cache.get(symbol)
         api = market.api
+        unavailable = market._adl_unavailable_cache.get(symbol)
+        if unavailable:
+            if unavailable[2] is api and 0 <= started - unavailable[0] < _UNAVAILABLE_MAX_AGE:
+                raise SymbolUnavailable(unavailable[1])
+            del market._adl_unavailable_cache[symbol]
+        cached = market._adl_rule_cache.get(symbol)
         if cached and cached[2] is api and 0 <= started - cached[0] < _RULE_MAX_AGE:
             return cached[1]
         with _budget(api):
@@ -321,15 +342,29 @@ def reduction_rule(market, symbol):
         # Check the whole native symbol list before selecting a rule; malformed
         # envelopes, duplicate symbols and missing assets never imply absence.
         MarketData._margin_assets(data)
-        matches = [row for row in data["symbols"] if row["symbol"] == symbol]
-        if len(matches) != 1 or matches[0].get("status") != "TRADING":
-            raise TradingError(f"ADL {symbol} 暂无可交易的市价规则")
-        row = matches[0]
-        quote_asset = _name(row.get("quoteAsset"), "计价资产")
-        _name(row.get("marginAsset"), "保证金资产")
-        order_types = row.get("orderTypes", row.get("OrderType"))
-        if not isinstance(order_types, list) or "MARKET" not in order_types:
-            raise TradingError(f"ADL {symbol} 缺少已确认的市价委托支持")
+        # Stale evidence cannot justify a symbol-only refusal either.
+        if market.api is not api or not 0 <= time.monotonic() - started < _RULE_MAX_AGE:
+            raise TradingError("ADL 交易规则在读取期间已失效")
+        try:
+            matches = [row for row in data["symbols"] if row["symbol"] == symbol]
+            if not matches:
+                raise SymbolUnavailable(f"ADL {symbol} 暂无可交易的市价规则")
+            status = matches[0].get("status")
+            if len(matches) != 1 or not isinstance(status, str) or not status:
+                raise TradingError(f"ADL {symbol} 市价规则响应不完整")
+            if status != "TRADING":
+                raise SymbolUnavailable(f"ADL {symbol} 暂无可交易的市价规则")
+            row = matches[0]
+            quote_asset = _name(row.get("quoteAsset"), "计价资产")
+            _name(row.get("marginAsset"), "保证金资产")
+            order_types = row.get("orderTypes", row.get("OrderType"))
+            if not isinstance(order_types, list) or any(not isinstance(kind, str) for kind in order_types):
+                raise TradingError(f"ADL {symbol} 缺少已确认的市价委托支持")
+            if "MARKET" not in order_types:
+                raise SymbolUnavailable(f"ADL {symbol} 缺少已确认的市价委托支持")
+        except SymbolUnavailable as exc:
+            market._adl_unavailable_cache[symbol] = started, str(exc), api
+            raise
         try:
             parsed = MarketData._market_rule(row)
         except (KeyError, ValueError, TypeError) as exc:

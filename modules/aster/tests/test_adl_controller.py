@@ -2,6 +2,7 @@
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
+from itertools import permutations
 import json
 from pathlib import Path
 import tempfile
@@ -12,7 +13,9 @@ from unittest.mock import Mock, patch
 
 from tests.helpers import account
 from trading import adl
-from trading.adl_exchange import ReductionPosition, ReductionRule, ReductionSnapshot
+from trading import adl_exchange
+from trading.adl_exchange import ReductionPosition, ReductionRule, ReductionSnapshot, reduction_rule as real_reduction_rule
+from tests.test_adl_exchange import FakeAPI, INFO, market_row
 from trading.exchange import AmbiguousOrder, BudgetWait, ExchangeError, LiveBroker
 from trading.models import TradingError, dec
 from tests.pair_legacy_fixtures import runtime_default
@@ -90,6 +93,68 @@ class ReductionPlanTests(unittest.TestCase):
                 adl.plan_reduction(snapshots, [SYMBOL], {SYMBOL: rule()}, limit)
         edge = adl.plan_reduction(snapshots, [SYMBOL], {SYMBOL: rule()}, "33.3")
         self.assertEqual(dec(edge["order"]["quantity"]), dec("0.1"))
+
+    def test_each_symbol_is_planned_independently_regardless_of_symbol_order(self):
+        # AAA's residual is below one lot, CCC's cap is below one lot at its
+        # mark; BBB remains reducible whether blocked symbols sort before or after it.
+        snapshots = {"a": SimpleNamespace(positions=(
+                         position("LONG", "1.01", symbol="AAAUSDT"), position("LONG", "5", symbol="BBBUSDT"),
+                         position("LONG", "2", symbol="CCCUSDT", mark="20000"))),
+                     "b": SimpleNamespace(positions=(
+                         position("SHORT", "1", symbol="AAAUSDT"), position("SHORT", "1", symbol="BBBUSDT"),
+                         position("SHORT", "1", symbol="CCCUSDT", mark="20000")))}
+        symbols = ("AAAUSDT", "BBBUSDT", "CCCUSDT")
+        rules = {symbol: rule(symbol) for symbol in symbols}
+        for ordered in permutations(symbols):
+            with self.subTest(order=ordered):
+                planned, blocked = adl.plan_reductions(snapshots, list(ordered), rules)
+                self.assertEqual(planned["order"]["symbol"], "BBBUSDT")
+                self.assertEqual((planned["order"]["positionSide"], planned["order"]["side"]), ("LONG", "SELL"))
+                self.assertEqual(dec(planned["order"]["quantity"]), dec("1"))
+                self.assertEqual(set(blocked), {"AAAUSDT", "CCCUSDT"})
+                self.assertIn("剩余差额 0.01 小于可执行", blocked["AAAUSDT"])
+                self.assertIn("单批金额上限 1000 USDT", blocked["CCCUSDT"])
+                self.assertEqual(adl.plan_reduction(snapshots, list(ordered), rules)["order"]["symbol"], "BBBUSDT")
+        with self.assertRaisesRegex(TradingError, "AAAUSDT 剩余差额 0.01 小于可执行市价数量；CCCUSDT 单批金额上限"):
+            adl.plan_reduction(snapshots, ["CCCUSDT", "AAAUSDT"], rules)
+
+
+class ReductionRuleAvailabilityTests(unittest.TestCase):
+    def test_only_a_complete_exchange_info_read_marks_one_symbol_unavailable(self):
+        determinate = (
+            lambda rows: rows[0].update(status="BREAK"),
+            lambda rows: rows[0].update(symbol="ETHUSDT"),
+            lambda rows: rows[0].update(orderTypes=["LIMIT"]),
+        )
+        for mutate in determinate:
+            with self.subTest(mutation=mutate):
+                data = {"symbols": [market_row(), market_row("OTHERUSDT")]}
+                mutate(data["symbols"])
+                market = SimpleNamespace(api=FakeAPI({INFO: data}))
+                with self.assertRaises(adl_exchange.SymbolUnavailable):
+                    real_reduction_rule(market, "BTCUSDT")
+        uncertain = (
+            lambda data: data.pop("symbols"),
+            lambda data: data.update(symbols=[]),
+            lambda data: data["symbols"].append(market_row()),
+            lambda data: data["symbols"][0].pop("status"),
+            lambda data: data["symbols"][0].pop("orderTypes"),
+            lambda data: data["symbols"][0].update(orderTypes=["LIMIT", 7]),
+            lambda data: data["symbols"][0].update(filters=[]),
+            lambda data: data["symbols"][0].pop("quoteAsset"),
+        )
+        for mutate in uncertain:
+            with self.subTest(mutation=mutate):
+                data = {"symbols": [market_row(), market_row("OTHERUSDT")]}
+                mutate(data)
+                market = SimpleNamespace(api=FakeAPI({INFO: data}))
+                with self.assertRaises(TradingError) as caught:
+                    real_reduction_rule(market, "BTCUSDT")
+                self.assertNotIsInstance(caught.exception, adl_exchange.SymbolUnavailable)
+        failed = SimpleNamespace(api=FakeAPI({INFO: ExchangeError("exchangeInfo unavailable", http_status=503)}))
+        with self.assertRaises(TradingError) as caught:
+            real_reduction_rule(failed, "BTCUSDT")
+        self.assertNotIsInstance(caught.exception, adl_exchange.SymbolUnavailable)
 
 
 class AdlControllerTests(unittest.TestCase):
@@ -483,6 +548,384 @@ class AdlControllerTests(unittest.TestCase):
         self.tick(1)
         self.assertEqual(self.state()["status"], "completed")
         self.assertEqual(self.state()["config"], {"enabled": True, "batch_notional": "1000"})
+
+    def multi_symbol_incident(self, blocked_symbol):
+        self.holdings = {"a": [position("LONG", "1.01", symbol=blocked_symbol), position("LONG", "5", symbol="BBBUSDT")],
+                         "b": [position("SHORT", "1", symbol=blocked_symbol), position("SHORT", "1", symbol="BBBUSDT")]}
+        self.position_updates = {aid: {(p.symbol, p.position_side): 999.0 for p in rows}
+                                 for aid, rows in self.holdings.items()}
+        self.observe(symbol=blocked_symbol, order_id=41)
+        self.observe(symbol="BBBUSDT", order_id=42)
+
+    def assert_blocked_symbol_keeps_scene_while_other_symbol_finishes(self, blocked_symbol):
+        self.multi_symbol_incident(blocked_symbol)
+        self.tick()
+        active = self.state()
+        self.assertEqual(active["status"], "active")
+        self.assertIn(blocked_symbol, active["reason"])
+        self.assertEqual(active["symbol_progress"]["BBBUSDT"]["status"], "reducing")
+        for _ in range(8):
+            self.tick(1)
+        self.assertEqual([(sent["account_id"], sent["order"]["symbol"], sent["order"]["positionSide"],
+                           sent["order"]["side"], sent["order"]["quantity"]) for sent in self.sent],
+                         [("a", "BBBUSDT", "LONG", "SELL", "1")] * 4)
+        state = self.state()
+        # A symbol that cannot be legally reduced keeps the incident open.
+        self.assertEqual(state["status"], "blocked")
+        self.assertIn(f"{blocked_symbol} 剩余差额 0.01 小于可执行市价数量", state["reason"])
+        self.assertNotIn("completed_at", state)
+        progress = state["symbol_progress"]
+        self.assertEqual(progress["BBBUSDT"]["status"], "balanced")
+        self.assertEqual(progress["BBBUSDT"]["residual"], "0")
+        self.assertEqual(progress[blocked_symbol]["status"], "blocked")
+        self.assertEqual((progress[blocked_symbol]["residual"], progress[blocked_symbol]["direction"]), ("0.01", "LONG"))
+        self.assertIn("小于可执行", progress[blocked_symbol]["reason"])
+        self.assertEqual(self.store.get("pair_runtime:pair")["phase"], "attention")
+        self.assertFalse(self.store.pair("pair")["enabled"])
+        with self.store.connect() as db:
+            self.assertEqual(len(adl._unhandled(db, "pair")), 2)
+        with self.assertRaises(TradingError):
+            self.controller.require_clear("pair")
+        # Manual balancing of the blocked symbol is the only way to complete.
+        self.holdings["b"][0] = position("SHORT", "1.01", symbol=blocked_symbol)
+        self.tick(10)
+        state = self.state()
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual({symbol: item["status"] for symbol, item in state["symbol_progress"].items()},
+                         {blocked_symbol: "balanced", "BBBUSDT": "balanced"})
+        with self.store.connect() as db:
+            self.assertEqual(adl._unhandled(db, "pair"), [])
+        self.assertEqual(len(self.sent), 4)
+
+    def test_residual_blocked_symbol_sorted_first_does_not_stop_other_symbols(self):
+        self.assert_blocked_symbol_keeps_scene_while_other_symbol_finishes("AAAUSDT")
+
+    def test_residual_blocked_symbol_sorted_last_gives_the_same_result(self):
+        self.assert_blocked_symbol_keeps_scene_while_other_symbol_finishes("ZZZUSDT")
+
+    def test_cap_blocked_symbol_is_reported_while_other_symbol_reduces(self):
+        self.holdings = {"a": [position("LONG", "2", symbol="AAAUSDT", mark="20000"), position("LONG", "2", symbol="BBBUSDT")],
+                         "b": [position("SHORT", "1", symbol="AAAUSDT", mark="20000"), position("SHORT", "1", symbol="BBBUSDT")]}
+        self.position_updates = {aid: {(p.symbol, p.position_side): 999.0 for p in rows}
+                                 for aid, rows in self.holdings.items()}
+        self.observe(symbol="AAAUSDT", order_id=41)
+        self.observe(symbol="BBBUSDT", order_id=42)
+        for _ in range(4):
+            self.tick(1)
+        self.assertEqual([sent["order"]["symbol"] for sent in self.sent], ["BBBUSDT"])
+        state = self.state()
+        self.assertEqual(state["status"], "blocked")
+        self.assertIn("AAAUSDT 单批金额上限 1000 USDT", state["reason"])
+        self.assertEqual(state["symbol_progress"]["AAAUSDT"]["residual"], "1")
+
+    def test_global_open_order_uncertainty_still_blocks_every_symbol(self):
+        self.multi_symbol_incident("AAAUSDT")
+        self.open_orders["a"] = [{"symbol": "AAAUSDT", "clientOrderId": "manual", "positionSide": "LONG"}]
+        self.tick()
+        self.tick(10)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.state()["status"], "blocked")
+        self.assertIn("未完成挂单", self.state()["reason"])
+        self.open_orders["a"] = []
+        self.tick(10)
+        self.assertEqual([sent["order"]["symbol"] for sent in self.sent], ["BBBUSDT"])
+
+    def test_unreflected_adl_evidence_on_blocked_symbol_still_blocks_every_symbol(self):
+        self.multi_symbol_incident("AAAUSDT")
+        self.now += 5
+        self.controller.observe("a", self.brokers["a"], self.payload(symbol="AAAUSDT", order_id=43))
+        self.tick()
+        self.tick(10)
+        self.assertEqual(self.sent, [])
+        self.assertIn("持仓更新时间尚未覆盖", self.state()["reason"])
+
+    def use_exchange_rules(self, response):
+        self.engine.market = SimpleNamespace(api=FakeAPI({INFO: response}))
+        rules = patch("trading.adl.adl_exchange.reduction_rule", side_effect=real_reduction_rule)
+        rules.start()
+        self.addCleanup(rules.stop)
+
+    def rule_incident(self):
+        self.holdings = {"a": [position("LONG", "2", symbol="AAAUSDT"), position("LONG", "5", symbol="BBBUSDT")],
+                         "b": [position("SHORT", "1", symbol="AAAUSDT"), position("SHORT", "1", symbol="BBBUSDT")]}
+        self.position_updates = {aid: {(p.symbol, p.position_side): 999.0 for p in rows}
+                                 for aid, rows in self.holdings.items()}
+        self.observe(symbol="AAAUSDT", order_id=41)
+        self.observe(symbol="BBBUSDT", order_id=42)
+
+    def test_symbol_without_tradable_market_rule_does_not_stop_other_symbols(self):
+        unavailable = market_row("AAAUSDT")
+        unavailable["status"] = "BREAK"
+        self.use_exchange_rules({"symbols": [unavailable, market_row("BBBUSDT")]})
+        self.rule_incident()
+        self.tick()
+        self.assertEqual([sent["order"]["symbol"] for sent in self.sent], ["BBBUSDT"])
+        state = self.state()
+        self.assertEqual(state["status"], "active")
+        self.assertIn("AAAUSDT 暂无可交易的市价规则", state["reason"])
+        self.assertEqual(state["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+        self.assertEqual(state["symbol_progress"]["AAAUSDT"]["residual"], "1")
+        self.assertIn("暂无可交易的市价规则", state["symbol_progress"]["AAAUSDT"]["reason"])
+
+    def test_exchange_info_read_failure_still_blocks_every_symbol(self):
+        self.use_exchange_rules(ExchangeError("exchangeInfo unavailable", http_status=503))
+        self.rule_incident()
+        self.tick()
+        self.tick(10)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.state()["status"], "blocked")
+
+    def test_unavailable_symbol_resumes_reduction_after_negative_cache_expires(self):
+        unavailable = {**market_row("AAAUSDT"), "status": "BREAK"}
+        self.use_exchange_rules({"symbols": [unavailable, market_row("BBBUSDT")]})
+        self.rule_incident()
+        api = self.engine.market.api
+        with patch("trading.adl_exchange.time.monotonic", side_effect=lambda: self.now):
+            self.tick()
+            self.assertEqual(len(api.calls), 2)
+            api.responses[INFO]["symbols"][0]["status"] = "TRADING"
+            for _ in range(2):
+                self.tick(1)
+            self.assertEqual([sent["order"]["symbol"] for sent in self.sent], ["BBBUSDT"] * 3)
+            self.assertEqual(len(api.calls), 2)
+            self.assertEqual(self.state()["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+            self.tick(8)
+        self.assertEqual(len(api.calls), 3)
+        self.assertEqual(self.sent[-1]["order"]["symbol"], "AAAUSDT")
+        self.assertEqual(self.state()["symbol_progress"]["AAAUSDT"]["status"], "reducing")
+        self.assertLessEqual(dec(self.sent[-1]["order"]["quantity"]), self.sent[-1]["net_before"])
+
+    def test_disabled_reduction_marks_unbalanced_symbols_for_manual_balance(self):
+        self.store.save_pair({**self.store.pair("pair"), "adl": {"enabled": False}})
+        self.multi_symbol_incident("AAAUSDT")
+        self.tick()
+        progress = self.state()["symbol_progress"]
+        self.assertEqual({symbol: item["status"] for symbol, item in progress.items()},
+                         {"AAAUSDT": "manual", "BBBUSDT": "manual"})
+        self.assertEqual(self.sent, [])
+
+    def test_open_order_after_partial_progress_stops_sending_and_holds_progress(self):
+        self.multi_symbol_incident("AAAUSDT")
+        self.tick()
+        self.tick(1)
+        self.assertEqual(len(self.sent), 2)
+        self.open_orders["b"] = [{"symbol": "BBBUSDT", "clientOrderId": "manual", "positionSide": "SHORT"}]
+        for _ in range(3):
+            self.tick(10)
+        self.assertEqual(len(self.sent), 2)
+        state = self.state()
+        self.assertEqual(state["status"], "blocked")
+        self.assertIn("未完成挂单", state["reason"])
+        self.assertEqual(state["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertIn("未完成挂单", state["symbol_progress"]["BBBUSDT"]["reason"])
+        self.assertEqual(state["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+
+    def test_new_unreflected_adl_after_partial_progress_stops_sending_and_holds_progress(self):
+        self.multi_symbol_incident("AAAUSDT")
+        self.tick()
+        self.tick(1)
+        self.assertEqual(len(self.sent), 2)
+        self.now += 1
+        self.controller.observe("a", self.brokers["a"], self.payload(symbol="BBBUSDT", order_id=43))
+        for _ in range(3):
+            self.tick(10)
+        self.assertEqual(len(self.sent), 2)
+        state = self.state()
+        self.assertIn("持仓更新时间尚未覆盖", state["reason"])
+        self.assertEqual(state["symbol_progress"]["BBBUSDT"]["status"], "held")
+
+    def test_batch_limit_halt_with_blocked_symbol_stops_other_symbols(self):
+        self.multi_symbol_incident("AAAUSDT")
+        with patch("trading.adl.MAX_BATCHES", 2):
+            for _ in range(4):
+                self.tick(1)
+            self.assertEqual(len(self.sent), 2)
+            state = self.state()
+            self.assertTrue(state["halted"])
+            self.assertIn("批次数上限", state["reason"])
+            self.assertEqual(state["symbol_progress"]["BBBUSDT"]["status"], "held")
+            for _ in range(2):
+                self.tick(10)
+            self.assertEqual(len(self.sent), 2)
+            progress = self.state()["symbol_progress"]
+            # The halted early return still persists the latest scene.
+            self.assertEqual(progress["BBBUSDT"]["checked_at"], self.now)
+            self.assertEqual((progress["BBBUSDT"]["status"], progress["BBBUSDT"]["residual"]), ("held", "2"))
+            self.assertEqual(progress["AAAUSDT"]["status"], "blocked")
+
+    def test_three_unfilled_batches_halt_with_blocked_symbol_stops_other_symbols(self):
+        def expire(orders, **_):
+            order = deepcopy(orders[0])
+            self.sent.append({"account_id": "a", "order": order})
+            result = receipt(order, "0", status="EXPIRED")
+            self.exchange_orders["a", order["newClientOrderId"]] = result
+            self.brokers["a"]._snapshot_generation += 1
+            return [result]
+
+        self.brokers["a"].submit.side_effect = expire
+        self.multi_symbol_incident("AAAUSDT")
+        for _ in range(6):
+            self.tick(1)
+        self.assertEqual(len(self.sent), 3)
+        state = self.state()
+        self.assertTrue(state["halted"])
+        self.assertIn("连续三批未成交", state["reason"])
+        self.assertEqual(state["symbol_progress"]["BBBUSDT"]["status"], "held")
+        for _ in range(2):
+            self.tick(10)
+        self.assertEqual(len(self.sent), 3)
+
+    def assert_halt_reason_survives_later_read_failure(self, *, legacy=False):
+        self.multi_symbol_incident("AAAUSDT")
+        with patch("trading.adl.MAX_BATCHES", 1):
+            self.tick()
+            self.tick(1)
+        halted = self.state()
+        halt_reason = halted["reason"]
+        self.assertTrue(halted["halted"])
+        if legacy:
+            halted.pop("halt_reason", None)
+            self.store.put("adl_pair:pair", halted)
+            self.store.put("adl_incident:" + halted["id"], halted)
+        self.controller = adl.AdlController(self.engine)
+        with patch.object(self.controller, "_read", side_effect=TradingError("完整持仓读取失败")):
+            self.tick(10)
+        self.assertEqual(self.state()["reason"], "完整持仓读取失败")
+        self.controller = adl.AdlController(self.engine)
+        self.tick(10)
+        current = self.state()
+        self.assertEqual(current["symbol_progress"]["BBBUSDT"]["reason"], halt_reason)
+        self.assertEqual(current["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertEqual(current["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+        self.assertEqual(current.get("halt_reason"), halt_reason)
+        self.assertEqual(self.store.get("adl_incident:" + current["id"])["halt_reason"], halt_reason)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_halt_reason_survives_later_read_failure_and_restart(self):
+        self.assert_halt_reason_survives_later_read_failure()
+
+    def test_legacy_halt_reason_is_preserved_before_later_read_failure(self):
+        self.assert_halt_reason_survives_later_read_failure(legacy=True)
+
+    def assert_legacy_halt_reason_survives_late_order(self, *, prior):
+        self.multi_symbol_incident("AAAUSDT")
+        if prior:
+            self.archived_runtime()
+        else:
+            self.submit_unknown = True
+            self.snapshot_filled = False
+            self.query_visible = False
+        self.tick()
+        self.tick(2)
+        self.tick(2)
+        self.now = self.state()["created_at"] + 120
+        with patch("trading.adl.MAX_BATCHES", 1):
+            self.tick()
+            if prior:
+                self.tick(1)
+        halted = self.state()
+        self.assertTrue(halted["halted"])
+        self.assertIn("批次数上限", halted["reason"])
+        halt_reason = halted["reason"]
+        field = "prior_orders" if prior else "batches"
+        original = halted[field][0]
+        self.assertEqual(original["resolution"], "positions_verified_unknown")
+        self.assertIsNone(original.get("receipt"))
+        self.assertEqual(len(self.sent), 1)
+        # Persist the old schema before a delayed receipt reopens reconciliation.
+        halted.pop("halt_reason", None)
+        self.store.put("adl_pair:pair", halted)
+        self.store.put("adl_incident:" + halted["id"], halted)
+        self.controller = adl.AdlController(self.engine)
+        broker = self.brokers[original["account_id"]]
+        active = receipt(original["order"], "0", status="NEW")
+        broker.cancel.return_value = active
+        with patch.object(broker, "order_event_receipt", return_value=active) as stream:
+            self.tick(10)
+            waiting = self.state()
+            expected = ("已暂停配对策略，正在核对原策略订单，未重复发送" if prior
+                        else "正在核对 ADL 减仓原订单，确认结果后才发送下一批")
+            self.assertEqual(waiting["reason"], expected)
+            self.assertEqual(waiting[field][0]["receipt"]["status"], "NEW")
+            self.assertNotIn("resolution", waiting[field][0])
+            waiting_history = self.store.get("adl_incident:" + halted["id"])
+            self.controller = adl.AdlController(self.engine)
+            stream.return_value = receipt(original["order"], "0", status="CANCELED")
+            self.tick(10)
+        current = self.state()
+        self.assertEqual(current[field][0]["state"], "terminal")
+        self.assertTrue(current["halted"])
+        self.assertEqual(current["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertEqual(current["symbol_progress"]["BBBUSDT"]["reason"], halt_reason)
+        self.assertEqual(current["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+        for saved in (waiting, waiting_history, current, self.store.get("adl_incident:" + halted["id"])):
+            self.assertEqual(saved.get("halt_reason"), halt_reason)
+            self.assertEqual(saved.get("notice_version"), halted.get("notice_version"))
+        self.assertEqual(len(self.sent), 1)
+
+    def test_legacy_halt_reason_survives_late_adl_order_reconciliation(self):
+        self.assert_legacy_halt_reason_survives_late_order(prior=False)
+
+    def test_legacy_halt_reason_survives_late_strategy_order_reconciliation(self):
+        self.assert_legacy_halt_reason_survives_late_order(prior=True)
+
+    def test_exchange_rejection_halts_and_holds_otherwise_reducible_symbol(self):
+        self.multi_symbol_incident("AAAUSDT")
+        self.brokers["a"].submit.side_effect = None
+        self.brokers["a"].submit.return_value = [{"code": -2019}]
+        self.tick()
+        self.tick(1)
+        halted = self.state()
+        self.assertTrue(halted["halted"])
+        self.assertIn("交易所拒绝 ADL 减仓", halted["reason"])
+        self.assertTrue(halted["batches"][-1]["rejected"])
+        self.assertEqual(halted["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertEqual(halted["symbol_progress"]["BBBUSDT"]["reason"], halted["reason"])
+        self.assertEqual(halted["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+        self.tick(10)
+        self.assertTrue(self.state()["halted"])
+        self.assertEqual(self.state()["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertEqual(self.brokers["a"].submit.call_count, 1)
+        self.brokers["b"].submit.assert_not_called()
+
+    def test_time_limit_halts_and_holds_otherwise_reducible_symbol(self):
+        self.multi_symbol_incident("AAAUSDT")
+        self.tick()
+        self.tick(adl.MAX_SECONDS + 1)
+        halted = self.state()
+        self.assertTrue(halted["halted"])
+        self.assertIn("处理时限", halted["reason"])
+        self.assertLess(len(halted["batches"]), adl.MAX_BATCHES)
+        self.assertEqual(halted["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertEqual(halted["symbol_progress"]["BBBUSDT"]["reason"], halted["reason"])
+        self.assertEqual(halted["symbol_progress"]["AAAUSDT"]["status"], "blocked")
+        self.tick(10)
+        self.assertEqual(self.state()["symbol_progress"]["BBBUSDT"]["status"], "held")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_halted_early_return_saves_scene_without_new_notice(self):
+        self.multi_symbol_incident("AAAUSDT")
+        with patch("trading.adl.MAX_BATCHES", 1):
+            self.tick()
+            self.tick(1)
+        halted = self.state()
+        with self.store.connect() as db:
+            reports = db.execute("SELECT id, message FROM outbox WHERE category='adl' ORDER BY id").fetchall()
+        self.assertTrue(reports)
+        with patch("trading.adl.adl_notifications.enqueue", wraps=adl.adl_notifications.enqueue) as enqueue:
+            self.tick(10)
+            self.tick(10)
+        enqueue.assert_not_called()
+        current = self.state()
+        self.assertEqual(current["notice_version"], halted["notice_version"])
+        self.assertEqual(current["symbol_progress"]["BBBUSDT"]["checked_at"], self.now)
+        self.assertGreater(current["symbol_progress"]["BBBUSDT"]["checked_at"],
+                           halted["symbol_progress"]["BBBUSDT"]["checked_at"])
+        self.assertEqual(self.store.get("adl_incident:" + current["id"])["symbol_progress"],
+                         current["symbol_progress"])
+        with self.store.connect() as db:
+            self.assertEqual(db.execute("SELECT id, message FROM outbox WHERE category='adl' ORDER BY id").fetchall(), reports)
+        self.assertEqual(len(self.sent), 1)
 
     def test_smaller_than_minimum_notional_cap_blocks_without_sending_and_manual_balance_finishes(self):
         self.store.save_pair({**self.store.pair("pair"), "adl": {"batch_notional": "99.99"}})
