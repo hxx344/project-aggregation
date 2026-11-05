@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -82,7 +82,7 @@ function fixture(options = {}) {
   const sources = [];
   let reads = 0;
   const create = overrides => createBinanceLighterCost({ dataDir, log: silent, now: () => base, mono: () => 100,
-    tickMs: 60_000, snapshotMs: 60_000, metadataMs: 60_000,
+    tickMs: 60_000, snapshotMs: 60_000, metadataMs: 60_000, persistGapMs: 20,
     engineFactory: fakeEngine,
     discover: async () => { reads += 1; return []; },
     connect(callbacks) {
@@ -117,8 +117,9 @@ test('partial simulated exposure persists immediately, stop preserves it, archiv
   try {
     await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
     f.sources[0].callbacks.onTrade({});
-    const persisted = JSON.parse(readFileSync(join(manager.directory, 'session-v2.json'))).report;
-    assert.equal(persisted.scenarios[0].inventory.binanceQuantity, 0.01);
+    const saved = () => JSON.parse(readFileSync(join(manager.directory, 'session-v2.json'))).report;
+    await until(() => saved().scenarios[0]?.inventory.binanceQuantity === 0.01);
+    const persisted = saved();
     assert.equal(persisted.scenarios[0].stats.binanceTurnover, 800);
     await manager.stop();
     assert.equal(manager.state().report.scenarios[0].inventory.residualQuantity, 0.01);
@@ -135,6 +136,93 @@ test('partial simulated exposure persists immediately, stop preserves it, archiv
     assert.equal(manager.state().archives[0].hasExposure, true);
     assert.equal(manager.state().archives[0].makerFills, 1);
   } finally { await manager.close(); f.cleanup(); }
+});
+
+test('running snapshots are staged off the hot path, coalesced, and a late one never overwrites stop', async () => {
+  const staged = [];
+  const f = fixture({ stage: (file, value) => new Promise(resolve => staged.push({ file, value, resolve })) });
+  const manager = f.create(), file = join(manager.directory, 'session-v2.json');
+  let committed = 0, discarded = 0;
+  const outcome = { commit() { committed += 1; }, discard() { discarded += 1; } };
+  try {
+    await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+    const feed = f.sources[0].callbacks;
+    feed.onTrade({});
+    for (let i = 1; i <= 5; i++) { feed.onBook({ venue: 'binance', symbol: 'BTC', sequence: String(i) }); feed.onTrade({}); }
+    assert.equal(staged.length, 1, 'one snapshot in flight; later changes wait for it');
+    assert.equal(staged[0].value.clean, false); assert.equal(staged[0].value.report.scenarios.length, 1);
+    staged[0].resolve(outcome);
+    await until(() => staged.length === 2);
+    assert.equal(committed, 1);
+    assert.equal(staged[1].value.report.books[0].sequence, '5', 'the follow-up snapshot carries the newest state');
+    await manager.stop();
+    staged[1].resolve(outcome); await delay(30);
+    assert.equal(committed, 1); assert.equal(discarded, 1);
+    assert.equal(JSON.parse(readFileSync(file)).clean, true, 'the synchronous stop record stays on disk');
+    assert.equal(staged.length, 2);
+  } finally { for (const row of staged) row.resolve(outcome); await manager.close(); f.cleanup(); }
+});
+
+test('real staged snapshots leave no temporary files and restart removes ones a crash left behind', async () => {
+  const f = fixture(); let manager = f.create();
+  const temporary = () => readdirSync(manager.directory).filter(name => name.endsWith('.tmp'));
+  try {
+    await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+    for (let i = 0; i < 5; i++) { f.sources[0].callbacks.onTrade({}); await delay(5); }
+    const file = join(manager.directory, 'session-v2.json');
+    await until(() => JSON.parse(readFileSync(file)).report.scenarios.length === 1);
+    await manager.stop(); await manager.close();
+    assert.deepEqual(temporary(), []);
+    writeFileSync(`${file}.${randomUUID()}.tmp`, '{"partial"');
+    writeFileSync(join(manager.directory, 'notes.tmp'), 'kept');
+    manager = f.create(); await manager.initialize();
+    assert.deepEqual(temporary(), ['notes.tmp'], 'only staged research files are removed');
+  } finally { await manager.close(); f.cleanup(); }
+});
+
+test('a rejected stage or a throw in the cooling timer stops the simulation instead of the process', async () => {
+  for (const mode of ['stage', 'timer']) {
+    let boom = false;
+    const f = fixture({
+      // A long gap keeps guarded() cooling, so in timer mode only the timer callback builds the next snapshot.
+      ...(mode === 'stage' ? { stage: async () => { throw new Error('fixture_stage_failure'); } } : { persistGapMs: 300 }),
+      engineFactory: (settings, options) => { const engine = fakeEngine(settings, options), report = engine.report;
+        return Object.assign(engine, { report: value => { if (boom) { boom = false; throw new Error('fixture_report_failure'); } return report(value); } }); },
+    });
+    const manager = f.create();
+    try {
+      await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+      if (mode === 'timer') {
+        const file = join(manager.directory, 'session-v2.json');
+        f.sources[0].callbacks.onTrade({});
+        await until(() => JSON.parse(readFileSync(file)).report.scenarios.length === 1);
+        boom = true; f.sources[0].callbacks.onTrade({}); // guarded() is cooling; the timer builds this snapshot and throws once
+      } else f.sources[0].callbacks.onTrade({});
+      // state() also builds a report, so let the background path take the one-shot failure first.
+      await until(() => !boom);
+      await until(() => manager.state().state === 'fault');
+      assert.equal(manager.state().enabled, false);
+    } finally { boom = false; await manager.close(); f.cleanup(); }
+  }
+});
+
+test('a staged snapshot of an archived session never lands over the next session', async () => {
+  const staged = [];
+  const f = fixture({ stage: (file, value) => new Promise(resolve => staged.push({ value, resolve })) });
+  const manager = f.create(), file = join(manager.directory, 'session-v2.json');
+  let committed = 0;
+  try {
+    await manager.initialize(); await manager.start(); await until(() => f.sources.length === 1);
+    const first = manager.state().report.sessionId;
+    f.sources[0].callbacks.onTrade({});
+    assert.equal(staged.length, 1);
+    await manager.stop(); await manager.archive(); await manager.start();
+    const second = manager.state().report.sessionId;
+    assert.notEqual(second, first);
+    staged[0].resolve({ commit() { committed += 1; }, discard() {} }); await delay(30);
+    assert.equal(committed, 0);
+    assert.equal(JSON.parse(readFileSync(file)).report.sessionId, second);
+  } finally { for (const row of staged) row.resolve({ commit() {}, discard() {} }); await manager.close(); f.cleanup(); }
 });
 
 test('archive interruption is separate from inventory exposure and fill count', async () => {
@@ -183,6 +271,7 @@ test('failed durable start or save cannot change runtime intent or saved config'
     assert.equal(manager.state().config.orderNotional, config().orderNotional);
     denied = ''; await manager.start(); await until(() => f.sources.length === 1);
     denied = 'session-v2.json'; f.sources[0].callbacks.onTrade({});
+    await until(() => manager.state().state === 'fault');
     assert.equal(manager.state().enabled, false); assert.equal(manager.state().state, 'fault');
     assert.equal(manager.state().report.scenarios[0].inventory.residualQuantity, 0.01);
     denied = '';
@@ -565,7 +654,9 @@ test('real inventory fills persist mid-hedge and dirty restart preserves origina
     trade(0);
     assert.ok(manager.state().report.scenarios[0].quotes.buy); assert.ok(manager.state().report.scenarios[0].quotes.sell);
     time = 1; trade(0.6);
-    const file = join(manager.directory, 'session-v2.json'), bytes = readFileSync(file);
+    const file = join(manager.directory, 'session-v2.json');
+    await until(() => JSON.parse(readFileSync(file)).report.scenarios[0].recentFills.length === 1);
+    const bytes = readFileSync(file);
     const beforeCrash = JSON.parse(bytes).report, row = beforeCrash.scenarios[0];
     assert.equal(row.inventory.binanceQuantity, 0.5); assert.equal(row.inventory.lighterQuantity, 0);
     assert.equal(row.inventory.residualQuantity, 0.5); assert.equal(row.hedge.quantity, 0.5);

@@ -36,7 +36,7 @@ export default function AeroPage({ onExpired }: { onExpired: () => void }) {
     <div className="as-tabs" role="tablist" aria-label="Aero 分区">{AERO_TABS.map((t) => <button key={t.id} type="button" role="tab" id={`aero-tab-${t.id}`} aria-selected={tab === t.id} aria-controls="aero-tabpanel" className={tab === t.id ? 'active' : ''} onClick={() => { if (tab !== t.id) openAeroTab(t.id); }}>{t.label}</button>)}</div>
     <div className="lp-page" role="tabpanel" id="aero-tabpanel" aria-labelledby={`aero-tab-${tab}`}>
       {tab === 'positions' ? <AeroSafePositions safe={safe} market={market} onConfig={goConfig} />
-        : tab === 'market' ? <AeroMarketPage market={market} onExpired={onExpired} onConfig={goConfig} />
+        : tab === 'market' ? <AeroMarketPage market={market} safe={safe.state} onExpired={onExpired} onConfig={goConfig} />
         : <><AeroSafeConfig safe={safe} /><MarketSettings market={market} /></>}
     </div>
   </div>;

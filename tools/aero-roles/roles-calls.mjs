@@ -84,9 +84,9 @@ const functionCall = (roleKey, target, f) => (f.condition
   ? ROLES_ABI.encodeFunctionData('scopeFunction', [roleKey, target, f.selector, flatten(f.condition), f.options])
   : ROLES_ABI.encodeFunctionData('allowFunction', [roleKey, target, f.selector, f.options]));
 
-// 已部署 Roles 的增量批次（加池）：current / next 均为 buildPermissions 的结果，只允许增加。
+// 已部署 Roles 的增量批次（加池、调额度）：current / next 均为 buildPermissions 的结果，权限只允许增加。
 // 新目标 scopeTarget 加全部函数；已有目标上条件变化或新增的函数重下 scopeFunction / allowFunction（整体替换该函数的条件）；
-// 新代币 setAllowance。已有额度不重下：setAllowance 会把当前余额重置为满额。
+// 新代币与每日数量变化的代币 setAllowance。数量未变的额度不重下：setAllowance 会把当前余额重置为满额。
 export function buildUpdateBatch({ current, next, roles }) {
   roles = getAddress(roles);
   if (current.roleKeyBytes !== next.roleKeyBytes) throw new Error('roleKey must not change');
@@ -110,7 +110,7 @@ export function buildUpdateBatch({ current, next, roles }) {
   }
   for (const a of next.allowances) {
     const old = current.allowances.find((x) => x.key === a.key);
-    if (old && old.perDay !== a.perDay) throw new Error(`allowance for ${a.symbol} must not change in an update`);
+    if (old && old.perDay !== a.perDay) add(ROLES_ABI.encodeFunctionData('setAllowance', [a.key, a.perDay, a.perDay, a.perDay, next.allowancePeriod, 0]), `调整额度 ${a.symbol}：每 24 小时 ${old.perDay} → ${a.perDay}（最小单位），执行后当天可用额度按新值计满`);
     if (!old) add(ROLES_ABI.encodeFunctionData('setAllowance', [a.key, a.perDay, a.perDay, a.perDay, next.allowancePeriod, 0]), `额度 ${a.symbol}：每 24 小时 ${a.perDay}（最小单位）`);
   }
   for (const a of current.allowances) if (!next.allowances.some((x) => x.key === a.key)) throw new Error(`update would drop the allowance for ${a.symbol}`);

@@ -2,13 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 import { retainHistoryPoints, type LiveQuote, type MarketData } from "../lib/market";
-import { HISTORY_REFRESH_MS, QUOTE_REFRESH_MS, startActivityPolling } from "../lib/polling";
+import { HISTORY_REFRESH_MS, HISTORY_TIMEOUT_MS, QUOTE_REFRESH_MS, startActivityPolling } from "../lib/polling";
 import type { InitialMarketData } from "../lib/initial-market";
 
 const retainedQuote = "后台尚未取得新报价，显示上次保存的数据；请留意采集时间。";
 
 async function request<T>(path: string, signal: AbortSignal): Promise<T> {
-  const response = await fetch(path, { cache: "no-store", signal: AbortSignal.any([signal,AbortSignal.timeout(15_000)]) });
+  // The polling signal carries each read's deadline.
+  const response = await fetch(path, { cache: "no-store", signal });
   if (!response.ok) throw new Error("行情更新失败，将在下一轮自动重试。");
   return response.json();
 }
@@ -27,6 +28,7 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], active = tru
     if (!active) return;
     const history = startActivityPolling({
       intervalMs: HISTORY_REFRESH_MS,
+      timeoutMs: HISTORY_TIMEOUT_MS,
       load: async signal => {
         const next = await request<MarketData>("/api/monitors/hynix/history",signal);
         if (!next.points?.length) throw new Error("暂时没有可对齐的历史行情。");

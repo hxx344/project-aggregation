@@ -6,7 +6,7 @@ import { exchangeContracts, exchangeDefinition, exchangeNames, type Exchange, ty
 import { exchangeFundingAction, HISTORY_PAGE_SIZE, HISTORY_REFRESH_MS, HISTORY_STALE_MS, HISTORY_WINDOW_MS, validateExchangeFundingHistory, type ExchangeFundingHistory } from "../lib/exchange-funding-history";
 import { analyzeFundingRange, fundingRangeInput, parseFundingRangeInput } from "../lib/exchange-funding-analysis";
 import { summaryTimestamp } from "../lib/monitor-summary";
-import { startActivityPolling } from "../lib/polling";
+import { HISTORY_TIMEOUT_MS, startActivityPolling } from "../lib/polling";
 
 export type FundingHistorySelection = { exchange: Exchange; direction: "short" | "long" };
 type HistoryCache = Partial<Record<Exchange, ExchangeFundingHistory>>;
@@ -57,6 +57,7 @@ export default function ExchangeFundingHistoryPanel({ id, monitorId, selection, 
     const cached = latest.current[exchange];
     const control = startActivityPolling({
       intervalMs: HISTORY_REFRESH_MS,
+      timeoutMs: HISTORY_TIMEOUT_MS,
       immediate: !cached || cached.status === "snapshot" || Date.now() - Date.parse(cached.fetchedAt) >= HISTORY_REFRESH_MS,
       async load(signal) {
         const response = await fetch(`/api/monitors/${monitorId}/${exchangeFundingAction(exchange)}`, { cache: "no-store", signal });

@@ -343,7 +343,7 @@ API 先完成现有的会话、来源与 `Sec-Fetch-Site` 校验，再转发方�
 | `/api/projects/:id/check`、`/api/projects/:id/sync` | 转发 | 采集与资产同步（`app.mjs:526`、`:532-535`） |
 | `/api/overview`、`/api/overview/events` | API | 使用运行时推送的投影 |
 | `/api/system/updates*` | API | 更新协调器 |
-| `/api/system/architecture`、`/api/system/metrics`、`/api/system/accounts`、`/api/system/recovery`、`/api/system/modules` | 转发 | 模块能力、基线和共享保护库都在运行时 |
+| `/api/system/architecture`、`/api/system/metrics`、`/api/system/accounts`、`/api/system/recovery`、`/api/system/modules`、`/api/system/event-loop` | 转发 | 模块能力、基线、共享保护库和事件循环卡顿测量都在运行时 |
 | `/api/trading*` | 转发 | 交易数据、导入、持仓与原生执行；原生执行写入口另有 5.5 节的准入 |
 | Portal 页面与升级连接 | API | 解析模块传输后直连模块 socket（`portal.mjs:221-224` 的 `targetFor` 已是异步函数） |
 | 静态资源 | API | |

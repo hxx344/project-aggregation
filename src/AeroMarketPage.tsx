@@ -11,8 +11,11 @@ import { bestRange, centeredRange, DEFAULT_PLAN, expectedDaysInRange, fullRange,
 import type { RebalancePlan } from './aero-market-math';
 import type { NetYield, RangeChoice } from './aero-market-math';
 import type { MarketChain, MarketConfig, MarketPool, MarketReplay, MarketReplays, MarketSamples, MarketSamplesUnchanged, MarketSnapshot, MarketWindow } from './aero-market-types';
+import { poolStatus } from './aero-safe-client';
+import type { AeroSafeState } from './aero-safe-types';
 import './aero-lp.css';
 import './aero-market.css';
+import './aero-safe.css';
 
 const DAY = 86400;
 const RANGES = [{ value: 0, label: '最窄（单个 tickSpacing）' }, { value: 0.01, label: '±1%' }, { value: 0.02, label: '±2%' }, { value: 0.05, label: '±5%' }, { value: 0.1, label: '±10%' }, { value: 0.2, label: '±20%' }];
@@ -215,7 +218,8 @@ export function SettingsForm({ config, busy, onSave }: { config: MarketConfig; b
   </form>;
 }
 
-export default function AeroMarketPage({ market, onExpired, onConfig }: { market: AeroMarket; onExpired: () => void; onConfig: () => void }) {
+// safe：实盘状态，用来在列表里标出已在 Safe 白名单（已加池）与待加池的池子；实盘只在 Base。
+export default function AeroMarketPage({ market, safe = null, onExpired, onConfig }: { market: AeroMarket; safe?: AeroSafeState | null; onExpired: () => void; onConfig: () => void }) {
   const { snapshot, cachedAt, loadError, actionError, setActionError, busy, read, execute, accept, fail, lifetime, generation } = market;
   const [chainFilter, setChainFilter] = useState('all');
   const [search, setSearch] = useState('');
@@ -547,7 +551,7 @@ export default function AeroMarketPage({ market, onExpired, onConfig }: { market
           const k = key(m.pool), starred = favoriteSet.has(k);
           return <tr key={k} onClick={() => openPool(m.pool)}>
               <th scope="row"><span className="am-pool-cell"><button type="button" className={`am-star${starred ? ' on' : ''}`} aria-pressed={starred} aria-label={`${starred ? '取消收藏' : '收藏'} ${pairName(m.pool)}`} title={favoriteDisabled ? '正在连接服务器，稍后可收藏' : starred ? '取消收藏' : '收藏'} disabled={favoriteDisabled} onClick={(e) => { e.stopPropagation(); toggleFavorite(m.pool); }}><Star size={15} /></button>
-                <button type="button" className="am-pool" title="查看池子详情"><strong>{pairName(m.pool)}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></span></th>
+                <button type="button" className="am-pool" title="查看池子详情"><strong>{pairName(m.pool)}{(() => { const status = m.pool.chain === 'base' ? poolStatus(safe, m.pool) : null; return status ? <span className={`as-tag ${status}`}>{status === 'listed' ? '已加池' : '待加池'}</span> : null; })()}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></span></th>
               <td className={`num strong ${m.replay ? m.replay.net > 0 ? 'up' : m.replay.net < 0 ? 'down' : '' : ''}`} title={replayNote(m)}>{m.replay ? `${signedUsd(perDay(m.replay))}/天` : '—'}<small>{m.replay ? `年化 ${pct(m.replay.apr, 0)} · 调仓 ${exitsOf(m.replay).toFixed(0)} 次 · ${m.replay.hours.toFixed(0)} 小时` : ''}</small></td>
               <td className="num">{m.score === null ? '—' : m.score.toFixed(1)}</td>
               <td className="num" title={averageNote(m)}>{m.avg?.score == null ? '—' : m.avg.score.toFixed(1)}</td>

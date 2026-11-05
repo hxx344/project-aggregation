@@ -14,4 +14,5 @@
 .ss-details dt{color:var(--text-tertiary)}
 .ss-details dd{margin:0;text-align:right;color:var(--text-secondary);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
 .ss-unavailable{color:var(--text-tertiary);font-size:.8125rem}
+.ss-note{margin:0;color:var(--text-tertiary);font-size:.75rem;line-height:1.5}
 .ss-meta{color:var(--text-tertiary);font-size:.75rem}

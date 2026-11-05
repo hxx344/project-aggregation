@@ -44,19 +44,21 @@ export type AeroSafeState = {
   pending: { hash: string; nonce: number; label: string; at: number; stale: boolean } | null;
   ledgerError?: string | null; job: AeroSafeJob | null; chain: AeroSafeChain | null; chainAt: number | null; chainError: string | null; refreshing: boolean;
   events: AeroSafeEvent[]; ledger: AeroSafeLedger[]; serverNow: number; auto?: AeroAutoState;
-  poolPlan?: { createdAt: number; pool: AeroSafePoolPlanPool; stale: boolean } | null;
+  changes?: AeroSafeChanges;
 };
-type PlanToken = { address: string; symbol: string; decimals: number };
-export type AeroSafePoolPlanPool = {
-  address: string; name: string; gauge: string; tickSpacing: number; token0: PlanToken; token1: PlanToken;
-  allowances: { token: string; symbol: string; perDay: string; decimals: number }[]; transactions: number;
+type ChangeToken = { address: string; symbol: string; decimals: number };
+export type AeroSafeChangePool = { address: string; name: string; gauge: string; tickSpacing: number; token0: ChangeToken; token1: ChangeToken; addedAt: number };
+// 白名单待变更：待加池与额度调整（perDay / current 为最小单位；current 为配置里的现值，新代币为 null）。
+export type AeroSafeChanges = {
+  pools: AeroSafeChangePool[];
+  allowances: { token: string; symbol: string; decimals: number; perDay: string; current: string | null }[];
+  preview: { transactions: number; usage: { label: string; nodes: number }[]; error: string | null };
+  // stale：配置在生成后已变化，不能再核对；behind：生成后又有变更，未包含在这份批次里。
+  batch: { createdAt: number; transactions: number; pools: string[]; allowances: { symbol: string; perDay: string; decimals: number }[]; stale: boolean; behind: boolean } | null;
 };
-// POST /pools/plan：builder 为 Safe{Wallet} Transaction Builder 可导入的批次 JSON。
-export type AeroSafePoolPlan = {
-  pool: AeroSafePoolPlanPool; transactions: { to: string; description: string }[]; builder: unknown;
-  usage: { label: string; nodes: number }[]; state: AeroSafeState;
-};
+// POST /changes/batch：builder 为 Safe{Wallet} Transaction Builder 可导入的批次 JSON。
+export type AeroSafeChangeBatch = { transactions: { to: string; description: string }[]; builder: unknown; usage: { label: string; nodes: number }[]; state: AeroSafeState };
 export type AeroSafePreview = {
-  pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string;
+  pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string; capped?: boolean;
   swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string; previewedAt: number;
 };

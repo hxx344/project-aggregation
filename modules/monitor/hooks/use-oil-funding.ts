@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { startActivityPolling } from "../lib/polling";
+import { HISTORY_TIMEOUT_MS, startActivityPolling } from "../lib/polling";
 import { retainFundingRows } from "../lib/hynix-funding-analysis";
 import type { SettledFundingRow } from "../lib/hynix-funding-history";
 import { validateFundingSnapshot } from "../modules/oil/binance-funding-history.mjs";
@@ -18,8 +18,9 @@ export function useOilFunding() {
   useEffect(() => {
     const polling = startActivityPolling({
       intervalMs: OIL_FUNDING_REFRESH_MS,
+      timeoutMs: HISTORY_TIMEOUT_MS,
       async load(signal) {
-        const response = await fetch("/api/monitors/oil/funding", { cache: "no-store", signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]) });
+        const response = await fetch("/api/monitors/oil/funding", { cache: "no-store", signal });
         if (!response.ok) throw new Error("历史资金费暂不可用，请稍后刷新。价差行情继续更新。");
         const input = await response.json() as { status?: string };
         const snapshot = validateFundingSnapshot(input);

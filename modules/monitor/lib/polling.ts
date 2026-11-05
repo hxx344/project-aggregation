@@ -2,6 +2,8 @@ import { backgroundReadDelay, readActivity } from './read-activity.ts';
 
 export const QUOTE_REFRESH_MS = 10_000;
 export const HISTORY_REFRESH_MS = 60_000;
+// Full-history payloads are hundreds of KB and share the browser's per-host connections with SSE streams and quote polls; 15 s is too tight on slow links.
+export const HISTORY_TIMEOUT_MS = 30_000;
 
 interface PollingOptions<T> {
   load: (signal: AbortSignal) => Promise<T>;
