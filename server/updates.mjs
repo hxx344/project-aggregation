@@ -90,6 +90,7 @@ export function publicUpdateState(value) {
   if (value.planScopes !== undefined && value.planScopes !== null && (!object(value.planScopes)
     || Object.keys(value.planScopes).some(mode => !DEPLOYMENT_MODES.has(mode)) || Object.values(value.planScopes).some(scope => !SCOPES.has(scope)))) invalid();
   if (value.planPrepare !== undefined && value.planPrepare !== null && typeof value.planPrepare !== 'boolean') invalid();
+  if (value.manualCheckAt !== undefined && !nullable(value.manualCheckAt, timestamp)) invalid();
   if (value.prepared !== undefined && value.prepared !== null && (!object(value.prepared) || value.prepared.planId !== value.planId
     || typeof value.prepared.planId !== 'string' || !DEPLOYMENT_MODES.has(value.prepared.deployMode))) invalid();
   const modules = value.modules.map(row => {
@@ -133,6 +134,8 @@ export function publicUpdateState(value) {
     // Only an updater that knows the prepare phase reports these; without them every full update is single-phase.
     ...(value.planPrepare === undefined ? {} : { planPrepare: value.planPrepare }),
     ...(value.prepared === undefined ? {} : { prepared: value.prepared === null ? null : { planId: value.prepared.planId, deployMode: value.prepared.deployMode } }),
+    // Earliest time the updater accepts a manual check; older updaters omit it.
+    ...(value.manualCheckAt === undefined ? {} : { manualCheckAt: value.manualCheckAt }),
     ...(value.githubToken === undefined ? {} : { githubToken: { configured: value.githubToken.configured } }),
     ...(value.moduleMaintenance === undefined ? {} : { moduleMaintenance: value.moduleMaintenance.map(row => ({ id: row.id, confirmed: row.confirmed })) }) };
 }
