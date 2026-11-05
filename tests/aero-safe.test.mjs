@@ -510,63 +510,98 @@ test('workbench Aero Safe API requires login, same origin and CSRF, and accepts 
   } finally { await app?.close(); rmSync(directory, { recursive: true }); }
 });
 
-test('adding a pool: plan builds a Safe batch, apply merges it only after the chain shows it active', async () => {
+test('pending changes: several pools and an allowance change share one frozen Safe batch, applied only once the chain shows it', async () => {
   const directory = fixtureDir();
-  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const WETH = getAddress('0x4200000000000000000000000000000000000006'), CBBTC = getAddress('0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf');
   const POOL = new Wallet('0x' + '99'.repeat(32)).address, GAUGE = new Wallet('0x' + 'aa'.repeat(32)).address;
-  const info = { address: POOL, gauge: GAUGE, tickSpacing: 100, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: USDC, symbol: 'USDC', decimals: 6 } };
+  const POOL2 = new Wallet('0x' + '9a'.repeat(32)).address, GAUGE2 = new Wallet('0x' + 'ab'.repeat(32)).address;
+  const POOL3 = new Wallet('0x' + '9b'.repeat(32)).address, GAUGE3 = new Wallet('0x' + 'ac'.repeat(32)).address;
+  const weth = { address: WETH, symbol: 'WETH', decimals: 18 }, usdc = { address: USDC, symbol: 'USDC', decimals: 6 }, cbbtc = { address: CBBTC, symbol: 'cbBTC', decimals: 8 };
+  const infos = { [POOL]: { address: POOL, gauge: GAUGE, tickSpacing: 100, token0: weth, token1: usdc },
+    [POOL2]: { address: POOL2, gauge: GAUGE2, tickSpacing: 1, token0: weth, token1: cbbtc },
+    [POOL3]: { address: POOL3, gauge: GAUGE3, tickSpacing: 1, token0: usdc, token1: cbbtc } };
   let active = false;
   const probes = [];
-  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => { assert.equal(address, POOL); return info; },
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => infos[address],
     verifyActive: async (args) => { probes.push(args); return { ok: active, checks: [{ label: 'NPM.mint WETH/USDC ts100', ok: active, status: active ? 'ModuleTransactionFailed' : 'OrViolation' }] }; } };
   const { manager } = managerWith(directory, { chain });
   try {
     await manager.initialize();
-    await assert.rejects(manager.planPool({ pool: POOL }), (error) => error.status === 409 && /Safe 配置/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL }), (error) => error.status === 409 && /Safe 配置/.test(error.message));
     await manager.save(baseConfig);
-    await assert.rejects(manager.planPool({ pool: POOL }), (error) => error.status === 400 && /WETH 的每日额度/.test(error.message));
-    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [USDC]: '5' } }), (error) => error.status === 400 && /不需要新额度/.test(error.message));
-    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '0.0000000000000000001' } }), (error) => error.status === 400);
-    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' }, extra: 1 }), (error) => error.status === 400);
+    await until(() => manager.state().chain);
+    await assert.rejects(manager.addPoolChange({ pool: POOL }), (error) => error.status === 400 && /WETH 的每日额度/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1', [CBBTC]: '1' } }), (error) => error.status === 400 && /不属于这个池子/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '0.0000000000000000001' } }), (error) => error.status === 400);
+    await assert.rejects(manager.buildChangeBatch(), (error) => error.status === 409 && /没有待变更/.test(error.message));
 
-    const plan = await manager.planPool({ pool: POOL, allowances: { [WETH]: '2.5' } });
-    assert.equal(plan.pool.name, 'WETH/USDC ts100');
-    assert.deepEqual(plan.pool.allowances, [{ token: WETH, symbol: 'WETH', perDay: '2500000000000000000', decimals: 18 }]);
-    assert.equal(plan.builder.transactions.length, plan.transactions.length);
-    assert.ok(plan.builder.transactions.every((t) => t.to === ROLES));
-    assert.equal(plan.builder.meta.createdFromSafeAddress, SAFE);
-    assert.equal(plan.state.poolPlan.pool.address, POOL);
-    assert.equal(plan.state.config.permissions.pools.length, 1); // the config is untouched until apply
-    const saved = JSON.parse(readFileSync(join(directory, 'aero-safe/pool-plan.json'), 'utf8'));
-    // Both directions are added for the new pair; the existing USDC allowance is reused, not reset.
-    assert.deepEqual(saved.permissions.swaps.slice(-2), [{ tokenIn: WETH, tokenOut: USDC, tickSpacing: 100 }, { tokenIn: USDC, tokenOut: WETH, tickSpacing: 100 }]);
-    assert.equal(saved.permissions.allowances.length, permissionsConfig.allowances.length + 1);
+    // Two pools wait in parallel: the second one reuses the WETH allowance queued by the first and only needs cbBTC.
+    let state = await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '2.5' } });
+    assert.deepEqual(state.changes.pools.map((p) => p.name), ['WETH/USDC ts100']);
+    assert.deepEqual(state.changes.allowances, [{ token: WETH, symbol: 'WETH', decimals: 18, perDay: '2500000000000000000', current: null }]);
+    await assert.rejects(manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '2.5' } }), (error) => error.status === 409 && /已在待加池/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL2 }), (error) => error.status === 400 && /cbBTC 的每日额度/.test(error.message));
+    state = await manager.addPoolChange({ pool: POOL2, allowances: { [CBBTC]: '0.01' } });
+    assert.equal(state.changes.pools.length, 2);
+    assert.equal(state.config.permissions.pools.length, 1); // the config is untouched until apply
+    // Adjusting an existing allowance; setting it back to the configured value withdraws the change.
+    await assert.rejects(manager.setAllowanceChanges({ [OTHER]: '1' }), (error) => error.status === 400 && /不在白名单额度/.test(error.message));
+    await assert.rejects(manager.setAllowanceChanges({ [WETH]: null }), (error) => error.status === 400 && /移出对应的待加池/.test(error.message));
+    await assert.rejects(manager.setAllowanceChanges({ [USDC]: '0' }), (error) => error.status === 400);
+    state = await manager.setAllowanceChanges({ [USDC]: '1000' });
+    assert.equal(state.changes.allowances.length, 2);
+    state = await manager.setAllowanceChanges({ [USDC]: '500.5' });
+    assert.deepEqual(state.changes.allowances.find((a) => a.token === USDC), { token: USDC, symbol: 'USDC', decimals: 6, perDay: '500500000', current: '1000000000' });
+    assert.ok(state.changes.preview.transactions > 0 && !state.changes.preview.error);
 
-    await assert.rejects(manager.applyPool(), (error) => error.status === 409 && /私钥/.test(error.message));
+    const batch = await manager.buildChangeBatch();
+    assert.equal(batch.builder.transactions.length, batch.transactions.length);
+    assert.ok(batch.builder.transactions.every((t) => t.to === ROLES));
+    assert.equal(batch.builder.meta.createdFromSafeAddress, SAFE);
+    assert.ok(batch.transactions.some((t) => /调整额度 USDC/.test(t.description)));
+    assert.deepEqual(batch.state.changes.batch.pools, ['WETH/USDC ts100', 'WETH/cbBTC ts1']);
+    assert.equal(batch.state.changes.batch.behind, false);
+    const saved = JSON.parse(readFileSync(join(directory, 'aero-safe/changes.json'), 'utf8'));
+    // Both directions are added for each new pair; the USDC allowance is replaced, new tokens are appended.
+    assert.deepEqual(saved.batch.permissions.swaps.slice(-4), [{ tokenIn: WETH, tokenOut: USDC, tickSpacing: 100 }, { tokenIn: USDC, tokenOut: WETH, tickSpacing: 100 },
+      { tokenIn: WETH, tokenOut: CBBTC, tickSpacing: 1 }, { tokenIn: CBBTC, tokenOut: WETH, tickSpacing: 1 }]);
+    assert.deepEqual(saved.batch.permissions.allowances.map((a) => [a.symbol, a.perDay]).filter(([s]) => ['USDC', 'WETH', 'cbBTC'].includes(s)),
+      [['USDC', '500500000'], ['WETH', '2500000000000000000'], ['cbBTC', '1000000']]);
+
+    // A third pool queued after the batch is not part of it and stays pending after apply.
+    state = await manager.addPoolChange({ pool: POOL3 });
+    assert.equal(state.changes.batch.behind, true);
+
+    await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /私钥/.test(error.message));
     await manager.setKey(KEY);
-    await assert.rejects(manager.applyPool(), (error) => error.status === 409 && /尚未在链上生效.*OrViolation/.test(error.message));
+    await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /尚未在链上生效.*OrViolation/.test(error.message));
     assert.equal(manager.state().config.permissions.pools.length, 1);
     assert.equal(probes.at(-1).bot, BOT.address);
-    assert.equal(probes.at(-1).next.pools.length, 2);
+    assert.equal(probes.at(-1).next.pools.length, 3); // the frozen batch: config + the first two pools
 
-    // The plan survives a restart.
+    // The pending changes and the frozen batch survive a restart.
     await manager.close();
     const restarted = managerWith(directory, { chain }).manager;
     await restarted.initialize();
-    assert.equal(restarted.state().poolPlan.pool.name, 'WETH/USDC ts100');
+    assert.equal(restarted.state().changes.pools.length, 3);
     active = true;
-    const state = await restarted.applyPool();
-    assert.equal(state.poolPlan, null);
-    assert.equal(state.config.permissions.pools.at(-1).gauge, GAUGE);
-    assert.equal(existsSync(join(directory, 'aero-safe/pool-plan.json')), false);
-    assert.equal(JSON.parse(readFileSync(join(directory, 'aero-safe/config.json'), 'utf8')).permissions.pools.length, 2);
-    await assert.rejects(restarted.applyPool(), (error) => error.status === 409 && /没有待启用/.test(error.message));
-    await assert.rejects(restarted.planPool({ pool: POOL }), (error) => error.status === 409 && /已在白名单/.test(error.message));
+    state = await restarted.applyChangeBatch();
+    assert.deepEqual(state.config.permissions.pools.map((p) => p.gauge).slice(1), [GAUGE, GAUGE2]);
+    assert.equal(state.config.permissions.allowances.find((a) => a.token === USDC).perDay, '500500000');
+    assert.deepEqual(state.changes.pools.map((p) => p.name), ['USDC/cbBTC ts1']);
+    assert.deepEqual(state.changes.allowances, []); // cbBTC is configured now, so the third pool needs no new allowance
+    assert.equal(state.changes.batch, null);
+    assert.equal(JSON.parse(readFileSync(join(directory, 'aero-safe/config.json'), 'utf8')).permissions.pools.length, 3);
+    await assert.rejects(restarted.applyChangeBatch(), (error) => error.status === 409 && /还没有生成/.test(error.message));
+    await assert.rejects(restarted.addPoolChange({ pool: POOL }), (error) => error.status === 409 && /已在白名单/.test(error.message));
+    state = await restarted.removePoolChange({ pool: POOL3 });
+    assert.equal(state.changes.pools.length, 0);
+    assert.equal(existsSync(join(directory, 'aero-safe/changes.json')), false);
     await restarted.close();
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test('an add-pool plan goes stale when the config changes and can be discarded', async () => {
+test('a batch goes stale when the config changes; removing a pool drops its new-token allowance; clear and failures', async () => {
   const directory = fixtureDir();
   const WETH = getAddress('0x4200000000000000000000000000000000000006');
   const POOL = new Wallet('0x' + '99'.repeat(32)).address;
@@ -577,21 +612,78 @@ test('an add-pool plan goes stale when the config changes and can be discarded',
     await manager.initialize();
     await manager.save(baseConfig);
     await manager.setKey(KEY);
-    await manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } });
-    await manager.save({ ...baseConfig, slippageBps: 80 }); // execution settings only: permissions unchanged, plan still valid
-    assert.equal(manager.state().poolPlan.stale, false);
+    let state = await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    state = await manager.removePoolChange({ pool: POOL });
+    assert.deepEqual([state.changes.pools.length, state.changes.allowances.length], [0, 0]);
+    await assert.rejects(manager.removePoolChange({ pool: POOL }), (error) => error.status === 404);
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.buildChangeBatch();
+    await manager.save({ ...baseConfig, slippageBps: 80 }); // execution settings only: permissions unchanged, batch still valid
+    assert.equal(manager.state().changes.batch.stale, false);
     await manager.save({ ...baseConfig, permissions: { ...permissionsConfig, allowances: permissionsConfig.allowances.map((a, i) => (i === 0 ? { ...a, perDay: '7' } : a)) } });
-    assert.equal(manager.state().poolPlan.stale, true);
-    await assert.rejects(manager.applyPool(), (error) => error.status === 409 && /重新生成/.test(error.message));
-    const state = await manager.discardPoolPlan();
-    assert.equal(state.poolPlan, null);
-    assert.equal(existsSync(join(directory, 'aero-safe/pool-plan.json')), false);
+    assert.equal(manager.state().changes.batch.stale, true);
+    await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /重新生成/.test(error.message));
+    state = await manager.clearChanges();
+    assert.equal(state.changes.batch, null);
+    assert.equal(existsSync(join(directory, 'aero-safe/changes.json')), false);
     chain.inspectPool = async () => { throw new executor.ExecError('这个池子没有 gauge（没有排放），不能加入白名单'); };
-    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 400 && /没有 gauge/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 400 && /没有 gauge/.test(error.message));
     chain.inspectPool = async () => ({ address: POOL, gauge: ROLES, tickSpacing: 1, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: USDC, symbol: 'USDC', decimals: 6 } });
-    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 400 && /Safe 或 Roles/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 400 && /Safe 或 Roles/.test(error.message));
     chain.inspectPool = async () => { throw new executor.ExecError('读取 池子 factory 失败：timeout', { code: 'rpc' }); };
-    await assert.rejects(manager.planPool({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 502 && /timeout/.test(error.message));
+    await assert.rejects(manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } }), (error) => error.status === 502 && /timeout/.test(error.message));
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('a saved single add-pool plan from the previous version becomes pending changes with its batch', async () => {
+  const directory = fixtureDir();
+  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const POOL = new Wallet('0x' + '99'.repeat(32)).address, GAUGE = new Wallet('0x' + 'aa'.repeat(32)).address;
+  const pool = { address: POOL, name: 'WETH/USDC ts100', gauge: GAUGE, tickSpacing: 100, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: USDC, symbol: 'USDC', decimals: 6 },
+    allowances: [{ token: WETH, symbol: 'WETH', perDay: '1000000000000000000', decimals: 18 }], transactions: 9 };
+  const next = { ...permissionsConfig, pools: [...permissionsConfig.pools, { name: pool.name, token0: WETH, token1: USDC, tickSpacing: 100, gauge: GAUGE }],
+    swaps: [...permissionsConfig.swaps, { tokenIn: WETH, tokenOut: USDC, tickSpacing: 100 }, { tokenIn: USDC, tokenOut: WETH, tickSpacing: 100 }],
+    allowances: [...permissionsConfig.allowances, { token: WETH, symbol: 'WETH', perDay: '1000000000000000000' }] };
+  mkdirSync(join(directory, 'aero-safe'), { recursive: true });
+  writeFileSync(join(directory, 'aero-safe/config.json'), JSON.stringify({ schema: 1, ...baseConfig, slippageBps: 50, autoSellRewards: true, minRewardSell: '1' }));
+  writeFileSync(join(directory, 'aero-safe/pool-plan.json'), JSON.stringify({ schema: 1, createdAt: 1, pool, baseline: JSON.stringify(permissionsConfig), permissions: next }));
+  const { manager } = managerWith(directory);
+  try {
+    await manager.initialize();
+    const { changes } = manager.state();
+    assert.deepEqual(changes.pools.map((p) => p.name), ['WETH/USDC ts100']);
+    assert.equal(changes.allowances[0].perDay, '1000000000000000000');
+    assert.deepEqual([changes.batch.transactions, changes.batch.stale, changes.batch.behind], [9, false, false]);
+    assert.equal(existsSync(join(directory, 'aero-safe/pool-plan.json')), false);
+    assert.equal(existsSync(join(directory, 'aero-safe/changes.json')), true);
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('the open USD cap only shrinks the share-based amounts, proportionally, and reaches the executor unchanged', async () => {
+  const WETH = getAddress('0x4200000000000000000000000000000000000006');
+  const ctx = { tokens: new Map([[WETH, { decimals: 18 }], [USDC, { decimals: 6 }]]) }, pool = { token0: WETH, token1: USDC };
+  const e18 = 10n ** 18n, e6 = 10n ** 6n;
+  // 2 WETH at $3000 + 4000 USDC = $10,000; a $5,000 cap halves both.
+  assert.deepEqual(executor.capAmounts(ctx, pool, 2n * e18, 4000n * e6, { usd: 5000, usd0: 3000, usd1: 1 }), { amount0: e18, amount1: 2000n * e6, capped: true });
+  assert.deepEqual(executor.capAmounts(ctx, pool, 2n * e18, 4000n * e6, { usd: 20000, usd0: 3000, usd1: 1 }), { amount0: 2n * e18, amount1: 4000n * e6, capped: false });
+  assert.deepEqual(executor.capAmounts(ctx, pool, 5n, 6n, null), { amount0: 5n, amount1: 6n, capped: false });
+  assert.throws(() => executor.capAmounts({ tokens: new Map() }, pool, 1n, 1n, { usd: 1, usd0: 1, usd1: 1 }), /精度未知/);
+
+  const directory = fixtureDir();
+  const seen = [];
+  const chain = { ...fakeChain({ openPosition: async (_ctx, _hooks, params) => { seen.push(['open', params.cap]); return {}; } }), previewOpen: async (_ctx, params) => { seen.push(['preview', params.cap]); return { amount0: 1n, amount1: 0n }; } };
+  const { manager } = managerWith(directory, { chain });
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    const cap = { usd: 500, usd0: 3000, usd1: 1 };
+    for (const bad of [{ usd: 0, usd0: 1, usd1: 1 }, { usd: 5, usd0: 1 }, { usd: 5, usd0: 1, usd1: 1, extra: 1 }, 'x']) {
+      await assert.rejects(manager.preview({ pool: OTHER, tickLower: -100, tickUpper: 100, cap: bad }), (error) => error.status === 400 && /投入上限/.test(error.message));
+    }
+    const preview = await manager.preview({ pool: OTHER, tickLower: -100, tickUpper: 100, cap });
+    await manager.preview({ pool: OTHER, tickLower: -100, tickUpper: 100 });
+    await manager.execute('open', { pool: OTHER, tickLower: -100, tickUpper: 100, cap, expect: { previewedAt: preview.previewedAt, amount0: '1', amount1: '0' } });
+    await until(() => manager.state().job?.status === 'done');
+    assert.deepEqual(seen, [['preview', cap], ['preview', null], ['open', cap]]);
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 

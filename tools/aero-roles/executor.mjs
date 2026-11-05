@@ -236,19 +236,19 @@ async function rolesProbe(rpc, { roles, bot, roleKeyBytes }, transaction) {
   throw new ExecError(`模拟调用失败：${errorText(last)}`);
 }
 
-// 加池批次执行后的生效核对：current / next 为 buildPermissions 的结果。对新增的池子、兑换路径与代币授权逐项以 bot 身份模拟，
-// Roles 放行才算生效（金额一律为 0，不会动资产）；新代币的额度直接读 Roles.allowances，须与计划完全一致。
+// 加池、调额度批次执行后的生效核对：current / next 为 buildPermissions 的结果。对新增的池子、兑换路径与代币授权逐项以 bot 身份模拟，
+// Roles 放行才算生效（金额一律为 0，不会动资产）；新增或数量变化的额度直接读 Roles.allowances，须与计划完全一致。
 // 返回 { ok, checks: [{ label, ok, status }] }。
 export async function verifyActive({ rpc, safe, roles, bot, current, next, now = Date.now }) {
   safe = getAddress(safe); roles = getAddress(roles); bot = getAddress(bot);
   const probe = { roles, bot, roleKeyBytes: next.roleKeyBytes };
   const known = (list, keyOf) => new Set(list.map(keyOf));
   const poolKey = (p) => p.gauge, swapKey = (s) => `${s.tokenIn}/${s.tokenOut}/${s.tickSpacing}`;
-  const oldPools = known(current.pools, poolKey), oldSwaps = known(current.swaps, swapKey), oldKeys = known(current.allowances, (a) => a.key);
+  const oldPools = known(current.pools, poolKey), oldSwaps = known(current.swaps, swapKey), oldAllowances = new Map(current.allowances.map((a) => [a.key, a.perDay]));
   const pools = next.pools.filter((p) => !oldPools.has(poolKey(p))), swaps = next.swaps.filter((s) => !oldSwaps.has(swapKey(s)));
   const end = BigInt(Math.floor(now() / 1000) + 3600);
   // NFT 授权的条件含"头寸归 Safe 所有"：用链上第一个已存在的 tokenId 模拟，gauge 参数通过而归属不符时 Roles 报 CustomConditionViolation。
-  const [sample] = await read('NPM tokenByIndex', () => call(rpc, NPM_INDEX_I, AERO.nft, 'tokenByIndex', [0n]));
+  const [sample] = pools.length ? await read('NPM tokenByIndex', () => call(rpc, NPM_INDEX_I, AERO.nft, 'tokenByIndex', [0n])) : [0n];
   const symbolOf = (token) => next.allowances.find((a) => a.token === token)?.symbol ?? token.slice(0, 8);
   const cases = [];
   const spenders = new Map();
@@ -276,7 +276,7 @@ export async function verifyActive({ rpc, safe, roles, bot, current, next, now =
     const status = await rolesProbe(rpc, probe, item.tx);
     checks.push({ label: item.label, status, ok: status === 'Ok' || status === 'ModuleTransactionFailed' || (item.accept ?? []).includes(status) });
   }
-  for (const a of next.allowances.filter((x) => !oldKeys.has(x.key))) {
+  for (const a of next.allowances.filter((x) => oldAllowances.get(x.key) !== x.perDay)) {
     const r = await read(`额度 ${a.symbol}`, () => call(rpc, ROLES_VIEW_I, roles, 'allowances', [a.key]));
     const ok = r.refill === a.perDay && r.maxRefill === a.perDay && r.period === BigInt(next.allowancePeriod);
     checks.push({ label: `额度 ${a.symbol}`, status: ok ? 'Ok' : `链上为每 ${r.period} 秒补 ${r.refill}、上限 ${r.maxRefill}`, ok });
@@ -518,16 +518,28 @@ function checkRange(pool, tickLower, tickUpper) {
   if (tickLower < -887272 || tickUpper > 887272) throw new ExecError('区间超出 tick 范围');
 }
 
+// cap（{ usd, usd0, usd1 }）给出时，按比例取出的数量按两币美元价估值，超过 usd 则两币等比缩小到上限内。
+export function capAmounts(ctx, pool, amount0, amount1, cap) {
+  if (!cap) return { amount0, amount1, capped: false };
+  const decimals = (token) => { const d = ctx.tokens.get(token)?.decimals; if (d == null) throw new ExecError('代币精度未知，无法按美元上限计算'); return d; };
+  const value = (Number(amount0) / 10 ** decimals(pool.token0)) * cap.usd0 + (Number(amount1) / 10 ** decimals(pool.token1)) * cap.usd1;
+  if (!(value > cap.usd)) return { amount0, amount1, capped: false };
+  const scale = BigInt(Math.floor((cap.usd / value) * 1e9));
+  return { amount0: (amount0 * scale) / 1_000_000_000n, amount1: (amount1 * scale) / 1_000_000_000n, capped: true };
+}
+
 // 开仓前预览：按比例取 Safe 余额，算出配平兑换并报价，不签名。
 // amounts（原始单位）给出时按它投入（不超过 Safe 余额），不再按 shareBps 取比例：自动调仓只投入本次平仓收回的币，不动 Safe 里的其他余额。
-export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts = null }) {
+export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts = null, cap = null }) {
   const pool = poolOf(ctx, poolAddress);
   checkRange(pool, tickLower, tickUpper);
   const [slot0, [feePips], b0, b1] = await read('池子与余额', () => Promise.all([
     call(ctx.rpc, POOL_I, pool.address, 'slot0'), call(ctx.rpc, POOL_I, pool.address, 'fee'), balanceOf(ctx, pool.token0), balanceOf(ctx, pool.token1),
   ]));
   const capped = (want, held) => (want > held ? held : want < 0n ? 0n : want);
-  const amount0 = amounts ? capped(amounts.amount0, b0) : (b0 * BigInt(shareBps)) / 10_000n, amount1 = amounts ? capped(amounts.amount1, b1) : (b1 * BigInt(shareBps)) / 10_000n;
+  const shared = amounts ? { amount0: capped(amounts.amount0, b0), amount1: capped(amounts.amount1, b1), capped: false }
+    : capAmounts(ctx, pool, (b0 * BigInt(shareBps)) / 10_000n, (b1 * BigInt(shareBps)) / 10_000n, cap);
+  const { amount0, amount1 } = shared;
   const plan = rebalance ? balanceSwap({ sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, feePips }) : null;
   let swapPlan = null;
   if (plan) {
@@ -538,7 +550,7 @@ export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper
   }
   const after0 = swapPlan ? (plan.zeroForOne ? amount0 - plan.amountIn : amount0 + (swapPlan.quoted ?? 0n)) : amount0;
   const after1 = swapPlan ? (plan.zeroForOne ? amount1 + (swapPlan.quoted ?? 0n) : amount1 - plan.amountIn) : amount1;
-  return { pool: pool.address, tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, swap: swapPlan, deposit0: after0, deposit1: after1 };
+  return { pool: pool.address, tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, capped: shared.capped, swap: swapPlan, deposit0: after0, deposit1: after1 };
 }
 
 // 用户确认的是预览数字：执行时重算的投入量偏离超过 1%、或配平兑换超出预览 10% 时不执行。
@@ -554,9 +566,9 @@ export function checkExpectation(preview, expect) {
 
 // 开仓：配平兑换（可选）→ 授权 NPM → 以 Safe 身份报价后 mint（最小量 = 报价 × (1 − 滑点)）→ NPM.approve + gauge.deposit 一批质押。
 // 中途失败时已完成的步骤保留在链上（例如已兑换未开仓），页面按 Safe 现状显示，可再次开仓或手动处理。
-export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, slippageBps, stake = true, expect = null, amounts = null }) {
+export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, slippageBps, stake = true, expect = null, amounts = null, cap = null }) {
   const pool = poolOf(ctx, poolAddress);
-  const preview = await previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts });
+  const preview = await previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts, cap });
   if (preview.amount0 === 0n && preview.amount1 === 0n) throw new ExecError('可投入的数量为 0，未发送');
   if (expect) checkExpectation(preview, expect);
   let amount0 = preview.amount0, amount1 = preview.amount1;

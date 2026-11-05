@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // 加池分叉演练：本机 anvil（只监听 127.0.0.1）分叉 Base，建 1/1 Safe 与只含 WETH/USDC ts100 的 Roles，
-// 用工作台服务端（server/automation/aero-safe.mjs，真实执行器）给 WETH/cbBTC ts1 生成加池批次：
+// 用工作台服务端（server/automation/aero-safe.mjs，真实执行器）把 WETH/cbBTC ts1 加入待加池、顺带调 USDC 每日额度，合成一份 Safe 批次：
 // 拒绝没有 gauge 的池子与非池子地址；批次未执行或只执行一部分时核对不通过、配置不变；Safe 执行完整批次后核对通过并入配置，
-// 再在新池开仓（经新兑换路径配平）、质押到新 gauge、平仓。
+// 按美元上限预览，再在新池开仓（经新兑换路径配平）、质押到新 gauge、平仓。
 // 用法：node tools/aero-roles/fork-add-pool.mjs [--fork-url https://mainnet.base.org] [--fork-block <n>]；需要 anvil 在 PATH（或 ANVIL_BIN）。
 import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -89,23 +89,28 @@ async function run(rpc) {
     await manager.setKey(bot.privateKey);
     await settle('读取');
 
-    await rejects('拒绝没有 gauge 的池子（WETH/cbBTC ts50）', () => manager.planPool({ pool: noGaugePool, allowances: { [CBBTC]: '1' } }), /没有 gauge/);
-    await rejects('拒绝不是池子的地址（USDC 合约）', () => manager.planPool({ pool: USDC, allowances: {} }), /失败|不是/);
-    await rejects('新代币必须填写每日额度', () => manager.planPool({ pool: newPool }), /cbBTC 的每日额度/);
-    const plan = await manager.planPool({ pool: newPool, allowances: { [CBBTC]: '0.5' } });
+    await rejects('拒绝没有 gauge 的池子（WETH/cbBTC ts50）', () => manager.addPoolChange({ pool: noGaugePool, allowances: { [CBBTC]: '1' } }), /没有 gauge/);
+    await rejects('拒绝不是池子的地址（USDC 合约）', () => manager.addPoolChange({ pool: USDC, allowances: {} }), /失败|不是/);
+    await rejects('新代币必须填写每日额度', () => manager.addPoolChange({ pool: newPool }), /cbBTC 的每日额度/);
+    await manager.addPoolChange({ pool: newPool, allowances: { [CBBTC]: '0.5' } });
+    // 同一批次顺带把 USDC 每日额度从 100 万调到 5000。
+    await manager.setAllowanceChanges({ [USDC]: '5000' });
+    const plan = await manager.buildChangeBatch();
     console.log(plan.transactions.map((t, i) => `  ${String(i + 1).padStart(2)}. ${t.description}`).join('\n'));
     console.log(`  条件节点：${plan.usage.map((u) => `${u.label} ${u.nodes}`).join('，')}`);
-    check('生成加池批次', plan.builder.transactions.length > 0 && plan.pool.name === 'WETH/cbBTC ts1', `${plan.builder.transactions.length} 笔`);
+    const usdcAt = plan.transactions.findIndex((t) => t.description.startsWith('调整额度 USDC'));
+    check('生成白名单变更批次', plan.builder.transactions.length > 0 && plan.state.changes.batch.pools[0] === 'WETH/cbBTC ts1' && usdcAt >= 0, `${plan.builder.transactions.length} 笔`);
 
-    await rejects('批次未执行时核对不通过、配置不变', () => manager.applyPool(), /尚未在链上生效/);
-    // 只执行除最后一笔（cbBTC 额度）以外的部分：仍须拒绝。
+    await rejects('批次未执行时核对不通过、配置不变', () => manager.applyChangeBatch(), /尚未在链上生效/);
+    // 只执行除 USDC 调额度以外的部分：仍须拒绝。
     const builderTxs = plan.builder.transactions;
-    check('部分批次执行', (await execBatch(builderTxs.slice(0, -1))).status === 1);
-    await rejects('缺 cbBTC 额度时核对不通过', () => manager.applyPool(), /额度 cbBTC/);
+    check('部分批次执行', (await execBatch(builderTxs.filter((_, i) => i !== usdcAt))).status === 1);
+    await rejects('USDC 额度未调整时核对不通过', () => manager.applyChangeBatch(), /额度 USDC/);
     check('配置仍只有原池子', manager.state().config.permissions.pools.length === 1);
-    check('补执行剩余一笔', (await execBatch(builderTxs.slice(-1))).status === 1);
-    const applied = await manager.applyPool();
-    check('核对通过并入配置', applied.config.permissions.pools.length === 2 && applied.poolPlan === null);
+    check('补执行剩余一笔', (await execBatch([builderTxs[usdcAt]])).status === 1);
+    const applied = await manager.applyChangeBatch();
+    check('核对通过并入配置', applied.config.permissions.pools.length === 2 && applied.changes.batch === null && applied.changes.pools.length === 0
+      && applied.config.permissions.allowances.find((x) => x.token === USDC).perDay === '5000000000');
     await settle('读取');
     const chainPool = manager.state().chain?.pools.find((p) => p.address === getAddress(newPool));
     check('刷新后读到新池', Boolean(chainPool), manager.state().chainError ?? '');
@@ -118,6 +123,8 @@ async function run(rpc) {
     const range = [Number(tick) - 40, Number(tick) + 40];
     const preview = await manager.preview({ pool: newPool, tickLower: range[0], tickUpper: range[1], shareBps: 10_000 });
     check('预览需要配平兑换 WETH → cbBTC', preview.swap?.tokenIn === WETH, JSON.stringify(preview.swap));
+    const capped = await manager.preview({ pool: newPool, tickLower: range[0], tickUpper: range[1], shareBps: 10_000, cap: { usd: 100, usd0: 2000, usd1: 1 } });
+    check('投入上限 $100（WETH 按 $2000 计）只投 0.05 WETH', capped.capped === true && BigInt(capped.amount0) === parseEther('0.05'), `${capped.amount0}`);
     await manager.execute('open', { pool: newPool, tickLower: range[0], tickUpper: range[1], shareBps: 10_000, expect: { previewedAt: preview.previewedAt, amount0: String(preview.amount0), amount1: String(preview.amount1), swapIn: preview.swap ? String(preview.swap.amountIn) : null, swapTokenIn: preview.swap?.tokenIn ?? null } });
     let s = await settle('开仓');
     check('新池开仓并质押', s.job.status === 'done', s.job.error ?? `#${s.job.result?.tokenId}`);
