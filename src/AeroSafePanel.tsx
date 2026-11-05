@@ -51,10 +51,10 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
     const lines = [`在 ${pool.token0.symbol}/${pool.token1.symbol} CL${pool.tickSpacing} 开仓：tick ${range[0]} 至 ${range[1]}`,
       `投入 Safe 余额的 ${shareBps / 100}%：${amount(p.amount0, t0)} + ${amount(p.amount1, t1)}`,
       p.swap ? `先配平兑换 ${amount(p.swap.amountIn, tokenOf(state?.chain, p.swap.tokenIn))}` : '不兑换',
-      `兑换与开仓的最小成交量按报价扣 ${slippage}% 滑点；执行时余额偏离预览超过 1% 会停止。`,
+      `兑换与开仓的最小成交量按报价扣 ${slippage}% 滑点；执行时余额偏离预览超过 1%、配平兑换超出预览 10% 或方向改变都会停止。`,
       '开仓后自动质押到 gauge；提前解押会被罚没部分奖励。'];
     if (state?.pending?.stale) lines.push(`上一笔交易（${state.pending.label}）超过 10 分钟未上链，本次会用同一 nonce 提价替换它。`);
-    const expect = { previewedAt: p.previewedAt, amount0: p.amount0, amount1: p.amount1, swapIn: p.swap?.amountIn ?? null };
+    const expect = { previewedAt: p.previewedAt, amount0: p.amount0, amount1: p.amount1, swapIn: p.swap?.amountIn ?? null, swapTokenIn: p.swap?.tokenIn ?? null };
     if (window.confirm(`${lines.join('\n')}\n\n确认由 bot 经 Roles 发送？`)) void execute('open', { pool: pool.address, tickLower: range[0], tickUpper: range[1], shareBps, rebalance, expect });
   };
 

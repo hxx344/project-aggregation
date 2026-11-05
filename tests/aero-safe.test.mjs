@@ -144,6 +144,29 @@ test('opening stops when the balances or the rebalance swap moved away from the 
   assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 800n }), /配平兑换量超出预览/);
   assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 0n }), /配平兑换量超出预览/);
   assert.doesNotThrow(() => executor.checkExpectation({ ...preview, swap: null }, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n }));
+  // The price moved enough to flip the rebalance: amounts of different tokens are not comparable.
+  const flipped = { ...preview, swap: { tokenIn: OTHER, amountIn: 900n } };
+  assert.throws(() => executor.checkExpectation(flipped, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: USDC }), /方向已改变/);
+  assert.doesNotThrow(() => executor.checkExpectation(flipped, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n, swapTokenIn: OTHER }));
+});
+
+test('openPosition checks the confirmed preview before anything is estimated or signed', async () => {
+  const POOL = new Wallet('0x' + '99'.repeat(32)).address;
+  const balances = { [USDC]: 10_000n, [OTHER]: 5_000n };
+  const rpc = fakeRpc();
+  rpc.call = async ({ to, data }) => {
+    const selector = data.slice(0, 10);
+    if (to === POOL && selector === executor.POOL_I.getFunction('slot0').selector) return executor.POOL_I.encodeFunctionResult('slot0', [2n ** 96n, 0, 0, 0, 0, true]);
+    if (to === POOL && selector === executor.POOL_I.getFunction('fee').selector) return executor.POOL_I.encodeFunctionResult('fee', [500]);
+    if (selector === executor.ERC20_I.getFunction('balanceOf').selector) return executor.ERC20_I.encodeFunctionResult('balanceOf', [balances[getAddress(to)]]);
+    throw new Error(`unexpected call ${to} ${selector}`);
+  };
+  const ctx = { ...ctxWith(rpc), pools: [{ name: 'USDC/OTHER', address: POOL, token0: USDC, token1: OTHER, tickSpacing: 10 }] };
+  const { seen, hooks } = hookSet();
+  const params = { pool: POOL, tickLower: -100, tickUpper: 100, shareBps: 10_000, rebalance: false, slippageBps: 50 };
+  balances[USDC] = 12_000n; // someone moved funds into the Safe after the preview
+  await assert.rejects(executor.openPosition(ctx, hooks, { ...params, expect: { amount0: 10_000n, amount1: 5_000n, swapIn: 0n, swapTokenIn: null } }), /余额自预览后变化/);
+  assert.deepEqual(rpc.calls, []); assert.equal(seen.persisted.length, 0);
 });
 
 test('configuration accepts only the page fields with their ranges', () => {
@@ -288,9 +311,11 @@ test('opening needs a fresh server-issued preview and passes the confirmed amoun
     clock += PREVIEW_TTL_MS + 1;
     await assert.rejects(manager.execute('open', { ...open, expect }), (error) => error.status === 409 && /重新预览/.test(error.message));
     await assert.rejects(manager.execute('open', { ...open, expect: { ...expect, previewedAt: clock, amount0: '-1' } }), (error) => error.status === 400);
+    // A previewed swap must name the token it sells.
+    await assert.rejects(manager.execute('open', { ...open, expect: { ...expect, previewedAt: clock, swapIn: '5' } }), (error) => error.status === 400);
     await manager.execute('open', { ...open, expect: { ...expect, previewedAt: clock - 1_000 } });
     await until(() => manager.state().job?.status === 'done');
-    assert.deepEqual(chain.calls, [['open', { amount0: 1n, amount1: 0n, swapIn: 0n }]]);
+    assert.deepEqual(chain.calls, [['open', { amount0: 1n, amount1: 0n, swapIn: 0n, swapTokenIn: null }]]);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
@@ -317,6 +342,57 @@ test('a failed ledger write keeps the pending record, and a later failure after 
     const settled = await until(() => manager.state().pending === null && manager.state());
     assert.deepEqual(settled.ledger.map((e) => [e.label, e.status]), [['领取排放', 'confirmed']]);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a ledger failure while recording a mined original keeps the replacement pending and says why', async () => {
+  const directory = fixtureDir();
+  let clock = 9_000_000;
+  const original = '0x' + 'cd'.repeat(32), replacement = '0x' + 'ef'.repeat(32);
+  const chain = fakeChain({ resolvePending: async () => ({ state: 'dropped', replaced: { hash: original, label: '旧兑换' }, replacedReceipt: { status: 1, blockNumber: 7, gasUsed: 5n, fee: 2n } }) });
+  const first = managerWith(directory, { chain });
+  try { await first.manager.initialize(); await first.manager.save(baseConfig); await first.manager.setKey(KEY); } finally { await first.manager.close(); }
+  mkdirSync(join(directory, 'aero-safe/txs.jsonl'));
+  writeFileSync(join(directory, 'aero-safe/pending.json'), JSON.stringify({ hash: replacement, raw: '0x00', from: BOT.address, nonce: 4, label: '新兑换', at: 0, replaces: [{ hash: original, label: '旧兑换' }] }));
+  const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
+  try {
+    await manager.initialize();
+    const held = await until(() => manager.state().ledgerError && !manager.state().refreshing && manager.state());
+    assert.equal(held.pending?.hash, replacement); // not settled as dropped while the original's line is missing
+    await assert.rejects(manager.execute('claim', {}), (error) => error.status === 409 && /交易记录写入失败/.test(error.message));
+    rmSync(join(directory, 'aero-safe/txs.jsonl'), { recursive: true });
+    clock += 60_000;
+    manager.refresh();
+    const settled = await until(() => manager.state().pending === null && manager.state());
+    assert.equal(settled.ledgerError, null);
+    assert.deepEqual(settled.ledger.map((e) => [e.hash, e.status]), [[replacement, 'dropped'], [original, 'confirmed']]);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a refresh that resolves the old transaction does not settle its same-nonce replacement', async () => {
+  const directory = fixtureDir();
+  const clock = 20_000_000;
+  const old = '0x' + 'ab'.repeat(32);
+  let releaseRefresh, releaseSign, calls = 0;
+  const refreshGate = new Promise((resolve) => { releaseRefresh = resolve; });
+  const hang = new Promise((resolve) => { releaseSign = resolve; });
+  const chain = fakeChain({ hang, resolvePending: async () => {
+    calls++;
+    if (calls === 1) { await refreshGate; return { state: 'confirmed', receipt: { status: 1, blockNumber: 2, gasUsed: 1n, fee: 1n } }; }
+    return { state: 'waiting' };
+  } });
+  const first = managerWith(directory, { chain });
+  try { await first.manager.initialize(); await first.manager.save(baseConfig); await first.manager.setKey(KEY); } finally { await first.manager.close(); }
+  writeFileSync(join(directory, 'aero-safe/pending.json'), JSON.stringify({ hash: old, raw: '0x00', from: BOT.address, nonce: 0, label: '旧兑换', at: clock - PENDING_STALE_MS, maxFeePerGas: '1', maxPriorityFeePerGas: '1' }));
+  const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
+  try {
+    await manager.initialize(); // the startup refresh is now waiting on the old transaction
+    await until(() => calls === 1);
+    await manager.execute('swap', { tokenIn: USDC, tokenOut: OTHER, amount: '1' });
+    const replaced = await until(() => manager.state().pending?.label === '兑换' && manager.state());
+    releaseRefresh(); // the old one turns out to be mined
+    await until(() => manager.state().events.some((e) => e.event === 'tx_settled' && e.hash === old && e.status === 'confirmed'));
+    assert.equal(manager.state().pending?.hash, replaced.pending.hash); // the replacement record is kept
+  } finally { releaseRefresh(); releaseSign(); await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
 test('update stop check refuses only while a running job waits on a signed transaction', async () => {

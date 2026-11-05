@@ -102,10 +102,11 @@ export default function AeroSafePage({ onExpired }: { onExpired: () => void }) {
     {loadError ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>状态读取失败：{loadError}</span></div> : null}
     {!state || !draft ? <section className="panel lp-empty" role="status"><LoaderCircle className="spin" /><strong>正在读取状态</strong></section> : <>
       {state.configError ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{state.configError}</span></div> : null}
+      {state.ledgerError ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{state.ledgerError}</span></div> : null}
       {state.paused ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>{state.pauseReason}</span></div> : null}
-      {state.pending ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已签名待上链：{state.pending.label}（nonce {state.pending.nonce}，{time(state.pending.at)}）{state.pending.hash.startsWith('0x') ? <> · {txLink(state.pending.hash)}</> : null}{state.pending.stale ? '；已超过 10 分钟，下一次操作会用同一 nonce 提价替换它' : '；结清前不能发新操作'}</span></div> : null}
+      {state.pending ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已签名待上链：{state.pending.label}（nonce {state.pending.nonce}，{time(state.pending.at)}）{state.pending.hash.startsWith('0x') ? <> · {txLink(state.pending.hash)}</> : null}{state.ledgerError ? '' : state.pending.stale ? '；已超过 10 分钟，下一次操作会用同一 nonce 提价替换它' : '；结清前不能发新操作'}</span></div> : null}
       {job ? <div className={`lp-callout ${job.status === 'failed' ? 'warning' : job.status === 'done' ? 'success' : ''}`} role="status">{job.status === 'running' ? <LoaderCircle size={16} className="spin" /> : job.status === 'failed' ? <CircleAlert size={16} /> : <ShieldCheck size={16} />}
-        <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? '已完成' : `${job.error}${job.signed ? '（本任务已有交易上链，请按下方台账与 Safe 现状核对后再操作）' : '（未签名，可直接重试）'}`}</span></div> : null}
+        <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? '已完成' : `${job.error}${job.signed ? '（本任务已有交易签名发出，请按下方台账与 Safe 现状核对后再操作）' : '（未签名，可直接重试）'}`}</span></div> : null}
 
       <section className="panel lp-status" aria-label="Safe 状态">
         <dl className="lp-facts">

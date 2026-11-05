@@ -31,7 +31,7 @@ export type AeroSafeState = {
   schema: 1; configured: boolean; config: AeroSafeConfig | null; configError: string | null; defaults: { rpcUrl: string; slippageBps: number; autoSellRewards: boolean; minRewardSell: string };
   wallet: string | null; paused: boolean; pauseReason: string | null;
   pending: { hash: string; nonce: number; label: string; at: number; stale: boolean } | null;
-  job: AeroSafeJob | null; chain: AeroSafeChain | null; chainAt: number | null; chainError: string | null; refreshing: boolean;
+  ledgerError?: string | null; job: AeroSafeJob | null; chain: AeroSafeChain | null; chainAt: number | null; chainError: string | null; refreshing: boolean;
   events: AeroSafeEvent[]; ledger: AeroSafeLedger[]; serverNow: number;
 };
 export type AeroSafePreview = {

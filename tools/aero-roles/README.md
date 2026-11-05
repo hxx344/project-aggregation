@@ -53,6 +53,6 @@ PATH=$HOME/.foundry/bin:$PATH node tools/aero-roles/fork-test.mjs   # 需要 anv
 - 执行器的交易截止时间取链上最新区块时间与本机时间的较晚者 + 600 秒；兑换与 mint 的最小成交量 = 以 Safe 身份 `eth_call` 报价 × (1 − 滑点)。
 - 提前解押罚没期（`gaugeFactory.effectivePenaltyConfig`）内的解押/平仓须在页面确认接受罚没，否则不签名。
 - 兑换的最小成交量只来自同一 RPC 的报价，没有按池子现价设价格冲击上限：薄池大额兑换或 RPC 返回偏低报价时照单成交，损失上限是 Roles 每日额度。RPC 应使用自己信任的节点。
-- 开仓确认基于服务端预览（2 分钟内有效）：执行时 Safe 余额偏离预览超过 1%、或配平兑换量超出预览 10% 时不签名。
-- 同一 nonce 上最多追溯 16 笔替换交易；未质押头寸只读 Safe 最新的 40 个 NFT（任何人都能向 Safe 转入粉尘头寸），已质押头寸全部读取。
+- 开仓确认基于服务端预览（2 分钟内有效）：执行时 Safe 余额偏离预览超过 1%、或配平兑换量超出预览 10%、或配平方向改变时不签名。
+- 同一 nonce 上最多追溯 16 笔替换交易；未质押头寸只读 Safe NFT 索引最靠后的 40 个（任何人都能向 Safe 转入粉尘头寸），另外总是读取本系统开出的头寸（`aero-safe/minted.json`，最多 100 个）；已质押头寸全部读取。
 - `executor.mjs` 与它依赖的 `addresses`、`conditions`、`permissions`、`policy`、`roles-calls` 随工作台运行时打包（`deploy/package-release.py` 的 `AERO_ROLES_RUNTIME_FILES`）；`cli.mjs`、`fork-test.mjs` 与文档不进发布包。
