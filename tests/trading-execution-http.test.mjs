@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createDecipheriv, randomUUID } from 'node:crypto';
+import http from 'node:http';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -163,19 +164,18 @@ test('automatic rule routes require a session, same Origin and CSRF, and saving 
 });
 test('logout while an automatic rule body is still arriving saves nothing', async t => {
   const f = await fixture(t), session = await f.login();
-  const origin = `http://127.0.0.1:${f.app.server.address().port}`, encoder = new TextEncoder();
+  const origin = `http://127.0.0.1:${f.app.server.address().port}`;
   const body = JSON.stringify({ config: { name: '', market: 'oil', exchange: 'binance', direction: 'short', openThreshold: '4', closeThreshold: '2', equalSize: '1', orderType: 'chase',
     confirmSamples: 3, maxOpensPerDay: 3, batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300_000 }, enabled: true, confirmLive: true });
-  let controller;
-  const stream = new ReadableStream({ start(value) { controller = value; } });
-  const pending = fetch(`${origin}${PREFIX}/auto/rules`, { method: 'POST', duplex: 'half', body: stream,
-    headers: { Cookie: session.cookie, Origin: origin, 'X-CSRF-Token': session.csrf, 'Content-Type': 'application/json' } });
-  controller.enqueue(encoder.encode(body.slice(0, 12)));
+  // A dedicated socket written in two parts: fetch with a stream body can fail when it must replay the body.
+  const request = http.request(`${origin}${PREFIX}/auto/rules`, { method: 'POST', agent: false,
+    headers: { Cookie: session.cookie, Origin: origin, 'X-CSRF-Token': session.csrf, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } });
+  const status = new Promise((resolve, reject) => { request.on('response', response => { response.resume(); resolve(response.statusCode); }); request.on('error', reject); });
+  request.write(body.slice(0, 12));
   await new Promise(resolve => setTimeout(resolve, 100));
   assert.equal((await f.request('/api/logout', { method: 'POST' })).status, 200);
-  controller.enqueue(encoder.encode(body.slice(12))); controller.close();
-  const response = await pending;
-  assert.equal(response.status, 401);
+  request.end(body.slice(12));
+  assert.equal(await status, 401);
   assert.equal(f.rows('SELECT * FROM execution_auto_rules').length, 0);
 });
 test('OKX execution connection requires a Passphrase, persists isolated mode and hides all credentials', async t => {
