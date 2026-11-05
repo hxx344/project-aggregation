@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -12,6 +12,18 @@ const pnpm = process.env.npm_execpath;
 if (!pnpm || !existsSync(pnpm) || !process.env.npm_config_user_agent?.startsWith('pnpm/')) {
   throw new Error('Run through pnpm run install:modules or pnpm run build:modules');
 }
+// pnpm 11 的独立发行版把 npm_execpath 设为原生可执行文件（Windows 上是 pnpm.exe），
+// Node 无法加载它，只能直接启动；JavaScript 入口仍交给当前 Node 执行（LESSONS L018）。
+function isNativeExecutable(file) {
+  const header = Buffer.alloc(4);
+  let fd;
+  try { fd = openSync(file, 'r'); readSync(fd, header, 0, 4, 0); } catch { return false; } finally { if (fd !== undefined) closeSync(fd); }
+  const magic = header.readUInt32BE(0);
+  return header[0] === 0x4d && header[1] === 0x5a // PE（MZ）
+    || magic === 0x7f454c46 // ELF
+    || [0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe, 0xcafebabe].includes(magic); // Mach-O
+}
+const [pnpmCommand, pnpmPrefix] = isNativeExecutable(pnpm) ? [pnpm, []] : [process.execPath, [pnpm]];
 const builds = [
   { id: 'monitor', importer: 'modules/monitor', artifact: 'dist/build-manifest.json' },
   { id: 'asset', importer: 'modules/asset', artifact: '.next/BUILD_ID' },
@@ -58,7 +70,7 @@ function digest(directory, buildDirectory) {
   return hash.digest('hex');
 }
 const run = (directory, args) => new Promise((resolve, reject) => {
-  const child = spawn(process.execPath, [pnpm, ...args], { cwd: directory, stdio: 'inherit', windowsHide: true });
+  const child = spawn(pnpmCommand, [...pnpmPrefix, ...args], { cwd: directory, stdio: 'inherit', windowsHide: true });
   child.once('error', reject);
   child.once('exit', code => code === 0 ? resolve() : reject(new Error(`pnpm ${args.join(' ')} failed (${code})`)));
 });

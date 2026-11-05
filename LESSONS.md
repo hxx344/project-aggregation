@@ -297,6 +297,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `pnpm-cli-entry-20261014`；迁移开发阶段一次已核实审查发现，连续修补不重复计数。
 
+**原生发行版补充（2026-11-06）：** `npm_execpath` 也不一定是 JavaScript。Windows 本机全局 pnpm 11.25.0 是 `@pnpm/exe` 原生发行版，`npm_execpath` 指向 `pnpm.exe`；基于 `bf02adc` 的 [模块构建脚本](scripts/modules.mjs) 和 [流水线命令解析](deploy/pipeline/exec.mjs) 都用 `node <npm_execpath>` 启动 pnpm，实际报 `ERR_UNKNOWN_FILE_EXTENSION ".exe"`，`pnpm run build:modules` 在安装依赖后、构建任何模块前失败。做法：读取入口文件头，PE/ELF/Mach-O 原生可执行文件直接启动，其余仍交给固定 Node。验证：[流水线测试](tests/pipeline.test.mjs) 覆盖 JS 入口、过短文件与三类原生文件头；Windows 原生 pnpm 下实际运行 `pnpm run build:modules` 并确认二次运行全部缓存跳过。事件记录：`pnpm-native-execpath-20261106`，与原事件根因相同、触发入口不同，计为关联的独立事件。
+
 ### L019：不可变依赖缓存禁止脚本入口隐式重装
 
 **适用条件：** 安装器先校验并冻结依赖，再通过可写外壳链接到构建工作区的流程。
