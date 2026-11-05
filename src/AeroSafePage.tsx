@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { ArrowLeftRight, CircleAlert, Coins, KeyRound, LoaderCircle, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
 import type { AeroSafeConfig, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
-import { same, tokenOf, units, useAeroSafe } from './aero-safe-client';
+import { autoSellNote, rewardSellTarget, same, tokenOf, units, useAeroSafe } from './aero-safe-client';
 import './aero-lp.css';
 import './aero-safe.css';
 
@@ -67,7 +67,8 @@ export default function AeroSafePage({ onExpired }: { onExpired: () => void }) {
   const positionAction = (pool: AeroSafePool) => (action: 'close' | 'stake' | 'unstake', p: AeroSafePosition, penalty: boolean) => {
     const label = action === 'close' ? '平仓（解押后撤出全部流动性并销毁 NFT，代币回到 Safe）' : action === 'stake' ? '质押到 gauge' : '从 gauge 解押';
     const warning = penalty ? '\n\n头寸仍在提前解押罚没期内，继续将被罚没部分奖励。' : '';
-    if (!window.confirm(`${pool.name} #${p.tokenId}：${label}？${warning}`)) return;
+    const sell = action === 'stake' ? '' : autoSellNote(state);
+    if (!window.confirm(`${pool.name} #${p.tokenId}：${label}？${warning}${sell}`)) return;
     void run(action, { tokenId: p.tokenId, ...(penalty ? { acceptPenalty: true } : {}) }, `已开始${action === 'close' ? '平仓' : action === 'stake' ? '质押' : '解押'}，进度见上方任务状态。`);
   };
   const save = async (event: FormEvent) => {
@@ -85,11 +86,12 @@ export default function AeroSafePage({ onExpired }: { onExpired: () => void }) {
   const doSwap = (event: FormEvent) => {
     event.preventDefault();
     if (!route || !swapAmount.trim()) return;
-    if (window.confirm(`用 Safe 的 ${swapAmount.trim()} ${symbol(route.tokenIn)} 兑换 ${symbol(route.tokenOut)}（CL${route.tickSpacing}）？`)) void run('swap', { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amount: swapAmount.trim() }, '已开始兑换。');
+    if (window.confirm(`用 Safe 的 ${swapAmount.trim()} ${symbol(route.tokenIn)} 兑换 ${symbol(route.tokenOut)}（CL${route.tickSpacing}）？\n\n最小成交量按报价扣 ${(state?.config?.slippageBps ?? 50) / 100}% 滑点。`)) void run('swap', { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amount: swapAmount.trim() }, '已开始兑换。');
   };
   const change = (patch: Partial<Draft>) => { if (draft) { setDraft({ ...draft, ...patch }); setDirty(true); setNotice(''); } };
   const earned = chain?.pools.reduce((sum, p) => sum + BigInt(p.earned || '0'), 0n) ?? 0n;
   const aero = chain?.tokens.find((t) => t.symbol === 'AERO');
+  const sellTarget = rewardSellTarget(state);
 
   return <div className="lp-page">
     <header className="lp-heading"><div><h1>Aero 实盘（Safe + Roles）</h1><p>资产与头寸在 Safe；bot 只持 gas，经 Zodiac Roles 在白名单与每日额度内操作，转出路径只有回到 Safe</p></div><div className="lp-toolbar">
@@ -103,21 +105,22 @@ export default function AeroSafePage({ onExpired }: { onExpired: () => void }) {
       {state.paused ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>{state.pauseReason}</span></div> : null}
       {state.pending ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已签名待上链：{state.pending.label}（nonce {state.pending.nonce}，{time(state.pending.at)}）{state.pending.hash.startsWith('0x') ? <> · {txLink(state.pending.hash)}</> : null}{state.pending.stale ? '；已超过 10 分钟，下一次操作会用同一 nonce 提价替换它' : '；结清前不能发新操作'}</span></div> : null}
       {job ? <div className={`lp-callout ${job.status === 'failed' ? 'warning' : job.status === 'done' ? 'success' : ''}`} role="status">{job.status === 'running' ? <LoaderCircle size={16} className="spin" /> : job.status === 'failed' ? <CircleAlert size={16} /> : <ShieldCheck size={16} />}
-        <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? '已完成' : `${job.error}${job.signed ? '' : '（未签名，可直接重试）'}`}</span></div> : null}
+        <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? '已完成' : `${job.error}${job.signed ? '（本任务已有交易上链，请按下方台账与 Safe 现状核对后再操作）' : '（未签名，可直接重试）'}`}</span></div> : null}
 
       <section className="panel lp-status" aria-label="Safe 状态">
         <dl className="lp-facts">
           <div><dt>Safe</dt><dd>{short(state.config?.safe)}<small>Roles {short(state.config?.roles)}</small></dd></div>
           <div><dt>bot</dt><dd>{short(state.wallet)}<small>{chain?.botEth != null ? `${units(chain.botEth, 18)} ETH 付 gas` : '未读取'}</small></dd></div>
           <div><dt>链上快照</dt><dd>{chain ? `区块 ${chain.blockNumber}` : '—'}<small>{state.chainError ? `读取失败：${state.chainError}` : state.refreshing ? '正在读取…' : time(state.chainAt)}</small></dd></div>
-          <div><dt>待领 AERO</dt><dd>{aero ? units(earned.toString(), aero.decimals) : '—'}<small>{state.config?.autoSellRewards ? `领取后自动卖成 WETH（≥ ${state.config.minRewardSell}）` : '领取后不自动卖出'}</small></dd></div>
+          <div><dt>待领 AERO</dt><dd>{aero ? units(earned.toString(), aero.decimals) : '—'}<small>{state.config?.autoSellRewards && sellTarget ? `领取后自动卖成 ${sellTarget}（≥ ${state.config.minRewardSell}）` : '领取后不自动卖出'}</small></dd></div>
           {chain?.tokens.map((t) => <div key={t.address}><dt>Safe {t.symbol}</dt><dd>{units(t.balance, t.decimals)}{(() => { const a = chain.allowances.find((x) => same(x.token, t.address)); return a ? <small>今日额度剩余 {units(a.remaining, t.decimals)} / {units(a.perDay, t.decimals)}</small> : null; })()}</dd></div>)}
         </dl>
         <div className="as-toolbar">
-          <button type="button" className="button secondary" disabled={disabled || earned === 0n} onClick={() => { if (window.confirm('领取全部 gauge 的 AERO 排放到 Safe？')) void run('claim', {}, '已开始领取。'); }}>{busy === 'claim' ? <LoaderCircle size={15} className="spin" /> : <Coins size={15} />}领取排放</button>
-          <button type="button" className="button secondary" disabled={disabled || !aero || aero.balance === '0'} onClick={() => { if (window.confirm('把 Safe 里的 AERO 卖成 WETH（受每日额度限制）？')) void run('sell', {}, '已开始卖出。'); }}>{busy === 'sell' ? <LoaderCircle size={15} className="spin" /> : <ArrowLeftRight size={15} />}卖出 AERO</button>
+          <button type="button" className="button secondary" disabled={disabled || earned === 0n} onClick={() => { if (window.confirm(`领取全部 gauge 的 AERO 排放到 Safe？${autoSellNote(state)}`)) void run('claim', {}, '已开始领取。'); }}>{busy === 'claim' ? <LoaderCircle size={15} className="spin" /> : <Coins size={15} />}领取排放</button>
+          <button type="button" className="button secondary" disabled={disabled || !aero || aero.balance === '0' || !sellTarget} title={sellTarget ? undefined : '白名单里没有卖出 AERO 的路径'} onClick={() => { if (window.confirm(`把 Safe 里的全部 AERO 卖成 ${sellTarget}（不超过今日额度）？`)) void run('sell', {}, '已开始卖出。'); }}>{busy === 'sell' ? <LoaderCircle size={15} className="spin" /> : <ArrowLeftRight size={15} />}卖出 AERO</button>
           {blocked ? <span className="as-muted">{blocked}</span> : <span className="as-muted">开仓在 Aero 市场的池详情页选区间后进行</span>}
         </div>
+        {chain?.ownedNfts != null && chain.ownedScanned != null && BigInt(chain.ownedNfts) > BigInt(chain.ownedScanned) ? <p className="as-muted">Safe 持有 {chain.ownedNfts} 个头寸 NFT，未质押头寸只列出最新的 {chain.ownedScanned} 个（已质押的全部列出）。</p> : null}
         {chain?.pools.map((pool) => <div key={pool.address} className="as-pool">
           <h3>{pool.name} <small>tick {pool.tick} · 待领 {aero ? units(pool.earned, aero.decimals) : pool.earned} AERO</small></h3>
           <div className="lp-table-scroll"><table className="lp-table"><thead><tr><th>头寸</th><th>区间</th><th>现价</th><th>持有（估）</th><th>质押</th><th>操作</th></tr></thead><tbody>

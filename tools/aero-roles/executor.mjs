@@ -106,6 +106,9 @@ export function rolesReason(error) {
 
 const call = async (rpc, iface, to, method, args = [], from) => iface.decodeFunctionResult(method, await rpc.call({ to, from, data: iface.encodeFunctionData(method, args) }));
 const tx = (to, iface, method, args) => ({ to, value: 0n, data: iface.encodeFunctionData(method, args) });
+const MAX_REPLACES = 16;
+// 任何人都能把头寸 NFT 转给 Safe：未质押头寸只看最新的这么多个，避免粉尘 NFT 拖垮读取。
+export const MAX_OWNED_SCAN = 40;
 export const minusBps = (amount, bps) => (amount * BigInt(10_000 - bps)) / 10_000n;
 // 截止时间取链上最新区块时间与本机时间的较晚者，服务器时钟偏慢时交易也不会一发出就过期。
 async function deadline(ctx) {
@@ -215,7 +218,13 @@ export async function readState(ctx) {
   for (const token of ctx.tokens.values()) balances[token.address] = (await read(`${token.symbol} 余额`, () => call(ctx.rpc, ERC20_I, token.address, 'balanceOf', [ctx.safe])))[0];
   const [owned] = await read('Safe 持有的 NFT', () => call(ctx.rpc, NPM_I, AERO.nft, 'balanceOf', [ctx.safe]));
   const ownedIds = [];
-  for (let i = 0n; i < owned; i++) ownedIds.push((await read('tokenOfOwnerByIndex', () => call(ctx.rpc, NPM_I, AERO.nft, 'tokenOfOwnerByIndex', [ctx.safe, i])))[0]);
+  const scanFrom = owned > BigInt(MAX_OWNED_SCAN) ? owned - BigInt(MAX_OWNED_SCAN) : 0n;
+  for (let i = owned - 1n; i >= scanFrom; i--) ownedIds.push((await read('tokenOfOwnerByIndex', () => call(ctx.rpc, NPM_I, AERO.nft, 'tokenOfOwnerByIndex', [ctx.safe, i])))[0]);
+  const ownedInfo = new Map();
+  const positionOf = async (tokenId) => {
+    if (!ownedInfo.has(tokenId)) ownedInfo.set(tokenId, await read(`头寸 #${tokenId}`, () => call(ctx.rpc, NPM_I, AERO.nft, 'positions', [tokenId])));
+    return ownedInfo.get(tokenId);
+  };
   const pools = [];
   for (const pool of ctx.pools) {
     const [slot0, [feePips], [stakedIds], penalty] = await read(`池子 ${pool.name}`, () => Promise.all([
@@ -224,7 +233,7 @@ export async function readState(ctx) {
     ]));
     const positions = [];
     const add = async (tokenId, staked) => {
-      const p = await read(`头寸 #${tokenId}`, () => call(ctx.rpc, NPM_I, AERO.nft, 'positions', [tokenId]));
+      const p = await positionOf(tokenId);
       if (getAddress(p.token0) !== pool.token0 || getAddress(p.token1) !== pool.token1 || Number(p.tickSpacing) !== pool.tickSpacing) return;
       const depositBlock = staked ? (await read(`质押区块 #${tokenId}`, () => call(ctx.rpc, GAUGE_I, pool.gauge, 'depositBlock', [tokenId])))[0] : null;
       const position = { tokenId, staked, tickLower: Number(p.tickLower), tickUpper: Number(p.tickUpper), liquidity: p.liquidity, tokensOwed0: p.tokensOwed0, tokensOwed1: p.tokensOwed1, depositBlock };
@@ -236,7 +245,7 @@ export async function readState(ctx) {
     if (stakedIds.length) { try { earned = (await call(ctx.rpc, GAUGE_I, pool.gauge, 'earned', [ctx.safe, [...stakedIds]]))[0]; } catch {} }
     pools.push({ ...pool, sqrtPriceX96: slot0.sqrtPriceX96, tick: Number(slot0.tick), feePips: Number(feePips), penalty: { minStakeBlocks: penalty.minStakeBlocks, penaltyRate: penalty.penaltyRate }, positions, earned });
   }
-  return { blockNumber, timestamp, bot, botEth, latestNonce, pendingNonce, balances, allowances: [...allowances.values()], pools };
+  return { blockNumber, timestamp, bot, botEth, latestNonce, pendingNonce, balances, allowances: [...allowances.values()], pools, ownedNfts: owned, ownedScanned: ownedIds.length };
 }
 
 // 已签名交易的去向：confirmed / reverted（已上链）、dropped（同一 nonce 已被其他交易占用，这笔不会再上链）、waiting（仍可能上链，重新广播一次）。
@@ -248,8 +257,12 @@ export async function resolvePending(ctx, pending) {
     const late = await read('交易回执', () => ctx.rpc.getTransactionReceipt(pending.hash)); // nonce 读之前刚上链的情况
     if (late) return { state: late.status === 1 ? 'confirmed' : 'reverted', receipt: late };
     // 同 nonce 提价替换后，上链的可能是被替换的旧交易。
-    const original = pending.replaces?.hash ? await read('被替换交易回执', () => ctx.rpc.getTransactionReceipt(pending.replaces.hash)) : null;
-    return { state: 'dropped', replacedReceipt: original ?? null };
+    // 连续替换时逐个查，最多一笔上链。
+    for (const replaced of pending.replaces ?? []) {
+      const original = await read('被替换交易回执', () => ctx.rpc.getTransactionReceipt(replaced.hash));
+      if (original) return { state: 'dropped', replaced, replacedReceipt: original };
+    }
+    return { state: 'dropped', replaced: null, replacedReceipt: null };
   }
   try { await ctx.rpc.broadcastTransaction(pending.raw); } catch {}
   return { state: 'waiting' };
@@ -292,7 +305,8 @@ export async function sendRoleTx(ctx, hooks, label, transactions) {
   const raw = await ctx.signer.signTransaction(Transaction.from({ type: 2, chainId: BASE_CHAIN_ID, to: ctx.roles, data, value: 0n, nonce, gasLimit, maxFeePerGas, maxPriorityFeePerGas }));
   const hash = keccak256(raw);
   const entry = { hash, raw, from, nonce, label, maxFeePerGas: String(maxFeePerGas), maxPriorityFeePerGas: String(maxPriorityFeePerGas), at: ctx.now(),
-    replaces: prior ? { hash: prior.hash, label: prior.label } : null };
+    // 同一 nonce 上此前签过的全部交易（新的在前），结清时逐个核对哪一笔上了链。
+    replaces: prior ? [{ hash: prior.hash, label: prior.label }, ...(prior.replaces ?? [])].slice(0, MAX_REPLACES) : [] };
   // 没有持久记录的交易不广播：重启后无法按哈希核对，可能重复执行。
   try { await hooks.persistPending(entry); } catch (error) { throw new ExecError(`${label}：待确认记录保存失败，未广播（${errorText(error)}）`); }
   hooks.log?.({ event: 'tx_signed', label, hash, nonce });
@@ -381,11 +395,20 @@ export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper
   return { pool: pool.address, tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, swap: swapPlan, deposit0: after0, deposit1: after1 };
 }
 
+// 用户确认的是预览数字：执行时重算的投入量偏离超过 1%、或配平兑换超出预览 10% 时不执行。
+export function checkExpectation(preview, expect) {
+  const off = (actual, expected, bps) => (actual > expected ? actual - expected : expected - actual) * 10_000n > expected * BigInt(bps);
+  if (off(preview.amount0, expect.amount0, 100) || off(preview.amount1, expect.amount1, 100)) throw new ExecError('Safe 余额自预览后变化超过 1%，请重新预览后再确认，未签名');
+  const swapIn = preview.swap?.amountIn ?? 0n;
+  if (swapIn * 10_000n > expect.swapIn * 11_000n) throw new ExecError('池子价格自预览后变化，配平兑换量超出预览 10%，请重新预览后再确认，未签名');
+}
+
 // 开仓：配平兑换（可选）→ 授权 NPM → 以 Safe 身份报价后 mint（最小量 = 报价 × (1 − 滑点)）→ NPM.approve + gauge.deposit 一批质押。
 // 中途失败时已完成的步骤保留在链上（例如已兑换未开仓），页面按 Safe 现状显示，可再次开仓或手动处理。
-export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, slippageBps, stake = true }) {
+export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, slippageBps, stake = true, expect = null }) {
   const pool = poolOf(ctx, poolAddress);
   const preview = await previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance });
+  if (expect) checkExpectation(preview, expect);
   let amount0 = preview.amount0, amount1 = preview.amount1;
   if (preview.swap) {
     hooks.step?.('配平兑换');

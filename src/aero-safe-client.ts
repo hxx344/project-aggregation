@@ -70,3 +70,17 @@ export function useAeroSafe(onExpired: () => void) {
   }, [fail]);
   return { state, loadError, busy, actionError, setActionError, read, call, execute, preview };
 }
+
+// 领取后自动卖出走第一条卖出 AERO 的白名单路径（与服务端 sellRewards 一致）；返回目标代币符号，没有路径时为 null。
+export function rewardSellTarget(state: AeroSafeState | null) {
+  const aero = state?.chain?.tokens.find((t) => t.symbol === 'AERO');
+  const route = aero ? state?.config?.permissions.swaps.find((s) => same(s.tokenIn, aero.address)) : undefined;
+  return route ? tokenOf(state?.chain, route.tokenOut)?.symbol ?? route.tokenOut : null;
+}
+
+// 领取、解押、平仓之后的自动卖出说明，写进确认框。
+export function autoSellNote(state: AeroSafeState | null) {
+  const target = rewardSellTarget(state);
+  if (!state?.config?.autoSellRewards || !target) return '';
+  return `\n\n完成后会自动把 Safe 里的全部 AERO（不超过今日额度、不少于 ${state.config.minRewardSell}）卖成 ${target}。`;
+}

@@ -16,7 +16,7 @@ export type AeroSafePool = {
   earned: string; penalty: { minStakeBlocks: string; penaltyRate: string }; positions: AeroSafePosition[];
 };
 export type AeroSafeChain = {
-  blockNumber: number; timestamp: number; bot: string | null; botEth: string | null; inflight: boolean; tokens: AeroSafeToken[];
+  blockNumber: number; timestamp: number; bot: string | null; botEth: string | null; inflight: boolean; tokens: AeroSafeToken[]; ownedNfts?: string | null; ownedScanned?: number | null;
   allowances: { token: string; symbol: string; perDay: string; remaining: string; maxRefill: string; refillAt: number | null }[];
   pools: AeroSafePool[];
 };
@@ -36,5 +36,5 @@ export type AeroSafeState = {
 };
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string;
-  swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string;
+  swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string; previewedAt: number;
 };

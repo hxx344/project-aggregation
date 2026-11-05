@@ -19,6 +19,8 @@ const REFRESH_MIN_MS = 5_000;
 const REFRESH_BUDGET_MS = 60_000;
 // 已签名未上链超过这个时长后，允许新操作用同一 nonce 提价替换（两笔最多只有一笔上链）。
 export const PENDING_STALE_MS = 10 * 60_000;
+// 开仓确认基于预览数字：预览超过这个时长后须重新预览。
+export const PREVIEW_TTL_MS = 2 * 60_000;
 const DEFAULTS = Object.freeze({ rpcUrl: 'https://mainnet.base.org', slippageBps: 50, autoSellRewards: true, minRewardSell: '1' });
 const ACTIONS = new Set(['open', 'close', 'stake', 'unstake', 'claim', 'sell', 'swap']);
 const actionLabels = { open: '开仓', close: '平仓', stake: '质押', unstake: '解押', claim: '领取排放', sell: '卖出 AERO', swap: '兑换' };
@@ -72,7 +74,7 @@ export function strictAeroSafeConfig(value) {
 function serialize(chain, ctx) {
   const s = (v) => (v == null ? null : String(v));
   return {
-    blockNumber: chain.blockNumber, timestamp: chain.timestamp, bot: chain.bot, botEth: s(chain.botEth),
+    blockNumber: chain.blockNumber, timestamp: chain.timestamp, bot: chain.bot, botEth: s(chain.botEth), ownedNfts: s(chain.ownedNfts), ownedScanned: chain.ownedScanned ?? null,
     inflight: chain.pendingNonce != null && chain.latestNonce != null && chain.pendingNonce > chain.latestNonce,
     tokens: [...ctx.tokens.values()].map((t) => ({ ...t, balance: s(chain.balances[t.address]) })),
     allowances: chain.allowances.map((a) => ({ token: a.token, symbol: a.symbol, perDay: s(a.perDay), remaining: s(a.remaining), maxRefill: s(a.maxRefill), refillAt: a.refillAt == null ? null : Number(a.refillAt) })),
@@ -86,13 +88,26 @@ function serialize(chain, ctx) {
   };
 }
 
-function parseParams(action, params, config, tokens) {
+const rawAmount = (value, label) => {
+  if (typeof value !== 'string' || !/^\d{1,78}$/.test(value)) throw new HttpError(400, `${label}无效，请重新预览`);
+  return BigInt(value);
+};
+// 开仓须带上用户确认过的预览：服务端签发的预览时间与投入量，执行时偏离则拒绝。
+function parseExpect(value, now) {
+  const e = value && typeof value === 'object' && !Array.isArray(value) ? value : null;
+  if (!e) throw new HttpError(400, '开仓须先预览，请预览后再确认');
+  if (!Number.isFinite(e.previewedAt) || now - e.previewedAt > PREVIEW_TTL_MS || e.previewedAt > now + 5_000) throw new HttpError(409, `预览已超过 ${PREVIEW_TTL_MS / 60_000} 分钟，请重新预览后再确认`);
+  return { amount0: rawAmount(e.amount0, '预览投入量'), amount1: rawAmount(e.amount1, '预览投入量'), swapIn: e.swapIn == null ? 0n : rawAmount(e.swapIn, '预览兑换量') };
+}
+
+function parseParams(action, params, config, tokens, now = Date.now()) {
   const p = params && typeof params === 'object' && !Array.isArray(params) ? params : {};
   const slippageBps = p.slippageBps === undefined ? config.slippageBps : integer(p.slippageBps, '滑点（基点）', 1, 500);
   const tokenId = () => { if (typeof p.tokenId !== 'string' || !/^\d{1,78}$/.test(p.tokenId)) throw new HttpError(400, 'tokenId 无效'); return BigInt(p.tokenId); };
   if (action === 'open') {
     return { pool: address(p.pool, '池子地址'), tickLower: integer(p.tickLower, '下沿 tick', -887272, 887272), tickUpper: integer(p.tickUpper, '上沿 tick', -887272, 887272),
-      shareBps: integer(p.shareBps ?? 10_000, '投入比例（基点）', 1, 10_000), rebalance: p.rebalance !== false, slippageBps, stake: p.stake !== false };
+      shareBps: integer(p.shareBps ?? 10_000, '投入比例（基点）', 1, 10_000), rebalance: p.rebalance !== false, slippageBps, stake: p.stake !== false,
+      ...(tokens ? { expect: parseExpect(p.expect, now) } : {}) };
   }
   if (action === 'close') return { tokenId: tokenId(), slippageBps, acceptPenalty: p.acceptPenalty === true };
   if (action === 'stake') return { tokenId: tokenId() };
@@ -173,7 +188,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     try {
       appendFileSync(ledgerPath, `${JSON.stringify({ at: now(), hash: entry.hash, nonce: entry.nonce, label: entry.label, status, block: receipt?.blockNumber ?? null,
         gasUsed: receipt?.gasUsed != null ? String(receipt.gasUsed) : null, fee: receipt?.fee != null ? String(receipt.fee) : null })}\n`, { mode: 0o600 });
-    } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘交易记录写入失败'); }
+    } catch (error) {
+      // 台账没写上就保留待确认记录：它是这笔交易唯一的持久记录，下次结清时按回执重写。
+      log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘交易记录写入失败');
+      record({ event: 'ledger_write_failed', label: entry.label, hash: entry.hash, status });
+      return;
+    }
     // 删除失败时记录留在磁盘，下次结清会按回执再记一次（台账按哈希去重）。
     if (pending?.hash === entry.hash) {
       try { rmSync(pendingPath, { force: true }); pending = null; } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘待确认记录删除失败'); }
@@ -181,13 +201,16 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     record({ event: 'tx_settled', label: entry.label, hash: entry.hash, status });
   }
   // 结清上一笔已签名交易。返回 null（无待确认）或 'waiting'。
+  // await 期间 pending 可能被同 nonce 替换，结清只针对开始时的那一笔。
   async function resolve(ctx) {
-    if (!pending) return null;
-    const result = await chain.resolvePending(ctx, pending);
+    const current = pending;
+    if (!current) return null;
+    if (current.unreadable) return 'waiting';
+    const result = await chain.resolvePending(ctx, current);
     if (result.state === 'waiting') return 'waiting';
     // 替换交易被丢弃而旧交易上链：先按旧交易的回执改记（台账按哈希取最新一行），再结清替换交易。
-    if (result.replacedReceipt && pending.replaces) settle({ hash: pending.replaces.hash, nonce: pending.nonce, label: pending.replaces.label }, result.replacedReceipt);
-    settle(pending, result.receipt ?? null, result.state === 'dropped' ? 'dropped' : undefined);
+    if (result.replacedReceipt && result.replaced) settle({ hash: result.replaced.hash, nonce: current.nonce, label: result.replaced.label }, result.replacedReceipt);
+    settle(current, result.receipt ?? null, result.state === 'dropped' ? 'dropped' : undefined);
     return pending ? 'waiting' : null;
   }
   const hooks = (jobId, ctx) => ({
@@ -198,6 +221,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const replaced = pending && pending.hash !== entry.hash && pending.nonce === entry.nonce ? pending : null;
       if (pending && !replaced) throw new Error('上一笔交易尚未结清');
       atomicJson(pendingPath, entry); pending = entry;
+      if (job?.id === jobId) job.signed = true;
       // 同 nonce 提价替换：旧交易与新交易最多一笔上链，旧的结果记为 replaced（以链上为准）。
       if (replaced) settle(replaced, null, 'replaced');
     },
@@ -244,7 +268,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       Object.assign(job, { status: 'done', finishedAt: now(), result: jsonable(result), step: null });
       record({ event: 'job_done', job: id, action });
     } catch (error) {
-      Object.assign(job, { status: 'failed', finishedAt: now(), error: error.message, signed: error.signed === true, code: error.code ?? null });
+      // 前面的步骤已签名上链时，后续步骤失败也不能显示为"未签名"。
+      Object.assign(job, { status: 'failed', finishedAt: now(), error: error.message, signed: error.signed === true || job.signed === true, code: error.code ?? null });
       record({ event: 'job_failed', job: id, action, error: error.message });
       if (!(error instanceof chain.ExecError)) log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘操作异常');
     }
@@ -311,7 +336,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const parsed = parseParams('open', params, config ?? DEFAULTS, null);
       let ctx;
       try { ctx = await connection(); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
-      try { return jsonable(await chain.previewOpen(ctx, parsed)); } catch (error) {
+      try { return jsonable({ ...(await chain.previewOpen(ctx, parsed)), previewedAt: now() }); } catch (error) {
         if (error instanceof chain.ExecError) throw new HttpError(400, error.message);
         throw new HttpError(502, `预览失败：${error.message}`);
       }
@@ -328,13 +353,13 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (pending?.unreadable) throw new HttpError(409, '待确认交易记录损坏，请核对 bot 地址的链上交易后删除 aero-safe/pending.json');
       let ctx;
       try { ctx = await connection(); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
-      const parsed = parseParams(action, params, config, ctx.tokens);
+      const parsed = parseParams(action, params, config, ctx.tokens, now());
       if (pending) {
         let status;
         try { status = await resolve(ctx); } catch (error) { throw new HttpError(502, `核对上一笔交易失败：${error.message}`); }
         if (status === 'waiting' && now() - pending.at < PENDING_STALE_MS) throw new HttpError(409, `上一笔交易（${pending.label}）仍在等待上链，请稍后再试`);
       }
-      job = { id: randomUUID(), action, label: actionLabels[action], params: jsonable(parsed), status: 'running', step: null, startedAt: now(), finishedAt: null, error: null, result: null };
+      job = { id: randomUUID(), action, label: actionLabels[action], params: jsonable(parsed), status: 'running', step: null, signed: false, startedAt: now(), finishedAt: null, error: null, result: null };
       record({ event: 'job_started', job: job.id, action });
       void run(action, parsed);
       return state();

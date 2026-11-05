@@ -8,7 +8,7 @@ import { Interface, Transaction, Wallet, getAddress } from 'ethers';
 import { AERO } from '../tools/aero-roles/addresses.mjs';
 import { buildPermissions } from '../tools/aero-roles/permissions.mjs';
 import * as executor from '../tools/aero-roles/executor.mjs';
-import { PENDING_STALE_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
+import { PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
 import { createApp } from '../server/app.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -78,7 +78,7 @@ test('a signed transaction is persisted before broadcast and never broadcast whe
   await executor.sendRoleTx(ctxWith(rpc), hooks, '授权', [approve(AERO.nft)]);
   assert.deepEqual(seen.order, [['estimate'], 'persist']); // nothing went out before the record was written
   assert.deepEqual(rpc.calls, ['estimate', 'broadcast', 'wait']);
-  assert.equal(seen.persisted[0].nonce, 3); assert.equal(seen.persisted[0].replaces, null);
+  assert.equal(seen.persisted[0].nonce, 3); assert.deepEqual(seen.persisted[0].replaces, []);
   assert.equal(Transaction.from(seen.persisted[0].raw).from, BOT.address);
   assert.equal(seen.settled.length, 1);
 
@@ -102,13 +102,17 @@ test('a stuck transaction is replaced at the same nonce with a fee bump, and a c
   await executor.sendRoleTx(ctxWith(rpc), hooks, '新', [approve(AERO.nft)]);
   const sent = Transaction.from(seen.persisted[0].raw);
   assert.equal(sent.nonce, 3); assert.equal(sent.maxFeePerGas, 2_500n); assert.equal(sent.maxPriorityFeePerGas, 500n);
-  assert.deepEqual(seen.persisted[0].replaces, { hash: prior.hash, label: '旧' });
+  assert.deepEqual(seen.persisted[0].replaces, [{ hash: prior.hash, label: '旧' }]);
+  // A second replacement keeps the whole same-nonce chain, newest first.
+  const again = hookSet({ pending: () => seen.persisted[0] });
+  await executor.sendRoleTx(ctxWith(fakeRpc()), again.hooks, '再新', [approve(AERO.nft)]);
+  assert.deepEqual(again.seen.persisted[0].replaces.map((r) => r.label), ['新', '旧']);
 
   // The prior was mined meanwhile (nonce moved on): it is settled from the chain, not replaced.
   let current = { ...prior, nonce: 2 }; let resolved = 0;
   const moved = hookSet({ pending: () => current, resolvePrior: async () => { resolved++; current = null; } });
   await executor.sendRoleTx(ctxWith(fakeRpc()), moved.hooks, '新', [approve(AERO.nft)]);
-  assert.equal(resolved, 1); assert.equal(moved.seen.persisted[0].replaces, null);
+  assert.equal(resolved, 1); assert.deepEqual(moved.seen.persisted[0].replaces, []);
   const stuck = hookSet({ pending: () => ({ ...prior, nonce: 2 }), resolvePrior: async () => {} });
   await assert.rejects(executor.sendRoleTx(ctxWith(fakeRpc()), stuck.hooks, '新', [approve(AERO.nft)]), (error) => error.signed === false && /尚未结清/.test(error.message));
 });
@@ -120,15 +124,26 @@ test('a broadcast whose receipt never arrives is reported as signed with an unkn
 });
 
 test('resolvePending confirms by hash, rebroadcasts while the nonce is open and finds a replaced original', async () => {
-  const pending = { hash: '0x' + 'bb'.repeat(32), raw: '0x01', from: BOT.address, nonce: 5, replaces: { hash: '0x' + 'cc'.repeat(32), label: '旧' } };
+  const first = { hash: '0x' + 'dd'.repeat(32), label: '最早' };
+  const pending = { hash: '0x' + 'bb'.repeat(32), raw: '0x01', from: BOT.address, nonce: 5, replaces: [{ hash: '0x' + 'cc'.repeat(32), label: '旧' }, first] };
   const mined = { status: 1, blockNumber: 1 };
   assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ receipts: { [pending.hash]: mined } })), pending), { state: 'confirmed', receipt: mined });
   const open = fakeRpc({ nonce: 5 });
   assert.deepEqual(await executor.resolvePending(ctxWith(open), pending), { state: 'waiting' });
   assert.deepEqual(open.broadcasts, ['0x01']);
   const original = { status: 1, blockNumber: 2 };
-  assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6, receipts: { [pending.replaces.hash]: original } })), pending), { state: 'dropped', replacedReceipt: original });
-  assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6 })), { ...pending, replaces: null }), { state: 'dropped', replacedReceipt: null });
+  // After two replacements the earliest one can still be the one that was mined.
+  assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6, receipts: { [first.hash]: original } })), pending), { state: 'dropped', replaced: first, replacedReceipt: original });
+  assert.deepEqual(await executor.resolvePending(ctxWith(fakeRpc({ nonce: 6 })), { ...pending, replaces: [] }), { state: 'dropped', replaced: null, replacedReceipt: null });
+});
+
+test('opening stops when the balances or the rebalance swap moved away from the confirmed preview', () => {
+  const preview = { amount0: 10_000n, amount1: 5_000n, swap: { amountIn: 1_000n } };
+  assert.doesNotThrow(() => executor.checkExpectation(preview, { amount0: 10_050n, amount1: 5_000n, swapIn: 950n }));
+  assert.throws(() => executor.checkExpectation(preview, { amount0: 9_800n, amount1: 5_000n, swapIn: 1_000n }), /余额自预览后变化/);
+  assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 800n }), /配平兑换量超出预览/);
+  assert.throws(() => executor.checkExpectation(preview, { amount0: 10_000n, amount1: 5_000n, swapIn: 0n }), /配平兑换量超出预览/);
+  assert.doesNotThrow(() => executor.checkExpectation({ ...preview, swap: null }, { amount0: 10_000n, amount1: 5_000n, swapIn: 1_000n }));
 });
 
 test('configuration accepts only the page fields with their ranges', () => {
@@ -158,7 +173,8 @@ function fakeChain(overrides = {}) {
     readState: async () => ({ blockNumber: 1, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {}, allowances: [], pools: [] }),
     resolvePending: overrides.resolvePending ?? (async () => ({ state: 'waiting' })),
     claimRewards: async (ctx, hooks) => { calls.push('claim'); await sign(ctx, hooks, '领取排放'); return { claimed: true }; },
-    sellRewards: async (_ctx, _hooks, options) => { calls.push(['sell', options.minAmount]); return { sold: false }; },
+    sellRewards: overrides.sellRewards ?? (async (_ctx, _hooks, options) => { calls.push(['sell', options.minAmount]); return { sold: false }; }),
+    openPosition: async (_ctx, _hooks, params) => { calls.push(['open', params.expect]); return {}; },
     swap: async (ctx, hooks, params) => { calls.push(['swap', params.amountIn]); await sign(ctx, hooks, '兑换'); return {}; },
     previewOpen: async () => ({ amount0: 1n }),
   };
@@ -244,17 +260,62 @@ test('an unsettled transaction blocks new work until it is stale, then is replac
 test('a dropped replacement whose original was mined records the original from its receipt', async () => {
   const directory = fixtureDir();
   const original = '0x' + 'cd'.repeat(32), replacement = '0x' + 'ef'.repeat(32);
-  const chain = fakeChain({ resolvePending: async () => ({ state: 'dropped', replacedReceipt: { status: 1, blockNumber: 7, gasUsed: 5n, fee: 2n } }) });
+  const chain = fakeChain({ resolvePending: async () => ({ state: 'dropped', replaced: { hash: original, label: '旧兑换' }, replacedReceipt: { status: 1, blockNumber: 7, gasUsed: 5n, fee: 2n } }) });
   const first = managerWith(directory, { chain });
   try { await first.manager.initialize(); await first.manager.save(baseConfig); await first.manager.setKey(KEY); } finally { await first.manager.close(); }
   writeFileSync(join(directory, 'aero-safe/txs.jsonl'), `${JSON.stringify({ hash: original, label: '旧兑换', status: 'replaced' })}\n`);
-  writeFileSync(join(directory, 'aero-safe/pending.json'), JSON.stringify({ hash: replacement, raw: '0x00', from: BOT.address, nonce: 4, label: '新兑换', at: 0, replaces: { hash: original, label: '旧兑换' } }));
+  writeFileSync(join(directory, 'aero-safe/pending.json'), JSON.stringify({ hash: replacement, raw: '0x00', from: BOT.address, nonce: 4, label: '新兑换', at: 0, replaces: [{ hash: original, label: '旧兑换' }] }));
   const { manager } = managerWith(directory, { chain });
   try {
     await manager.initialize();
     const state = await until(() => manager.state().ledger.length === 2 && !manager.state().refreshing && manager.state());
     assert.equal(state.pending, null);
     assert.deepEqual(state.ledger.map((e) => [e.hash, e.status]), [[replacement, 'dropped'], [original, 'confirmed']]);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('opening needs a fresh server-issued preview and passes the confirmed amounts to the executor', async () => {
+  const directory = fixtureDir();
+  let clock = 5_000_000;
+  const { manager, chain } = managerWith(directory, { manager: { now: () => clock } });
+  const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    const preview = await manager.preview(open);
+    assert.equal(preview.previewedAt, clock);
+    await assert.rejects(manager.execute('open', open), (error) => error.status === 400 && /先预览/.test(error.message));
+    const expect = { previewedAt: preview.previewedAt, amount0: '1', amount1: '0', swapIn: null };
+    clock += PREVIEW_TTL_MS + 1;
+    await assert.rejects(manager.execute('open', { ...open, expect }), (error) => error.status === 409 && /重新预览/.test(error.message));
+    await assert.rejects(manager.execute('open', { ...open, expect: { ...expect, previewedAt: clock, amount0: '-1' } }), (error) => error.status === 400);
+    await manager.execute('open', { ...open, expect: { ...expect, previewedAt: clock - 1_000 } });
+    await until(() => manager.state().job?.status === 'done');
+    assert.deepEqual(chain.calls, [['open', { amount0: 1n, amount1: 0n, swapIn: 0n }]]);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a failed ledger write keeps the pending record, and a later failure after a signed step is not shown as unsigned', async () => {
+  const directory = fixtureDir();
+  let clock = 9_000_000;
+  const chain = fakeChain({
+    resolvePending: async () => ({ state: 'confirmed', receipt: { status: 1, blockNumber: 3, gasUsed: 1n, fee: 1n } }),
+    sellRewards: async () => { throw new executor.ExecError('卖出报价失败'); },
+  });
+  const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    mkdirSync(join(directory, 'aero-safe/txs.jsonl')); // appending to a directory fails
+    await manager.execute('claim', {});
+    const failed = await until(() => manager.state().job?.status === 'failed' && !manager.state().refreshing && manager.state());
+    assert.equal(failed.job.signed, true); // the claim went out before the sale failed
+    assert.equal(failed.pending?.label, '领取排放');
+    assert.ok(existsSync(join(directory, 'aero-safe/pending.json')));
+    assert.ok(failed.events.some((e) => e.event === 'ledger_write_failed'));
+    rmSync(join(directory, 'aero-safe/txs.jsonl'), { recursive: true });
+    clock += 60_000;
+    manager.refresh();
+    const settled = await until(() => manager.state().pending === null && manager.state());
+    assert.deepEqual(settled.ledger.map((e) => [e.label, e.status]), [['领取排放', 'confirmed']]);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
