@@ -2,6 +2,7 @@ export type TradingExchange = 'binance' | 'bybit' | 'okx';
 export type TradingPair = 'binance,bybit' | 'binance,okx' | 'bybit,okx';
 export type TradingAccountMode = 'standard' | 'portfolio-margin' | 'unified' | 'cross' | 'isolated';
 export type OilSymbol = 'CLUSDT' | 'BZUSDT';
+export type HynixSymbol = 'SKHYUSDT' | 'SKHYNIXUSDT';
 export type TradingReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
 export type TradingImportSource = {
   projectId: string; name: string; projectRevision: string;
@@ -13,7 +14,7 @@ export type TradingImportSource = {
 };
 export type TradingImportSelection = { projectId: string; projectRevision: string; sourceRevision: string };
 export type TradingPosition = {
-  id: string; exchange: TradingExchange; symbol: OilSymbol;
+  id: string; exchange: TradingExchange; symbol: OilSymbol | HynixSymbol;
   side: 'long' | 'short'; mode: 'one-way' | 'hedge';
   quantity: string; entryPrice: string | null; markPrice: string | null;
   notional: string | null; unrealizedPnl: string | null;
@@ -39,6 +40,16 @@ export type TradingLeg = {
   grossNotional: string | null; netNotional: string | null; unrealizedPnl: string | null;
   fundingNet: string | null; fundingComplete: boolean;
 };
+/** Position-only legs: SK hynix funding and PnL are not part of the oil ledger. */
+export type TradingHynixLeg = {
+  id: string; exchange: TradingExchange; symbol: HynixSymbol; name: string;
+  state: TradingReadState; fetchedAt: string | null; positions: TradingPosition[];
+  grossNotional: string | null; netNotional: string | null; unrealizedPnl: string | null;
+};
+export type TradingHynix = {
+  accounts: { exchange: TradingExchange; state: TradingReadState; fetchedAt: string | null; error: string | null }[];
+  legs: TradingHynixLeg[];
+};
 export type TradingPnlPoint = { time: number; unrealizedPnl: string | null; fundingPnl: string | null; totalPnl: string | null };
 export type TradingPnl = {
   currency: 'USDT'; intervalMs: number; cumulativeStart: number; end: number; recordingStartedAt: number | null;
@@ -50,6 +61,8 @@ export type TradingState = {
   generatedAt: string; period: { days: 7 | 30; start: string; end: string };
   cache: { builtAt: string | null; servedAt: string; rebuilding: boolean; error?: { code: 'view_rebuild_failed'; message: string; at: string } | null };
   accounts: TradingAccount[]; legs: TradingLeg[];
+  /** Absent from servers released before SK hynix positions were observed. */
+  hynix?: TradingHynix;
   exchanges: TradingExchange[];
   pnl: TradingPnl;
   structure: { state: 'unknown' | 'incomplete' | 'opposed' | 'same-direction' | 'mixed'; message: string };

@@ -4,14 +4,16 @@ import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-d
 import { createTradingPnl } from './trading-pnl.mjs';
 import { createHash } from 'node:crypto';
 import { TRADING_VIEW_VERSION, packTradingView, unpackTradingView } from './trading-view-cache.mjs';
-import { TRADING_EXCHANGES as EXCHANGES, TRADING_SYMBOLS as SYMBOLS, TRADING_NAMES as NAMES, TRADING_PAIRS, DEFAULT_TRADING_PAIR, normalizeTradingPair, tradingPairKey } from './trading-markets.mjs';
+import { TRADING_EXCHANGES as EXCHANGES, TRADING_SYMBOLS as SYMBOLS, TRADING_HYNIX_SYMBOLS as HYNIX_SYMBOLS, TRADING_NAMES as NAMES, TRADING_PAIRS, DEFAULT_TRADING_PAIR, normalizeTradingPair, tradingPairKey } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
+import { instrumentId as okxInstrumentId } from './trading-okx-common.mjs';
 import { immediate } from './control/schema.mjs';
 
 const DAY = 86_400_000;
 const POSITION_INTERVAL = 30_000, FUNDING_INTERVAL = 300_000;
 const POSITION_STALE = 75_000, FUNDING_STALE = 900_000;
 const PAGE_SIZE = 50;
+const HYNIX_NAMES = Object.freeze({ SKHYUSDT: 'SKHY · ADR', SKHYNIXUSDT: 'SKHYNIX · 正股' });
 const iso = time => new Date(time).toISOString();
 const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
 
@@ -22,6 +24,7 @@ export class TradingError extends Error {
 function emptySnapshot(exchange) {
   return { version: 1, exchange,
     positions: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
+    hynix: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
     funding: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null, diagnostic: null } };
 }
 function exchangeOf(exchange) {
@@ -71,11 +74,11 @@ function fundingStart(snapshot, end) {
   }
   return Math.max(end - 30 * DAY, Math.min(gap, end - DAY));
 }
-function normalizePositions(result, exchange, now) {
+function normalizePositions(result, exchange, now, symbols = SYMBOLS) {
   if (!result || !Array.isArray(result.positions) || result.positions.length > (exchange === 'okx' ? 8 : 4) || timeOf(result.fetchedAt) === null || timeOf(result.fetchedAt) > now + 60_000) throw new Error('Invalid positions');
   const ids = new Set();
   const rows = result.positions.map(item => {
-    if (!item || item.exchange !== exchange || !SYMBOLS.includes(item.symbol) || !['long', 'short'].includes(item.side) || !['one-way', 'hedge'].includes(item.mode)) throw new Error('Invalid position identity');
+    if (!item || item.exchange !== exchange || !symbols.includes(item.symbol) || !['long', 'short'].includes(item.side) || !['one-way', 'hedge'].includes(item.mode)) throw new Error('Invalid position identity');
     if (exchange === 'okx' && !['cross', 'isolated'].includes(item.marginMode)) throw new Error('Invalid margin mode');
     const id = `${exchange}:${item.symbol}:${item.mode}:${item.side}${exchange === 'okx' ? ':' + item.marginMode : ''}`;
     if (ids.has(id)) throw new Error('Duplicate position'); ids.add(id);
@@ -84,9 +87,9 @@ function normalizePositions(result, exchange, now) {
       quantity: decimal(item.quantity, { positive: true }), entryPrice: optional(item.entryPrice, true), markPrice: optional(item.markPrice, true),
       notional: optional(item.notional, true), unrealizedPnl: optional(item.unrealizedPnl), leverage: optional(item.leverage, true),
       liquidationPrice: optional(item.liquidationPrice, true), sourceUpdatedAt: timeOf(item.sourceUpdatedAt) === null ? null : iso(timeOf(item.sourceUpdatedAt)),
-      ...(exchange === 'okx' ? { marginMode: item.marginMode, instrumentId: item.symbol === 'CLUSDT' ? 'CL-USDT-SWAP' : 'BZ-USDT-SWAP', quantityUnit: '张', contractSize: decimal(item.contractSize, { positive: true }) } : {}) };
+      ...(exchange === 'okx' ? { marginMode: item.marginMode, instrumentId: okxInstrumentId(item.symbol), quantityUnit: '张', contractSize: decimal(item.contractSize, { positive: true }) } : {}) };
   });
-  for (const symbol of SYMBOLS) {
+  for (const symbol of symbols) {
     for (const margin of exchange === 'okx' ? ['cross', 'isolated'] : [undefined]) {
       const positions = rows.filter(row => row.symbol === symbol && row.marginMode === margin);
       if (positions.some(row => row.mode === 'one-way') && positions.length > 1) throw new Error('Conflicting position modes');
@@ -108,6 +111,18 @@ function normalizeReceipts(events, exchange, start = 0, end = Infinity) {
   }
   return [...result.values()].sort((a, b) => timeOf(a.time) - timeOf(b.time) || a.id.localeCompare(b.id));
 }
+function parseHynix(value, exchange) {
+  // Snapshots written before the SK hynix reader have no section; a damaged one never discards the oil ledger.
+  if (!value) return emptySnapshot(exchange).hynix;
+  try {
+    const positions = value.fetchedAt ? normalizePositions({ positions: value.rows, fetchedAt: value.fetchedAt }, exchange, Date.now(), HYNIX_SYMBOLS) : { rows: [], fetchedAt: null };
+    const diagnostic = normalizeTradingDiagnostic(value.diagnostic);
+    return { ...positions, lastAttemptAt: timeOf(value.lastAttemptAt) === null ? null : iso(timeOf(value.lastAttemptAt)), diagnostic,
+      error: formatTradingDiagnostic(diagnostic) || (value.error ? '上次海力士仓位读取失败，请刷新重试' : null) };
+  } catch {
+    return { ...emptySnapshot(exchange).hynix, error: '本地海力士仓位缓存无效，请刷新重新读取' };
+  }
+}
 function parseSnapshot(row) {
   const fallback = emptySnapshot(row.exchange);
   if (!row.snapshot) return fallback;
@@ -119,11 +134,11 @@ function parseSnapshot(row) {
     const safeStamp = value => timeOf(value) === null ? null : iso(timeOf(value));
     const positionsDiagnostic = normalizeTradingDiagnostic(value.positions.diagnostic), fundingDiagnostic = normalizeTradingDiagnostic(value.funding.diagnostic);
     // Persist only application-owned diagnostics. Arbitrary disk strings never become API error text.
-    return { ...fallback, positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
+    return { ...fallback, hynix: parseHynix(value.hynix, row.exchange), positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
       funding: { events, coverage, fetchedAt: safeStamp(value.funding.fetchedAt), lastAttemptAt: safeStamp(value.funding.lastAttemptAt),
         requestedEnd: Number.isSafeInteger(value.funding.requestedEnd) ? value.funding.requestedEnd : null, diagnostic: fundingDiagnostic, error: formatTradingDiagnostic(fundingDiagnostic) || (value.funding.error ? '上次资金费读取未完成，请刷新重试' : null) } };
   } catch {
-    fallback.positions.error = fallback.funding.error = '本地交易缓存无效，请刷新重新读取';
+    fallback.positions.error = fallback.hynix.error = fallback.funding.error = '本地交易缓存无效，请刷新重新读取';
     return fallback;
   }
 }
@@ -217,7 +232,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     if (jobs.has(key)) return jobs.get(key).promise;
     const previous = cache.get(exchange)[kind];
     const newFundingBatch = kind === 'funding' && (previous.requestedEnd || 0) < end;
-    const cooldown = force || newFundingBatch ? 5000 : kind === 'positions' ? POSITION_INTERVAL : FUNDING_INTERVAL;
+    const cooldown = force || newFundingBatch ? 5000 : kind === 'funding' ? FUNDING_INTERVAL : POSITION_INTERVAL;
     if (previous.lastAttemptAt && now() - timeOf(previous.lastAttemptAt) < cooldown) return Promise.resolve();
     const controller = new AbortController();
     const start = kind === 'funding' ? fundingStart(previous, end) : null;
@@ -238,17 +253,18 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     const promise = (async () => {
       try {
         const credentials = privateCredentials(row), accountMode = accountModeOf(exchange, row.account_mode);
-        const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? clients.get(exchange).positions(credentials, { signal, accountMode }) : clients.get(exchange).funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
+        const client = clients.get(exchange);
+        const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? client.positions(credentials, { signal, accountMode })
+          : kind === 'hynix' ? client.hynixPositions(credentials, { signal, accountMode }) : client.funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
         if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
-        if (kind === 'positions') {
-          const value = normalizePositions(result, exchange, now());
-          write(exchange, row.revision, snapshot => ({ ...snapshot, positions: { ...snapshot.positions, ...value, error: null, diagnostic: null } }));
-        } else {
-          saveFunding(result);
+        if (kind === 'funding') saveFunding(result);
+        else {
+          const value = normalizePositions(result, exchange, now(), kind === 'hynix' ? HYNIX_SYMBOLS : SYMBOLS);
+          write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], ...value, error: null, diagnostic: null } }));
         }
       } catch (error) {
         if (closed || rowFor(exchange).revision !== row.revision || controller.signal.aborted && controller.signal.reason?.name !== 'TimeoutError') return;
-        const diagnostic = normalizeTradingDiagnostic(error?.diagnostic) || normalizeTradingDiagnostic({ version: 1, exchange, accountMode: row.account_mode, operation: kind, code: error?.name === 'TimeoutError' ? 'timeout' : 'upstream' });
+        const diagnostic = normalizeTradingDiagnostic(error?.diagnostic) || normalizeTradingDiagnostic({ version: 1, exchange, accountMode: row.account_mode, operation: kind === 'funding' ? 'funding' : 'positions', code: error?.name === 'TimeoutError' ? 'timeout' : 'upstream' });
         write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], diagnostic, error: formatTradingDiagnostic(diagnostic) || safeError(error) } }));
       }
     })().finally(() => { if (jobs.get(key)?.promise === promise) jobs.delete(key); });
@@ -258,7 +274,9 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     const current = now();
     if (!fundingBatchEnd || current - fundingBatchEnd >= (force ? 5000 : FUNDING_INTERVAL)) fundingBatchEnd = current;
     const positions = Promise.allSettled(EXCHANGES.map(exchange => run(exchange, 'positions', { force, end: current }))).then(() => { if (!closed && recordPnl()) invalidateViews(); });
-    return Promise.allSettled([positions, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]).then(result => { if (!closed) flushViews(); return result; });
+    // SK hynix reads run beside, never inside, the oil position batch that records PnL.
+    const hynix = EXCHANGES.map(exchange => run(exchange, 'hynix', { force }));
+    return Promise.allSettled([positions, ...hynix, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]).then(result => { if (!closed) flushViews(); return result; });
   }
   function buildState(days = 7, pair = DEFAULT_TRADING_PAIR) {
     if (![7, 30].includes(days)) throw new TradingError(400, '资金费区间仅支持 7 天或 30 天');
@@ -403,6 +421,15 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
         netNotional: known ? sumOrUnknown(positions, 'notional', true) : null, unrealizedPnl: known ? sumOrUnknown(positions, 'unrealizedPnl') : null,
         fundingNet: !account.funding.complete && !stored.fundingReceiptCount ? null : stored.fundingNet, fundingComplete: account.funding.complete };
     }));
+    const hynixAccounts = entriesFor(pair).map(({ row, snapshot }) => ({ exchange: row.exchange,
+      state: readState(!!row.credentials, snapshot.hynix, current, POSITION_STALE), fetchedAt: snapshot.hynix.fetchedAt, error: snapshot.hynix.error }));
+    const hynixLegs = pair.flatMap(exchange => HYNIX_SYMBOLS.map(symbol => {
+      const account = hynixAccounts.find(item => item.exchange === exchange), known = !!account.fetchedAt;
+      const positions = accounts.find(item => item.exchange === exchange).connected ? cache.get(exchange).hynix.rows.filter(row => row.symbol === symbol) : [];
+      return { id: `${exchange}:${symbol}`, exchange, symbol, name: HYNIX_NAMES[symbol], state: account.state, fetchedAt: account.fetchedAt, positions,
+        grossNotional: known ? sumOrUnknown(positions, 'notional') : null, netNotional: known ? sumOrUnknown(positions, 'notional', true) : null,
+        unrealizedPnl: known ? sumOrUnknown(positions, 'unrealizedPnl') : null };
+    }));
     const selectedAccounts = accounts.filter(account => pair.includes(account.exchange));
     const complete = selectedAccounts.every(account => account.funding.complete), events = saved.funding.events;
     const totals = !complete && !events.length ? { income: null, expense: null, net: null } : { income: saved.funding.income, expense: saved.funding.expense, net: saved.funding.net };
@@ -416,7 +443,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     const latest = expired ? { time: current, unrealizedPnl: null, fundingPnl: null, totalPnl: null } : last;
     const pages = Math.max(1, Math.ceil(events.length / PAGE_SIZE)), selected = Math.min(page ?? 0, pages - 1);
     return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: saved.generatedAt,
-      exchanges: pair, period: saved.period, accounts, legs, structure: structure(legs),
+      exchanges: pair, period: saved.period, accounts, legs, structure: structure(legs), hynix: { accounts: hynixAccounts, legs: hynixLegs },
       funding: { complete, ...totals, currency: 'USDT', daily, events: page === undefined ? events : events.slice(selected * PAGE_SIZE, (selected + 1) * PAGE_SIZE), pagination: { page: selected, pageSize: PAGE_SIZE, total: events.length, pages } },
       pnl: { ...historical, end: current, points: expired ? [...historical.points, latest] : historical.points, latest, status: expired ? 'incomplete' : historical.status },
       cache: { builtAt: saved.generatedAt, servedAt: iso(current), rebuilding: viewsDirty, error: viewError },
@@ -455,6 +482,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       resetViews();
       if (!fundingBatchEnd || now() - fundingBatchEnd >= FUNDING_INTERVAL) fundingBatchEnd = now();
       void run(exchange, 'funding', { end: fundingBatchEnd }).catch(() => {});
+      void run(exchange, 'hynix').catch(() => {});
     } catch (error) {
       if (error instanceof TradingError) throw error;
       throw new TradingError(400, controller.signal.aborted && controller.signal.reason?.name !== 'TimeoutError' ? '连接验证已取消' : safeError(error));
