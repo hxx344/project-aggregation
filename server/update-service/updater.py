@@ -404,7 +404,18 @@ class Coordinator:
             result['checkError'] += f'；已暂停重试，约 {math.ceil(server_wait / 60)} 分钟后自动重试'
         elif result['checkError'] and local_wait > 0:
             result['checkError'] += f'；约 {math.ceil(local_wait / 60)} 分钟后自动重试，也可以手动重新检查'
+        # check() answers a click inside these limits with the unchanged state, so the
+        # page shows when a manual check is accepted instead of ignoring the click.
+        manual_wait = self._manual_check_wait(state, now)
+        result['manualCheckAt'] = iso(now + manual_wait) if manual_wait > 0 else None
         return result
+
+    def _manual_check_wait(self, state, now):
+        """Read-only mirror of check()'s manual limits; _check_delay owns clock rebasing."""
+        minimum_interval = CHECK_FAILURE_MIN_INTERVAL if state.get('failureCount') else CHECK_MIN_INTERVAL
+        started = state.get('lastCheckStarted') or timestamp(state.get('checkedAt'))
+        interval_wait = minimum_interval - (now - started) if 0 < started <= now else 0
+        return max(0, interval_wait, state.get('retryNotBefore', 0) - now)
 
     def _record_check_failure(self, state, message, retry_at=0):
         count = state.get('failureCount', 0)

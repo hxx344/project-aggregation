@@ -4,7 +4,7 @@ async (page) => {
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const errors = [], applies = [], checks = [];
   const releaseNotes = '系统更新可查看具体变更 📝\n- 保留多行说明\n<img src=x onerror="window.__releaseNoteExecuted=true">\n' + '完整说明文本：' + 'x'.repeat(240);
-  let reads = 0, unavailable = false, disconnected = false, expireSession = false, loseApplyResponse = false, loseCheckResponse = false;
+  let reads = 0, refuseCheck = null, unavailable = false, disconnected = false, expireSession = false, loseApplyResponse = false, loseCheckResponse = false;
   let holdRead = false, holdCheck = false, holdApply = false;
   const heldReads = [], heldChecks = [], heldApplies = [];
   const initial = () => ({ enabled: true, checking: false, checkedAt: '2026-10-09T04:00:00.000Z', checkError: null,
@@ -79,6 +79,8 @@ async (page) => {
     if (path === '/api/system/updates/check') {
       checks.push(request.postDataJSON());
       if (loseCheckResponse) { loseCheckResponse = false; return route.abort('connectionfailed'); }
+      // The updater answers a click inside its manual limit with the unchanged state.
+      if (refuseCheck) { const data = { ...structuredClone(state), manualCheckAt: refuseCheck }; refuseCheck = null; return send(data, 202); }
       state.checking = true;
       const data = structuredClone(state);
       if (holdCheck) { holdCheck = false; await new Promise(resolve => heldChecks.push(resolve)); }
@@ -265,6 +267,20 @@ async (page) => {
   await page.reload(); await emit(); await openUpdates();
   await page.getByText('版本检查未完成', { exact: true }).waitFor();
   assert(!(await page.locator('.update-summary').innerText()).includes('已是最新'), 'check failures cannot claim the installation is current');
+  state.manualCheckAt = new Date(await page.evaluate(() => Date.now() + 5_000)).toISOString(); await emit();
+  const waitingCheck = page.getByRole('button', { name: '5 秒后可检查', exact: true });
+  await waitingCheck.waitFor();
+  assert(await waitingCheck.isDisabled(), 'a manual check inside the updater limit is not clickable');
+  await advance(2_000);
+  await page.getByRole('button', { name: '3 秒后可检查', exact: true }).waitFor();
+  await advance(3_000);
+  assert(await page.getByRole('button', { name: '检查更新', exact: true }).isEnabled(), 'the check button unlocks when the updater accepts manual checks');
+  const checksBeforeRefusal = checks.length;
+  refuseCheck = new Date(await page.evaluate(() => Date.now() + 30_000)).toISOString();
+  await page.getByRole('button', { name: '检查更新', exact: true }).click();
+  await page.getByText('距上次检查时间过短，本次未重新检查；按钮倒计时结束后可再次检查。', { exact: true }).waitFor();
+  assert(checks.length === checksBeforeRefusal + 1 && await page.getByRole('button', { name: '30 秒后可检查', exact: true }).isDisabled(), 'a refused click explains itself instead of silently doing nothing');
+  state.manualCheckAt = null;
   unavailable = true;
   await page.reload(); await openUpdates();
   await page.getByText('先启用在线更新', { exact: true }).waitFor();
@@ -311,6 +327,6 @@ async (page) => {
   assert(reads === beforeExpired, 'session expiry stops update polling');
   assert(await page.evaluate(() => window.__updateStreams.every(stream => stream.closed)), 'session expiry closes all update streams');
   assert(errors.length === 0, `browser errors: ${errors.join('; ')}`);
-  assert(checks.length === 3, 'only the three explicit manual clicks send check requests');
-  return { passed: true, reads, checks: checks.length, confirmedUpdates: applies.length, scenarios: ['stable versions', 'release notes keyboard disclosure and plain text', 'release notes freshness and legacy fallback', 'mobile long release notes', 'no automatic checks', 'hidden stream', 'hidden fallback', 'heartbeat timeout', 'offline recovery', 'stale GET isolation', 'two-step confirmation', 'unchanged plan while checking', 'double-click protection', 'late apply response', 'structured progress', 'restart reconnect', 'refresh recovery', 'automatic reload after observed success', 'lost apply response', 'late check response', 'failed check with old cache', 'check failure', 'legacy setup', 'mobile focus', 'seven-module confirmation', 'stale plan', 'plan expiry', 'session expiry'], screenshots: ['updates-desktop.png', 'updates-review.png', 'updates-progress.png', 'updates-mobile.png', 'updates-mobile-review.png', 'updates-notes-desktop.png', 'updates-notes-mobile.png'] };
+  assert(checks.length === 4, 'only the four explicit manual clicks send check requests');
+  return { passed: true, reads, checks: checks.length, confirmedUpdates: applies.length, scenarios: ['stable versions', 'release notes keyboard disclosure and plain text', 'release notes freshness and legacy fallback', 'mobile long release notes', 'no automatic checks', 'hidden stream', 'hidden fallback', 'heartbeat timeout', 'offline recovery', 'stale GET isolation', 'two-step confirmation', 'unchanged plan while checking', 'double-click protection', 'late apply response', 'structured progress', 'restart reconnect', 'refresh recovery', 'automatic reload after observed success', 'lost apply response', 'late check response', 'failed check with old cache', 'check failure', 'manual check countdown', 'refused manual check notice', 'legacy setup', 'mobile focus', 'seven-module confirmation', 'stale plan', 'plan expiry', 'session expiry'], screenshots: ['updates-desktop.png', 'updates-review.png', 'updates-progress.png', 'updates-mobile.png', 'updates-mobile-review.png', 'updates-notes-desktop.png', 'updates-notes-mobile.png'] };
 }

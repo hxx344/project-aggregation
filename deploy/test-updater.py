@@ -1392,9 +1392,15 @@ class CoordinatorTests(RootFixture):
             self.assertEqual(self.coordinator.load()['nextCheckNotBefore'], self.clock + 2 * updater.AUTO_CHECK_INTERVAL)
             self.assertEqual(self.coordinator.load()['retryNotBefore'], 0)
         # A failing state keeps manual checks at the slower pace, not CHECK_MIN_INTERVAL.
+        # The page learns when the next manual check is accepted instead of clicking into a no-op.
+        accepted_at = updater.iso(self.clock + updater.CHECK_FAILURE_MIN_INTERVAL)
+        self.assertEqual(self.coordinator.status()['manualCheckAt'], accepted_at)
         self.clock += updater.CHECK_FAILURE_MIN_INTERVAL - 1
-        self.assertFalse(self.coordinator.check()['checking'])
+        refused = self.coordinator.check()
+        self.assertFalse(refused['checking'])
+        self.assertEqual(refused['manualCheckAt'], accepted_at)
         self.clock += 1
+        self.assertIsNone(self.coordinator.status()['manualCheckAt'])
         self.assertGreater(self.coordinator.next_check_delay(), 0)
         recovered = self.check()
         self.assertIsNotNone(recovered['planId'])
@@ -1408,7 +1414,9 @@ class CoordinatorTests(RootFixture):
         self.assertEqual(self.coordinator.load()['retryNotBefore'], deadline)
         self.clock = deadline - 1
         restarted = self.make_coordinator(); restarted.recover(starting=True)
-        self.assertFalse(restarted.check(minimum_interval=0)['checking'])
+        refused = restarted.check(minimum_interval=0)
+        self.assertFalse(refused['checking'])
+        self.assertEqual(refused['manualCheckAt'], updater.iso(deadline))
         self.clock = deadline
         self.coordinator = restarted
         self.assertIsNotNone(self.check(minimum_interval=0)['planId'])

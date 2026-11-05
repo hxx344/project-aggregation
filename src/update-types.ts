@@ -49,6 +49,8 @@ export type UpdateState = {
   checking: boolean;
   checkedAt: string | null;
   checkError: string | null;
+  /** Earliest time a manual check is accepted; null when accepted now, absent from older updaters. */
+  manualCheckAt?: string | null;
   planId: string | null;
   /** Restart scope of the plan per deployment mode; a missing value means full. */
   planScopes?: Partial<Record<UpdateDeployMode, UpdateScope>> | null;
