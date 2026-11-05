@@ -16,6 +16,8 @@ const LEDGER_TAIL_BYTES = 256 * 1024;
 const LEDGER_SHOWN = 30;
 const CONTEXT_TTL_MS = 10 * 60_000;
 const REFRESH_MIN_MS = 5_000;
+// 头寸判为已销毁后，须隔这么久、且区块号前进后再次判定才删除记录（防负载均衡后面滞后的节点）。
+const BURN_CONFIRM_MS = 60_000;
 const REFRESH_BUDGET_MS = 60_000;
 // 已签名未上链超过这个时长后，允许新操作用同一 nonce 提价替换（两笔最多只有一笔上链）。
 export const PENDING_STALE_MS = 10 * 60_000;
@@ -138,7 +140,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
   let config = null, configError = null, wallet = null, pending = null, job = null, snapshot = null, snapshotAt = null, snapshotError = null;
-  let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [], burnSeen = new Set();
+  let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [], burnSeen = new Map();
   const events = [];
   let operation = Promise.resolve();
   const serial = (fn) => {
@@ -247,10 +249,13 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const ctx = await connection();
     try { await resolve(ctx); } catch (error) { record({ event: 'pending_check_failed', error: error.message }); }
     const value = await chain.readState(ctx, { knownIds: minted });
-    // 连续两次刷新都判为已销毁才删除，偶发误判不会丢掉头寸记录。
-    const burned = (value.burnedIds ?? []).map(String);
-    forget(burned.filter((id) => burnSeen.has(id)));
-    burnSeen = new Set(burned);
+    // 每次刷新都判为已销毁、且距首次判定满 BURN_CONFIRM_MS 并跨过更新的区块才删除，偶发误判不会丢掉头寸记录。
+    const at = now(), block = Number(value.blockNumber);
+    const seen = new Map((value.burnedIds ?? []).map((id) => [String(id), burnSeen.get(String(id)) ?? { at, block }]));
+    const confirmed = [...seen].filter(([, first]) => at - first.at >= BURN_CONFIRM_MS && block > first.block).map(([id]) => id);
+    forget(confirmed);
+    for (const id of confirmed) seen.delete(id);
+    burnSeen = seen;
     snapshot = serialize(value, ctx); snapshotAt = now(); snapshotError = null;
   }
   function refresh() {

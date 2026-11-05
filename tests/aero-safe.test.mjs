@@ -440,7 +440,7 @@ test('a minted position is remembered before staking, read on every refresh and 
   let burned = [];
   const chain = fakeChain({
     openPosition: async (_ctx, hooks) => { hooks.minted(77n); throw new executor.ExecError('质押：bot 的 ETH 不足以支付 gas', { code: 'gas' }); },
-    readState: async (_ctx, options) => { reads.push(options.knownIds.slice()); return { blockNumber: 1, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {}, allowances: [], pools: [], burnedIds: burned }; },
+    readState: async (_ctx, options) => { reads.push(options.knownIds.slice()); return { blockNumber: reads.length, timestamp: 1, bot: BOT.address, botEth: 1n, latestNonce: 0, pendingNonce: 0, balances: {}, allowances: [], pools: [], burnedIds: burned }; },
   });
   let clock = 30_000_000;
   const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
@@ -452,10 +452,14 @@ test('a minted position is remembered before staking, read on every refresh and 
     assert.deepEqual(JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids, ['77']); // kept although staking failed
     assert.deepEqual(reads.at(-1), ['77']);
     burned = [77n];
+    const mintedIds = () => JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids;
     clock += 60_000; manager.refresh();
     await until(() => reads.length >= 3 && !manager.state().refreshing);
-    assert.deepEqual(JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids, ['77']); // one burned reading is not enough
-    clock += 60_000; manager.refresh();
+    assert.deepEqual(mintedIds(), ['77']); // one burned reading is not enough
+    clock += 10_000; manager.refresh();
+    await until(() => reads.length >= 4 && !manager.state().refreshing);
+    assert.deepEqual(mintedIds(), ['77']); // a second reading seconds later may come from the same lagging node
+    clock += 50_000; manager.refresh();
     await until(() => JSON.parse(readFileSync(join(directory, 'aero-safe/minted.json'), 'utf8')).ids.length === 0);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
