@@ -4,6 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { monitors } from '../lib/monitors.ts';
 
 const failure = (message, status = 400) => Object.assign(new Error(message), { status });
+/** Monitors added after switches were first saved; a file written before them starts them enabled. */
+const ADDED_MONITORS = new Set(['anthropic']);
 export async function openMonitorControlStore(directory) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const file = join(directory, 'monitor-control.json');
@@ -14,6 +16,7 @@ export async function openMonitorControlStore(directory) {
     // Switches of retired monitors (such as the removed gold/oil `cl-xau`) are ignored and dropped on the next save.
     for (const { id } of monitors) {
       const value = Object.hasOwn(loaded.monitors, id) ? loaded.monitors[id] : undefined;
+      if (value === undefined && ADDED_MONITORS.has(id)) continue;
       if (!value || typeof value.enabled !== 'boolean' || !Number.isSafeInteger(value.revision) || value.revision < 0) throw Error('Invalid state');
       state.monitors[id] = { enabled: value.enabled, revision: value.revision };
     }

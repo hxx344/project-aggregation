@@ -88,3 +88,43 @@ export function summaryExpired(summary: MonitorSummary, intervalMs: number, now:
   const maxAgeMs = getQuoteStaleAfterMs({ collection: { maxAgeMs: summary.staleAfterMs } }, intervalMs + 15_000);
   return summary.status === "live" && summary.fetchedAt !== null && now - Date.parse(summary.fetchedAt) > maxAgeMs;
 }
+
+export const anthropicTrendOptions = { days: 7, intervalMs: 900_000, label: "7 天 · 15 分钟线", shortLabel: "7天", unit: "%" };
+export type AnthropicSummaryUpdate = {
+  status: SummaryStatus;
+  /** Binance per-share premium over xyz:ANT and io:ANTH, in percent. */
+  premiumXyz: number | null;
+  premiumIo: number | null;
+  /** Hyperliquid contract the trend follows. */
+  trendLeg: string;
+  fetchedAt: string | null;
+  staleAfterMs?: number;
+  history?: TrendHistory;
+};
+
+export function anthropicSummary(update?: AnthropicSummaryUpdate, trend?: MonitorTrend): MonitorSummary {
+  return {
+    status: update?.status ?? "loading",
+    fetchedAt: update?.fetchedAt ?? null,
+    staleAfterMs: getQuoteStaleAfterMs({ collection: { maxAgeMs: update?.staleAfterMs } }, 35_000),
+    metrics: [metric("溢价 · xyz:ANT", update?.premiumXyz, 2, "%"), metric("溢价 · io:ANTH", update?.premiumIo, 2, "%")],
+    note: `Binance 每股价格相对 Hyperliquid · 走势取 ${update?.trendLeg ?? "xyz:ANT"}`,
+    trend: trend ?? createTrend(update?.history, anthropicTrendOptions, update?.status === "error"),
+  };
+}
+
+/** Same caching as the oil reader: quote changes never rebuild the trend geometry. */
+export function createAnthropicSummaryReader() {
+  let previousHistory: TrendHistory | undefined, previousTrend: MonitorTrend | undefined;
+  return (update: AnthropicSummaryUpdate) => {
+    const history = update.history, error = update.status === "error";
+    if (!previousTrend || history?.points !== previousHistory?.points) previousTrend = createTrend(history, anthropicTrendOptions, error);
+    else {
+      const status = history ? error ? "stale" : history.status : error ? "error" : "loading";
+      const fetchedAt = history?.fetchedAt ?? null;
+      if (status !== previousTrend.status || fetchedAt !== previousTrend.fetchedAt) previousTrend = { ...previousTrend, status, fetchedAt };
+    }
+    previousHistory = history;
+    return anthropicSummary(update, previousTrend);
+  };
+}

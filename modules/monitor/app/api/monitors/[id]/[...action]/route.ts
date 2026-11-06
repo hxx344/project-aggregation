@@ -6,6 +6,7 @@ import { unavailablePerpetualOpportunities } from "../../../../../lib/perpetual-
 import { fundingExchangeFromAction, supportsFundingHistory } from '../../../../../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION } from '../../../../../lib/oil-hedge-prices.ts';
 import { unavailablePerpetualSummary } from '../../../../../lib/perpetual-summary.ts';
+import { ANTHROPIC_CANDLE_ACTION, anthropicCandleWindow } from '../../../../../modules/anthropic/market.mjs';
 
 export async function GET(request: Request, context: { params: Promise<{ id: string; action: string[] }> }) {
   const { id, action } = await context.params;
@@ -29,13 +30,14 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
   if (["alerts", "status"].includes(name)) return Response.json({ available: false, monitorId: id, reason: "当前为网页行情版。Linux 一键部署后可运行常驻监控并保存飞书告警。" }, { headers });
   if ((!exchange && !fundingExchange && !hedgePrices && !["quote", "history", "funding", OIL_CANDLE_ACTION].includes(name)) || !monitor.capabilities.includes(exchange || fundingExchange || hedgePrices ? "quote" : name)) return Response.json({ error: "模块不支持此接口" }, { status: 404, headers });
   let candleDays: number | null = null;
-  if (id === "oil" && name === OIL_CANDLE_ACTION) {
+  const anthropicCandles = id === "anthropic" && name === ANTHROPIC_CANDLE_ACTION;
+  if ((id === "oil" && name === OIL_CANDLE_ACTION) || anthropicCandles) {
     try { candleDays = parseCandleWindowDays(new URL(request.url).searchParams.get("days")); }
     catch { return Response.json({ error: "K 线区间参数无效" }, { status: 400, headers }); }
   }
   try {
     const value = await readMonitorData(id, name);
-    return Response.json(candleDays === null ? value : intradayWindow(value, candleDays), { headers });
+    return Response.json(candleDays === null ? value : anthropicCandles ? anthropicCandleWindow(value, candleDays) : intradayWindow(value, candleDays), { headers });
   }
   catch { return Response.json({ error: "行情暂不可用，请稍后重试" }, { status: 503, headers }); }
 }

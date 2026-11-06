@@ -15,6 +15,7 @@ import { createExchangeFundingReader } from '../lib/exchange-funding-service.ts'
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
 import { createOilHedgePricesReader } from '../lib/oil-hedge-price-service.ts';
 import { formatBinanceQuoteError } from '../lib/binance-quote-request.ts';
+import { ANTHROPIC_CANDLE_ACTION, ANTHROPIC_CANDLE_REFRESH_MS, ANTHROPIC_QUOTE_REFRESH_MS, fetchAnthropicCandles, fetchAnthropicQuote } from '../modules/anthropic/market.mjs';
 
 export function seedMarketDatabase(store) {
   store.write('hynix', 'history', getMarketSnapshot(), { seed: true });
@@ -48,6 +49,8 @@ export function marketJobs({ oilIntervalMs = 30_000, variationalSession, variati
     ...['oil', 'hynix'].flatMap(id => fundingHistoryExchanges(id).map(exchange => ({ id, action: exchangeFundingAction(exchange), intervalMs: HISTORY_REFRESH_MS, load: previous => readFundingHistory(exchange, previous, id) }))),
     { id: 'oil', action: OIL_HEDGE_PRICES_ACTION, intervalMs: HEDGE_PRICES_REFRESH_MS, load: previous => readHedgePrices(previous) },
     { id: 'oil', action: OIL_CANDLE_ACTION, intervalMs: OIL_CANDLE_REFRESH_MS, load: previous => fetchIntradaySnapshot(previous ?? oilIntradayArchive) },
+    { id: 'anthropic', action: 'quote', intervalMs: ANTHROPIC_QUOTE_REFRESH_MS, load: () => fetchAnthropicQuote() },
+    { id: 'anthropic', action: ANTHROPIC_CANDLE_ACTION, intervalMs: ANTHROPIC_CANDLE_REFRESH_MS, load: previous => fetchAnthropicCandles(previous) },
   ];
 }
 

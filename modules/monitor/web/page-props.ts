@@ -2,7 +2,7 @@ import type { InitialMarketData } from '../lib/initial-market';
 
 export type PageProps = {
   initial: InitialMarketData | null;
-  initialMonitor: 'oil' | 'hynix' | 'perpetual';
+  initialMonitor: 'oil' | 'hynix' | 'anthropic' | 'perpetual';
 };
 
 export function pageProps(url: URL, initial: InitialMarketData | null): PageProps {
@@ -10,6 +10,6 @@ export function pageProps(url: URL, initial: InitialMarketData | null): PageProp
   return {
     initial,
     // Retired ids (such as the removed gold/oil `cl-xau`) fall back to the oil monitor.
-    initialMonitor: monitor === 'hynix' || monitor === 'perpetual' ? monitor : 'oil',
+    initialMonitor: monitor === 'hynix' || monitor === 'anthropic' || monitor === 'perpetual' ? monitor : 'oil',
   };
 }

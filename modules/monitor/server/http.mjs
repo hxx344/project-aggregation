@@ -3,6 +3,7 @@ import { promisify } from 'node:util';
 import { readHubSummary } from './hub-summary.mjs';
 import { monitors } from '../lib/monitors.ts';
 import { intradayWindow, OIL_CANDLE_ACTION, parseCandleWindowDays } from '../modules/oil/intraday.mjs';
+import { ANTHROPIC_CANDLE_ACTION, anthropicCandleWindow } from '../modules/anthropic/market.mjs';
 const compress = promisify(gzip);
 import { timingSafeEqual } from "node:crypto";
 
@@ -92,10 +93,11 @@ export function createHandler({ service, services, username, password, pageHandl
             if (request.headers["sec-fetch-site"] === "cross-site" || (origin && new URL(origin).host !== request.headers.host)) return json(response, 403, { error: "不接受跨站配置请求" });
             if (!/^application\/json(?:;|$)/i.test(request.headers["content-type"] || "")) return json(response, 415, { error: "请使用 JSON 请求" });
           }
-          const historicalRead = !writing && ['oil', 'hynix'].includes(id)
+          const historicalRead = !writing && ['oil', 'hynix', 'anthropic'].includes(id)
             && (/(?:^|\/)(?:history|funding|trend)$/.test(action) || action.startsWith('candles/'));
           let candleDays = null;
-          if (id === 'oil' && action === OIL_CANDLE_ACTION && !writing) {
+          const windowed = id === 'oil' && action === OIL_CANDLE_ACTION || id === 'anthropic' && action === ANTHROPIC_CANDLE_ACTION;
+          if (windowed && !writing) {
             try { candleDays = parseCandleWindowDays(new URL(request.url, 'http://localhost').searchParams.get('days')); }
             catch { return json(response, 400, { error: 'K 线区间参数无效' }); }
           }
@@ -103,7 +105,7 @@ export function createHandler({ service, services, username, password, pageHandl
             let input;
             if (writing) input = await body(request);
             const value = await backend.handle(action, request.method, input);
-            return await json(response, 200, candleDays === null ? value : intradayWindow(value, candleDays), historicalRead || action === 'opportunities-v2' || (id === 'perpetual' && action === 'quote') ? request : undefined);
+            return await json(response, 200, candleDays === null ? value : id === 'anthropic' ? anthropicCandleWindow(value, candleDays) : intradayWindow(value, candleDays), historicalRead || action === 'opportunities-v2' || (id === 'perpetual' && action === 'quote') ? request : undefined);
           }
           catch (error) { return json(response, error.status || (writing ? action.includes("test") ? 502 : 400 : 503), { error: writing ? error.message : "监控服务暂不可用" }); }
         }
