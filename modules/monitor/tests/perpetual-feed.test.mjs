@@ -208,3 +208,24 @@ test("late HTTP data from a retired service cannot overwrite an already recovere
   finish({ ...sequenced(6, "service-a"), quotes: [btc] }); await tick();
   assert.equal(f.data.at(-1).streamId, "service-b"); assert.equal(f.data.at(-1).quotes[0].bid, 200); f.feed.stop();
 });
+
+test("polling-only feed opens no stream and keeps one read per interval", async () => {
+  const f = fixture(undefined, { stream: false, pollIntervalMs: () => 30000 }); await tick();
+  assert.equal(f.streams.length, 0);
+  assert.deepEqual(f.data.map(item => item.generatedAt), [1]);
+  assert.equal(f.statuses.at(-1), "polling");
+  f.run(30000); await tick();
+  assert.equal(f.data.length, 2); assert.equal(f.streams.length, 0);
+  f.feed.resume(); await tick();
+  assert.equal(f.streams.length, 0, "resume never opens a stream in polling-only mode");
+  f.feed.stop(); assert.equal(f.timers.size, 0);
+});
+
+test("deferred polling feed waits one interval before its first read", async () => {
+  let reads = 0;
+  const f = fixture(async () => { reads++; return snapshot(1); }, { stream: false, deferFirstRead: true, pollIntervalMs: () => 30000 }); await tick();
+  assert.equal(reads, 0); assert.equal(f.streams.length, 0);
+  f.run(30000); await tick();
+  assert.equal(reads, 1);
+  f.feed.stop(); assert.equal(f.timers.size, 0);
+});

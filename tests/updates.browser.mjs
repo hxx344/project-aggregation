@@ -134,14 +134,21 @@ async (page) => {
   assert(await page.locator('.update-summary strong').textContent() === '版本待确认', 'an empty identity is never latest');
   state = initial(); await emit();
   await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
-  const beforeHidden = reads;
+  // Hidden tabs release the long-lived connection and poll instead.
+  const beforeHidden = reads, hiddenStreams = await page.evaluate(() => window.__updateStreams.length);
   await page.evaluate(() => { window.__updateHidden = true; document.dispatchEvent(new Event('visibilitychange')); });
-  await advance(900_000);
-  assert(reads === beforeHidden, 'healthy hidden stream needs no fallback reads');
+  assert(await page.evaluate(() => window.__updateStreams.every(stream => stream.closed)), 'hiding releases the update stream connection');
+  for (let i = 0; i < 4; i++) await advance(15_000);
+  assert(reads - beforeHidden >= 3 && reads - beforeHidden <= 5, `hidden page reads about every fifteen seconds: ${reads - beforeHidden}`);
   assert(checks.length === 0, 'even stale state never triggers an automatic POST check');
-  await makeAvailable('hidden-plan'); await emit();
+  await makeAvailable('hidden-plan'); await advance(15_000);
   await page.getByRole('button', { name: '系统更新：1 个可用更新', exact: true }).waitFor();
-  assert(await page.evaluate(() => window.__updateStreams.length === 1 && !window.__updateStreams[0].closed), 'hidden page retains its live update stream');
+  assert(await page.evaluate(count => window.__updateStreams.length === count, hiddenStreams), 'a hidden page does not reopen the stream');
+  const beforeVisible = reads;
+  await page.evaluate(() => { window.__updateHidden = false; document.dispatchEvent(new Event('visibilitychange')); });
+  assert(await page.evaluate(count => window.__updateStreams.length === count + 1 && !window.__updateStreams.at(-1).closed, hiddenStreams), 'showing the page reopens the stream');
+  await emit(); await advance(1_100);
+  assert(reads === beforeVisible, 'a snapshot pushed during the wake grace period replaces the wake read');
   await page.evaluate(() => { window.__updateFailConnect = true; });
   await streamError(); await page.waitForTimeout(40);
   const beforeFallback = reads;
@@ -151,10 +158,6 @@ async (page) => {
   assert(checks.length === 0, 'stream reconnection and fallback never check releases');
   await page.evaluate(() => { window.__updateFailConnect = false; }); await advance(10_000);
   await emit();
-  const beforeVisible = reads;
-  await page.evaluate(() => { window.__updateHidden = false; document.dispatchEvent(new Event('visibilitychange')); });
-  await advance(1_100);
-  assert(reads === beforeVisible, 'a healthy stream supplies state without a redundant wake read');
 
   // A newly pushed plan wins over a GET that was already in flight.
   await openUpdates();
@@ -170,11 +173,11 @@ async (page) => {
   assert(await page.getByText('该版本未提供更新内容。', { exact: true }).count() === 1, 'legacy releases have a clear missing-notes fallback');
   await page.getByRole('button', { name: '关闭系统更新', exact: true }).click();
 
-  // A silent open socket is unhealthy even while the browser stays hidden.
+  // A silent open socket is unhealthy.
   const beforeSilent = await page.evaluate(() => window.__updateStreams.length);
-  await page.evaluate(() => { window.__updateSilent = true; window.__updateHidden = true; document.dispatchEvent(new Event('visibilitychange')); });
+  await page.evaluate(() => { window.__updateSilent = true; });
   await advance(60_000);
-  assert(await page.evaluate(() => window.__updateStreams.length) > beforeSilent, 'missing heartbeats recreate the hidden stream');
+  assert(await page.evaluate(() => window.__updateStreams.length) > beforeSilent, 'missing heartbeats recreate the stream');
   await page.evaluate(() => { window.__updateSilent = false; }); await emit();
   await page.evaluate(() => { window.__updateOnline = false; window.dispatchEvent(new Event('offline')); });
   const beforeOffline = reads;

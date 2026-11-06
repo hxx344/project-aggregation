@@ -128,14 +128,24 @@ async page => {
         check(JSON.stringify(await names()) === JSON.stringify(bases.slice(30)), `${label}: ranking and page survive activity changes`);
         check(await filter.inputValue() === '.5' && await frame.getByRole('textbox', { name: '搜索币种', exact: true }).inputValue() === 'COIN', `${label}: filters survive activity changes`);
       };
+      const quoteReads = () => counts.get('/api/monitors/perpetual/quote') ?? 0;
       await restoreEvents(frame); await tick(100);
+      check(JSON.stringify(await stats(frame)) === JSON.stringify(original), `${label}: healthy SSE survives repeated focus/pageshow/online`);
+      check(quoteReads() === originalReads, `${label}: healthy restores do not re-fetch the full quote snapshot`);
       if (embedded) await activity(false); else await visibility(frame, true);
       await tick(2200); await preserved();
+      const hidden = await stats(frame);
+      check(hidden.live === 0 && hidden.created === original.created && hidden.closed === original.closed + 1, `${label}: background closes the per-second SSE`);
+      check(quoteReads() === originalReads, `${label}: entering background waits one interval before polling`);
+      await tick(28_000);
+      await until(async () => quoteReads() === originalReads + 1, `${label}: background polls the quote snapshot after thirty seconds`);
+      check((await stats(frame)).created === original.created, `${label}: background polling opens no stream`);
+      await preserved();
       if (embedded) await activity(true); else await visibility(frame, false);
       await restoreEvents(frame); await tick(100);
+      await until(async () => (await stats(frame)).live === 1 && quoteReads() === originalReads + 2, `${label}: foreground reopens the SSE and reads one snapshot`);
       await preserved();
-      check((await stats(frame)).created === original.created && (await stats(frame)).closed === original.closed, `${label}: healthy SSE survives hidden/visible and repeated focus/pageshow/online`);
-      check((counts.get('/api/monitors/perpetual/quote') ?? 0) === originalReads, `${label}: healthy restores do not re-fetch the full quote snapshot`);
+      check((await stats(frame)).created === original.created + 1, `${label}: foreground and restore bursts open exactly one SSE`);
 
       await rows.first().getByRole('button', { name: /^展开 .*质量依据与各平台报价$/ }).click();
       await until(async () => await detail.count() === 1 && (await stats(frame)).live === 0, `${label}: opening details intentionally pauses the feed`);
@@ -163,7 +173,7 @@ async page => {
       await until(async () => (await stats(frame)).live === 1, `${label}: online resumes the stream`);
       await restoreEvents(frame); await tick(1000); await preserved();
       check((await stats(frame)).created === beforeOffline.created + 1, `${label}: online recovery and concurrent restore events create one SSE`);
-      results.push({ mode: label, streams: await stats(frame), checks: ['healthy SSE and HTTP baseline retained', 'ranking, filters and second page retained', 'expanded detail, selected tab and pause retained', 'hidden quote expiration remains explicit', 'explicit close resumes once', 'real offline/online recovers once'] });
+      results.push({ mode: label, streams: await stats(frame), checks: ['healthy SSE retained across restore bursts', 'background polls without SSE and foreground reopens one', 'ranking, filters and second page retained', 'expanded detail, selected tab and pause retained', 'hidden quote expiration remains explicit', 'explicit close resumes once', 'real offline/online recovers once'] });
     }
     check(errors.length === 0, `Unexpected browser errors: ${errors.join('; ')}`);
     check(external.length === 0, `Unexpected external requests: ${external.join(', ')}`);

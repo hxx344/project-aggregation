@@ -1594,6 +1594,93 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 1), result)
         self.assertNotIn("blocked_reason", self.state())
 
+    def busy_account_events(self):
+        """Replay fills, ACCOUNT_UPDATE and private stream reconnects landing inside every snapshot wait."""
+        reasons = iter(["ORDER_TRADE_UPDATE", "ACCOUNT_UPDATE", "私有流重连"] * 20)
+
+        def event(aid, params, request):
+            self.engine.brokers[aid].invalidate_account_reads(next(reasons))
+            return httpx.Response(200, json=[])
+        self.snapshot_handler = event
+
+    def revoked_round(self):
+        """Run one due check; return its view and the levels of its skip log lines."""
+        self.due()
+        with self.assertLogs("aster.trading", level="INFO") as logs:
+            result = self.balancer.tick(self.pair, self.snapshots())
+        levels = [record.levelname for record in logs.records
+                  if "revoked during receipt snapshot" in record.getMessage()]
+        return result, levels
+
+    def test_frequent_account_events_count_consecutive_skips_and_escalate_at_the_threshold(self):
+        threshold = margin_balance.TRANSFER_SNAPSHOT_REVOKED_WARN_SKIPS
+        self.busy_account_events()
+        for count in range(1, 2 * threshold + 2):
+            with self.subTest(count=count):
+                if count == threshold:
+                    # The streak is durable: a restarted balancer keeps counting.
+                    self.balancer = MarginBalancer(self.engine)
+                result, levels = self.revoked_round()
+                self.assertEqual((result["status"], result["blocks_trading"], len(self.posts())), ("waiting", False, 0), result)
+                self.assertEqual(self.state()["snapshot_revoked_skips"], count)
+                self.assertIn(f"已连续 {count} 次因此未发送", result["reason"])
+                self.assertEqual("请留意较薄一侧的保证金" in result["reason"], count >= threshold, result["reason"])
+                # A WARNING each time the streak reaches a multiple of the threshold, INFO otherwise.
+                self.assertEqual(levels, ["WARNING" if count % threshold == 0 else "INFO"])
+                # Never prepared: no shared operation, unknown write or pending follow-up.
+                self.assertIsNone(self.state().get("pending"))
+                self.assertEqual((self.shared_operations(), self.unresolved()), ([], []))
+                # The stored reason keeps the escalation visible until the next check.
+                between = self.balancer.tick(self.pair, self.snapshots())
+                self.assertEqual((between["status"], between["blocks_trading"], between["reason"]),
+                                 ("waiting", False, result["reason"]))
+                status = MarginBalancer.status_view(self.pair, self.state())
+                self.assertEqual((status["status"], status["blocks_trading"], status["reason"]),
+                                 ("waiting", False, result["reason"]))
+        # Reaching the send ends the streak, whatever the transfer's outcome.
+        self.snapshot_handler = None
+        self.fail_dispatch = True
+        self.due()
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("unknown", 1), result)
+        self.assertNotIn("snapshot_revoked_skips", self.state())
+
+    def test_revoked_skip_streak_resets_when_no_transfer_is_needed_or_balancing_stops(self):
+        threshold = margin_balance.TRANSFER_SNAPSHOT_REVOKED_WARN_SKIPS
+        enabled = self.pair
+        stops = {"balanced": None,
+                 "balancing disabled": {**enabled, "margin": {**enabled["margin"], "enabled": False}},
+                 "pair paused": {**enabled, "enabled": False}}
+        for name, stopped in stops.items():
+            with self.subTest(name):
+                self.busy_account_events()
+                for _ in range(threshold - 1):
+                    self.revoked_round()
+                self.assertEqual(self.state()["snapshot_revoked_skips"], threshold - 1)
+                self.snapshot_handler = None
+                if stopped is None:
+                    self.balances.update(long="2000", short="2000")
+                    self.due()
+                    result = self.balancer.tick(self.pair, self.snapshots())
+                    self.assertEqual(result["status"], "waiting", result)
+                    self.balances.update(long="3000", short="1000")
+                else:
+                    self.pair = self.store.save_pair(validate_pair({**stopped, "revision": self.pair["revision"]}))
+                    result = self.balancer.tick(self.pair, self.snapshots())
+                    self.assertIn(result["status"], {"disabled", "paused"}, result)
+                    self.pair = self.store.save_pair(validate_pair({**enabled, "revision": self.pair["revision"]}))
+                self.assertNotIn("snapshot_revoked_skips", self.state())
+                self.assertEqual(len(self.posts()), 0)
+                # The next streak starts from one and needs the full threshold again.
+                self.busy_account_events()
+                result, levels = self.revoked_round()
+                self.assertEqual((self.state()["snapshot_revoked_skips"], levels), (1, ["INFO"]))
+                self.assertNotIn("请留意", result["reason"])
+                self.snapshot_handler = None
+                state = self.state()
+                state.pop("snapshot_revoked_skips")
+                self.store.put("pair_margin:gold", state)
+
     def test_throttled_snapshot_defers_the_transfer_like_any_throttle_and_never_leaves_it_unknown(self):
         self.snapshot_handler = lambda aid, params, request: httpx.Response(
             429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
