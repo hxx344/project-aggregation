@@ -57,6 +57,8 @@ test('account identity is independent of API key revision, parent, and decimal U
   assert.throws(() => accountKey({ ...identity(), apiKey: 'forbidden' }), code('INVALID_IDENTITY'));
   const wallet = `0x${'Aa'.repeat(20)}`;
   assert.equal(normalizeAccountIdentity(identity(wallet, { authority: 'aster' })).accountId, wallet.toLowerCase());
+  assert.equal(normalizeAccountIdentity(identity(wallet, { authority: 'hyperliquid' })).accountId, wallet.toLowerCase());
+  for (const bad of ['123', `0x${'g'.repeat(40)}`, `0x${'a'.repeat(39)}`]) assert.throws(() => accountKey(identity(bad, { authority: 'hyperliquid' })), code('INVALID_IDENTITY'));
   const old = bindClaim(writer);
   writer.bind('connection-0', identity(), 2);
   assert.throws(() => writer.assertOwned(old, 0), code('BINDING_CHANGED'));
@@ -638,6 +640,15 @@ test('crashed marker publisher recovers only its proven dead-process temporary l
   const peer = await pythonPeer(t, f.databasePath, 'hub');
   assert.equal((await peer.call('claim', [identity()])).result.claims[0].fence, 2);
   await peer.close();
+});
+
+test('Python and Node derive the same Hyperliquid wallet account key from any address case', async (t) => {
+  const f = fixture(t); const python = await pythonPeer(t, f.databasePath);
+  const mixed = { authority: 'hyperliquid', environment: 'mainnet', accountId: `0x${'aB'.repeat(20)}` };
+  assert.ok((await python.call('bind', 'python', mixed, 1)).result.verified);
+  const ticket = (await python.call('claim', [mixed])).result;
+  assert.equal(ticket.claims[0].accountKey, accountKey({ ...mixed, accountId: mixed.accountId.toLowerCase() }));
+  await python.close();
 });
 
 test('native Node and Python processes contend for the same SQLite account and retain permanent module pin', async (t) => {

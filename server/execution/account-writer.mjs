@@ -9,7 +9,7 @@ const HEARTBEAT_MS = 5_000;
 const SAFETY_MS = 10_000;
 // Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance.
 const ASTER_WRITE_EXPIRY_MS = 120_000;
-const AUTHORITIES = new Set(['binance', 'bybit', 'okx', 'gate-crossex', 'aster']);
+const AUTHORITIES = new Set(['binance', 'bybit', 'okx', 'gate-crossex', 'aster', 'hyperliquid']);
 const ENVIRONMENTS = new Set(['mainnet', 'testnet', 'demo']);
 const SECRET_KEY = /^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$/i;
 const RECOVERY_IDS = ['authorityId', 'recoveryId', 'checkpointId', 'handoffId', 'sourceAuthorityId'];
@@ -30,7 +30,8 @@ function normalizeScope(scope) {
   return { authority: scope.authority, environment: scope.environment };
 }
 function normalizeUid(value, authority) {
-  if (authority === 'aster') {
+  // Wallet-addressed venues: the master account address, compared case-insensitively.
+  if (authority === 'aster' || authority === 'hyperliquid') {
     if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(value)) fail('INVALID_IDENTITY');
     return value.toLowerCase();
   }

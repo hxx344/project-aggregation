@@ -149,7 +149,7 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     return { identity: result.identity };
   });
   const account = wrapped(async (credentials, { accountMode, signal, symbols } = {}) => {
-    const mode = modeOf(accountMode), selected = executionSymbols(symbols);
+    const mode = modeOf(accountMode), selected = executionSymbols(symbols, OKX_EXECUTION_SYMBOLS);
     if (!selected || selected.some(symbol => !OKX_EXECUTION_SYMBOLS.includes(symbol))) fail('input');
     const config = await permissionSnapshot(credentials, signal);
     const positions = [], openOrders = [], modes = {}, seen = new Set();

@@ -1,5 +1,8 @@
 import type { TradingExchange } from './trading-types';
-import type { ExecutionMarket, ExecutionQuoteBook, ExecutionQuotes, ExecutionSymbol } from './trading-execution-types';
+import type { ExecutionExchange, ExecutionQuoteBook, ExecutionQuotes, ExecutionSymbol } from './trading-execution-types';
+
+/** Markets with one fixed contract pair per venue; Anthropic has its own view (trading-anthropic.ts). */
+export type SpreadMarket = 'oil' | 'hynix';
 
 /**
  * Display-only spreads for the arbitrage page, computed from top of book.
@@ -9,7 +12,7 @@ import type { ExecutionMarket, ExecutionQuoteBook, ExecutionQuotes, ExecutionSym
  * percent of B; the executable edge sells at one venue's bid and buys at the
  * other's ask, percent of that ask. Values are floats for display only.
  */
-export const SPREAD_MARKETS: Record<ExecutionMarket, { name: string; base: ExecutionSymbol; other: ExecutionSymbol; baseLabel: string; otherLabel: string; ratio: number; spreadLabel: string }> = {
+export const SPREAD_MARKETS: Record<SpreadMarket, { name: string; base: ExecutionSymbol; other: ExecutionSymbol; baseLabel: string; otherLabel: string; ratio: number; spreadLabel: string }> = {
   oil: { name: '原油', base: 'CLUSDT', other: 'BZUSDT', baseLabel: 'CL', otherLabel: 'BZ', ratio: 1, spreadLabel: 'BZ − CL' },
   hynix: { name: '海力士', base: 'SKHYNIXUSDT', other: 'SKHYUSDT', baseLabel: '正股', otherLabel: 'ADR', ratio: 10, spreadLabel: 'ADR − 正股 ÷ 10' },
 };
@@ -23,7 +26,7 @@ const fraction = (value: string) => value.split('.')[1]?.length ?? 0;
 const price = (value: unknown) => typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) && Number(value) > 0 ? Number(value) : null;
 
 /** Parses one leg; a leg read more than maxAgeMs before the server reply is stale. */
-export function readBook(quotes: ExecutionQuotes, exchange: TradingExchange, symbol: ExecutionSymbol): BookRead {
+export function readBook(quotes: ExecutionQuotes, exchange: ExecutionExchange, symbol: ExecutionSymbol): BookRead {
   const row: ExecutionQuoteBook | undefined = quotes.books.find(book => book.exchange === exchange && book.symbol === symbol);
   if (!row) return { book: null, error: '未取得盘口' };
   if (row.error) return { book: null, error: row.error };
@@ -33,7 +36,7 @@ export function readBook(quotes: ExecutionQuotes, exchange: TradingExchange, sym
 }
 
 /** Same-venue spread of a market: other leg minus base leg (base scaled by the market ratio). */
-export function venueSpread(market: ExecutionMarket, base: Book | null, other: Book | null): Spread | null {
+export function venueSpread(market: SpreadMarket, base: Book | null, other: Book | null): Spread | null {
   if (!base || !other) return null;
   const reference = base.mid / SPREAD_MARKETS[market].ratio;
   return { value: other.mid - reference, percent: (other.mid / reference - 1) * 100, digits: Math.max(base.digits, other.digits), stale: base.stale || other.stale };

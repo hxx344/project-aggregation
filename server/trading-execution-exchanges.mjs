@@ -1,7 +1,8 @@
 import { createHmac, createHash } from 'node:crypto';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
-import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
+import { createHyperliquidExecutionClient } from './trading-hyperliquid-execution.mjs';
+import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs';
 
 /**
  * Restricted live execution protocol. No caller-supplied host, path, order type,
@@ -80,7 +81,6 @@ import { EXECUTION_ALL_SYMBOLS, executionSymbols } from './trading-markets.mjs';
  * https://bybit-exchange.github.io/docs/v5/user/apikey-info
  */
 
-const SYMBOLS = EXECUTION_ALL_SYMBOLS;
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_PAGES = 40;
 const MAX_ROWS = 2000;
@@ -305,8 +305,10 @@ function upstreamFailure(exchange, status, data, mutation) {
 
 export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000 } = {}) {
   if (exchange === 'okx') return createOkxExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
+  if (exchange === 'hyperliquid') return createHyperliquidExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
   if (!['binance', 'bybit'].includes(exchange) || typeof fetchImpl !== 'function' || typeof now !== 'function'
       || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) fail('configuration');
+  const SYMBOLS = EXECUTION_VENUE_SYMBOLS[exchange];
   let timeOffset = 0;
   const ruleCache = new Map();
   let identityEvidence = null;
@@ -558,7 +560,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   }
 
   async function account(credentials, { accountMode, signal, requireIdentity = false, symbols } = {}) {
-    const options = { accountMode: modeOf(accountMode), signal, requireIdentity }, selected = executionSymbols(symbols);
+    const options = { accountMode: modeOf(accountMode), signal, requireIdentity }, selected = executionSymbols(symbols, SYMBOLS);
     if (!selected) fail('input');
     const snapshot = await permissionSnapshot(credentials, options);
     const positions = [], openOrders = [], strategies = [], modes = {}, seenOrders = new Set(), seenStrategies = new Set();

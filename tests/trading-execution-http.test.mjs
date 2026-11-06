@@ -14,6 +14,8 @@ const PASSWORD = 'execution-http-fixture-password';
 const PREFIX = '/api/trading/execution';
 const credentials = suffix => ({ apiKey: `fixture_key_sensitive_${suffix}`, apiSecret: `fixture_secret_sensitive_${suffix}` });
 const stamp = time => new Date(time).toISOString();
+// Fixture-only wallet strings; the client factory is mocked and never signs.
+const WALLET = { address: '0x' + 'a1'.repeat(20), agent: '0x' + 'b2'.repeat(18) + '7e57', agentKey: '0x' + 'c3d4'.repeat(16) };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const leg = (exchange, symbol, side) => ({ exchange, symbol, side, quantity: '2', stopPrice: side === 'long' ? '90' : '50' });
 function intent(preset = 'cross-exchange') {
@@ -32,12 +34,13 @@ async function fixture(t) {
     identity: exchange === 'bybit' ? 'fixture-uid' : null,
     modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [],
   }]));
+  accounts.hyperliquid = { identity: WALLET.address, modes: { 'io:ANTH': 'one-way', 'xyz:ANT': 'one-way' }, positions: [], openOrders: [], strategies: [], leverage: { 'io:ANTH': { type: 'isolated', value: 5 }, 'xyz:ANT': { type: 'cross', value: 5 } } };
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: stamp(clock),
     rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
   const executionClientFactory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'inspect', 'stop'].map(method => [method, async (...args) => {
     calls.push({ exchange, method, args });
     if (handlers[`${exchange}:${method}`]) return handlers[`${exchange}:${method}`](...args);
-    if (method === 'verify') return { identity: accounts[exchange].identity };
+    if (method === 'verify') return { identity: accounts[exchange].identity, ...(exchange === 'hyperliquid' ? { agentAddress: WALLET.agent } : {}) };
     if (method === 'account') return structuredClone(accounts[exchange]);
     if (method === 'market') return market(args[0]);
     const spec = args[1];
@@ -203,6 +206,23 @@ test('OKX execution connection requires a Passphrase, persists isolated mode and
     for (const secret of Object.values(live)) assert.equal(content.includes(Buffer.from(secret)), false);
   }
   assert.equal(f.readOnlyCalls.length, 0); assert.equal(f.mutations.length, 0);
+});
+
+test('a Hyperliquid API wallet connects over HTTP and its private key never leaves the encrypted store', async t => {
+  const f = await fixture(t); await f.login();
+  const route = `${PREFIX}/accounts/hyperliquid`, body = { revision: 0, accountMode: 'agent', address: WALLET.address.toUpperCase().replace('0X', '0x'), agentKey: WALLET.agentKey };
+  for (const patch of [{ agentKey: undefined }, { address: '0x1234' }, { accountMode: 'cross' }, { apiKey: 'fixture_key_sensitive_x' }]) assert.equal((await f.request(route, { method: 'PUT', body: { ...body, ...patch } })).status, 400);
+  assert.equal(f.calls.length, 0);
+  const connected = await f.request(route, { method: 'PUT', body });
+  assert.equal(connected.status, 200);
+  const view = connected.data.connections.find(row => row.exchange === 'hyperliquid');
+  assert.deepEqual({ connected: view.connected, accountMode: view.accountMode, keyLabel: view.keyLabel, identity: view.identity }, { connected: true, accountMode: 'agent', keyLabel: '7e57', identity: WALLET.address });
+  assert.ok(f.calls.every(call => call.args[0].address === WALLET.address && call.args[0].agentKey === WALLET.agentKey));
+  for (const response of [connected, await f.request(PREFIX), await f.request('/api/trading')]) assert.equal(JSON.stringify(response.data).includes(WALLET.agentKey.slice(2)), false);
+  for (const filename of (await readdir(f.dataDir)).filter(name => /^hub\.sqlite/.test(name))) assert.equal((await readFile(path.join(f.dataDir, filename))).includes(Buffer.from(WALLET.agentKey.slice(2))), false);
+  const removed = await f.request(route, { method: 'DELETE', body: { revision: 1 } });
+  assert.equal(removed.status, 200); assert.equal(removed.data.connections.find(row => row.exchange === 'hyperliquid').connected, false);
+  assert.equal(f.readOnlyCalls.length, 0);
 });
 
 test('execution HTTP rejects market-order fields, injected internal options and malformed JSON before exchange reads', async t => {
@@ -396,6 +416,7 @@ test('native execution writes hold an execution entry and are refused by the dur
   for (const [route, method, body] of [
     [`${PREFIX}/accounts/binance`, 'PUT', { revision: revision('binance'), accountMode: 'standard', ...credentials('binance') }],
     [`${PREFIX}/accounts/bybit`, 'DELETE', { revision: revision('bybit') }],
+    [`${PREFIX}/accounts/hyperliquid`, 'PUT', { revision: revision('hyperliquid'), accountMode: 'agent', address: WALLET.address, agentKey: WALLET.agentKey }],
     [`${PREFIX}/preview`, 'POST', intent()],
     [`${PREFIX}/jobs`, 'POST', { previewId: randomUUID(), requestId: randomUUID(), confirmLive: true }]]) {
     const refused = await f.request(route, { method, body });

@@ -684,8 +684,8 @@ test('Binance TradFi perpetual rules and SK hynix symbols are tradable; account 
   assert.deepEqual(snapshot.modes, { SKHYUSDT: 'one-way' });
   const read = calls.filter(call => call.url.pathname.endsWith('/positionRisk')).map(call => call.url.searchParams.get('symbol'));
   assert.deepEqual(read, ['SKHYUSDT']);
-  assert.deepEqual(Object.keys((await client.account(credentials)).modes), ['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT']);
-  for (const symbols of [[], ['ETHUSDT'], 'CLUSDT']) await assert.rejects(client.account(credentials, { symbols }), isError('input'));
+  assert.deepEqual(Object.keys((await client.account(credentials)).modes), ['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT', 'ANTHROPICUSDT']);
+  for (const symbols of [[], ['ETHUSDT'], 'CLUSDT', ['io:ANTH']]) await assert.rejects(client.account(credentials, { symbols }), isError('input'));
 });
 
 const MARKET_ORDER = 'fd4300ae-7847-404e-b947-b46980a4d140';
