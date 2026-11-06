@@ -3,14 +3,14 @@ import { chmodSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { chinaDate, db, getLedger, withLock } from './store';
 import { seedLedger, type SourceLedger } from './seed';
-import { EXAMPLE_SOURCE, parseSource, isGateProject } from './source-ledger';
+import { EXAMPLE_SOURCE, parseSource, isGateProject, isHyperliquidProject } from './source-ledger';
 import { snapshotValues, configuredExchanges, quantityValue, withMarketQuantity, UNKNOWN_QUANTITY_ERROR } from './asset-values';
 import type { Asset, Ledger } from './types';
 
 function importPlan(source: SourceLedger, current: Ledger, previous: SourceLedger) {
   const imported = seedLedger(source), old = seedLedger(previous);
   const retained: string[] = [], matched = new Set<string>();
-  const key = (asset: Asset) => asset.mode === 'manual' ? isGateProject(asset.project) ? 'gate' : asset.project + '\0' + asset.kind : asset.mode;
+  const key = (asset: Asset) => asset.mode === 'manual' ? isGateProject(asset.project) ? 'gate' : isHyperliquidProject(asset.project) ? 'hyperliquid' : asset.project + '\0' + asset.kind : asset.mode;
   const edited = (asset: Asset) => {
     const base = old.assets.find(a => a.id === asset.id);
     return !base || asset.quantity !== base.quantity || (asset.mode === 'manual' && (asset.price !== base.price || asset.value !== base.value));
@@ -21,7 +21,7 @@ function importPlan(source: SourceLedger, current: Ledger, previous: SourceLedge
     const saved = existing[0];
     if (!saved) return asset;
     matched.add(saved.id);
-    if ((asset.mode === 'bybit' || asset.mode === 'aster' || asset.mode === 'binance' || asset.mode === 'okx' || asset.mode === 'gate' || asset.mode === 'variational') && (current.connections[asset.mode].configured || current.connections[asset.mode].lastSync)) {
+    if ((asset.mode === 'bybit' || asset.mode === 'aster' || asset.mode === 'binance' || asset.mode === 'okx' || asset.mode === 'gate' || asset.mode === 'variational' || asset.mode === 'hyperliquid') && (current.connections[asset.mode].configured || current.connections[asset.mode].lastSync)) {
       retained.push(asset.project + ' 已同步余额');
       return { ...saved, id: asset.id, cell: asset.cell };
     }
@@ -40,7 +40,7 @@ function importPlan(source: SourceLedger, current: Ledger, previous: SourceLedge
   });
   let nextId = Math.max(...imported.assets.map(a => Number(a.id.slice(4)))) + 1;
   for (const asset of current.assets) {
-    const syncedWallet = (asset.mode === 'binance' || asset.mode === 'okx' || asset.mode === 'gate' || asset.mode === 'variational') && (current.connections[asset.mode].configured || current.connections[asset.mode].lastSync);
+    const syncedWallet = (asset.mode === 'binance' || asset.mode === 'okx' || asset.mode === 'gate' || asset.mode === 'variational' || asset.mode === 'hyperliquid') && (current.connections[asset.mode].configured || current.connections[asset.mode].lastSync);
     if (!matched.has(asset.id) && (edited(asset) || syncedWallet)) {
       imported.assets.push({ ...asset, id: 'row-' + nextId++ });
       retained.push(asset.project + (syncedWallet ? ' 已同步余额（额外保留）' : ' 手动修改（额外保留）'));

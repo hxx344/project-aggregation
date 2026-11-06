@@ -335,6 +335,9 @@ test('asset freshness follows dynamic mode rows and preserves manual valuation d
     assert.equal(oldVar.updatedAt, old); assert.equal(oldVar.freshness, undefined);
     const failedVar = await read([{ ...dynamic, mode: 'variational', error: '同步失败' }]);
     assert.equal(failedVar.partial, true); assert.doesNotMatch(failedVar.message, /未识别/);
+  const hyperliquid = await read([manual, { ...dynamic, id: 'hyperliquid', project: 'Hyperliquid', mode: 'hyperliquid' }]);
+  assert.equal(hyperliquid.partial, false); assert.equal(hyperliquid.updatedAt, now); assert.doesNotMatch(hyperliquid.message, /未识别/);
+  assert.equal(hyperliquid.metrics.find(metric => metric.key === 'ledger_total').value, 150);
   const staticOnly = await read([manual]);
   assert.equal(staticOnly.freshness, 'static'); assert.equal(staticOnly.updatedAt, old); assert.match(staticOnly.message, /静态估值/);
   const unknown = await read([{ ...manual, mode: 'new-source' }]);

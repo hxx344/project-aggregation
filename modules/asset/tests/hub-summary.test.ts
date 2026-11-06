@@ -59,9 +59,19 @@ test('Gate USD estimates count once and retain source failure and age in the sum
   assert.doesNotMatch(failed.health.message,/未识别/);
 });
 
+test('Hyperliquid account values are a recognised live source', () => {
+  const read = (row: ReturnType<typeof asset> & {error?: string}) => buildHubSummary({...input(),assets:[row]},now).data;
+  const current = read(asset('hyperliquid',fresh,88.5));
+  assert.equal(current.health.state,'online');
+  assert.equal(current.metrics[0].value,88.5);
+  assert.doesNotMatch(current.health.message,/未识别/);
+  assert.equal(read(asset('hyperliquid','2020-01-01T00:00:00Z')).health.state,'stale');
+  assert.equal(read({...asset('hyperliquid'),error:'Hyperliquid 读取失败'}).health.state,'partial');
+});
+
 test('disconnected single-account exchanges retain valuations without a live freshness requirement', () => {
   const old = '2020-01-01T00:00:00.000Z';
-  for (const mode of ['bybit', 'binance', 'okx', 'gate', 'variational']) {
+  for (const mode of ['bybit', 'binance', 'okx', 'gate', 'variational', 'hyperliquid']) {
     const source = { ...input(), connectedExchanges: [], assets: [{ ...asset(mode, old, 123.45), error: 'Previous sync failed' }] };
     const original = structuredClone(source);
     const summary = buildHubSummary(source, now).data;

@@ -8,7 +8,7 @@ import { join } from 'node:path';
 // Run the real lib/store.ts: resolve its extensionless imports and swap only the modules with
 // external effects (exchanges, vault, positions cache, database file) for tests/fixtures/store-fakes.ts.
 const fakes = new URL('./fixtures/store-fakes.ts', import.meta.url).href;
-const faked = new Set(['./exchanges', './okx', './gate', './variational', './fx', './vault', './hub-positions', './sqlite']);
+const faked = new Set(['./exchanges', './okx', './gate', './variational', './hyperliquid', './fx', './vault', './hub-positions', './sqlite']);
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.endsWith('/lib/store.ts') && faked.has(specifier)) return { url: fakes, shortCircuit: true };
@@ -107,4 +107,39 @@ test('a live refresh renews its lease past the TTL, keeps edits out and releases
   assert.deepEqual(ledger.asterAccounts.map(a => [a.id, a.value, a.error]), [['d0', 200, null], ['d1', 200, null], ['d2', 100, 'Aster 请求超时'], ['d3', 200, null]]);
   await store.deleteAsterAccount(owner, 'd3', 'remove');
   assert.deepEqual((await store.getLedger(owner)).asterAccounts.map(a => a.id), ['d0', 'd1', 'd2']);
+});
+
+test('Hyperliquid connects by address, keeps the last value on failed refreshes and hides unexpected errors', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.parse('2026-10-30T04:00:00Z') });
+  const owner = 'hyperliquid-owner', walletAddress = '0x' + 'ab'.repeat(19) + 'c1';
+  control.hyperliquid = 123.4;
+  let ledger = await store.connect(owner, { exchange: 'hyperliquid', walletAddress });
+  const created = ledger.assets.find(a => a.mode === 'hyperliquid')!;
+  assert.deepEqual([created.project, created.value, created.status], ['Hyperliquid', 123.4, '只读同步 · 估值时间']);
+  assert.deepEqual([ledger.connections.hyperliquid.configured, ledger.connections.hyperliquid.label], [true, 'abc1']);
+  assert.deepEqual(control.hyperliquidCalls.splice(0), [{ walletAddress, verifyRole: true }]);
+  await assert.rejects(store.editAsset(owner, { id: created.id, quantity: 1, price: 1 }), /只读接口/);
+
+  control.hyperliquid = new Error('Hyperliquid 读取受到限流（HTTP 429）：请稍后重试并减少手动刷新；已保留上次数据');
+  ledger = await store.refresh(owner);
+  let asset = ledger.assets.find(a => a.mode === 'hyperliquid')!;
+  assert.deepEqual([asset.value, asset.status, asset.error], [123.4, '同步失败 · 保留旧值', control.hyperliquid.message]);
+  assert.equal(ledger.connections.hyperliquid.error, control.hyperliquid.message);
+  assert.deepEqual(control.hyperliquidCalls.splice(0), [{ walletAddress, verifyRole: false }]);
+
+  t.mock.timers.tick(31_000);
+  control.hyperliquid = new Error('connect ETIMEDOUT secret-host');
+  asset = (await store.refresh(owner)).assets.find(a => a.mode === 'hyperliquid')!;
+  assert.equal(asset.error, 'Hyperliquid 同步失败，请更新连接或稍后重试；已保留上次数据');
+
+  t.mock.timers.tick(31_000);
+  control.hyperliquid = 200;
+  ledger = await store.refresh(owner);
+  asset = ledger.assets.find(a => a.mode === 'hyperliquid')!;
+  assert.deepEqual([asset.value, asset.status, asset.error, ledger.connections.hyperliquid.error], [200, '只读同步 · 估值时间', undefined, null]);
+  assert.equal(ledger.assets.filter(a => a.mode === 'hyperliquid').length, 1, 'refresh and reconnect reuse one asset row');
+
+  ledger = await store.disconnect(owner, 'hyperliquid');
+  asset = ledger.assets.find(a => a.mode === 'hyperliquid')!;
+  assert.deepEqual([ledger.connections.hyperliquid.configured, asset.value, asset.status], [false, 200, '已断开 · 保留旧值']);
 });

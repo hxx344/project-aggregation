@@ -66,6 +66,7 @@ Entropy / Lighter 的 SNDK、ANTH 研究使用[工作台内置工具](docs/entro
 
 - [部署与迁移](docs/deployment.md)
 - [Gate 资产连接](docs/gate-assets.md)
+- [Hyperliquid 资产连接](docs/hyperliquid-assets.md)
 - [本地路由配置](docs/local-route.md)
 - [协作规则](AGENTS.md)、[经验记录](LESSONS.md)、[代码规范](docs/code-standards.md)
 - [文件组织](docs/FILE_ORGANIZATION.md)
