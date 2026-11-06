@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
-import type { AeroSafeAction, AeroSafeChain, AeroSafeChangeBatch, AeroSafePreview, AeroSafeState } from './aero-safe-types';
+import type { AeroPoolPolicy, AeroPoolState, AeroSafeAction, AeroSafeChain, AeroSafeChangeBatch, AeroSafePreview, AeroSafeState } from './aero-safe-types';
 
 export const AERO_SAFE_ROOT = '/api/automation/aero-safe';
 // 加池、生成批次、核对启用：服务端从收到请求起 50 秒内（含排队）给出结果，API 转发时限 60 秒；
@@ -41,6 +41,14 @@ export function poolStatus(state: AeroSafeState | null | undefined, pool: { addr
   if (state?.changes?.pools.some((p) => same(p.address, pool.address))) return 'queued';
   return null;
 }
+
+export const POOL_STATE_TEXT: Record<AeroPoolState, string> = { active: '运行', reduce: '只减不加', stopped: '已停止' };
+const POLICY_DEFAULT: AeroPoolPolicy = { state: 'active', capUsd: null, auto: true };
+// 某池的仓位策略（没写的池子为默认：运行、不限、参与自动调仓）。
+export const policyRule = (state: AeroSafeState | null | undefined, pool: string): AeroPoolPolicy => state?.policy?.pools[pool.toLowerCase()] ?? POLICY_DEFAULT;
+export const usd = (value: number) => `$${Math.round(value).toLocaleString('zh-CN')}`;
+// 上限按设置的原值显示（最多两位小数），不四舍五入成看起来更高的整数。
+export const usdCap = (value: number) => `$${value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
 
 // 页面与池详情面板共用：任务运行或交易待确认时每 3 秒轮询，否则 15 秒。
 export function useAeroSafe(onExpired: () => void) {
@@ -112,8 +120,10 @@ export function rewardSellTarget(state: AeroSafeState | null) {
 }
 
 // 领取、解押、平仓之后的自动卖出说明，写进确认框。
-export function autoSellNote(state: AeroSafeState | null) {
+// pool 给出且本池含 AERO 时撤出不卖（收回的 AERO 是本金）。
+export function autoSellNote(state: AeroSafeState | null, pool?: { token0: string; token1: string }) {
   const target = rewardSellTarget(state);
   if (!state?.config?.autoSellRewards || !target) return '';
+  if (pool && [pool.token0, pool.token1].some((t) => tokenOf(state.chain, t)?.symbol === 'AERO')) return '\n\n本池含 AERO，撤出后不自动卖出 AERO。';
   return `\n\n完成后会自动把 Safe 里的全部 AERO（不超过今日额度、不少于 ${state.config.minRewardSell}）卖成 ${target}。`;
 }

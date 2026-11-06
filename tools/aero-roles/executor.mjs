@@ -583,7 +583,18 @@ async function quoteSwap(ctx, route, amountIn) {
   }
 }
 
-export async function swap(ctx, hooks, { tokenIn, tokenOut, amountIn, slippageBps }) {
+// 价格冲击：同一路径上千分之一数量的报价作为参考价，整笔报价比参考价少多少（基点）。参考量报价为 0（数量太小）时无法判断，返回 null。
+export async function swapImpactBps(ctx, route, amountIn, amountOut) {
+  const ref = amountIn / 1000n;
+  if (ref === 0n) return null;
+  const { amountOut: refOut } = await quoteSwap(ctx, route, ref);
+  if (refOut === 0n) return null;
+  const ratio = (amountOut * ref * 10_000n) / (refOut * amountIn);
+  return ratio >= 10_000n ? 0 : Number(10_000n - ratio);
+}
+
+// maxImpactBps 给出时，价格冲击超过它就不发送（code 'impact'）：滑点只防报价之后的价格变动，防不住在浅池里一次卖太多。
+export async function swap(ctx, hooks, { tokenIn, tokenOut, amountIn, slippageBps, maxImpactBps = null }) {
   const route = swapRoute(ctx, tokenIn, tokenOut);
   if (amountIn <= 0n) throw new ExecError('兑换数量须大于 0');
   const held = await balanceOf(ctx, route.tokenIn);
@@ -591,6 +602,10 @@ export async function swap(ctx, hooks, { tokenIn, tokenOut, amountIn, slippageBp
   await ensureApprovals(ctx, hooks, [{ token: route.tokenIn, spender: AERO.swapRouter, amount: amountIn }]);
   const { params, amountOut } = await quoteSwap(ctx, route, amountIn);
   if (amountOut === 0n) throw new ExecError('兑换报价为 0，未发送');
+  if (maxImpactBps !== null) {
+    const impact = await swapImpactBps(ctx, route, amountIn, amountOut);
+    if (impact !== null && impact > maxImpactBps) throw new ExecError(`价格冲击约 ${impact / 100}%，超过上限 ${maxImpactBps / 100}%，未兑换`, { code: 'impact' });
+  }
   const before = await balanceOf(ctx, route.tokenOut);
   const symbol = (t) => ctx.tokens.get(t)?.symbol ?? t;
   hooks.moving?.('swap'); // 下一笔签名的是会挪动资金的兑换（自动调仓据此记录"已签名、结果未落定"）
@@ -719,7 +734,7 @@ export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, t
   return { tokenId, amount0: quote.amount0, amount1: quote.amount1 };
 }
 
-async function locate(ctx, tokenId) {
+export async function locate(ctx, tokenId) {
   const p = await read(`头寸 #${tokenId}`, () => call(ctx.rpc, NPM_I, AERO.nft, 'positions', [tokenId]));
   const pool = ctx.pools.find((x) => x.token0 === getAddress(p.token0) && x.token1 === getAddress(p.token1) && x.tickSpacing === Number(p.tickSpacing));
   if (!pool) throw new ExecError(`头寸 #${tokenId} 不属于白名单池子`);
@@ -768,6 +783,49 @@ export async function closePosition(ctx, hooks, { tokenId, slippageBps, acceptPe
   calls.push(tx(AERO.nft, NPM_I, 'burn', [tokenId]));
   await sendRoleTx(ctx, hooks, `平仓 #${tokenId}`, calls);
   return { closed: true };
+}
+
+// 减仓：解押（如已质押）→ 按比例 decreaseLiquidity + collect（不销毁 NFT）→ 原来已质押的重新质押（罚没期从重新质押起算）。
+// shareBps 为 10000 时等同平仓，请用 closePosition。收回的币与本头寸未领的手续费一起回到 Safe。
+export async function reducePosition(ctx, hooks, { tokenId, shareBps, slippageBps, acceptPenalty = false }) {
+  if (!Number.isInteger(shareBps) || shareBps < 1 || shareBps >= 10_000) throw new ExecError('减仓比例须在 0.01% 到 99.99% 之间；全部撤出请用平仓');
+  const { position, staked } = await locate(ctx, tokenId);
+  const liquidity = (position.liquidity * BigInt(shareBps)) / 10_000n;
+  if (liquidity === 0n) throw new ExecError(`头寸 #${tokenId} 按 ${shareBps / 100}% 撤出的流动性为 0，未发送`);
+  if (staked) { hooks.step?.('解押'); await unstakePosition(ctx, hooks, { tokenId, acceptPenalty }); }
+  hooks.step?.('撤出部分流动性');
+  const params = { tokenId, liquidity, amount0Min: 0n, amount1Min: 0n, deadline: await deadline(ctx) };
+  let quote;
+  try { quote = await call(ctx.rpc, NPM_I, AERO.nft, 'decreaseLiquidity', [params], ctx.safe); } catch (error) { throw new ExecError(`撤出报价失败：${errorText(error)}`, { signed: staked }); }
+  await sendRoleTx(ctx, hooks, `减仓 #${tokenId} ${shareBps / 100}%`, [
+    tx(AERO.nft, NPM_I, 'decreaseLiquidity', [{ ...params, amount0Min: minusBps(quote.amount0, slippageBps), amount1Min: minusBps(quote.amount1, slippageBps) }]),
+    tx(AERO.nft, NPM_I, 'collect', [{ tokenId, recipient: ctx.safe, amount0Max: MAX_UINT128, amount1Max: MAX_UINT128 }]),
+  ]);
+  if (staked) {
+    hooks.step?.('重新质押');
+    try { await stakePosition(ctx, hooks, { tokenId }); } catch (error) {
+      throw new ExecError(`减仓已完成，但头寸 #${tokenId} 重新质押失败：${error.message}。头寸未质押、不领排放，自动调仓也不管它，请在「仓位」手动质押；这次收回的币未卖出、未换币，留在 Safe`, { signed: true, code: error.code });
+    }
+  }
+  return { reduced: true, tokenId, liquidity, restaked: staked };
+}
+
+// 撤出后换成本池的某一种代币：卖出另一种，必须有白名单兑换路径。执行前先校验，免得撤出后才发现换不了。
+export function exitRoute(ctx, pool, exitToken) {
+  let out;
+  try { out = getAddress(exitToken); } catch { throw new ExecError('要换成的代币地址无效'); }
+  if (out !== pool.token0 && out !== pool.token1) throw new ExecError('只能换成本池的两种代币之一');
+  const tokenIn = out === pool.token0 ? pool.token1 : pool.token0;
+  const symbol = (t) => ctx.tokens.get(t)?.symbol ?? t;
+  const route = ctx.permissions.swaps.find((s) => s.tokenIn === tokenIn && s.tokenOut === out);
+  if (!route) throw new ExecError(`白名单里没有 ${symbol(tokenIn)} → ${symbol(out)} 的兑换路径，不能换成 ${symbol(out)}`);
+  return route;
+}
+
+// 某代币今日剩余的 Roles 额度（没有额度键时为 0）。
+export async function remainingAllowance(ctx, token) {
+  const key = allowanceFor(ctx, token)?.key;
+  return key ? (await remainingAllowances(ctx)).allowances.get(key)?.remaining ?? 0n : 0n;
 }
 
 // 领取全部白名单 gauge 上 Safe 的排放（只对有质押的 gauge 发）。

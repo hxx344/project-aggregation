@@ -1410,3 +1410,16 @@ test('a queued pool records the gauge liveness reading; unknown survives a resta
     await restarted.close();
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('exit route needs a whitelisted swap from the other pool token, and reduce rejects a full or empty share before reading the chain', async () => {
+  const USDC = getAddress('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'), OTHER_TOKEN = getAddress('0x44B63aF715D5ef02CC3646a6CE96875e11d69E85'), LONE = getAddress('0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee');
+  const ctx = { permissions, tokens: new Map() };
+  const pool = { token0: OTHER_TOKEN, token1: USDC };
+  assert.equal(executor.exitRoute(ctx, pool, USDC.toLowerCase()).tokenIn, OTHER_TOKEN);
+  assert.equal(executor.exitRoute(ctx, pool, OTHER_TOKEN).tokenIn, USDC);
+  assert.throws(() => executor.exitRoute(ctx, { token0: LONE, token1: USDC }, LONE), /白名单里没有/);
+  assert.throws(() => executor.exitRoute(ctx, pool, LONE), /只能换成本池/);
+  assert.throws(() => executor.exitRoute(ctx, pool, 'nope'), /地址无效/);
+  const untouched = { rpc: new Proxy({}, { get: () => { throw new Error('read the chain'); } }) };
+  for (const shareBps of [0, 10_000, 1.5]) await assert.rejects(executor.reducePosition(untouched, {}, { tokenId: 1n, shareBps, slippageBps: 50 }), /减仓比例/);
+});
