@@ -232,7 +232,7 @@ Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/a
 - Aero「配置」→ 白名单变更：调整已有代币的每日额度，查看、移出待加池，生成批次、核对启用；
 - 行情列表里，已在白名单的池子标「已加池」，在待加池里的标「待加池」。
 
-待变更存在 `aero-safe/changes.json`（重启后仍在），包括待加池（可多个）与额度调整。所有待变更合成一份批次，因为 `scopeFunction` 整体替换函数条件：各自从配置出发生成的批次会互相覆盖 `NPM.mint` 的池 `Or`、`NPM.approve` 的 gauge 列表和兑换 `Or`。上一版的单个加池计划 `pool-plan.json` 启动时转成待变更（连同批次）后删除。
+待变更存在 `aero-safe/changes.json`（重启后仍在），包括待加池（可多个）与额度调整。所有待变更合成一份批次，因为 `scopeFunction` 整体替换函数条件：各自从配置出发生成的批次会互相覆盖 `NPM.mint` 的池 `Or`、`NPM.approve` 的 gauge 列表和兑换 `Or`。上一版的单个加池计划 `pool-plan.json` 启动时转成待变更（连同批次）后删除；这类旧批次没有记录 Safe 与 Roles 地址，一律作废，须重新生成。
 
 - 加入待加池（`POST /api/automation/aero-safe/changes/pool`，`{ pool, allowances: { 代币地址: 每日数量 } }`）：
   - 先链上核验池子（`executor.inspectPool`，与 `cli.mjs plan` 的池子核对相同）：
@@ -249,7 +249,7 @@ Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/a
   - 已有目标上条件变化的函数：重下 `scopeFunction`（整体替换）；
   - 新额度与改动的额度：`setAllowance(key, perDay, perDay, perDay, 86400, 0)`，执行后当天可用额度按新值计满（调低也一样）；未改动的额度不重下。
   - 减少权限（删池、删路径、删额度）一律拒绝。
-  - 批次冻结存入 `changes.json`，返回 Transaction Builder JSON；不改配置、不签名。已有未启用批次时再生成会提示：旧批次如已执行应先核对启用，否则新批次会重复其中的额度设置。生成后又加入的变更不进这份批次，页面标明，启用后继续保留，可再生成下一份。
+  - 批次冻结存入 `changes.json`，返回 Transaction Builder JSON；不改配置、不签名。已有未启用批次时再生成会提示：旧批次如已执行应先核对启用，否则新批次会重复其中的额度设置。页面把冻结内容与最新草稿分开显示：生成后新增的变更不进这份批次，启用后继续保留，可再生成下一份；生成后从草稿撤回或改了值的池子与额度单独警示，已生成的批次文件仍包含它们，在 Safe 执行仍会生效，不想执行须重新生成并只执行新文件。
 - 执行：页面下载 JSON，在 Safe{Wallet} → Transaction Builder 导入，核对后用硬件钱包签名执行。同一批次只执行一次：重复执行会把相关代币当天的额度重置为满额。
 - 启用（`POST /changes/apply`）：只核对冻结的批次，全部通过才并入配置。以 bot 身份 `eth_call` `Roles.execTransactionWithRole(…, shouldRevert = true)`，金额一律为 0，不动资产。逐项核对：
   - 新池 `mint`、`NPM.approve → 新 gauge`；
@@ -257,7 +257,7 @@ Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/a
   - 新兑换路径；
   - 新代币对 NPM / Router 的 `approve`。
 
-  Roles 放行，或只是下游合约自身失败（`ModuleTransactionFailed`），算生效。`NPM.approve` 用链上已有的 tokenId 模拟，`CustomConditionViolation`（头寸不归 Safe）也算 gauge 参数已放行。新增与改动的额度直接读 `Roles.allowances`，补充量、上限和周期必须与批次一致。其他 Roles 拒绝、或非 Roles 原因的回滚都算未生效，配置不变。Safe 配置在生成后又有变化时，批次作废，须重新生成。
+  Roles 放行，或只是下游合约自身失败（`ModuleTransactionFailed`），算生效。`NPM.approve` 用链上已有的 tokenId 模拟，`CustomConditionViolation`（头寸不归 Safe）也算 gauge 参数已放行。新增与改动的额度直接读 `Roles.allowances`，补充量、上限和周期必须与批次一致。其他 Roles 拒绝、或非 Roles 原因的回滚都算未生效，配置不变。权限配置或 Safe/Roles 地址在生成后有变化、或批次没有记录目标地址时，批次作废，须重新生成。链上核对（加池的池子核验同理）在串行队列外等待，不挡自动调仓；回到队列后重新检查登录、维护、运行中的任务与未结清交易，并确认配置、批次与 bot 都没变，才写入配置。配置写入后 `changes.json` 写不进去时页面报告；重启后按配置认出已启用的批次（权限与目标都相同），不要求重新签名，之后排队的变更保留。
 - 容量：Roles 每个函数的条件树最多 255 个节点。兑换 `Or` 每条路径 9 个节点，先用满：每加一个两边都是新代币的池子增加 2 条路径，按初始 3 条路径算，最多约 13 个池子。
 - 分叉演练：`node tools/aero-roles/fork-add-pool.mjs`。2026-11-05 Base 区块 53550378，18/18 通过：
   - 从只含 WETH/USDC ts100 的 Roles 出发，把 WETH/cbBTC ts1 加入待加池并把 USDC 每日额度从 100 万调到 5000，合成 13 笔批次；

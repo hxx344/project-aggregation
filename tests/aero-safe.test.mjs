@@ -643,7 +643,7 @@ test('a batch goes stale when the config changes; removing a pool drops its new-
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
-test('a saved single add-pool plan from the previous version becomes pending changes with its batch', async () => {
+test('a saved single add-pool plan from the previous version becomes pending changes, but its untargeted batch must be regenerated', async () => {
   const directory = fixtureDir();
   const WETH = getAddress('0x4200000000000000000000000000000000000006');
   const POOL = new Wallet('0x' + '99'.repeat(32)).address, GAUGE = new Wallet('0x' + 'aa'.repeat(32)).address;
@@ -655,16 +655,238 @@ test('a saved single add-pool plan from the previous version becomes pending cha
   mkdirSync(join(directory, 'aero-safe'), { recursive: true });
   writeFileSync(join(directory, 'aero-safe/config.json'), JSON.stringify({ schema: 1, ...baseConfig, slippageBps: 50, autoSellRewards: true, minRewardSell: '1' }));
   writeFileSync(join(directory, 'aero-safe/pool-plan.json'), JSON.stringify({ schema: 1, createdAt: 1, pool, baseline: JSON.stringify(permissionsConfig), permissions: next }));
-  const { manager } = managerWith(directory);
+  const chain = { ...fakeChain(), verifyActive: async () => ({ ok: true, checks: [] }) };
+  const { manager } = managerWith(directory, { chain });
   try {
     await manager.initialize();
     const { changes } = manager.state();
     assert.deepEqual(changes.pools.map((p) => p.name), ['WETH/USDC ts100']);
     assert.equal(changes.allowances[0].perDay, '1000000000000000000');
-    assert.deepEqual([changes.batch.transactions, changes.batch.stale, changes.batch.behind], [9, false, false]);
+    // 旧计划没有记录 Safe/Roles：即使权限基线相同也不能核对，须重新生成。
+    assert.deepEqual([changes.batch.transactions, changes.batch.stale, changes.batch.behind], [9, true, false]);
+    assert.match(changes.batch.staleReason, /旧版本.*Safe 与 Roles/);
     assert.equal(existsSync(join(directory, 'aero-safe/pool-plan.json')), false);
     assert.equal(existsSync(join(directory, 'aero-safe/changes.json')), true);
+    await manager.setKey(KEY);
+    await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /旧版本.*重新生成/.test(error.message));
+    // 重启后读回仍拒绝；重新生成的批次带目标，正常核对。
+    await manager.close();
+    const restarted = managerWith(directory, { chain }).manager;
+    await restarted.initialize();
+    assert.equal(restarted.state().changes.batch.stale, true);
+    await assert.rejects(restarted.applyChangeBatch(), (error) => error.status === 409 && /旧版本/.test(error.message));
+    await restarted.buildChangeBatch();
+    assert.equal(restarted.state().changes.batch.stale, false);
+    const state = await restarted.applyChangeBatch();
+    assert.equal(state.config.permissions.pools.length, 2);
+    await restarted.close();
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+// 池子 WETH/USDC（WETH 为新代币）与 WETH/cbBTC 的夹具。
+function twoPools() {
+  const WETH = getAddress('0x4200000000000000000000000000000000000006'), CBBTC = getAddress('0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf');
+  const POOL = new Wallet('0x' + '99'.repeat(32)).address, POOL2 = new Wallet('0x' + '9a'.repeat(32)).address;
+  const weth = { address: WETH, symbol: 'WETH', decimals: 18 }, usdc = { address: USDC, symbol: 'USDC', decimals: 6 }, cbbtc = { address: CBBTC, symbol: 'cbBTC', decimals: 8 };
+  const infos = { [POOL]: { address: POOL, gauge: new Wallet('0x' + 'aa'.repeat(32)).address, tickSpacing: 100, token0: weth, token1: usdc },
+    [POOL2]: { address: POOL2, gauge: new Wallet('0x' + 'ab'.repeat(32)).address, tickSpacing: 1, token0: weth, token1: cbbtc } };
+  return { WETH, CBBTC, POOL, POOL2, infos };
+}
+const deferred = () => { let resolve; const promise = new Promise((r) => { resolve = r; }); return { promise, resolve }; };
+// 串行队列没被占住：排在后面的写操作应在短时间内完成。
+const settlesWithin = (promise, ms = 500) => Promise.race([promise.then(() => true), delay(ms).then(() => false)]);
+
+test('a batch is refused after only the Safe or only the Roles changes, also after a restart; an unchanged batch applies', async () => {
+  const directory = fixtureDir();
+  const { WETH, POOL, infos } = twoPools();
+  const SAFE2 = new Wallet('0x' + 'cc'.repeat(32)).address, ROLES2 = new Wallet('0x' + 'bb'.repeat(32)).address;
+  const probes = [];
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => infos[address], verifyActive: async (args) => { probes.push(args); return { ok: true, checks: [] }; } };
+  let { manager } = managerWith(directory, { chain });
+  const restart = async () => { await manager.close(); ({ manager } = managerWith(directory, { chain })); await manager.initialize(); };
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await manager.setKey(KEY);
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.buildChangeBatch();
+    for (const [label, changed] of [['Safe', { safe: SAFE2 }], ['Roles', { roles: ROLES2 }]]) {
+      await manager.save({ ...baseConfig, ...changed });
+      assert.equal(manager.state().changes.batch.stale, true, `${label} change makes the batch stale`);
+      assert.match(manager.state().changes.batch.staleReason, /Safe 或 Roles 地址/);
+      await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /Safe 或 Roles 地址.*重新生成/.test(error.message));
+      await restart();
+      assert.equal(manager.state().changes.batch.stale, true, `${label} change is still refused after a restart`);
+      await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /重新生成/.test(error.message));
+      // 地址改回生成时的值：权限与目标都相同，批次可以核对。
+      await manager.save(baseConfig);
+      assert.equal(manager.state().changes.batch.stale, false);
+    }
+    assert.equal(probes.length, 0, 'a stale batch never reaches the chain check');
+    await restart();
+    const state = await manager.applyChangeBatch();
+    assert.equal(probes.length, 1);
+    assert.deepEqual([probes[0].safe, probes[0].roles], [SAFE, ROLES]);
+    assert.equal(state.config.permissions.pools.length, 2);
+    assert.equal(state.changes.batch, null);
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('a failed pending-changes write after apply is reported, and a restart recognises the applied batch and keeps newer changes', async () => {
+  const directory = fixtureDir();
+  const { WETH, CBBTC, POOL, POOL2, infos } = twoPools();
+  let verified = 0;
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => infos[address], verifyActive: async () => { verified += 1; return { ok: true, checks: [] }; } };
+  let { manager } = managerWith(directory, { chain });
+  const restart = async () => { await manager.close(); ({ manager } = managerWith(directory, { chain })); await manager.initialize(); };
+  const blocker = join(directory, 'aero-safe/changes.json.tmp');
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await manager.setKey(KEY);
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.buildChangeBatch();
+    // 批次之后排队的变更：不在批次里，启用后须保留。
+    await manager.addPoolChange({ pool: POOL2, allowances: { [CBBTC]: '0.5' } });
+    // 第一次写（config.json）成功，第二次写（changes.json）失败。
+    mkdirSync(blocker);
+    let state = await manager.applyChangeBatch();
+    assert.equal(state.config.permissions.pools.length, 2);
+    assert.equal(state.changes.batch, null);
+    assert.deepEqual(state.changes.pools.map((p) => p.name), ['WETH/cbBTC ts1']);
+    assert.match(state.changes.persistError, /已核对启用并写入配置.*changes\.json 写入失败.*不需要重新签名/);
+    assert.ok(state.events.some((e) => e.event === 'changes_write_failed'));
+    assert.ok(JSON.parse(readFileSync(join(directory, 'aero-safe/changes.json'), 'utf8')).batch, 'the old batch is still on disk');
+
+    // 写入仍失败时重启：按配置认出已启用的批次，新排队的变更保留，页面继续报告。
+    await restart();
+    state = manager.state();
+    assert.equal(state.changes.batch, null);
+    assert.deepEqual(state.changes.pools.map((p) => p.name), ['WETH/cbBTC ts1']);
+    assert.deepEqual(state.changes.allowances.map((a) => [a.symbol, a.perDay]), [['cbBTC', '50000000']]);
+    assert.match(state.changes.persistError, /changes\.json 写入失败/);
+
+    // 数据目录恢复后重启：落盘为整理后的内容，不再报告，也不需要再核对或签名。
+    rmSync(blocker, { recursive: true });
+    await restart();
+    state = manager.state();
+    assert.equal(state.changes.batch, null);
+    assert.equal(state.changes.persistError, null);
+    assert.ok(state.events.some((e) => e.event === 'changes_batch_recognized'));
+    const saved = JSON.parse(readFileSync(join(directory, 'aero-safe/changes.json'), 'utf8'));
+    assert.deepEqual([saved.batch, saved.pools.map((p) => p.name)], [null, ['WETH/cbBTC ts1']]);
+    assert.equal(state.config.permissions.pools.length, 2);
+    await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /还没有生成/.test(error.message));
+    assert.equal(verified, 1, 'the applied batch is not checked or signed again');
+    // 下一份批次只含新排队的池子。
+    const next = await manager.buildChangeBatch();
+    assert.deepEqual(next.state.changes.batch.pools, ['WETH/cbBTC ts1']);
+  } finally { rmSync(blocker, { recursive: true, force: true }); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('the batch view separates frozen items from draft additions and withdrawals, for pools and allowances', async () => {
+  const directory = fixtureDir();
+  const { WETH, CBBTC, POOL, POOL2, infos } = twoPools();
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => infos[address], verifyActive: async () => ({ ok: true, checks: [] }) };
+  const { manager } = managerWith(directory, { chain });
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await until(() => manager.state().chain);
+    await manager.setKey(KEY);
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.setAllowanceChanges({ [USDC]: '500' });
+    let { batch } = (await manager.buildChangeBatch()).state.changes;
+    assert.deepEqual([batch.added, batch.withdrawn], [{ pools: [], allowances: [] }, { pools: [], allowances: [] }]);
+    // 撤回冻结批次里的池子（连带它的新代币额度）、改掉冻结的 USDC 额度、再加一个池子。
+    await manager.removePoolChange({ pool: POOL });
+    await manager.setAllowanceChanges({ [USDC]: '600' });
+    await manager.addPoolChange({ pool: POOL2, allowances: { [WETH]: '2', [CBBTC]: '0.5' } });
+    batch = manager.state().changes.batch;
+    assert.equal(batch.stale, false);
+    assert.equal(batch.behind, true);
+    assert.deepEqual(batch.pools, ['WETH/USDC ts100']); // frozen content is unchanged
+    assert.deepEqual(batch.withdrawn, { pools: ['WETH/USDC ts100'], allowances: [
+      { symbol: 'WETH', perDay: '1000000000000000000', decimals: 18 }, { symbol: 'USDC', perDay: '500000000', decimals: 6 }] });
+    assert.deepEqual(batch.added, { pools: ['WETH/cbBTC ts1'], allowances: [
+      { symbol: 'USDC', perDay: '600000000', decimals: 6 }, { symbol: 'WETH', perDay: '2000000000000000000', decimals: 18 }, { symbol: 'cbBTC', perDay: '50000000', decimals: 8 }] });
+    // 只撤回额度也算撤回：撤回 USDC 调整后草稿里没有它，冻结批次仍会设为 500。
+    await manager.setAllowanceChanges({ [USDC]: null });
+    assert.deepEqual(manager.state().changes.batch.withdrawn.allowances.map((a) => a.symbol), ['WETH', 'USDC']);
+    // 旧批次已在 Safe 执行时核对启用：撤回的池子与额度照样并入配置（链上已生效），新增的继续待变更。
+    const state = await manager.applyChangeBatch();
+    assert.ok(state.config.permissions.pools.some((p) => p.name === 'WETH/USDC ts100'));
+    assert.equal(state.config.permissions.allowances.find((a) => a.token === USDC).perDay, '500000000');
+    assert.deepEqual(state.changes.pools.map((p) => p.name), ['WETH/cbBTC ts1']);
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('slow RPC reads for add-pool and apply wait outside the serial queue and recheck config, login, maintenance and jobs before committing', async () => {
+  const directory = fixtureDir();
+  const { WETH, CBBTC, POOL, POOL2, infos } = twoPools();
+  const ROLES2 = new Wallet('0x' + 'bb'.repeat(32)).address;
+  let maintenance = false, inspectGate = null, verifyGate = null, release;
+  const hang = new Promise((resolve) => { release = resolve; });
+  const chain = { ...fakeChain({ hang }),
+    inspectPool: async (_rpc, address) => { if (inspectGate) await inspectGate.promise; return infos[address]; },
+    verifyActive: async () => { if (verifyGate) await verifyGate.promise; return { ok: true, checks: [] }; } };
+  const { manager } = managerWith(directory, { chain, manager: { readMaintenance: () => maintenance } });
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await until(() => manager.state().chain);
+    await manager.setKey(KEY);
+
+    // 加池：核验池子期间队列可用；配置换了，核验结果不能写入。
+    inspectGate = deferred();
+    const adding = manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    assert.equal(await settlesWithin(manager.setAllowanceChanges({ [USDC]: '700' })), true, 'queue is free while the pool is inspected');
+    await manager.save({ ...baseConfig, roles: ROLES2 });
+    inspectGate.resolve();
+    await assert.rejects(adding, (error) => error.status === 409 && /核验池子期间已变化/.test(error.message));
+    assert.equal(manager.state().changes.pools.length, 0);
+    await manager.save(baseConfig);
+    inspectGate = null;
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.buildChangeBatch();
+
+    const applyWhile = async (during, check, authorize) => {
+      verifyGate = deferred();
+      const applying = manager.applyChangeBatch(authorize);
+      await delay(10);
+      await during();
+      verifyGate.resolve();
+      await assert.rejects(applying, check);
+      verifyGate = null;
+      assert.ok(manager.state().changes.batch, 'the batch is kept for a later apply');
+      assert.equal(manager.state().config.permissions.pools.length, 1);
+    };
+    // 核对期间：队列可用，第二次核对被拒；维护开始则不提交。
+    await applyWhile(async () => {
+      assert.equal(await settlesWithin(manager.addPoolChange({ pool: POOL2, allowances: { [CBBTC]: '0.5' } })), true, 'queue is free while the batch is verified');
+      await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /正在核对/.test(error.message));
+      maintenance = true;
+    }, (error) => error.status === 503 && /维护/.test(error.message));
+    maintenance = false;
+    // 核对期间登录失效：提交前重新验证。
+    let loggedIn = true;
+    await applyWhile(() => { loggedIn = false; }, (error) => error.status === 401,
+      () => { if (!loggedIn) throw Object.assign(new Error('登录已失效'), { status: 401 }); });
+    // 核对期间配置换了 Roles。
+    await applyWhile(() => manager.save({ ...baseConfig, roles: ROLES2 }), (error) => error.status === 409 && /重新生成/.test(error.message));
+    await manager.save(baseConfig);
+    // 核对期间只改执行参数：配置代际变了，要求重新核对。
+    await applyWhile(() => manager.save({ ...baseConfig, slippageBps: 80 }), (error) => error.status === 409 && /核对期间已变化/.test(error.message));
+    // 核对期间启动了任务并签出一笔待确认交易。
+    await applyWhile(async () => { await manager.execute('claim', {}); await until(() => manager.state().pending); },
+      (error) => error.status === 409 && /正在执行/.test(error.message));
+    release();
+    await until(() => manager.state().job?.status === 'done' && !manager.state().pending);
+    // 条件都满足时正常提交；核对期间新排的池子保留。
+    const state = await manager.applyChangeBatch();
+    assert.equal(state.config.permissions.pools.length, 2);
+    assert.deepEqual(state.changes.pools.map((p) => p.name), ['WETH/cbBTC ts1']);
+  } finally { release(); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
 test('the open USD cap only shrinks the share-based amounts, proportionally, and reaches the executor unchanged', async () => {
