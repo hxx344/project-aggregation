@@ -74,7 +74,7 @@ function PositionRow({ pool, position, metrics, market, state, disabled, onActio
     <td className="num">{raw(position.amount0, t0?.decimals)} {t0?.symbol}<small>{raw(position.amount1, t1?.decimals)} {t1?.symbol}</small><small>≈ {usd(m?.valueUsd)}</small></td>
     <YieldCell metrics={m} market={market} />
     <td className="num">{!inRange ? '已出区间' : m ? days(m.daysIn) : '—'}<small>{m ? `日波动 ${pct(m.vol, 2)}` : ''}</small></td>
-    <td>{position.staked ? '已质押' : '未质押'}{m?.stakedSeconds != null ? <small>约 {days(m.stakedSeconds / 86_400)}</small> : null}{penalty ? <small className="as-warn">罚没期还剩约 {penaltyBlocks} 块（≈{Math.ceil(penaltyBlocks * 2 / 60)} 分钟）</small> : null}</td>
+    <td>{position.staked ? '已质押' : '未质押'}{m?.stakedSeconds != null ? <small>约 {days(m.stakedSeconds / 86_400)}</small> : null}{penalty ? <small className="as-warn">罚没期还剩约 {penaltyBlocks} 块{chain.blockSeconds ? `（≈${Math.ceil(penaltyBlocks * chain.blockSeconds / 60)} 分钟）` : ''}</small> : null}</td>
     <td><div className="as-actions">
       {position.staked ? <button type="button" className="button secondary" disabled={disabled} onClick={() => onAction('unstake', position, penalty)}>解押</button>
         : <button type="button" className="button secondary" disabled={disabled} onClick={() => onAction('stake', position, false)}>质押</button>}
@@ -175,7 +175,7 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
   const snapshotAt = market.snapshot?.chains.find((c) => c.id === 'base')?.updatedAt ?? null;
   const rows = useMemo(() => (chain?.pools ?? []).map((pool) => {
     const live = livePool(market.snapshot?.pools, pool);
-    return { pool, live, metrics: new Map(pool.positions.map((p) => [p.tokenId, live ? positionMetrics(live, p, { aeroUsd, blockNumber: chain?.blockNumber ?? null, chainTime: chain?.timestamp ?? null, snapshotAt }) : null])) };
+    return { pool, live, metrics: new Map(pool.positions.map((p) => [p.tokenId, live ? positionMetrics(live, p, { aeroUsd, chainTime: chain?.timestamp ?? null, snapshotAt }) : null])) };
   }), [chain, market.snapshot, aeroUsd, snapshotAt]);
   const all = rows.flatMap((r) => [...r.metrics.values()]).filter((m): m is PositionMetrics => !!m);
   const positionCount = rows.reduce((n, r) => n + r.pool.positions.length, 0);

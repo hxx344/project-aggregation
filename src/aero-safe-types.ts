@@ -9,14 +9,16 @@ export type AeroSafeConfig = { schema?: number; rpcUrl: string; safe: string; ro
 export type AeroSafeToken = { address: string; symbol: string; decimals: number; balance: string | null };
 export type AeroSafePosition = {
   tokenId: string; staked: boolean; tickLower: number; tickUpper: number; liquidity: string; amount0: number | null; amount1: number | null;
-  tokensOwed0: string; tokensOwed1: string; depositBlock: string | null; penaltyUntilBlock: string | null;
+  // depositTime：质押区块的链上时间戳（秒）。
+  tokensOwed0: string; tokensOwed1: string; depositBlock: string | null; depositTime?: number | null; penaltyUntilBlock: string | null;
 };
 export type AeroSafePool = {
   name: string; address: string; gauge: string; token0: string; token1: string; tickSpacing: number; sqrtPriceX96: string; tick: number; feePips: number;
   earned: string; penalty: { minStakeBlocks: string; penaltyRate: string }; positions: AeroSafePosition[];
 };
 export type AeroSafeChain = {
-  blockNumber: number; timestamp: number; bot: string | null; botEth: string | null; inflight: boolean; tokens: AeroSafeToken[]; ownedNfts?: string | null; ownedScanned?: number | null;
+  // blockSeconds：最近一段区块实测的平均出块秒数，读不到时为 null。
+  blockNumber: number; timestamp: number; blockSeconds?: number | null; bot: string | null; botEth: string | null; inflight: boolean; tokens: AeroSafeToken[]; ownedNfts?: string | null; ownedScanned?: number | null;
   allowances: { token: string; symbol: string; perDay: string; remaining: string; maxRefill: string; refillAt: number | null }[];
   pools: AeroSafePool[];
 };

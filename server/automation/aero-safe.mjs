@@ -87,7 +87,7 @@ export function strictAeroSafeConfig(value) {
 function serialize(chain, ctx) {
   const s = (v) => (v == null ? null : String(v));
   return {
-    blockNumber: chain.blockNumber, timestamp: chain.timestamp, bot: chain.bot, botEth: s(chain.botEth), ownedNfts: s(chain.ownedNfts), ownedScanned: chain.ownedScanned ?? null,
+    blockNumber: chain.blockNumber, timestamp: chain.timestamp, blockSeconds: chain.blockSeconds ?? null, bot: chain.bot, botEth: s(chain.botEth), ownedNfts: s(chain.ownedNfts), ownedScanned: chain.ownedScanned ?? null,
     inflight: chain.pendingNonce != null && chain.latestNonce != null && chain.pendingNonce > chain.latestNonce,
     tokens: [...ctx.tokens.values()].map((t) => ({ ...t, balance: s(chain.balances[t.address]) })),
     allowances: chain.allowances.map((a) => ({ token: a.token, symbol: a.symbol, perDay: s(a.perDay), remaining: s(a.remaining), maxRefill: s(a.maxRefill), refillAt: a.refillAt == null ? null : Number(a.refillAt) })),
@@ -96,7 +96,7 @@ function serialize(chain, ctx) {
       sqrtPriceX96: s(p.sqrtPriceX96), tick: p.tick, feePips: p.feePips, earned: s(p.earned),
       penalty: { minStakeBlocks: s(p.penalty.minStakeBlocks), penaltyRate: s(p.penalty.penaltyRate) },
       positions: p.positions.map((x) => ({ tokenId: s(x.tokenId), staked: x.staked, tickLower: x.tickLower, tickUpper: x.tickUpper, liquidity: s(x.liquidity),
-        amount0: x.amount0, amount1: x.amount1, tokensOwed0: s(x.tokensOwed0), tokensOwed1: s(x.tokensOwed1), depositBlock: s(x.depositBlock), penaltyUntilBlock: s(x.penaltyUntilBlock) })),
+        amount0: x.amount0, amount1: x.amount1, tokensOwed0: s(x.tokensOwed0), tokensOwed1: s(x.tokensOwed1), depositBlock: s(x.depositBlock), depositTime: x.depositTime ?? null, penaltyUntilBlock: s(x.penaltyUntilBlock) })),
     })),
   };
 }

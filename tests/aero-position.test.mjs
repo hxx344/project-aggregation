@@ -12,10 +12,10 @@ const pool = (patch = {}) => ({
   tvlUsd: 1e6, emissionPerSec: 0.01, emissionWindowSec: 604800, vol24h: { daily: 0.02, annual: 0.38, samples: 24 }, vol7d: { daily: 0.03, annual: 0.57, samples: 168 }, change24h: 0.01, ...patch,
 });
 // 1 WETH + 3000 USDC 的原始单位。
-const position = (patch = {}) => ({ tickLower: tick - 500, tickUpper: tick + 500, liquidity: '1000000000000000', staked: true, amount0: 1e18, amount1: 3000e6, depositBlock: '100', ...patch });
+const position = (patch = {}) => ({ tickLower: tick - 500, tickUpper: tick + 500, liquidity: '1000000000000000', staked: true, amount0: 1e18, amount1: 3000e6, depositTime: 1_000_000 - 7200, ...patch });
 
 test('staked in-range position earns its share of staked liquidity', () => {
-  const m = positionMetrics(pool(), position(), { aeroUsd: 1.2, blockNumber: 100 + 3600, chainTime: 1_000_000, snapshotAt: 1_000_000_000 });
+  const m = positionMetrics(pool(), position(), { aeroUsd: 1.2, chainTime: 1_000_000, snapshotAt: 1_000_000_000 });
   assert.equal(m.inRange, true);
   assert.equal(m.valueUsd, 6000);
   assert.equal(m.share, 0.25);
@@ -30,14 +30,24 @@ test('staked in-range position earns its share of staked liquidity', () => {
   assert.ok(m.low < m.now && m.now < m.high && m.toLow < 0 && m.toHigh > 0);
 });
 
-const ctx = { aeroUsd: 1, blockNumber: 200, chainTime: 1_000_000, snapshotAt: 1_000_000_000 };
+const ctx = { aeroUsd: 1, chainTime: 1_000_000, snapshotAt: 1_000_000_000 };
+
+test('staked duration comes from block timestamps, not a fixed block interval', () => {
+  // 0.2 秒出块下 21600 块只有 1.2 小时；按块数乘 2 秒会算成 12 小时。
+  const m = positionMetrics(pool(), position({ depositTime: 1_000_000 - 4320 }), ctx);
+  assert.equal(m.stakedSeconds, 4320);
+  // 质押时间晚于链上快照时间（快照是质押前读的）时不显示负数。
+  assert.equal(positionMetrics(pool(), position({ depositTime: 1_000_100 }), ctx).stakedSeconds, 0);
+  // 服务端没给质押时间（旧版本或读取失败）时不估算。
+  assert.equal(positionMetrics(pool(), position({ depositTime: undefined }), ctx).stakedSeconds, null);
+});
 
 test('a market snapshot taken before the stake does not yet include it', () => {
-  // 质押于区块 100、现在 3700：质押时刻 = 1_000_000 − 7200 秒；快照早于它。
-  const early = positionMetrics(pool(), position(), { aeroUsd: 1, blockNumber: 3700, chainTime: 1_000_000, snapshotAt: (1_000_000 - 7300) * 1000 });
+  // 质押时刻 = 1_000_000 − 7200 秒；快照早于它。
+  const early = positionMetrics(pool(), position(), { aeroUsd: 1, chainTime: 1_000_000, snapshotAt: (1_000_000 - 7300) * 1000 });
   assert.equal(early.share, 0.2, 'mine / (staked + mine)');
   // 快照里的质押流动性还小于自身时（不含自身），份额不超过 100%。
-  const empty = positionMetrics(pool({ stakedLiquidity: '0' }), position(), { aeroUsd: 1, blockNumber: null, chainTime: null, snapshotAt: null });
+  const empty = positionMetrics(pool({ stakedLiquidity: '0' }), position(), { aeroUsd: 1, chainTime: null, snapshotAt: null });
   assert.equal(empty.share, 1);
   assert.equal(empty.stakedSeconds, null);
   const capped = positionMetrics(pool({ stakedLiquidity: '1' }), position(), ctx);
@@ -45,7 +55,7 @@ test('a market snapshot taken before the stake does not yet include it', () => {
 });
 
 test('unstaked position shows the projected share after staking', () => {
-  const m = positionMetrics(pool(), position({ staked: false }), { aeroUsd: 1, blockNumber: 200, chainTime: 1_000_000, snapshotAt: 1_000_000_000 }, DEFAULT_PLAN);
+  const m = positionMetrics(pool(), position({ staked: false }), { aeroUsd: 1, chainTime: 1_000_000, snapshotAt: 1_000_000_000 }, DEFAULT_PLAN);
   assert.equal(m.projected, true);
   assert.equal(m.share, 0.2);
   assert.equal(m.stakedSeconds, null);

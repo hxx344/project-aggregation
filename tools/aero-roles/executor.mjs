@@ -113,6 +113,31 @@ export const MAX_OWNED_SCAN = 40;
 // 同 nonce 替换链；兼容开发期写下的单个对象格式。
 const replacedChain = (value) => (Array.isArray(value) ? value : value ? [value] : []);
 export const minusBps = (amount, bps) => (amount * BigInt(10_000 - bps)) / 10_000n;
+// Base 出块间隔会随网络升级变化（已由 2 秒降到 0.2 秒），时长一律按区块时间戳算，不用固定出块常数。
+// 区块时间戳确定后不再变化，按区块号缓存，避免每次刷新为每个已质押头寸重读。
+const BLOCK_TIME_CACHE_MAX = 1024;
+const blockTimes = new Map();
+// 只用于展示的区块读取：单次、最多等 5 秒，失败返回 null，不按 read() 重试拖慢 readState（自动调仓也依赖它）。
+const DISPLAY_READ_MS = 5_000;
+async function displayBlock(ctx, number) {
+  let timer;
+  try {
+    return await Promise.race([ctx.rpc.getBlock(number), new Promise((resolve) => { timer = setTimeout(() => resolve(null), DISPLAY_READ_MS); })]);
+  } catch { return null; } finally { clearTimeout(timer); }
+}
+async function blockTimestamp(ctx, number) {
+  const key = BigInt(number);
+  if (blockTimes.has(key)) return blockTimes.get(key);
+  const block = await displayBlock(ctx, key);
+  if (!block) return null;
+  const timestamp = Number(block.timestamp);
+  if (blockTimes.size >= BLOCK_TIME_CACHE_MAX) blockTimes.delete(blockTimes.keys().next().value);
+  blockTimes.set(key, timestamp);
+  return timestamp;
+}
+// 最近这么多块的平均出块秒数，用来把罚没期剩余块数折成时间。
+const BLOCK_SAMPLE = 3000;
+
 // 截止时间取链上最新区块时间与本机时间的较晚者，服务器时钟偏慢时交易也不会一发出就过期。
 async function deadline(ctx) {
   const block = await read('最新区块', () => ctx.rpc.getBlock('latest'));
@@ -359,7 +384,8 @@ export async function readState(ctx, { knownIds = [] } = {}) {
       const p = await positionOf(tokenId);
       if (getAddress(p.token0) !== pool.token0 || getAddress(p.token1) !== pool.token1 || Number(p.tickSpacing) !== pool.tickSpacing) return;
       const depositBlock = staked ? (await read(`质押区块 #${tokenId}`, () => call(ctx.rpc, GAUGE_I, pool.gauge, 'depositBlock', [tokenId])))[0] : null;
-      const position = { tokenId, staked, tickLower: Number(p.tickLower), tickUpper: Number(p.tickUpper), liquidity: p.liquidity, tokensOwed0: p.tokensOwed0, tokensOwed1: p.tokensOwed1, depositBlock };
+      const depositTime = depositBlock ? await blockTimestamp(ctx, depositBlock) : null;
+      const position = { tokenId, staked, tickLower: Number(p.tickLower), tickUpper: Number(p.tickUpper), liquidity: p.liquidity, tokensOwed0: p.tokensOwed0, tokensOwed1: p.tokensOwed1, depositBlock, depositTime };
       positions.push({ ...position, ...positionAmounts(position, slot0.sqrtPriceX96), penaltyUntilBlock: staked && penalty.penaltyRate > 0n ? depositBlock + penalty.minStakeBlocks : null });
     };
     for (const id of stakedIds) await add(id, true);
@@ -368,7 +394,10 @@ export async function readState(ctx, { knownIds = [] } = {}) {
     if (stakedIds.length) { try { earned = (await call(ctx.rpc, GAUGE_I, pool.gauge, 'earned', [ctx.safe, [...stakedIds]]))[0]; } catch {} }
     pools.push({ ...pool, sqrtPriceX96: slot0.sqrtPriceX96, tick: Number(slot0.tick), feePips: Number(feePips), penalty: { minStakeBlocks: penalty.minStakeBlocks, penaltyRate: penalty.penaltyRate }, positions, earned });
   }
-  return { blockNumber, timestamp, bot, botEth, latestNonce, pendingNonce, balances, allowances: [...allowances.values()], pools, ownedNfts: owned, ownedScanned: scanned, burnedIds };
+  const sample = Math.min(BLOCK_SAMPLE, blockNumber - 1);
+  const sampled = sample > 0 ? await displayBlock(ctx, blockNumber - sample) : null;
+  const blockSeconds = sampled ? (timestamp - Number(sampled.timestamp)) / sample : null;
+  return { blockNumber, timestamp, blockSeconds: Number.isFinite(blockSeconds) && blockSeconds > 0 ? blockSeconds : null, bot, botEth, latestNonce, pendingNonce, balances, allowances: [...allowances.values()], pools, ownedNfts: owned, ownedScanned: scanned, burnedIds };
 }
 
 // 已签名交易的去向：confirmed / reverted（已上链）、dropped（同一 nonce 已被其他交易占用，这笔不会再上链）、waiting（仍可能上链，重新广播一次）。
