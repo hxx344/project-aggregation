@@ -2,6 +2,7 @@
 import { AbiCoder, Interface, ZeroAddress, concat, getAddress, getCreate2Address, keccak256, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
 import { BASE_CHAIN_ID, MULTISEND_SELECTOR, ROLES, SAFE } from './addresses.mjs';
 import { flatten } from './conditions.mjs';
+import { accrue } from './policy.mjs';
 
 const coder = AbiCoder.defaultAbiCoder();
 export const ROLES_ABI = new Interface([
@@ -86,8 +87,8 @@ const functionCall = (roleKey, target, f) => (f.condition
 
 // 已部署 Roles 的增量批次（加池、调额度）：current / next 均为 buildPermissions 的结果，权限只允许增加。
 // 新目标 scopeTarget 加全部函数；已有目标上条件变化或新增的函数重下 scopeFunction / allowFunction（整体替换该函数的条件）；
-// 新代币与每日数量变化的代币 setAllowance。数量未变的额度不重下：setAllowance 会把当前余额重置为满额。
-export function buildUpdateBatch({ current, next, roles }) {
+// 新代币与每日数量变化的代币 setAllowance（见 allowancePlan）。数量未变的额度不重下。
+function permissionCalls({ current, next, roles }) {
   roles = getAddress(roles);
   if (current.roleKeyBytes !== next.roleKeyBytes) throw new Error('roleKey must not change');
   const roleKey = next.roleKeyBytes;
@@ -108,13 +109,101 @@ export function buildUpdateBatch({ current, next, roles }) {
       add(data, `${old?.has(f.selector) ? '更新条件' : f.condition ? '按条件允许' : '允许'} ${target.label}.${f.label}`);
     }
   }
+  return txs;
+}
+
+// 需要 setAllowance 的额度：新代币与每日数量变化的代币。previous 为配置里的旧每日数量（新代币为 null）。
+export function allowanceChanges({ current, next }) {
+  for (const a of current.allowances) if (!next.allowances.some((x) => x.key === a.key)) throw new Error(`update would drop the allowance for ${a.symbol}`);
+  const out = [];
   for (const a of next.allowances) {
     const old = current.allowances.find((x) => x.key === a.key);
-    if (old && old.perDay !== a.perDay) add(ROLES_ABI.encodeFunctionData('setAllowance', [a.key, a.perDay, a.perDay, a.perDay, next.allowancePeriod, 0]), `调整额度 ${a.symbol}：每 24 小时 ${old.perDay} → ${a.perDay}（最小单位），执行后当天可用额度按新值计满`);
-    if (!old) add(ROLES_ABI.encodeFunctionData('setAllowance', [a.key, a.perDay, a.perDay, a.perDay, next.allowancePeriod, 0]), `额度 ${a.symbol}：每 24 小时 ${a.perDay}（最小单位）`);
+    if (!old || old.perDay !== a.perDay) out.push({ allowance: a, previous: old ? old.perDay : null });
   }
-  for (const a of current.allowances) if (!next.allowances.some((x) => x.key === a.key)) throw new Error(`update would drop the allowance for ${a.symbol}`);
+  return out;
+}
+
+// 批次笔数（不读链）：供待变更预览显示。
+export function updateBatchSize({ current, next, roles }) {
+  return permissionCalls({ current, next, roles }).length + allowanceChanges({ current, next }).length;
+}
+
+const isUnset = (r) => r.refill === 0n && r.maxRefill === 0n && r.period === 0n && r.balance === 0n && r.timestamp === 0n;
+const UINT128_MAX = (1n << 128n) - 1n;
+// 链上已有额度的批次须在本期结束前这么久上链，给硬件钱包签名与打包留出时间。
+export const EXECUTE_MARGIN_SECONDS = 600n;
+
+// 一个额度的 setAllowance 参数与执行效果。onchain 为生成批次时 Roles.allowances(key) 的读数，now 为读数所在区块时间（秒），均为 bigint。
+// - 链上尚未设置：首次设置，balance = refill = maxRefill = perDay、timestamp 0（Roles v2 setAllowance 把 0 换成执行区块时间，
+//   周期从执行时刻起算），任何时刻执行本期都只有 perDay；没有执行期限。
+// - 链上已有：按 Roles 规则折算到 now，本期已用 = 本期上限 cap（refill 与 maxRefill 取大，偏保守）− 折算余额；
+//   新 balance = max(0, perDay − 已用)，timestamp 为本期起点，不在本期重新计满，下一个补充时刻 nextRefill 起按 perDay 补满。
+//   setAllowance 覆盖余额、忘掉执行前已花的量，且 Roles 不提供"读数未变才执行"的前置条件，所以本期累计取决于执行时刻：
+//   · executeBefore（nextRefill 前 EXECUTE_MARGIN_SECONDS）前执行：生成后 bot 不再花时 = 已用 + balance（limits.idle）；
+//     生成后到执行前 bot 再花的部分另计，最多 cap + balance（limits.inTime）。
+//   · 超过 nextRefill 才执行：timestamp 已过一整期，首次消费即补满 perDay，执行前当期按旧额度已花的不计入，最多 cap + perDay（limits.late）。
+//   · 同一周期内重复执行每次再放出 balance（replay.samePeriod）；之后周期再执行当期重新计满 perDay（replay.laterPeriod）。
+//   旧周期不是新周期整数倍时 inTime / late 为 null（期限内旧额度还可能补充）。
+// - 旧额度 maxRefill 为 uint128 上限（setAllowance 传 0 即无上限，余额可跨期累积）时无法折算本期已用：used 与 limits 为 null，balance 按 0。
+export function allowancePlan({ perDay, period, onchain, now }) {
+  perDay = BigInt(perDay); period = BigInt(period);
+  if (!onchain || typeof now !== 'bigint') throw new Error('allowance state required');
+  if (isUnset(onchain)) return { first: true, balance: perDay, timestamp: 0n, used: 0n, nextRefill: null, executeBefore: null, limits: { idle: perDay, inTime: perDay, late: perDay },
+    replay: { samePeriod: perDay, laterPeriod: perDay } };
+  const { balance: accrued, timestamp: accruedStart } = accrue(onchain, now);
+  let start = onchain.period > 0n ? accruedStart : now;
+  // 新周期长度与链上不同时，前进到包含 now 的那一期；旧周期为新周期整数倍时已用仍按链上本期起点算，覆盖的区间更长，偏保守。
+  if (now >= start + period) start += ((now - start) / period) * period;
+  const nextRefill = start + period, executeBefore = nextRefill - EXECUTE_MARGIN_SECONDS;
+  const uncapped = onchain.maxRefill === UINT128_MAX;
+  const cap = onchain.refill > onchain.maxRefill ? onchain.refill : onchain.maxRefill;
+  const used = uncapped ? null : cap > accrued ? cap - accrued : 0n;
+  const balance = used === null ? 0n : perDay > used ? perDay - used : 0n;
+  // 旧周期不是新周期整数倍时（更短，或如 36 小时对 24 小时），旧额度的补充时刻可能落在 [start, nextRefill) 内，
+  // 生成后再花的量不受 cap 约束，inTime / late 给不出上限。
+  const refillsSooner = onchain.period > 0n && onchain.period % period !== 0n;
+  const limits = used === null ? { idle: null, inTime: null, late: null }
+    : { idle: used + balance, inTime: refillsSooner ? null : cap + balance, late: refillsSooner ? null : cap + perDay };
+  return { first: false, balance, timestamp: start, used, nextRefill, executeBefore, limits, replay: { samePeriod: balance, laterPeriod: perDay } };
+}
+
+export const utc = (seconds) => new Date(Number(seconds) * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+const str = (v) => (v === null ? null : String(v));
+
+// allowanceState：{ now: 区块时间（bigint 秒）, allowances: Map<key, Roles.allowances 读数> }，有额度要设时必填；缺任何一个读数即拒绝生成，
+// 不按满额猜。额度那几笔另带 allowance（执行效果），供界面单列；toTransactionBuilderJson 只取 to / value / data。
+// 本期离结束不足 EXECUTE_MARGIN_SECONDS 时拒绝生成（code period_ending）：来不及在补满前执行，等换期后再生成。
+export function buildUpdateBatch({ current, next, roles, allowanceState }) {
+  const txs = permissionCalls({ current, next, roles });
+  const changes = allowanceChanges({ current, next });
+  if (changes.length && (!allowanceState || typeof allowanceState.now !== 'bigint')) throw new Error('allowance state required: read Roles.allowances before building the batch');
+  const to = getAddress(roles);
+  for (const { allowance: a, previous } of changes) {
+    const onchain = allowanceState.allowances.get(a.key);
+    if (!onchain) throw new Error(`allowance state for ${a.symbol} is missing`);
+    const plan = allowancePlan({ perDay: a.perDay, period: next.allowancePeriod, onchain, now: allowanceState.now });
+    if (plan.executeBefore !== null && plan.executeBefore <= allowanceState.now) {
+      throw Object.assign(new Error(`${a.symbol} 本期额度 ${utc(plan.nextRefill)} 补满，离现在不到 ${EXECUTE_MARGIN_SECONDS / 60n} 分钟，来不及在补满前执行；请在补满后重新生成`), { code: 'period_ending' });
+    }
+    const head = previous === null ? `额度 ${a.symbol}：每 24 小时 ${a.perDay}（最小单位）` : `调整额度 ${a.symbol}：每 24 小时 ${previous} → ${a.perDay}（最小单位）`;
+    const effect = plan.first ? `链上尚无此额度，执行后本期可用 ${a.perDay}`
+      : `${plan.used === null ? '链上旧额度没有补充上限，无法折算本期已用，执行后本期剩余按 0' : `按生成时链上读数本期已用 ${plan.used}，执行后本期剩余 ${plan.balance}`}（不在本期重新计满），${utc(plan.nextRefill)} 起按 ${a.perDay} 补满；`
+        + `须在 ${utc(plan.executeBefore)} 前执行，${plan.limits.inTime === null ? '' : `期限前执行本期累计最多 ${plan.limits.inTime}（生成后 bot 不再花时 ${plan.limits.idle}），`}`
+        + `超过 ${utc(plan.nextRefill)} 才执行会当期补满${plan.limits.late === null ? '' : `，执行当期累计最多 ${plan.limits.late}`}`;
+    txs.push({ to, value: '0', data: ROLES_ABI.encodeFunctionData('setAllowance', [a.key, plan.balance, BigInt(a.perDay), BigInt(a.perDay), next.allowancePeriod, plan.timestamp]),
+      description: `${head}；${effect}`,
+      allowance: { key: a.key, token: a.token, symbol: a.symbol, previous: str(previous), perDay: String(a.perDay), first: plan.first, used: str(plan.used), balance: String(plan.balance),
+        nextRefill: plan.nextRefill === null ? null : Number(plan.nextRefill), executeBefore: plan.executeBefore === null ? null : Number(plan.executeBefore), readAt: Number(allowanceState.now),
+        limits: { idle: str(plan.limits.idle), inTime: str(plan.limits.inTime), late: str(plan.limits.late) },
+        replay: { samePeriod: String(plan.replay.samePeriod), laterPeriod: String(plan.replay.laterPeriod) } } });
+  }
   return txs;
+}
+
+// 批次的执行期限（秒）：链上已有额度那几笔里最早的 executeBefore；只有首次设置或不调额度时为 null。
+export function batchExecuteBefore(transactions) {
+  const times = transactions.map((t) => t.allowance?.executeBefore).filter((v) => typeof v === 'number');
+  return times.length ? Math.min(...times) : null;
 }
 
 // 每个函数条件树的节点数（Roles 上限 255），用于提示白名单还能加多少。

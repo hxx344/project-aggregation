@@ -18,10 +18,18 @@ export async function checkTransactions(permissions, transactions, ctx) {
 
 // 链上当前可用额度：与 Roles AllowanceTracker._accruedAllowance 相同，每满一个 period 补 refill，最多补到 maxRefill。
 // allowance 为 Roles.allowances(key) 的读数，now 为区块时间（秒），均为 bigint。
-export function accruedAllowance({ refill, maxRefill, period, balance, timestamp }, now) {
-  if (period === 0n || now < timestamp + period || balance >= maxRefill) return balance;
-  const refilled = balance + refill * ((now - timestamp) / period);
-  return refilled < maxRefill ? refilled : maxRefill;
+export function accruedAllowance(allowance, now) {
+  return accrue(allowance, now).balance;
+}
+
+// 同一规则下的余额与本期起点：满一个 period 后 timestamp 前进整数个 period（余额已达 maxRefill 时也前进）。
+export function accrue({ refill, maxRefill, period, balance, timestamp }, now) {
+  if (period === 0n || now < timestamp + period) return { balance, timestamp };
+  const elapsed = (now - timestamp) / period;
+  const start = timestamp + elapsed * period;
+  if (balance >= maxRefill) return { balance, timestamp: start };
+  const refilled = balance + refill * elapsed;
+  return { balance: refilled < maxRefill ? refilled : maxRefill, timestamp: start };
 }
 
 async function checkOne(permissions, tx, ctx) {

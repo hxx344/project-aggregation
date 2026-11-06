@@ -231,11 +231,49 @@ export async function inspectPool(rpc, address) {
   if (code.toLowerCase() !== GAUGE_CLONE) throw new ExecError(`gauge ${gaugeAddress} 不是已审实现 ${AERO.gaugeImplementation} 的克隆`);
   if (getAddress(gaugePool) !== address) throw new ExecError(`gauge ${gaugeAddress} 不指向这个池子`);
   if (getAddress(nft) !== AERO.nft || getAddress(voter) !== AERO.voter) throw new ExecError(`gauge ${gaugeAddress} 的 NFT / voter 与固定地址不符`);
+  const gaugeStatus = await gaugeLiveness(rpc, gaugeAddress);
+  if (gaugeStatus.state === 'killed') throw new ExecError(`gauge ${gaugeAddress} 已被 Voter 停用（isAlive = false），不能加入白名单`);
   const token = async (a) => {
     const [[decimals], [symbol]] = await read(`代币 ${a}`, () => Promise.all([call(rpc, ERC20_I, a, 'decimals'), call(rpc, ERC20_I, a, 'symbol')]));
     return { address: a, decimals: Number(decimals), symbol: String(symbol).replace(/[^\x20-\x7e]/g, '').trim().slice(0, SYMBOL_MAX) || a.slice(0, 8) };
   };
-  return { address, gauge: gaugeAddress, tickSpacing, token0: await token(token0), token1: await token(token1) };
+  return { address, gauge: gaugeAddress, tickSpacing, gaugeStatus, token0: await token(token0), token1: await token(token1) };
+}
+
+const VOTER_I = new Interface(['function isAlive(address gauge) view returns (bool)']);
+// gauge 是否被 Voter 停用。只认 Voter.isAlive(gauge) 的明确读数：true → alive，false → killed。
+// PR #190 记录固定 Voter 0x3824…（LeafVoter）读 isAlive 会回滚；回滚、返回值无法解析或读取失败都只报 unknown（不当作正常，也不拒绝），
+// 零排放（rewardRate 为 0、本期已结束）可能只是本周期没有投票，不拿来推断停用。单次读取，受 provider 20 秒超时约束，不重试。
+// 返回值须恰好是一个 32 字节字且为 0 或 1：ethers 解 bool 时把任何非零字当 true、也不管多出的字节，不按它解码。
+export async function gaugeLiveness(rpc, gauge) {
+  let raw;
+  try {
+    raw = await rpc.call({ to: AERO.voter, data: VOTER_I.encodeFunctionData('isAlive', [getAddress(gauge)]) });
+  } catch (error) {
+    if (error?.code === 'CALL_EXCEPTION') return { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' };
+    return { state: 'unknown', note: `读取 Voter.isAlive 失败（${errorText(error)}），无法确认 gauge 是否已被停用` };
+  }
+  const word = typeof raw === 'string' && /^0x[0-9a-fA-F]{64}$/.test(raw) ? BigInt(raw) : null;
+  if (word === 1n) return { state: 'alive', note: 'Voter.isAlive = true' };
+  if (word === 0n) return { state: 'killed', note: 'Voter.isAlive = false' };
+  return { state: 'unknown', note: 'Voter.isAlive 的返回值不是 0 或 1 的 32 字节布尔值，无法确认 gauge 是否已被停用' };
+}
+
+// 生成调额度批次用的链上额度：同一区块的 Roles.allowances(key) 与该区块时间（bigint 秒）。
+// 每步单次 20 秒超时、最多 2 次；任一读数失败即抛出（调用方拒绝生成批次，不按满额猜）。
+export async function readAllowances(rpc, roles, keys) {
+  roles = getAddress(roles);
+  const chainId = await read('chainId', () => rpc.send('eth_chainId', []));
+  if (Number(chainId) !== BASE_CHAIN_ID) throw new ExecError(`RPC 不是 Base 主网（chainId ${Number(chainId)}）`);
+  const block = await read('最新区块', () => rpc.getBlock('latest'));
+  if (!block) throw new ExecError('读取最新区块失败：节点没有返回区块', { code: 'rpc' });
+  const raws = await read('Roles 额度', () => Promise.all(keys.map(async (key) => ROLES_VIEW_I.decodeFunctionResult('allowances',
+    await rpc.call({ to: roles, data: ROLES_VIEW_I.encodeFunctionData('allowances', [key]), blockTag: block.number })))));
+  const allowances = new Map(keys.map((key, i) => {
+    const r = raws[i];
+    return [key, { refill: r.refill, maxRefill: r.maxRefill, period: r.period, balance: r.balance, timestamp: r.timestamp }];
+  }));
+  return { blockNumber: block.number, now: BigInt(block.timestamp), allowances };
 }
 
 // 以 bot 身份 eth_call Roles.execTransactionWithRole（shouldRevert）只判权限：返回 Roles 的结论名。

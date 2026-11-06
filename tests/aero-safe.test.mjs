@@ -8,7 +8,8 @@ import { Interface, Transaction, Wallet, getAddress } from 'ethers';
 import { AERO } from '../tools/aero-roles/addresses.mjs';
 import { buildPermissions } from '../tools/aero-roles/permissions.mjs';
 import * as executor from '../tools/aero-roles/executor.mjs';
-import { PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
+import { ROLES_ABI } from '../tools/aero-roles/roles-calls.mjs';
+import { BATCH_BUDGET_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
 import { createApp } from '../server/app.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -203,6 +204,9 @@ function fakeChain(overrides = {}) {
     openPosition: overrides.openPosition ?? (async (_ctx, _hooks, params) => { calls.push(['open', params.expect]); return {}; }),
     swap: async (ctx, hooks, params) => { calls.push(['swap', params.amountIn]); await sign(ctx, hooks, '兑换'); return {}; },
     previewOpen: async () => ({ amount0: 1n }),
+    // 生成批次前的链上额度读数：默认全部尚未设置（首次设置）。
+    readAllowances: overrides.readAllowances ?? (async (_rpc, _roles, keys) => ({ blockNumber: 1, now: 1_800_000_000n,
+      allowances: new Map(keys.map((key) => [key, { refill: 0n, maxRefill: 0n, period: 0n, balance: 0n, timestamp: 0n }])) })),
   };
 }
 function managerWith(directory, options = {}) {
@@ -979,4 +983,165 @@ test('verifyActive passes only what Roles lets through and reads new allowances 
   assert.deepEqual(result.checks.filter((c) => !c.ok).map((c) => c.label), ['额度 WETH']);
   // A revert that is not a Roles error is never read as a pass.
   await assert.rejects(run(() => { throw revert('0x08c379a0'); }), /原因不是 Roles 权限/);
+});
+
+test('the batch reads the on-chain allowance first: an adjustment keeps this period\'s spending, a failed read refuses, a change during the read is rejected', async () => {
+  const directory = fixtureDir();
+  const usdcKey = permissions.allowances.find((a) => a.token === USDC).key;
+  const DAY = 86_400n, day0 = 20_000n * DAY;
+  const reads = [];
+  let fail = false, gate = null, readAt = day0 + 3600n;
+  let clock = Number(day0 + 3600n) * 1000;
+  const chain = { ...fakeChain(), verifyActive: async () => ({ ok: true, checks: [] }),
+    readAllowances: async (_rpc, roles, keys) => {
+      reads.push({ roles, keys });
+      if (gate) await gate;
+      if (fail) throw new executor.ExecError('读取 Roles 额度 失败：boom', { code: 'rpc' });
+      // 每日 1000 USDC，本期（day0 起）已用 300。
+      return { blockNumber: 9, now: readAt, allowances: new Map(keys.map((key) => [key, { refill: 1_000_000_000n, maxRefill: 1_000_000_000n, period: DAY, balance: 700_000_000n, timestamp: day0 }])) };
+    } };
+  const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await until(() => manager.state().chain);
+    await manager.setAllowanceChanges({ [USDC]: '500' });
+    fail = true;
+    await assert.rejects(manager.buildChangeBatch(), (error) => error.status === 502 && /读取链上额度失败，未生成批次/.test(error.message));
+    assert.equal(manager.state().changes.batch, null, 'nothing is frozen without the on-chain reading');
+    fail = false;
+    const out = await manager.buildChangeBatch();
+    assert.deepEqual(reads.at(-1), { roles: ROLES, keys: [usdcKey] });
+    const call = ROLES_ABI.parseTransaction({ data: out.builder.transactions[0].data });
+    // 500 − 300 spent = 200 left today; refill/maxRefill = 500; timestamp stays at today's period start.
+    assert.deepEqual(call.args.slice(1).map(String), ['200000000', '500000000', '500000000', '86400', String(day0)]);
+    const [effect] = out.allowances;
+    assert.deepEqual([effect.symbol, effect.decimals, effect.previous, effect.perDay, effect.used, effect.balance, effect.replay.samePeriod, effect.replay.laterPeriod],
+      ['USDC', 6, '1000000000', '500000000', '300000000', '200000000', '200000000', '500000000']);
+    assert.match(out.transactions[0].description, /本期已用 300000000，执行后本期剩余 200000000/);
+    assert.match(out.builder.meta.description, /重复执行.*USDC 每次执行最多再花 200000000/);
+    // The batch must run before this period's refill (minus 10 minutes); the deadline is frozen with it and survives a restart.
+    const executeBefore = Number(day0 + DAY - 600n) * 1000;
+    assert.deepEqual([out.executeBefore, effect.executeBefore, effect.limits.inTime, effect.limits.late], [executeBefore, executeBefore / 1000, '1200000000', '1500000000']);
+    assert.match(out.builder.meta.description, /须在 .+ UTC 前执行；过了期限不要再执行，请重新生成/);
+    assert.deepEqual([out.state.changes.batch.executeBefore, out.state.changes.batch.expired], [executeBefore, false]);
+    await manager.close();
+    let restarted = managerWith(directory, { chain, manager: { now: () => clock } }).manager;
+    await restarted.initialize();
+    assert.equal(restarted.state().changes.batch.executeBefore, executeBefore);
+    // Past the deadline the batch is marked expired (an unexecuted file must not run any more), but one executed in time can still be applied.
+    clock = executeBefore;
+    assert.equal(restarted.state().changes.batch.expired, true);
+    await restarted.setKey(KEY);
+    const applied = await restarted.applyChangeBatch();
+    assert.equal(applied.config.permissions.allowances.find((a) => a.token === USDC).perDay, '500000000');
+    await restarted.close();
+    restarted = managerWith(directory, { chain, manager: { now: () => clock } }).manager;
+    await restarted.initialize();
+    await until(() => restarted.state().chain);
+
+    // Too close to the period end to run in time: refused, nothing frozen.
+    await restarted.setAllowanceChanges({ [USDC]: '400' });
+    readAt = day0 + DAY - 300n;
+    await assert.rejects(restarted.buildChangeBatch(), (error) => error.status === 409 && /不到 10 分钟/.test(error.message));
+    assert.equal(restarted.state().changes.batch, null);
+    readAt = day0 + 3600n;
+
+    // A draft change while the chain read is in flight is not frozen into a batch built from the old draft.
+    let release;
+    gate = new Promise((resolve) => { release = resolve; });
+    let building = restarted.buildChangeBatch();
+    const seen = reads.length;
+    await until(() => reads.length === seen + 1);
+    await restarted.setAllowanceChanges({ [USDC]: '600' });
+    release(); gate = null;
+    await assert.rejects(building, (error) => error.status === 409 && /读取链上额度期间已变化/.test(error.message));
+
+    // The whole request, queueing included, is bounded by BATCH_BUDGET_MS from its arrival: past it nothing is frozen.
+    gate = new Promise((resolve) => { release = resolve; });
+    building = restarted.buildChangeBatch();
+    await until(() => reads.length === seen + 2);
+    clock += BATCH_BUDGET_MS;
+    release(); gate = null;
+    await assert.rejects(building, (error) => error.status === 504 && /含排队等待/.test(error.message));
+    assert.equal(restarted.state().changes.batch, null);
+    await restarted.close();
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('waiting in the serial queue counts toward the batch budget, and a callback that runs after the timeout freezes nothing', async () => {
+  const directory = fixtureDir();
+  const DAY = 86_400n, day0 = 20_000n * DAY;
+  let previewGate = null, readGate = null;
+  const chain = { ...fakeChain(),
+    previewOpen: async () => { await previewGate; return { amount0: 1n }; },
+    readAllowances: async (_rpc, _roles, keys) => {
+      await readGate;
+      return { blockNumber: 9, now: day0 + 3600n, allowances: new Map(keys.map((key) => [key, { refill: 1_000_000_000n, maxRefill: 1_000_000_000n, period: DAY, balance: 700_000_000n, timestamp: day0 }])) };
+    } };
+  const { manager } = managerWith(directory, { chain, manager: { now: () => Number(day0 + 3600n) * 1000, batchBudgetMs: 300 } });
+  const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
+  const batched = () => manager.state().events.filter((e) => e.event === 'changes_batched').length;
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    await until(() => manager.state().chain);
+    await manager.setAllowanceChanges({ [USDC]: '500' });
+
+    // 1. A long preview holds the queue before the first step.
+    let release;
+    previewGate = new Promise((resolve) => { release = resolve; });
+    let previewing = manager.preview(open);
+    let started = Date.now();
+    await assert.rejects(manager.buildChangeBatch(), (error) => error.status === 504 && /含排队等待其他操作/.test(error.message));
+    assert.ok(Date.now() - started < 2_000, 'the queue wait is bounded by the budget');
+    release(); await previewing; previewGate = null;
+
+    // 2. The chain read returns, but the queue is held again before the batch is frozen.
+    let releaseRead;
+    readGate = new Promise((resolve) => { releaseRead = resolve; });
+    previewGate = new Promise((resolve) => { release = resolve; });
+    started = Date.now();
+    const building = manager.buildChangeBatch();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    previewing = manager.preview(open);
+    releaseRead();
+    await assert.rejects(building, (error) => error.status === 504 && /含排队等待其他操作/.test(error.message));
+    assert.ok(Date.now() - started < 2_000, 'the second queue wait is bounded too');
+    release(); await previewing;
+    await manager.setAllowanceChanges({ [USDC]: '500' }); // runs after the abandoned callback in queue order
+    assert.deepEqual([manager.state().changes.batch, batched()], [null, 0], 'the abandoned callback froze nothing');
+
+    // An idle queue still builds the batch within the budget.
+    previewGate = null; readGate = null;
+    const out = await manager.buildChangeBatch();
+    assert.deepEqual([out.state.changes.batch.transactions, batched()], [1, 1]);
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+test('a queued pool records the gauge liveness reading; unknown survives a restart and old entries read as unknown', async () => {
+  const directory = fixtureDir();
+  const { POOL, POOL2, WETH, CBBTC, infos } = twoPools();
+  const statuses = { [POOL]: { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' }, [POOL2]: { state: 'alive', note: 'Voter.isAlive = true' } };
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => ({ ...infos[address], gaugeStatus: statuses[address] }) };
+  const { manager } = managerWith(directory, { chain });
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await until(() => manager.state().chain);
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    const state = await manager.addPoolChange({ pool: POOL2, allowances: { [CBBTC]: '0.01' } });
+    assert.deepEqual(state.changes.pools.map((p) => p.gaugeStatus.state), ['unknown', 'alive']);
+    await manager.close();
+    // Entries written by the previous version carry no reading at all.
+    const file = join(directory, 'aero-safe/changes.json');
+    const saved = JSON.parse(readFileSync(file, 'utf8'));
+    delete saved.pools[1].gaugeStatus;
+    writeFileSync(file, JSON.stringify(saved));
+    const restarted = managerWith(directory, { chain }).manager;
+    await restarted.initialize();
+    const pools = restarted.state().changes.pools;
+    assert.deepEqual(pools.map((p) => p.gaugeStatus.state), ['unknown', 'unknown']);
+    assert.match(pools[0].gaugeStatus.note, /不提供 isAlive/);
+    assert.match(pools[1].gaugeStatus.note, /未核对/);
+    await restarted.close();
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });

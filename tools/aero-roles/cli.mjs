@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { Contract, FetchRequest, JsonRpcProvider, Network, ZeroAddress, formatUnits, getAddress, keccak256 } from 'ethers';
 import { AERO, BASE_CHAIN_ID, CODEHASH, SAFE, SAFE_PROXY_CODEHASH } from './addresses.mjs';
 import { buildPermissions } from './permissions.mjs';
+import { gaugeLiveness } from './executor.mjs';
 import { FALLBACK_HANDLER_SLOT, GUARD_SLOT, MODULE_GUARD_SLOT, MODULES_SENTINEL, SAFE_ABI, buildSetupBatch, toTransactionBuilderJson } from './roles-calls.mjs';
 
 const RPC_TIMEOUT_MS = 20_000;
@@ -78,7 +79,9 @@ export async function verifyOnChain(rpc, { permissions, ...input }) {
     const registered = await read(`getPool ${pool.name}`, () => new Contract(AERO.clFactory, FACTORY_ABI, rpc).getPool(pool.token0, pool.token1, pool.tickSpacing));
     if (getAddress(poolGauge) !== pool.gauge || getAddress(factory) !== AERO.clFactory || getAddress(registered) !== getAddress(poolAddress)) problems.push(`${pool.name}: pool.gauge/factory/getPool 不符`);
     if (getAddress(t0) !== pool.token0 || getAddress(t1) !== pool.token1 || Number(spacing) !== pool.tickSpacing) problems.push(`${pool.name}: 池子代币或 tickSpacing 与配置不符`);
-    lines.push(`做市池 ${pool.name}：${poolAddress}（tickSpacing ${pool.tickSpacing}），gauge ${pool.gauge}`);
+    const liveness = await gaugeLiveness(rpc, pool.gauge);
+    if (liveness.state === 'killed') problems.push(`${pool.name}: gauge 已被 Voter 停用（isAlive = false）`);
+    lines.push(`做市池 ${pool.name}：${poolAddress}（tickSpacing ${pool.tickSpacing}），gauge ${pool.gauge}${liveness.state === 'alive' ? '' : `（gauge 状态未知：${liveness.note}）`}`);
   }
   const factory = new Contract(AERO.clFactory, FACTORY_ABI, rpc);
   for (const swap of permissions.swaps) {

@@ -7,7 +7,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { Wallet, getAddress, parseUnits } from 'ethers';
 import { buildPermissions } from '../../tools/aero-roles/permissions.mjs';
-import { buildUpdateBatch, conditionUsage, toTransactionBuilderJson } from '../../tools/aero-roles/roles-calls.mjs';
+import { allowanceChanges, batchExecuteBefore, buildUpdateBatch, conditionUsage, toTransactionBuilderJson, updateBatchSize, utc } from '../../tools/aero-roles/roles-calls.mjs';
 import * as executor from '../../tools/aero-roles/executor.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
@@ -24,6 +24,9 @@ const BURN_CONFIRM_MS = 60_000;
 const REFRESH_BUDGET_MS = 60_000;
 // 加池：链上核验与生效核对各自的总时限（单次读取另有 20 秒超时、最多 2 次）。
 const POOL_BUDGET_MS = 90_000;
+// 生成批次从收到请求起的总时限，含两次排队等待与读链：须短于 API 转发时限（60 秒），超时即不冻结批次，
+// 避免浏览器或 API 已放弃后批次仍在后台生成。页面等待时间相应长于 API 时限。
+export const BATCH_BUDGET_MS = 50_000;
 // 已签名未上链超过这个时长后，允许新操作用同一 nonce 提价替换（两笔最多只有一笔上链）。
 export const PENDING_STALE_MS = 10 * 60_000;
 // 开仓确认基于预览数字：预览超过这个时长后须重新预览。
@@ -200,11 +203,16 @@ export function normalizeChanges(permissions, changes) {
 
 const EMPTY_CHANGES = Object.freeze({ schema: 1, pools: [], allowances: [], batch: null });
 const changeToken = (t) => ({ address: getAddress(t?.address), symbol: String(t?.symbol ?? '').slice(0, 32), decimals: Number(t?.decimals) });
+// 加池时 Voter 对 gauge 停用状态的读数：alive 或 unknown（已停用的池子加不进来）。旧版本加入的池子没有核对过，按 unknown。
+const gaugeStatusOf = (value) => (value?.state === 'alive' || value?.state === 'unknown'
+  ? { state: value.state, note: String(value.note ?? '').slice(0, 200) }
+  : { state: 'unknown', note: '加入时未核对 gauge 是否已被停用' });
 // 读回待变更文件：格式不符时整份放弃（随时可重新加入）。
 function readChanges(saved) {
   if (saved?.schema !== 1 || !Array.isArray(saved.pools) || !Array.isArray(saved.allowances)) throw new Error('格式不符');
   const pools = saved.pools.map((p) => {
-    const pool = { address: getAddress(p.address), name: String(p.name), gauge: getAddress(p.gauge), tickSpacing: Number(p.tickSpacing), token0: changeToken(p.token0), token1: changeToken(p.token1), addedAt: Number(p.addedAt) || 0 };
+    const pool = { address: getAddress(p.address), name: String(p.name), gauge: getAddress(p.gauge), tickSpacing: Number(p.tickSpacing), token0: changeToken(p.token0), token1: changeToken(p.token1), addedAt: Number(p.addedAt) || 0,
+      gaugeStatus: gaugeStatusOf(p.gaugeStatus) };
     if (!Number.isInteger(pool.tickSpacing) || ![pool.token0, pool.token1].every((t) => t.symbol && Number.isInteger(t.decimals) && t.decimals >= 0 && t.decimals <= 36)) throw new Error('池子格式不符');
     return pool;
   });
@@ -218,7 +226,9 @@ function readChanges(saved) {
     if (typeof b.baseline !== 'string' || !Number.isFinite(b.createdAt) || !Number.isInteger(b.transactions)) throw new Error('批次格式不符');
     buildPermissions(b.permissions);
     if (b.target !== undefined && typeof b.target !== 'string') throw new Error('批次格式不符');
+    if (b.executeBefore != null && !Number.isFinite(b.executeBefore)) throw new Error('批次格式不符');
     batch = { createdAt: b.createdAt, baseline: b.baseline, ...(b.target === undefined ? {} : { target: b.target }), permissions: b.permissions, transactions: b.transactions,
+      executeBefore: b.executeBefore ?? null,
       pools: (b.pools ?? []).map(String), allowances: (b.allowances ?? []).map((a) => ({ ...(a.token === undefined ? {} : { token: getAddress(a.token) }), symbol: String(a.symbol), perDay: String(a.perDay), decimals: Number(a.decimals) })) };
   }
   return { schema: 1, pools, allowances, batch };
@@ -233,7 +243,7 @@ function migratePoolPlan(saved) {
 
 // readPrices：行情扫描的 Base 代币美元价 { at, usd: { 小写地址: 美元价 } } 或 null，只用于按总资产比例核对单池上限。
 export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = () => false, readAdmission = () => true, readPrices = () => null, log = console, now = Date.now,
-  chain = executor, makeProvider = executor.provider } = {}) {
+  chain = executor, makeProvider = executor.provider, batchBudgetMs = BATCH_BUDGET_MS } = {}) {
   const directory = path.join(dataDir, 'aero-safe');
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
@@ -279,16 +289,16 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         history: auto.history.slice(-10).reverse(), watch: structuredClone(autoWatch), note: autoNote, checkedAt: autoCheckedAt, intervalMs: AUTO_TICK_MS },
     };
   }
-  // 待变更合成后的权限、批次笔数与条件节点用量；按配置与待变更缓存，不在每次轮询时重算。
+  // 待变更合成后的权限、批次笔数与条件节点用量；按配置与待变更缓存，不在每次轮询时重算。额度那几笔的参数要读链，生成批次时才算。
   function changesNext() {
     // 批次每笔发往 config.roles、由 config.safe 执行：二者也是缓存键的一部分。
     const key = JSON.stringify([config ? batchTarget(config) : null, config?.permissions ?? null, changes.pools, changes.allowances]);
     if (changesPreview?.key === key) return changesPreview;
-    let out = { key, permissions: null, transactions: [], usage: [], error: null };
+    let out = { key, permissions: null, size: 0, usage: [], error: null };
     if (config && (changes.pools.length || changes.allowances.length)) {
       try {
         const permissions = applyChanges(config.permissions, changes), built = buildPermissions(permissions);
-        out = { ...out, permissions, transactions: buildUpdateBatch({ current: buildPermissions(config.permissions), next: built, roles: config.roles }), usage: conditionUsage(built) };
+        out = { ...out, permissions, size: updateBatchSize({ current: buildPermissions(config.permissions), next: built, roles: config.roles }), usage: conditionUsage(built) };
       } catch (error) {
         out.error = /condition tree has \d+ nodes/.test(error.message) ? `白名单已满：${error.message}（Roles 每个函数最多 255 个条件节点）` : `生成权限失败：${error.message}`;
       }
@@ -327,10 +337,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const stale = batch && staleReason(batch);
     return {
       pools: structuredClone(changes.pools), allowances: changes.allowances.map((a) => ({ ...a, current: current(a.token) })),
-      preview: { transactions: next.transactions.length, usage: next.usage, error: next.error },
+      preview: { transactions: next.size, usage: next.usage, error: next.error },
       persistError: changesWriteError,
       batch: batch && { createdAt: batch.createdAt, transactions: batch.transactions, pools: [...batch.pools], allowances: batch.allowances.map(({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals })),
         stale: Boolean(stale), staleReason: stale,
+        // 执行期限（毫秒）：本期补满前 10 分钟；到补满时刻后才在 Safe 执行，执行当期额度会补满、执行前已花的不计入。过期不妨碍核对已在期限前执行的批次。
+        executeBefore: batch.executeBefore ?? null, expired: batch.executeBefore != null && now() >= batch.executeBefore,
         behind: Boolean(next.permissions) && JSON.stringify(next.permissions) !== JSON.stringify(batch.permissions),
         ...batchDiff(batch) },
     };
@@ -835,10 +847,10 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
           set.push({ token: t.address, symbol: t.symbol, decimals: t.decimals, perDay: allowanceUnits(value, t.symbol, t.decimals) });
         }
         const name = `${info.token0.symbol}/${info.token1.symbol} ts${info.tickSpacing}`;
-        const pool = { address: info.address, name, gauge: info.gauge, tickSpacing: info.tickSpacing, token0: changeToken(info.token0), token1: changeToken(info.token1), addedAt: now() };
+        const pool = { address: info.address, name, gauge: info.gauge, tickSpacing: info.tickSpacing, token0: changeToken(info.token0), token1: changeToken(info.token1), addedAt: now(), gaugeStatus: gaugeStatusOf(info.gaugeStatus) };
         const allowances = [...changes.allowances.filter((a) => !set.some((x) => sameAddress(x.token, a.token))), ...set];
         acceptChanges(normalizeChanges(config.permissions, { ...changes, pools: [...changes.pools, pool], allowances }));
-        record({ event: 'pool_queued', pool: name });
+        record({ event: 'pool_queued', pool: name, gauge: pool.gaugeStatus.state });
         return state();
       });
     },
@@ -879,23 +891,66 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       return state();
     }),
     // 生成 Safe 批次（Transaction Builder JSON）：配置 → 全部待变更的增量，冻结下来供执行后核对。不改配置、不签名。
-    buildChangeBatch: (authorize = () => {}) => serial(() => {
-      authorize();
-      requireChangesConfig();
-      const next = changesNext();
-      if (next.error) throw new HttpError(/^白名单已满/.test(next.error) ? 409 : 400, next.error);
-      if (!next.permissions || !next.transactions.length) throw new HttpError(409, '没有待变更');
-      const createdAt = now();
-      const label = (a) => ({ symbol: a.symbol, perDay: a.perDay, decimals: a.decimals });
-      const batch = { createdAt, baseline: JSON.stringify(config.permissions), target: batchTarget(config), permissions: next.permissions, transactions: next.transactions.length,
-        pools: changes.pools.map((p) => p.name), allowances: changes.allowances.map((a) => ({ token: a.token, ...label(a) })) };
-      saveChanges({ ...changes, batch });
-      const names = batch.pools.length ? batch.pools.join('、') : '调整额度';
-      record({ event: 'changes_batched', pools: batch.pools, allowances: batch.allowances.length, transactions: batch.transactions });
-      const builder = toTransactionBuilderJson({ safe: config.safe, transactions: next.transactions, createdAt, name: `Aero 白名单变更 ${names}`.slice(0, 120),
-        description: `Roles ${config.roles}：${[batch.pools.length ? `增加池子 ${batch.pools.join('、')}` : '', batch.allowances.length ? `调整 ${batch.allowances.map((a) => a.symbol).join('、')} 每日额度` : ''].filter(Boolean).join('；')}` });
-      return { transactions: next.transactions.map((t) => ({ to: t.to, description: t.description })), builder, usage: next.usage, state: state() };
-    }),
+    // 要 setAllowance 的额度先在串行队列外读链上当前额度（读不到即拒绝生成，不按满额猜），按本期已用折算新余额；
+    // 回到队列后确认配置代际与待变更都没变才冻结。从开始处理起整体（两次排队与读链）不超过 batchBudgetMs，
+    // 须短于 API 转发时限（60 秒）；超时即返回 504，排在队列里的回调之后轮到时也不再冻结。
+    buildChangeBatch: async (authorize = () => {}) => {
+      const deadline = now() + batchBudgetMs;
+      let abandoned = false;
+      const late = () => { abandoned = true; return new HttpError(504, `生成批次超过 ${batchBudgetMs / 1000} 秒（含排队等待其他操作），未生成批次，请稍后重试`); };
+      const queued = (fn) => {
+        const left = deadline - now();
+        if (left <= 0) return Promise.reject(late());
+        let timer;
+        const budget = new Promise((_, reject) => { timer = setTimeout(() => reject(late()), left); timer.unref?.(); });
+        return Promise.race([serial(() => { if (abandoned || now() >= deadline) throw late(); return fn(); }), budget]).finally(() => clearTimeout(timer));
+      };
+      const plan = await queued(() => {
+        authorize();
+        requireChangesConfig();
+        const next = changesNext();
+        if (next.error) throw new HttpError(/^白名单已满/.test(next.error) ? 409 : 400, next.error);
+        if (!next.permissions || !next.size) throw new HttpError(409, '没有待变更');
+        const keys = allowanceChanges({ current: buildPermissions(config.permissions), next: buildPermissions(next.permissions) }).map((c) => c.allowance.key);
+        return { key: next.key, generation: configGeneration, cfg: config, keys };
+      });
+      let allowanceState = null;
+      if (plan.keys.length) {
+        const left = deadline - now();
+        if (left <= 0) throw late();
+        try { allowanceState = await withBudget(chain.readAllowances(makeProvider(plan.cfg.rpcUrl), plan.cfg.roles, plan.keys), left, '读取链上额度'); } catch (error) {
+          if (error instanceof HttpError) throw error.status === 504 ? late() : new HttpError(error.status, `${error.message}；未生成批次`);
+          throw new HttpError(502, `读取链上额度失败，未生成批次：${error.message}`);
+        }
+      }
+      return queued(() => {
+        authorize();
+        requireChangesConfig();
+        const next = changesNext();
+        if (configGeneration !== plan.generation || next.key !== plan.key) throw new HttpError(409, 'Safe 配置或待变更在读取链上额度期间已变化，请重新生成');
+        let transactions;
+        try { transactions = buildUpdateBatch({ current: buildPermissions(config.permissions), next: buildPermissions(next.permissions), roles: config.roles, allowanceState }); } catch (error) {
+          throw new HttpError(error.code === 'period_ending' ? 409 : 400, `生成批次失败：${error.message}`);
+        }
+        const createdAt = now();
+        const executeBefore = batchExecuteBefore(transactions);
+        const label = (a) => ({ symbol: a.symbol, perDay: a.perDay, decimals: a.decimals });
+        const batch = { createdAt, baseline: JSON.stringify(config.permissions), target: batchTarget(config), permissions: next.permissions, transactions: transactions.length,
+          executeBefore: executeBefore === null ? null : executeBefore * 1000,
+          pools: changes.pools.map((p) => p.name), allowances: changes.allowances.map((a) => ({ token: a.token, ...label(a) })) };
+        saveChanges({ ...changes, batch });
+        const names = batch.pools.length ? batch.pools.join('、') : '调整额度';
+        // 额度那几笔的执行效果：本期已用、执行后本期剩余，以及重复执行或执行前 bot 再消耗时每次最多可再花的数量（单列给界面）。
+        const decimalsOf = (token) => changes.allowances.find((a) => sameAddress(a.token, token))?.decimals ?? null;
+        const allowances = transactions.filter((t) => t.allowance).map((t) => ({ ...t.allowance, decimals: decimalsOf(t.allowance.token) }));
+        record({ event: 'changes_batched', pools: batch.pools, allowances: batch.allowances.length, transactions: batch.transactions });
+        const deadlineNote = executeBefore === null ? '' : `。须在 ${utc(executeBefore)} 前执行；过了期限不要再执行，请重新生成（到本期补满时刻后才执行，执行当期额度补满、执行前已花的不计入）`;
+        const replayNote = allowances.length ? `。额度按生成时链上读数折算；同一批次重复执行或执行前 bot 再消耗时，本期累计可超过新额度：${allowances.map((a) => `${a.symbol} 每次执行最多再花 ${a.replay.samePeriod}，之后周期执行当期计满 ${a.replay.laterPeriod}`).join('；')}（最小单位）` : '';
+        const builder = toTransactionBuilderJson({ safe: config.safe, transactions, createdAt, name: `Aero 白名单变更 ${names}`.slice(0, 120),
+          description: `Roles ${config.roles}：${[batch.pools.length ? `增加池子 ${batch.pools.join('、')}` : '', batch.allowances.length ? `调整 ${batch.allowances.map((a) => a.symbol).join('、')} 每日额度` : ''].filter(Boolean).join('；')}${deadlineNote}${replayNote}` });
+        return { transactions: transactions.map((t) => ({ to: t.to, description: t.description })), allowances, executeBefore: batch.executeBefore, builder, usage: next.usage, state: state() };
+      });
+    },
     // 硬件钱包在 Safe{Wallet} 执行批次后：以 bot 身份模拟核对批次里的权限全部已在链上生效，再并入配置。批次之后新加的变更继续保留。
     // 模拟核对在串行队列外等待（最长 POOL_BUDGET_MS），不挡自动调仓；同一时间只跑一次。回到队列后重新检查登录、维护、
     // 任务与未结清交易，并确认配置代际、批次与 bot 都没变，才写入配置。
