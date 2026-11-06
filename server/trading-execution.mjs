@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
+import { ExecutionError, WaitError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_ALL_SYMBOLS } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
@@ -487,6 +487,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       return state();
     });
   }
+  // The unfinished job (manual or automatic) holding one of the symbols, if any.
+  function lockOwner(legs) {
+    for (const leg of legs) { const row = stmt.prepare('SELECT job_id FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`); if (row) return row.job_id; }
+    return null;
+  }
   // Server-side start for a saved automatic rule. It runs the same account,
   // book, position and lock checks as a preview, then saves the job, its locks
   // and the caller's own record (commit) in one transaction: a crash can never
@@ -506,8 +511,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (!Number.isSafeInteger(accounts[leg.exchange])) throw new ExecutionError(500, '自动任务参数无效');
       return { ...leg, accountRevision: accounts[leg.exchange] };
     });
-    const lockedLeg = () => intent.legs.some(leg => stmt.prepare('SELECT 1 FROM execution_locks WHERE resource=?').get(`${leg.exchange}:${leg.symbol}`));
-    if (lockedLeg()) throw new ExecutionError(409, '所选合约已有未结束任务');
+    const lockedLeg = () => lockOwner(intent.legs) !== null;
+    if (lockedLeg()) throw new WaitError(409, '所选合约已有未结束任务');
     let collected;
     try { collected = await collect(intent.legs); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
     check({ books: [...collected.markets].map(([key, market]) => ({ exchange: key.split(':')[0], symbol: market.symbol, bid: market.bid, ask: market.ask, at: market.at })) });
@@ -515,7 +520,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     writable();
     return transaction(() => {
       for (const leg of plan.legs) context(leg.exchange, leg.accountRevision);
-      if (lockedLeg()) throw new ExecutionError(409, '所选合约已有未结束任务');
+      if (lockedLeg()) throw new WaitError(409, '所选合约已有未结束任务');
       const job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [], auto: { ruleId: auto.ruleId, action: auto.action, guard },
         status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) };
       commit(job.id);
@@ -996,7 +1001,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, startAutomatic, jobView, jobAccounts, connectionOf, leading, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, startAutomatic, lockOwner, jobView, jobAccounts, connectionOf, leading, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       let ownsLease = false;

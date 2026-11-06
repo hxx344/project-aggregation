@@ -42,7 +42,8 @@ async function fixture(t, { maintenance = false, start = baseTime, guarded = fal
   t.after(async () => { await auto.close(); await execution.close(); writer?.close(); db.close(); if (directory) rmSync(directory, { recursive: true, force: true }); });
   const fill = record => {
     Object.assign(record, { filledQuantity: record.quantity, terminal: true, childrenSettled: true, status: 'terminal' });
-    const side = record.positionSide === 'LONG' ? 'long' : 'short', account = accounts[record.exchange];
+    // One-way (BOTH) orders: an opening buy or a closing sell moves the long position.
+    const side = record.positionSide === 'LONG' ? 'long' : record.positionSide === 'SHORT' ? 'short' : (record.side === 'buy') !== record.reduceOnly ? 'long' : 'short', account = accounts[record.exchange];
     const position = account.positions.find(row => row.symbol === record.symbol && row.side === side);
     const change = record.reduceOnly ? -Number(record.quantity) : Number(record.quantity), next = (position ? Number(position.quantity) : 0) + change;
     account.positions = account.positions.filter(row => row !== position);
@@ -372,13 +373,107 @@ test('refusals before any order back off and disable the rule after three attemp
   assert.equal(f.jobs.length, 0); assert.equal(f.records.size, 0);
 });
 
-test('only one running or holding rule per venue and market, and live trading needs confirmation', async t => {
+test('live trading needs confirmation and a stale form cannot overwrite a rule', async t => {
   const f = await fixture(t);
   assert.throws(() => f.auto.create({ config: config(), enabled: true }), /确认规则会自动实盘下单/);
   enable(f);
-  assert.throws(() => f.auto.create({ config: config({ direction: 'long', openThreshold: '1', closeThreshold: '3' }), enabled: true, confirmLive: true }), /只能有一条/);
-  const state = f.auto.create({ config: config({ exchange: 'bybit' }) });
-  assert.equal(state.rules.length, 2); assert.equal(state.rules[1].enabled, false);
+  const state = f.auto.create({ config: config({ direction: 'long', openThreshold: '1', closeThreshold: '3' }), enabled: true, confirmLive: true });
+  assert.equal(state.rules.length, 2); assert.equal(state.rules[1].enabled, true);
   const first = f.rule;
   assert.throws(() => f.auto.update(first.id, { revision: first.revision + 1, config: config() }), /已被更新/);
+});
+
+test('several rules on one venue and market run their jobs in turn and each closes only its own legs', async t => {
+  const f = await fixture(t);
+  f.auto.create({ config: config({ name: 'A', confirmSamples: 1 }), enabled: true, confirmLive: true });
+  f.auto.create({ config: config({ name: 'B', confirmSamples: 1, openThreshold: '4.5', closeThreshold: '1' }), enabled: true, confirmLive: true });
+  const rule = name => f.auto.state().rules.find(item => item.config.name === name);
+  await f.step();
+  assert.equal(f.jobs.length, 1); assert.equal(rule('A').state.phase, 'opening');
+  // B meets its threshold too, but the symbols are locked by A's job: it waits instead of failing.
+  assert.equal(rule('B').state.phase, 'idle'); assert.equal(rule('B').state.failures, 0); assert.equal(rule('B').enabled, true);
+  assert.match(rule('B').live.note, /开仓等待：同合约有未结束的规则「A」的开仓任务 .{8}（执行中）/);
+  await f.settle(); await f.step();
+  assert.equal(rule('A').state.phase, 'holding');
+  assert.equal(f.jobs.length, 2); assert.equal(rule('B').state.phase, 'opening'); assert.equal(f.jobs[0].auto.ruleId, rule('B').id);
+  await f.settle(); await f.step();
+  assert.equal(rule('B').state.phase, 'holding');
+  assert.deepEqual(f.accounts.binance.positions.map(row => [row.symbol, row.side, row.quantity]).sort(), [['BZUSDT', 'short', '2'], ['CLUSDT', 'long', '2']]);
+  // Buying back at 1.51 meets A's close threshold (2) but not B's (1).
+  f.prices.BZUSDT = ['71.5', '71.51'];
+  await f.step();
+  assert.equal(rule('A').state.phase, 'closing'); assert.equal(rule('B').state.phase, 'holding');
+  await f.settle(); await f.step();
+  assert.equal(rule('A').state.phase, 'idle'); assert.equal(rule('A').enabled, true);
+  assert.deepEqual([...f.records.values()].filter(record => record.reduceOnly).map(record => [record.symbol, record.quantity]).sort(), [['BZUSDT', '1'], ['CLUSDT', '1']]);
+  assert.deepEqual(f.accounts.binance.positions.map(row => [row.symbol, row.side, row.quantity]).sort(), [['BZUSDT', 'short', '1'], ['CLUSDT', 'long', '1']]);
+  assert.deepEqual(rule('B').state.held.map(leg => [leg.symbol, leg.side, leg.quantity]), [['BZUSDT', 'short', '1'], ['CLUSDT', 'long', '1']]);
+});
+
+test('in one-way mode an opposite rule waits for the other position to close without counting failures', async t => {
+  const f = await fixture(t);
+  for (const symbol of ['BZUSDT', 'CLUSDT']) f.accounts.binance.modes[symbol] = 'one-way';
+  f.auto.create({ config: config({ name: 'short', confirmSamples: 1 }), enabled: true, confirmLive: true });
+  f.auto.create({ config: config({ name: 'long', direction: 'long', confirmSamples: 1, openThreshold: '6', closeThreshold: '8' }), enabled: true, confirmLive: true });
+  const rule = name => f.auto.state().rules.find(item => item.config.name === name);
+  await f.step(); await f.settle(); await f.step();
+  assert.equal(rule('short').state.phase, 'holding');
+  // Opening the long spread would net against the short one: the executor refuses before sending anything.
+  assert.equal(f.jobs.length, 1); assert.match(rule('long').live.note, /单向模式已有反向仓位/);
+  // Within the retry interval the waiting rule reads nothing from the venue.
+  let reads = 0;
+  f.hooks.account = () => { reads++; };
+  for (let i = 0; i < 5; i++) await f.step();
+  assert.equal(reads, 0);
+  for (let i = 0; i < 5; i++) { await f.wait(30_000); await f.step(); }
+  assert.ok(reads >= 5); f.hooks.account = null;
+  assert.equal(rule('long').enabled, true); assert.equal(rule('long').state.failures, 0); assert.equal(rule('long').state.phase, 'idle');
+  assert.equal(rule('long').state.events.filter(item => item.message.includes('单向模式已有反向仓位')).length, 1);
+  assert.equal(f.jobs.length, 1); assert.equal(f.records.size, 2);
+  f.prices.BZUSDT = ['71.5', '71.51'];
+  await f.step();
+  assert.equal(rule('short').state.phase, 'closing');
+  await f.settle(); await f.step();
+  assert.equal(rule('short').state.phase, 'idle'); assert.deepEqual(f.accounts.binance.positions, []);
+  await f.wait(30_000); await f.step();
+  assert.equal(rule('long').state.phase, 'opening');
+  await f.settle(); await f.step();
+  assert.equal(rule('long').state.phase, 'holding');
+  assert.deepEqual(f.accounts.binance.positions.map(row => [row.symbol, row.side, row.quantity]).sort(), [['BZUSDT', 'long', '1'], ['CLUSDT', 'short', '1']]);
+});
+
+test('a holding rule whose symbols are held by a paused job waits to close and records the blocker once', async t => {
+  const f = await fixture(t);
+  const rule = name => f.auto.state().rules.find(item => item.config.name === name);
+  f.auto.create({ config: config({ name: 'A', confirmSamples: 1 }), enabled: true, confirmLive: true });
+  await f.step(); await f.settle(); await f.step();
+  assert.equal(rule('A').state.phase, 'holding');
+  f.auto.create({ config: config({ name: 'B', confirmSamples: 1 }), enabled: true, confirmLive: true });
+  f.hooks.create = () => { throw new ExecutionExchangeError('交易所拒绝委托'); };
+  await f.step(); await f.settle();
+  assert.equal(f.jobs[0].status, 'paused'); assert.equal(f.jobs[0].auto.ruleId, rule('B').id);
+  f.hooks.create = null;
+  f.prices.BZUSDT = ['71.5', '71.51'];
+  for (let i = 0; i < 4; i++) await f.step();
+  assert.equal(rule('B').state.phase, 'review');
+  // A's close threshold is met, but the paused job keeps the symbols: A waits, visibly and without failing.
+  assert.equal(rule('A').state.phase, 'holding'); assert.equal(rule('A').enabled, true); assert.equal(rule('A').state.failures, 0);
+  assert.match(rule('A').live.note, /平仓等待：同合约有未结束的规则「B」的开仓任务 .{8}（已暂停/);
+  assert.equal(rule('A').live.value, null);
+  assert.equal(rule('A').state.events.filter(item => item.message.startsWith('平仓等待')).length, 1);
+  assert.equal([...f.records.values()].filter(record => record.reduceOnly).length, 0);
+});
+
+test('a lock taken while the books are read makes the rule wait instead of failing', async t => {
+  const f = await fixture(t);
+  f.auto.create({ config: config({ confirmSamples: 1 }), enabled: true, confirmLive: true });
+  f.hooks.account = () => { f.hooks.account = null; f.db.prepare('INSERT INTO execution_locks(resource,job_id) VALUES (?,?)').run('binance:CLUSDT', 'outside-job'); };
+  await f.step();
+  assert.equal(f.jobs.length, 0); assert.equal(f.rule.state.failures, 0); assert.equal(f.rule.enabled, true);
+  assert.match(f.rule.live.note, /开仓等待：所选合约已有未结束任务/);
+  f.db.prepare('DELETE FROM execution_locks WHERE job_id=?').run('outside-job');
+  await f.step();
+  assert.equal(f.jobs.length, 0, 'waits out the retry interval');
+  await f.wait(30_000); await f.step();
+  assert.equal(f.jobs.length, 1);
 });

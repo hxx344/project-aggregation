@@ -15,6 +15,8 @@ export const legOrderType = leg => leg.orderType ?? 'chase';
 export class ExecutionError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
+// A refusal before anything is sent that clears once another job or position ends.
+export class WaitError extends ExecutionError {}
 export const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 export function exactKeys(value, keys) {
   if (!object(value) || Object.keys(value).some(key => !keys.includes(key))) throw new ExecutionError(400, '交易参数包含不支持的字段');
@@ -158,7 +160,7 @@ export function checkPosition(account, leg, action, quantity) {
   const current = currentPosition(account, leg);
   if (account.modes[leg.symbol] !== leg.positionMode) throw new ExecutionError(409, '持仓模式已改变，请重新预览');
   if (action === 'close' && compareDecimals(quantity, current) > 0) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 可平数量不足`);
-  if (action === 'open' && leg.positionMode === 'one-way' && account.positions.some(position => position.symbol === leg.symbol && position.side !== leg.side && compareDecimals(position.quantity, '0') > 0)) throw new ExecutionError(409, '单向模式已有反向仓位，请先明确平仓，不能把开仓变成隐式减仓');
+  if (action === 'open' && leg.positionMode === 'one-way' && account.positions.some(position => position.symbol === leg.symbol && position.side !== leg.side && compareDecimals(position.quantity, '0') > 0)) throw new WaitError(409, '单向模式已有反向仓位，请先明确平仓，不能把开仓变成隐式减仓');
   return current;
 }
 export function ensureNoExternalOrders(account, symbol, ownedIds = new Set()) {
