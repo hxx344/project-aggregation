@@ -147,7 +147,8 @@ export default function App() {
     const controller = new AbortController();
     const connect = () => {
       stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry);
-      if (controller.signal.aborted || !navigator.onLine) return;
+      // Hidden tabs fall back to the 30-second read so they do not hold one of the browser's six HTTP/1.1 connections to this host.
+      if (controller.signal.aborted || !navigator.onLine || document.hidden) return;
       watchdog = createStreamWatchdog();
       const decode = createOverviewDecoder();
       const current = new EventSource('/api/overview/events?protocol=2'); stream = current;
@@ -171,13 +172,13 @@ export default function App() {
         }
       }, 1000);
     };
-    const visible = () => { if (!document.hidden) resume(); };
+    const visible = () => { if (document.hidden) connect(); else resume(); };
     const offline = () => { clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
     // This local timer only sends requests when the stream heartbeat has expired.
-    const health = window.setInterval(() => { if (navigator.onLine && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
+    const health = window.setInterval(() => { if (navigator.onLine && !document.hidden && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
     return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearTimeout(resumeTimer); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
   }, [authenticated, accept, load]);
   useEffect(() => {

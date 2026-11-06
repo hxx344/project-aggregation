@@ -302,7 +302,8 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     };
     const connect = () => {
       disconnect();
-      if (disposed || !navigator.onLine || sessionExpired.current) return;
+      // Hidden tabs rely on tick() polling so they do not hold one of the browser's six HTTP/1.1 connections to this host.
+      if (disposed || !navigator.onLine || sessionExpired.current || document.hidden) return;
       receivedAt = performance.now();
       try {
         const current = new EventSource('/api/system/updates/events');
@@ -334,7 +335,7 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
         }
       }, 1000);
     };
-    const visible = () => { if (!document.hidden) resume(); };
+    const visible = () => { if (document.hidden) disconnect(); else resume(); };
     const offline = () => {
       clearTimeout(resumeTimer);
       resumeTimer = undefined;
