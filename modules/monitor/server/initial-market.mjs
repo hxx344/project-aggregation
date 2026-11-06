@@ -4,7 +4,7 @@ import { hynixTrendOptions, oilTrendOptions } from '../lib/monitor-summary.ts';
 import { recentIntradayChartRows } from '../modules/oil/intraday.mjs';
 
 /** The overview card's seven-day window, with the source status and time kept intact. */
-function hynixTrend(history) {
+export function hynixTrend(history) {
   if (!Array.isArray(history?.points)) return null;
   const source = { points: history.points.map(point => ({ time: point.time, value: point.premium })), status: history.status, fetchedAt: history.fetchedAt };
   return { points: createTrend(source, hynixTrendOptions).points, status: source.status, fetchedAt: source.fetchedAt };

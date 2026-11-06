@@ -779,6 +779,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `monitor-initial-history-payload-20261015`；一次实际慢加载定位，不推进主线复盘检查点。
 **状态补充（2026-11）：** 金油比监控已于 2026-11 移除，首屏不再输出 `cl-xau` 数据；概览与详情分离的契约仍适用于原油、海力士和合约页面。
+**轮询补充（#166，2026-11-06）：** 契约不只管首屏，也管之后的轮询：海力士概览原先用 `useMarketFeed(initial.hynix, active || summaryActive)`，任何页签下都每 60 秒读一次完整 `/api/monitors/hynix/history`。现在完整历史只在详情打开时轮询，概览改读 `/api/monitors/hynix/trend`（与首屏 `hynix.trend` 同一函数、168 点、保留 `status` 与 `fetchedAt`，历史缺失返回 503），并拒收乱序的旧响应；卡片取三份读数中源时间最新的一份，是否过期看当前负责更新卡片的读取。本地种子数据每次读取 196,645 B / gzip 43,781 B → 8,344 B / gzip 2,221 B。验证：`modules/monitor/tests/monitor-summary-refresh.browser.mjs` 断言原油页签 60 秒内 trend 2 次、history 0 次，打开详情才读历史。
 **补充（Issue #141，2026-11-05）：** 海力士首屏改为只内嵌 168 点 `hynix.trend`。拆分后详情 hook 不能再把首屏数据当作已加载的完整历史：首次成功读取前，概览沿用首屏趋势及其真实时间，读取失败标为过期；详情图与表格显示加载中，不能显示“暂无可用行情 / 暂无记录”。[浏览器回归](modules/monitor/tests/hynix-initial-fallback.browser.mjs) 让首次历史请求返回 503 后再成功，去掉回退或未加载状态时会失败。原油 `oil.candles` 仍整份内嵌，属同类余项。
 **补充（Issue #166，2026-11-05）：** 原油首屏改为只内嵌 672 点（7 天 × 96）`oil.trend`，由服务端从已校验的 15 分钟 K 线生成并保留源状态与 `fetchedAt`；详情首次挂载即读取完整 K 线，成功前图表与表格显示加载中。本地仓库种子数据下内嵌 JSON 由 798,942 降到 33,611 字节，客户端挂载解析与初始计算中位数约 80–95ms 降到 0.5ms。[浏览器回归](modules/monitor/tests/oil-initial-fallback.browser.mjs) 同样以首次 503、下一轮成功验证回退与加载状态。海力士概览每 60 秒仍拉完整历史，未改。
 

@@ -26,6 +26,9 @@ async page => {
         return route.fulfill({ json: { status: 'live', fetchedAt, interval: '1h', firstAvailable: '2026-09-23T00:00:00.000Z', warnings: [],
           points: [0, 1, 2].map(index => ({ time: Date.UTC(2026, 8, 23, index), ordinary: 1000, adr: 120 + index, equivalent: 100, spread: 20 + index, premium: 20 + index })) } });
       }
+      if (path === '/api/monitors/hynix/trend') {
+        return route.fulfill({ json: { status: 'live', fetchedAt, points: [0, 1, 2].map(index => ({ time: Date.UTC(2026, 8, 23, index), value: 20 + index })) } });
+      }
       // Unrelated panels are deliberately unavailable; they must not block Hynix.
       return route.fulfill({ status: 503, json: { error: 'Controlled unavailable response' } });
     });
@@ -41,22 +44,27 @@ async page => {
     await waitReading('+21.00%');
     check(count('quote') === 1, 'Oil startup must request Hynix once without opening its detail');
     for (let cycle = 0; cycle < 6; cycle++) { await tick(); await waitReading(`+${22 + cycle}.00%`); }
-    check(count('quote') === 7 && count('history') === 2, 'One quote per 10s and one history read per 60s');
+    check(count('quote') === 7 && count('trend') === 2, 'One quote per 10s and one overview trend read per 60s');
+    check(count('history') === 0, 'The overview card must not read the full history while its detail is closed');
     check(count('funding') === 0, 'Hidden Hynix detail must not request funding history');
     check((await card.innerText()).includes('实时'), 'The visible card must remain live beyond the stale threshold');
     check(await stamp() === new Date(now).toISOString(), 'Show the actual latest quote time');
 
     const fundingOpened = page.waitForRequest('**/api/monitors/hynix/funding', { timeout: 10_000 });
+    const historyOpened = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
     await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
     // Let React's lazy chart boundary commit before switching back.
     now += 1000; await page.clock.runFor(1000);
-    await fundingOpened;
+    await fundingOpened; await historyOpened;
     await page.getByRole('tabpanel', { name: '海力士 ADR', exact: true }).waitFor();
+    const trendReads = count('trend'), trendResumed = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
     await page.getByRole('tab', { name: '原油价差', exact: true }).click();
+    await trendResumed;
     check(count('quote') === 7, 'Switching details must not restart or duplicate the shared quote feed');
-    const fundingReads = count('funding');
+    const fundingReads = count('funding'), historyReads = count('history');
     await tick(); await waitReading('+28.00%');
     check(count('quote') === 8 && count('funding') === fundingReads, 'Returning to oil must retain one Hynix quote poller');
+    check(count('history') === historyReads && count('trend') === trendReads + 1, 'Closing the detail returns the card to the overview trend');
 
     const retainedReading = await reading(), retainedTime = await stamp();
     failQuote = true;

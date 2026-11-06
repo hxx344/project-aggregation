@@ -18,6 +18,24 @@ export function createTrend(history: TrendHistory | undefined, options: { days: 
   return { ...options, points, status: history ? error ? "stale" : history.status : error ? "error" : "loading", fetchedAt: history?.fetchedAt ?? null };
 }
 
+const TREND_STATUSES: ReadonlySet<string> = new Set(["live", "snapshot", "stale"]);
+
+/** Validates a trend read from the API; createTrend still drops non-finite points. */
+export function parseTrendHistory(input: unknown): TrendHistory {
+  const value = input as Partial<TrendHistory> | null;
+  if (!value || typeof value !== "object" || !Array.isArray(value.points) || typeof value.status !== "string" || !TREND_STATUSES.has(value.status)
+    || typeof value.fetchedAt !== "string" || !Number.isFinite(Date.parse(value.fetchedAt))
+    || value.points.some(point => !point || typeof point !== "object")) throw new Error("Invalid trend history");
+  return { points: value.points, status: value.status, fetchedAt: value.fetchedAt };
+}
+
+/** The most recently fetched of several reads of the same history; earlier arguments win ties. */
+export function latestTrend(...sources: (TrendHistory | null | undefined)[]): TrendHistory | undefined {
+  let latest: TrendHistory | undefined;
+  for (const source of sources) if (source && (!latest || Date.parse(source.fetchedAt) > Date.parse(latest.fetchedAt))) latest = source;
+  return latest;
+}
+
 // Both histories use a 60s collector and a 60s browser poll; allow 30s for requests.
 const TREND_UPDATE_GRACE_MS = 2 * 60_000 + 30_000;
 

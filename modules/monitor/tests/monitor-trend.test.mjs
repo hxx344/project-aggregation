@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createTrend, trendGeometry, trendExpired } from "../lib/monitor-trend.ts";
+import { createTrend, latestTrend, parseTrendHistory, trendGeometry, trendExpired } from "../lib/monitor-trend.ts";
 import { hynixSummary, oilSummary } from "../lib/monitor-summary.ts";
 
 const hour = 3_600_000, day = hour * 24;
@@ -102,3 +102,15 @@ for (const [market, intervalMs] of [["oil", 900_000], ["hynix", hour]]) {
     assert.equal(trendExpired(createTrend(undefined, { ...options, intervalMs }), boundary), false);
   });
 }
+
+test("an overview trend read keeps its source status and time, and the newest read of the history wins", () => {
+  const trend = { points: [{ time: 0, value: 1.5 }, { time: hour, value: 0 }], status: "snapshot", fetchedAt: "2026-09-11T07:00:00Z" };
+  assert.deepEqual(parseTrendHistory({ ...trend, extra: true }), trend);
+  for (const invalid of [null, [], { ...trend, points: null }, { ...trend, status: "error" }, { ...trend, fetchedAt: "not a time" }, { ...trend, fetchedAt: undefined }, { ...trend, points: [null] }])
+    assert.throws(() => parseTrendHistory(invalid), /Invalid trend history/);
+  const older = { ...trend, status: "live", fetchedAt: "2026-09-11T06:59:00Z" }, newer = { ...trend, status: "live", fetchedAt: "2026-09-11T07:01:00Z" };
+  assert.equal(latestTrend(undefined, null), undefined);
+  assert.equal(latestTrend(older, newer, trend), newer);
+  assert.equal(latestTrend(trend, { ...trend }), trend, "Ties keep the earlier source");
+  assert.equal(latestTrend(undefined, older), older, "A missing source falls back to the next one");
+});

@@ -8,7 +8,7 @@ import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useMarketFeed } from "../hooks/use-market-feed";
 import { hynixSummary, hynixTrendOptions, type SummaryProps } from "../lib/monitor-summary";
-import { createTrend } from "../lib/monitor-trend";
+import { createTrend, latestTrend } from "../lib/monitor-trend";
 import type { InitialMarketData } from "../lib/initial-market";
 import { useHubFills } from "../lib/hub-fills";
 
@@ -36,11 +36,12 @@ export default function Dashboard({ onSummary, active = true, selected = active,
   if (active && !hasOpened) setHasOpened(true);
   const charts = hasOpened || shown;
   // The overview card stays visible while another market's detail is selected.
-  // Share its feed with the detail without activating hidden charts or funding history.
-  const { data, quote, loading, error, quoteError, refresh } = useMarketFeed(initial?.hynix, active || summaryActive);
+  // Share its quotes with the detail; only the open detail reads the full history and funding.
+  const { data, trend: overviewTrend, quote, loading, error, trendError, quoteError, refresh } = useMarketFeed(initial?.hynix, active, summaryActive);
   const initialTrend = initial?.hynix?.trend ?? undefined;
-  // Until the full history arrives, keep the embedded overview trend and its real source time.
-  const trend = useMemo(() => createTrend(data ? { points: data.points.map(point => ({ time: point.time, value: point.premium })), status: data.status, fetchedAt: data.fetchedAt } : initialTrend, hynixTrendOptions, Boolean(error)), [data, error, initialTrend]);
+  const fullTrend = useMemo(() => data ? { points: data.points.map(point => ({ time: point.time, value: point.premium })), status: data.status, fetchedAt: data.fetchedAt } : undefined, [data]);
+  // Show the most recent read with its real source time; the reader currently serving the card decides whether it is stale.
+  const trend = useMemo(() => createTrend(latestTrend(fullTrend, overviewTrend, initialTrend), hynixTrendOptions, active ? Boolean(error) : trendError), [fullTrend, overviewTrend, initialTrend, active, error, trendError]);
   useEffect(() => { onSummary?.(hynixSummary(quote, quoteError, trend)); }, [onSummary, quote, quoteError, trend]);
   const [range,setRange] = useState<number | null>(null);
   const trades = useHubFills("hynix", tradesActive);
