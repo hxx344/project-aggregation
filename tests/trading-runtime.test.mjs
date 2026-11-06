@@ -32,13 +32,13 @@ async function fixture(t, overrides = {}) {
     bybit: [position('bybit', 'CLUSDT', 'short'), position('bybit', 'BZUSDT', 'long')],
     okx: [position('okx', 'CLUSDT', 'short', { marginMode: 'cross', contractSize: '0.1' }), position('okx', 'BZUSDT', 'long', { marginMode: 'cross', contractSize: '0.01' })],
   };
-  const hynixRows = { binance: [], bybit: [], okx: [] };
-  const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'hynixPositions', 'funding'].map(method => [method, async (secret, options) => {
+  const hynixRows = { binance: [], bybit: [], okx: [] }, anthropicRows = { binance: [], okx: [] };
+  const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'hynixPositions', 'anthropicPositions', 'funding'].map(method => [method, async (secret, options) => {
     calls.push({ exchange, method, secret, ...options });
     if (handlers[exchange][method]) return handlers[exchange][method](secret, options);
     return method === 'funding'
       ? { fetchedAt: stamp(clock), events: [], coverage: [{ start: options.start, end: options.end }], complete: true, error: null }
-      : { fetchedAt: stamp(clock), positions: method === 'hynixPositions' ? hynixRows[exchange] : rows[exchange] };
+      : { fetchedAt: stamp(clock), positions: method === 'hynixPositions' ? hynixRows[exchange] : method === 'anthropicPositions' ? anthropicRows[exchange] : rows[exchange] };
   }]));
   const options = { dataDir, initialPassword: PASSWORD, refreshInterval: 0, assetSyncIntervalMs: 0,
     tradingRefreshIntervalMs: 0, tradingClientFactory: clientFactory, tradingNow: () => clock,
@@ -73,7 +73,7 @@ async function fixture(t, overrides = {}) {
     try { return db.prepare('SELECT * FROM trading_accounts WHERE exchange=?').get(exchange); } finally { db.close(); }
   }
   return { get app() { return app; }, get now() { return clock; }, get origin() { return origin; },
-    advance: amount => { clock += amount; }, rows, hynixRows, handlers, calls, request, login, connect, stored, dataDir,
+    advance: amount => { clock += amount; }, rows, hynixRows, anthropicRows, handlers, calls, request, login, connect, stored, dataDir,
     async reopen() { if (!closed) await app.close(); closed = true; await open(); },
     async close() { await app.close(); closed = true; },
   };
@@ -228,7 +228,7 @@ test('portfolio margin mode persists across restart and governs every verificati
   assert.deepEqual(f.stored('binance'), previous);
   assert.equal(f.app.trading.state().accounts[0].accountMode, 'portfolio-margin');
   f.advance(6000); await f.app.trading.refresh({ force: true });
-  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['funding', 'hynixPositions', 'positions', 'verify']);
+  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['anthropicPositions', 'funding', 'hynixPositions', 'positions', 'verify']);
   assert.ok(f.calls.every(row => row.accountMode === 'portfolio-margin'));
 });
 
@@ -280,6 +280,25 @@ test('four-leg structure follows observed positions, preserves both hedge sides 
   assert.equal(f.app.trading.state().legs[0].fetchedAt, empty.legs[0].fetchedAt);
 });
 
+test('Anthropic positions use the Binance and OKX read-only accounts, never Bybit, through the real entry', async t => {
+  const f = await fixture(t); await f.login();
+  f.anthropicRows.okx = [position('okx', 'ANTHROPICUSDT', 'short', { quantity: '30', markPrice: '183.5', liquidationPrice: '220.2', notional: '5505', marginMode: 'cross', contractSize: '1' })];
+  await f.connect('binance'); await f.connect('bybit'); await f.connect('okx', { ...credentials('okx'), passphrase: 'private_fixture_passphrase' });
+  const { status, data } = await f.request('/api/trading/anthropic');
+  assert.equal(status, 200);
+  assert.deepEqual(data.sources.map(source => [source.exchange, source.state]), [['binance', 'live'], ['okx', 'live'], ['hyperliquid', 'unconfigured']]);
+  const [leg] = data.sources[1].positions;
+  assert.deepEqual([leg.symbol, leg.side, leg.liquidationPrice, leg.distancePercent, leg.alerting], ['ANTHROPICUSDT', 'short', '220.2', '20.00', false]);
+  assert.ok(!f.calls.some(call => call.method === 'anthropicPositions' && call.exchange === 'bybit'));
+  assert.ok(f.calls.filter(call => call.method === 'anthropicPositions').every(call => call.secret.apiKey.includes(call.exchange)));
+  assert.equal((await f.request('/api/trading')).data.legs.every(leg => leg.symbol !== 'ANTHROPICUSDT'), true, 'outside the oil legs');
+  const refused = await f.request('/api/trading/anthropic/alerts', { method: 'PUT', body: { config: { enabled: true, thresholdPercent: 20, repeatMinutes: 30 } } });
+  assert.equal(refused.status, 409);
+  assert.equal((await f.request('/api/trading/anthropic/alerts', { method: 'PUT', body: { config: { enabled: false, thresholdPercent: 0, repeatMinutes: 30 } } })).status, 400);
+  const saved = await f.request('/api/trading/anthropic/alerts', { method: 'PUT', body: { config: { enabled: false, thresholdPercent: 15, repeatMinutes: 60 } } });
+  assert.deepEqual([saved.status, saved.data.alerts.config], [200, { enabled: false, thresholdPercent: 15, repeatMinutes: 60 }]);
+  assert.equal((await f.request('/api/trading/anthropic/alerts/test', { method: 'POST', body: {} })).status, 409);
+});
 test('SK hynix positions use the read-only accounts outside oil legs and PnL, fail on their own and survive restarts', async t => {
   const f = await fixture(t); await f.login();
   f.hynixRows.binance = [position('binance', 'SKHYUSDT', 'long', { quantity: '100', entryPrice: '37', markPrice: '38.25', notional: '3825', unrealizedPnl: '125' })];
@@ -497,7 +516,7 @@ test('overlapping refresh requests share work and enforce the manual refresh coo
   waiting.resolve({ fetchedAt: stamp(f.now), positions: f.rows.binance }); await Promise.all([first, second]);
   const completedCount = f.calls.length; await f.app.trading.refresh({ force: true }); assert.equal(f.calls.length, completedCount);
   f.advance(31000); await f.app.trading.refresh();
-  assert.ok(f.calls.slice(completedCount).every(row => ['positions', 'hynixPositions'].includes(row.method)));
+  assert.ok(f.calls.slice(completedCount).every(row => ['positions', 'hynixPositions', 'anthropicPositions'].includes(row.method)));
 });
 
 test('one timed-out exchange preserves its old timestamp while the other completes, and close aborts outstanding reads', async t => {

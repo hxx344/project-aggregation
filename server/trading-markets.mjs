@@ -11,6 +11,9 @@ export const EXECUTION_MARKETS = Object.freeze({
 });
 /** SK hynix positions are observed with the read-only accounts; their funding and PnL stay out of the oil ledger. */
 export const TRADING_HYNIX_SYMBOLS = EXECUTION_MARKETS.hynix.symbols;
+/** Anthropic legs on the read-only accounts (Bybit lists no Anthropic contract); positions only, outside the oil ledger. */
+export const TRADING_ANTHROPIC_SYMBOLS = Object.freeze(['ANTHROPICUSDT']);
+export const TRADING_ANTHROPIC_EXCHANGES = Object.freeze(['binance', 'okx']);
 export const EXECUTION_ALL_SYMBOLS = Object.freeze(Object.values(EXECUTION_MARKETS).flatMap(market => market.symbols));
 const CEX_SYMBOLS = [...EXECUTION_MARKETS.oil.symbols, ...EXECUTION_MARKETS.hynix.symbols];
 /** Contracts each venue actually lists; every leg, quote and account read is limited to these. */

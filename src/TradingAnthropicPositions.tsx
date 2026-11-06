@@ -1,0 +1,159 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { FormEvent } from 'react';
+import { BellRing, CircleAlert, LoaderCircle, Send } from 'lucide-react';
+import { api, ApiError } from './api';
+import type { AnthropicShares } from './trading-execution-types';
+import { contractKey, findContract, sharesPerUnit } from './trading-anthropic';
+
+type Source = 'binance' | 'okx' | 'hyperliquid';
+type ReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
+type Position = {
+  id: string; exchange: Source; symbol: string; side: 'long' | 'short'; quantity: string; quantityUnit: string | null; contractSize?: string;
+  entryPrice: string | null; markPrice: string | null; notional: string | null; unrealizedPnl: string | null; leverage: string | null;
+  marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; alerting: boolean;
+};
+type SourceState = { exchange: Source; connected: boolean; address?: string | null; state: ReadState; fetchedAt: string | null; error: string | null; refreshing: boolean; positions: Position[] };
+type AlertConfig = { enabled: boolean; thresholdPercent: number; repeatMinutes: number };
+type HistoryEntry = { at: string; status: 'sent' | 'failed' | 'uncertain'; count: number; summary: string[]; error: string | null };
+type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { config: AlertConfig; channel: { configured: boolean }; history: HistoryEntry[]; error: string | null; staleAfterSeconds: number; hysteresisPercent: number } };
+
+const BASE = '/api/trading/anthropic';
+const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid' };
+const STATES: Record<ReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
+const UNCONNECTED: Record<Source, string> = { binance: '在下方「账户连接」连接 Binance 只读账户后显示。', okx: '在下方「账户连接」连接 OKX 只读账户后显示。', hyperliquid: '在上方实盘执行区连接 Hyperliquid 后，按主账户地址读取。' };
+const HISTORY: Record<HistoryEntry['status'], string> = { sent: '已发送', failed: '发送失败', uncertain: '结果未知' };
+const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+const formatDate = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? dateFormat.format(new Date(value)) : '尚未读取';
+// Exchange decimal strings are shown as sent; only the share estimate is a float.
+function amount(value: string | null, signed = false) {
+  if (value === null || !/^-?\d+(?:\.\d+)?$/.test(value)) return '—';
+  const negative = value.startsWith('-'), nonzero = /[1-9]/.test(value);
+  const [integer, fraction] = value.replace(/^-/, '').split('.');
+  const decimals = fraction?.replace(/0+$/, '');
+  return `${negative && nonzero ? '−' : signed && nonzero ? '+' : ''}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${decimals ? `.${decimals}` : ''}`;
+}
+const polarity = (value: string | null) => value === null || !/[1-9]/.test(value) ? '' : value.startsWith('-') ? 'trading-negative' : 'trading-positive';
+const shareText = (value: number) => value.toLocaleString('zh-CN', { maximumFractionDigits: value < 100 ? 2 : 0 });
+
+/** Estimated shares a leg stands for under the page's share-count assumption; null when unknown. */
+function sharesOf(position: Position, shares: AnthropicShares) {
+  const contract = findContract(contractKey(position as { exchange: Source; symbol: 'ANTHROPICUSDT' }));
+  const perUnit = contract ? sharesPerUnit(contract, shares) : null;
+  if (!perUnit) return null;
+  return Number(position.quantity) * perUnit * (position.contractSize ? Number(position.contractSize) : 1);
+}
+
+export default function TradingAnthropicPositions({ shares, onExpired }: { shares: AnthropicShares; onExpired: () => void }) {
+  const [data, setData] = useState<WatchState | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<{ enabled: boolean; threshold: string; repeat: string } | null>(null);
+  const [busy, setBusy] = useState<'save' | 'test' | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  // Save and test failures stay until the next write; the polling read clears only its own error.
+  const [writeError, setWriteError] = useState<string | null>(null);
+  const mounted = useRef(true), expires = useRef(onExpired), reading = useRef<AbortController | null>(null);
+  expires.current = onExpired;
+
+  const load = useCallback(async () => {
+    if (reading.current) return;
+    const controller = new AbortController(); reading.current = controller;
+    try {
+      const value = await api<WatchState>(BASE, { signal: controller.signal, timeoutMs: 12_000 });
+      if (mounted.current) { setData(value); setError(null); }
+    } catch (failure) {
+      if (!mounted.current || controller.signal.aborted) return;
+      if (failure instanceof ApiError && failure.status === 401) expires.current();
+      else setError(failure instanceof Error ? failure.message : 'Anthropic 仓位读取失败');
+    } finally { if (reading.current === controller) reading.current = null; }
+  }, []);
+  useEffect(() => {
+    mounted.current = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = () => { void load(); timer = setTimeout(poll, document.hidden ? 60_000 : 10_000); };
+    const wake = () => { if (!document.hidden) { clearTimeout(timer); poll(); } };
+    poll();
+    document.addEventListener('visibilitychange', wake);
+    return () => { mounted.current = false; clearTimeout(timer); reading.current?.abort(); document.removeEventListener('visibilitychange', wake); };
+  }, [load]);
+
+  const config = data?.alerts.config;
+  const form = draft ?? (config ? { enabled: config.enabled, threshold: String(config.thresholdPercent), repeat: String(config.repeatMinutes) } : null);
+  async function write(kind: 'save' | 'test', event?: FormEvent) {
+    event?.preventDefault();
+    if (!form || busy) return;
+    setBusy(kind); setNotice(null); setWriteError(null);
+    try {
+      const value = kind === 'save'
+        ? await api<WatchState>(`${BASE}/alerts`, { method: 'PUT', body: JSON.stringify({ config: { enabled: form.enabled, thresholdPercent: Number(form.threshold), repeatMinutes: Number(form.repeat) } }), timeoutMs: 15_000 })
+        : await api<WatchState>(`${BASE}/alerts/test`, { method: 'POST', body: '{}', timeoutMs: 20_000 });
+      if (!mounted.current) return;
+      setData(value);
+      if (kind === 'save') setDraft(null);
+      setNotice(kind === 'save' ? '预警设置已保存。' : '测试消息已发送，请在飞书群确认。');
+    } catch (failure) {
+      if (!mounted.current) return;
+      if (failure instanceof ApiError && failure.status === 401) expires.current();
+      else setWriteError(failure instanceof Error ? failure.message : '操作失败');
+    } finally { if (mounted.current) setBusy(null); }
+  }
+
+  const positions = data?.sources.flatMap(source => source.positions) ?? [];
+  const estimates = positions.map(position => ({ position, shares: sharesOf(position, shares) }));
+  const longShares = estimates.filter(item => item.position.side === 'long').reduce((sum, item) => sum + (item.shares ?? NaN), 0);
+  const shortShares = estimates.filter(item => item.position.side === 'short').reduce((sum, item) => sum + (item.shares ?? NaN), 0);
+  const threshold = config?.thresholdPercent ?? null;
+  const dirty = !!draft && !!config && (draft.enabled !== config.enabled || Number(draft.threshold) !== config.thresholdPercent || Number(draft.repeat) !== config.repeatMinutes);
+
+  return <section className="trading-panel trading-positions trading-anthropic-positions" aria-labelledby="trading-anthropic-title">
+    <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>Binance / OKX 用只读账户 · Hyperliquid 用实盘连接的主账户地址（公开接口）· 每 30 秒读取，强平距离按标记价计算</p></div></div>
+    {!data ? <div className="trading-anthropic-loading" role="status">{error ? <span className="trading-warning">{error}</span> : <><LoaderCircle className="spin" size={20} /><span>正在读取 Anthropic 仓位…</span></>}</div> : <>
+      <div className="trading-account-statuses">{data.sources.map(source => <div className="trading-account-status" key={source.exchange}>
+        <div><strong>{NAMES[source.exchange]}</strong><span className={`trading-status ${source.state}`}><i aria-hidden="true" />{STATES[source.state]}</span>{source.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div>
+        <p>{source.connected ? <>仓位读取：{formatDate(source.fetchedAt)}{source.fetchedAt ? '（北京时间）' : ''}{source.address ? ` · ${source.address.slice(0, 6)}…${source.address.slice(-4)}` : ''}</> : UNCONNECTED[source.exchange]}</p>
+        {source.error ? <p className="trading-warning">{source.error}</p> : null}
+      </div>)}</div>
+      {positions.length ? <div className="trading-position-scroll"><table className="trading-position-table" aria-label="Anthropic 仓位明细"><thead><tr>
+        <th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">数量<small>原生单位 · 估算股数</small></th><th scope="col">开仓均价</th><th scope="col">标记价格</th>
+        <th scope="col">名义价值</th><th scope="col">未实现盈亏</th><th scope="col">强平价</th><th scope="col">距强平</th><th scope="col">杠杆</th>
+      </tr></thead><tbody>{estimates.map(({ position, shares: estimate }) => {
+        const distance = position.distancePercent, near = distance !== null && threshold !== null && Number(distance) <= threshold;
+        return <tr key={position.id} className={`trading-leg-start${near ? ' trading-anthropic-near' : ''}`} data-position-id={position.id}>
+          <th scope="row" className="trading-leg-name"><strong>{position.symbol}</strong><span>{NAMES[position.exchange]}</span></th>
+          <td data-label="方向"><span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span></td>
+          <td data-label="数量 · 估算股数">{amount(position.quantity)}{position.quantityUnit ? ` ${position.quantityUnit}` : ''}<small className="trading-anthropic-shares">{estimate === null ? '股数未知' : `≈ ${shareText(estimate)} 股`}</small></td>
+          <td data-label="开仓均价">{amount(position.entryPrice)}</td>
+          <td data-label="标记价格">{amount(position.markPrice)}</td>
+          <td data-label="名义价值">{amount(position.notional)}</td>
+          <td data-label="未实现盈亏" className={polarity(position.unrealizedPnl)}>{amount(position.unrealizedPnl, true)}</td>
+          <td data-label="强平价">{position.liquidationPrice === null ? <span className="trading-muted">未提供</span> : amount(position.liquidationPrice)}</td>
+          <td data-label="距强平" className={near ? 'trading-negative' : ''}>{distance === null ? '—' : `${distance}%`}{position.alerting ? <small className="trading-anthropic-alerting">预警中</small> : null}</td>
+          <td data-label="杠杆">{position.leverage ? `${amount(position.leverage)}×` : '—'}{position.marginMode ? ` ${position.marginMode === 'isolated' ? '逐仓' : position.marginMode === 'cross' ? '全仓' : position.marginMode}` : ''}</td>
+        </tr>;
+      })}</tbody></table></div> : <p className="trading-anthropic-empty">{data.sources.some(source => source.state === 'live') ? '已连接的账户当前没有 Anthropic 仓位。' : '尚无可确认的 Anthropic 仓位数据。'}</p>}
+      {positions.length ? <div className={`trading-structure ${Number.isFinite(longShares) && Number.isFinite(shortShares) ? 'opposed' : 'incomplete'}`}><span>多空股数</span><strong>{Number.isFinite(longShares) && Number.isFinite(shortShares)
+        ? `多头 ≈ ${shareText(longShares)} 股 · 空头 ≈ ${shareText(shortShares)} 股 · 差 ${shareText(Math.abs(longShares - shortShares))} 股（按上方股数假设 ${shares.outstanding}B / ${shares.diluted}B 估算）`
+        : '股数假设无效，暂不估算多空股数'}</strong></div> : null}
+
+      <form className="trading-anthropic-alerts" onSubmit={event => void write('save', event)}>
+        <h3><BellRing size={16} />强平预警 · 飞书</h3>
+        {!data.alerts.channel.configured ? <p className="trading-warning"><CircleAlert size={14} />尚未配置飞书机器人：请先在「系统 → 飞书汇总」保存 Webhook，预警复用同一个机器人。</p> : null}
+        {form ? <div className="trading-anthropic-alert-fields">
+          <label className="trading-anthropic-toggle"><input type="checkbox" checked={form.enabled} onChange={event => setDraft({ ...form, enabled: event.target.checked })} />启用预警</label>
+          <label>距强平低于<span><input type="number" inputMode="decimal" min={1} max={90} step="any" value={form.threshold} onChange={event => setDraft({ ...form, threshold: event.target.value })} />%</span></label>
+          <label>仍未解除时每隔<span><input type="number" inputMode="numeric" min={5} max={1440} step={1} value={form.repeat} onChange={event => setDraft({ ...form, repeat: event.target.value })} />分钟提醒</span></label>
+          <button className="button primary" type="submit" disabled={!!busy || !dirty}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : null}保存</button>
+          <button className="button secondary" type="button" disabled={!!busy || !data.alerts.channel.configured} onClick={() => void write('test')}>{busy === 'test' ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}发送测试</button>
+        </div> : null}
+        <p className="trading-anthropic-rule">任一腿的距强平低于阈值时发送；距离回升到阈值以上 {data.alerts.hysteresisPercent} 个百分点后解除并通知。仓位从账户消失、或有仓位的账户超过 {Math.round(data.alerts.staleAfterSeconds / 60)} 分钟读不到新数据时也会提醒。交易所未提供强平价的仓位（如全仓保证金充足）不参与判断。</p>
+        {error ? <p className="trading-warning" role="alert">{error}</p> : null}
+        {writeError ? <p className="trading-warning" role="alert">{writeError}</p> : null}
+        {data.alerts.error ? <p className="trading-warning" role="alert">{data.alerts.error}</p> : null}
+        {notice ? <p role="status">{notice}</p> : null}
+        {data.alerts.history.length ? <details className="trading-anthropic-history"><summary>最近发送（{data.alerts.history.length}）</summary><ul>{data.alerts.history.slice(0, 10).map(entry => <li key={entry.at}>
+          <time dateTime={entry.at}>{formatDate(entry.at)}</time> · <span className={entry.status === 'sent' ? '' : 'trading-warning'}>{HISTORY[entry.status]}</span> · {entry.summary.join('；')}{entry.error ? `（${entry.error}）` : ''}
+        </li>)}</ul></details> : null}
+      </form>
+      <p className="trading-footnote">强平价与标记价来自交易所账户接口；Hyperliquid 标记价按仓位价值 ÷ 数量折算。估算股数沿用页面的股数假设，只用于核对多空是否大致相等。</p>
+    </>}
+  </section>;
+}

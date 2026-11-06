@@ -19,6 +19,14 @@ const PREVIEW_TTL = 30_000, LEASE_TTL = 60_000;
 // no longer be accepted by any venue.
 const CREATE_ARRIVAL_MARGIN_MS = 60_000, CREATE_OBSERVE_MS = 120_000, ABSENT_CREATE_CHECKS = 2;
 const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5, MISMATCH_RECHECK_MS = 60_000;
+// A status read that failed in transport (timeout, connection, 5xx, rate limit)
+// says nothing about the order. Nothing is amended, cancelled or sent while it
+// is unread, so a resting hedge leg is kept for this window before the job
+// pauses and cancels it (which would leave the filled sibling unhedged). Both
+// bounds apply, so a read that hangs until the call deadline still gets retries.
+const READ_RETRY_MS = 20_000, READ_RETRY_ATTEMPTS = 3;
+// Binance -1003, Bybit 10006 and OKX 50011 are request-rate refusals.
+const RATE_LIMIT_CODES = new Set([-1003, 10006, 50011]);
 // Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
 const VENUE_CLOCK_TOLERANCE_MS = 300_000;
 // The client rounds the window out to whole seconds; stay inside its limit after rounding.
@@ -81,6 +89,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const pending = new Set(), controllers = new Set(), busyJobs = new Set(), connecting = new Set();
   const writerTickets = new Map(), verifiedAccounts = new Map(), protectionErrors = new Map(), recoveredWriterJobs = new Set();
   const attentionChecks = new Map();
+  const readFailures = new Map();
   let protectionReady = !accountWriter;
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
   function lostLease() {
@@ -942,6 +951,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (heldRemainders.has(key)) return;
     heldRemainders.add(key); event(latest, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 剩余数量低于交易所最小下单量，委托保留原价、不再追价`); saveJob(latest);
   }
+  // Transport-level read failures; data, identity and rejection errors still pause at once.
+  const transientRead = error => error instanceof ExecutionExchangeError && !closing
+    && (['timeout', 'transport', 'upstream', 'aborted'].includes(error.code) || error.code === 'rejected' && RATE_LIMIT_CODES.has(error.providerCode));
   async function runJob(id) {
     if (busyJobs.has(id)) return; busyJobs.add(id);
     try {
@@ -955,7 +967,19 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const allBefore = orders(id), working = allBefore.filter(unsettled);
       if (working.length) {
         const readings = await Promise.allSettled(working.map(order => inspectOrder(order)));
-        if (readings.some(result => result.status === 'rejected' || result.value === false)) { pause(id, '委托状态读取失败或提交结果不明，暂停并撤销余单'); await stopping(jobFor(id)); return; }
+        const failed = working.map((order, index) => ({ order, result: readings[index] })).filter(({ result }) => result.status === 'rejected' || result.value === false);
+        if (failed.length) {
+          const detail = failed.map(({ order, result }) => `${TRADING_NAMES[order.exchange]} ${order.spec.symbol}：${result.status === 'rejected' ? safeError(result.reason) : '提交结果尚未查到'}`).join('；');
+          const streak = readFailures.get(id) ?? { since: now(), count: 0 };
+          if (failed.every(({ result }) => result.status === 'rejected' && transientRead(result.reason)) && (streak.count < READ_RETRY_ATTEMPTS || now() - streak.since < READ_RETRY_MS)) {
+            if (!streak.count) { const latest = jobFor(id); event(latest, `委托状态暂时读取失败（${detail}），至少重试 ${READ_RETRY_ATTEMPTS} 次、${READ_RETRY_MS / 1000} 秒，期间不追价、不下新单`); saveJob(latest); }
+            readFailures.set(id, { ...streak, count: streak.count + 1 });
+            return;
+          }
+          readFailures.delete(id);
+          pause(id, `委托状态读取失败或提交结果不明（${detail}），暂停并撤销余单`); await stopping(jobFor(id)); return;
+        }
+        if (readFailures.delete(id)) { const latest = jobFor(id); event(latest, '委托状态已恢复读取，继续执行'); saveJob(latest); }
         job = jobFor(id);
         if (job.status === 'stopping') { await stopping(job); return; }
         for (const original of working) {
@@ -987,7 +1011,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
             if (jobFor(id).status === 'stopping') break;
           }
         }
-      }
+      } else readFailures.delete(id);
       job = jobFor(id);
       if (job.status === 'stopping') { await stopping(job); return; }
       if (!['queued', 'running'].includes(job.status)) return;
@@ -1033,6 +1057,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       } catch { /* A new lease owner will reconcile durable intents. */ }
     } finally {
       busyJobs.delete(id);
+      if (!['queued', 'running'].includes(jobFor(id).status)) readFailures.delete(id);
       if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); attentionChecks.delete(id); }
     }
   }
