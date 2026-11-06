@@ -662,6 +662,27 @@ test('a learned gap holds the budget for at most two minutes', () => {
   assert.ok(run.current.timeline[364].has(bookKey('FIRST')));
 });
 
+const longestAbsence = (run, base) => {
+  let longest = 0, current = 0;
+  for (const rows of run.current.timeline) { current = rows.has(bookKey(base)) ? 0 : current + 1; longest = Math.max(longest, current); }
+  return longest;
+};
+
+// Reservations of pairs whose realignment gaps exceed the 120s cap lapse before they realign, yet releasing them
+// earlier, or whenever the pair's observed rhythm says it cannot use the slot yet, let the short pair take every
+// budget: one long pair below was never shown again and another waited 2370s (#222).
+for (const [name, alignments, longGap] of [
+  ['three long pairs', [['L0', 90, 3, 130], ['L1', 88, 1, 139], ['L2', 102, 2, 131], ['S', 0, 3, 26]], ['L0', 'L1', 'L2']],
+  ['two long pairs', [['L0', 48, 2, 123], ['L1', 64, 2, 138], ['S', 17, 3, 20]], ['L0', 'L1']],
+]) {
+  test(`pairs realigning beyond the reservation cap keep their reservation against a short pair: ${name} (#222)`, () => {
+    const run = differentialReplay(periodicAlignmentFrames(3600, alignments, { avoidBaseline: true }));
+    assertNoRegression(run, name);
+    assertRecoveryLiveness(run, name);
+    for (const base of longGap) assert.ok(longestAbsence(run, base) <= 900, `${name}: ${base} absent for ${longestAbsence(run, base)}s`);
+  });
+}
+
 test('starvation: 128 randomized periodic replays with random periods and phases recover every cohort within a bounded wait', context => {
   let longest = 0, worst = 0;
   for (let seed = 1; seed <= 128; seed++) {
