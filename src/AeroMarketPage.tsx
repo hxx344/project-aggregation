@@ -37,7 +37,7 @@ function discoveryText({ enabled, discovery: d }: MarketChain, serverNow: number
   const notices = [];
   if (d.phase === 'running') notices.push('正在重新发现池子，完成后更新当前数据；若未完成，下一轮先刷新当前数据');
   if (d.phase === 'pending') notices.push(d.refreshPending ? '池子发现待继续，下一轮先刷新当前数据' : '池子发现待继续，后续轮次重新尝试');
-  if (d.phase === 'budget_backoff') notices.push(`重新发现连续 ${d.stalledAttempts ?? 0} 次预算耗尽且无新进展，已暂停${d.retryAt ? `，${when(d.retryAt)} 再试` : ''}；当前数据继续刷新`);
+  if (d.phase === 'budget_backoff') notices.push(`重新发现已累计 ${d.stalledAttempts ?? 0} 次预算耗尽且无新进展，已暂停${d.retryAt ? `，${when(d.retryAt)} 再试` : ''}；当前数据继续刷新`);
   if (d.stale || d.failures > 0) {
     const age = d.at ? `池子列表 ${Math.floor((serverNow - d.at) / 3_600_000)} 小时未更新` : '池子列表未更新';
     const failed = d.failures > 0 ? `，重新发现连续失败 ${d.failures} 次：${d.error ?? '原因未知'}${d.retryAt ? `，${when(d.retryAt)} 再试` : ''}` : '';

@@ -205,9 +205,10 @@ export async function readPoolStatics(rpc, pools) {
   });
 }
 
+// 没有 gauge（零地址）为 null；子调用失败为 undefined，调用方据此区分"确实没有"与"这次没读到"。
 export async function readGauges(rpc, pools) {
   const rows = await rpc.multicall(pools.map((pool) => ({ target: pool, iface: POOL, fn: 'gauge' })));
-  return rows.map((r) => (r.ok && !/^0x0{40}$/i.test(r.value) ? r.value.toLowerCase() : null));
+  return rows.map((r) => (!r.ok ? undefined : /^0x0{40}$/i.test(r.value) ? null : r.value.toLowerCase()));
 }
 
 export async function readTokens(rpc, tokens) {
