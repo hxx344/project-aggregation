@@ -1120,7 +1120,7 @@ test('waiting in the serial queue counts toward the batch budget, and a callback
 test('a queued pool records the gauge liveness reading; unknown survives a restart and old entries read as unknown', async () => {
   const directory = fixtureDir();
   const { POOL, POOL2, WETH, CBBTC, infos } = twoPools();
-  const statuses = { [POOL]: { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' }, [POOL2]: { state: 'alive', note: 'Voter.isAlive = true' } };
+  const statuses = { [POOL]: { state: 'unknown', note: 'CLGaugeFactory.emissionCap 调用回滚，无法确认 gauge 是否已被停用' }, [POOL2]: { state: 'alive', note: 'Voter.isActivated = true，CLGaugeFactory.emissionCap = 205170325290406412（上限不为 0 不代表本期一定有排放）' } };
   const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => ({ ...infos[address], gaugeStatus: statuses[address] }) };
   const { manager } = managerWith(directory, { chain });
   try {
@@ -1140,7 +1140,7 @@ test('a queued pool records the gauge liveness reading; unknown survives a resta
     await restarted.initialize();
     const pools = restarted.state().changes.pools;
     assert.deepEqual(pools.map((p) => p.gaugeStatus.state), ['unknown', 'unknown']);
-    assert.match(pools[0].gaugeStatus.note, /不提供 isAlive/);
+    assert.match(pools[0].gaugeStatus.note, /emissionCap 调用回滚/);
     assert.match(pools[1].gaugeStatus.note, /未核对/);
     await restarted.close();
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }

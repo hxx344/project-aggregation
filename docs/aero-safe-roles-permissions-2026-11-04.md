@@ -58,8 +58,8 @@ v0.2 变更：管理钱包定为单个硬件钱包 1/1（第 10 节）；首版�
 | CLFactory | `0x9CB220581b91b0C83223012FE69688b92aD07a76` | `voter() = 0x3824…4078` |
 | NonfungiblePositionManager（NPM） | `0x4857DB576eE0e45F10525eC59527BfD10beeC60b` | `factory() = CLFactory`，`name() = "Slipstream V3 Deposit"`，`owner() = 0x4225…4cE0`（协议方，只能改描述器，不涉资金） |
 | SwapRouter | `0x9Ee35Bf1bd69a03c6F0393582030fCe8Bb93D418` | `factory() = CLFactory`，`WETH9() = 0x4200…0006` |
-| Voter（LeafVoter） | `0x382409fad8503FbCdbB27A4211551fa03e884078` | `RECEIPT_TOKEN() = 0x6CdD…ceE7`（xAERO） |
-| CLGaugeFactory | `0xf437f62053ACB121665b8fDBfeA8F214FB8E589d` | gauge 的 `gaugeFactory()` |
+| Voter（LeafVoter） | `0x382409fad8503FbCdbB27A4211551fa03e884078` | `RECEIPT_TOKEN() = 0x6CdD…ceE7`（xAERO）；Blockscout 已验证源码，非代理；没有 `isAlive` / `isGauge` / `killGauge`，gauge 激活状态读 `isActivated(gauge)` |
+| CLGaugeFactory | `0xf437f62053ACB121665b8fDBfeA8F214FB8E589d` | gauge 的 `gaugeFactory()`；`isGauge(gauge)` 对已登记 gauge 为 true；`emissionCap(gauge)` 为该 gauge 的排放上限，清零即停用 |
 | CLGauge 实现 | `0x89E91A960154b1ed6c093039a8F0725ab67D14E0` | 已查两个 gauge 均为它的 EIP-1167 克隆 |
 
 不要使用旧部署：NPM `0x8279…5b72`、SwapRouter `0xBE6D…18a5` 的 `factory()` 都是旧工厂 `0x5e7B…809A`，与当前池子不配套。
@@ -239,7 +239,7 @@ Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/a
     - 池子由 CL 工厂按 (token0, token1, tickSpacing) 登记；
     - 有 gauge，没有 gauge 的池子拒绝；
     - gauge 是已审实现的 EIP-1167 克隆，与池子互相指向，NFT 与 voter 是固定地址。
-    - 向 Voter 读 `isAlive(gauge)`（单次，不重试）：`false` 拒绝；`true` 记为正常；调用回滚（固定 Voter 0x3824… 不提供该方法：2026-11-06 主网 `eth_call` 无返回数据回滚，合约字节码的分派表里也没有 `isAlive` 选择器，所以目前新加的池子都会标为未知）、返回值不是恰好 32 字节的 0 或 1、或读取失败都记为「gauge 状态未知」，待加池与配置页照此展示，不当作正常，也不拿零排放推断停用。`cli.mjs plan` 同样读取并在摘要行标出未知。
+    - 读 gauge 停用状态（`executor.gaugeLiveness`，三项读数钉在同一区块，每项单次、20 秒超时、不重试）：固定 Voter 0x3824… 是 LeafVoter，没有 `isAlive` / `isGauge` / `killGauge`（Blockscout 已验证源码里没有这些函数，主网 `eth_call` 读 `isAlive` 回滚），改读两项停用信号：`Voter.isActivated(gauge)` 为 `false`（投票路由到 ZERO_GAUGE，拿不到排放；源码没有取消激活的路径）拒绝；`CLGaugeFactory.emissionCap(gauge)` 为 0（紧急委员会或 CAP_ADMIN 清零后排放全部转入 surplus，等价旧版 killGauge；CAP_OPERATOR 不能设为 0）拒绝。未登记的地址读 `emissionCap` 也是 0，所以先读 `CLGaugeFactory.isGauge(gauge)`，未登记时记为「gauge 状态未知」，不当作停用。已激活且上限不为 0 记为正常；上限不为 0 只说明没有被清零，不代表本期一定有排放，也不拿零排放推断停用。调用回滚、返回值不是恰好 32 字节（bool 只认 0 或 1，`uint128` 高 128 位须为 0）、或读取失败都记为「gauge 状态未知」，待加池与配置页照此展示，不当作正常，也不拒绝。不用 FactoryRegistry 的 `emissionCap`（未知 gauge 也返回 0，无法区分），也不扫 `EmissionCapSet` 事件（频繁，公共 RPC 区块跨度受限）。`cli.mjs plan` 同样读取：停用的列入问题，未知的在摘要行标出。
     - 代币和 gauge 不能是 Safe、Roles、固定的协议合约，也不能与已有目标重合（同一地址出现两次时，后下发的 `scopeFunction` 会覆盖前一个）；`buildPermissions` 对所有配置都做这项检查。
   - 配置和其他待加池里都没有额度的新代币必须填每日额度，页面按约 1000 美元预填；也可顺带填这两个代币的已有额度。已在白名单、已在待加池、或同代币对同 tickSpacing 已在待加池的拒绝；合成后条件树超限返回 409「白名单已满」，不加入。
 - 调额度（`POST /changes/allowances`，`{ allowances: { 代币地址: 每日数量 | null } }`）：已有代币改回配置值或传 null 即撤回；待加池新代币的额度只能改，不需要时移出对应池子。
