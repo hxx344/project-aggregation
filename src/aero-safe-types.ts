@@ -90,4 +90,6 @@ export type AeroSafePreview = {
   capUsd?: number | null; // 实际生效的投入上限（页面填的与本池剩余空间取小）
   // 本池设了美元上限时的占用：capUsd 上限、inPoolUsd 本池已有、roomUsd 还能放（投入已按它缩小）。
   limit?: { capUsd: number; inPoolUsd: number; roomUsd: number } | null;
+  // 开仓要消耗的 Roles 每日额度（最小单位）：兑换卖出量与 mint desired 合计；remaining 为当前可用，未配置额度时为 null。allowanceShort 为额度不足的说明。
+  allowance: { token: string; symbol: string; need: string; remaining: string | null }[]; allowanceShort: string | null;
 };

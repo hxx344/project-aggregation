@@ -1,7 +1,7 @@
 // bot 经 Roles 以 Safe 名义执行 Aero Slipstream 操作（docs/aero-safe-roles-permissions-2026-11-04.md 第 9 节）。
 // 交易目标与参数只取自配置和 addresses.mjs，RPC 只提供读数与报价；每笔先过本地校验（policy.mjs），再由链上 Roles 校验。
 // 报价一律以 Safe 身份 eth_call 目标合约（NPM / Router），最小成交量 = 报价 × (1 − 滑点)。
-import { FetchRequest, Interface, JsonRpcProvider, MaxUint256, Network, Transaction, getAddress, keccak256 } from 'ethers';
+import { FetchRequest, Interface, JsonRpcProvider, MaxUint256, Network, Transaction, formatUnits, getAddress, keccak256 } from 'ethers';
 import { AERO, BASE_CHAIN_ID } from './addresses.mjs';
 import { buildPermissions } from './permissions.mjs';
 import { accruedAllowance, checkTransactions } from './policy.mjs';
@@ -630,6 +630,33 @@ export function capAmounts(ctx, pool, amount0, amount1, cap) {
   return { amount0: (amount0 * scale) / 1_000_000_000n, amount1: (amount1 * scale) / 1_000_000_000n, capped: true };
 }
 
+// 开仓要消耗的 Roles 额度（原始单位）：兑换的卖出量与 mint 的 desired 共用卖出币的额度键，买入币按兑换报价（没有报价时按现价折算）计入 mint。
+export function openAllowanceNeed(pool, { amount0, amount1, swap, sqrtPriceX96 }) {
+  let need0 = amount0, need1 = amount1;
+  if (swap) {
+    const zeroForOne = getAddress(swap.tokenIn) === pool.token0;
+    const q192 = 1n << 192n, s2 = BigInt(sqrtPriceX96) ** 2n;
+    // 现价折算不扣手续费，略高于实际成交，按偏多计入额度。
+    const out = swap.quoted ?? (zeroForOne ? (swap.amountIn * s2) / q192 : (swap.amountIn * q192) / s2);
+    if (zeroForOne) need1 += out; else need0 += out;
+  }
+  return { need0, need1 };
+}
+
+const shortUnits = (value, decimals) => (decimals == null ? String(value) : Number(formatUnits(value, decimals)).toLocaleString('en-US', { maximumSignificantDigits: 6 }));
+
+// 按当前可用额度核对开仓需要的额度；不够时返回可读说明，够时返回 null。
+function allowanceShortText(ctx, rows) {
+  const short = rows.filter((r) => r.need > 0n && (r.remaining == null || r.remaining < r.need));
+  if (!short.length) return null;
+  const parts = short.map((r) => {
+    const d = ctx.tokens?.get(r.token)?.decimals;
+    return `${r.symbol} 需约 ${shortUnits(r.need, d)}，剩 ${r.remaining == null ? '无额度' : shortUnits(r.remaining, d)}`;
+  });
+  const fit = short.every((r) => r.remaining != null) ? short.reduce((min, r) => { const pct = (r.remaining * 100n) / r.need; return pct < min ? pct : min; }, 100n) : null;
+  return `今日额度不足（${parts.join('；')}）${fit != null ? `，额度只够这次投入量的约 ${fit}%` : ''}；请调低投入比例或上限、等额度补充，或在「配置」调整每日额度`;
+}
+
 // 开仓前预览：按比例取 Safe 余额，算出配平兑换并报价，不签名。
 // amounts（原始单位）给出时按它投入（不超过 Safe 余额），不再按 shareBps 取比例：自动调仓只投入本次平仓收回的币，不动 Safe 里的其他余额。
 export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts = null, cap = null }) {
@@ -652,7 +679,14 @@ export async function previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper
   }
   const after0 = swapPlan ? (plan.zeroForOne ? amount0 - plan.amountIn : amount0 + (swapPlan.quoted ?? 0n)) : amount0;
   const after1 = swapPlan ? (plan.zeroForOne ? amount1 + (swapPlan.quoted ?? 0n) : amount1 - plan.amountIn) : amount1;
-  return { pool: pool.address, tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, capped: shared.capped, swap: swapPlan, deposit0: after0, deposit1: after1 };
+  const { need0, need1 } = openAllowanceNeed(pool, { amount0, amount1, swap: swapPlan, sqrtPriceX96: slot0.sqrtPriceX96 });
+  const { allowances: remaining } = await remainingAllowances(ctx);
+  const allowance = [[pool.token0, need0], [pool.token1, need1]].map(([token, need]) => {
+    const a = allowanceFor(ctx, token);
+    return { token, symbol: a?.symbol ?? ctx.tokens?.get(token)?.symbol ?? token.slice(0, 8), need, remaining: a ? remaining.get(a.key)?.remaining ?? null : null };
+  });
+  return { pool: pool.address, tick: Number(slot0.tick), sqrtPriceX96: slot0.sqrtPriceX96, tickLower, tickUpper, amount0, amount1, capped: shared.capped, swap: swapPlan, deposit0: after0, deposit1: after1,
+    allowance, allowanceShort: allowanceShortText(ctx, allowance) };
 }
 
 // 用户确认的是预览数字：执行时重算的投入量偏离超过 1%、或配平兑换超出预览 10% 时不执行。
@@ -673,6 +707,8 @@ export async function openPosition(ctx, hooks, { pool: poolAddress, tickLower, t
   const preview = await previewOpen(ctx, { pool: poolAddress, tickLower, tickUpper, shareBps, rebalance, amounts, cap });
   if (preview.amount0 === 0n && preview.amount1 === 0n) throw new ExecError('可投入的数量为 0，未发送');
   if (expect) checkExpectation(preview, expect);
+  // 额度按兑换卖出量与 mint desired 合计扣：不够时在兑换前停下，免得兑换已成交、开仓才被拒。
+  if (preview.allowanceShort) throw new ExecError(`${preview.allowanceShort}，未签名`, { code: 'allowance' });
   let amount0 = preview.amount0, amount1 = preview.amount1;
   if (preview.swap) {
     hooks.step?.('配平兑换');
