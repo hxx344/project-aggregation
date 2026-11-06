@@ -1,14 +1,16 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { atomicJson } from '../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from './http-common.mjs';
+import { postCard, validateChannel } from './automation/feishu-digest-core.mjs';
 import { decimal } from './trading-decimal.mjs';
 import { EXECUTION_VENUE_SYMBOLS, TRADING_NAMES } from './trading-markets.mjs';
 
 // Anthropic arbitrage positions and their liquidation watch. Read only: the
 // Binance/OKX legs come from the read-only accounts (trading.anthropic()), the
 // Hyperliquid legs from the public info endpoint for the master address of the
-// live connection. Alerts go through the Feishu digest's robot.
+// live connection. Alerts go through their own Feishu robot when one is saved,
+// otherwise through the Feishu digest's robot.
 // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals
 const HL_INFO = 'https://api.hyperliquid.xyz/info';
 const HL_SYMBOLS = EXECUTION_VENUE_SYMBOLS.hyperliquid;
@@ -131,9 +133,32 @@ export function alertCard(events, { title, threshold, at, test = false }) {
       { tag: 'note', elements: [{ tag: 'plain_text', content: `距强平 = 标记价到强平价的距离 ÷ 标记价；阈值 ${threshold}%。数据来自工作台最新读取，时间为北京时间。` }] }] };
 }
 
-export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
+export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, encrypt, decrypt, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
   const directory = path.join(dataDir, 'anthropic-watch');
-  const configPath = path.join(directory, 'config.json'), statePath = path.join(directory, 'state.json');
+  const configPath = path.join(directory, 'config.json'), statePath = path.join(directory, 'state.json'), channelPath = path.join(directory, 'channel.json');
+  // The own robot's webhook is a credential like the digest's: encrypted at rest, decrypted only to send, never returned.
+  // A saved but unreadable robot blocks sending instead of falling back to the digest's group.
+  let ownHost = null, ownError = null;
+  function robot() {
+    if (ownHost || ownError) return { configured: !!ownHost, source: 'own', title: '工作台', host: ownHost, error: ownError };
+    const digest = feishu.alertChannel();
+    return { configured: digest.configured, source: digest.configured ? 'digest' : null, title: digest.title, host: null, error: null };
+  }
+  // Throws when the file is missing or unreadable; the caller treats that as a definite refusal (nothing was sent).
+  function readOwn() {
+    if (!existsSync(channelPath)) throw new Error('预警机器人已被清除');
+    const saved = readBounded(channelPath);
+    if (!object(saved)) throw new Error('invalid_anthropic_watch_channel');
+    return validateChannel(decrypt(saved.value));
+  }
+  async function post(card) {
+    if (closed) throw new Error('飞书发送已停止');
+    if (!ownHost && !ownError) return feishu.postAlert(card, { signal: controller.signal });
+    let channel;
+    try { channel = readOwn(); } catch { throw new Error('预警机器人无法读取，消息未发出，请重新填写'); }
+    await postCard(channel, card, { fetcher, now: now(), signal: controller.signal });
+  }
+  const NO_ROBOT = '请先保存预警机器人，或在「系统 → 飞书汇总」配置机器人';
   let config = { ...ANTHROPIC_ALERT_DEFAULTS }, loadError = null, stateError = null;
   // active: leg id → { sentAt, label }; stale: source → sentAt. Both are claimed on disk before a send.
   let alerts = { active: {}, stale: {} }, history = [], failedAt = 0, lastError = null;
@@ -231,13 +256,13 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
   }
 
   async function deliver(events, next) {
-    const channel = feishu.alertChannel();
+    const channel = robot();
     const previous = alerts;
     // Claim before sending (L090): a failed claim sends nothing and keeps the events eligible.
     if (!persist(next)) return;
     alerts = next;
     const entry = { at: iso(now()), status: 'sent', count: events.length, summary: events.map(event => eventLine(event, config.thresholdPercent).split('\n')[0]).slice(0, 6), error: null };
-    try { await feishu.postAlert(alertCard(events, { title: channel.title, threshold: config.thresholdPercent, at: now() }), { signal: controller.signal }); failedAt = 0; lastError = null; }
+    try { await post(alertCard(events, { title: channel.title, threshold: config.thresholdPercent, at: now() })); failedAt = 0; lastError = null; }
     catch (error) {
       entry.status = error?.uncertain ? 'uncertain' : 'failed'; entry.error = String(error?.message || '飞书发送失败').slice(0, 200); lastError = entry.error;
       // A definite refusal releases the claim so the next check sends again; an uncertain one may have arrived.
@@ -254,7 +279,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
     polling = (async () => {
       await readHyperliquid();
       if (closed || sending || !config.enabled || loadError) return;
-      const channel = feishu.alertChannel();
+      const channel = robot();
       if (!channel.configured || failedAt && now() - failedAt < FAILURE_RETRY_MS) return;
       const { events, next } = evaluate(sources());
       if (!events.length) return;
@@ -265,11 +290,11 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
   }
 
   function state() {
-    const list = sources(), channel = feishu.alertChannel();
+    const list = sources(), channel = robot();
     return { schema: 1, generatedAt: iso(now()), sources: list.map(source => ({ ...source, positions: source.positions.map(row => {
       const distance = liquidationDistance(row);
       return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), alerting: Object.hasOwn(alerts.active, row.id) };
-    }) })), alerts: { config: { ...config }, channel: { configured: channel.configured }, history: structuredClone(history), error: loadError ?? stateError ?? lastError,
+    }) })), alerts: { config: { ...config }, channel: { configured: channel.configured, source: channel.source, host: channel.host, error: channel.error }, history: structuredClone(history), error: loadError ?? stateError ?? lastError,
       staleAfterSeconds: STALE_ALERT_MS / 1000, hysteresisPercent: HYSTERESIS } };
   }
 
@@ -286,6 +311,8 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
         if (saved && object(saved.alerts) && object(saved.alerts.active) && object(saved.alerts.stale)) alerts = { active: saved.alerts.active, stale: saved.alerts.stale };
         if (saved && Array.isArray(saved.history)) history = saved.history.slice(0, HISTORY_LIMIT);
       } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警状态无法读取，从空状态开始'); }
+      try { if (existsSync(channelPath)) ownHost = new URL(readOwn().webhookUrl).hostname; }
+      catch { ownHost = null; ownError = '已保存的预警机器人无法读取，请重新填写'; log.warn({ type: 'anthropic-watch' }, ownError); }
       if (intervalMs > 0) {
         timer = setInterval(() => void poll(), intervalMs); timer.unref?.();
         first = setTimeout(() => void poll(), 1000); first.unref?.();
@@ -294,7 +321,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
     save(value) {
       let next;
       try { next = validateAlertConfig(value); } catch (error) { throw new HttpError(400, error.message); }
-      if (next.enabled && !feishu.alertChannel().configured) throw new HttpError(409, '启用前请先在「系统 → 飞书汇总」保存飞书机器人 Webhook');
+      if (next.enabled && !robot().configured) throw new HttpError(409, robot().error ?? `启用前${NO_ROBOT}`);
       try { atomicJson(configPath, next); }
       catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警设置写入失败'); throw new HttpError(503, '预警设置无法保存，请恢复存储后重试'); }
       // Switching off forgets open alerts, so switching on again reports the current situation afresh.
@@ -302,16 +329,38 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
       config = next; loadError = null; failedAt = 0; lastError = null;
       return state();
     },
+    setChannel(value) {
+      let next;
+      try { next = validateChannel(value); } catch (error) { throw new HttpError(400, error.message); }
+      try { atomicJson(channelPath, { value: encrypt(next) }); }
+      catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警机器人写入失败'); throw new HttpError(503, '预警机器人无法保存，请恢复存储后重试'); }
+      ownHost = new URL(next.webhookUrl).hostname; ownError = null; failedAt = 0; lastError = null;
+      return state();
+    },
+    clearChannel() {
+      // Without the digest's robot there is nowhere left to send: switch off durably before removing the robot,
+      // so a failed write never leaves alerts on disk enabled while the page shows them off.
+      if (config.enabled && !feishu.alertChannel().configured) {
+        const next = { ...config, enabled: false };
+        try { atomicJson(configPath, next); }
+        catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警设置写入失败'); throw new HttpError(503, '预警设置无法保存，机器人未清除，请恢复存储后重试'); }
+        config = next; alerts = { active: {}, stale: {} }; persist();
+      }
+      try { rmSync(channelPath, { force: true }); }
+      catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警机器人删除失败'); throw new HttpError(503, '预警机器人无法清除，请恢复存储后重试'); }
+      ownHost = null; ownError = null; failedAt = 0; lastError = null;
+      return state();
+    },
     async test() {
-      const channel = feishu.alertChannel();
-      if (!channel.configured) throw new HttpError(409, '请先在「系统 → 飞书汇总」保存飞书机器人 Webhook');
+      const channel = robot();
+      if (!channel.configured) throw new HttpError(409, channel.error ?? NO_ROBOT);
       if (testing) throw new HttpError(409, '测试消息正在发送，请稍候');
       const lines = sources().flatMap(source => source.positions.map(row => {
         const distance = liquidationDistance(row);
         return `${legName(row)}：距强平 ${distance === null ? '未提供强平价' : `${distance.toFixed(2)}%`}`;
       }));
       testing = true;
-      try { await feishu.postAlert(alertCard(lines.length ? lines : ['当前没有读取到 Anthropic 仓位。'], { title: channel.title, threshold: config.thresholdPercent, at: now(), test: true }), { signal: controller.signal }); }
+      try { await post(alertCard(lines.length ? lines : ['当前没有读取到 Anthropic 仓位。'], { title: channel.title, threshold: config.thresholdPercent, at: now(), test: true })); }
       catch (error) { throw new HttpError(error?.uncertain ? 504 : 502, String(error?.message || '飞书发送失败')); }
       finally { testing = false; }
       return state();

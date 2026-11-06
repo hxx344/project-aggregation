@@ -298,6 +298,16 @@ test('Anthropic positions use the Binance and OKX read-only accounts, never Bybi
   const saved = await f.request('/api/trading/anthropic/alerts', { method: 'PUT', body: { config: { enabled: false, thresholdPercent: 15, repeatMinutes: 60 } } });
   assert.deepEqual([saved.status, saved.data.alerts.config], [200, { enabled: false, thresholdPercent: 15, repeatMinutes: 60 }]);
   assert.equal((await f.request('/api/trading/anthropic/alerts/test', { method: 'POST', body: {} })).status, 409);
+  const hook = 'https://open.feishu.cn/open-apis/bot/v2/hook/runtime-own-token';
+  assert.equal((await f.request('/api/trading/anthropic/alerts/channel', { method: 'PUT', body: { webhookUrl: 'http://open.feishu.cn/x', signingSecret: '' } })).status, 400);
+  const own = await f.request('/api/trading/anthropic/alerts/channel', { method: 'PUT', body: { webhookUrl: hook, signingSecret: 'runtime-own-secret' } });
+  assert.deepEqual([own.status, own.data.alerts.channel], [200, { configured: true, source: 'own', host: 'open.feishu.cn', error: null }]);
+  const stored = await readFile(path.join(f.dataDir, 'anthropic-watch', 'channel.json'), 'utf8');
+  assert.doesNotMatch(stored + JSON.stringify((await f.request('/api/trading/anthropic')).data), /runtime-own-token|runtime-own-secret/, 'encrypted at rest and never returned');
+  assert.equal((await f.request('/api/trading/anthropic/alerts', { method: 'PUT', body: { config: { enabled: true, thresholdPercent: 20, repeatMinutes: 30 } } })).status, 200, 'the own robot allows switching on');
+  assert.equal((await f.request('/api/trading/anthropic/alerts/channel/clear', { method: 'POST', body: { extra: 1 } })).status, 400);
+  const cleared = await f.request('/api/trading/anthropic/alerts/channel/clear', { method: 'POST', body: {} });
+  assert.deepEqual([cleared.status, cleared.data.alerts.channel.configured, cleared.data.alerts.config.enabled], [200, false, false], 'no digest robot either: alerts switch off');
 });
 test('SK hynix positions use the read-only accounts outside oil legs and PnL, fail on their own and survive restarts', async t => {
   const f = await fixture(t); await f.login();

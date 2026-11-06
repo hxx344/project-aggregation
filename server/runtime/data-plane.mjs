@@ -139,7 +139,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
     positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
   // Anthropic legs: read-only Binance/OKX accounts plus the live Hyperliquid connection's public positions.
-  const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0, readCex: () => trading.anthropic(),
+  const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, encrypt, decrypt, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0, readCex: () => trading.anthropic(),
     readAddress: () => { const row = execution.state().connections.find(item => item.exchange === 'hyperliquid'); return row?.connected && typeof row.identity === 'string' ? row.identity.toLowerCase() : null; } });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
@@ -385,7 +385,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     if (pathname === '/api/trading/anthropic' || pathname.startsWith('/api/trading/anthropic/')) {
       if (url.search) throw new HttpError(400, 'Anthropic 仓位接口不接受查询参数');
       if (pathname === '/api/trading/anthropic' && method === 'GET') return reply(200, anthropicWatch.state());
-      const action = pathname === '/api/trading/anthropic/alerts' && method === 'PUT' ? 'save' : pathname === '/api/trading/anthropic/alerts/test' && method === 'POST' ? 'test' : null;
+      const action = pathname === '/api/trading/anthropic/alerts' && method === 'PUT' ? 'save' : pathname === '/api/trading/anthropic/alerts/test' && method === 'POST' ? 'test'
+        : pathname === '/api/trading/anthropic/alerts/channel' && method === 'PUT' ? 'channel' : pathname === '/api/trading/anthropic/alerts/channel/clear' && method === 'POST' ? 'clear' : null;
       if (!action) throw new HttpError(404, 'Anthropic 仓位接口不存在');
       const body = await bodyOf();
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
@@ -393,7 +394,9 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         if (!body || Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供预警设置');
         return reply(200, anthropicWatch.save(body.config));
       }
+      if (action === 'channel') return reply(200, anthropicWatch.setChannel(body));
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      if (action === 'clear') return reply(200, anthropicWatch.clearChannel());
       return reply(200, await anthropicWatch.test());
     }
     if (pathname === '/api/trading/positions') {
