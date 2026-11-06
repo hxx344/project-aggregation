@@ -86,7 +86,10 @@ ensure_tools() { :; }
 validate_embedded_runtime() { :; }
 prepare_greeks_runtime() { :; }
 prepare_aster_runtime() { :; }
-migrate_embedded_modules() { note "migrate $1"; }
+migrate_embedded_modules() {
+  note "migrate $1"
+  if [[ -f "$FIXTURE_ROOT/fail-migrate" ]]; then rm -f -- "$FIXTURE_ROOT/fail-migrate"; note 'migrate refused'; return 1; fi
+}
 migration_settled() { [[ ! -f "$FIXTURE_ROOT/migration-pending" ]]; }
 ensure_node() { NODE_BIN="$FIXTURE_ROOT/runtime/node"; }
 sleep() { :; }
@@ -838,18 +841,45 @@ run_install
 expect_code 0
 if grep -Fq 'Aero LP' "$fixture/last.log"; then printf 'The retired wallet notice outlived the wallet.\n' >&2; false; fi
 
+# 12. A fresh install with an update service that knows the layout starts on
+# the dual-slot units, slot a: no dual units yet, so no cutover recovery or
+# slot record is read before the first activation.
+make_package fresh
+run_install FRESH_INSTALL=1
+expect_code 0
+in_order '^layout dual$' '^scope full$' '^activate_dual_full$' "^systemctl start $service$" '^finish_activation'
+no_call '^resolve_cutover'
+if grep -Fq '上次首次安装在切换版本后、保存配置快照前中断' "$fixture/last.log"; then printf 'A clean first install was treated as resumed.\n' >&2; false; fi
+fresh=$(release_path fresh "$fixture/fresh-application")
+[[ $(cat "$fixture/fresh-application/.api-slot") == "{\"slot\":\"a\",\"release\":\"$fresh\"}" ]]
+[[ $(readlink "$fixture/fresh-application/current") == "$fresh" && -f "$fixture/fresh-entry-unit" && ! -e "$fixture/fresh-api-unit" ]]
+[[ -f "$fixture/fresh-systemd/active/$service-api@a" && -f "$fixture/fresh-systemd/enabled/$service-api@a" ]]
+# The interruption cases below start again from an empty host.
+rm -rf -- "$fixture/fresh-application" "$fixture/fresh-systemd" "$fixture/fresh-environment"
+rm -f -- "$fixture/fresh-unit" "$fixture/fresh-api-unit" "$fixture/fresh-entry-unit" "$fixture/fresh-slot-unit"
+
 # 12a. A first install killed after it moved current but before it saved the
 # environment snapshot (#185). The retry has no successful environment to roll
 # back to; it must not refuse forever. A failed retry removes the candidate and
 # the units like a failed first install and keeps the configuration and data.
-make_package fresh
-fresh=$(release_path fresh "$fixture/fresh-application")
+printf 'fixture data\n' > "$fixture/data/fresh-sentinel"
+data_before=$(ls -lAR --time-style=+%s "$fixture/data" | sha256sum)
 printf 'systemctl start %s\n' "$service" > "$fixture/crash-on"
 run_install FRESH_INSTALL=1
 expect_code 137
 [[ $(readlink "$fixture/fresh-application/current") == "$fresh" && ! -e "$fixture/fresh-application/.last-successful.env" ]]
 [[ $(cat "$fixture/fresh-application/.pending-previous") == "$fresh - full" && -f "$fixture/fresh-unit" ]]
 cp "$fixture/fresh-environment" "$fixture/fresh-environment.before"
+# A host that once succeeded (.deployed-state is never removed) but lost its
+# environment snapshot is not a first install: it still refuses before switching.
+printf 'fixture success marker\n' > "$fixture/fresh-application/.deployed-state"
+run_install FRESH_INSTALL=1
+expect_code 1
+grep -Fq '缺少上次成功的环境配置快照' "$fixture/last.log"
+if grep -Fq '上次首次安装在切换版本后、保存配置快照前中断' "$fixture/last.log"; then printf 'A host with a successful deployment was treated as a first install.\n' >&2; false; fi
+no_call '^(activate_dual_full|dual_teardown|systemctl (stop|disable))'
+[[ $(readlink "$fixture/fresh-application/current") == "$fresh" && $(cat "$fixture/fresh-application/.pending-previous") == "$fresh - full" && -f "$fixture/fresh-unit" ]]
+rm -f -- "$fixture/fresh-application/.deployed-state"
 printf '%s\n' "$fresh" > "$fixture/unready-release"
 run_install FRESH_INSTALL=1
 rm -f -- "$fixture/unready-release"
@@ -862,15 +892,33 @@ no_call '^(finish_activation|restore_dual_units)'
 [[ ! -e "$fixture/fresh-unit" && ! -e "$fixture/fresh-entry-unit" && ! -e "$fixture/fresh-slot-unit" && ! -e "$fixture/fresh-api-unit" ]]
 [[ ! -e "$fixture/fresh-systemd/active/$service" && ! -e "$fixture/fresh-systemd/enabled/$service-api@a" ]]
 cmp -s "$fixture/fresh-environment" "$fixture/fresh-environment.before"
+[[ $(ls -lAR --time-style=+%s "$fixture/data" | sha256sum) == "$data_before" ]]
 [[ -d "$fixture/fresh-application/releases" && -f "$fresh/.managed-release" ]]
-# Interrupted the same way again, the next retry resumes and succeeds.
+# Interrupted again, then a retry with ANOTHER release fails before current
+# moves: the rollback must still remove the earlier candidate from current,
+# or every later retry would meet a record for a release current never named.
+printf 'systemctl start %s\n' "$service" > "$fixture/crash-on"
+run_install FRESH_INSTALL=1
+expect_code 137
+[[ $(readlink "$fixture/fresh-application/current") == "$fresh" ]]
+cp "$fixture/release-manifest.json" "$fixture/fresh-manifest.json"; cp "$fixture/package.tar.gz" "$fixture/fresh-package.tar.gz"
+new_package fresh-two five
+fresh_two=$(release_path fresh-two "$fixture/fresh-application")
+touch "$fixture/fail-migrate"
+run_install FRESH_INSTALL=1
+rm -f -- "$fixture/fail-migrate"
+expect_code 1
+grep -Fq '上次首次安装在切换版本后、保存配置快照前中断' "$fixture/last.log"
+in_order '^activate_dual_full$' "^migrate $fresh_two$" '^migrate refused$' '^dual_teardown$'
+no_call "^systemctl start $service$"
+[[ ! -e "$fixture/fresh-application/current" && ! -L "$fixture/fresh-application/current" && ! -e "$fixture/fresh-unit" ]]
+[[ $(ls -lAR --time-style=+%s "$fixture/data" | sha256sum) == "$data_before" ]]
+cp "$fixture/fresh-manifest.json" "$fixture/release-manifest.json"; cp "$fixture/fresh-package.tar.gz" "$fixture/package.tar.gz"
+# Interrupted the same way once more, the next retry resumes and succeeds.
 printf 'systemctl start %s\n' "$service" > "$fixture/crash-on"
 run_install FRESH_INSTALL=1
 expect_code 137
 [[ $(readlink "$fixture/fresh-application/current") == "$fresh" && ! -e "$fixture/fresh-application/.last-successful.env" ]]
-
-# 12. A fresh install with an update service that knows the layout starts on
-# the dual-slot units, slot a. Here it resumes the interrupted first install.
 run_install FRESH_INSTALL=1
 expect_code 0
 grep -Fq '上次首次安装在切换版本后、保存配置快照前中断' "$fixture/last.log"
@@ -880,4 +928,5 @@ cmp -s "$fixture/fresh-application/.last-successful.env" "$fixture/fresh-environ
 [[ $(cat "$fixture/fresh-application/.api-slot") == "{\"slot\":\"a\",\"release\":\"$fresh\"}" ]]
 [[ $(readlink "$fixture/fresh-application/current") == "$fresh" && -f "$fixture/fresh-entry-unit" && ! -e "$fixture/fresh-api-unit" ]]
 [[ -f "$fixture/fresh-systemd/active/$service-api@a" && -f "$fixture/fresh-systemd/enabled/$service-api@a" ]]
+[[ $(ls -lAR --time-style=+%s "$fixture/data" | sha256sum) == "$data_before" ]]
 printf 'Dual-slot main(): layout gate, first enable, API-only and full updates, scope refusal, failed candidate, rollback after the record moved, interrupted switches, failed full update, retained pending rollback target, retired wallet notice and resumed first install passed.\n'

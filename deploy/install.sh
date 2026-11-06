@@ -3068,8 +3068,9 @@ drop_pending_previous() {
 # then removes the candidate and the units like any failed first install (#185).
 resume_interrupted_first_install() {
   local target previous scope extra
-  [[ -n "$old_release" && ! -e "$APP_DIR/.last-successful.env" && -f "$APP_DIR/.pending-previous" &&
-     ! -L "$APP_DIR/previous" && ! -e "$APP_DIR/.api-cutover" ]] || return 0
+  # .deployed-state is written only by a successful run and never removed.
+  [[ -n "$old_release" && ! -e "$APP_DIR/.last-successful.env" && ! -e "$APP_DIR/.deployed-state" &&
+     -f "$APP_DIR/.pending-previous" && ! -L "$APP_DIR/previous" && ! -e "$APP_DIR/.api-cutover" ]] || return 0
   read -r target previous scope extra < "$APP_DIR/.pending-previous" || return 0
   [[ "$target" == "$old_release" && "$previous" == - && -z "$extra" ]] || return 0
   log '上次首次安装在切换版本后、保存配置快照前中断；按首次安装重试，失败时移除未完成的版本和服务单元，配置与数据保留。'
