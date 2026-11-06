@@ -5,7 +5,7 @@ comes from authenticated Aster responses, never a locally supplied account name.
 """
 from contextlib import ExitStack, contextmanager, nullcontext
 from copy import copy, deepcopy
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from dataclasses import replace
 from decimal import Decimal
 from fractions import Fraction
@@ -22,7 +22,8 @@ from urllib.parse import urlencode
 from eth_account import Account as EthAccount
 from eth_account.messages import encode_typed_data
 
-from .exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, TransferRejected, api_wait_notice, credentials_for
+from .exchange import (API, AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, SnapshotRevoked, TransferRejected,
+                       api_wait_notice, credentials_for)
 from .models import TradingError, dec, decimal_value, positive, wire
 from .pair_planning import PairRecoveryConflict
 from .margin_control import margin_running
@@ -91,11 +92,21 @@ SETTLE_BASES = frozenset({"late_receipt_confirmed", "nonce_expired_no_receipt", 
 # but with an attribution note and the long cooldown, so "ambiguous
 # attribution" includes a possibly wrong success label.
 # The snapshot is best effort and only taken when a shared follow-up can use
-# it: one page per side, a short timeout and no retry. A missing budget,
-# failure, throttle or full page omits that side (an exchange throttle also
-# defers the transfer through the shared cooldown, as for any request); it
-# never blocks sending.
-TRANSFER_SNAPSHOT_TIMEOUT_SECONDS = 4
+# it: one page per side, both sides in parallel, no retry. A missing budget,
+# failure, throttle, full page or missed deadline omits that side (an exchange
+# throttle also defers the transfer through the shared cooldown, as for any
+# request); it never blocks sending.
+# It runs inside the account snapshot's freshness window, which the send
+# re-checks; a stale snapshot there is a hard failure that blocks trading and
+# repeats every check. HTTPX timeouts apply per stage, not in total, so the
+# wait is bounded by wall-clock time instead (a straggling read is abandoned
+# and ignored), and cut so that the reserve stays for the send; with less
+# than the minimum left the snapshot is skipped.
+TRANSFER_SNAPSHOT_TIMEOUT_SECONDS = 1.5
+TRANSFER_SNAPSHOT_MIN_SECONDS = 0.3
+TRANSFER_SNAPSHOT_FRESHNESS_RESERVE_SECONDS = 3
+# AccountSnapshot.require_fresh's default window, enforced by require_current.
+ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS = 8
 TRANSFER_SNAPSHOT_WEIGHT = 30
 TRANSFER_SNAPSHOT_RECEIPTS_LIMIT = 100
 TRANSFER_SWEEP_SECONDS = 30
@@ -691,7 +702,8 @@ class MarginBalancer:
         with priority:
             try:
                 rows = broker.api.call("GET", "/fapi/v3/income",
-                    {"startTime": start, "endTime": end, "limit": TRANSFER_INCOME_PAGE_ROWS}, signed=True, weight=30,
+                    {"startTime": start, **({"endTime": end} if end is not None else {}),
+                     "limit": TRANSFER_INCOME_PAGE_ROWS}, signed=True, weight=30,
                     **({"timeout": timeout} if timeout is not None else {}))
             except RequestNotSent:
                 raise
@@ -1087,15 +1099,28 @@ class MarginBalancer:
         return {side for side, value in before.items() if side in ("long", "short") and isinstance(value, list)
                 } if isinstance(before, dict) else set()
 
-    def _before_receipts(self, members, plan):
-        """Best-effort pre-send snapshot of same-amount USD1 receipts, per completely read side."""
+    def _before_receipts(self, members, plan, snapshots):
+        """Best-effort pre-send snapshot of same-amount USD1 receipts, per completely read side.
+
+        ``snapshots`` are the account snapshots the send re-checks; the wait
+        never eats into the reserve of their freshness window.
+        """
         if not writer_for(self.engine).enabled:
             return {}  # Standalone runs keep no unknown follow-up to settle.
         now = time.time()
+        stamps = [getattr(snapshot, "timestamp", None) for snapshot in snapshots.values()]
+        fresh_until = (min(stamps) + ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS
+                       if stamps and all(type(stamp) in (int, float) for stamp in stamps) else now)
+        wait = min(TRANSFER_SNAPSHOT_TIMEOUT_SECONDS, fresh_until - now - TRANSFER_SNAPSHOT_FRESHNESS_RESERVE_SECONDS)
+        if not wait >= TRANSFER_SNAPSHOT_MIN_SECONDS:
+            LOG.info("transfer receipt snapshot skipped: account snapshot freshness left %.1fs", fresh_until - now)
+            return {}
+        deadline = time.monotonic() + wait
         # Server time may run TRANSFER_CLOCK_TOLERANCE_SECONDS either way;
         # the settlement read starts that far before the later creation time.
+        # No endTime: the exchange returns what it holds up to its own now,
+        # which covers a server clock ahead without sending a future time.
         start = int((now - TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
-        end = int((now + TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
         try:
             # Admit both reads plus the transfer POST so the snapshot can
             # never spend the budget the transfer itself needs.
@@ -1104,24 +1129,44 @@ class MarginBalancer:
         except Exception as exc:  # noqa: BLE001 - optional evidence; send without it
             LOG.info("transfer receipt snapshot skipped: %s", type(exc).__name__)
             return {}
+        signs = {plan["source"]: -1, plan["destination"]: 1}
+
+        def read(side, budget, flags):
+            # Budget priority is thread-local: carry the caller's into the worker.
+            with budget._inherit_priority(flags) if flags is not None else nullcontext():
+                collected = []
+                page = self._income_page(self.engine.broker(members[side]), start, None, False, None,
+                                         collected=collected, timeout=TRANSFER_SNAPSHOT_TIMEOUT_SECONDS)
+                return page, collected
+
+        pool = ThreadPoolExecutor(max_workers=len(signs), thread_name_prefix="margin-receipts")
+        futures = {}
+        try:
+            for side in signs:
+                budget = getattr(getattr(self.engine.broker(members[side]), "api", None), "budget", None)
+                flags = budget._priority_flags() if callable(getattr(budget, "_priority_flags", None)) else None
+                futures[side] = pool.submit(read, side, budget, flags)
+            futures_wait(list(futures.values()), timeout=max(0.0, deadline - time.monotonic()))
+        finally:
+            # Never join a straggler; it ends on its own HTTPX timeout.
+            pool.shutdown(wait=False, cancel_futures=True)
         amount = dec(plan["amount"])
         result = {}
-        for side, sign in ((plan["source"], -1), (plan["destination"], 1)):
-            collected = []
+        for side, future in futures.items():
+            if not future.done() or future.cancelled():
+                LOG.info("transfer receipt snapshot for %s incomplete: deadline", side)
+                continue
             try:
-                page = self._income_page(self.engine.broker(members[side]), start, end, False, None,
-                                         collected=collected, timeout=TRANSFER_SNAPSHOT_TIMEOUT_SECONDS)
+                page, collected = future.result()
             except Exception as exc:  # noqa: BLE001 - optional evidence; send without it
                 LOG.info("transfer receipt snapshot for %s incomplete: %s", side, type(exc).__name__)
-                if isinstance(exc, ExchangeError) and api_wait_notice(exc) is not None:
-                    break  # Honour the throttle; do not read the other side.
                 continue
             if len(page) >= TRANSFER_INCOME_PAGE_ROWS:
                 # A full page may hide receipts; a recorded side must be complete.
                 LOG.info("transfer receipt snapshot for %s incomplete: full page", side)
                 continue
             seen = sorted({(row["incomeType"], _identifier(row["tranId"])) for row in collected
-                           if dec(row["income"]) == amount * sign})
+                           if dec(row["income"]) == amount * signs[side]})
             if len(seen) <= TRANSFER_SNAPSHOT_RECEIPTS_LIMIT:  # Bounded record; a truncated list is not complete.
                 result[side] = [list(item) for item in seen]
         return result
@@ -1691,10 +1736,20 @@ class MarginBalancer:
                 self._record_success(pair, state)
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
             # Same-amount receipts visible now cannot belong to this request.
-            before_receipts = self._before_receipts(members, plan)
+            before_receipts = self._before_receipts(members, plan, snapshots)
             # The fresh exchange withdrawal limit includes reserved funds;
             # trading recovery and archived orders cannot gate this transfer.
-            require_current()
+            try:
+                require_current()
+            except SnapshotRevoked:
+                # An account event during the snapshot wait revoked the reads
+                # this plan used. Nothing is prepared or sent yet, so skip
+                # without blocking and plan again from the next fresh read.
+                reason = ("本次划转未发送：发送前流水快照期间账户发生变化，余额预读已失效；"
+                          "下一轮重新读取余额后再规划，交易不受影响")
+                LOG.info("pair %s transfer skipped: account reads revoked during receipt snapshot", pair["id"])
+                state = self._record_failure(pair, state, reason, soft=True)
+                return self._view(state, config, "waiting", reason, blocks=not state.get("retry_without_blocking"))
             created = time.time()
             pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": created, "status": "submitting",
                 "identity": self._fingerprint(pair, members, children, master),

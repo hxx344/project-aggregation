@@ -1,6 +1,7 @@
 """Margin transfers through the real managed writer and HTTPX dispatch hooks."""
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from copy import deepcopy
+import inspect
 import math
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ from trading import margin_balance
 from trading.account_writer import ManagedWriter
 from trading.exchange import API, BudgetWait, LiveBroker, RateBudget, RequestNotSent, TransferRejected
 from trading.margin_balance import MarginBalancer, TransferAPI
-from trading.models import TradingError, positive
+from trading.models import AccountSnapshot, TradingError, positive
 from trading.pairing import PairManager, validate_pair
 from trading.paper import DemoMarket
 from trading.store import Store
@@ -104,7 +105,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.income_rows = {}
         self.income_error = False
         self.income_handler = None
-        # Pre-send receipt snapshots (4 s timeout) are recorded apart from
+        # Pre-send receipt snapshots (bounded wall-clock wait) are recorded apart from
         # settlement reads and answer from what was visible before sending.
         self.snapshot_requests = []
         self.snapshot_rows = {}
@@ -1341,9 +1342,10 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual(sorted(aid for aid, _ in self.snapshot_requests), ["long", "short"])
         created = int(record["created_at"] * 1000)
         for _, params in self.snapshot_requests:
-            start, end = int(params["startTime"]), int(params["endTime"])
-            # The window covers the full clock tolerance on both sides of sending.
-            self.assertEqual(end - start, 2 * margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS * 1000)
+            start = int(params["startTime"])
+            # The window starts a full clock tolerance before sending and
+            # runs to the exchange's own now: no future endTime is sent.
+            self.assertNotIn("endTime", params)
             self.assertLessEqual(start, created - margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS * 1000)
             self.assertLess(created - start, (margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS + 5) * 1000)
 
@@ -1430,13 +1432,20 @@ class ManagedMarginTransferTests(unittest.TestCase):
         def network(aid, params, request):
             raise httpx.ConnectError("injected snapshot failure", request=request)
 
-        def full_page(aid, params, request):
-            return httpx.Response(200, json=self.busy_rows(margin_balance.TRANSFER_INCOME_PAGE_ROWS,
-                                                           int(params["startTime"]), int(params["endTime"])))
-        cases = {"full page": (full_page, None, set()), "network": (network, None, set()),
+        def rows(count):
+            # The snapshot sends no endTime; fill the page from its start.
+            def handler(aid, params, request):
+                self.assertNotIn("endTime", params)
+                start = int(params["startTime"])
+                return httpx.Response(200, json=self.busy_rows(count, start, start + 120_000))
+            return handler
+        full = margin_balance.TRANSFER_INCOME_PAGE_ROWS
+        cases = {"full page": (rows(full), None, set()), "network": (network, None, set()),
                  "budget": (None, 10 ** 6, set()),
                  "one side": (lambda aid, params, request: network(aid, params, request) if aid == "short"
-                              else httpx.Response(200, json=[]), None, {"long"})}
+                              else httpx.Response(200, json=[]), None, {"long"}),
+                 # Control: one row short of a full page is a complete read.
+                 "page minus one": (rows(full - 1), None, {"long", "short"})}
         for name, (handler, weight, sides) in cases.items():
             with self.subTest(name):
                 self.snapshot_handler, self.snapshot_requests = handler, []
@@ -1450,15 +1459,147 @@ class ManagedMarginTransferTests(unittest.TestCase):
                 for api in self.api_instances:
                     api.budget.until = 0
                 result, settled_at = self.settle_at(("A-" + name.replace(" ", "-"), 5))
-                self.assert_settled_once(operation_id, result, "缺少发送前流水快照", outcome="confirmed")
+                self.assert_settled_once(operation_id, result, "可能误认其他同额划转", outcome="confirmed")
+                note = self.settlement(operation_id)["note"]
+                if sides == {"long", "short"}:
+                    self.assertNotIn("缺少发送前流水快照", note)
+                else:
+                    self.assertIn("缺少发送前流水快照", note)
                 self.reset_for_next_transfer()
+
+    @contextmanager
+    def timed_snapshot(self):
+        """Record how long each pre-send snapshot took, apart from the rest of the check."""
+        durations, original = [], self.balancer._before_receipts
+
+        def timed(*args):
+            started, wall = time.monotonic(), time.time()
+            try:
+                return original(*args)
+            finally:
+                durations.append({"started": wall, "seconds": time.monotonic() - started})
+        with patch.object(self.balancer, "_before_receipts", side_effect=timed):
+            yield durations
+
+    def test_slow_snapshot_reads_are_abandoned_by_wall_clock_and_the_transfer_is_sent(self):
+        # HTTPX timeouts apply per stage, so a read can outlast them (the mock
+        # transport ignores them entirely). A stale account snapshot at the
+        # send would block trading and repeat every check.
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def slow(seconds, *, fail=False):
+            def handler(aid, params, request):
+                release.wait(seconds)
+                if fail:
+                    raise httpx.ReadTimeout("injected snapshot timeout", request=request)
+                return httpx.Response(200, json=[])
+            return handler
+        cases = {"each side 4.5 s": (slow(4.5), set()),
+                 "one side hangs": (lambda aid, params, request: slow(60)(aid, params, request) if aid == "short"
+                                    else httpx.Response(200, json=[]), {"long"}),
+                 "both sides time out": (slow(4.5, fail=True), set())}
+        for name, (handler, sides) in cases.items():
+            with self.subTest(name):
+                self.snapshot_handler, self.snapshot_requests = handler, []
+                self.fail_dispatch = True
+                with self.timed_snapshot() as durations:
+                    result = self.balancer.tick(self.pair, self.snapshots())
+                self.fail_dispatch = False
+                self.snapshot_handler = None
+                self.assertEqual((result["status"], len(self.posts())), ("unknown", 1), result)
+                self.assertEqual(sorted(aid for aid, _ in self.snapshot_requests), ["long", "short"])
+                self.assertLess(durations[0]["seconds"], margin_balance.TRANSFER_SNAPSHOT_TIMEOUT_SECONDS + 0.5, result)
+                operation_id = "aster:transfer:" + self.state()["pending"]["request_id"]
+                self.due()
+                self.assertEqual(self.balancer.tick(self.pair, self.snapshots())["status"], "skipped")
+                # Only completely read sides are recorded; a missing side is
+                # not an empty snapshot and settles by the previous rules.
+                self.assertEqual(set(self.follow_up().get("before_receipts", {})), sides)
+                result, settled_at = self.settle_at(("A-" + name.replace(" ", "-"), 5))
+                self.assert_settled_once(operation_id, result, "缺少发送前流水快照", outcome="confirmed")
+                self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+                self.reset_for_next_transfer()
+
+    def test_snapshot_never_spends_the_account_snapshot_freshness_reserve(self):
+        reserve = margin_balance.TRANSFER_SNAPSHOT_FRESHNESS_RESERVE_SECONDS
+        window = margin_balance.ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.snapshot_handler = lambda aid, params, request: (release.wait(4.5), httpx.Response(200, json=[]))[1]
+        # The first age leaves under a second for the snapshot, the second
+        # less than the minimum. Earlier steps of the check also age the
+        # snapshot, so the allowed wait is derived from when it started.
+        for age in (window - reserve - 1, window - reserve - margin_balance.TRANSFER_SNAPSHOT_MIN_SECONDS + 0.1):
+            with self.subTest(age=age):
+                self.requests, self.request_queries, self.snapshot_requests = [], [], []
+                self.balances.update(long="3000", short="1000")
+                state = self.state()
+                state.update(pending=None, next_check_at=0, cooldown_until=0)
+                self.store.put("pair_margin:gold", state)
+                snapshots = self.snapshots()
+                for snapshot in snapshots.values():
+                    snapshot.timestamp -= age
+                with self.timed_snapshot() as durations:
+                    result = self.balancer.tick(self.pair, snapshots)
+                self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 1), result)
+                fresh_until = min(snapshot.timestamp for snapshot in snapshots.values()) + window
+                wait = min(margin_balance.TRANSFER_SNAPSHOT_TIMEOUT_SECONDS, fresh_until - durations[0]["started"] - reserve)
+                self.assertLess(wait, margin_balance.TRANSFER_SNAPSHOT_TIMEOUT_SECONDS - 0.4)
+                self.assertEqual(len(self.snapshot_requests), 2 if wait >= margin_balance.TRANSFER_SNAPSHOT_MIN_SECONDS else 0)
+                self.assertLess(durations[0]["seconds"], max(wait, 0) + 0.3, result)
+                self.assertNotIn("before_receipts", self.state()["last_transfer"])
+
+    def test_freshness_window_matches_the_account_snapshot_check(self):
+        default = inspect.signature(AccountSnapshot.require_fresh).parameters["max_age"].default
+        self.assertEqual(margin_balance.ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS, default)
+
+    def test_expired_unknown_with_the_original_tranid_is_verified_with_the_ordinary_cooldown(self):
+        operation_id = self.skip_timed_out_transfer()
+        state = self.state()
+        state["unsettled_transfers"][0]["transaction_id"] = "late-1"
+        self.store.put("pair_margin:gold", state)
+        # A same-amount transfer with another tranId is not this request.
+        result, settled_at = self.settle_at(("late-1", 5), ("external-B", 20))
+        self.assert_settled_once(operation_id, result, None, outcome="confirmed")
+        settlement = self.settlement(operation_id)
+        self.assertEqual(settlement["basis"], "late_receipt_confirmed")
+        self.assertNotIn("note", settlement)
+        self.assertIn("已由两侧流水核实到账", result["reason"])
+        self.assertNotIn("延长冷却", result["reason"])
+        self.assertNotIn("可能为其他同额划转", result["reason"])
+        self.assertEqual(self.state()["cooldown_until"], settled_at + margin_balance.TRANSFER_SETTLE_COOLDOWN_SECONDS)
+        self.assertIn(["TRANSFER", "late-1"], self.state()["used_receipts"])
+        self.assertNotIn(["TRANSFER", "external-B"], self.state()["used_receipts"])
+
+    def test_account_event_during_the_snapshot_wait_skips_the_send_without_blocking(self):
+        def event(aid, params, request):
+            self.engine.brokers[aid].invalidate_account_reads("injected account event")
+            return httpx.Response(200, json=[])
+        self.snapshot_handler = event
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], result["blocks_trading"], len(self.posts())), ("waiting", False, 0), result)
+        self.assertIn("未发送", result["reason"])
+        state = self.state()
+        self.assertIsNone(state.get("pending"))
+        self.assertIs(state["retry_without_blocking"], True)
+        # Nothing was prepared: no shared operation, unknown or not.
+        self.assertEqual((self.shared_operations(), self.unresolved()), ([], []))
+        # Until the next check the pair keeps trading.
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], result["blocks_trading"], len(self.posts())), ("waiting", False, 0), result)
+        self.snapshot_handler = None
+        self.due()
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 1), result)
+        self.assertNotIn("blocked_reason", self.state())
 
     def test_throttled_snapshot_defers_the_transfer_like_any_throttle_and_never_leaves_it_unknown(self):
         self.snapshot_handler = lambda aid, params, request: httpx.Response(
             429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
         result = self.balancer.tick(self.pair, self.snapshots())
-        # The other side is not read; the shared cooldown refuses the POST locally.
-        self.assertEqual([aid for aid, _ in self.snapshot_requests], ["long"])
+        # Both sides are read in parallel; the shared cooldown refuses the POST locally.
+        self.assertEqual(sorted(aid for aid, _ in self.snapshot_requests), ["long", "short"])
         self.assertEqual((result["status"], len(self.posts()), self.unresolved()), ("rejected", 0, []), result)
         self.assertIsNone(self.state()["pending"])
         self.snapshot_handler, self.snapshot_requests = None, []

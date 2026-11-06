@@ -68,6 +68,14 @@ class SnapshotSuperseded(TradingError):
     """An account event or write invalidated a read-only preparation."""
 
 
+class SnapshotRevoked(TradingError):
+    """A prepared read no longer matches the account's read generation.
+
+    Kept apart from SnapshotSuperseded, which some callers handle specially:
+    everywhere else this still behaves as a plain TradingError.
+    """
+
+
 class PublicBracketsUnavailable(ExchangeError):
     """The background public risk table is not usable yet."""
 
@@ -1604,7 +1612,7 @@ class LiveBroker:
         """A prepared ordinary read cannot cross an account write or event."""
         with self._snapshot_lock:
             if getattr(snapshot, "account_read_generation", None) != self._snapshot_generation:
-                raise TradingError("账户预读结果已失效，等待新快照")
+                raise SnapshotRevoked("账户预读结果已失效，等待新快照")
         snapshot.require_fresh()
 
     @staticmethod
