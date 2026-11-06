@@ -1677,6 +1677,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `monitor-embed-hydration-20261106`；回归浏览器验收发现，正式版首屏可恢复但会整树重建。
 
+### L103：多腿执行中单次状态读取的传输失败不能直接暂停并撤掉对冲腿
+
+**适用条件：** 多条腿并行挂单、每轮先读各腿委托状态再决定追价或下单的执行循环，包括本仓套利交易 `server/trading-execution.mjs` 的 `runJob()`；读取失败后的暂停会进入停止流程撤销余单。
+
+**根因：** 原逻辑只要任一腿 `inspectOrder()` 抛错就暂停并撤销余单，不区分超时、连接失败、5xx、限流这类与委托无关的传输失败。2026-11-07 Anthropic 跨所开仓第 1 批 Binance 0.78 已全部成交，Hyperliquid `io:ANTH` 买单仍在挂单，一次状态读取失败即暂停并撤掉 Hyperliquid 委托，留下无对冲的 Binance 空单；事件只写“委托状态读取失败或提交结果不明”，看不出是哪条腿、什么错误。
+
+**以后做法：** 只有传输类失败（`timeout`、`transport`、`upstream`、`aborted` 且服务未关闭、Binance -1003 / Bybit 10006 限流）在有界窗口（`READ_RETRY_MS` 20 秒）内跳过本轮重试，窗口内不追价、不撤单、不下新单，首次失败与恢复各记一条事件；数据格式、身份数量不一致、提交结果未查到等仍立即暂停。暂停原因和事件必须写明交易所、合约和具体错误。
+
+**如何验证：** 运行 `node --test --test-name-pattern="transient status read" tests/trading-execution.test.mjs`，确认超时读取在窗口内不撤单不下单、恢复后继续完成、超过窗口才暂停，`invalid_data` 立即暂停，且原因带出 `Bybit CLUSDT：…`。
+
+**证据：** 用户 2026-11-07 截图：任务 `991841cb-…` 03:17:02 Binance 腿最后对账（已全部成交），03:17:07 读取失败暂停，03:17:24 Hyperliquid 委托撤销 0 成交。服务器日志未落具体错误，触发腿与错误码未核实。
+
+**事件记录：** `trading-transient-read-pause-20261107`；用户反馈。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

@@ -563,6 +563,36 @@ test('unknown or regressing fill information pauses instead of reducing recorded
   assert.equal(f.creates.length, 2);
 });
 
+test('a transient status read keeps the resting hedge leg for a bounded window, other read errors pause at once', async t => {
+  for (const scenario of ['recovers', 'persists', 'invalid']) {
+    const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+    const [filled, hedge] = [...f.records.values()]; f.fill(filled.id);
+    // The malformed answer comes once; the stop pass reads the order normally.
+    f.handlers['bybit:inspect'] = async () => { if (scenario === 'invalid') delete f.handlers['bybit:inspect']; throw new ExecutionExchangeError(scenario === 'invalid' ? 'invalid_data' : 'timeout'); };
+    await f.service.tick();
+    const stops = () => f.calls.filter(call => call.method === 'stop').length;
+    if (scenario === 'invalid') {
+      assert.equal(f.job.status, 'paused'); assert.equal(stops(), 1);
+      assert.ok(f.job.events.some(item => /委托状态读取失败或提交结果不明（Bybit CLUSDT：交易所响应不完整或格式无效）/.test(item.message)));
+      assert.equal(hedge.terminal, true); continue;
+    }
+    assert.equal(f.job.status, 'running'); assert.equal(stops(), 0); assert.equal(hedge.terminal, false);
+    assert.match(f.job.events.at(-1).message, /Bybit CLUSDT：交易所请求超时.*20 秒内重试/);
+    f.advance(5000); await f.service.tick();
+    assert.equal(f.job.status, 'running'); assert.equal(stops(), 0); assert.equal(f.creates.length, 2);
+    if (scenario === 'recovers') {
+      delete f.handlers['bybit:inspect']; f.advance(1000); await f.service.tick();
+      assert.equal(f.job.events.at(-1).message, '委托状态已恢复读取，继续执行');
+      f.fill(hedge.id); await f.service.tick(); assert.equal(f.job.status, 'completed');
+    } else {
+      f.advance(15_000); await f.service.tick();
+      // Still unreadable while cancelling, so the job waits in attention for the slow re-check.
+      assert.equal(f.job.status, 'attention'); assert.equal(stops(), 1);
+      assert.ok(f.job.events.some(item => item.message === '委托状态读取失败或提交结果不明（Bybit CLUSDT：交易所请求超时），暂停并撤销余单'));
+    }
+  }
+});
+
 test('lease transfer between a successful guard read and the database write cannot persist a stale ACK', async t => {
   const f = await fixture(t), arrived = deferred(), release = deferred();
   const prepare = f.db.prepare.bind(f.db); let transferAfterRead = false;
