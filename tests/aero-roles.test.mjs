@@ -250,99 +250,205 @@ test('the whitelist fills up at the Roles 255-node limit with about 13 pools', (
   assert.ok(conditionUsage(current).every((u) => u.nodes <= 255));
 });
 
-// Roles v2 AllowanceTracker 的额度行为（与 _accruedAllowance / consumeAllowance 相同的规则），用来按周期累计核对批次的效果。
-function rolesAllowances() {
-  const store = new Map();
+// 已部署的 Roles v2 mastercopy（ROLES.mastercopy，Base 上 Sourcify 已验证源码）的额度规则，按 Solidity 逐行重写，不引用被测代码：
+// AllowanceTracker._accruedAllowance、_flushPrepare（消费后写回折算余额与时间戳），PermissionBuilder.setAllowance
+// （maxRefill 传 0 记为 uint128 上限，timestamp 传 0 记为执行区块时间）。
+const U128_MAX = (1n << 128n) - 1n;
+function solidityAccrued(allowance, blockTimestamp) {
+  if (allowance.period === 0n || blockTimestamp < allowance.timestamp + allowance.period) return [allowance.balance, allowance.timestamp];
+  const elapsedIntervals = (blockTimestamp - allowance.timestamp) / allowance.period;
+  let balance;
+  if (allowance.balance < allowance.maxRefill) {
+    balance = allowance.balance + allowance.refill * elapsedIntervals;
+    balance = balance < allowance.maxRefill ? balance : allowance.maxRefill;
+  } else {
+    balance = allowance.balance;
+  }
+  return [balance, allowance.timestamp + elapsedIntervals * allowance.period];
+}
+function referenceRoles() {
+  const store = new Map(), spent = [];
   const at = (key) => store.get(key) ?? { ...UNSET };
   return {
     read: (key) => ({ ...at(key) }),
-    exec(tx) {
+    setAllowance(tx, blockTimestamp) {
       const call = ROLES_ABI.parseTransaction({ data: tx.data });
       assert.equal(call.name, 'setAllowance');
       const [key, balance, maxRefill, refill, period, timestamp] = call.args;
-      store.set(key, { refill, maxRefill: maxRefill === 0n ? (1n << 128n) - 1n : maxRefill, period, balance, timestamp });
+      store.set(key, { refill, maxRefill: maxRefill !== 0n ? maxRefill : U128_MAX, period, timestamp: timestamp !== 0n ? timestamp : blockTimestamp, balance });
     },
-    consume(key, amount, now) {
-      const a = at(key), { balance, timestamp } = accrue(a, now);
-      if (amount > balance) return false;
-      store.set(key, { ...a, balance: balance - amount, timestamp });
+    consume(key, consumed, blockTimestamp) {
+      const a = at(key), [balance, timestamp] = solidityAccrued(a, blockTimestamp);
+      if (consumed > balance) return false;
+      store.set(key, { ...a, balance: balance - consumed, timestamp });
+      spent.push({ key, at: blockTimestamp, amount: consumed });
       return true;
     },
+    spendable: (key, blockTimestamp) => solidityAccrued(at(key), blockTimestamp)[0],
+    // bot 私钥泄露时的最坏情况：把当前可用全部花掉。
+    drain(key, blockTimestamp) {
+      const value = solidityAccrued(at(key), blockTimestamp)[0];
+      if (value) assert.equal(this.consume(key, value, blockTimestamp), true);
+      return value;
+    },
+    spentBetween: (key, from, to) => spent.filter((s) => s.key === key && s.at >= from && s.at < to).reduce((sum, s) => sum + s.amount, 0n),
   };
 }
-const spendable = (roles, key, now) => accrue(roles.read(key), now).balance;
 const withFirstPerDay = (perDay) => buildPermissions({ ...config, allowances: config.allowances.map((a, i) => (i === 0 ? { ...a, perDay } : a)) });
 
-test('adjusting an allowance after spending keeps the period total within the new budget', () => {
+test('policy.accrue matches the reference Roles v2 rule', () => {
+  const values = [0n, 1n, 30n, 100n, 150n];
+  for (const refill of [0n, 50n, 100n]) for (const maxRefill of [1n, 100n, U128_MAX]) for (const period of [0n, 3600n, 86400n]) for (const balance of values) {
+    for (const timestamp of [0n, 1000n]) for (const dt of [0n, 3599n, 3600n, 86399n, 86400n, 3n * 86400n + 7n]) {
+      const allowance = { refill, maxRefill, period, balance, timestamp }, now = timestamp + dt;
+      const [b, t] = solidityAccrued(allowance, now);
+      assert.deepEqual(accrue(allowance, now), { balance: b, timestamp: t }, JSON.stringify({ ...allowance, now }, (_, v) => String(v)));
+    }
+  }
+});
+
+test('an allowance adjustment stays within the stated period limits at every execution time (reference Roles v2 model)', () => {
   const ROLES_ADDR = new Wallet('0x' + '56'.repeat(32)).address;
-  const DAY = 86_400n, day0 = 20_000n * DAY;
+  const DAY = 86_400n, H = 3_600n;
+  // Setup at 21:00 UTC: timestamp 0 becomes the setup block time, so periods follow the setup, not UTC midnight.
+  const setupAt = 20_000n * DAY - 3n * H, p1 = setupAt + DAY;
   const current = withFirstPerDay('100'), key = current.allowances[0].key;
-  // Setup batch: 100 per day, timestamp 0 (periods start at UTC midnight).
   const setup = buildSetupBatch({ permissions: current, safe: SAFE_ADDR, bot: BOT, saltNonce: 1n });
   const setupAllowance = setup.transactions.find((t) => { const c = ROLES_ABI.parseTransaction({ data: t.data }); return c?.name === 'setAllowance' && c.args[0] === key; });
-  const fresh = () => { const r = rolesAllowances(); r.exec(setupAllowance); return r; };
+  const fresh = () => { const r = referenceRoles(); r.setAllowance(setupAllowance, setupAt); return r; };
   const batchAt = (roles, next, now) => {
     const txs = buildUpdateBatch({ current, next, roles: ROLES_ADDR, allowanceState: { now, allowances: new Map(next.allowances.map((a) => [a.key, roles.read(a.key)])) } });
     assert.equal(txs.length, 1);
     return txs[0];
   };
+  assert.equal(fresh().read(key).timestamp, setupAt);
+  const t1 = setupAt + 10n * H;
 
-  // 10:00 the bot spends 30; lowering to 50 leaves 20 for the rest of the day (period total 50, not 30 + 50).
-  const roles = fresh();
-  const t1 = day0 + 10n * 3600n, t2 = t1 + 3600n;
-  assert.equal(roles.consume(key, 30n, t1), true);
-  const lower = batchAt(roles, withFirstPerDay('50'), t1);
+  // 1. Spent 30, lowered to 50 and executed an hour later; draining afterwards stops at a period total of 50 (limits.idle).
+  const r1 = fresh();
+  assert.equal(r1.consume(key, 30n, t1), true);
+  const lower = batchAt(r1, withFirstPerDay('50'), t1);
   assert.deepEqual([lower.allowance.used, lower.allowance.balance, lower.allowance.first], ['30', '20', false]);
-  assert.equal(lower.allowance.nextRefill, Number(day0 + DAY));
-  assert.match(lower.description, /^调整额度 .*100 → 50.*本期已用 30.*本期剩余 20/);
-  roles.exec(lower);
-  assert.equal(spendable(roles, key, t2), 20n);
-  assert.equal(roles.consume(key, 21n, t2), false);
-  assert.equal(roles.consume(key, 20n, t2), true, 'period total 30 + 20 = the new 50');
-  // Next UTC day: the full new budget.
-  assert.equal(spendable(roles, key, day0 + DAY), 50n);
+  assert.deepEqual([lower.allowance.nextRefill, lower.allowance.executeBefore], [Number(p1), Number(p1 - 600n)]);
+  assert.deepEqual(lower.allowance.limits, { idle: '50', inTime: '120', late: '150' });
+  assert.match(lower.description, /本期已用 30，执行后本期剩余 20.*须在 .+ UTC 前执行，期限前执行本期累计最多 120（生成后 bot 不再花时 50）.*执行当期累计最多 150/);
+  r1.setAllowance(lower, t1 + H);
+  assert.equal(r1.drain(key, t1 + H), 20n);
+  assert.equal(r1.spentBetween(key, setupAt, p1), 50n);
+  assert.equal(r1.spendable(key, p1), 50n, 'the next period gets the new full budget');
 
-  // Replay in the same period after spending the remainder re-opens exactly replay.samePeriod (20).
+  // 2. Spend first, then execute in the same period: the bot drains the old remaining 70 after generation, so 30 + 70 + 20 = limits.inTime.
+  const r2 = fresh();
+  assert.equal(r2.consume(key, 30n, t1), true);
+  const b2 = batchAt(r2, withFirstPerDay('50'), t1);
+  assert.equal(r2.drain(key, t1 + H), 70n);
+  r2.setAllowance(b2, BigInt(b2.allowance.executeBefore) - 1n);
+  r2.drain(key, BigInt(b2.allowance.executeBefore) - 1n);
+  assert.equal(r2.spentBetween(key, setupAt, p1), BigInt(b2.allowance.limits.inTime));
+
+  // 3. Cross-period, spend first, then execute: generated on day 1 with nothing spent; on day 2 the bot spends the old 100 and only then the batch runs.
+  const r3 = fresh(), g3 = setupAt + 20n * H;
+  const b3 = batchAt(r3, withFirstPerDay('50'), g3);
+  assert.deepEqual(b3.allowance.limits, { idle: '50', inTime: '150', late: '150' });
+  const day2 = p1 + 2n * H;
+  assert.ok(day2 > BigInt(b3.allowance.nextRefill));
+  assert.equal(r3.drain(key, day2), 100n);
+  r3.setAllowance(b3, day2 + H);
+  assert.equal(r3.drain(key, day2 + H), 50n, 'executed after the deadline the first spend refills to the new budget');
+  assert.equal(r3.spentBetween(key, p1, p1 + DAY), BigInt(b3.allowance.limits.late));
+  assert.ok(BigInt(b3.allowance.limits.late) > 50n, 'a late execution exceeds the new daily amount, which is why the batch carries a deadline');
+
+  // 4. Sweep every execution hour across two period boundaries with a bot that drains before and after the execution:
+  //    the execution period stays within inTime (before nextRefill) or late (after), the periods before within the old cap, later ones within the new budget.
+  let lateExceeded = false;
+  for (let execAt = t1 + 1n; execAt < t1 + 2n * DAY + 6n * H; execAt += H) {
+    const r = fresh();
+    assert.equal(r.consume(key, 30n, t1), true);
+    const b = batchAt(r, withFirstPerDay('50'), t1);
+    const periodOf = (t) => setupAt + ((t - setupAt) / DAY) * DAY;
+    for (const t of [t1, ...[p1, p1 + DAY, p1 + 2n * DAY].filter((ps) => ps < execAt), execAt - 1n]) if (t >= t1 && t < execAt) r.drain(key, t);
+    r.setAllowance(b, execAt);
+    for (const t of [execAt, ...[p1, p1 + DAY, p1 + 2n * DAY, p1 + 3n * DAY].filter((ps) => ps > execAt)]) r.drain(key, t);
+    const execPeriod = periodOf(execAt);
+    const bound = execAt < BigInt(b.allowance.nextRefill) ? BigInt(b.allowance.limits.inTime) : BigInt(b.allowance.limits.late);
+    const total = r.spentBetween(key, execPeriod, execPeriod + DAY);
+    assert.ok(total <= bound, `executed at +${execAt - t1}s: period total ${total} exceeds the stated ${bound}`);
+    if (execAt >= BigInt(b.allowance.nextRefill) && total > 50n) lateExceeded = true;
+    for (let ps = setupAt; ps < execPeriod; ps += DAY) assert.ok(r.spentBetween(key, ps, ps + DAY) <= 100n);
+    for (let ps = execPeriod + DAY; ps <= p1 + 3n * DAY; ps += DAY) assert.ok(r.spentBetween(key, ps, ps + DAY) <= 50n);
+  }
+  assert.ok(lateExceeded);
+
+  // 5. Replays: the same period re-opens replay.samePeriod; a later period refills to replay.laterPeriod.
   assert.equal(lower.allowance.replay.samePeriod, '20');
-  roles.exec(lower);
-  assert.equal(spendable(roles, key, t2 + 1n), 20n);
-  // Replay in a later period after that period's budget was spent refills it to replay.laterPeriod (50).
-  const t3 = day0 + DAY + 5n * 3600n;
-  assert.equal(roles.consume(key, 50n, t3), true);
-  assert.equal(spendable(roles, key, t3), 0n);
-  roles.exec(lower);
-  assert.equal(spendable(roles, key, t3 + 1n), BigInt(lower.allowance.replay.laterPeriod));
+  r1.setAllowance(lower, t1 + 2n * H);
+  assert.equal(r1.spendable(key, t1 + 2n * H), 20n);
+  const t3 = p1 + 5n * H;
+  assert.equal(r1.drain(key, t3), 50n);
+  r1.setAllowance(lower, t3 + 1n);
+  assert.equal(r1.spendable(key, t3 + 1n), BigInt(lower.allowance.replay.laterPeriod));
 
-  // Raising after spending 30: 150 − 30 = 120 left today, period total 150.
-  const roles2 = fresh();
-  assert.equal(roles2.consume(key, 30n, t1), true);
-  roles2.exec(batchAt(roles2, withFirstPerDay('150'), t1));
-  assert.equal(spendable(roles2, key, t2), 120n);
+  // 6. Raising after spending 30: 150 − 30 = 120 left this period.
+  const r6 = fresh();
+  assert.equal(r6.consume(key, 30n, t1), true);
+  r6.setAllowance(batchAt(r6, withFirstPerDay('150'), t1), t1 + H);
+  assert.equal(r6.spendable(key, t1 + H), 120n);
 
-  // Generated today but executed tomorrow: tomorrow simply gets the new full budget.
-  const roles3 = fresh();
-  assert.equal(roles3.consume(key, 30n, t1), true);
-  const late = batchAt(roles3, withFirstPerDay('50'), t1);
-  roles3.exec(late);
-  assert.equal(spendable(roles3, key, day0 + DAY + 1n), 50n);
+  // 7. A first setting has no deadline: whenever it runs, its period starts at the execution block and holds perDay.
+  const next = buildPermissions({ ...config, allowances: [...config.allowances, { token: getAddress('0x4200000000000000000000000000000000000006'), symbol: 'WETH', perDay: '7' }] });
+  const [firstTx] = buildUpdateBatch({ current: permissions, next, roles: ROLES_ADDR, allowanceState: unsetState(next, t1) });
+  assert.deepEqual([firstTx.allowance.first, firstTx.allowance.executeBefore], [true, null]);
+  const wethKey = next.allowances.at(-1).key, r7 = referenceRoles(), runAt = t1 + 5n * DAY + 123n;
+  r7.setAllowance(firstTx, runAt);
+  assert.equal(r7.drain(wethKey, runAt), 7n);
+  assert.equal(r7.spendable(wethKey, runAt + DAY - 1n), 0n);
+  assert.equal(r7.spendable(wethKey, runAt + DAY), 7n);
 });
 
-test('allowancePlan: lowering below the spent amount, stale timestamps, first setting and conservative reads', () => {
+test('allowancePlan: lowering below the spent amount, stale timestamps, other periods, first setting and an uncapped allowance', () => {
   const DAY = 86_400n, day0 = 20_000n * DAY, now = day0 + 7_200n;
   const spent30 = { refill: 100n, maxRefill: 100n, period: DAY, balance: 70n, timestamp: day0 };
-  assert.deepEqual(allowancePlan({ perDay: '150', period: 86400, onchain: spent30, now }), { first: false, balance: 120n, timestamp: day0, used: 30n, nextRefill: day0 + DAY, replay: { samePeriod: 120n, laterPeriod: 150n } });
-  assert.equal(allowancePlan({ perDay: '20', period: 86400, onchain: spent30, now }).balance, 0n, 'lowering below the spent amount leaves nothing this period');
-  // No spending for days: the reading accrues to today's period start, so nothing counts as spent today.
+  assert.deepEqual(allowancePlan({ perDay: '150', period: 86400, onchain: spent30, now }), { first: false, balance: 120n, timestamp: day0, used: 30n, nextRefill: day0 + DAY,
+    executeBefore: day0 + DAY - 600n, limits: { idle: 150n, inTime: 220n, late: 250n }, replay: { samePeriod: 120n, laterPeriod: 150n } });
+  const below = allowancePlan({ perDay: '20', period: 86400, onchain: spent30, now });
+  assert.deepEqual([below.balance, below.limits.idle], [0n, 30n], 'lowering below the spent amount leaves nothing; the period total is what was already spent');
+  // No spending for days: the reading accrues to the current period start, so nothing counts as spent.
   const idle = allowancePlan({ perDay: '50', period: 86400, onchain: { refill: 100n, maxRefill: 100n, period: DAY, balance: 70n, timestamp: 0n }, now });
   assert.deepEqual([idle.balance, idle.timestamp, idle.used], [50n, day0, 0n]);
-  // Unset on chain → first setting with timestamp 0.
-  assert.deepEqual(allowancePlan({ perDay: '5', period: 86400, onchain: UNSET, now }), { first: true, balance: 5n, timestamp: 0n, used: 0n, nextRefill: null, replay: { samePeriod: 5n, laterPeriod: 5n } });
-  // An allowance set elsewhere with maxRefill = max is treated as fully spent (balance 0), never as a fresh budget.
-  assert.equal(allowancePlan({ perDay: '50', period: 86400, onchain: { refill: 100n, maxRefill: (1n << 128n) - 1n, period: DAY, balance: 70n, timestamp: day0 }, now }).balance, 0n);
+  // A longer on-chain period moves the start forward to the 24-hour period holding now; a shorter one cannot bound spending before the deadline.
+  const weekly = allowancePlan({ perDay: '50', period: 86400, onchain: { ...spent30, period: 7n * DAY, timestamp: day0 - 3n * DAY }, now });
+  assert.deepEqual([weekly.timestamp, weekly.used, weekly.nextRefill], [day0, 30n, day0 + DAY]);
+  const hourly = allowancePlan({ perDay: '50', period: 86400, onchain: { ...spent30, period: 3_600n, timestamp: now - 60n }, now });
+  assert.deepEqual([hourly.timestamp, hourly.limits], [now - 60n, { idle: 50n, inTime: null, late: null }]);
+  // A longer period that is not a whole number of days refills inside the 24-hour period (36 h: at now + 6 h, before nextRefill at now + 18 h).
+  const odd = allowancePlan({ perDay: '50', period: 86400, onchain: { ...spent30, period: 36n * 3_600n, timestamp: now - 30n * 3_600n }, now });
+  assert.deepEqual([odd.timestamp, odd.nextRefill, odd.limits], [now - 6n * 3_600n, now + 18n * 3_600n, { idle: 50n, inTime: null, late: null }]);
+  assert.deepEqual(weekly.limits, { idle: 50n, inTime: 120n, late: 150n });
+  // Unset on chain → first setting with timestamp 0 and no deadline.
+  assert.deepEqual(allowancePlan({ perDay: '5', period: 86400, onchain: UNSET, now }), { first: true, balance: 5n, timestamp: 0n, used: 0n, nextRefill: null, executeBefore: null,
+    limits: { idle: 5n, inTime: 5n, late: 5n }, replay: { samePeriod: 5n, laterPeriod: 5n } });
+  // maxRefill = uint128 max (set elsewhere with 0): the spent amount cannot be derived; it shows as unknown and leaves nothing this period.
+  const uncapped = allowancePlan({ perDay: '50', period: 86400, onchain: { refill: 100n, maxRefill: U128_MAX, period: DAY, balance: 70n, timestamp: day0 }, now });
+  assert.deepEqual([uncapped.used, uncapped.balance, uncapped.limits], [null, 0n, { idle: null, inTime: null, late: null }]);
   assert.throws(() => allowancePlan({ perDay: '5', period: 86400, onchain: null, now }), /allowance state required/);
   assert.throws(() => allowancePlan({ perDay: '5', period: 86400, onchain: UNSET, now: 1 }), /allowance state required/);
 });
 
+test('a batch is refused when the period ends before it could run, and an uncapped reading is described as unknown', () => {
+  const ROLES_ADDR = new Wallet('0x' + '59'.repeat(32)).address;
+  const DAY = 86_400n, day0 = 20_000n * DAY;
+  const next = withFirstPerDay('50'), key = next.allowances[0].key;
+  const state = (now, onchain) => ({ now, allowances: new Map([[key, onchain]]) });
+  const reading = { refill: 100n, maxRefill: 100n, period: DAY, balance: 70n, timestamp: day0 };
+  const current = withFirstPerDay('100');
+  assert.throws(() => buildUpdateBatch({ current, next, roles: ROLES_ADDR, allowanceState: state(day0 + DAY - 600n, reading) }), (error) => error.code === 'period_ending' && /不到 10 分钟/.test(error.message));
+  const [tx] = buildUpdateBatch({ current, next, roles: ROLES_ADDR, allowanceState: state(day0 + DAY - 601n, reading) });
+  assert.equal(tx.allowance.executeBefore, Number(day0 + DAY - 600n));
+  const [open] = buildUpdateBatch({ current, next, roles: ROLES_ADDR, allowanceState: state(day0 + 60n, { ...reading, maxRefill: U128_MAX }) });
+  assert.equal(open.allowance.used, null);
+  assert.match(open.description, /没有补充上限，无法折算本期已用，执行后本期剩余按 0/);
+  assert.doesNotMatch(open.description, /累计最多/);
+});
 test('a new-token allowance that already ran on chain is not reset by a regenerated batch; missing reads refuse', () => {
   const ROLES_ADDR = new Wallet('0x' + '57'.repeat(32)).address;
   const WETH = getAddress('0x4200000000000000000000000000000000000006');
@@ -368,6 +474,13 @@ test('gauge liveness: only an explicit Voter.isAlive reading counts; anything el
   const reverted = await gaugeLiveness(rpcWith(() => { throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' }); }), GAUGE);
   assert.deepEqual([reverted.state, /不提供 isAlive/.test(reverted.note)], ['unknown', true]);
   assert.equal((await gaugeLiveness(rpcWith(() => '0x'), GAUGE)).state, 'unknown', 'an empty return is not read as false');
+  // Only exactly one 32-byte word holding 0 or 1 counts: ethers would read any non-zero word as true and ignore trailing bytes.
+  const word = (v) => '0x' + v.toString(16).padStart(64, '0');
+  for (const raw of [word(2n), word(1n) + '00'.repeat(32), word(1n).slice(0, -2), '0x' + 'ff'.repeat(32), word(0n) + '00']) {
+    const odd = await gaugeLiveness(rpcWith(() => raw), GAUGE);
+    assert.deepEqual([odd.state, /不是 0 或 1/.test(odd.note)], ['unknown', true], raw);
+  }
+  assert.equal((await gaugeLiveness(rpcWith(() => word(1n).toUpperCase().replace('0X', '0x')), GAUGE)).state, 'alive');
   const offline = await gaugeLiveness(rpcWith(() => { throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' }); }), GAUGE);
   assert.deepEqual([offline.state, /读取 Voter.isAlive 失败/.test(offline.note)], ['unknown', true]);
 });

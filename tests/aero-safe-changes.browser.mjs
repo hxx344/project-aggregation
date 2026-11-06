@@ -3,7 +3,7 @@
 // Every API is an isolated fixture; nothing reaches an RPC, the Safe or Roles.
 // Covers 配置 → 白名单变更: unsaved allowance inputs survive state reads while one token's decimals flip between unknown and known
 // (only that row is flagged and revalidated, untouched rows follow the server), and the frozen batch is shown apart from the
-// draft's additions and withdrawals for both pools and allowances, plus the stale reason and the persistence error.
+// draft's additions and withdrawals for both pools and allowances, the execution deadline once it has passed, plus the stale reason and the persistence error.
 async (page) => {
   const origin = 'http://127.0.0.1:4180', root = '/api/automation/aero-safe';
   const assert = (value, message) => { if (!value) throw new Error(message); };
@@ -97,6 +97,16 @@ async (page) => {
     await page.getByText('生成批次之后已从草稿撤回或改了值：额度 USDC 500', { exact: false }).waitFor();
     assert(await page.getByText('继续保留', { exact: false }).count() === 0, 'a withdrawal is not described as kept for later');
     assert(await page.getByRole('button', { name: '已执行，核对并启用' }).isVisible(), 'the frozen batch can still be applied');
+
+    // 过了执行期限：警示未执行的不要再执行、请重新生成；已在期限前执行的仍可核对启用。
+    const deadline = Date.now() - 60_000;
+    batch = { ...batch, executeBefore: deadline, expired: true };
+    await poll();
+    const expired = page.getByRole('alert').filter({ hasText: '这份批次已过执行期限' });
+    await expired.waitFor();
+    const expiredText = await expired.innerText();
+    assert(expiredText.includes(`${new Date(deadline).toISOString().slice(0, 16).replace('T', ' ')} UTC`) && /不要再执行这份文件/.test(expiredText) && /已在期限前执行的，可以核对启用/.test(expiredText), `expired notice: ${expiredText}`);
+    assert(await page.getByRole('button', { name: '已执行，核对并启用' }).isVisible(), 'a batch executed in time can still be applied after the deadline');
 
     // 3. 失效原因与写盘失败照原文显示；失效批次不能核对。
     batch = { ...batch, stale: true, staleReason: '这份批次来自旧版本，没有记录 Safe 与 Roles 地址，不能再核对，请重新生成' };

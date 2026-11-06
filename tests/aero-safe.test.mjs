@@ -9,7 +9,7 @@ import { AERO } from '../tools/aero-roles/addresses.mjs';
 import { buildPermissions } from '../tools/aero-roles/permissions.mjs';
 import * as executor from '../tools/aero-roles/executor.mjs';
 import { ROLES_ABI } from '../tools/aero-roles/roles-calls.mjs';
-import { PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
+import { BATCH_BUDGET_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
 import { createApp } from '../server/app.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -990,16 +990,17 @@ test('the batch reads the on-chain allowance first: an adjustment keeps this per
   const usdcKey = permissions.allowances.find((a) => a.token === USDC).key;
   const DAY = 86_400n, day0 = 20_000n * DAY;
   const reads = [];
-  let fail = false, gate = null;
+  let fail = false, gate = null, readAt = day0 + 3600n;
+  let clock = Number(day0 + 3600n) * 1000;
   const chain = { ...fakeChain(), verifyActive: async () => ({ ok: true, checks: [] }),
     readAllowances: async (_rpc, roles, keys) => {
       reads.push({ roles, keys });
       if (gate) await gate;
       if (fail) throw new executor.ExecError('读取 Roles 额度 失败：boom', { code: 'rpc' });
-      // 每日 1000 USDC，今天（UTC 0 点起）已用 300。
-      return { blockNumber: 9, now: day0 + 3600n, allowances: new Map(keys.map((key) => [key, { refill: 1_000_000_000n, maxRefill: 1_000_000_000n, period: DAY, balance: 700_000_000n, timestamp: day0 }])) };
+      // 每日 1000 USDC，本期（day0 起）已用 300。
+      return { blockNumber: 9, now: readAt, allowances: new Map(keys.map((key) => [key, { refill: 1_000_000_000n, maxRefill: 1_000_000_000n, period: DAY, balance: 700_000_000n, timestamp: day0 }])) };
     } };
-  const { manager } = managerWith(directory, { chain });
+  const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
   try {
     await manager.initialize();
     await manager.save(baseConfig);
@@ -1019,18 +1020,103 @@ test('the batch reads the on-chain allowance first: an adjustment keeps this per
       ['USDC', 6, '1000000000', '500000000', '300000000', '200000000', '200000000', '500000000']);
     assert.match(out.transactions[0].description, /本期已用 300000000，执行后本期剩余 200000000/);
     assert.match(out.builder.meta.description, /重复执行.*USDC 每次执行最多再花 200000000/);
+    // The batch must run before this period's refill (minus 10 minutes); the deadline is frozen with it and survives a restart.
+    const executeBefore = Number(day0 + DAY - 600n) * 1000;
+    assert.deepEqual([out.executeBefore, effect.executeBefore, effect.limits.inTime, effect.limits.late], [executeBefore, executeBefore / 1000, '1200000000', '1500000000']);
+    assert.match(out.builder.meta.description, /须在 .+ UTC 前执行；过了期限不要再执行，请重新生成/);
+    assert.deepEqual([out.state.changes.batch.executeBefore, out.state.changes.batch.expired], [executeBefore, false]);
+    await manager.close();
+    let restarted = managerWith(directory, { chain, manager: { now: () => clock } }).manager;
+    await restarted.initialize();
+    assert.equal(restarted.state().changes.batch.executeBefore, executeBefore);
+    // Past the deadline the batch is marked expired (an unexecuted file must not run any more), but one executed in time can still be applied.
+    clock = executeBefore;
+    assert.equal(restarted.state().changes.batch.expired, true);
+    await restarted.setKey(KEY);
+    const applied = await restarted.applyChangeBatch();
+    assert.equal(applied.config.permissions.allowances.find((a) => a.token === USDC).perDay, '500000000');
+    await restarted.close();
+    restarted = managerWith(directory, { chain, manager: { now: () => clock } }).manager;
+    await restarted.initialize();
+    await until(() => restarted.state().chain);
+
+    // Too close to the period end to run in time: refused, nothing frozen.
+    await restarted.setAllowanceChanges({ [USDC]: '400' });
+    readAt = day0 + DAY - 300n;
+    await assert.rejects(restarted.buildChangeBatch(), (error) => error.status === 409 && /不到 10 分钟/.test(error.message));
+    assert.equal(restarted.state().changes.batch, null);
+    readAt = day0 + 3600n;
 
     // A draft change while the chain read is in flight is not frozen into a batch built from the old draft.
     let release;
     gate = new Promise((resolve) => { release = resolve; });
-    const building = manager.buildChangeBatch();
-    await until(() => reads.length === 3);
-    await manager.setAllowanceChanges({ [USDC]: '600' });
+    let building = restarted.buildChangeBatch();
+    const seen = reads.length;
+    await until(() => reads.length === seen + 1);
+    await restarted.setAllowanceChanges({ [USDC]: '600' });
     release(); gate = null;
     await assert.rejects(building, (error) => error.status === 409 && /读取链上额度期间已变化/.test(error.message));
+
+    // The whole request, queueing included, is bounded by BATCH_BUDGET_MS from its arrival: past it nothing is frozen.
+    gate = new Promise((resolve) => { release = resolve; });
+    building = restarted.buildChangeBatch();
+    await until(() => reads.length === seen + 2);
+    clock += BATCH_BUDGET_MS;
+    release(); gate = null;
+    await assert.rejects(building, (error) => error.status === 504 && /含排队等待/.test(error.message));
+    assert.equal(restarted.state().changes.batch, null);
+    await restarted.close();
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('waiting in the serial queue counts toward the batch budget, and a callback that runs after the timeout freezes nothing', async () => {
+  const directory = fixtureDir();
+  const DAY = 86_400n, day0 = 20_000n * DAY;
+  let previewGate = null, readGate = null;
+  const chain = { ...fakeChain(),
+    previewOpen: async () => { await previewGate; return { amount0: 1n }; },
+    readAllowances: async (_rpc, _roles, keys) => {
+      await readGate;
+      return { blockNumber: 9, now: day0 + 3600n, allowances: new Map(keys.map((key) => [key, { refill: 1_000_000_000n, maxRefill: 1_000_000_000n, period: DAY, balance: 700_000_000n, timestamp: day0 }])) };
+    } };
+  const { manager } = managerWith(directory, { chain, manager: { now: () => Number(day0 + 3600n) * 1000, batchBudgetMs: 300 } });
+  const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
+  const batched = () => manager.state().events.filter((e) => e.event === 'changes_batched').length;
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    await until(() => manager.state().chain);
+    await manager.setAllowanceChanges({ [USDC]: '500' });
+
+    // 1. A long preview holds the queue before the first step.
+    let release;
+    previewGate = new Promise((resolve) => { release = resolve; });
+    let previewing = manager.preview(open);
+    let started = Date.now();
+    await assert.rejects(manager.buildChangeBatch(), (error) => error.status === 504 && /含排队等待其他操作/.test(error.message));
+    assert.ok(Date.now() - started < 2_000, 'the queue wait is bounded by the budget');
+    release(); await previewing; previewGate = null;
+
+    // 2. The chain read returns, but the queue is held again before the batch is frozen.
+    let releaseRead;
+    readGate = new Promise((resolve) => { releaseRead = resolve; });
+    previewGate = new Promise((resolve) => { release = resolve; });
+    started = Date.now();
+    const building = manager.buildChangeBatch();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    previewing = manager.preview(open);
+    releaseRead();
+    await assert.rejects(building, (error) => error.status === 504 && /含排队等待其他操作/.test(error.message));
+    assert.ok(Date.now() - started < 2_000, 'the second queue wait is bounded too');
+    release(); await previewing;
+    await manager.setAllowanceChanges({ [USDC]: '500' }); // runs after the abandoned callback in queue order
+    assert.deepEqual([manager.state().changes.batch, batched()], [null, 0], 'the abandoned callback froze nothing');
+
+    // An idle queue still builds the batch within the budget.
+    previewGate = null; readGate = null;
+    const out = await manager.buildChangeBatch();
+    assert.deepEqual([out.state.changes.batch.transactions, batched()], [1, 1]);
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
 test('a queued pool records the gauge liveness reading; unknown survives a restart and old entries read as unknown', async () => {
   const directory = fixtureDir();
   const { POOL, POOL2, WETH, CBBTC, infos } = twoPools();

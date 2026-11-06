@@ -93,7 +93,8 @@ export function useAeroSafe(onExpired: () => void) {
     if (busyRef.current || !signal || signal.aborted) return null;
     busyRef.current = 'batch'; setBusy('batch'); setActionError('');
     generation.current++;
-    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: 120_000 }); if (!signal.aborted) setState(data.state); return data; }
+    // 服务端从收到请求起 50 秒内（含排队）给出结果，API 转发时限 60 秒；页面等得比二者都长，让知道原因的一层先回复。
+    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: 70_000 }); if (!signal.aborted) setState(data.state); return data; }
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);

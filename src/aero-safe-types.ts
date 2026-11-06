@@ -63,18 +63,21 @@ export type AeroSafeChanges = {
   persistError: string | null;
   // stale：配置在生成后已变化或批次没有记录目标地址，不能再核对，staleReason 为原因；behind：最新草稿合成的权限与这份批次不同。
   // added：只在最新草稿里、不在这份批次的项；withdrawn：在这份批次里、草稿已撤回或改了值的项（旧批次文件执行时仍会生效）。
+  // executeBefore：执行期限（毫秒，只有首次设置或不调额度时为 null）；expired：已过期限，未执行的不应再执行，已在期限前执行的仍可核对。
   batch: { createdAt: number; transactions: number; pools: string[]; allowances: AeroSafeBatchAllowance[]; stale: boolean; staleReason: string | null; behind: boolean;
-    added: AeroSafeBatchItems; withdrawn: AeroSafeBatchItems } | null;
+    executeBefore?: number | null; expired?: boolean; added: AeroSafeBatchItems; withdrawn: AeroSafeBatchItems } | null;
 };
 export type AeroSafeBatchAllowance = { symbol: string; perDay: string; decimals: number };
 export type AeroSafeBatchItems = { pools: string[]; allowances: AeroSafeBatchAllowance[] };
 // 批次里一个额度的执行效果（最小单位字符串）：按生成时链上读数（readAt，区块时间秒）的本期已用 used 折算，执行后本期剩余 balance，
-// nextRefill（秒）起按 perDay 补满；first 为链上尚无此额度的首次设置。replay：同一批次重复执行或执行前 bot 再消耗时，
-// 同一周期内每执行一次最多再花 samePeriod，到之后的周期再执行则当期计满 laterPeriod。decimals 读不到时为 null。
+// nextRefill（秒）起按 perDay 补满；first 为链上尚无此额度的首次设置。used 为 null：链上旧额度没有补充上限，无法折算，balance 按 0。
+// executeBefore（秒）：须在此前执行；limits 为本期累计上限：idle 生成后 bot 不再花、inTime 期限前执行（含生成后再花）、late 超过 nextRefill 才执行，
+// 给不出上限时为 null。replay：同一周期内每多执行一次最多再花 samePeriod，到之后的周期再执行则当期计满 laterPeriod。decimals 读不到时为 null。
 export type AeroSafeAllowanceEffect = { key: string; token: string; symbol: string; decimals: number | null; previous: string | null; perDay: string; first: boolean;
-  used: string; balance: string; nextRefill: number | null; readAt: number; replay: { samePeriod: string; laterPeriod: string } };
+  used: string | null; balance: string; nextRefill: number | null; executeBefore: number | null; readAt: number;
+  limits: { idle: string | null; inTime: string | null; late: string | null }; replay: { samePeriod: string; laterPeriod: string } };
 // POST /changes/batch：builder 为 Safe{Wallet} Transaction Builder 可导入的批次 JSON。
-export type AeroSafeChangeBatch = { transactions: { to: string; description: string }[]; allowances: AeroSafeAllowanceEffect[]; builder: unknown; usage: { label: string; nodes: number }[]; state: AeroSafeState };
+export type AeroSafeChangeBatch = { transactions: { to: string; description: string }[]; allowances: AeroSafeAllowanceEffect[]; executeBefore: number | null; builder: unknown; usage: { label: string; nodes: number }[]; state: AeroSafeState };
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string; capped?: boolean;
   swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string; previewedAt: number;

@@ -28,6 +28,7 @@ async (page) => {
   });
   // Fixture server model.
   let queued = [], allowances = [], batch = null, merged = false, failApply = true, usdcPerDay = '1000000000';
+  const DEADLINE = Math.floor(Date.now() / 1000) + 3 * 3600; // 执行期限（秒），区块时间
   const requests = [], errors = [], previews = [];
   const queuedPool = () => ({ address: POOL, name: 'WETH/cbBTC ts1', gauge: GAUGE, tickSpacing: 1, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: CBBTC, symbol: 'cbBTC', decimals: 8 }, addedAt: Date.now(),
     gaugeStatus: { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' } });
@@ -87,10 +88,13 @@ async (page) => {
     if (url.pathname === `${root}/changes/batch` && method === 'POST') {
       batch = { createdAt: Date.now(), transactions: 4, pools: ['WETH/cbBTC ts1'], allowances: allowances.map(({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals })), stale: false, staleReason: null, behind: false,
         added: { pools: [], allowances: [] }, withdrawn: { pools: [], allowances: [] } };
-      const effect = (symbol, decimals, previous, perDay, used, balance, first) => ({ key: `0x${symbol}`, token: symbol, symbol, decimals, previous, perDay, first, used, balance,
-        nextRefill: first ? null : 1_800_057_600, readAt: 1_800_000_000, replay: { samePeriod: balance, laterPeriod: perDay } });
-      return send({ builder: { version: '1.0', chainId: '8453', transactions: [] }, usage: [{ label: 'Router.exactInputSingle', nodes: 29 }],
-        allowances: [effect('cbBTC', 8, null, '1000000', '0', '1000000', true), effect('USDC', 6, '1000000000', '500000000', '600000000', '0', false)],
+      batch.executeBefore = DEADLINE * 1000; batch.expired = false;
+      const effect = (symbol, decimals, previous, perDay, used, balance, first, limits) => ({ key: `0x${symbol}`, token: symbol, symbol, decimals, previous, perDay, first, used, balance,
+        nextRefill: first ? null : DEADLINE + 600, executeBefore: first ? null : DEADLINE, readAt: 1_800_000_000, limits, replay: { samePeriod: balance, laterPeriod: perDay } });
+      return send({ builder: { version: '1.0', chainId: '8453', transactions: [] }, usage: [{ label: 'Router.exactInputSingle', nodes: 29 }], executeBefore: DEADLINE * 1000,
+        allowances: [effect('cbBTC', 8, null, '1000000', '0', '1000000', true, { idle: '1000000', inTime: '1000000', late: '1000000' }),
+          effect('USDC', 6, '1000000000', '500000000', '600000000', '0', false, { idle: '600000000', inTime: '1000000000', late: '1500000000' }),
+          effect('AERO', 18, '5000000000000000000', '4000000000000000000', null, '0', false, { idle: null, inTime: null, late: null })],
         transactions: [{ to: '0xfed', description: '限定目标 gauge WETH/cbBTC ts1' }, { to: '0xfed', description: '按条件允许 NPM.mint' }, { to: '0xfed', description: '额度 cbBTC：每 24 小时 1000000（最小单位）' },
           { to: '0xfed', description: '调整额度 USDC：每 24 小时 1000000000 → 500000000（最小单位）；按生成时链上读数本期已用 600000000，执行后本期剩余 0（不在本期重新计满）' }], state: state() });
     }
@@ -158,9 +162,19 @@ async (page) => {
     await page.getByText('批次明细').click();
     await page.getByText('调整额度 USDC：每 24 小时 1000000000 → 500000000', { exact: false }).waitFor();
     // 额度的执行效果单列：本期已用 600 时调到 500，本期不再可用；重复执行的上限逐个代币列出。
-    await page.getByText('USDC：每日 1000 USDC → 500 USDC；本期已用 600 USDC，执行后本期剩余 0 USDC', { exact: false }).waitFor();
-    await page.getByText('cbBTC：链上尚无此额度，首次设置为每日 0.01 cbBTC', { exact: false }).waitFor();
-    await page.getByText('USDC 每多执行一次本期最多再花 0 USDC，到之后的周期再执行则当期重新计满 500 USDC', { exact: false }).waitFor();
+    // 调整已有额度的批次带执行期限：期限前与期限后执行的本期累计上限分别列出；旧额度无补充上限时显示无法折算。
+    const deadlineUtc = `${new Date(DEADLINE * 1000).toISOString().slice(0, 16).replace('T', ' ')} UTC`, refillUtc = `${new Date((DEADLINE + 600) * 1000).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+    await page.getByText(`前在 Safe 执行这份批次`, { exact: false }).filter({ hasText: deadlineUtc }).waitFor();
+    const usdcEffect = page.locator('li', { hasText: 'USDC：每日 1000 USDC → 500 USDC；生成时本期已用 600 USDC，执行后本期剩余 0 USDC' });
+    await usdcEffect.waitFor();
+    const usdcText = await usdcEffect.innerText();
+    assert(usdcText.includes(`${deadlineUtc}） 前执行：期限前执行本期累计最多 1000 USDC（生成后 bot 不再开仓兑换时为 600 USDC）`), `in-time limit: ${usdcText}`);
+    assert(usdcText.includes(`${refillUtc}） 才执行，执行当期额度补满、执行前已花的不计入，当期累计最多 1500 USDC`), `late limit: ${usdcText}`);
+    await page.getByText('cbBTC：链上尚无此额度，首次设置为每日 0.01 cbBTC，周期从执行时起算', { exact: false }).waitFor();
+    const aeroText = await page.locator('li', { hasText: 'AERO：每日 5 AERO → 4 AERO' }).innerText();
+    assert(aeroText.includes('链上旧额度没有补充上限，无法折算本期已用，执行后本期剩余按 0') && aeroText.includes('期限前执行的本期累计给不出上限') && !aeroText.includes('当期累计最多'), `uncapped: ${aeroText}`);
+    await page.getByText('USDC 同一周期内每多执行一次最多再花 0 USDC，到之后的周期再执行则当期重新计满 500 USDC', { exact: false }).waitFor();
+    await page.getByText('这份批次须在', { exact: false }).filter({ hasText: deadlineUtc }).waitFor();
     assert(await page.locator('.as-list .as-warn', { hasText: 'gauge 状态未知' }).count() === 1, 'the pending pool list flags the unknown gauge');
     const download = page.waitForEvent('download');
     await page.getByRole('button', { name: '下载批次 JSON' }).click();

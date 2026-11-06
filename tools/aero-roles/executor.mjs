@@ -244,15 +244,19 @@ const VOTER_I = new Interface(['function isAlive(address gauge) view returns (bo
 // gauge 是否被 Voter 停用。只认 Voter.isAlive(gauge) 的明确读数：true → alive，false → killed。
 // PR #190 记录固定 Voter 0x3824…（LeafVoter）读 isAlive 会回滚；回滚、返回值无法解析或读取失败都只报 unknown（不当作正常，也不拒绝），
 // 零排放（rewardRate 为 0、本期已结束）可能只是本周期没有投票，不拿来推断停用。单次读取，受 provider 20 秒超时约束，不重试。
+// 返回值须恰好是一个 32 字节字且为 0 或 1：ethers 解 bool 时把任何非零字当 true、也不管多出的字节，不按它解码。
 export async function gaugeLiveness(rpc, gauge) {
+  let raw;
   try {
-    const [alive] = await call(rpc, VOTER_I, AERO.voter, 'isAlive', [getAddress(gauge)]);
-    return alive ? { state: 'alive', note: 'Voter.isAlive = true' } : { state: 'killed', note: 'Voter.isAlive = false' };
+    raw = await rpc.call({ to: AERO.voter, data: VOTER_I.encodeFunctionData('isAlive', [getAddress(gauge)]) });
   } catch (error) {
     if (error?.code === 'CALL_EXCEPTION') return { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' };
-    if (error?.code === 'BAD_DATA') return { state: 'unknown', note: 'Voter.isAlive 的返回值无法解析，无法确认 gauge 是否已被停用' };
     return { state: 'unknown', note: `读取 Voter.isAlive 失败（${errorText(error)}），无法确认 gauge 是否已被停用` };
   }
+  const word = typeof raw === 'string' && /^0x[0-9a-fA-F]{64}$/.test(raw) ? BigInt(raw) : null;
+  if (word === 1n) return { state: 'alive', note: 'Voter.isAlive = true' };
+  if (word === 0n) return { state: 'killed', note: 'Voter.isAlive = false' };
+  return { state: 'unknown', note: 'Voter.isAlive 的返回值不是 0 或 1 的 32 字节布尔值，无法确认 gauge 是否已被停用' };
 }
 
 // 生成调额度批次用的链上额度：同一区块的 Roles.allowances(key) 与该区块时间（bigint 秒）。
