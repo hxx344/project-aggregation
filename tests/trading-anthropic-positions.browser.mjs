@@ -7,7 +7,7 @@ async (page) => {
   const pageErrors = [], writes = [];
   page.on('pageerror', error => pageErrors.push(error.message));
   const fixedTime = '2026-11-06T04:00:00.000Z', start = '2026-10-30T04:00:00.000Z';
-  let config = { enabled: true, thresholdPercent: 20, repeatMinutes: 30 }, channel = true, testFailure = true;
+  let config = { enabled: true, thresholdPercent: 20, repeatMinutes: 30 }, channel = { configured: true, source: 'digest', host: null, error: null }, testFailure = true;
   const leg = (exchange, symbol, side, extra) => ({ id: `${exchange}:${symbol}:${side}`, exchange, symbol, side, quantityUnit: null, contractSize: null, entryPrice: '180', unrealizedPnl: '0', leverage: '3', marginMode: 'isolated', ...extra });
   const watch = () => ({ generatedAt: fixedTime, sources: [
     { exchange: 'binance', connected: true, state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
@@ -16,7 +16,7 @@ async (page) => {
       positions: [leg('okx', 'ANTHROPICUSDT', 'short', { quantity: '300', quantityUnit: '张', contractSize: '1', markPrice: '183.6', notional: '5508', unrealizedPnl: '-108', liquidationPrice: '240', distancePercent: '30.72', alerting: false, marginMode: 'cross' })] },
     { exchange: 'hyperliquid', connected: true, address: '0x' + 'ab'.repeat(20), state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
       positions: [leg('hyperliquid', 'xyz:ANT', 'long', { quantity: '100', markPrice: '14.4', notional: '1440', liquidationPrice: null, distancePercent: null, alerting: false })] },
-  ], alerts: { config, channel: { configured: channel }, history: [{ at: fixedTime, status: 'sent', count: 1, summary: ['Binance ANTHROPICUSDT 做多：距强平 18.20%（阈值 20%）'], error: null }], error: null, staleAfterSeconds: 180, hysteresisPercent: 2 } });
+  ], alerts: { config, channel, history: [{ at: fixedTime, status: 'sent', count: 1, summary: ['Binance ANTHROPICUSDT 做多：距强平 18.20%（阈值 20%）'], error: null }], error: null, staleAfterSeconds: 180, hysteresisPercent: 2 } });
   const trading = () => ({ mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, cache: { builtAt: fixedTime, servedAt: fixedTime, rebuilding: false }, period: { days: 7, start, end: fixedTime },
     exchanges: ['binance', 'bybit'], accounts: [], legs: [], structure: { state: 'opposed', message: '' },
     pnl: { currency: 'USDT', intervalMs: 60000, cumulativeStart: Date.parse(start), end: Date.parse(fixedTime), recordingStartedAt: Date.parse(fixedTime), pointCount: 0, points: [], latest: null, status: 'ready' },
@@ -34,6 +34,14 @@ async (page) => {
     if (url.pathname === '/api/trading/anthropic/alerts' && method === 'PUT') {
       const body = JSON.parse(request.postData()); writes.push(body);
       config = body.config; return send(watch());
+    }
+    if (url.pathname === '/api/trading/anthropic/alerts/channel' && method === 'PUT') {
+      writes.push(JSON.parse(request.postData()));
+      channel = { configured: true, source: 'own', host: 'open.feishu.cn', error: null }; return send(watch());
+    }
+    if (url.pathname === '/api/trading/anthropic/alerts/channel/clear' && method === 'POST') {
+      writes.push(JSON.parse(request.postData()));
+      channel = { configured: true, source: 'digest', host: null, error: null }; return send(watch());
     }
     if (url.pathname === '/api/trading/anthropic/alerts/test' && method === 'POST') {
       writes.push(JSON.parse(request.postData()));
@@ -70,7 +78,28 @@ async (page) => {
   await section.getByRole('alert').filter({ hasText: '飞书发送失败（19024）' }).waitFor();
   assert(JSON.stringify(writes[1]) === '{}', 'test sends an empty body');
 
-  channel = false;
+  assert((await section.locator('.trading-anthropic-robot-status').innerText()).includes('「系统 → 飞书汇总」的机器人'), 'falls back to the digest robot');
+  await section.getByText('使用预警专用机器人').click();
+  const hook = 'https://open.feishu.cn/open-apis/bot/v2/hook/fixture-own';
+  const saveRobot = section.getByRole('button', { name: '保存机器人' });
+  assert(await saveRobot.isDisabled(), 'saving the robot needs a webhook');
+  await section.getByLabel('Webhook 地址').fill(hook);
+  await section.getByLabel('签名密钥（可选）').fill('fixture-secret');
+  await saveRobot.click();
+  await section.getByText('预警机器人已保存', { exact: false }).waitFor();
+  assert(JSON.stringify(writes[2]) === JSON.stringify({ webhookUrl: hook, signingSecret: 'fixture-secret' }), `robot PUT body: ${JSON.stringify(writes[2])}`);
+  assert((await section.locator('.trading-anthropic-robot-status').innerText()).includes('预警专用机器人（open.feishu.cn）'), 'shows only the host of the own robot');
+  assert(await section.getByLabel('Webhook 地址').inputValue() === '' && await section.getByLabel('Webhook 地址').getAttribute('type') === 'password', 'the webhook is masked and cleared after saving');
+  await section.getByRole('button', { name: '改用飞书汇总的机器人' }).click();
+  await section.getByText('已改用「系统 → 飞书汇总」的机器人。').waitFor();
+  assert(JSON.stringify(writes[3]) === '{}', 'clear sends an empty body');
+
+  channel = { configured: false, source: 'own', host: null, error: '已保存的预警机器人无法读取，请重新填写' };
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await section.getByRole('alert').filter({ hasText: '已保存的预警机器人无法读取' }).waitFor();
+  assert(await section.getByRole('button', { name: '发送测试' }).isDisabled(), 'an unreadable own robot blocks the test');
+
+  channel = { configured: false, source: null, host: null, error: null };
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
   await section.getByText('尚未配置飞书机器人', { exact: false }).waitFor();
   assert(await section.getByRole('button', { name: '发送测试' }).isDisabled(), 'test needs the Feishu robot');

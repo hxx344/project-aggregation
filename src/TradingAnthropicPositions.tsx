@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { BellRing, CircleAlert, LoaderCircle, Send } from 'lucide-react';
+import { BellRing, CircleAlert, KeyRound, LoaderCircle, Send } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { AnthropicShares } from './trading-execution-types';
 import { contractKey, findContract, sharesPerUnit } from './trading-anthropic';
@@ -15,7 +15,7 @@ type Position = {
 type SourceState = { exchange: Source; connected: boolean; address?: string | null; state: ReadState; fetchedAt: string | null; error: string | null; refreshing: boolean; positions: Position[] };
 type AlertConfig = { enabled: boolean; thresholdPercent: number; repeatMinutes: number };
 type HistoryEntry = { at: string; status: 'sent' | 'failed' | 'uncertain'; count: number; summary: string[]; error: string | null };
-type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { config: AlertConfig; channel: { configured: boolean }; history: HistoryEntry[]; error: string | null; staleAfterSeconds: number; hysteresisPercent: number } };
+type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { config: AlertConfig; channel: { configured: boolean; source: 'own' | 'digest' | null; host: string | null; error: string | null }; history: HistoryEntry[]; error: string | null; staleAfterSeconds: number; hysteresisPercent: number } };
 
 const BASE = '/api/trading/anthropic';
 const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid' };
@@ -47,7 +47,8 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
   const [data, setData] = useState<WatchState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState<{ enabled: boolean; threshold: string; repeat: string } | null>(null);
-  const [busy, setBusy] = useState<'save' | 'test' | null>(null);
+  const [busy, setBusy] = useState<'save' | 'test' | 'robot' | 'clear' | null>(null);
+  const [robot, setRobot] = useState({ webhookUrl: '', signingSecret: '' });
   const [notice, setNotice] = useState<string | null>(null);
   // Save and test failures stay until the next write; the polling read clears only its own error.
   const [writeError, setWriteError] = useState<string | null>(null);
@@ -78,18 +79,23 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
 
   const config = data?.alerts.config;
   const form = draft ?? (config ? { enabled: config.enabled, threshold: String(config.thresholdPercent), repeat: String(config.repeatMinutes) } : null);
-  async function write(kind: 'save' | 'test', event?: FormEvent) {
+  async function write(kind: 'save' | 'test' | 'robot' | 'clear', event?: FormEvent) {
     event?.preventDefault();
     if (!form || busy) return;
     setBusy(kind); setNotice(null); setWriteError(null);
     try {
       const value = kind === 'save'
         ? await api<WatchState>(`${BASE}/alerts`, { method: 'PUT', body: JSON.stringify({ config: { enabled: form.enabled, thresholdPercent: Number(form.threshold), repeatMinutes: Number(form.repeat) } }), timeoutMs: 15_000 })
+        : kind === 'robot' ? await api<WatchState>(`${BASE}/alerts/channel`, { method: 'PUT', body: JSON.stringify(robot), timeoutMs: 15_000 })
+        : kind === 'clear' ? await api<WatchState>(`${BASE}/alerts/channel/clear`, { method: 'POST', body: '{}', timeoutMs: 15_000 })
         : await api<WatchState>(`${BASE}/alerts/test`, { method: 'POST', body: '{}', timeoutMs: 20_000 });
       if (!mounted.current) return;
       setData(value);
       if (kind === 'save') setDraft(null);
-      setNotice(kind === 'save' ? '预警设置已保存。' : '测试消息已发送，请在飞书群确认。');
+      if (kind === 'robot') setRobot({ webhookUrl: '', signingSecret: '' });
+      setNotice(kind === 'save' ? '预警设置已保存。' : kind === 'robot' ? '预警机器人已保存，建议发送一条测试确认。'
+        : kind === 'clear' ? value.alerts.channel.configured ? '已改用「系统 → 飞书汇总」的机器人。' : '独立机器人已清除；飞书汇总也没有机器人，预警已停用。'
+        : '测试消息已发送，请在飞书群确认。');
     } catch (failure) {
       if (!mounted.current) return;
       if (failure instanceof ApiError && failure.status === 401) expires.current();
@@ -134,9 +140,24 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         ? `多头 ≈ ${shareText(longShares)} 股 · 空头 ≈ ${shareText(shortShares)} 股 · 差 ${shareText(Math.abs(longShares - shortShares))} 股（按上方股数假设 ${shares.outstanding}B / ${shares.diluted}B 估算）`
         : '股数假设无效，暂不估算多空股数'}</strong></div> : null}
 
-      <form className="trading-anthropic-alerts" onSubmit={event => void write('save', event)}>
+      <div className="trading-anthropic-alerts">
         <h3><BellRing size={16} />强平预警 · 飞书</h3>
-        {!data.alerts.channel.configured ? <p className="trading-warning"><CircleAlert size={14} />尚未配置飞书机器人：请先在「系统 → 飞书汇总」保存 Webhook，预警复用同一个机器人。</p> : null}
+        {data.alerts.channel.error ? <p className="trading-warning" role="alert"><CircleAlert size={14} />{data.alerts.channel.error}</p>
+          : !data.alerts.channel.configured ? <p className="trading-warning"><CircleAlert size={14} />尚未配置飞书机器人：在下方保存一个预警专用机器人，或在「系统 → 飞书汇总」配置后沿用。</p>
+          : <p className="trading-anthropic-robot-status">发送到：{data.alerts.channel.source === 'own' ? `预警专用机器人（${data.alerts.channel.host}）` : '「系统 → 飞书汇总」的机器人'}</p>}
+        <details className="trading-anthropic-robot">
+          <summary>{data.alerts.channel.source === 'own' || data.alerts.channel.error ? '更换预警专用机器人' : '使用预警专用机器人'}</summary>
+          <form className="trading-anthropic-robot-fields" onSubmit={event => void write('robot', event)}>
+            <label>Webhook 地址<input type="password" value={robot.webhookUrl} onChange={event => setRobot({ ...robot, webhookUrl: event.target.value })} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" autoComplete="off" /></label>
+            <label>签名密钥（可选）<input type="password" value={robot.signingSecret} onChange={event => setRobot({ ...robot, signingSecret: event.target.value })} autoComplete="new-password" /></label>
+            <small>在要接收预警的飞书群添加「自定义机器人」后获得；加密保存，不在页面回显。机器人开启「关键词」时，可设为「强平」或「预警」。</small>
+            <div className="trading-anthropic-robot-actions">
+              <button className="button primary" type="submit" disabled={!!busy || !robot.webhookUrl.trim()}>{busy === 'robot' ? <LoaderCircle size={15} className="spin" /> : <KeyRound size={15} />}保存机器人</button>
+              {data.alerts.channel.source === 'own' || data.alerts.channel.error ? <button className="button secondary" type="button" disabled={!!busy} onClick={() => void write('clear')}>{busy === 'clear' ? <LoaderCircle size={15} className="spin" /> : null}改用飞书汇总的机器人</button> : null}
+            </div>
+          </form>
+        </details>
+        <form onSubmit={event => void write('save', event)}>
         {form ? <div className="trading-anthropic-alert-fields">
           <label className="trading-anthropic-toggle"><input type="checkbox" checked={form.enabled} onChange={event => setDraft({ ...form, enabled: event.target.checked })} />启用预警</label>
           <label>距强平低于<span><input type="number" inputMode="decimal" min={1} max={90} step="any" value={form.threshold} onChange={event => setDraft({ ...form, threshold: event.target.value })} />%</span></label>
@@ -144,6 +165,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
           <button className="button primary" type="submit" disabled={!!busy || !dirty}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : null}保存</button>
           <button className="button secondary" type="button" disabled={!!busy || !data.alerts.channel.configured} onClick={() => void write('test')}>{busy === 'test' ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}发送测试</button>
         </div> : null}
+        </form>
         <p className="trading-anthropic-rule">任一腿的距强平低于阈值时发送；距离回升到阈值以上 {data.alerts.hysteresisPercent} 个百分点后解除并通知。仓位从账户消失、或有仓位的账户超过 {Math.round(data.alerts.staleAfterSeconds / 60)} 分钟读不到新数据时也会提醒。交易所未提供强平价的仓位（如全仓保证金充足）不参与判断。</p>
         {error ? <p className="trading-warning" role="alert">{error}</p> : null}
         {writeError ? <p className="trading-warning" role="alert">{writeError}</p> : null}
@@ -152,7 +174,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         {data.alerts.history.length ? <details className="trading-anthropic-history"><summary>最近发送（{data.alerts.history.length}）</summary><ul>{data.alerts.history.slice(0, 10).map(entry => <li key={entry.at}>
           <time dateTime={entry.at}>{formatDate(entry.at)}</time> · <span className={entry.status === 'sent' ? '' : 'trading-warning'}>{HISTORY[entry.status]}</span> · {entry.summary.join('；')}{entry.error ? `（${entry.error}）` : ''}
         </li>)}</ul></details> : null}
-      </form>
+      </div>
       <p className="trading-footnote">强平价与标记价来自交易所账户接口；Hyperliquid 标记价按仓位价值 ÷ 数量折算。估算股数沿用页面的股数假设，只用于核对多空是否大致相等。</p>
     </>}
   </section>;

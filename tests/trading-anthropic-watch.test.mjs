@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAnthropicWatch, liquidationDistance, parseHyperliquidState, validateAlertConfig } from '../server/trading-anthropic-watch.mjs';
@@ -12,26 +12,30 @@ const hlPosition = (coin, szi, liquidationPx, positionValue = '1000') => ({ type
 function harness({ cex = [], configured = true } = {}) {
   const dataDir = mkdtempSync(path.join(tmpdir(), 'anthropic-watch-'));
   let time = Date.parse('2026-11-06T00:00:00Z');
-  const books = { io: [], xyz: [] }, posts = [], requests = [];
+  const books = { io: [], xyz: [] }, posts = [], requests = [], ownPosts = [];
   let postFailure = null, hlFailure = null, gate = null, address = ADDRESS;
   const fetcher = async (url, init) => {
-    const body = JSON.parse(init.body); requests.push(body);
+    const body = JSON.parse(init.body);
+    if (String(url).startsWith('https://open.feishu.cn/') && h.ownFail) return h.ownFail();
+    if (String(url).startsWith('https://open.feishu.cn/')) { ownPosts.push({ url, text: body.card.elements[0].text.content, signed: !!body.sign }); return new Response(JSON.stringify({ code: 0 }), { status: 200 }); }
+    requests.push(body);
     if (hlFailure) return hlFailure();
     return new Response(JSON.stringify({ assetPositions: books[body.dex] }), { status: 200 });
   };
   const feishu = {
-    alertChannel: () => ({ configured, title: '工作台汇总' }),
+    alertChannel: () => ({ configured: h.digest, title: '工作台汇总' }),
     async postAlert(card) { if (gate) await gate; if (postFailure) throw postFailure; posts.push(card.elements[0].text.content); },
   };
   const source = { value: cex };
   const create = () => {
-    const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: () => address, feishu, log: quiet, fetcher, now: () => time, intervalMs: 0 });
+    const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: () => address, feishu, encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed), log: quiet, fetcher, now: () => time, intervalMs: 0 });
     watch.initialize(); return watch;
   };
-  const h = { watch: create(), books, posts, requests, source, dataDir, advance: ms => { time += ms; }, now: () => time, fail: error => { postFailure = error; },
+  const h = { digest: configured, books, posts, ownPosts, requests, source, dataDir, advance: ms => { time += ms; }, now: () => time, fail: error => { postFailure = error; },
     hlFail: make => { hlFailure = make; }, hold: promise => { gate = promise; }, setAddress: value => { address = value; },
     restart: async () => { await h.watch.close(); h.watch = create(); },
     cleanup: () => rmSync(dataDir, { recursive: true, force: true }) };
+  h.watch = create();
   return h;
 }
 
@@ -292,4 +296,91 @@ test('a refused send cannot restore alerts that switching off just cleared; test
     await h.watch.test();
     assert.equal(h.posts.length, 5);
   } finally { h.cleanup(); }
+});
+
+test('an own robot replaces the digest robot, is never returned, blocks sending when unreadable and falls back when cleared', async () => {
+  const h = harness();
+  const hook = 'https://open.feishu.cn/open-apis/bot/v2/hook/own-robot-token';
+  try {
+    assert.equal(h.watch.state().alerts.channel.source, 'digest');
+    assert.throws(() => h.watch.setChannel({ webhookUrl: 'https://example.com/hook', signingSecret: '' }), { status: 400 });
+    assert.throws(() => h.watch.setChannel({ webhookUrl: hook }), { status: 400 });
+    const saved = h.watch.setChannel({ webhookUrl: hook, signingSecret: 'own-secret' });
+    assert.deepEqual(saved.alerts.channel, { configured: true, source: 'own', host: 'open.feishu.cn', error: null });
+    assert.doesNotMatch(JSON.stringify(saved), /own-robot-token|own-secret/);
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    h.books.io = [hlPosition('io:ANTH', '-10', '110')];
+    await h.watch.poll();
+    assert.equal(h.posts.length, 0, 'the digest robot is not used');
+    assert.equal(h.ownPosts.length, 1); assert.equal(h.ownPosts[0].url, hook); assert.ok(h.ownPosts[0].signed);
+    assert.match(h.ownPosts[0].text, /距强平 10\.00%/);
+    await h.watch.test();
+    assert.equal(h.ownPosts.length, 2);
+
+    // Unreadable after a restart: no fallback to the digest's group, the error is shown, sending is blocked.
+    const file = path.join(h.dataDir, 'anthropic-watch', 'channel.json');
+    const original = readFileSync(file, 'utf8');
+    writeFileSync(file, JSON.stringify({ value: { sealed: '{broken' } }));
+    await h.restart();
+    const broken = h.watch.state().alerts.channel;
+    assert.deepEqual([broken.configured, broken.source], [false, 'own']); assert.match(broken.error, /无法读取/);
+    await assert.rejects(h.watch.test(), { status: 409, message: /无法读取/ });
+    h.advance(30 * 60_000); await h.watch.poll();
+    assert.equal(h.posts.length, 0); assert.equal(h.ownPosts.length, 2);
+
+    // A robot saved again is used; clearing it falls back to the digest robot and keeps alerts on.
+    writeFileSync(file, original); await h.restart();
+    assert.equal(h.watch.state().alerts.channel.source, 'own');
+    const cleared = h.watch.clearChannel();
+    assert.deepEqual(cleared.alerts.channel, { configured: true, source: 'digest', host: null, error: null });
+    assert.equal(cleared.alerts.config.enabled, true);
+    await h.watch.poll();
+    assert.equal(h.posts.length, 1, 'the due repeat goes to the digest robot'); assert.match(h.posts[0], /仍距强平/);
+
+    // Without a digest robot, clearing switches alerts off.
+    h.watch.setChannel({ webhookUrl: hook, signingSecret: '' });
+    h.digest = false;
+    const off = h.watch.clearChannel();
+    assert.deepEqual([off.alerts.channel.configured, off.alerts.channel.source, off.alerts.config.enabled], [false, null, false]);
+    await h.restart();
+    assert.equal(h.watch.state().alerts.config.enabled, false, 'switching off is durable');
+  } finally { await h.watch.close(); h.cleanup(); }
+});
+
+test('an own robot that breaks after startup refuses definitely without the digest robot; a lost response is not resent', async () => {
+  const h = harness();
+  const hook = 'https://open.feishu.cn/open-apis/bot/v2/hook/own-robot-token';
+  const file = path.join(h.dataDir, 'anthropic-watch', 'channel.json');
+  const last = () => h.watch.state().alerts.history[0];
+  try {
+    h.watch.setChannel({ webhookUrl: hook, signingSecret: '' });
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    h.books.io = [hlPosition('io:ANTH', '-10', '110')];
+    await h.watch.poll();
+    assert.equal(h.ownPosts.length, 1);
+    const original = readFileSync(file, 'utf8');
+    for (const broken of [null, JSON.stringify({ value: { sealed: '{broken' } }), JSON.stringify({ value: { sealed: JSON.stringify({ webhookUrl: 'https://example.com/x', signingSecret: '' }) } })]) {
+      if (broken === null) rmSync(file); else writeFileSync(file, broken);
+      h.advance(30 * 60_000); await h.watch.poll();
+      assert.equal(h.posts.length, 0, 'never falls back to the digest robot');
+      assert.equal(last().status, 'failed'); assert.match(last().error, /预警机器人无法读取/);
+      writeFileSync(file, original);
+      h.advance(60_000); await h.watch.poll();
+      assert.match(h.ownPosts.at(-1).text, /仍距强平/, 'the refused repeat is sent once the robot is readable again');
+    }
+    assert.equal(h.ownPosts.length, 4);
+
+    h.ownFail = () => { throw new TypeError('fetch failed'); };
+    h.advance(30 * 60_000); await h.watch.poll();
+    assert.equal(last().status, 'uncertain');
+    h.ownFail = null;
+    h.advance(60_000); await h.watch.poll();
+    assert.equal(h.ownPosts.length, 4, 'a possibly delivered repeat is not resent');
+
+    writeFileSync(file, 'null'); await h.restart();
+    assert.match(h.watch.state().alerts.channel.error, /无法读取/, 'a non-object file is unreadable, not absent');
+    h.watch.save({ enabled: false, thresholdPercent: 20, repeatMinutes: 30 });
+    assert.throws(() => h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 }), { status: 409, message: /无法读取/ });
+    assert.equal(h.posts.length, 0);
+  } finally { await h.watch.close(); h.cleanup(); }
 });
