@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { LoaderCircle, Save } from 'lucide-react';
 import type { AeroPoolState, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
-import { POOL_STATE_TEXT, autoSellNote, policyRule, same, tokenOf, usd, type AeroSafe } from './aero-safe-client';
+import { POOL_STATE_TEXT, autoSellNote, policyRule, same, tokenOf, usd, usdCap, type AeroSafe } from './aero-safe-client';
 
 // 撤出后可换成的代币：本池两种代币里，白名单有「另一种 → 它」兑换路径的。
 export function exitTokens(state: AeroSafeState, pool: AeroSafePool) {
@@ -34,13 +34,13 @@ export function PoolPolicy({ safe, pool, disabled, onStop }: { safe: AeroSafe; p
     if (capUsd !== null && (!/^\d+(\.\d{1,2})?$/.test(text) || !(capUsd > 0))) { setActionError('本池上限须为正的美元金额（最多两位小数），留空即不限。'); return; }
     if (await call('policy', '/policy', 'PUT', { policy: { pool: pool.address, state: draft.state, capUsd, auto: draft.auto } })) setDirty(false);
   };
-  const roomText = rule.capUsd === null ? '不限' : room?.error ? `上限 ${usd(rule.capUsd)}：${room.error}` : room?.inPoolUsd !== undefined ? `已用约 ${usd(room.inPoolUsd)} / ${usd(rule.capUsd)}，还能放约 ${usd(Math.max(0, room.roomUsd ?? 0))}` : `上限 ${usd(rule.capUsd)}`;
+  const roomText = rule.capUsd === null ? '不限' : room?.error ? `上限 ${usdCap(rule.capUsd)}：${room.error}` : room?.inPoolUsd !== undefined ? `已用约 ${usd(room.inPoolUsd)} / ${usdCap(rule.capUsd)}，还能放约 ${usd(Math.max(0, room.roomUsd ?? 0))}` : `上限 ${usdCap(rule.capUsd)}`;
   return <div className="as-form as-policy" role="group" aria-label={`${pool.name} 仓位策略`}>
-    <label>状态<select value={draft.state} disabled={!!corrupt} onChange={(e) => change({ state: e.target.value as AeroPoolState })}>
+    <label>状态<select value={draft.state} disabled={!!corrupt || busy === 'policy'} onChange={(e) => change({ state: e.target.value as AeroPoolState })}>
       {(Object.keys(POOL_STATE_TEXT) as AeroPoolState[]).map((s) => <option key={s} value={s}>{POOL_STATE_TEXT[s]}</option>)}
     </select></label>
-    <label>本池上限（美元）<input inputMode="decimal" placeholder="不限" value={draft.cap} disabled={!!corrupt} onChange={(e) => change({ cap: e.target.value })} /></label>
-    <label className="as-check"><input type="checkbox" checked={draft.auto} disabled={!!corrupt} onChange={(e) => change({ auto: e.target.checked })} />参与自动调仓</label>
+    <label>本池上限（美元）<input inputMode="decimal" placeholder="不限" value={draft.cap} disabled={!!corrupt || busy === 'policy'} onChange={(e) => change({ cap: e.target.value })} /></label>
+    <label className="as-check"><input type="checkbox" checked={draft.auto} disabled={!!corrupt || busy === 'policy'} onChange={(e) => change({ auto: e.target.checked })} />参与自动调仓</label>
     <button type="button" className="button secondary" disabled={!dirty || !!busy || !!corrupt} onClick={() => void save()}>{busy === 'policy' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存</button>
     {dirty ? <button type="button" className="as-link" onClick={discard}>放弃修改</button> : null}
     <span className="as-muted">{corrupt ?? `${POOL_STATE_TEXT[rule.state]} · ${roomText}${rule.auto ? '' : ' · 不自动调仓'}`}</span>

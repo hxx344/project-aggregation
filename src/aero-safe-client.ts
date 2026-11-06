@@ -47,6 +47,8 @@ const POLICY_DEFAULT: AeroPoolPolicy = { state: 'active', capUsd: null, auto: tr
 // 某池的仓位策略（没写的池子为默认：运行、不限、参与自动调仓）。
 export const policyRule = (state: AeroSafeState | null | undefined, pool: string): AeroPoolPolicy => state?.policy?.pools[pool.toLowerCase()] ?? POLICY_DEFAULT;
 export const usd = (value: number) => `$${Math.round(value).toLocaleString('zh-CN')}`;
+// 上限按设置的原值显示（最多两位小数），不四舍五入成看起来更高的整数。
+export const usdCap = (value: number) => `$${value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
 
 // 页面与池详情面板共用：任务运行或交易待确认时每 3 秒轮询，否则 15 秒。
 export function useAeroSafe(onExpired: () => void) {

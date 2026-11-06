@@ -158,7 +158,9 @@ function autoChain({ tick = 1000, twap = 1000, cardinality = 900, openError = nu
     swap: async (ctx, hooks, params) => {
       calls.push(['swap', params.tokenIn, params.tokenOut, params.amountIn, params.maxImpactBps]);
       if (state.swapError) throw state.swapError;
-      await sign(ctx, hooks, '兑换'); return { received: params.amountIn / 2n };
+      await sign(ctx, hooks, '兑换');
+      if (state.afterSwapError) throw state.afterSwapError; // 上链后读余额失败：未标记 signed 的读错误
+      return { received: params.amountIn / 2n };
     },
     previewOpen: async (ctx, params) => { calls.push(['preview', params.cap]); return { pool: POOL, tick: state.tick, sqrtPriceX96: sqrt(state.tick), tickLower: params.tickLower, tickUpper: params.tickUpper, amount0: 1n, amount1: 1n, capped: false, swap: null, deposit0: 1n, deposit1: 1n }; },
     closePosition: async (ctx, hooks, params) => {
@@ -526,6 +528,7 @@ const setCap = (manager, capUsd, patch = {}) => manager.setPolicy({ pool: POOL, 
 
 test('pool policies are validated, keyed by lower-case address, and defaults are not stored', () => {
   assert.deepEqual(strictPoolPolicy({ pool: POOL, state: 'reduce', capUsd: 1234.5, auto: false }), { pool: POOL.toLowerCase(), state: 'reduce', capUsd: 1234.5, auto: false });
+  for (const capUsd of [19.99, 0.29, 1.1]) assert.equal(strictPoolPolicy({ pool: POOL, state: 'active', capUsd, auto: true }).capUsd, capUsd); // 两位小数不因浮点误差被拒
   for (const [patch, reason] of [
     [{ state: 'paused' }, /状态/], [{ auto: 'yes' }, /布尔/], [{ capUsd: 0 }, /单池上限/], [{ capUsd: -1 }, /单池上限/], [{ capUsd: 1.234 }, /两位小数/],
     [{ capUsd: '100' }, /单池上限/], [{ capUsd: 2e12 }, /单池上限/], [{ pool: '0x12' }, /池子地址/], [{ extra: 1 }, /未知/],
@@ -785,6 +788,26 @@ test('stopping a pool after a close holds its reopen without halting; resuming r
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
+test('a pool stopped while its rebalance is closing is not reopened; the reopen stays pending', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => USD1(clock.at) });
+  const close = chain.closePosition;
+  let stopping = null;
+  chain.closePosition = async (...args) => { const r = await close(...args); stopping = setCap(manager, null, { state: 'stopped' }); await stopping; return r; };
+  try {
+    await manager.setAuto({ enabled: true }); await settled(manager);
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    assert.ok(stopping, 'the rebalance closed');
+    const job = manager.state().job;
+    assert.equal(job.status, 'failed');
+    assert.match(job.error, /本池已停止，未重开，收回的币留在 Safe/);
+    assert.equal(chain.calls.some((c) => c[0] === 'open'), false);
+    assert.ok(saved().reopen);
+    assert.equal(manager.state().auto.halted, null);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
 test('an old ratio cap halts a running auto on upgrade and is dropped from auto.json; an unreadable policy blocks adds and auto', async () => {
   const clock = { at: 1_000_000 };
   const directory = mkdtempSync(join(tmpdir(), 'aero-auto-'));
@@ -893,6 +916,13 @@ test('a partial reduce keeps the NFT and swaps only the coins it brought back, u
     await manager.execute('reduce', { tokenId: '7', shareBps: 2500, exitToken: T0 }); await settled(manager);
     assert.equal(manager.state().job.status, 'failed');
     assert.equal(manager.state().job.signed, true);
+    // 兑换已上链、之后读余额失败（读错误本身不带 signed）：仍按已签名报错，不能写成"未兑换"
+    chain.state.swapError = null; chain.state.afterSwapError = new executor.ExecError('读取 Safe 余额失败', { code: 'rpc' });
+    await manager.execute('reduce', { tokenId: '7', shareBps: 2500, exitToken: T0 }); await settled(manager);
+    job = manager.state().job;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.signed, true);
+    assert.match(job.error, /T1 → T0 已签名发送，结果待核对：读取 Safe 余额失败/);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
@@ -937,6 +967,19 @@ test('exiting a whole pool checks every penalty before signing, then closes each
     assert.deepEqual(chain.calls.filter((c) => c[0] === 'swap'), [['swap', T1, T0, 8000n, 100]]);
     await manager.execute('exitPool', { pool: POOL }); await settled(manager);
     assert.match(manager.state().job.error, /没有头寸/);
+    // 平到第二个头寸失败：写明已平哪些、之后没卖也没换
+    chain.state.positions = [position(), position({ tokenId: '8' })]; chain.calls.length = 0;
+    chain.closePosition = async (ctx, hooks, params) => {
+      if (params.tokenId === 8n) throw new executor.ExecError('撤出报价失败：boom');
+      const left = chain.state.positions.filter((p) => p.tokenId !== String(params.tokenId)); const r = await close(ctx, hooks, params); chain.state.positions = left; return r;
+    };
+    await manager.execute('exitPool', { pool: POOL, exitToken: T0 }); await settled(manager);
+    job = manager.state().job;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.signed, true);
+    assert.match(job.error, /已平 #7；平 #8 失败：撤出报价失败：boom。剩余头寸未平，已平头寸收回的币未卖出、未换币/);
+    assert.equal(chain.calls.some((c) => c[0] === 'swap'), false);
+    chain.closePosition = async (ctx, hooks, params) => { const left = chain.state.positions.filter((p) => p.tokenId !== String(params.tokenId)); const r = await close(ctx, hooks, params); chain.state.positions = left; return r; };
     await manager.execute('exitPool', { pool: T0 }); await settled(manager);
     assert.match(manager.state().job.error, /不在白名单/);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }

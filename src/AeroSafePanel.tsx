@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { CircleAlert, ListPlus, LoaderCircle, Play, ScanSearch, ShieldCheck } from 'lucide-react';
 import type { MarketPool } from './aero-market-types';
 import type { AeroSafePreview } from './aero-safe-types';
-import { CHANGE_TIMEOUT_MS, POOL_STATE_TEXT, exactUnits, policyRule, rawUnits, same, tokenOf, units, usd, useAeroSafe, type AeroSafe } from './aero-safe-client';
+import { CHANGE_TIMEOUT_MS, POOL_STATE_TEXT, exactUnits, policyRule, rawUnits, same, tokenOf, units, usd, usdCap, useAeroSafe, type AeroSafe } from './aero-safe-client';
 import { openAeroTab } from './aero-nav';
 import './aero-safe.css';
 
@@ -99,7 +99,7 @@ export function OpenForm({ safe, pool, range, usd0, usd1, verb = '开仓' }: {
   const blocked = !state?.wallet ? '请先在 Aero「配置」填写 bot 私钥' : state.paused ? state.pauseReason : policyBlocked ? policyBlocked : running ? `${job.label}正在执行` : state.pending && !state.pending.stale ? `上一笔交易（${state.pending.label}）等待上链` : null;
   const t0 = tokenOf(state?.chain, pool.token0), t1 = tokenOf(state?.chain, pool.token1);
   const amount = (raw: string | null | undefined, token: typeof t0) => (token ? `${units(raw, token.decimals)} ${token.symbol}` : '—');
-  const limitText = (l: { capUsd: number; inPoolUsd: number; roomUsd: number }) => `本池上限 ${usd(l.capUsd)}，已有约 ${usd(l.inPoolUsd)}，还能放约 ${usd(Math.max(0, l.roomUsd))}`;
+  const limitText = (l: { capUsd: number; inPoolUsd: number; roomUsd: number }) => `本池上限 ${usdCap(l.capUsd)}，已有约 ${usd(l.inPoolUsd)}，还能放约 ${usd(Math.max(0, l.roomUsd))}`;
 
   const runPreview = async () => {
     if (shareBps === null || capInvalid) return;
@@ -125,7 +125,7 @@ export function OpenForm({ safe, pool, range, usd0, usd1, verb = '开仓' }: {
   return <>
     <div className="as-row">
       <span>Safe 余额：{amount(t0?.balance, t0)} · {amount(t1?.balance, t1)}</span>
-      <span>仓位策略：{POOL_STATE_TEXT[rule.state]} · {rule.capUsd === null ? '不限上限' : room?.error ? `上限 ${usd(rule.capUsd)}（${room.error}）` : room?.inPoolUsd !== undefined ? limitText({ capUsd: rule.capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd ?? 0 }) : `上限 ${usd(rule.capUsd)}`}</span>
+      <span>仓位策略：{POOL_STATE_TEXT[rule.state]} · {rule.capUsd === null ? '不限上限' : room?.error ? `上限 ${usdCap(rule.capUsd)}（${room.error}）` : room?.inPoolUsd !== undefined ? limitText({ capUsd: rule.capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd ?? 0 }) : `上限 ${usd(rule.capUsd)}`}</span>
     </div>
     <div className="as-form">
       <label>投入比例（%）<input type="number" min={1} max={100} step={1} value={shareText} onChange={(e) => setShareText(e.target.value)} /></label>

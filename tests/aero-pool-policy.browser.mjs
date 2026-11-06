@@ -59,7 +59,7 @@ async (page) => {
     await policy.getByLabel('本池上限（美元）').fill('1000.5');
     await policy.getByLabel('参与自动调仓').uncheck();
     await save.click();
-    await policy.getByText('已用约 $400 / $1,001', { exact: false }).waitFor();
+    await policy.getByText('已用约 $400 / $1,000.5', { exact: false }).waitFor();
     assert(JSON.stringify(policies) === JSON.stringify([{ pool: POOL, state: 'reduce', capUsd: 1000.5, auto: false }]), `policy body: ${JSON.stringify(policies)}`);
     assert((await policy.textContent()).includes('不自动调仓') && await save.isDisabled(), 'saved policy shown, draft clean');
     await policy.getByLabel('本池上限（美元）').fill('-3');

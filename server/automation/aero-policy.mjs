@@ -26,7 +26,7 @@ function rule(v, fail) {
   if (!POOL_STATES.includes(v.state)) throw fail('池子状态须为 运行、只减不加 或 已停止');
   if (typeof v.auto !== 'boolean') throw fail('自动调仓开关须为布尔值');
   const cap = v.capUsd;
-  if (cap !== null && (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0 || cap > CAP_MAX_USD || Math.round(cap * 100) !== cap * 100)) {
+  if (cap !== null && (typeof cap !== 'number' || !Number.isFinite(cap) || cap <= 0 || cap > CAP_MAX_USD || Number(cap.toFixed(2)) !== cap)) {
     throw fail('单池上限须为正的美元金额（最多两位小数），留空即不限');
   }
   return { state: v.state, capUsd: cap, auto: v.auto };

@@ -635,13 +635,21 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const result = { pool: pool.address };
     if (action === 'reduce' && params.shareBps < 10_000) Object.assign(result, await chain.reducePosition(ctx, h, params));
     else {
+      const closed = [];
       for (const tokenId of ids) {
         if (ids.length > 1) h.step(`平仓 #${tokenId}`);
-        await chain.closePosition(ctx, h, { tokenId, slippageBps: params.slippageBps, acceptPenalty: params.acceptPenalty });
+        try { await chain.closePosition(ctx, h, { tokenId, slippageBps: params.slippageBps, acceptPenalty: params.acceptPenalty }); } catch (error) {
+          // 整池平仓中途失败：写明已平的头寸，且之后的卖出与换币都没做，免得重试时以为前面的币也换过了。
+          if (!closed.length) throw error;
+          throw new chain.ExecError(`已平 ${closed.map((x) => `#${x}`).join('、')}；平 #${tokenId} 失败：${error.message}。剩余头寸未平，已平头寸收回的币未卖出、未换币，留在 Safe`, { signed: true, code: error.code });
+        }
+        closed.push(String(tokenId));
       }
-      result.closed = ids.map(String);
+      result.closed = closed;
     }
-    result.sold = await sellAfter();
+    // 池子本身含 AERO 时不卖：收回的 AERO 是本金，卖掉再换回来白付两次滑点。
+    const holdsReward = [pool.token0, pool.token1].some((t) => t.toLowerCase() === chain.REWARD_TOKEN.toLowerCase());
+    result.sold = holdsReward ? null : await sellAfter();
     if (!route) return result;
     h.step('换币');
     const symbol = (t) => ctx.tokens.get(t)?.symbol ?? t;
@@ -654,11 +662,15 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     result.exit = exit;
     if (gained === 0n) { exit.reason = `没有新收回的 ${symbol(route.tokenIn)}，无需兑换`; return result; }
     if (amountIn === 0n) { exit.reason = `${symbol(route.tokenIn)} 今日额度已用完，未兑换，收回的币留在 Safe，额度恢复后可手动兑换`; return result; }
+    // 兑换签名后（记待确认之后）的任何失败都按已签名处理：确认后读余额失败时兑换其实已上链，不能写成"未兑换"。
+    let swapSigned = false;
+    const sh = { ...h, persistPending: (entry) => { const saved = h.persistPending(entry); swapSigned = true; return saved; } };
     try {
-      const swapped = await chain.swap(ctx, h, { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amountIn, slippageBps: params.slippageBps, maxImpactBps: params.maxImpactBps });
+      const swapped = await chain.swap(ctx, sh, { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amountIn, slippageBps: params.slippageBps, maxImpactBps: params.maxImpactBps });
       exit.received = String(swapped.received);
     } catch (error) {
       // 兑换已签名而结果未知时照常报错：交给台账与人工核对。没签名的失败（价格冲击、报价、额度）只记原因，撤出已经完成。
+      if (swapSigned) throw error.signed === true ? error : new chain.ExecError(`${what} 已签名发送，结果待核对：${error.message}`, { signed: true, code: error.code });
       if (error.signed === true) throw error;
       exit.left = String(gained); exit.amountIn = '0';
       exit.reason = `${what} 未兑换：${error.message}，收回的币留在 Safe`;
@@ -770,6 +782,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     } else {
       let amounts = { amount0: BigInt(target.amount0), amount1: BigInt(target.amount1) };
       if (amounts.amount0 === 0n && amounts.amount1 === 0n) throw new chain.ExecError('平仓没有收回任何代币，未重开');
+      // 平仓之后到重开之前，本池可能已被停止或关闭自动调仓：不重开，待重开记录保留（改回后续做）。
+      const latest = policyOf(policy, pool.address);
+      if (policy.corrupt || latest.state === 'stopped' || !latest.auto) throw new chain.ExecError(policy.corrupt ?? `本池${latest.state === 'stopped' ? POOL_STATE_LABELS.stopped : '关闭了自动调仓'}，未重开，收回的币留在 Safe`, { code: 'policy' });
       const fit = await fitPoolCap(ctx, h, pool, amounts, target.closed);
       if (fit) amounts = { amount0: fit.amount0, amount1: fit.amount1 };
       // 兑换确认后待重开记下的是缩减后的数量，重试时不会再被判为缩减：标记随兑换结果一起落盘并沿用。
