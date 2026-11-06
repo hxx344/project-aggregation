@@ -10,6 +10,9 @@ export const control = {
   values: new Map<string, number>(),
   pending: [] as Pending[],
   usdc: 1,
+  /** The next Hyperliquid read answers with this total or rejects with this error. */
+  hyperliquid: 0 as number | Error,
+  hyperliquidCalls: [] as { walletAddress: string; verifyRole: boolean }[],
 };
 
 let database: ReturnType<typeof openDatabase> | undefined;
@@ -37,5 +40,10 @@ export function syncAster(c: { walletAddress: string }): Promise<{ total: number
   const answer = (total: number) => ({ total, details: [] });
   if (!control.held.has(c.walletAddress)) return Promise.resolve(answer(control.values.get(c.walletAddress) ?? 0));
   return new Promise((resolve, reject) => control.pending.push({ wallet: c.walletAddress, resolve: total => resolve(answer(total)), reject }));
+}
+export async function syncHyperliquid(c: { walletAddress: string }, _fetcher?: unknown, options: { verifyRole?: boolean } = {}) {
+  control.hyperliquidCalls.push({ walletAddress: c.walletAddress, verifyRole: !!options.verifyRole });
+  if (control.hyperliquid instanceof Error) throw control.hyperliquid;
+  return { total: control.hyperliquid, details: [] as Balance[], updatedAt: new Date().toISOString() };
 }
 export const hubPositionsService = { peek: async () => null };
