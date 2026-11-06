@@ -1300,3 +1300,100 @@ test('live view, summary and update checks keep every unfinished order while fin
   }
   assert.deepEqual(results[0], results[1], 'order reads do not grow with finished history');
 });
+
+test('writer recovery reads unfinished orders and only those finished orders whose shared operation is still open', async t => {
+  const results = [];
+  for (const finishedCount of [100, 400]) {
+    const f = fixture(t, { managed: true }); await f.connect(); f.mode('OPEN');
+    const execution = await f.confirm(await f.preview()), leg = execution.legs[0];
+    await f.runtime.cancel({ orderId: leg.id, requestId: 'history-cancel-001' });
+    f.remote.get(leg.orderId).state = 'CANCELLED'; await f.runtime.refresh();
+    const order = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(leg.id).json);
+    assert.equal(order.status, 'CANCELLED');
+    // The cancelled order is final privately, but a crash left both of its shared operations open.
+    const shared = id => f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(id)?.state;
+    f.writer.db.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(order.writerCreateId);
+    f.writer.db.prepare("UPDATE aw_operations SET state='unknown' WHERE operation_id=?").run(order.writerCancelId);
+    const version = f.runtime.connectionView().version, insert = f.store.db.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)');
+    f.store.transaction(() => {
+      for (let i = 0; i < finishedCount; i++) {
+        const row = { id: `history-${i}`, executionId: `history-execution-${i}`, index: 0, text: `history-text-${i}`, version, status: i % 2 ? 'FILLED' : 'CANCELLED',
+          symbol: symbols[0], side: 'BUY', positionSide: 'LONG', quantity: '1', executedQty: i % 2 ? '1' : '0', orderId: `history-order-${i}`, updatedAt: f.now - 100000 - i };
+        insert.run(row.id, row.executionId, row.text, version, row.status, row.updatedAt, JSON.stringify(row));
+      }
+    });
+    const prepare = f.store.prepare; let rows = 0, historySql = null;
+    f.store.prepare = sql => {
+      const statement = prepare(sql);
+      if (/UNION ALL/.test(sql)) historySql = sql;
+      if (!/^\s*SELECT[\s\S]*FROM live_orders/i.test(sql)) return statement;
+      return new Proxy(statement, { get(target, key) {
+        const value = Reflect.get(target, key);
+        if (key === 'all') return (...args) => { const found = value.apply(target, args); rows += found.length; return found; };
+        if (key === 'get') return (...args) => { const found = value.apply(target, args); if (found) rows++; return found; };
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    try { await f.reopen(); } finally { f.store.prepare = prepare; }
+    assert.equal(shared(order.writerCreateId), 'confirmed');
+    assert.equal(shared(order.writerCancelId), 'confirmed');
+    assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+    assert.equal(f.calls.create.length, 1); assert.equal(f.calls.cancel.length, 1);
+    const plan = f.store.db.prepare(`EXPLAIN QUERY PLAN ${historySql}`).all(version, '[]', version).map(row => row.detail);
+    assert.ok(plan.some(detail => /USING (?:COVERING )?INDEX live_orders_unfinished\b/.test(detail)) && !plan.some(detail => /^SCAN live_orders$/.test(detail)), plan.join('; '));
+    results.push(rows);
+  }
+  assert.equal(results[0], results[1], `writer recovery reads ${results.join(' / ')} order rows`);
+});
+
+test('writer recovery maps legacy cancels and request ids named legacy to their order, and reads the whole history for an unmapped cancel', async t => {
+  for (const form of ['legacy', 'request named legacy', 'unmapped']) {
+    const results = [];
+    for (const finishedCount of [100, 400]) {
+      const f = fixture(t, { managed: true }); await f.connect(); f.mode('OPEN');
+      const version = f.runtime.connectionView().version, insert = f.store.db.prepare('INSERT INTO live_orders VALUES (?,?,?,?,?,?,?)');
+      f.store.transaction(() => {
+        for (let i = 0; i < finishedCount; i++) {
+          const row = { id: `history-${i}`, executionId: `history-execution-${i}`, index: 0, text: `history-text-${i}`, version, status: i % 2 ? 'FILLED' : 'CANCELLED',
+            symbol: symbols[0], side: 'BUY', positionSide: 'LONG', quantity: '1', executedQty: i % 2 ? '1' : '0', orderId: `history-order-${i}`, updatedAt: f.now - 100000 - i };
+          insert.run(row.id, row.executionId, row.text, version, row.status, row.updatedAt, JSON.stringify(row));
+        }
+      });
+      const execution = await f.confirm(await f.preview()), leg = execution.legs[0];
+      // A request id may itself read as a legacy cancel id of another stored order.
+      const requestId = form === 'request named legacy' ? 'legacy:history-0' : 'history-cancel-001';
+      await f.runtime.cancel({ orderId: leg.id, requestId });
+      f.remote.get(leg.orderId).state = 'CANCELLED'; await f.runtime.refresh();
+      const order = JSON.parse(f.store.prepare('SELECT json FROM live_orders WHERE id=?').get(leg.id).json);
+      assert.equal(order.status, 'CANCELLED'); assert.equal(order.writerCancelId, `crossex:cancel:${requestId}`);
+      if (form === 'legacy') {
+        const legacyId = `crossex:cancel:legacy:${order.id}`;
+        f.writer.db.prepare('UPDATE aw_operations SET operation_id=? WHERE operation_id=?').run(legacyId, order.writerCancelId);
+        f.writer.db.prepare('UPDATE aw_operation_accounts SET operation_id=? WHERE operation_id=?').run(legacyId, order.writerCancelId);
+        order.writerCancelId = legacyId;
+        f.store.prepare('UPDATE live_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.id);
+      }
+      // A legacy cancel has no request row; an unmapped cancel lost it.
+      if (form !== 'request named legacy') f.store.prepare('DELETE FROM live_requests WHERE id=?').run(requestId);
+      f.writer.db.prepare("UPDATE aw_operations SET state='unknown' WHERE operation_id=?").run(order.writerCancelId);
+      const prepare = f.store.prepare; let rows = 0;
+      f.store.prepare = sql => {
+        const statement = prepare(sql);
+        if (!/^\s*SELECT[\s\S]*FROM live_orders/i.test(sql)) return statement;
+        return new Proxy(statement, { get(target, key) {
+          const value = Reflect.get(target, key);
+          if (key === 'all') return (...args) => { const found = value.apply(target, args); rows += found.length; return found; };
+          if (key === 'get') return (...args) => { const found = value.apply(target, args); if (found) rows++; return found; };
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      };
+      try { await f.reopen(); } finally { f.store.prepare = prepare; }
+      assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(order.writerCancelId)?.state, 'confirmed', form);
+      assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false, form);
+      assert.equal(f.calls.cancel.length, 1);
+      results.push(rows);
+    }
+    if (form === 'unmapped') assert.ok(results[1] - results[0] >= 300, `an unmapped cancel reads the whole history: ${results.join(' / ')} order rows`);
+    else assert.equal(results[0], results[1], `${form}: writer recovery reads ${results.join(' / ')} order rows`);
+  }
+});

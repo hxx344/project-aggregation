@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
+import { createExecutionJobsReader, UNFINISHED_EXECUTION_JOB_SQL } from '../server/control/execution-jobs.mjs';
 import { createExecutionExchangeClient, ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 import { createOkxExecutionClient } from '../server/trading-okx-execution.mjs';
 import { normalizeIntent, splitQuantity } from '../server/trading-execution-plan.mjs';
@@ -1487,4 +1488,109 @@ test('an uncertain Bybit market create is reconciled by client order id like Bin
   await f.service.tick();
   assert.ok(f.calls.some(call => call.exchange === 'bybit' && call.method === 'inspect' && call.args[1].id === null && call.args[1].orderType === 'market'));
   await assert.rejects(f.service.reconcile(f.job.id, { legId: bybit.id, notCreated: true, acknowledge: true }), /确认未创建/);
+});
+
+test('the update idle check reads only unfinished jobs through the executor index however long the history grows', async t => {
+  const results = [];
+  for (const finished of [200, 2000]) {
+    const f = historyFixture(t, finished);
+    f.db.exec('CREATE TABLE execution_entries (id TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL)');
+    const reader = createExecutionJobsReader(f.db), prepare = f.db.prepare;
+    let rows = 0;
+    f.db.prepare = sql => {
+      const statement = prepare.call(f.db, sql);
+      if (!/FROM execution_jobs/.test(sql)) return statement;
+      return { all: (...args) => { const found = statement.all(...args); rows += found.length; return found; } };
+    };
+    try {
+      const statuses = () => reader.state().jobs.map(job => job.status).sort();
+      rows = 0; assert.deepEqual(statuses(), ['attention', 'legacy-unknown', 'paused', 'unknown']); const indexed = rows;
+      const sql = `SELECT json FROM execution_jobs INDEXED BY execution_jobs_unfinished WHERE ${UNFINISHED_EXECUTION_JOB_SQL}`;
+      assert.ok(prepare.call(f.db, `EXPLAIN QUERY PLAN ${sql}`).all().some(row => /USING INDEX execution_jobs_unfinished\b/.test(row.detail)));
+      f.db.exec('DROP INDEX execution_jobs_unfinished');
+      rows = 0; assert.deepEqual(statuses(), ['attention', 'legacy-unknown', 'paused', 'unknown'], 'without the index every row is parsed');
+      assert.equal(rows, finished + 4);
+      results.push(indexed);
+    } finally { f.db.prepare = prepare; }
+  }
+  assert.deepEqual(results, [4, 4], 'the idle check reads only unfinished rows');
+});
+
+test('restart protection reads only unfinished jobs, unsettled orders and orders whose shared operation is still open', async t => {
+  const results = [];
+  for (const finished of [50, 300]) {
+    const f = await fixture(t, { guarded: true });
+    f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+    const job = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs').get().json);
+    const legs = f.db.prepare('SELECT json FROM execution_orders ORDER BY rowid').all().map(row => JSON.parse(row.json));
+    assert.equal(legs.length, 2);
+    // The job and both orders finished privately; a crash left the first create open in the shared registry.
+    job.status = 'completed';
+    f.db.prepare('UPDATE execution_jobs SET json=? WHERE id=?').run(JSON.stringify(job), job.id);
+    for (const order of legs) {
+      Object.assign(order, { settled: true, unknown: false, writerDispatch: 'confirmed' }); order.writerOperation.state = 'confirmed';
+      f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+    }
+    const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+    shared.prepare("UPDATE aw_operations SET state='sending' WHERE operation_id=?").run(legs[0].writerOperation.operationId); shared.close();
+    // A stopped job whose order never settled is recovered whatever its job status.
+    const stopped = { ...job, id: 'stopped-unsettled', status: 'stopped' }, unsettled = { ...legs[1], localId: randomUUID(), jobId: stopped.id, settled: false, unknown: true };
+    delete unsettled.writerOperation; delete unsettled.writerDispatch;
+    f.db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)').run(stopped.id, JSON.stringify(stopped));
+    f.db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run(unsettled.localId, stopped.id, JSON.stringify(unsettled));
+    for (let i = 0; i < finished; i++) {
+      const id = `done-${i}`, localId = randomUUID();
+      f.db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)').run(id, JSON.stringify({ id, status: i % 2 ? 'completed' : 'stopped', createdAt: new Date(baseTime - i).toISOString() }));
+      f.db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run(localId, id, JSON.stringify({ localId, jobId: id, settled: true,
+        writerOperation: { operationId: `hub:create:${localId}`, action: 'create', payload: {}, state: 'confirmed' }, writerDispatch: 'confirmed' }));
+    }
+    await f.service.close(); f.service = f.create();
+    const prepare = f.db.prepare; let rows = 0;
+    f.db.prepare = sql => {
+      const statement = prepare.call(f.db, sql);
+      if (!/^\s*SELECT[\s\S]*FROM execution_(jobs|orders)/i.test(sql)) return statement;
+      return new Proxy(statement, { get(target, key) {
+        const value = Reflect.get(target, key);
+        if (key === 'all') return (...args) => { const found = value.apply(target, args); rows += found.length; return found; };
+        if (key === 'get') return (...args) => { const found = value.apply(target, args); if (found) rows++; return found; };
+        return typeof value === 'function' ? value.bind(target) : value;
+      } });
+    };
+    try { await f.service.initializeProtection(); } finally { f.db.prepare = prepare; }
+    const state = id => f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(id)?.state;
+    assert.equal(state(legs[0].writerOperation.operationId), 'confirmed', 'the open shared create of a finished job is settled');
+    assert.equal(state(`hub:create:${unsettled.localId}`), 'unknown', 'the unsettled order of a stopped job enters the registry');
+    assert.equal(f.writer.db.prepare("SELECT count(*) AS n FROM aw_operations WHERE operation_id LIKE 'hub:create:%' AND state IN ('sending','unknown')").get().n, 1);
+    assert.equal(f.creates.length, 2);
+    results.push(rows);
+  }
+  assert.equal(results[0], results[1], `restart protection reads ${results.join(' / ')} job and order rows`);
+});
+
+test('restart protection maps every hub operation id form back to its finished job', async t => {
+  for (const form of ['create', 'cancel', 'amend', 'legacy-cancel', 'legacy-amend']) {
+    const f = await fixture(t, { guarded: true });
+    f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+    const job = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs').get().json);
+    const legs = f.db.prepare('SELECT json FROM execution_orders ORDER BY rowid').all().map(row => JSON.parse(row.json));
+    const { localId } = legs[0], created = legs[0].writerOperation.operationId;
+    const operationId = { create: created, cancel: `hub:cancel:${localId}:2`, amend: `hub:amend:${localId}:1`, 'legacy-cancel': `hub:legacy-cancel:${localId}`, 'legacy-amend': `hub:legacy-amend:${localId}` }[form];
+    job.status = 'completed';
+    f.db.prepare('UPDATE execution_jobs SET json=? WHERE id=?').run(JSON.stringify(job), job.id);
+    for (const order of legs) {
+      Object.assign(order, { settled: true, unknown: false, writerDispatch: 'confirmed' }); order.writerOperation.state = 'confirmed';
+      f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+    }
+    // The settled order's last shared operation, under each id form the executor writes, was left open by a crash.
+    legs[0].writerOperation.operationId = operationId;
+    f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(legs[0]), localId);
+    const shared = new DatabaseSync(join(f.directory, 'execution-control.sqlite'));
+    shared.prepare("UPDATE aw_operations SET operation_id=?,state='sending' WHERE operation_id=?").run(operationId, created);
+    shared.prepare('UPDATE aw_operation_accounts SET operation_id=? WHERE operation_id=?').run(operationId, created); shared.close();
+    await f.service.close(); f.service = f.create();
+    await f.service.initializeProtection();
+    assert.equal(f.writer.db.prepare('SELECT state FROM aw_operations WHERE operation_id=?').get(operationId)?.state, 'confirmed', operationId);
+    assert.equal(f.writer.db.prepare("SELECT count(*) AS n FROM aw_operations WHERE state IN ('sending','unknown')").get().n, 0, operationId);
+    assert.equal(f.creates.length, 2);
+  }
 });

@@ -5,7 +5,7 @@ import { ExecutionError, WaitError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKey
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_ALL_SYMBOLS } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
-import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL } from './control/execution-jobs.mjs';
+import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL, UNFINISHED_EXECUTION_JOB_SQL } from './control/execution-jobs.mjs';
 import { immediate } from './control/schema.mjs';
 import { evaluateRule, boundsFor, SPREADS } from './trading-auto.mjs';
 
@@ -27,13 +27,21 @@ const CONNECT_SYMBOLS = EXECUTION_MARKETS.oil.symbols;
 // unknown one, is unfinished and always read in full for recovery.
 const JOB_STATUS = "json_extract(json,'$.status')", JOB_CREATED = "json_extract(json,'$.createdAt')";
 const FINAL_SQL = [...FINAL].map(status => `'${status}'`).join(',');
-const UNFINISHED_JOB = `(${JOB_STATUS} IS NULL OR ${JOB_STATUS} NOT IN (${FINAL_SQL}))`, FINISHED_JOB = `${JOB_STATUS} IN (${FINAL_SQL})`;
+const UNFINISHED_JOB = UNFINISHED_EXECUTION_JOB_SQL, FINISHED_JOB = `${JOB_STATUS} IN (${FINAL_SQL})`;
 const FINISHED_JOB_PAGE = 30;
 // Automatic jobs send only from books received within this window of the send decision.
 const AUTO_BOOK_WINDOW_MS = 1500;
 const JOB_INDEXES_SQL = `
   CREATE INDEX IF NOT EXISTS execution_jobs_unfinished ON execution_jobs(${JOB_CREATED}) WHERE ${UNFINISHED_JOB};
   CREATE INDEX IF NOT EXISTS execution_jobs_finished ON execution_jobs(${JOB_CREATED}) WHERE ${FINISHED_JOB};`;
+// Only JSON true or 1 counts as settled here. Other truthy values and rows
+// that are not strict JSON are indexed as unsettled, which costs a read but
+// never skips them. This assumes rows the executor wrote with JSON.stringify:
+// with duplicate settled keys SQLite takes the first and JSON.parse the last,
+// which only a hand-edited row can contain.
+const UNSETTLED_ORDER = "(CASE WHEN json_valid(json) THEN json_extract(json,'$.settled') END) IS NOT 1";
+const ORDER_INDEX_SQL = `
+  CREATE INDEX IF NOT EXISTS execution_orders_unsettled ON execution_orders(job_id) WHERE ${UNSETTLED_ORDER};`;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
 const QUOTES_TTL_MS = 2000, QUOTE_TIMEOUT_MS = 6000;
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
@@ -56,6 +64,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     ${JOB_INDEXES_SQL}
     CREATE TABLE IF NOT EXISTS execution_orders (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, json TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS execution_orders_job ON execution_orders(job_id);
+    ${ORDER_INDEX_SQL}
     CREATE TABLE IF NOT EXISTS execution_previews (id TEXT PRIMARY KEY, session TEXT NOT NULL, expires INTEGER NOT NULL, json TEXT NOT NULL, consumed TEXT);
     CREATE INDEX IF NOT EXISTS idx_execution_previews_expires ON execution_previews(expires) WHERE consumed IS NULL;
     CREATE TABLE IF NOT EXISTS execution_requests (id TEXT PRIMARY KEY, preview_id TEXT NOT NULL, job_id TEXT NOT NULL, session TEXT NOT NULL);
@@ -79,7 +88,6 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (!EXECUTION_EXCHANGES.includes(exchange)) throw new ExecutionError(404, '交易所不存在');
     return stmt.prepare('SELECT * FROM execution_accounts WHERE exchange=?').get(exchange);
   };
-  const jobs = () => stmt.prepare('SELECT json FROM execution_jobs').all().map(row => JSON.parse(row.json));
   // SQLite otherwise favours a rowid table scan to preserve insertion order,
   // evaluating JSON status across all history. INDEXED BY forces the partial
   // indexes; rowid ordering still keeps tick and restart processing stable.
@@ -87,8 +95,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const read = () => stmt.prepare(sql).all(...args);
     try { return read(); }
     catch (error) {
-      if (!/^no such index: execution_jobs_(unfinished|finished)$/.test(error?.message)) throw error;
-      db.exec(JOB_INDEXES_SQL);
+      if (!/^no such index: execution_(jobs_unfinished|jobs_finished|orders_unsettled)$/.test(error?.message)) throw error;
+      db.exec(JOB_INDEXES_SQL + ORDER_INDEX_SQL);
       return read();
     }
   };
@@ -194,9 +202,23 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     }
     return ticket;
   }
+  // Recovery only needs unfinished jobs, jobs with an unsettled order, and jobs
+  // whose order still owns a shared sending/unknown operation. That last set
+  // includes finished jobs whose settled order recorded its result privately
+  // before a crash left the shared operation open. Every hub operation id
+  // embeds the order's localId (a UUID) as its third segment.
+  function recoveryJobs(pendingOperationIds = []) {
+    const ids = new Set(unfinishedJobs().map(job => job.id));
+    for (const { job_id: jobId } of indexedJobRows(`SELECT DISTINCT job_id FROM execution_orders INDEXED BY execution_orders_unsettled WHERE ${UNSETTLED_ORDER}`)) ids.add(jobId);
+    for (const operationId of pendingOperationIds) {
+      const localId = operationId.split(':')[2], row = localId && stmt.prepare('SELECT job_id FROM execution_orders WHERE id=?').get(localId);
+      if (row) ids.add(row.job_id);
+    }
+    return stmt.prepare('SELECT json FROM execution_jobs WHERE id IN (SELECT value FROM json_each(?)) ORDER BY rowid').all(JSON.stringify([...ids])).map(row => JSON.parse(row.json));
+  }
   async function initializeProtection() {
     if (!accountWriter) return;
-    const savedJobs = jobs();
+    const savedJobs = recoveryJobs();
     const legacyExchanges = new Set(savedJobs.flatMap(job => ACTIVE.has(job.status) || orders(job.id).some(order => !order.settled) ? jobExchanges(job) : []));
     const configured = EXECUTION_EXCHANGES.map(accountRow).filter(row => row.credentials);
     for (const row of EXECUTION_EXCHANGES.map(accountRow)) if (row.credentials || legacyExchanges.has(row.exchange)) bindAccount(row.exchange, row.revision, null);
@@ -212,7 +234,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     }));
     protectionReady = true;
     const sharedPending = accountWriter.snapshot().operations.some(row => row.moduleId === 'hub' && ['sending', 'unknown'].includes(row.state));
-    for (const job of jobs()) if (ACTIVE.has(job.status) || orders(job.id).some(order => !order.settled) || sharedPending && orders(job.id).some(order => order.writerOperation)) {
+    for (const job of recoveryJobs(sharedPending ? accountWriter.pendingOperationIds() : [])) if (ACTIVE.has(job.status) || orders(job.id).some(order => !order.settled) || sharedPending && orders(job.id).some(order => order.writerOperation)) {
       try {
         protectAndRecover(job);
         if (FINAL.has(job.status)) { writerTickets.delete(job.id); recoveredWriterJobs.delete(job.id); }
