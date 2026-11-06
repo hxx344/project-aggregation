@@ -130,6 +130,10 @@ test('send failures separate a definite refusal from a possibly delivered messag
   await assert.rejects(send(reply(200, async () => { throw new Error('html'); })), error => error.uncertain === true);
   await assert.rejects(send(reply(200, async () => ({ StatusCode: 0 }))), error => error.uncertain === true);
   await assert.rejects(send(async () => { throw new Error('reset'); }), error => error.uncertain === true);
+  await assert.rejects(send(async () => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect'), { code: 'ECONNRESET' }) }); }), error => error.uncertain === true, 'a reset after connecting may follow delivery');
+  for (const code of ['ENOTFOUND', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT']) {
+    await assert.rejects(send(async () => { throw Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error(code), { code }) }); }), error => !error.uncertain && /未发出/.test(error.message), `${code} never reaches Feishu`);
+  }
 });
 
 test('each slot goes out once, including across a restart', async () => {

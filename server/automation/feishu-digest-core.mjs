@@ -159,6 +159,8 @@ export function renderCard(digest, { showIssues, schedule: plan }) {
 
 const FAILURES = { 9499: '消息格式不正确', 19021: '签名密钥或服务器时间不正确', 19022: '服务器 IP 不在机器人白名单内', 19024: '消息未匹配机器人的关键词设置，可在标题中加入关键词', 11232: '机器人发送频率受限' };
 const uncertain = message => Object.assign(new Error(message), { uncertain: true });
+// Failures before any byte reaches Feishu (name lookup, refused or failed connect): nothing can have arrived.
+const UNSENT = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'UND_ERR_CONNECT_TIMEOUT']);
 export async function postCard({ webhookUrl, signingSecret }, card, { fetcher = fetch, now = Date.now(), signal, timeoutMs = 8000 } = {}) {
   const payload = { msg_type: 'interactive', card };
   if (signingSecret) {
@@ -171,7 +173,10 @@ export async function postCard({ webhookUrl, signingSecret }, card, { fetcher = 
   try {
     response = await fetcher(webhookUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), redirect: 'error', signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
   // A lost response may follow a delivered message, so the caller must not resend blindly.
-  } catch { throw uncertain('飞书连接失败或超时，消息可能已送达'); }
+  } catch (error) {
+    if (UNSENT.has(error?.cause?.code) || UNSENT.has(error?.code)) throw new Error('飞书连接失败，消息未发出');
+    throw uncertain('飞书连接失败或超时，消息可能已送达');
+  }
   if (!response.ok) { const error = new Error(`飞书返回 HTTP ${response.status}`); error.uncertain = response.status >= 500; throw error; }
   try { result = await response.json(); } catch { throw uncertain('飞书返回了无法识别的响应，消息可能已送达'); }
   if (!object(result) || !Number.isInteger(result.code)) throw uncertain('飞书返回了无法识别的响应，消息可能已送达');

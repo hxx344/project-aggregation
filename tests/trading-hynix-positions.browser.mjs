@@ -47,12 +47,12 @@ async (page) => {
     await page.evaluate(() => window.dispatchEvent(new Event('online'))); await response;
   };
   const section = page.locator('section.trading-hynix-positions');
-  const oilRows = page.locator('section.trading-positions:not(.trading-hynix-positions) .trading-position-table tbody tr');
+  const oilRows = page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions) .trading-position-table tbody tr');
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await section.getByRole('heading', { name: '海力士仓位', exact: true }).waitFor();
   assert(await oilRows.count() === 4, 'oil table keeps exactly its four legs');
-  assert(!(await page.locator('section.trading-positions:not(.trading-hynix-positions)').innerText()).includes('SKHY'), 'SK hynix rows never enter the oil table');
+  assert(!(await page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions)').innerText()).includes('SKHY'), 'SK hynix rows never enter the oil table');
   const rows = section.locator('.trading-position-table tbody tr');
   assert(await rows.count() === 4, 'SK hynix shows two contracts on each selected exchange');
   const texts = await rows.allInnerTexts();
@@ -65,7 +65,7 @@ async (page) => {
   await section.getByText('Bybit 仓位读取失败（HTTP 400，Bybit 10001）', { exact: false }).waitFor();
   assert((await rows.nth(3).innerText()).includes('做空'), 'a failed read keeps the last observed SK hynix position');
   assert((await section.locator('.trading-account-status').nth(1).innerText()).includes('数据已过期'), 'failed exchange is marked stale');
-  assert(!(await page.locator('section.trading-positions:not(.trading-hynix-positions)').innerText()).includes('仓位读取失败'), 'an SK hynix failure does not mark the oil table');
+  assert(!(await page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions)').innerText()).includes('仓位读取失败'), 'an SK hynix failure does not mark the oil table');
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => window.scrollTo(0, 0));

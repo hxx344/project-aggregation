@@ -4,7 +4,7 @@ import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-d
 import { createTradingPnl } from './trading-pnl.mjs';
 import { createHash } from 'node:crypto';
 import { TRADING_VIEW_VERSION, packTradingView, unpackTradingView } from './trading-view-cache.mjs';
-import { TRADING_EXCHANGES as EXCHANGES, TRADING_SYMBOLS as SYMBOLS, TRADING_HYNIX_SYMBOLS as HYNIX_SYMBOLS, TRADING_NAMES as NAMES, TRADING_PAIRS, DEFAULT_TRADING_PAIR, normalizeTradingPair, tradingPairKey } from './trading-markets.mjs';
+import { TRADING_EXCHANGES as EXCHANGES, TRADING_SYMBOLS as SYMBOLS, TRADING_HYNIX_SYMBOLS as HYNIX_SYMBOLS, TRADING_ANTHROPIC_SYMBOLS as ANTHROPIC_SYMBOLS, TRADING_ANTHROPIC_EXCHANGES as ANTHROPIC_EXCHANGES, TRADING_NAMES as NAMES, TRADING_PAIRS, DEFAULT_TRADING_PAIR, normalizeTradingPair, tradingPairKey } from './trading-markets.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { instrumentId as okxInstrumentId } from './trading-okx-common.mjs';
 import { immediate } from './control/schema.mjs';
@@ -25,6 +25,7 @@ function emptySnapshot(exchange) {
   return { version: 1, exchange,
     positions: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
     hynix: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
+    anthropic: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
     funding: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null, diagnostic: null } };
 }
 function exchangeOf(exchange) {
@@ -111,16 +112,19 @@ function normalizeReceipts(events, exchange, start = 0, end = Infinity) {
   }
   return [...result.values()].sort((a, b) => timeOf(a.time) - timeOf(b.time) || a.id.localeCompare(b.id));
 }
-function parseHynix(value, exchange) {
-  // Snapshots written before the SK hynix reader have no section; a damaged one never discards the oil ledger.
-  if (!value) return emptySnapshot(exchange).hynix;
+// Position-only sections read beside the oil ledger, by snapshot key.
+const SIDE_MARKETS = Object.freeze({ hynix: { symbols: HYNIX_SYMBOLS, name: '海力士' }, anthropic: { symbols: ANTHROPIC_SYMBOLS, name: 'Anthropic' } });
+function parseSide(kind, value, exchange) {
+  // Snapshots written before a side reader existed have no section; a damaged one never discards the oil ledger.
+  if (!value) return emptySnapshot(exchange)[kind];
+  const { symbols, name } = SIDE_MARKETS[kind];
   try {
-    const positions = value.fetchedAt ? normalizePositions({ positions: value.rows, fetchedAt: value.fetchedAt }, exchange, Date.now(), HYNIX_SYMBOLS) : { rows: [], fetchedAt: null };
+    const positions = value.fetchedAt ? normalizePositions({ positions: value.rows, fetchedAt: value.fetchedAt }, exchange, Date.now(), symbols) : { rows: [], fetchedAt: null };
     const diagnostic = normalizeTradingDiagnostic(value.diagnostic);
     return { ...positions, lastAttemptAt: timeOf(value.lastAttemptAt) === null ? null : iso(timeOf(value.lastAttemptAt)), diagnostic,
-      error: formatTradingDiagnostic(diagnostic) || (value.error ? '上次海力士仓位读取失败，请刷新重试' : null) };
+      error: formatTradingDiagnostic(diagnostic) || (value.error ? `上次${name}仓位读取失败，请刷新重试` : null) };
   } catch {
-    return { ...emptySnapshot(exchange).hynix, error: '本地海力士仓位缓存无效，请刷新重新读取' };
+    return { ...emptySnapshot(exchange)[kind], error: `本地${name}仓位缓存无效，请刷新重新读取` };
   }
 }
 function parseSnapshot(row) {
@@ -134,11 +138,11 @@ function parseSnapshot(row) {
     const safeStamp = value => timeOf(value) === null ? null : iso(timeOf(value));
     const positionsDiagnostic = normalizeTradingDiagnostic(value.positions.diagnostic), fundingDiagnostic = normalizeTradingDiagnostic(value.funding.diagnostic);
     // Persist only application-owned diagnostics. Arbitrary disk strings never become API error text.
-    return { ...fallback, hynix: parseHynix(value.hynix, row.exchange), positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
+    return { ...fallback, hynix: parseSide('hynix', value.hynix, row.exchange), anthropic: parseSide('anthropic', value.anthropic, row.exchange), positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
       funding: { events, coverage, fetchedAt: safeStamp(value.funding.fetchedAt), lastAttemptAt: safeStamp(value.funding.lastAttemptAt),
         requestedEnd: Number.isSafeInteger(value.funding.requestedEnd) ? value.funding.requestedEnd : null, diagnostic: fundingDiagnostic, error: formatTradingDiagnostic(fundingDiagnostic) || (value.funding.error ? '上次资金费读取未完成，请刷新重试' : null) } };
   } catch {
-    fallback.positions.error = fallback.hynix.error = fallback.funding.error = '本地交易缓存无效，请刷新重新读取';
+    fallback.positions.error = fallback.hynix.error = fallback.anthropic.error = fallback.funding.error = '本地交易缓存无效，请刷新重新读取';
     return fallback;
   }
 }
@@ -228,7 +232,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   function run(exchange, kind, { force = false, end = now() } = {}) {
     if (closed) return Promise.resolve();
     const row = rowFor(exchange), key = `${exchange}:${kind}`;
-    if (!row.credentials) return Promise.resolve();
+    if (!row.credentials || kind === 'anthropic' && !ANTHROPIC_EXCHANGES.includes(exchange)) return Promise.resolve();
     if (jobs.has(key)) return jobs.get(key).promise;
     const previous = cache.get(exchange)[kind];
     const newFundingBatch = kind === 'funding' && (previous.requestedEnd || 0) < end;
@@ -255,11 +259,11 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
         const credentials = privateCredentials(row), accountMode = accountModeOf(exchange, row.account_mode);
         const client = clients.get(exchange);
         const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? client.positions(credentials, { signal, accountMode })
-          : kind === 'hynix' ? client.hynixPositions(credentials, { signal, accountMode }) : client.funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
+          : kind === 'hynix' ? client.hynixPositions(credentials, { signal, accountMode }) : kind === 'anthropic' ? client.anthropicPositions(credentials, { signal, accountMode }) : client.funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
         if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
         if (kind === 'funding') saveFunding(result);
         else {
-          const value = normalizePositions(result, exchange, now(), kind === 'hynix' ? HYNIX_SYMBOLS : SYMBOLS);
+          const value = normalizePositions(result, exchange, now(), SIDE_MARKETS[kind]?.symbols ?? SYMBOLS);
           write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], ...value, error: null, diagnostic: null } }));
         }
       } catch (error) {
@@ -275,8 +279,8 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     if (!fundingBatchEnd || current - fundingBatchEnd >= (force ? 5000 : FUNDING_INTERVAL)) fundingBatchEnd = current;
     const positions = Promise.allSettled(EXCHANGES.map(exchange => run(exchange, 'positions', { force, end: current }))).then(() => { if (!closed && recordPnl()) invalidateViews(); });
     // SK hynix reads run beside, never inside, the oil position batch that records PnL.
-    const hynix = EXCHANGES.map(exchange => run(exchange, 'hynix', { force }));
-    return Promise.allSettled([positions, ...hynix, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]).then(result => { if (!closed) flushViews(); return result; });
+    const sides = EXCHANGES.flatMap(exchange => [run(exchange, 'hynix', { force }), run(exchange, 'anthropic', { force })]);
+    return Promise.allSettled([positions, ...sides, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]).then(result => { if (!closed) flushViews(); return result; });
   }
   function buildState(days = 7, pair = DEFAULT_TRADING_PAIR) {
     if (![7, 30].includes(days)) throw new TradingError(400, '资金费区间仅支持 7 天或 30 天');
@@ -483,6 +487,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       if (!fundingBatchEnd || now() - fundingBatchEnd >= FUNDING_INTERVAL) fundingBatchEnd = now();
       void run(exchange, 'funding', { end: fundingBatchEnd }).catch(() => {});
       void run(exchange, 'hynix').catch(() => {});
+      void run(exchange, 'anthropic').catch(() => {});
     } catch (error) {
       if (error instanceof TradingError) throw error;
       throw new TradingError(400, controller.signal.aborted && controller.signal.reason?.name !== 'TimeoutError' ? '连接验证已取消' : safeError(error));
@@ -505,7 +510,16 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   }
   const timer = intervalMs > 0 ? setInterval(() => { if (!closed) void refresh(); }, intervalMs) : null; timer?.unref();
   const first = intervalMs > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
-  return { state, refresh, connect, disconnect,
+  /** Anthropic legs on the read-only accounts, independent of the selected pair. */
+  function anthropic() {
+    const current = now();
+    return ANTHROPIC_EXCHANGES.map(exchange => {
+      const row = rowFor(exchange), snapshot = cache.get(exchange).anthropic, connected = !!row.credentials;
+      return { exchange, connected, state: readState(connected, snapshot, current, POSITION_STALE), fetchedAt: snapshot.fetchedAt, error: snapshot.error,
+        refreshing: jobs.has(`${exchange}:anthropic`), positions: connected ? snapshot.rows : [] };
+    });
+  }
+  return { state, refresh, connect, disconnect, anthropic,
     async close() { closed = true; clearInterval(timer); clearTimeout(first); clearTimeout(viewTimer); for (const controller of validations.values()) controller.abort(); for (const job of jobs.values()) job.controller.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise)); jobs.clear(); validations.clear(); },
   };
 }

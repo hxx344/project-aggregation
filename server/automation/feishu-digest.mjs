@@ -160,6 +160,12 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
       const digest = buildDigest(items, next, now()), { bytes, omitted } = renderCard(digest, next);
       return { digest, bytes, omitted, catalog: items.map(({ id, name, level, status, metrics }) => ({ id, name, level, status, metrics: metrics.map(({ key, label }) => ({ key, label })) })) };
     },
+    /** Other alerts reuse this robot; the digest title carries any keyword the robot requires. */
+    alertChannel: () => ({ configured: !!channelHost, title: config.title }),
+    async postAlert(card, { signal } = {}) {
+      if (closed) throw new Error('飞书发送已停止');
+      await postCard(readChannel(), card, { fetcher, now: now(), signal });
+    },
     async send() {
       if (sending) throw new HttpError(409, '正在发送，请稍后再试');
       if (!channelHost) throw new HttpError(409, '请先保存飞书机器人 Webhook');
