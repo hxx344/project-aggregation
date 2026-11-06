@@ -81,4 +81,6 @@ export type AeroSafeChangeBatch = { transactions: { to: string; description: str
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string; capped?: boolean;
   swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string; previewedAt: number;
+  // 开仓要消耗的 Roles 每日额度（最小单位）：兑换卖出量与 mint desired 合计；remaining 为当前可用，未配置额度时为 null。allowanceShort 为额度不足的说明。
+  allowance: { token: string; symbol: string; need: string; remaining: string | null }[]; allowanceShort: string | null;
 };
