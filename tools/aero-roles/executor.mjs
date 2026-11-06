@@ -804,7 +804,7 @@ export async function reducePosition(ctx, hooks, { tokenId, shareBps, slippageBp
   if (staked) {
     hooks.step?.('重新质押');
     try { await stakePosition(ctx, hooks, { tokenId }); } catch (error) {
-      throw new ExecError(`减仓已完成，但头寸 #${tokenId} 重新质押失败：${error.message}。头寸未质押、不领排放，自动调仓也不管它，请在「仓位」手动质押`, { signed: true, code: error.code });
+      throw new ExecError(`减仓已完成，但头寸 #${tokenId} 重新质押失败：${error.message}。头寸未质押、不领排放，自动调仓也不管它，请在「仓位」手动质押；这次收回的币未卖出、未换币，留在 Safe`, { signed: true, code: error.code });
     }
   }
   return { reduced: true, tokenId, liquidity, restaked: staked };

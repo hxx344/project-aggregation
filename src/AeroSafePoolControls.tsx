@@ -12,7 +12,7 @@ const symbolOf = (state: AeroSafeState, address: string) => tokenOf(state.chain,
 const exitNote = (state: AeroSafeState, pool: AeroSafePool, exitToken: string) => {
   if (!exitToken) return '';
   const other = same(exitToken, pool.token0) ? pool.token1 : pool.token0;
-  return `\n\n撤出后把这次收回的 ${symbolOf(state, other)}${state.config?.autoSellRewards ? '（含卖 AERO 所得）' : ''} 换成 ${symbolOf(state, exitToken)}：不超过今日额度，价格冲击超过 1% 时不换；没换掉的留在 Safe，任务结果会写明。`;
+  return `\n\n撤出后把这次收回的 ${symbolOf(state, other)}${state.config?.autoSellRewards && symbolOf(state, pool.token0) !== 'AERO' && symbolOf(state, pool.token1) !== 'AERO' ? '（含卖 AERO 所得）' : ''} 换成 ${symbolOf(state, exitToken)}：不超过今日额度，价格冲击超过 1% 时不换；没换掉的留在 Safe，任务结果会写明。`;
 };
 
 // 本池的仓位策略：状态、美元上限、是否参与自动调仓。保存立即生效，不需要 Safe 签名。
@@ -42,7 +42,7 @@ export function PoolPolicy({ safe, pool, disabled, onStop }: { safe: AeroSafe; p
     <label>本池上限（美元）<input inputMode="decimal" placeholder="不限" value={draft.cap} disabled={!!corrupt || busy === 'policy'} onChange={(e) => change({ cap: e.target.value })} /></label>
     <label className="as-check"><input type="checkbox" checked={draft.auto} disabled={!!corrupt || busy === 'policy'} onChange={(e) => change({ auto: e.target.checked })} />参与自动调仓</label>
     <button type="button" className="button secondary" disabled={!dirty || !!busy || !!corrupt} onClick={() => void save()}>{busy === 'policy' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存</button>
-    {dirty ? <button type="button" className="as-link" onClick={discard}>放弃修改</button> : null}
+    {dirty ? <button type="button" className="as-link" disabled={busy === 'policy'} onClick={discard}>放弃修改</button> : null}
     <span className="as-muted">{corrupt ?? `${POOL_STATE_TEXT[rule.state]} · ${roomText}${rule.auto ? '' : ' · 不自动调仓'}`}</span>
     {pool.positions.length ? <button type="button" className="button secondary" disabled={disabled} onClick={onStop}>停止本池…</button> : null}
   </div>;
@@ -62,7 +62,7 @@ export function StopPool({ safe, pool, onClose, onStarted }: { safe: AeroSafe; p
   const submit = async () => {
     const lines = [`停止 ${pool.name}：设为「已停止」，不再开仓、加仓，自动调仓跳过本池。`];
     if (exitAll) lines.push(`然后平掉本池全部 ${pool.positions.length} 个头寸（解押、撤出流动性、销毁 NFT），代币回到 Safe。${locked.length ? acceptPenalty ? `\n${locked.length} 个头寸仍在罚没期内，会被罚没部分奖励。` : `\n${locked.length} 个头寸仍在罚没期内，未勾选接受罚没时不会平仓。` : ''}`);
-    if (!window.confirm(`${lines.join('\n')}${exitAll ? `${exitNote(state, pool, exitToken)}${autoSellNote(state)}` : ''}`)) return;
+    if (!window.confirm(`${lines.join('\n')}${exitAll ? `${exitNote(state, pool, exitToken)}${autoSellNote(state, pool)}` : ''}`)) return;
     if (rule.state !== 'stopped') {
       const saved = await call('policy', '/policy', 'PUT', { policy: { pool: pool.address, state: 'stopped', capUsd: rule.capUsd, auto: rule.auto } });
       if (!saved) return;
@@ -99,7 +99,7 @@ export function Withdraw({ safe, pool, position, penalty, onClose, onStarted }: 
     if (shareBps === null) return;
     const what = full ? '平仓（解押后撤出全部流动性并销毁 NFT，代币回到 Safe）' : `减仓 ${shareBps / 100}%（撤出这部分流动性与未领手续费，代币回到 Safe${position.staked ? '；之后重新质押，罚没期从重新质押起算' : ''}）`;
     const warning = penalty ? '\n\n头寸仍在提前解押罚没期内，继续将被罚没部分奖励。' : '';
-    if (!window.confirm(`${pool.name} #${position.tokenId}：${what}？${warning}${exitNote(state, pool, exitToken)}${autoSellNote(state)}`)) return;
+    if (!window.confirm(`${pool.name} #${position.tokenId}：${what}？${warning}${exitNote(state, pool, exitToken)}${autoSellNote(state, pool)}`)) return;
     const params = { tokenId: position.tokenId, ...(exitToken ? { exitToken } : {}), ...(penalty ? { acceptPenalty: true } : {}) };
     const done = await execute(full ? 'close' : 'reduce', full ? params : { ...params, shareBps });
     if (done) { onStarted(`已开始${full ? '平仓' : '减仓'}，进度见上方任务状态。`); onClose(); }

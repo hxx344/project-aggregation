@@ -157,7 +157,9 @@ function autoChain({ tick = 1000, twap = 1000, cardinality = 900, openError = nu
     },
     swap: async (ctx, hooks, params) => {
       calls.push(['swap', params.tokenIn, params.tokenOut, params.amountIn, params.maxImpactBps]);
+      if (state.approveFirst) await sign(ctx, hooks, '授权'); // 首次兑换先授权 Router
       if (state.swapError) throw state.swapError;
+      hooks.moving?.('swap');
       await sign(ctx, hooks, '兑换');
       if (state.afterSwapError) throw state.afterSwapError; // 上链后读余额失败：未标记 signed 的读错误
       return { received: params.amountIn / 2n };
@@ -788,6 +790,29 @@ test('stopping a pool after a close holds its reopen without halting; resuming r
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
+test('withdrawing from a pool that holds AERO does not sell the AERO principal; a failed sell after closing reports what was done', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  const { manager, directory } = await managed(chain, clock);
+  try {
+    chain.REWARD_TOKEN = T0; // 本池 T0 当作 AERO
+    await manager.execute('close', { tokenId: '7' }); await settled(manager);
+    assert.equal(manager.state().job.status, 'done', manager.state().job.error);
+    assert.equal(chain.calls.some((c) => c[0] === 'sell'), false);
+    assert.equal(manager.state().job.result.sold, null);
+    // 普通池子：平仓后卖出失败（未签名），报错写明撤出已完成、未换币
+    chain.REWARD_TOKEN = executor.REWARD_TOKEN;
+    chain.state.positions = [position()];
+    chain.sellRewards = async () => { throw new executor.ExecError('AERO 卖出报价失败'); };
+    await manager.execute('close', { tokenId: '7', exitToken: T0 }); await settled(manager);
+    const job = manager.state().job;
+    assert.equal(job.status, 'failed');
+    assert.equal(job.signed, true);
+    assert.match(job.error, /撤出已完成；卖出 AERO 失败：AERO 卖出报价失败。未换币，收回的币留在 Safe/);
+    assert.equal(chain.calls.some((c) => c[0] === 'swap'), false);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
 test('a pool stopped while its rebalance is closing is not reopened; the reopen stays pending', async () => {
   const clock = { at: 1_000_000 };
   const chain = autoChain({ priced: true });
@@ -805,6 +830,21 @@ test('a pool stopped while its rebalance is closing is not reopened; the reopen 
     assert.equal(chain.calls.some((c) => c[0] === 'open'), false);
     assert.ok(saved().reopen);
     assert.equal(manager.state().auto.halted, null);
+  } finally { await manager.close(); rmSync(directory, { recursive: true }); }
+});
+
+test('a pool whose auto switch is turned off while its rebalance is closing is not reopened', async () => {
+  const clock = { at: 1_000_000 };
+  const chain = autoChain({ priced: true });
+  const { manager, directory, saved } = await managed(chain, clock, { readPrices: () => USD1(clock.at) });
+  const close = chain.closePosition;
+  chain.closePosition = async (...args) => { const r = await close(...args); await setCap(manager, null, { auto: false }); return r; };
+  try {
+    await manager.setAuto({ enabled: true }); await settled(manager);
+    await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+    assert.match(manager.state().job.error, /本池关闭了自动调仓，未重开/);
+    assert.equal(chain.calls.some((c) => c[0] === 'open'), false);
+    assert.ok(saved().reopen);
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
@@ -916,6 +956,13 @@ test('a partial reduce keeps the NFT and swaps only the coins it brought back, u
     await manager.execute('reduce', { tokenId: '7', shareBps: 2500, exitToken: T0 }); await settled(manager);
     assert.equal(manager.state().job.status, 'failed');
     assert.equal(manager.state().job.signed, true);
+    // 授权已上链、兑换因价格冲击没发出：仍是"未兑换"，撤出照常完成
+    chain.state.approveFirst = true; chain.state.swapError = new executor.ExecError('价格冲击约 3%，超过上限 1%，未兑换', { code: 'impact' });
+    await manager.execute('reduce', { tokenId: '7', shareBps: 2500, exitToken: T0 }); await settled(manager);
+    job = manager.state().job;
+    assert.equal(job.status, 'done', job.error);
+    assert.match(job.result.exit.reason, /T1 → T0 未兑换：价格冲击/);
+    chain.state.approveFirst = false;
     // 兑换已上链、之后读余额失败（读错误本身不带 signed）：仍按已签名报错，不能写成"未兑换"
     chain.state.swapError = null; chain.state.afterSwapError = new executor.ExecError('读取 Safe 余额失败', { code: 'rpc' });
     await manager.execute('reduce', { tokenId: '7', shareBps: 2500, exitToken: T0 }); await settled(manager);

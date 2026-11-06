@@ -120,8 +120,10 @@ export function rewardSellTarget(state: AeroSafeState | null) {
 }
 
 // 领取、解押、平仓之后的自动卖出说明，写进确认框。
-export function autoSellNote(state: AeroSafeState | null) {
+// pool 给出且本池含 AERO 时撤出不卖（收回的 AERO 是本金）。
+export function autoSellNote(state: AeroSafeState | null, pool?: { token0: string; token1: string }) {
   const target = rewardSellTarget(state);
   if (!state?.config?.autoSellRewards || !target) return '';
+  if (pool && [pool.token0, pool.token1].some((t) => tokenOf(state.chain, t)?.symbol === 'AERO')) return '\n\n本池含 AERO，撤出后不自动卖出 AERO。';
   return `\n\n完成后会自动把 Safe 里的全部 AERO（不超过今日额度、不少于 ${state.config.minRewardSell}）卖成 ${target}。`;
 }

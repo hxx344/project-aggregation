@@ -641,6 +641,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         try { await chain.closePosition(ctx, h, { tokenId, slippageBps: params.slippageBps, acceptPenalty: params.acceptPenalty }); } catch (error) {
           // 整池平仓中途失败：写明已平的头寸，且之后的卖出与换币都没做，免得重试时以为前面的币也换过了。
           if (!closed.length) throw error;
+          if (!(error instanceof chain.ExecError)) log.warn?.({ type: 'aero-safe', err: error }, 'Aero 整池平仓异常');
           throw new chain.ExecError(`已平 ${closed.map((x) => `#${x}`).join('、')}；平 #${tokenId} 失败：${error.message}。剩余头寸未平，已平头寸收回的币未卖出、未换币，留在 Safe`, { signed: true, code: error.code });
         }
         closed.push(String(tokenId));
@@ -649,7 +650,10 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     }
     // 池子本身含 AERO 时不卖：收回的 AERO 是本金，卖掉再换回来白付两次滑点。
     const holdsReward = [pool.token0, pool.token1].some((t) => t.toLowerCase() === chain.REWARD_TOKEN.toLowerCase());
-    result.sold = holdsReward ? null : await sellAfter();
+    try { result.sold = holdsReward ? null : await sellAfter(); } catch (error) {
+      if (error.signed === true) throw error;
+      throw new chain.ExecError(`撤出已完成；卖出 AERO 失败：${error.message}。${route ? '未换币，' : ''}收回的币留在 Safe`, { signed: true, code: error.code });
+    }
     if (!route) return result;
     h.step('换币');
     const symbol = (t) => ctx.tokens.get(t)?.symbol ?? t;
@@ -662,9 +666,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     result.exit = exit;
     if (gained === 0n) { exit.reason = `没有新收回的 ${symbol(route.tokenIn)}，无需兑换`; return result; }
     if (amountIn === 0n) { exit.reason = `${symbol(route.tokenIn)} 今日额度已用完，未兑换，收回的币留在 Safe，额度恢复后可手动兑换`; return result; }
-    // 兑换签名后（记待确认之后）的任何失败都按已签名处理：确认后读余额失败时兑换其实已上链，不能写成"未兑换"。
-    let swapSigned = false;
-    const sh = { ...h, persistPending: (entry) => { const saved = h.persistPending(entry); swapSigned = true; return saved; } };
+    // 兑换那一笔签名后（moving('swap') 之后记下待确认）的任何失败都按已签名处理：确认后读余额失败时兑换其实已上链，不能写成"未兑换"。
+    // 之前的授权交易不算：授权后报价或价格冲击不过时兑换并没有发出。
+    let swapStage = false, swapSigned = false;
+    const sh = { ...h, moving: (stage) => { h.moving?.(stage); swapStage = stage === 'swap'; },
+      persistPending: (entry) => { const saved = h.persistPending(entry); if (swapStage) swapSigned = true; return saved; } };
     try {
       const swapped = await chain.swap(ctx, sh, { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amountIn, slippageBps: params.slippageBps, maxImpactBps: params.maxImpactBps });
       exit.received = String(swapped.received);

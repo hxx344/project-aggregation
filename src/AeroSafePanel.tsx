@@ -131,7 +131,7 @@ export function OpenForm({ safe, pool, range, usd0, usd1, verb = '开仓' }: {
   return <>
     <div className="as-row">
       <span>Safe 余额：{amount(t0?.balance, t0)} · {amount(t1?.balance, t1)}</span>
-      <span>仓位策略：{POOL_STATE_TEXT[rule.state]} · {rule.capUsd === null ? '不限上限' : room?.error ? `上限 ${usdCap(rule.capUsd)}（${room.error}）` : room?.inPoolUsd !== undefined ? limitText({ capUsd: rule.capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd ?? 0 }) : `上限 ${usd(rule.capUsd)}`}</span>
+      <span>仓位策略：{POOL_STATE_TEXT[rule.state]} · {rule.capUsd === null ? '不限上限' : room?.error ? `上限 ${usdCap(rule.capUsd)}（${room.error}）` : room?.inPoolUsd !== undefined ? limitText({ capUsd: rule.capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd ?? 0 }) : `上限 ${usdCap(rule.capUsd)}`}</span>
     </div>
     <div className="as-form">
       <label>投入比例（%）<input type="number" min={1} max={100} step={1} value={shareText} onChange={(e) => setShareText(e.target.value)} /></label>
