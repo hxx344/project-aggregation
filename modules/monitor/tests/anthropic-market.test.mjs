@@ -140,21 +140,21 @@ test('Binance 429/418 starts a cooldown shared by quotes and candles, and a deli
   const gate = createBinanceGate();
   let binanceCalls = 0;
   const limited = fetcher({ binance: () => { binanceCalls++; return fail(429); }, hl: body => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95, body.dex === 'io')) });
-  const first = await fetchAnthropicQuote({ now: NOW, fetcher: limited, gate });
+  const first = await fetchAnthropicQuote({ now: NOW, fetcher: limited, gate, clock: () => NOW });
   assert.match(first.errors.binance, /429/);
   assert.equal(first.errors.io, '合约已下架');
   assert.equal(first.xyz.markPx, 95);
-  const cooled = await fetchAnthropicQuote({ now: NOW + 59_000, fetcher: limited, gate });
+  const cooled = await fetchAnthropicQuote({ now: NOW + 59_000, fetcher: limited, gate, clock: () => NOW + 59_000 });
   assert.equal(binanceCalls, 1, 'no Binance request inside the cooldown');
   assert.equal(cooled.errors.binance, '接口限流冷却中（HTTP 429）');
-  const candles = await fetchAnthropicCandles(null, { now: NOW + 59_000, fetcher: fetcher({ binance: () => { binanceCalls++; return fail(429); }, hl: body => ok([candle(body.req.coin, lastClosed, 95)]) }), gate });
+  const candles = await fetchAnthropicCandles(null, { now: NOW + 59_000, fetcher: fetcher({ binance: () => { binanceCalls++; return fail(429); }, hl: body => ok([candle(body.req.coin, lastClosed, 95)]) }), gate, clock: () => NOW + 59_000 });
   assert.equal(binanceCalls, 1);
   assert.equal(candles.metadata.errors.binance, '接口限流冷却中（HTTP 429）');
-  await fetchAnthropicQuote({ now: NOW + 60_000, fetcher: limited, gate });
+  await fetchAnthropicQuote({ now: NOW + 60_000, fetcher: limited, gate, clock: () => NOW + 60_000 });
   assert.equal(binanceCalls, 2, 'the cooldown ends after 60 s');
   const banned = fetcher({ binance: () => fail(418), hl: body => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95)) });
-  await fetchAnthropicQuote({ now: NOW + 130_000, fetcher: banned, gate });
-  assert.match((await fetchAnthropicQuote({ now: NOW + 249_000, fetcher: banned, gate })).errors.binance, /冷却中（HTTP 418）/);
+  await fetchAnthropicQuote({ now: NOW + 130_000, fetcher: banned, gate, clock: () => NOW + 130_000 });
+  assert.match((await fetchAnthropicQuote({ now: NOW + 249_000, fetcher: banned, gate, clock: () => NOW + 249_000 })).errors.binance, /冷却中（HTTP 418）/);
 });
 
 test('a failed candle leg is reported in the snapshot, survives store, window and client validation, and clears on success', async () => {

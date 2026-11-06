@@ -114,16 +114,17 @@ class BinanceCooldown extends Error {
  * Binance answers requests made while rate limited (429) with an escalating IP ban (418) that would
  * also stop the oil and Hynix Binance reads, so after either status this module sends no Binance
  * request for 60 s (429) or 120 s (418), mirroring lib/binance-quote-request.ts defaults.
- * One gate serves the quote and candle jobs; tests pass their own.
+ * One gate serves the quote and candle jobs and reads the wall clock when a request is sent or
+ * fails (a candle backfill can page for a minute); tests pass their own gate and clock.
  */
 export const createBinanceGate = () => ({ until: 0, status: 0 });
 const sharedBinanceGate = createBinanceGate();
-async function binanceRequest(path, params, { gate = sharedBinanceGate, now, ...options }) {
-  if (now < gate.until) throw new BinanceCooldown(gate.status);
+async function binanceRequest(path, params, { gate = sharedBinanceGate, clock = Date.now, ...options }) {
+  if (clock() < gate.until) throw new BinanceCooldown(gate.status);
   try { return await requestBinance(path, params, options); }
   catch (error) {
     const status = Number(/Binance HTTP (418|429)$/.exec(String(error?.message ?? ''))?.[1]);
-    if (status) { gate.until = Math.max(gate.until, now + (status === 418 ? 120_000 : 60_000)); gate.status = status; }
+    if (status) { gate.until = Math.max(gate.until, clock() + (status === 418 ? 120_000 : 60_000)); gate.status = status; }
     throw error;
   }
 }
@@ -146,8 +147,8 @@ async function readHyperliquidQuote(key, options) {
 }
 
 /** One quote round; a failed leg keeps its reason so the page can say which venue is missing. Each request times out after 10 s. */
-export async function fetchAnthropicQuote({ fetcher = fetch, now = Date.now(), timeout = 10_000, gate = sharedBinanceGate } = {}) {
-  const options = { fetcher, timeout, gate, now };
+export async function fetchAnthropicQuote({ fetcher = fetch, now = Date.now(), timeout = 10_000, gate = sharedBinanceGate, clock = Date.now } = {}) {
+  const options = { fetcher, timeout, gate, clock };
   const reads = await Promise.allSettled([readBinanceQuote(options), ...HYPERLIQUID_LEGS.map(key => readHyperliquidQuote(key, options))]);
   const quote = { fetchedAt: new Date(now).toISOString(), errors: {} };
   LEG_KEYS.forEach((key, index) => {
@@ -242,10 +243,10 @@ async function hyperliquidCandles(key, startTime, endTime, options) {
  * never leaves a permanent gap. A failed leg keeps its saved closes; the round fails only when
  * every leg fails. Each request times out after 15 s; the collector retries on its next tick.
  * @param {unknown} [existing]
- * @param {{ fetcher?: typeof fetch, now?: number, timeout?: number, gate?: { until: number, status: number } }} [options]
+ * @param {{ fetcher?: typeof fetch, now?: number, timeout?: number, gate?: { until: number, status: number }, clock?: () => number }} [options]
  */
-export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate } = {}) {
-  const previous = existing ? validateAnthropicCandles(existing) : null, options = { fetcher, timeout, gate, now };
+export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate, clock = Date.now } = {}) {
+  const previous = existing ? validateAnthropicCandles(existing) : null, options = { fetcher, timeout, gate, clock };
   const firstStart = Math.floor((now - ANTHROPIC_INITIAL_DAYS * DAY_MS) / ANTHROPIC_CANDLE_MS) * ANTHROPIC_CANDLE_MS;
   const startOf = key => {
     const last = previous?.data.findLast(row => row[key] !== null);
