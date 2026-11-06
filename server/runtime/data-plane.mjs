@@ -226,7 +226,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   async function handle(request) {
     try { return await route(request); } catch (error) { return respond(error); }
   }
-  async function route({ method, target, sessionId, contentType, body: stream }) {
+  async function route({ method, target, sessionId, contentType, deadline, body: stream }) {
     const url = new URL(target, 'http://runtime.internal');
     const pathname = url.pathname;
     const bodyOf = () => readJson(contentType, stream);
@@ -336,10 +336,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize)); }
       if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize)); }
       if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize)); }
-      if (action === 'addPoolChange') { only('pool', 'allowances'); return reply(200, await aeroSafe.addPoolChange(body, authorize)); }
+      if (action === 'addPoolChange') { only('pool', 'allowances'); return reply(200, await aeroSafe.addPoolChange(body, authorize, { deadline })); }
       if (action === 'setAllowanceChanges') { only('allowances'); return reply(200, await aeroSafe.setAllowanceChanges(body.allowances, authorize)); }
       if (action === 'removePoolChange') { only('pool'); return reply(200, await aeroSafe.removePoolChange(body, authorize)); }
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      if (action === 'buildChangeBatch' || action === 'applyChangeBatch') return reply(200, await aeroSafe[action](authorize, { deadline }));
       return reply(200, await aeroSafe[action](authorize));
     }
     if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {

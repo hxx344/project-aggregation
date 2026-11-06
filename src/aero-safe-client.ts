@@ -3,6 +3,9 @@ import { api, ApiError } from './api';
 import type { AeroSafeAction, AeroSafeChain, AeroSafeChangeBatch, AeroSafePreview, AeroSafeState } from './aero-safe-types';
 
 export const AERO_SAFE_ROOT = '/api/automation/aero-safe';
+// 加池、生成批次、核对启用：服务端从收到请求起 50 秒内（含排队）给出结果，API 转发时限 60 秒；
+// 页面等得比二者都长，让知道原因的一层先回复。
+export const CHANGE_TIMEOUT_MS = 70_000;
 const message = (reason: unknown) => (reason instanceof Error ? reason.message : '请求失败，请重试。');
 
 // 原始单位 → 展示：按精度移位后最多 6 位有效数字；非常小的值显示为下界。
@@ -93,8 +96,7 @@ export function useAeroSafe(onExpired: () => void) {
     if (busyRef.current || !signal || signal.aborted) return null;
     busyRef.current = 'batch'; setBusy('batch'); setActionError('');
     generation.current++;
-    // 服务端从收到请求起 50 秒内（含排队）给出结果，API 转发时限 60 秒；页面等得比二者都长，让知道原因的一层先回复。
-    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: 70_000 }); if (!signal.aborted) setState(data.state); return data; }
+    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: CHANGE_TIMEOUT_MS }); if (!signal.aborted) setState(data.state); return data; }
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);

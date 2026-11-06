@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { CircleAlert, ListPlus, LoaderCircle, Play, ScanSearch, ShieldCheck } from 'lucide-react';
 import type { MarketPool } from './aero-market-types';
 import type { AeroSafePreview } from './aero-safe-types';
-import { exactUnits, rawUnits, same, tokenOf, units, useAeroSafe } from './aero-safe-client';
+import { CHANGE_TIMEOUT_MS, exactUnits, rawUnits, same, tokenOf, units, useAeroSafe } from './aero-safe-client';
 import { openAeroTab } from './aero-nav';
 import './aero-safe.css';
 
@@ -33,7 +33,7 @@ function AddPool({ pool, safe }: { pool: MarketPool; safe: ReturnType<typeof use
   const missing = fresh.find((t) => rawUnits(amounts[t.address] ?? '', t.decimals) === null);
   const add = () => {
     if (missing) return;
-    void call('queue', '/changes/pool', 'POST', { pool: pool.address, allowances: Object.fromEntries(fresh.map((t) => [t.address, amounts[t.address]])) }, 120_000);
+    void call('queue', '/changes/pool', 'POST', { pool: pool.address, allowances: Object.fromEntries(fresh.map((t) => [t.address, amounts[t.address]])) }, CHANGE_TIMEOUT_MS);
   };
   const others = (changes?.pools.length ?? 0) - (queued ? 1 : 0);
   if (queued) {
