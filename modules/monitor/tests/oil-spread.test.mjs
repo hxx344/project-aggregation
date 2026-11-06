@@ -6,6 +6,7 @@ import { intradayChartRows, recentIntradayChartRows, createIntradaySnapshot, OIL
 import { oilHistory } from '../lib/oil-history.ts';
 import { initialSummaries } from '../lib/initial-market.ts';
 import { oilSummary } from '../lib/monitor-summary.ts';
+import { oilTrend } from '../server/initial-market.mjs';
 
 test('oil spread is Brent − WTI on decimal quotes and unavailable for invalid legs', () => {
   for (const [brent, wti, expected] of [[80, 75, 5], [75, 80, -5], [80, 80, 0], [75.3, 75, 0.3], [70.1, 66.2, 3.9]]) {
@@ -27,10 +28,11 @@ test('saved prices are recalculated per bar before averaging and SSR matches the
   ], fetchedAt);
   const saved = structuredClone(candles), rows = intradayChartRows(candles);
   assert.deepEqual(rows.map(row => row.spread), [5, 5, -5]);
+  assert.ok(rows.every(row => !Object.hasOwn(row, 'date')), 'chart rows carry no unused per-row date strings');
   assert.equal(rows[2].time - rows[1].time, 2 * OIL_CANDLE_MS);
   assert.deepEqual(oilHistory(candles).points.map(point => point.spread), [5, 5, -5], 'the shared chart reads the recalculated per-bar spread');
   const quote = { source: 'Binance', currency: 'USDT', fetchedAt, status: 'snapshot', brent: { coin: 'BZUSDT', markPx: 75, fundingRate: null, fundingIntervalHours: null, nextFundingAt: null }, wti: { coin: 'CLUSDT', markPx: 80, fundingRate: null, fundingIntervalHours: null, nextFundingAt: null } };
-  const initial = initialSummaries({ renderedAt: Date.parse(fetchedAt), oil: { quote, candles }, hynix: { quote: null, trend: null } }).oil;
+  const initial = initialSummaries({ renderedAt: Date.parse(fetchedAt), oil: { quote, trend: oilTrend(candles) }, hynix: { quote: null, trend: null } }).oil;
   const live = oilSummary({ status: 'stale', spread: oilSpread(75, 80), fundingHourlyRate: null, fundingBasis: 'quantity', fetchedAt, history: { points: rows.map(row => ({ time: row.time, value: row.spread })), fetchedAt, status: candles.status } });
   assert.equal(initial.metrics[0].value, '−5.000');
   assert.equal(initial.metrics[0].label, '价差 · USDT/桶');
@@ -98,9 +100,12 @@ test('the first-render oil trend only builds its window yet matches the trend fr
     const full = intradayChartRows(candles);
     assert.deepEqual(recentIntradayChartRows(candles, 7 * day), full.filter(row => row.time >= full.at(-1).time + OIL_CANDLE_MS - 7 * day));
     const history = { points: full.map(row => ({ time: row.time, value: row.spread })), status: candles.status, fetchedAt: candles.metadata.fetchedAt };
-    const initial = initialSummaries({ renderedAt: Date.parse(candles.metadata.fetchedAt), oil: { quote: null, candles }, hynix: { quote: null } }).oil;
+    const initial = initialSummaries({ renderedAt: Date.parse(candles.metadata.fetchedAt), oil: { quote: null, trend: oilTrend(candles) }, hynix: { quote: null } }).oil;
     assert.deepEqual(initial.trend, oilSummary({ status: 'loading', spread: null, fundingHourlyRate: null, fundingBasis: 'quantity', fetchedAt: null, history }).trend);
     assert.deepEqual(candles, before);
   }
   assert.throws(() => recentIntradayChartRows({ ...gapped, metadata: { ...gapped.metadata, pairedObservationRows: 1 } }, 7 * day), /mismatch/, 'the whole snapshot is still validated');
+  assert.equal(oilTrend({ ...gapped, metadata: { ...gapped.metadata, pairedObservationRows: 1 } }), null, 'an invalid snapshot embeds no trend');
+  assert.equal(oilTrend(null), null);
+  assert.deepEqual(oilTrend({ ...gapped, status: 'snapshot' }).status, 'snapshot', 'the embedded trend keeps the source status');
 });

@@ -1,5 +1,5 @@
 import type { Point } from "./market.ts";
-import { intradayChartRows, validateIntradaySnapshot } from "../modules/oil/intraday.mjs";
+import { validatedIntradayChartRows, validateIntradaySnapshot } from "../modules/oil/intraday.mjs";
 
 type OilSnapshot = ReturnType<typeof validateIntradaySnapshot>;
 /** Paired 15-minute closes on the shared spread-chart shape: leg A = Brent, leg B = WTI. */
@@ -11,7 +11,7 @@ export type OilHistory = { points: Point[]; status: "live" | "snapshot"; fetched
  */
 export function oilHistory(input: unknown): OilHistory {
   const snapshot = validateIntradaySnapshot(input);
-  const points = intradayChartRows(snapshot).flatMap(({ time, brent, wti, spread }) => brent === null || wti === null ? [] : [{ time: time as number, adr: brent, ordinary: wti, equivalent: wti, spread, premium: NaN }]);
+  const points = validatedIntradayChartRows(snapshot).flatMap(({ time, brent, wti, spread }) => brent === null || wti === null ? [] : [{ time: time as number, adr: brent, ordinary: wti, equivalent: wti, spread, premium: NaN }]);
   return { points, status: snapshot.status === "snapshot" ? "snapshot" : "live", fetchedAt: snapshot.metadata.fetchedAt, metadata: snapshot.metadata };
 }
 

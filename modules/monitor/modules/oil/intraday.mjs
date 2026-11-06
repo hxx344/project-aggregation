@@ -80,11 +80,19 @@ export async function fetchIntradaySnapshot(existing = null, options = {}) {
 function chartRow(row) {
   if (row.brent === null || row.wti === null) return null;
   const spread = oilSpread(row.brent, row.wti);
-  return spread === null ? null : { ...row, date: new Date(row.time).toISOString(), spread };
+  return spread === null ? null : { ...row, spread };
+}
+
+/**
+ * Chart rows of a snapshot that `validateIntradaySnapshot` already returned; skips a second validation.
+ * @param {ReturnType<typeof validateIntradaySnapshot>} snapshot
+ */
+export function validatedIntradayChartRows(snapshot) {
+  return snapshot.data.flatMap(row => chartRow(row) ?? []);
 }
 
 export function intradayChartRows(snapshot) {
-  return validateIntradaySnapshot(snapshot).data.flatMap(row => chartRow(row) ?? []);
+  return validatedIntradayChartRows(validateIntradaySnapshot(snapshot));
 }
 
 /** Chart rows opening within `durationMs` before the end of the last charted bar, the window a trend keeps. */

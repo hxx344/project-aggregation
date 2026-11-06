@@ -25,23 +25,18 @@ function readQuote(input: unknown): OilQuote {
   return input as OilQuote;
 }
 
-function initialHistory(initial: InitialMarketData["oil"] | undefined) {
-  try { return initial?.candles ? oilHistory(initial.candles) : null; } catch { return null; }
-}
-
 /**
  * Quote polling serves both the overview card and the detail; 15-minute candles only poll while the detail is open.
+ * The first render embeds only the overview trend, so the full candles are always read from the API.
  */
-export function useOilFeed(initial?: InitialMarketData["oil"], initialReadAt?: number, active = true, summaryActive = active) {
-  const [data, setData] = useState<OilHistory | null>(() => initialHistory(initial));
+export function useOilFeed(initial?: InitialMarketData["oil"], active = true, summaryActive = active) {
+  const [data, setData] = useState<OilHistory | null>(null);
   const [quote, setQuote] = useState<OilQuote | null>(initial?.quote ?? null);
-  const [historyLoading, setHistoryLoading] = useState(!data);
+  const [historyLoading, setHistoryLoading] = useState(true);
   const [quoteLoading, setQuoteLoading] = useState(!initial?.quote);
   const [error, setError] = useState("");
   const [quoteError, setQuoteError] = useState(initial?.quote?.status === "snapshot" ? retainedQuote : "");
   const controls = useRef<{ history?: () => void; quote?: () => void }>({});
-  const hydrated = useRef({ history: Boolean(data), readAt: initialReadAt ?? 0 });
-  const activated = useRef(false);
   const latest = useRef<OilQuote | null>(initial?.quote ?? null);
   const quoteActive = active || summaryActive;
 
@@ -69,7 +64,6 @@ export function useOilFeed(initial?: InitialMarketData["oil"], initialReadAt?: n
     const history = startActivityPolling({
       intervalMs: HISTORY_REFRESH_MS,
       timeoutMs: HISTORY_TIMEOUT_MS,
-      immediate: activated.current || !hydrated.current.history || Date.now() - hydrated.current.readAt >= HISTORY_REFRESH_MS,
       load: async signal => oilHistory(await request(`/api/monitors/oil/${OIL_CANDLE_ACTION}`, signal)),
       onData: next => { setData(previous => retainOilHistory(previous, next)); setError(""); },
       // Validation errors are internal English text; only user-facing (Chinese) messages are shown as-is.
@@ -77,7 +71,6 @@ export function useOilFeed(initial?: InitialMarketData["oil"], initialReadAt?: n
       onSettled: () => setHistoryLoading(false),
     });
     controls.current.history = () => { void history.refresh(); };
-    activated.current = true;
     return () => { controls.current.history = undefined; history.stop(); };
   }, [active]);
 

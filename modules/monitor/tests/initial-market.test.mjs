@@ -8,7 +8,8 @@ import { readInitialMarket, registerInitialMarket } from '../server/initial-mark
 import { readInitialMarket as readServerInitialMarket } from '../lib/server-initial-market.ts';
 import { initialSummaries } from '../lib/initial-market.ts';
 import { createTrend } from '../lib/monitor-trend.ts';
-import { hynixTrendOptions } from '../lib/monitor-summary.ts';
+import { hynixTrendOptions, oilTrendOptions } from '../lib/monitor-summary.ts';
+import { intradayChartRows } from '../modules/oil/intraday.mjs';
 
 test('first render reads persisted history immediately with collection stopped and preserves missing quotes and source dates', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'market-initial-test-'));
@@ -37,8 +38,13 @@ test('first render reads persisted history immediately with collection stopped a
     assert.deepEqual(summaries.hynix.trend, createTrend({ points: history.points.map(point => ({ time: point.time, value: point.premium })), status: history.status, fetchedAt: history.fetchedAt }, hynixTrendOptions), 'The overview trend matches the one built from the full history');
     assert.equal(summaries.oil.trend.points.length, 672);
     assert.equal(summaries.oil.trend.intervalMs, 900_000);
-    assert.equal(data.oil.candles.metadata.interval, '15m');
-    assert.equal(data.oil.candles.collection.source, 'database');
+    const candles = await services.get('oil').handle('candles/15m', 'GET');
+    assert.ok(candles.data.length > 16_000);
+    assert.equal(Object.hasOwn(data.oil, 'candles'), false, 'The full 15-minute candles are read on demand, not embedded in the first render');
+    assert.equal(data.oil.trend.points.length, 672);
+    assert.deepEqual(data.oil.trend, { points: intradayChartRows(candles).slice(-672).map(row => ({ time: row.time, value: row.spread })), status: candles.status, fetchedAt: candles.metadata.fetchedAt });
+    assert.ok(Buffer.byteLength(JSON.stringify(data.oil)) < 40_000, 'The embedded oil overview stays bounded as candles grow');
+    assert.deepEqual(summaries.oil.trend, createTrend({ points: intradayChartRows(candles).map(row => ({ time: row.time, value: row.spread })), status: candles.status, fetchedAt: candles.metadata.fetchedAt }, oilTrendOptions), 'The overview trend matches the one built from the full candles');
   } finally { if (services) { await Promise.all([...services.values()].map(service => service.stop())); await services.market.stop(); await services.notifications.stop(); } await rm(directory, { recursive: true, force: true }); }
 });
 

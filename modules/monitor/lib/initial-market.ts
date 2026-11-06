@@ -2,10 +2,9 @@ import type { LiveQuote } from "./market";
 import type { MonitorRuntimeMap } from './monitor-control';
 import type { validateOilHistory, validateOilQuote } from "./market-validation";
 import { calculateShortSpreadFunding } from "../modules/oil/binance.mjs";
-import { hynixSummary, hynixTrendOptions, oilSummary, oilTrendOptions } from "./monitor-summary.ts";
+import { hynixSummary, hynixTrendOptions, oilSummary } from "./monitor-summary.ts";
 import { createTrend, type TrendHistory } from "./monitor-trend.ts";
 import { binanceOilExchangeQuote, type ExternalQuoteSet } from "./exchange-quotes.ts";
-import { recentIntradayChartRows, type createIntradaySnapshot } from "../modules/oil/intraday.mjs";
 import { oilSpread } from "../modules/oil/spread.mjs";
 import { getQuoteStaleAfterMs, type QuoteFreshness } from './market-freshness.ts';
 
@@ -14,7 +13,8 @@ export type InitialMarketData = {
   runtime?: MonitorRuntimeMap;
   /** Only the overview's seven-day premium trend; the detail chart reads the full history API. */
   hynix: { quote: LiveQuote | null; trend?: TrendHistory | null; exchanges?: ExternalQuoteSet };
-  oil: { quote: (ReturnType<typeof validateOilQuote> & QuoteFreshness & { status: "live" | "snapshot" }) | null; history?: ReturnType<typeof validateOilHistory> | null; candles?: ReturnType<typeof createIntradaySnapshot> | null; exchanges?: ExternalQuoteSet };
+  /** Only the overview's seven-day Brent − WTI trend; the detail chart reads the full 15-minute candles API. */
+  oil: { quote: (ReturnType<typeof validateOilQuote> & QuoteFreshness & { status: "live" | "snapshot" }) | null; history?: ReturnType<typeof validateOilHistory> | null; trend?: TrendHistory | null; exchanges?: ExternalQuoteSet };
 };
 
 export function initialSummaries(initial: InitialMarketData | null) {
@@ -28,8 +28,8 @@ export function initialSummaries(initial: InitialMarketData | null) {
       fundingBasis: "quantity", fetchedAt: oil.quote?.fetchedAt ?? null,
       staleAfterMs: getQuoteStaleAfterMs(oil.quote, 75_000),
       comparison: oil.quote ? binanceOilExchangeQuote(oil.quote, oil.quote.status === "snapshot") : undefined,
-      // The overview only shows the trend window; the detail chart builds its full rows separately.
-      history: oil.candles ? { points: recentIntradayChartRows(oil.candles, oilTrendOptions.days * 86_400_000).map(row => ({ time: row.time, value: row.spread })), status: oil.candles.status, fetchedAt: oil.candles.metadata.fetchedAt } : undefined,
+      // The server embeds only the trend window; the detail chart reads its full rows separately.
+      history: oil.trend ?? undefined,
     } : undefined),
   };
 }

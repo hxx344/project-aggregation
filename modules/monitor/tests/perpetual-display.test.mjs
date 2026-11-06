@@ -396,7 +396,7 @@ function keysIgnoringSkew(frame, at) {
  * A continuously rankable received pair is shown within 20s + event-loop lateness:
  * both the rolling recovery budget and the next baseline deadline are at most 20s away.
  * Additionally, a safe frame must serve the oldest ready/recently-ready cohort at its first
- * budget slot; a reservation lapses 20s after the last realignment. This catches starvation
+ * budget slot; a reservation lapses 20s plus one display tick after the last realignment. This catches starvation
  * hidden by HEAD or by repeated short skew interruptions.
  */
 function assertRecoveryLiveness(run, context, timerLatenessMs = 0) {
@@ -428,7 +428,7 @@ function assertRecoveryLiveness(run, context, timerLatenessMs = 0) {
       assert.ok(second * 1000 - waiting.get(key) < 20_000 + timerLatenessMs,
         `${context}: ${key} continuously ready since ${waiting.get(key)}ms, still absent at ${second}s`);
     }
-    const reserved = [...candidates].filter(([, candidate]) => second * 1000 < candidate.lastReady + 20_000);
+    const reserved = [...candidates].filter(([, candidate]) => second * 1000 < candidate.lastReady + 21_000);
     const oldest = Math.min(...reserved.map(([, candidate]) => candidate.since));
     const oldestReady = reserved.filter(([key, candidate]) => candidate.since === oldest && ready.has(key));
     if (!oldestReady.length || used || second * 1000 < recoveryAt + 20_000) continue;
@@ -456,6 +456,77 @@ function repeatedSkewFrames(seconds, alignments = [['EARLY', 1], ['LATE', 3]]) {
       [base, cycle && second < cycle + delay ? cycle - 7 : second]));
   });
 }
+
+/**
+ * Starvation across short re-skews (#187). A previously shown pair is tracked from its first absent
+ * second while it stays eligible apart from leg skew and keeps realigning within one interval plus a
+ * display tick of its previous readiness (or of losing the row). assertRecoveryLiveness forgets such a
+ * pair when it skews again; this tracker does not, so a pair that only misses the budget each cycle fails.
+ */
+function assertNoStarvation(run, context, boundMs) {
+  const { current, frames } = run, tracked = new Map(), seen = new Set();
+  let latest, longest = 0;
+  for (let second = 0; second < frames.length; second++) {
+    const at = SOURCE + second * 1000, now = second * 1000;
+    if (frames[second]) latest = frames[second];
+    const shown = current.timeline[second], ready = replayRowKeys(latest, at), eligible = keysIgnoringSkew(latest, at);
+    for (const [key, pair] of tracked) {
+      if (shown.has(key) || !eligible.has(key)) tracked.delete(key);
+      else if (ready.has(key)) pair.lastReady = now;
+      else if (now >= Math.max(pair.since, pair.lastReady) + 21_000) tracked.delete(key);
+    }
+    for (const key of eligible) if (seen.has(key) && !shown.has(key) && !tracked.has(key)) {
+      tracked.set(key, { since: now, lastReady: ready.has(key) ? now : -Infinity });
+    }
+    for (const key of shown) seen.add(key);
+    for (const [key, pair] of tracked) {
+      longest = Math.max(longest, now - pair.since);
+      assert.ok(now - pair.since <= boundMs,
+        `${context}: ${key} keeps realigning but absent since ${pair.since}ms at ${second}s; publications=${current.publishedAt}`);
+    }
+  }
+  return longest;
+}
+
+// Every base realigns for `width` seconds at `phase` of each 20s cycle; otherwise Bybit trails by 6s.
+function periodicAlignmentFrames(seconds, alignments) {
+  return range(0, seconds).map(second => pairFrame(second, alignments.map(([base, phase, width = 1]) =>
+    [base, second < 20 || (second % 20 - phase + 20) % 20 < width ? second : second - 6])));
+}
+
+test('a pair aligned one second after a competing pair is not starved by the recovery budget (#187)', () => {
+  const run = differentialReplay(periodicAlignmentFrames(3600, [['EARLY', 1], ['THIRD', 1], ['LATE', 2]]));
+  assertNoRegression(run, 'adjacent periodic phases');
+  assertRecoveryLiveness(run, 'adjacent periodic phases');
+  assertNoStarvation(run, 'adjacent periodic phases', 60_000);
+  const absent = base => run.current.absent.get(`0:${JSON.stringify([base, `binance:${base}USDT`, `bybit:${base}USDT`])}`);
+  for (const base of ['EARLY', 'THIRD', 'LATE']) {
+    // HEAD shows the aligned prelude through the +20s publication of frame 19, then never again.
+    assert.equal(run.head.absent.get(`0:${JSON.stringify([base, `binance:${base}USDT`, `bybit:${base}USDT`])}`), 3561);
+    // One recovery per interval now alternates the two cohorts instead of always serving EARLY/THIRD.
+    assert.ok(absent(base) < 2000, `${base} absent ${absent(base)}s`);
+  }
+});
+
+test('starvation: 128 randomized periodic-phase replays recover every competing cohort within a bounded wait', context => {
+  let longest = 0;
+  for (let seed = 1; seed <= 128; seed++) {
+    const random = randomSource(seed), count = 2 + Math.floor(random() * 3);
+    // Phases end before the baseline-sampled 19th second: a cohort aligned in baseline frames would make
+    // every other recovery rotate a shown pair out, which the display deliberately refuses.
+    const alignments = Array.from({ length: count }, (_, index) => {
+      const width = 1 + Math.floor(random() * 3);
+      return [`P${index}`, 1 + Math.floor(random() * (19 - width)), width];
+    });
+    const run = differentialReplay(periodicAlignmentFrames(240, alignments));
+    assertNoRegression(run, `periodic seed=${seed}`);
+    assertRecoveryLiveness(run, `periodic seed=${seed}`);
+    // Oldest first serves one cohort per interval: a pair waits out the interval that dropped it,
+    // then at most one interval per other cohort before its own phase comes round.
+    longest = Math.max(longest, assertNoStarvation(run, `periodic seed=${seed} ${JSON.stringify(alignments)}`, 20_000 * (count + 1)));
+  }
+  context.diagnostic(`longest tracked absence ${longest / 1000}s`);
+});
 
 test('repeated single-pair skew recovers at every available budget instead of losing the candidate', () => {
   const run = differentialReplay(repeatedSkewFrames(121, [['EARLY', 1]]));
@@ -506,7 +577,7 @@ test('a permanently skewed candidate cannot reserve the budget ahead of a newer 
   assert.equal(run.current.timeline[41].size, 2);
 });
 
-test('a previously ready candidate releases its reservation after one interval, including without new frames', () => {
+test('a previously ready candidate releases its reservation after one interval and a display tick, including without new frames', () => {
   const frames = range(0, 60).map(second => {
     if (second > 41) return null;
     const ready = second >= 19 && second <= 20 ? 13 : second >= 39 && second <= 40 ? 33 : second;
@@ -516,7 +587,7 @@ test('a previously ready candidate releases its reservation after one interval, 
   const run = differentialReplay(frames);
   assertNoRegression(run, 'expired candidate reservation');
   assertRecoveryLiveness(run, 'expired candidate reservation');
-  assert.deepEqual(run.current.publishedAt, [0, 20_000, 21_000, 40_000, 50_000, 60_000]);
+  assert.deepEqual(run.current.publishedAt, [0, 20_000, 21_000, 40_000, 51_000, 60_000]);
   assert.equal(run.current.data[4].sequence, 41);
 });
 
@@ -723,6 +794,7 @@ test('recovery liveness: 384 randomized repeated-skew replays cannot starve a pe
     const run = differentialReplay(repeatedSkewFrames(180, alignments));
     assertNoRegression(run, `repeated seed=${seed}`);
     assertRecoveryLiveness(run, `repeated seed=${seed}`);
+    assertNoStarvation(run, `repeated seed=${seed}`, 60_000);
     for (const [base] of alignments) {
       const key = `0:${JSON.stringify([base, `binance:${base}USDT`, `bybit:${base}USDT`])}`;
       assert.ok(run.current.timeline.slice(40).some(rows => rows.has(key)), `repeated seed=${seed}: ${base} never recovered`);

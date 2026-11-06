@@ -4,6 +4,9 @@ import { PERPETUAL_FUNDING_MAX_AGE_MS, PERPETUAL_LEG_SKEW_MS, normalizedFunding8
 export const PERPETUAL_DISPLAY_INTERVAL_MS = 20_000;
 // Publish before the one-second display clock can render a held-back expiry.
 const EXPIRY_MARGIN_MS = 1_000;
+// A waiting pair that realigns once per display interval is due again exactly when its reservation
+// would lapse; one display tick lets that frame arrive before the budget timer serves a newer pair.
+const RESERVATION_GRACE_MS = 1_000;
 const PRICE_MODES: PerpetualPriceMode[] = ['book', 'mark'];
 
 type SkewedPair = { mode: PerpetualPriceMode; base: string; first: string; second: string };
@@ -137,7 +140,8 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
    * This is an additional whole-frame publication; the baseline timer and expiry protection remain
    * intact. At most one recovery is allowed between baseline publications and in any rolling 20s.
    * An older candidate that missed its last realignment can reserve the next slot for at most
-   * 20s after that observation. This lets LATE precede a newly dropped EARLY without letting a
+   * 20s plus one display tick after that observation. This lets LATE precede a newly dropped EARLY,
+   * including when LATE realigns once per interval one second after EARLY (#187), without letting a
    * permanently skewed pair block the queue. One whole frame serves all currently ready pairs.
    */
   const recoveryWait = (next: PerpetualSnapshot) => {
@@ -147,7 +151,7 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
     let oldestReady = Infinity, wait = Math.max(0, recoveredAt + PERPETUAL_DISPLAY_INTERVAL_MS - checkedAt);
     for (const key of ready) oldestReady = Math.min(oldestReady, skewed.get(key)!.since);
     for (const pair of skewed.values()) if (pair.since < oldestReady) {
-      wait = Math.max(wait, pair.lastReadyAt + PERPETUAL_DISPLAY_INTERVAL_MS - checkedAt);
+      wait = Math.max(wait, pair.lastReadyAt + PERPETUAL_DISPLAY_INTERVAL_MS + RESERVATION_GRACE_MS - checkedAt);
     }
     if (expiryPending(next, at)) return Infinity;
     const previousLive = liveVenues(published);
