@@ -23,19 +23,24 @@ const rankable = (quote: PerpetualQuote, live: Set<string>, mode: PerpetualPrice
 const aligned = (first: PerpetualQuote, second: PerpetualQuote, mode: PerpetualPriceMode) =>
   Math.abs(quotePriceTime(first, mode) - quotePriceTime(second, mode)) <= PERPETUAL_LEG_SKEW_MS;
 
+/** Rankable quotes of one price mode grouped by base. */
+function rankableGroups(snapshot: PerpetualSnapshot, live: Set<string>, mode: PerpetualPriceMode, at: number) {
+  const groups = new Map<string, PerpetualQuote[]>();
+  for (const quote of snapshot.quotes) {
+    if (!rankable(quote, live, mode, at, snapshot.staleAfterMs)) continue;
+    const group = groups.get(quote.base);
+    if (group) group.push(quote); else groups.set(quote.base, [quote]);
+  }
+  return groups.values();
+}
+
 /** Pairs that were rankable and aligned when `before` was shown and only the leg time skew removes from `after`. */
 function skewDroppedPairs(before: PerpetualSnapshot, beforeAt: number, after: PerpetualSnapshot, afterAt: number): SkewedPair[] {
   if (before.status === 'unavailable' || after.status === 'unavailable') return [];
   const previous = new Map(before.quotes.map(quote => [quoteKey(quote), quote]));
   const liveBefore = liveVenues(before), liveAfter = liveVenues(after), dropped: SkewedPair[] = [];
   for (const mode of PRICE_MODES) {
-    const groups = new Map<string, PerpetualQuote[]>();
-    for (const quote of after.quotes) {
-      if (!rankable(quote, liveAfter, mode, afterAt, after.staleAfterMs)) continue;
-      const group = groups.get(quote.base);
-      if (group) group.push(quote); else groups.set(quote.base, [quote]);
-    }
-    for (const group of groups.values()) for (let left = 0; left < group.length; left++) for (let right = left + 1; right < group.length; right++) {
+    for (const group of rankableGroups(after, liveAfter, mode, afterAt)) for (let left = 0; left < group.length; left++) for (let right = left + 1; right < group.length; right++) {
       const first = group[left], second = group[right];
       if (first.exchange === second.exchange || aligned(first, second, mode)) continue;
       const shownFirst = previous.get(quoteKey(first)), shownSecond = previous.get(quoteKey(second));
@@ -62,7 +67,13 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   let latest: PerpetualSnapshot | null = null, published: PerpetualSnapshot | null = null, publishedAt: number | null = null, publishedSource = 0;
   let displayed = new Map<string, PerpetualQuote>();
   // Actual publications own recovery history; the HEAD baseline above owns only its cadence.
-  let shown: PerpetualSnapshot | null = null, shownSource = 0, recoveredAt = -Infinity, recoveryUsed = false;
+  let recoveredAt = -Infinity, recoveryUsed = false;
+  // Pairs any publication has shown rankable and aligned. A seen pair that a later publication shows
+  // rankable but skewed waits for recovery, however it lost the row: a drop that coincided with an
+  // offline venue or a stale leg must not hide it from recovery forever (#220).
+  const seen = new Set<string>();
+  // A waiting pair stays queued, and keeps its priority, while it is briefly unrankable; it is only
+  // ready while rankable and aligned, and leaves the queue once a publication shows it.
   // lastReadyAt and gap (the longest wait between two such realignments, 0 until observed) count
   // only realignments in frames that pass every recovery safety check.
   const skewed = new Map<string, SkewedPair & { since: number; lastReadyAt: number; gap: number }>();
@@ -70,18 +81,14 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   let recoveryTimer: unknown, recoveryDueAt = Infinity;
   const clear = () => { if (timer !== undefined) cancel(timer); timer = undefined; dueAt = Infinity; };
   const clearRecovery = () => { if (recoveryTimer !== undefined) cancel(recoveryTimer); recoveryTimer = undefined; recoveryDueAt = Infinity; };
-  const candidatesIn = (snapshot: PerpetualSnapshot, isPublication = false) => {
+  const candidatesIn = (snapshot: PerpetualSnapshot) => {
     const ready = new Set<string>();
-    if (!skewed.size) return ready;
+    if (!skewed.size || snapshot.status === 'unavailable') return ready;
     const at = sourceNow?.() ?? 0, live = liveVenues(snapshot), quotes = new Map(snapshot.quotes.map(quote => [quoteKey(quote), quote]));
     for (const [key, pair] of skewed) {
       const left = quotes.get(pair.first), right = quotes.get(pair.second);
-      if (snapshot.status === 'unavailable' || !left || !right || left.base !== pair.base || right.base !== pair.base
-        || !rankable(left, live, pair.mode, at, snapshot.staleAfterMs) || !rankable(right, live, pair.mode, at, snapshot.staleAfterMs)) {
-        skewed.delete(key);
-      } else if (aligned(left, right, pair.mode)) {
-        if (isPublication) skewed.delete(key); else ready.add(key);
-      }
+      if (left && right && left.base === pair.base && right.base === pair.base && aligned(left, right, pair.mode)
+        && rankable(left, live, pair.mode, at, snapshot.staleAfterMs) && rankable(right, live, pair.mode, at, snapshot.staleAfterMs)) ready.add(key);
     }
     return ready;
   };
@@ -95,13 +102,18 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
     }
   };
   const show = (snapshot: PerpetualSnapshot) => {
-    const at = sourceNow?.() ?? 0, since = now();
-    candidatesIn(snapshot, true);
-    if (shown && sourceNow) for (const pair of skewDroppedPairs(shown, shownSource, snapshot, at)) {
-      const key = pairKey(pair);
-      if (!skewed.has(key)) skewed.set(key, { ...pair, since, lastReadyAt: -Infinity, gap: 0 });
+    if (sourceNow && snapshot.status !== 'unavailable') {
+      const at = sourceNow(), since = now(), live = liveVenues(snapshot);
+      for (const mode of PRICE_MODES) for (const group of rankableGroups(snapshot, live, mode, at)) {
+        for (let left = 0; left < group.length; left++) for (let right = left + 1; right < group.length; right++) {
+          const first = group[left], second = group[right];
+          if (first.exchange === second.exchange) continue;
+          const pair = { mode, base: first.base, first: quoteKey(first), second: quoteKey(second) }, key = pairKey(pair);
+          if (aligned(first, second, mode)) { seen.add(key); skewed.delete(key); }
+          else if (seen.has(key) && !skewed.has(key)) skewed.set(key, { ...pair, since, lastReadyAt: -Infinity, gap: 0 });
+        }
+      }
     }
-    shown = snapshot; shownSource = at;
     onData(snapshot);
   };
   const flush = () => {
@@ -115,7 +127,7 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   };
   const reset = () => {
     clear(); clearRecovery(); latest = null; published = null; publishedAt = null; displayed = new Map();
-    shown = null; skewed.clear(); recoveredAt = -Infinity; recoveryUsed = false;
+    seen.clear(); skewed.clear(); recoveredAt = -Infinity; recoveryUsed = false;
   };
   /** Sampling must not expire a displayed quote whose newer observation is already held back. */
   const expiryWait = (next: PerpetualSnapshot) => {
