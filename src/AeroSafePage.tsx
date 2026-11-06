@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { FormEvent } from 'react';
+import type { FormEvent, ReactNode } from 'react';
 import { ArrowLeftRight, CircleAlert, Coins, KeyRound, LoaderCircle, Repeat, RefreshCw, Save, ShieldCheck, Trash2 } from 'lucide-react';
-import type { AeroAutoConfig, AeroAutoState, AeroSafeConfig as SafeConfig, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
+import type { AeroAutoConfig, AeroAutoState, AeroExitResult, AeroSafeConfig as SafeConfig, AeroSafePool, AeroSafePosition, AeroSafeState } from './aero-safe-types';
 import type { AeroSafe } from './aero-safe-client';
 import { AeroSafeChanges } from './AeroSafeChanges';
+import { OpenForm } from './AeroSafePanel';
+import { PoolPolicy, StopPool, Withdraw } from './AeroSafePoolControls';
 import { autoSellNote, rewardSellTarget, same, tokenOf, units } from './aero-safe-client';
 import type { AeroMarket } from './aero-market-client';
 import { amount, days, pct, signed, usd } from './aero-market-format';
@@ -51,13 +53,16 @@ function YieldCell({ metrics, market }: { metrics: PositionMetrics | null; marke
 function autoLine(auto: AeroAutoState | undefined, tokenId: string, now: number) {
   if (!auto?.config.enabled || auto.halted) return null;
   const w = auto.watch.find((x) => x.tokenId === tokenId);
-  if (!w || w.dueAt === null) return null;
+  if (!w) return null;
   if (w.blocked) return `自动调仓暂缓：${w.blocked}`;
+  if (w.dueAt === null) return null;
   const left = Math.ceil((w.dueAt - now) / 60_000);
   return left > 0 ? `出区间已 ${Math.max(0, Math.floor((now - (w.outSince ?? now)) / 60_000))} 分钟，约 ${left} 分钟后自动调仓` : '自动调仓即将执行';
 }
 
-function PositionRow({ pool, position, metrics, market, state, disabled, onAction }: { pool: AeroSafePool; position: AeroSafePosition; metrics: PositionMetrics | null; market: boolean; state: AeroSafeState; disabled: boolean; onAction: (action: 'close' | 'stake' | 'unstake', p: AeroSafePosition, penalty: boolean) => void }) {
+type RowPanel = { tokenId: string; kind: 'withdraw' | 'add' };
+function PositionRow({ pool, position, metrics, market, state, disabled, open, onAction, onPanel, children }: { pool: AeroSafePool; position: AeroSafePosition; metrics: PositionMetrics | null; market: boolean; state: AeroSafeState; disabled: boolean;
+  open: RowPanel['kind'] | null; onAction: (action: 'stake' | 'unstake', p: AeroSafePosition, penalty: boolean) => void; onPanel: (kind: RowPanel['kind'] | null) => void; children?: (penalty: boolean) => ReactNode }) {
   const chain = state.chain!;
   const t0 = tokenOf(chain, pool.token0), t1 = tokenOf(chain, pool.token1);
   const inRange = pool.tick >= position.tickLower && pool.tick < position.tickUpper;
@@ -66,7 +71,7 @@ function PositionRow({ pool, position, metrics, market, state, disabled, onActio
   const raw = (v: number | null, d = 18) => (typeof v === 'number' ? units(BigInt(Math.floor(v)).toString(), d) : '—');
   const m = metrics;
   const auto = autoLine(state.auto, position.tokenId, state.serverNow);
-  return <tr>
+  return <><tr>
     <th scope="row">#{position.tokenId}</th>
     <td className="num">{m ? `${priceText(m.low)} – ${priceText(m.high)}` : `tick ${position.tickLower} 至 ${position.tickUpper}`}<small>{m ? `${m.width} · tick ${position.tickLower} 至 ${position.tickUpper}` : '行情未覆盖，只显示 tick'}</small></td>
     <td className={`num ${inRange ? 'as-in' : 'as-out'}`}>{m ? priceText(m.now) : `tick ${pool.tick}`}
@@ -78,9 +83,11 @@ function PositionRow({ pool, position, metrics, market, state, disabled, onActio
     <td><div className="as-actions">
       {position.staked ? <button type="button" className="button secondary" disabled={disabled} onClick={() => onAction('unstake', position, penalty)}>解押</button>
         : <button type="button" className="button secondary" disabled={disabled} onClick={() => onAction('stake', position, false)}>质押</button>}
-      <button type="button" className="button secondary" disabled={disabled} onClick={() => onAction('close', position, penalty)}>平仓</button>
+      <button type="button" className={`button ${open === 'withdraw' ? 'primary' : 'secondary'}`} disabled={disabled} onClick={() => onPanel(open === 'withdraw' ? null : 'withdraw')}>减仓/平仓…</button>
+      <button type="button" className={`button ${open === 'add' ? 'primary' : 'secondary'}`} disabled={disabled} title="按本头寸的区间再开一个新头寸" onClick={() => onPanel(open === 'add' ? null : 'add')}>加仓…</button>
     </div></td>
-  </tr>;
+  </tr>
+  {open && children ? <tr className="as-subrow"><td colSpan={8}>{children(penalty)}</td></tr> : null}</>;
 }
 
 function JobCallouts({ state }: { state: AeroSafeState }) {
@@ -91,8 +98,18 @@ function JobCallouts({ state }: { state: AeroSafeState }) {
     {state.paused ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>{state.pauseReason}</span></div> : null}
     {state.pending ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已签名待上链：{state.pending.label}（nonce {state.pending.nonce}，{time(state.pending.at)}）{state.pending.hash.startsWith('0x') ? <> · {txLink(state.pending.hash)}</> : null}{state.ledgerError ? '' : state.pending.stale ? '；已超过 10 分钟，下一次操作会用同一 nonce 提价替换它' : '；结清前不能发新操作'}</span></div> : null}
     {job ? <div className={`lp-callout ${job.status === 'failed' ? 'warning' : job.status === 'done' ? 'success' : ''}`} role="status">{job.status === 'running' ? <LoaderCircle size={16} className="spin" /> : job.status === 'failed' ? <CircleAlert size={16} /> : <ShieldCheck size={16} />}
-      <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? '已完成' : `${job.error}${job.signed ? '（本任务已有交易签名发出，请按下方台账与 Safe 现状核对后再操作）' : '（未签名，可直接重试）'}`}</span></div> : null}
+      <span>{job.label}（{time(job.startedAt)}）：{job.status === 'running' ? job.step ?? '执行中' : job.status === 'done' ? `已完成${exitText(state, job.result)}` : `${job.error}${job.signed ? '（本任务已有交易签名发出，请按下方台账与 Safe 现状核对后再操作）' : '（未签名，可直接重试）'}`}</span></div> : null}
   </>;
+}
+
+// 撤出后换币的结果说明（没有换币时为空串）。
+function exitText(state: AeroSafeState, result: unknown) {
+  const exit = (result as { exit?: AeroExitResult } | null)?.exit;
+  if (!exit) return '';
+  const tIn = tokenOf(state.chain, exit.tokenIn), tOut = tokenOf(state.chain, exit.tokenOut);
+  const a = (raw: string | null, t: typeof tIn) => (t ? `${units(raw, t.decimals)} ${t.symbol}` : raw ?? '—');
+  const swapped = exit.received !== null ? `；已把 ${a(exit.amountIn, tIn)} 换成 ${a(exit.received, tOut)}` : '';
+  return `${swapped}${exit.reason ? `；${exit.reason}${exit.left !== '0' && exit.received === null && exit.gained !== '0' ? `（${a(exit.left, tIn)}）` : ''}` : ''}`;
 }
 
 // 自动调仓的状态：开关、停用原因、平仓后待重开的币与最近的调仓记录。
@@ -103,23 +120,6 @@ function reopenCoins(state: AeroSafeState | null) {
   const pool = chain?.pools.find((p) => same(p.address, r.pool));
   const t0 = pool ? tokenOf(chain, pool.token0) : null, t1 = pool ? tokenOf(chain, pool.token1) : null;
   return t0 && t1 ? `${units(r.amount0, t0.decimals)} ${t0.symbol} + ${units(r.amount1, t1.decimals)} ${t1.symbol}` : `${r.amount0} + ${r.amount1}（原始单位）`;
-}
-// 单池上限（基点 ↔ 百分比文本）。10000 即不限。
-const CAP_NONE = 10_000;
-const capText = (bps: number) => String(bps / 100);
-function capBpsOf(text: string): number | null {
-  const t = text.trim();
-  if (!/^\d+(\.\d{1,2})?$/.test(t)) return null;
-  const bps = Math.round(Number(t) * 100);
-  return bps >= 1 && bps <= CAP_NONE ? bps : null;
-}
-// 自动调仓状态与启用确认里的上限说明；全部不限时为空串。
-function capSummary(config: AeroAutoConfig, chain: AeroSafeState['chain']) {
-  const caps = Object.entries(config.poolCaps ?? {}), base = config.poolCapBps ?? CAP_NONE;
-  if (base >= CAP_NONE && caps.every(([, v]) => v >= CAP_NONE)) return '';
-  const name = (address: string) => chain?.pools.find((p) => same(p.address, address))?.name ?? short(address);
-  const each = caps.map(([k, v]) => `${name(k)} ${v >= CAP_NONE ? '不限' : `${capText(v)}%`}`).join('、');
-  return `单池上限：${base >= CAP_NONE ? '默认不限' : `默认 ${capText(base)}%`}${each ? `（${each}）` : ''}，按「行情」美元价估算总资产，重开时超出部分的币留在 Safe，缺价或价格超过 60 分钟未更新时不调仓`;
 }
 function AutoStatus({ state, onConfig }: { state: AeroSafeState; onConfig: () => void }) {
   const auto = state.auto;
@@ -133,7 +133,7 @@ function AutoStatus({ state, onConfig }: { state: AeroSafeState; onConfig: () =>
       {auto.reopen ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>已平仓 #{auto.reopen.closed ?? '—'}（{time(auto.reopen.at)}），待重开：{reopenCoins(state)}，宽度 {auto.reopen.cells} 格{auto.reopen.minted ? `；新头寸 #${auto.reopen.minted} 已开出，待质押` : ''}{auto.reopen.inflight ? `；${auto.reopen.inflight === 'swap' ? '配平兑换' : '开仓'}交易结果未确认` : ''}。</span></div> : null}
       {auto.error && auto.error !== auto.halted?.reason ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{auto.error}</span></div> : null}
       <p className="as-muted">{c.enabled
-        ? `已质押头寸连续出区间 ${c.triggerMinutes} 分钟后平仓，把收回的币以现价为中心按原宽度重开并质押；现价偏离 ${c.twapSeconds / 60} 分钟 TWAP 超过 ${c.maxTwapDeviationBps / 100}% 时不动；同池冷却 ${c.cooldownMinutes} 分钟，24 小时最多 ${c.maxPerDay} 次；${c.acceptPenalty ? '罚没期内也会解押' : '罚没期内等待'}。${capSummary(c, state.chain) ? `${capSummary(c, state.chain)}。` : ''}`
+        ? `已质押头寸连续出区间 ${c.triggerMinutes} 分钟后平仓，把收回的币以现价为中心按原宽度重开并质押；现价偏离 ${c.twapSeconds / 60} 分钟 TWAP 超过 ${c.maxTwapDeviationBps / 100}% 时不动；同池冷却 ${c.cooldownMinutes} 分钟，24 小时最多 ${c.maxPerDay} 次；${c.acceptPenalty ? '罚没期内也会解押' : '罚没期内等待'}。各池的美元上限、是否参与自动调仓在下面每个池子的仓位策略里设置，重开时超出上限的币留在 Safe。`
         : '未开启：出区间的头寸只提示，不会自动平仓。'}{c.enabled && auto.checkedAt ? ` 上次检查 ${time(auto.checkedAt)}${auto.note ? `：${auto.note}` : ''}。` : ''}</p>
       {auto.history.length ? <div className="lp-table-scroll"><table className="lp-table"><thead><tr><th>时间</th><th>平仓</th><th>重开</th><th className="num">新区间 tick</th></tr></thead><tbody>
         {auto.history.map((h, i) => <tr key={`${h.at}:${i}`}><td>{time(h.at)}</td><td>#{h.closed ?? '—'}</td><td className={h.opened ? 'as-in' : 'as-out'}>{h.opened ? `#${h.opened}${h.capped ? '（按上限缩减）' : ''}` : auto.reopen && auto.reopen.closed === h.closed ? '待重开' : '未完成'}</td><td className="num">{h.tickLower !== null && h.tickUpper !== null ? `${h.tickLower} 至 ${h.tickUpper}` : '—'}</td></tr>)}
@@ -148,18 +148,20 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
   const [swapRoute, setSwapRoute] = useState(0);
   const [swapAmount, setSwapAmount] = useState('');
   const [notice, setNotice] = useState('');
+  const [panel, setPanel] = useState<RowPanel | null>(null);
+  const [stopping, setStopping] = useState<string | null>(null);
   const chain = state?.chain;
   const blocked = blockedOf(state);
   const disabled = !!busy || !!blocked || !chain;
   const aeroUsd = market.snapshot?.aero.usd ?? null;
   const symbol = (address: string) => tokenOf(chain, address)?.symbol ?? short(address);
   const run = async (action: Parameters<typeof execute>[0], params: Record<string, unknown>, done: string) => { setNotice(''); if (await execute(action, params)) setNotice(done); };
-  const positionAction = (pool: AeroSafePool) => (action: 'close' | 'stake' | 'unstake', p: AeroSafePosition, penalty: boolean) => {
-    const label = action === 'close' ? '平仓（解押后撤出全部流动性并销毁 NFT，代币回到 Safe）' : action === 'stake' ? '质押到 gauge' : '从 gauge 解押';
+  const positionAction = (pool: AeroSafePool) => (action: 'stake' | 'unstake', p: AeroSafePosition, penalty: boolean) => {
+    const label = action === 'stake' ? '质押到 gauge' : '从 gauge 解押';
     const warning = penalty ? '\n\n头寸仍在提前解押罚没期内，继续将被罚没部分奖励。' : '';
     const sell = action === 'stake' ? '' : autoSellNote(state);
     if (!window.confirm(`${pool.name} #${p.tokenId}：${label}？${warning}${sell}`)) return;
-    void run(action, { tokenId: p.tokenId, ...(penalty ? { acceptPenalty: true } : {}) }, `已开始${action === 'close' ? '平仓' : action === 'stake' ? '质押' : '解押'}，进度见上方任务状态。`);
+    void run(action, { tokenId: p.tokenId, ...(penalty ? { acceptPenalty: true } : {}) }, `已开始${action === 'stake' ? '质押' : '解押'}，进度见上方任务状态。`);
   };
   const swaps = state?.config?.permissions.swaps ?? [];
   const route = swaps[swapRoute];
@@ -219,15 +221,22 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
         <div className="as-toolbar">
           <button type="button" className="button secondary" disabled={disabled || earned === 0n} onClick={() => { if (window.confirm(`领取全部 gauge 的 AERO 排放到 Safe？${autoSellNote(state)}`)) void run('claim', {}, '已开始领取。'); }}>{busy === 'claim' ? <LoaderCircle size={15} className="spin" /> : <Coins size={15} />}领取排放</button>
           <button type="button" className="button secondary" disabled={disabled || !aero || aero.balance === '0' || !sellTarget} title={sellTarget ? undefined : '白名单里没有卖出 AERO 的路径'} onClick={() => { if (window.confirm(`把 Safe 里的全部 AERO 卖成 ${sellTarget}（不超过今日额度）？`)) void run('sell', {}, '已开始卖出。'); }}>{busy === 'sell' ? <LoaderCircle size={15} className="spin" /> : <ArrowLeftRight size={15} />}卖出 AERO</button>
-          {blocked ? <span className="as-muted">{blocked}</span> : <span className="as-muted">开仓在「行情」的池详情页选区间后进行</span>}
+          {blocked ? <span className="as-muted">{blocked}</span> : <span className="as-muted">新区间开仓在「行情」的池详情页选区间后进行；已有头寸可在下面加仓、减仓或平仓</span>}
         </div>
         {chain?.ownedNfts != null && chain.ownedScanned != null && BigInt(chain.ownedNfts) > BigInt(chain.ownedScanned) ? <p className="as-muted">Safe 持有 {chain.ownedNfts} 个头寸 NFT，未质押头寸只列出索引最靠后的 {chain.ownedScanned} 个，另含本系统开出的头寸（已质押的全部列出）。</p> : null}
         {rows.map(({ pool, live, metrics }) => {
           const q = live ? quoteOf(live) : null;
           return <div key={pool.address} className="as-pool">
             <h3>{pool.name} <small>{q && live ? `现价 ${priceText(q.price(pool.tick))}（${q.label}）· 24h ${signed(live.change24h)} · 日波动 24h ${pct(live.vol24h?.daily, 2)} / 7d ${pct(live.vol7d?.daily, 2)} · TVL ${usd(live.tvlUsd)} · 池子日排放 ${live.emissionPerSec === null ? '—' : `${amount(live.emissionPerSec * 86_400)} AERO`}` : `tick ${pool.tick}`} · 待领 {aero ? units(pool.earned, aero.decimals) : pool.earned} AERO</small></h3>
+            <PoolPolicy safe={safe} pool={pool} disabled={disabled} onStop={() => setStopping(stopping === pool.address ? null : pool.address)} />
+            {stopping === pool.address ? <StopPool safe={safe} pool={pool} onClose={() => setStopping(null)} onStarted={setNotice} /> : null}
             <div className="lp-table-scroll"><table className="lp-table as-table"><thead><tr><th>头寸</th><th className="num">价格区间{q ? `（${q.quote}/${q.base}）` : ''}</th><th className="num">现价位置</th><th className="num">持有（估）</th><th className="num">预计收益</th><th className="num" title="按日波动的无漂移随机游走估算首次离开区间的期望时间">预计在区间</th><th>质押</th><th>操作</th></tr></thead><tbody>
-              {pool.positions.length ? pool.positions.map((p) => <PositionRow key={p.tokenId} pool={pool} position={p} metrics={metrics.get(p.tokenId) ?? null} market={!!live} state={state} disabled={disabled} onAction={positionAction(pool)} />)
+              {pool.positions.length ? pool.positions.map((p) => <PositionRow key={p.tokenId} pool={pool} position={p} metrics={metrics.get(p.tokenId) ?? null} market={!!live} state={state} disabled={disabled}
+                open={panel?.tokenId === p.tokenId ? panel.kind : null} onAction={positionAction(pool)} onPanel={(kind) => setPanel(kind ? { tokenId: p.tokenId, kind } : null)}>
+                {(penalty) => panel?.kind === 'withdraw'
+                  ? <Withdraw safe={safe} pool={pool} position={p} penalty={penalty} onClose={() => setPanel(null)} onStarted={setNotice} />
+                  : <OpenForm safe={safe} pool={pool} range={[p.tickLower, p.tickUpper]} usd0={live?.token0.usd ?? null} usd1={live?.token1.usd ?? null} verb="加仓" />}
+              </PositionRow>)
                 : <tr><td colSpan={8} className="lp-table-empty">Safe 在本池暂无头寸</td></tr>}
             </tbody></table></div>
           </div>;
@@ -258,11 +267,9 @@ export function AeroSafePositions({ safe, market, onConfig }: { safe: AeroSafe; 
 }
 
 type AutoNumberKey = 'triggerMinutes' | 'cooldownMinutes' | 'maxPerDay' | 'twapSeconds' | 'maxTwapDeviationBps';
-// poolCap / poolCaps 为百分比文本；poolCaps 按池子地址（小写），留空即用 poolCap。
-type AutoDraft = Record<AutoNumberKey, string> & { enabled: boolean; acceptPenalty: boolean; poolCap: string; poolCaps: Record<string, string> };
+type AutoDraft = Record<AutoNumberKey, string> & { enabled: boolean; acceptPenalty: boolean };
 const autoDraftOf = (c: AeroAutoConfig): AutoDraft => ({ enabled: c.enabled, acceptPenalty: c.acceptPenalty, triggerMinutes: String(c.triggerMinutes), cooldownMinutes: String(c.cooldownMinutes),
-  maxPerDay: String(c.maxPerDay), twapSeconds: String(c.twapSeconds), maxTwapDeviationBps: String(c.maxTwapDeviationBps),
-  poolCap: capText(c.poolCapBps ?? CAP_NONE), poolCaps: Object.fromEntries(Object.entries(c.poolCaps ?? {}).map(([k, v]) => [k.toLowerCase(), capText(v)])) });
+  maxPerDay: String(c.maxPerDay), twapSeconds: String(c.twapSeconds), maxTwapDeviationBps: String(c.maxTwapDeviationBps) });
 const AUTO_FIELDS: { key: AutoNumberKey; label: string; hint: string; min: number; max: number }[] = [
   { key: 'triggerMinutes', label: '出区间等待（分钟）', hint: '连续出区间满这么久才调仓，1–1440', min: 1, max: 1440 },
   { key: 'cooldownMinutes', label: '同池冷却（分钟）', hint: '两次调仓的最短间隔，0–1440', min: 0, max: 1440 },
@@ -281,9 +288,6 @@ function AutoForm({ safe }: { safe: AeroSafe }) {
   useEffect(() => { if (auto && !dirty) setDraft(autoDraftOf(auto.config)); }, [auto, dirty]);
   if (!auto || !draft) return null;
   const change = (patch: Partial<AutoDraft>) => { setDraft({ ...draft, ...patch }); setDirty(true); setNotice(''); };
-  // 可单独设上限的池子：链上快照里的池子，加上已设上限但快照里没有的地址（保留设置，可清空删除）。
-  const capPools = [...(state?.chain?.pools ?? []).map((p) => ({ address: p.address.toLowerCase(), name: p.name })),
-    ...Object.keys(draft.poolCaps).filter((k) => !state?.chain?.pools.some((p) => same(p.address, k))).map((k) => ({ address: k, name: short(k) }))];
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     const value: AeroAutoConfig = { enabled: draft.enabled, acceptPenalty: draft.acceptPenalty } as AeroAutoConfig;
@@ -292,19 +296,10 @@ function AutoForm({ safe }: { safe: AeroSafe }) {
       if (!/^\d+$/.test(text) || n < f.min || n > f.max) { setActionError(`${f.label}须为 ${f.min} 到 ${f.max} 的整数。`); return; }
       value[f.key] = n;
     }
-    const poolCapBps = capBpsOf(draft.poolCap);
-    if (poolCapBps === null) { setActionError('单池上限须为 0.01 到 100 的百分比（最多两位小数），100 即不限。'); return; }
-    const poolCaps: Record<string, number> = {};
-    for (const [address, text] of Object.entries(draft.poolCaps)) {
-      if (!text.trim()) continue;
-      const bps = capBpsOf(text);
-      if (bps === null) { setActionError(`${capPools.find((p) => p.address === address)?.name ?? short(address)} 的上限须为 0.01 到 100 的百分比（最多两位小数），留空即用默认值。`); return; }
-      poolCaps[address] = bps;
-    }
-    value.poolCapBps = poolCapBps; value.poolCaps = poolCaps;
-    const capNote = capSummary(value, state?.chain ?? null);
-    if (value.enabled && (!auto.config.enabled || auto.halted) && !window.confirm(`启用自动调仓？\n\n已质押头寸连续出区间 ${value.triggerMinutes} 分钟后，bot 会经 Roles 自动：解押 → 平仓 → ${state?.config?.autoSellRewards ? '卖出本次领到的 AERO → ' : ''}把收回的币以现价为中心按原宽度配平兑换并重开 → 质押。${capNote ? `
-${capNote}。` : ''}
+    const capped = Object.values(state?.policy?.pools ?? {}).filter((r) => r.capUsd !== null).length;
+    const capNote = capped ? `${capped} 个池子设了美元上限，重开时超出上限的币留在 Safe；缺价或价格超过 60 分钟未更新时等待。` : '各池都没有设美元上限（在「仓位」每个池子的仓位策略里设置）。';
+    if (value.enabled && (!auto.config.enabled || auto.halted) && !window.confirm(`启用自动调仓？\n\n已质押头寸连续出区间 ${value.triggerMinutes} 分钟后，bot 会经 Roles 自动：解押 → 平仓 → ${state?.config?.autoSellRewards ? '卖出本次领到的 AERO → ' : ''}把收回的币以现价为中心按原宽度配平兑换并重开 → 质押。已停止或关闭了自动调仓的池子跳过。
+${capNote}
 每一步仍受 Roles 白名单与每日额度限制；任何异常都会停用自动调仓，等你核对。${auto.reopen ? (auto.reopen.minted ? `\n\n启用后先质押已开出的新头寸 #${auto.reopen.minted}。` : `\n\n启用后先用 Safe 的 ${reopenCoins(state)} 重开（上次平仓收回的币）。如果这些币已经手动用掉，请先放弃待重开记录。`) : ''}`)) return;
     const data = await call('auto', '/auto', 'PUT', { auto: value });
     if (data?.auto) { setDirty(false); setDraft(autoDraftOf(data.auto.config)); setNotice(value.enabled ? '自动调仓已启用，每 30 秒检查一次。' : '自动调仓已关闭。'); }
@@ -322,10 +317,8 @@ ${capNote}。` : ''}
         <label className="lp-field as-check"><span>启用自动调仓</span><input type="checkbox" checked={draft.enabled} onChange={(e) => change({ enabled: e.target.checked })} /></label>
         <label className="lp-field as-check"><span>罚没期内也解押</span><input type="checkbox" checked={draft.acceptPenalty} onChange={(e) => change({ acceptPenalty: e.target.checked })} /></label>
         {AUTO_FIELDS.map((f) => <label key={f.key} className="lp-field"><span>{f.label}</span><input value={draft[f.key]} inputMode="numeric" onChange={(e) => change({ [f.key]: e.target.value })} /><small>{f.hint}</small></label>)}
-        <label className="lp-field"><span>单池上限（占总资产 %）</span><input value={draft.poolCap} inputMode="decimal" onChange={(e) => change({ poolCap: e.target.value })} /><small>0.01–100，100 即不限；下面没单独设置的池子用这个值</small></label>
-        {capPools.map((p) => <label key={p.address} className="lp-field"><span>{p.name} 上限（%）</span><input value={draft.poolCaps[p.address] ?? ''} placeholder={`默认 ${draft.poolCap.trim() || '—'}`} inputMode="decimal" onChange={(e) => change({ poolCaps: { ...draft.poolCaps, [p.address]: e.target.value } })} /><small>留空用默认值</small></label>)}
       </div>
-      <p className="as-muted">只管理已质押的头寸；新区间以现价为中心、宽度与原头寸相同，只投入这次平仓收回的币（{state?.config?.autoSellRewards ? '含卖出本次领到的 AERO 所得' : '不含 AERO'}），Safe 里的其他余额不动。今日额度不够时不平仓。单池上限按「行情」美元价估算：总资产 = Safe 白名单代币余额 + 全部头寸（含未领手续费，不含未领 AERO 与 bot 的 gas），重开后本池全部头寸不超过总资产的这个比例，超出部分的币留在 Safe；本池其他头寸已占满时不平仓，缺价或价格超过 60 分钟未更新时等待。</p>
+      <p className="as-muted">只管理已质押的头寸；新区间以现价为中心、宽度与原头寸相同，只投入这次平仓收回的币（{state?.config?.autoSellRewards ? '含卖出本次领到的 AERO 所得' : '不含 AERO'}），Safe 里的其他余额不动。今日额度不够时不平仓。每个池子的状态、美元上限与是否参与自动调仓在「仓位」的池子仓位策略里设置：上限按「行情」美元价估算本池全部头寸（含未领手续费），重开时超出上限的币留在 Safe；本池其他头寸已占满时不平仓，缺价或价格超过 60 分钟未更新时等待。</p>
     </fieldset>
     {auto.closing || auto.reopen ? <div className="lp-callout warning" role="status"><CircleAlert size={16} /><span>{auto.stuck ?? (auto.closing ? `平仓中断：#${auto.closing.tokenId}` : `有待重开的币：${reopenCoins(state)}${auto.reopen?.minted ? `，新头寸 #${auto.reopen.minted} 待质押` : ''}；如已手动处理，请放弃这条记录`)}。</span>
       <button type="button" className="button secondary" disabled={!!busy || state?.job?.status === 'running' || !!state?.pending} title={state?.pending ? '上一笔交易尚未结清' : undefined} onClick={() => void discard()}>{busy === 'discard' ? <LoaderCircle size={15} className="spin" /> : null}放弃这条记录</button></div> : null}

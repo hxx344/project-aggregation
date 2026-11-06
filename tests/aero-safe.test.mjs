@@ -164,14 +164,74 @@ test('openPosition checks the confirmed preview before anything is estimated or 
     if (to === POOL && selector === executor.POOL_I.getFunction('slot0').selector) return executor.POOL_I.encodeFunctionResult('slot0', [2n ** 96n, 0, 0, 0, 0, true]);
     if (to === POOL && selector === executor.POOL_I.getFunction('fee').selector) return executor.POOL_I.encodeFunctionResult('fee', [500]);
     if (selector === executor.ERC20_I.getFunction('balanceOf').selector) return executor.ERC20_I.encodeFunctionResult('balanceOf', [balances[getAddress(to)]]);
+    if (to === ROLES) return '0x' + '00'.repeat(32 * 5); // an empty allowance: the balance check must still reject first
     throw new Error(`unexpected call ${to} ${selector}`);
   };
+  rpc.getBlock = async () => ({ number: 1, timestamp: 1_000 });
   const ctx = { ...ctxWith(rpc), pools: [{ name: 'USDC/OTHER', address: POOL, token0: USDC, token1: OTHER, tickSpacing: 10 }] };
   const { seen, hooks } = hookSet();
   const params = { pool: POOL, tickLower: -100, tickUpper: 100, shareBps: 10_000, rebalance: false, slippageBps: 50 };
   balances[USDC] = 12_000n; // someone moved funds into the Safe after the preview
   await assert.rejects(executor.openPosition(ctx, hooks, { ...params, expect: { amount0: 10_000n, amount1: 5_000n, swapIn: 0n, swapTokenIn: null } }), /余额自预览后变化/);
   assert.deepEqual(rpc.calls, []); assert.equal(seen.persisted.length, 0);
+});
+
+test('the turnover allowance a rebalance swap and mint share is counted before any swap', () => {
+  const pool = { token0: USDC, token1: OTHER };
+  // Selling token0: the swap and the remaining mint both spend token0, and the quoted output is minted as token1.
+  assert.deepEqual(executor.openAllowanceNeed(pool, { amount0: 1_000n, amount1: 20n, sqrtPriceX96: 2n ** 96n, swap: { tokenIn: USDC, amountIn: 400n, quoted: 390n } }), { need0: 1_000n, need1: 410n });
+  // Selling token1 without a quote: the output is valued at the spot price (token1 per token0 = 4), fees not deducted.
+  assert.deepEqual(executor.openAllowanceNeed(pool, { amount0: 0n, amount1: 1_000n, sqrtPriceX96: 2n * 2n ** 96n, swap: { tokenIn: OTHER, amountIn: 1_000n, quoted: null } }), { need0: 250n, need1: 1_000n });
+  assert.deepEqual(executor.openAllowanceNeed(pool, { amount0: 7n, amount1: 9n, sqrtPriceX96: 2n ** 96n, swap: null }), { need0: 7n, need1: 9n });
+});
+
+test('openPosition stops before the rebalance swap when the daily allowance cannot cover swap plus mint', async () => {
+  const [t0, t1] = [USDC, OTHER].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
+  const POOL = new Wallet('0x' + '99'.repeat(32)).address;
+  const local = buildPermissions({ roleKey: 'test', pools: [{ name: 'A/B', token0: t0, token1: t1, tickSpacing: 10, gauge: new Wallet('0x' + 'ab'.repeat(32)).address }],
+    swaps: [{ tokenIn: t0, tokenOut: t1, tickSpacing: 10 }, { tokenIn: t1, tokenOut: t0, tickSpacing: 10 }],
+    allowances: [{ token: t0, symbol: 'AAA', perDay: '1' }, { token: t1, symbol: 'BBB', perDay: '1' }] });
+  const ROLES_VIEW_I = new Interface(['function allowances(bytes32) view returns (uint128 refill, uint128 maxRefill, uint64 period, uint128 balance, uint64 timestamp)']);
+  const run = async (remaining) => {
+    const rpc = fakeRpc();
+    rpc.getBlock = async () => ({ number: 1, timestamp: 1_000 });
+    rpc.call = async ({ to, data }) => {
+      const selector = data.slice(0, 10);
+      if (to === POOL && selector === executor.POOL_I.getFunction('slot0').selector) return executor.POOL_I.encodeFunctionResult('slot0', [2n ** 96n, 0, 0, 0, 0, true]);
+      if (to === POOL && selector === executor.POOL_I.getFunction('fee').selector) return executor.POOL_I.encodeFunctionResult('fee', [500]);
+      if (selector === executor.ERC20_I.getFunction('balanceOf').selector) return executor.ERC20_I.encodeFunctionResult('balanceOf', [getAddress(to) === t0 ? 1_000_000_000n : 0n]);
+      if (to === ROLES && selector === ROLES_VIEW_I.getFunction('allowances').selector) {
+        const [key] = ROLES_VIEW_I.decodeFunctionData('allowances', data);
+        const a = local.allowances.find((x) => x.key === key);
+        return ROLES_VIEW_I.encodeFunctionResult('allowances', [10n ** 12n, 10n ** 12n, 86_400n, remaining[a.token], 1_000n]);
+      }
+      throw new Error(`unexpected call ${to} ${selector}`); // the router quote fails as before the Router is approved
+    };
+    const ctx = { ...ctxWith(rpc), permissions: local, tokens: new Map([[t0, { decimals: 6, symbol: 'AAA' }], [t1, { decimals: 6, symbol: 'BBB' }]]),
+      pools: [{ name: 'A/B', address: POOL, token0: t0, token1: t1, tickSpacing: 10 }] };
+    const { seen, hooks } = hookSet({ step: (s) => seen.steps.push(s) });
+    seen.steps = [];
+    const params = { pool: POOL, tickLower: -1000, tickUpper: 1000, shareBps: 10_000, rebalance: true, slippageBps: 50 };
+    const preview = await executor.previewOpen(ctx, params);
+    return { rpc, seen, preview, open: () => executor.openPosition(ctx, hooks, params) };
+  };
+
+  // The seller token: half is swapped and half minted, so the whole 1,000 counts although each step alone fits in 600.
+  const seller = await run({ [t0]: 600_000_000n, [t1]: 10n ** 12n });
+  assert.ok(seller.preview.swap && seller.preview.swap.amountIn < 600_000_000n);
+  assert.deepEqual(seller.preview.allowance.map((a) => [a.symbol, a.need, a.remaining]), [['AAA', 1_000_000_000n, 600_000_000n], ['BBB', seller.preview.swap.amountIn, 10n ** 12n]]);
+  assert.match(seller.preview.allowanceShort, /^今日额度不足（AAA 需约 1,000，剩 600）\uff0c额度只够这次投入量的约 60%/);
+  await assert.rejects(seller.open(), (error) => error.code === 'allowance' && error.signed === false && /AAA 需约 1,000，剩 600.*未签名$/.test(error.message));
+  assert.deepEqual(seller.rpc.calls, []); assert.equal(seller.seen.persisted.length, 0); assert.deepEqual(seller.seen.steps, []);
+
+  // The bought token: what the swap returns is minted too and needs its own allowance.
+  const buyer = await run({ [t0]: 10n ** 12n, [t1]: 100_000_000n });
+  assert.match(buyer.preview.allowanceShort, /BBB 需约 [\d.,]+，剩 100）/);
+  await assert.rejects(buyer.open(), (error) => error.code === 'allowance');
+  assert.deepEqual(buyer.rpc.calls, []); assert.equal(buyer.seen.persisted.length, 0);
+
+  assert.equal((await run({ [t0]: 10n ** 12n, [t1]: 10n ** 12n })).preview.allowanceShort, null);
+  assert.equal((await run({ [t0]: 1_000_000_000n, [t1]: 10n ** 12n })).preview.allowanceShort, null); // exactly enough passes
 });
 
 test('configuration accepts only the page fields with their ranges', () => {
@@ -1349,4 +1409,17 @@ test('a queued pool records the gauge liveness reading; unknown survives a resta
     assert.match(pools[1].gaugeStatus.note, /未核对/);
     await restarted.close();
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('exit route needs a whitelisted swap from the other pool token, and reduce rejects a full or empty share before reading the chain', async () => {
+  const USDC = getAddress('0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913'), OTHER_TOKEN = getAddress('0x44B63aF715D5ef02CC3646a6CE96875e11d69E85'), LONE = getAddress('0x3f5bF3EdAc59d650D8fDf9657a71F2f904A3a4Ee');
+  const ctx = { permissions, tokens: new Map() };
+  const pool = { token0: OTHER_TOKEN, token1: USDC };
+  assert.equal(executor.exitRoute(ctx, pool, USDC.toLowerCase()).tokenIn, OTHER_TOKEN);
+  assert.equal(executor.exitRoute(ctx, pool, OTHER_TOKEN).tokenIn, USDC);
+  assert.throws(() => executor.exitRoute(ctx, { token0: LONE, token1: USDC }, LONE), /白名单里没有/);
+  assert.throws(() => executor.exitRoute(ctx, pool, LONE), /只能换成本池/);
+  assert.throws(() => executor.exitRoute(ctx, pool, 'nope'), /地址无效/);
+  const untouched = { rpc: new Proxy({}, { get: () => { throw new Error('read the chain'); } }) };
+  for (const shareBps of [0, 10_000, 1.5]) await assert.rejects(executor.reducePosition(untouched, {}, { tokenId: 1n, shareBps, slippageBps: 50 }), /减仓比例/);
 });
