@@ -1018,6 +1018,131 @@ test('discovery reads pools in batches and a deadline between batches keeps the 
   await market.close();
 });
 
+// Base 规模的慢节点（issue #180）：579 个池子，其中 100 个有 gauge 且有流动性（跟踪集合），其余低于 TVL 门槛。
+// 每次读取按 aero-market-rpc 的批量参数（每个 aggregate3 120 次调用、并发 3）折算串行批数，每批 round 毫秒；
+// 时间按 1 ms 代表 1 秒缩放：20 ms 一批即 20 秒一批，整轮预算 300 ms 即 5 分钟。读取遵守取消信号。
+const BASE_POOLS = 579, BASE_TRACKED = 100, ROUND_MS = 20;
+function baseScaleChain() {
+  const chain = { t: 1_800_000_000, round: 0, gaugeReads: [], stateReads: [] };
+  const pools = Array.from({ length: BASE_POOLS }, (_, i) => '0x' + (i + 1).toString(16).padStart(40, '0'));
+  const tracked = new Set(pools.slice(0, BASE_TRACKED));
+  const gaugeOf = (address) => (tracked.has(address) ? '0xf' + address.slice(-39) : null);
+  const batches = (calls) => Math.ceil(Math.ceil(calls / 120) / 3);
+  const blockAt = (t) => Math.round((t - 1_700_000_000) / BLOCK_TIME);
+  const wait = (n, signal) => new Promise((resolve, reject) => {
+    let timer = null;
+    const cancel = () => { clearTimeout(timer); reject(Object.assign(new Error('eth_call 超过 20 秒未响应'), { kind: 'timeout' })); };
+    if (signal?.aborted) return cancel();
+    timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, n * chain.round);
+    signal?.addEventListener('abort', cancel, { once: true });
+  });
+  const raw = 3000e-12;
+  const stateOf = (address) => (tracked.has(address)
+    ? { sqrtPriceX96: sqrtX96(raw), tick: tickOf(raw), liquidity: String(10n ** 18n), stakedLiquidity: String(5n * 10n ** 17n), fee: 500, unstakedFee: 100_000,
+      balance0: String(10n ** 21n), balance1: String(3n * 10n ** 12n), rewardShare: String(BigInt(chain.t - 1_700_000_000) * 10n ** 17n) }
+    : { sqrtPriceX96: sqrtX96(raw), tick: tickOf(raw), liquidity: '1000', stakedLiquidity: '0', fee: 500, unstakedFee: 100_000, balance0: '1', balance1: '1', rewardShare: null });
+  const reads = {
+    async readPoolAddresses(rpc, _factory, known, limit = Infinity) {
+      const added = pools.slice(known, known + limit);
+      await wait(1 + batches(added.length), rpc.signal);
+      return { total: BASE_POOLS, added };
+    },
+    async readPoolStatics(rpc, list) { await wait(batches(list.length * 4), rpc.signal); return list.map((a) => ({ address: a, token0: WETH, token1: USDC, tickSpacing: 100, gauge: gaugeOf(a) })); },
+    async readTokens(rpc, list) { await wait(batches(list.length * 2), rpc.signal); return list.map((t) => ({ symbol: t === WETH ? 'WETH' : 'USDC', decimals: t === USDC ? 6 : 18 })); },
+    async readGauges(rpc, list) { chain.gaugeReads.push(list.length); await wait(batches(list.length), rpc.signal); return list.map(gaugeOf); },
+    async readPoolStates(rpc, list, block) {
+      await wait(batches(list.length * 8 + 1), rpc.signal);
+      chain.stateReads.push({ block, pools: list.length });
+      return { block, timestamp: chain.t, states: list.map((p) => stateOf(p.address)) };
+    },
+    async readPoolHistory() { throw Object.assign(new Error('missing trie node'), { kind: 'node' }); },
+  };
+  // 每轮新建的 RPC 先做一次链校验再读区块号（两批）；出块时间的两次读取并行（一批）。
+  const createRpc = ({ signal }) => ({ signal, blockNumber: async () => { await wait(2, signal); return blockAt(chain.t); }, blockTimestamp: async (n) => { await wait(1, signal); return 1_700_000_000 + n * BLOCK_TIME; } });
+  return { chain, reads, createRpc, blockAt };
+}
+
+test('Base-scale rediscovery on a 20 s-per-batch node resumes its gauge/state reads across rounds and still refreshes current data', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 300 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).activeCount, BASE_TRACKED);
+  const discoveredAt = baseOf(market).discovery.at;
+  // 整批读取一次尝试要 2（链校验+区块号）+ 1（池子数）+ 2（gauge）+ 13（全部状态）+ 1（出块时间）= 19 批 = 380 ms，超过 300 ms 预算；
+  // 修复前动态阶段不能跨轮续读，重新发现永远待继续。
+  fake.chain.round = ROUND_MS;
+  fake.chain.t += 6 * 3600 + 1;
+  const gaugeReads = fake.chain.gaugeReads.length;
+  const log = [];
+  let attempts = 0;
+  for (let round = 0; round < 8 && baseOf(market).discovery.at === discoveredAt; round++) {
+    const before = baseOf(market), yielded = before.discovery.refreshPending;
+    await clock.fire(); await settle(market);
+    const base = baseOf(market);
+    log.push({ yielded, phase: base.discovery.phase, updatedAt: base.updatedAt, stalls: base.discovery.stalledAttempts });
+    assert.equal(base.status, 'ok');
+    assert.deepEqual([base.discovery.failures, base.discovery.error, base.discovery.retryAt], [0, null, null], 'budget exhaustion is not a node failure');
+    if (yielded) {
+      assert.equal(base.updatedAt, fake.chain.t * 1000, 'the round after an unfinished rediscovery refreshes the current snapshot first');
+      assert.equal(base.discovery.refreshPending, false);
+    } else {
+      attempts++;
+      if (base.discovery.at === discoveredAt) {
+        assert.equal(base.discovery.phase, 'pending');
+        assert.equal(base.discovery.stalledAttempts, 0, 'each resumed attempt retains new gauge/state shards');
+        assert.equal(base.updatedAt, before.updatedAt, 'at most one round yields its current read');
+      }
+    }
+    if (base.discovery.at === discoveredAt) fake.chain.t += 15 * 60;
+  }
+  t.diagnostic(JSON.stringify(log));
+  const base = baseOf(market);
+  assert.ok(attempts >= 2 && attempts <= 3, `rediscovery finishes within a bounded number of attempts (took ${attempts})`);
+  assert.equal(base.discovery.at, fake.chain.t * 1000, 'rediscovery completed');
+  assert.equal(base.discovery.phase, 'idle');
+  assert.equal(base.updatedAt, fake.chain.t * 1000);
+  assert.equal(base.activeCount, BASE_TRACKED);
+  assert.deepEqual(fake.chain.gaugeReads.slice(gaugeReads), [360, 219], 'gauges are read once and reused by the resumed attempt');
+  assert.deepEqual(fake.chain.stateReads.at(-1), { block: fake.blockAt(fake.chain.t), pools: BASE_TRACKED },
+    'stitched states only select the tracked set: the published snapshot is re-read in one block of the finishing round');
+  assert.equal(market.state().pools.length, BASE_TRACKED);
+});
+
+test('the resumable gauge/state draft is dropped when too old or when the RPC changes', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 300 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  fake.chain.round = ROUND_MS;
+  fake.chain.t += 6 * 3600 + 1;
+  const partial = async () => {
+    const from = fake.chain.gaugeReads.length;
+    await clock.fire(); await settle(market);
+    assert.equal(baseOf(market).discovery.phase, 'pending');
+    fake.chain.t += 60; await clock.fire(); await settle(market);
+    assert.equal(baseOf(market).updatedAt, fake.chain.t * 1000);
+    return fake.chain.gaugeReads.slice(from);
+  };
+  assert.deepEqual(await partial(), [360, 219]);
+  // 默认 15 分钟间隔时草稿时限为 6 小时：超过后 gauge 与状态从头重读，不与 6 小时前的读数拼接。
+  fake.chain.t += 6 * 3600 + 1;
+  assert.deepEqual(await partial(), [360, 219], 'an expired draft starts the gauge/state stage over');
+  assert.equal(baseOf(market).discovery.stalledAttempts, 0, 'reading fresh shards after expiry still counts as progress');
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { enabled: true, rpcUrl: 'https://rpc.example/new' } } });
+  fake.chain.t += 60;
+  const from = fake.chain.gaugeReads.length;
+  await clock.fire(); await settle(market);
+  assert.deepEqual(fake.chain.gaugeReads.slice(from, from + 1), [360], 'a new RPC never resumes the old draft');
+});
+
 test('an RPC change cancels the old round before discovery and the new RPC starts over', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   onlyBase(dir);
