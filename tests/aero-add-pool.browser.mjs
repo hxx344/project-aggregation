@@ -31,7 +31,7 @@ async (page) => {
   const DEADLINE = Math.floor(Date.now() / 1000) + 3 * 3600; // 执行期限（秒），区块时间
   const requests = [], errors = [], previews = [];
   const queuedPool = () => ({ address: POOL, name: 'WETH/cbBTC ts1', gauge: GAUGE, tickSpacing: 1, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: CBBTC, symbol: 'cbBTC', decimals: 8 }, addedAt: Date.now(),
-    gaugeStatus: { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' } });
+    gaugeStatus: { state: 'unknown', note: 'CLGaugeFactory.emissionCap 调用回滚，无法确认 gauge 是否已被停用' } });
   const permissions = () => ({ roleKey: 'aero-lp-bot', swaps: [],
     allowances: [{ token: WETH, symbol: 'WETH', perDay: '1000000000000000000' }, { token: USDC, symbol: 'USDC', perDay: usdcPerDay }, ...(merged ? [{ token: CBBTC, symbol: 'cbBTC', perDay: '1000000' }] : [])],
     pools: [{ name: 'WETH/USDC ts100', token0: WETH, token1: USDC, tickSpacing: 100, gauge: listedPool.gauge }, ...(merged ? [{ name: 'WETH/cbBTC ts1', token0: WETH, token1: CBBTC, tickSpacing: 1, gauge: GAUGE }] : [])] });
@@ -129,7 +129,7 @@ async (page) => {
     await add.click();
     await page.getByText('这个池子已在待加池里', { exact: false }).waitFor();
     await page.getByText('新代币每日额度：cbBTC 0.01', { exact: false }).waitFor();
-    await page.getByText('gauge 状态未知：Voter 不提供 isAlive', { exact: false }).waitFor();
+    await page.getByText('gauge 状态未知：CLGaugeFactory.emissionCap 调用回滚', { exact: false }).waitFor();
     await page.getByRole('button', { name: '移出待加池' }).click();
     await add.waitFor();
     await page.getByLabel('cbBTC 每日额度').fill('0.01');

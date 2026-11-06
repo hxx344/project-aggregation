@@ -466,23 +466,75 @@ test('a new-token allowance that already ran on chain is not reset by a regenera
   assert.throws(() => buildUpdateBatch({ current: permissions, next, roles: ROLES_ADDR, allowanceState: missing }), /allowance state for WETH is missing/);
 });
 
-test('gauge liveness: only an explicit Voter.isAlive reading counts; anything else is unknown', async () => {
-  const VOTER_I = new Interface(['function isAlive(address) view returns (bool)']);
-  const rpcWith = (behaviour) => ({ call: async ({ to, data }) => { assert.equal(to, AERO.voter); assert.equal(VOTER_I.parseTransaction({ data }).args[0], GAUGE); return behaviour(); } });
-  assert.equal((await gaugeLiveness(rpcWith(() => VOTER_I.encodeFunctionResult('isAlive', [true])), GAUGE)).state, 'alive');
-  assert.equal((await gaugeLiveness(rpcWith(() => VOTER_I.encodeFunctionResult('isAlive', [false])), GAUGE)).state, 'killed');
-  const reverted = await gaugeLiveness(rpcWith(() => { throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' }); }), GAUGE);
-  assert.deepEqual([reverted.state, /不提供 isAlive/.test(reverted.note)], ['unknown', true]);
-  assert.equal((await gaugeLiveness(rpcWith(() => '0x'), GAUGE)).state, 'unknown', 'an empty return is not read as false');
-  // Only exactly one 32-byte word holding 0 or 1 counts: ethers would read any non-zero word as true and ignore trailing bytes.
+test('gauge liveness: Voter.isActivated and CLGaugeFactory.emissionCap read in parallel at latest; anything unreadable is unknown', async () => {
+  const STATUS_I = new Interface(['function isGauge(address) view returns (bool)', 'function emissionCap(address) view returns (uint128)', 'function isActivated(address) view returns (bool)']);
   const word = (v) => '0x' + v.toString(16).padStart(64, '0');
-  for (const raw of [word(2n), word(1n) + '00'.repeat(32), word(1n).slice(0, -2), '0x' + 'ff'.repeat(32), word(0n) + '00']) {
-    const odd = await gaugeLiveness(rpcWith(() => raw), GAUGE);
-    assert.deepEqual([odd.state, /不是 0 或 1/.test(odd.note)], ['unknown', true], raw);
+  const REAL_CAP = 0x02d8e952e562d20cn; // Base mainnet reading for a live gauge at block 53882083
+  const healthy = { isGauge: word(1n), emissionCap: word(REAL_CAP), isActivated: word(1n) };
+  // Each read answers from `answers[fn]` (a string or a function that throws); every call must hit the right contract at latest.
+  const rpcWith = (answers) => ({
+    getBlockNumber: async () => assert.fail('no separate block-number round trip'),
+    call: async ({ to, data, blockTag }) => {
+      const tx = STATUS_I.parseTransaction({ data });
+      assert.equal(to, tx.name === 'isActivated' ? AERO.voter : AERO.gaugeFactory, tx.name);
+      assert.equal(tx.args[0], GAUGE);
+      assert.equal(blockTag, 'latest');
+      const answer = { ...healthy, ...answers }[tx.name];
+      return typeof answer === 'function' ? answer() : answer;
+    },
+  });
+  const read = (answers) => gaugeLiveness(rpcWith(answers), GAUGE.toLowerCase());
+
+  const alive = await read({});
+  assert.equal(alive.state, 'alive');
+  assert.match(alive.note, new RegExp(`emissionCap = ${REAL_CAP}.*不代表本期一定有排放`));
+  assert.equal((await read({ emissionCap: word((1n << 128n) - 1n) })).state, 'alive', 'the largest uint128 is a valid cap');
+  assert.equal((await read({ isActivated: word(1n).toUpperCase().replace('0X', '0x') })).state, 'alive');
+
+  const capZero = await read({ emissionCap: word(0n) });
+  assert.deepEqual([capZero.state, /已被清零.*emissionCap = 0/.test(capZero.note)], ['killed', true]);
+  const inactive = await read({ isActivated: word(0n) });
+  assert.deepEqual([inactive.state, /尚未在 Voter 激活.*激活后可重新加入.*isActivated = false/.test(inactive.note)], ['killed', true]);
+  const both = await read({ isActivated: word(0n), emissionCap: word(0n) });
+  assert.deepEqual([both.state, /尚未在 Voter 激活.*排放上限也为 0.*emissionCap = 0/.test(both.note)], ['killed', true]);
+  // Not activated refuses whether or not the factory knows the address.
+  const unknownInactive = await read({ isGauge: word(0n), emissionCap: word(0n), isActivated: word(0n) });
+  assert.deepEqual([unknownInactive.state, /激活后可重新加入/.test(unknownInactive.note)], ['killed', true]);
+  // An address the factory never created also reads cap 0; that says nothing about whether it was stopped.
+  const unregistered = await read({ isGauge: word(0n), emissionCap: word(0n) });
+  assert.deepEqual([unregistered.state, /不在 CLGaugeFactory .* 登记/.test(unregistered.note)], ['unknown', true]);
+
+  const revert = () => { throw Object.assign(new Error('execution reverted'), { code: 'CALL_EXCEPTION' }); };
+  for (const [fn, label] of [['isGauge', 'CLGaugeFactory.isGauge'], ['emissionCap', 'CLGaugeFactory.emissionCap'], ['isActivated', 'Voter.isActivated']]) {
+    const reverted = await read({ [fn]: revert });
+    assert.deepEqual([reverted.state, reverted.note.startsWith(`${label} 调用回滚`)], ['unknown', true], fn);
+    const offline = await read({ [fn]: () => { throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' }); } });
+    assert.deepEqual([offline.state, offline.note.startsWith(`读取 ${label} 失败（timeout）`)], ['unknown', true], fn);
+    // Only exactly one 32-byte word counts: ethers would ignore trailing bytes and accept a truncated or empty return.
+    for (const raw of ['0x', word(1n) + '00'.repeat(32), word(1n).slice(0, -2), word(0n) + '00', '0x' + 'zz'.repeat(32), null]) {
+      const odd = await read({ [fn]: raw });
+      assert.deepEqual([odd.state, odd.note.startsWith(`${label} 的返回值不是 32 字节`)], ['unknown', true], `${fn} ${raw}`);
+    }
   }
-  assert.equal((await gaugeLiveness(rpcWith(() => word(1n).toUpperCase().replace('0X', '0x')), GAUGE)).state, 'alive');
-  const offline = await gaugeLiveness(rpcWith(() => { throw Object.assign(new Error('timeout'), { code: 'TIMEOUT' }); }), GAUGE);
-  assert.deepEqual([offline.state, /读取 Voter.isAlive 失败/.test(offline.note)], ['unknown', true]);
+  // Booleans are 0 or 1 only (ethers would read any non-zero word as true).
+  for (const fn of ['isGauge', 'isActivated']) {
+    for (const raw of [word(2n), '0x' + 'ff'.repeat(32)]) {
+      const odd = await read({ [fn]: raw });
+      assert.deepEqual([odd.state, /不是 32 字节的 0 或 1/.test(odd.note)], ['unknown', true], `${fn} ${raw}`);
+    }
+  }
+  // A uint128 word with any of its high 128 bits set is malformed, not a huge cap.
+  for (const raw of [word(1n << 128n), word((1n << 255n) | REAL_CAP), '0x' + 'ff'.repeat(32)]) {
+    const odd = await read({ emissionCap: raw });
+    assert.deepEqual([odd.state, /不是 32 字节的 uint128/.test(odd.note)], ['unknown', true], raw);
+  }
+  // One explicit stop reading is enough to refuse, even when the other signal cannot be read.
+  const inactiveCapUnreadable = await read({ isActivated: word(0n), emissionCap: revert });
+  assert.deepEqual([inactiveCapUnreadable.state, /isActivated = false/.test(inactiveCapUnreadable.note)], ['killed', true]);
+  const clearedVoterUnreadable = await read({ emissionCap: word(0n), isActivated: revert });
+  assert.deepEqual([clearedVoterUnreadable.state, /emissionCap = 0/.test(clearedVoterUnreadable.note)], ['killed', true]);
+  // A zero cap only counts once the factory confirms the gauge is registered.
+  assert.equal((await read({ emissionCap: word(0n), isGauge: revert })).state, 'unknown');
 });
 
 test('readAllowances reads every key at one block and fails instead of guessing', async () => {

@@ -86,21 +86,22 @@ async (page) => {
   const selectedUrl = page.url();
   await page.evaluate(() => { window.__hidden = true; document.dispatchEvent(new Event('visibilitychange')); });
   for (const frame of frames) assert(await frame.evaluate(() => fixture.activity.at(-1).active === false && fixture.activity.at(-1).backgroundUpdates === true), 'browser hiding preserves reads without foreground permission');
-  for (let i = 0; i < 6; i++) { sample++; await advance(15_000); await emit(); }
-  assert(await page.evaluate(() => window.__streams.length === 1 && !window.__streams[0].closed), 'hidden tab retains its healthy stream');
+  // Hidden tabs release the long-lived connection and keep thirty-second cache reads.
+  assert(await page.evaluate(() => window.__streams.length === 1 && window.__streams[0].closed), 'hiding releases the overview stream connection');
   assert(connections === 1, 'navigation does not recreate the stream');
+  const before = reads.length;
+  for (let i = 0; i < 3; i++) {
+    sample++;
+    const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/overview');
+    await advance(30_000); await (await response).finished(); await page.waitForTimeout(30);
+  }
+  // The 1.5-second startup read may also land here now that a hidden tab has no live stream.
+  assert(reads.length - before >= 3 && reads.length - before <= 4, `hidden tab reads the overview every thirty seconds: ${reads.length - before}`);
+  assert(await page.evaluate(() => window.__streams.length === 1), 'a hidden tab does not reopen the stream');
   for (const frame of frames) assert(await frame.evaluate(() => fixture.reads >= 3), 'every hidden module advances multiple background rounds');
   await frames[0].evaluate(() => navigateHost()); await page.waitForTimeout(30);
   assert(page.url() === selectedUrl, 'hidden module cannot navigate the host');
   await checkSample();
-
-  // A disconnected stream still gets bounded cache reads while hidden.
-  let response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/overview');
-  await page.evaluate(() => window.__streams.at(-1).onerror());
-  await (await response).finished();
-  const before = reads.length; sample++;
-  await advance(30_000);
-  assert(reads.length > before, 'hidden stream failure keeps thirty-second fallback polling');
 
   // Each wake replaces a held request; delayed old data may never win.
   for (const event of ['focus', 'pageshow', 'online']) {
@@ -118,8 +119,9 @@ async (page) => {
   await advance(60_000); assert(reads.length === offlineReads, 'offline suspends reads');
   await page.evaluate(() => { window.__online = true; });
   sample++; await readNow('online');
-  response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/overview');
+  const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/overview');
   await page.evaluate(() => { window.__hidden = false; document.dispatchEvent(new Event('visibilitychange')); });
+  assert(await page.evaluate(() => window.__streams.length === 2 && !window.__streams[1].closed), 'showing the tab reopens the stream');
   await advance(1_100);
   await (await response).finished();
   expire = true; await readNow('focus');

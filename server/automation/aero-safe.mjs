@@ -205,7 +205,7 @@ export function normalizeChanges(permissions, changes) {
 
 const EMPTY_CHANGES = Object.freeze({ schema: 1, pools: [], allowances: [], batch: null });
 const changeToken = (t) => ({ address: getAddress(t?.address), symbol: String(t?.symbol ?? '').slice(0, 32), decimals: Number(t?.decimals) });
-// 加池时 Voter 对 gauge 停用状态的读数：alive 或 unknown（已停用的池子加不进来）。旧版本加入的池子没有核对过，按 unknown。
+// 加池时 gauge 停用状态的读数（Voter.isActivated 与 CLGaugeFactory.emissionCap）：alive 或 unknown（已停用的池子加不进来）。旧版本加入的池子没有核对过，按 unknown。
 const gaugeStatusOf = (value) => (value?.state === 'alive' || value?.state === 'unknown'
   ? { state: value.state, note: String(value.note ?? '').slice(0, 200) }
   : { state: 'unknown', note: '加入时未核对 gauge 是否已被停用' });

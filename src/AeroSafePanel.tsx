@@ -49,7 +49,7 @@ function AddPool({ pool, safe }: { pool: MarketPool; safe: ReturnType<typeof use
     </>;
   }
   return <>
-    <p className="as-muted">这个池子不在 Roles 白名单里，bot 还不能在此开仓。加入待加池后，可与其他待加池、额度调整合成一份 Safe 批次：增加该池的 gauge、开仓与质押权限、新代币的授权与每日额度，以及该池两个方向的配平兑换；由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后启用。加入时会向 Voter 核对 gauge 是否已被停用：已停用的拒绝，读不到停用状态时标为「gauge 状态未知」。</p>
+    <p className="as-muted">这个池子不在 Roles 白名单里，bot 还不能在此开仓。加入待加池后，可与其他待加池、额度调整合成一份 Safe 批次：增加该池的 gauge、开仓与质押权限、新代币的授权与每日额度，以及该池两个方向的配平兑换；由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后启用。加入时会核对 gauge 是否已被停用（Voter 的激活状态与 gauge 工厂的排放上限）：未激活或排放上限已清零的拒绝，读不到时标为「gauge 状态未知」。</p>
     {others ? <p className="as-muted">已有 {others} 个待加池，会合进同一份批次。</p> : null}
     <div className="as-form">
       {fresh.map((t) => <label key={t.address}>{t.symbol} 每日额度
