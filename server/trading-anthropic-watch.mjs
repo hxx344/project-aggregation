@@ -139,9 +139,8 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
   let alerts = { active: {}, stale: {} }, history = [], failedAt = 0, lastError = null;
   let hl = { address: null, rows: [], fetchedAt: null, lastAttemptAt: null, error: null };
   let timer = null, first = null, closed = false, polling = null, sending = null, testing = false;
-  // epoch changes on every saved setting, so a refused send cannot restore alerts a save just cleared.
-  // notLiveSince: source → first time this process saw it without a fresh read; startedAt bounds both.
-  let epoch = 0, startedAt = now();
+  // notLiveSince: source → first time this process saw it without a fresh read; startedAt bounds it.
+  let startedAt = now();
   const notLiveSince = {};
   const controller = new AbortController();
 
@@ -167,8 +166,10 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
       if (hl.address) {
         const active = Object.fromEntries(Object.entries(alerts.active).filter(([id]) => !id.startsWith('hyperliquid:')));
         const { hyperliquid: staleSince, ...stale } = alerts.stale;
-        if (Object.keys(active).length !== Object.keys(alerts.active).length || staleSince !== undefined) { const next = { active, stale }; if (persist(next)) alerts = next; }
+        // Memory drops them even if the disk write fails, since the old address is not read again.
+        if (Object.keys(active).length !== Object.keys(alerts.active).length || staleSince !== undefined) { alerts = { active, stale }; persist(); }
       }
+      delete notLiveSince.hyperliquid;
       hl = { address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null };
     }
     if (!address) return;
@@ -231,7 +232,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
 
   async function deliver(events, next) {
     const channel = feishu.alertChannel();
-    const previous = alerts, claimed = epoch;
+    const previous = alerts;
     // Claim before sending (L090): a failed claim sends nothing and keeps the events eligible.
     if (!persist(next)) return;
     alerts = next;
@@ -240,7 +241,8 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
     catch (error) {
       entry.status = error?.uncertain ? 'uncertain' : 'failed'; entry.error = String(error?.message || '飞书发送失败').slice(0, 200); lastError = entry.error;
       // A definite refusal releases the claim so the next check sends again; an uncertain one may have arrived.
-      if (!error?.uncertain && !closed) { failedAt = now(); if (claimed === epoch) alerts = previous; }
+      // Switching off or changing account replaces the alerts object; their result is never rolled back.
+      if (!error?.uncertain && !closed) { failedAt = now(); if (alerts === next) alerts = previous; }
       log.warn({ status: entry.status, error: entry.error, type: 'anthropic-watch' }, 'Anthropic 强平预警发送失败');
     }
     history = [entry, ...history].slice(0, HISTORY_LIMIT);
@@ -297,7 +299,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, lo
       catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警设置写入失败'); throw new HttpError(503, '预警设置无法保存，请恢复存储后重试'); }
       // Switching off forgets open alerts, so switching on again reports the current situation afresh.
       if (!next.enabled) { alerts = { active: {}, stale: {} }; persist(); }
-      config = next; loadError = null; failedAt = 0; lastError = null; epoch += 1;
+      config = next; loadError = null; failedAt = 0; lastError = null;
       return state();
     },
     async test() {

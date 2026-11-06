@@ -272,12 +272,24 @@ test('a refused send cannot restore alerts that switching off just cleared; test
     await h.watch.poll();
     assert.equal(h.posts.length, 2); assert.doesNotMatch(h.posts[1], /仍距强平/, 'switching on again reports afresh');
 
+    // A save that keeps alerts on does not swallow a refused send.
+    h.books.io = [];
+    h.hold(new Promise(resolve => { release = resolve; }));
+    h.fail(new Error('飞书发送失败（19024）'));
+    const refused = h.watch.poll();
+    await new Promise(resolve => setImmediate(resolve));
+    h.watch.save({ enabled: true, thresholdPercent: 25, repeatMinutes: 30 });
+    release(); await refused;
+    h.hold(null); h.fail(null);
+    h.advance(60_000); await h.watch.poll();
+    assert.equal(h.posts.length, 3); assert.match(h.posts[2], /仓位已不在账户中/, 'the refused gone notice is sent on the next check');
+
     h.hold(new Promise(resolve => { release = resolve; }));
     const first = h.watch.test();
     await assert.rejects(h.watch.test(), { status: 409 });
     release(); await first;
     h.hold(null);
     await h.watch.test();
-    assert.equal(h.posts.length, 4);
+    assert.equal(h.posts.length, 5);
   } finally { h.cleanup(); }
 });
