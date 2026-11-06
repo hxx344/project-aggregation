@@ -58,6 +58,16 @@ function decodeFragment(value) {
 
 // RPC 诊断统一入口：先去密钥再裁剪/归一空白，兼容原文、解码回显和大小写混用的百分号转义。
 // 路径段和查询值均可能是短密钥，不按长度猜测；URL 无法解析或诊断过长时只保留固定类别。
+// 短片段（不足 SHORT_SECRET_LENGTH）只在前后不紧邻字母数字时按独立片段替换；
+// 嵌在更长单词里（如 /e 命中 trie）既不能逐处打星号也不能放过，整条改为固定类别。
+const SHORT_SECRET_LENGTH = 8;
+const isWordChar = (char) => /[A-Za-z0-9]/.test(char ?? '');
+function embeddedIn(text, secret) {
+  for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) {
+    if (isWordChar(text[at - 1]) || isWordChar(text[at + secret.length])) return true;
+  }
+  return false;
+}
 export function scrubRpcMessage(text, url, limit = 240) {
   let out = String(text), parsed;
   if (out.length > 8192) return 'RPC 错误（诊断内容过长）';
@@ -78,9 +88,14 @@ export function scrubRpcMessage(text, url, limit = 240) {
   add(parsed.username); add(parsed.password);
   // 先统一回显的编码形式，再从长到短匹配，避免 /v2 等短路由片段提前打断完整密钥。
   out = normalize(decodeFragment(out));
-  for (const secret of [...secrets].sort((a, b) => b.length - a.length)) out = out.split(secret).join('***');
-  return out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()]+/gi, '<地址>')
-    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+  const ordered = [...secrets].sort((a, b) => b.length - a.length);
+  for (const secret of ordered) if (secret.length >= SHORT_SECRET_LENGTH) out = out.split(secret).join('***');
+  // 回显的地址整段去掉后再查短片段：地址内的命中已随地址消失，剩余命中才需要处理。
+  out = out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'<>()]+/gi, '<地址>');
+  const short = ordered.filter((secret) => secret.length < SHORT_SECRET_LENGTH);
+  if (short.some((secret) => embeddedIn(out, secret))) return 'RPC 错误（诊断原文含配置地址片段，已隐藏）';
+  for (const secret of short) out = out.split(secret).join('***');
+  return out.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
 }
 
 export function createRpc({ url, chainId, fetchImpl = fetch, timeoutMs = RPC_TIMEOUT_MS, retryDelayMs = RETRY_DELAY_MS, signal } = {}) {

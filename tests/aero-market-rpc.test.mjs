@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { inspect } from 'node:util';
-import { createRpc, readPoolAddresses } from '../server/research/aero-market-rpc.mjs';
+import { createRpc, readPoolAddresses, scrubRpcMessage } from '../server/research/aero-market-rpc.mjs';
 import { strictMarketConfig, DEFAULT_CONFIG } from '../server/research/aero-market.mjs';
 
 const LIMIT = 8 * 1024 * 1024;
@@ -159,6 +159,19 @@ for (const row of secretCases) test(`rpc redacts credential variants: ${row.name
   assert.match(error.message, /quota denied/);
   assert.ok(!error.message.includes(row.echo), 'the echoed credential must be absent');
   assert.doesNotMatch(error.message, /probeAlpha|probe%ZZvalue|probe line|x\+y/i);
+});
+
+// 短片段逐处替换会把常见单词改成星号（#186）：嵌在单词里时整条换成固定类别，独立出现时照常隐藏。
+for (const row of [
+  { name: 'short path segment inside common words', url: 'https://rpc.example/e', message: 'missing trie node', expected: 'RPC 错误（诊断原文含配置地址片段，已隐藏）' },
+  { name: 'short segment glued to other text is not leaked', url: 'https://rpc.example/zq', message: 'apikeyzq rejected', expected: 'RPC 错误（诊断原文含配置地址片段，已隐藏）' },
+  { name: 'standalone short segment is starred', url: `https://rpc.example/v2/${encodedSecret}`, message: `v2 quota denied: ${decodedSecret}`, expected: '*** quota denied: ***' },
+  { name: 'short segment absent keeps the diagnosis', url: `https://rpc.example/v2/${encodedSecret}`, message: `missing trie node ${decodedSecret}`, expected: 'missing trie node ***' },
+  { name: 'short segment only inside an echoed address', url: 'https://rpc.example/zq', message: 'quota denied at https://rpc.example/zq', expected: 'quota denied at <地址>' },
+]) test(`rpc short credential fragments: ${row.name}`, () => {
+  const out = scrubRpcMessage(row.message, row.url);
+  assert.doesNotMatch(out, /\*\*\*[a-z]|[a-z]\*\*\*/i, 'no partially starred words');
+  assert.equal(out, row.expected);
 });
 
 for (const mode of ['network', 'body', 'node-code', 'result']) test(`RPC error metadata cannot carry a credential: ${mode}`, async () => {
