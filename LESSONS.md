@@ -1648,6 +1648,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `arb-auto-bounds-20261106`；首次合并前审查发现，未逃逸到正式版。
 
+### L101：后台页面不长期占用 HTTP/1.1 连接，也不在后台跑每秒推送
+
+**适用条件：** 工作台按 `http://hub.localhost:<端口>` 等 HTTP/1.1 地址访问，页面或预载模块 iframe 用 EventSource 等长连接；或已加载的隐藏模块在 `backgroundUpdates:true` 下继续运行推送与定时重绘。
+
+**根因：** 浏览器对同一主机最多保持 6 条 HTTP/1.1 连接，多个标签页共享。`d2151ee`（2026-10-09）为切回即新鲜，让总览推送在标签页隐藏时保留；系统更新推送本来也不随隐藏断开。每个工作台标签页因此长期占 2 条，开两三个标签页后其余请求只能排队，表现为其他工作台标签页卡住。监控模块的永续行情推送同理占用模块主机连接，并在隐藏时仍每秒解析一帧、遍历全部报价；CrossEx 的 1 秒时钟用 `document.hidden` 判断前台，但 `display:none` 的 iframe 仍报告可见；Greeks 每 10 秒无条件重建持仓 SVG。
+
+**以后做法：** 页面隐藏或模块转入后台时关闭长连接，改用已有的低频读取（总览 30 秒、系统更新 15 秒/任务中 2 秒、永续快照 30 秒），回到前台立即重连并补读一次。模块判断前台以宿主 `activity` 的 `active` 与 `document.hidden` 共同为准，不能只看 `document.hidden`。新增长连接或秒级定时器时写清隐藏状态下的行为。
+
+**如何验证：** [后台更新回归](tests/background-updates.browser.mjs) 与 [系统更新回归](tests/updates.browser.mjs) 确认隐藏即关闭推送、隐藏期间按周期读取、切回只新建一条推送；[永续后台回归](modules/monitor/tests/perpetual-background.browser.mjs) 确认独立打开与工作台 iframe 两种情况下后台关闭推送、等一个周期后读取快照、切回只建一条推送且筛选与分页保留；[行情流单元测试](modules/monitor/tests/perpetual-feed.test.mjs) 覆盖仅轮询与延后首读。
+
+**证据：** project-aggregation 基线 `dee1e20`。2026-11-06 用户反馈打开工作台后其他工作台标签页与其他网站都变卡，访问地址为 `http://hub.localhost:3100/`（HTTP/1.1，经端口转发到服务器）。本机用 3000 条报价、每秒一帧补丁的夹具测量隐藏的监控 iframe：主线程任务占比由约 1.1% 降至 0.4%，后台推送帧由 30 秒 30 帧降至 0；前台约 2%。这只证明隐藏模块的开销下降，不能断言"其他网站变卡"主要来自这里，现场浏览器任务管理器数据未取得。
+
+**事件记录：** `hub-background-connections-20261106`；用户反馈；不推进主线复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

@@ -814,7 +814,7 @@ async function loadAccount() {
 async function load() { await Promise.allSettled([loadMarket(), loadAccount()]); }
 async function openTrade() { await prepareTrade('open'); }
 function tick() { $('clock').textContent = `${new Date().toLocaleTimeString('en-GB',{hour12:false,timeZone:'UTC'})} UTC`; renderOrdersFreshness(); updatePlanControls(); updateRfqConfirmation(); }
-setInterval(renderPositionPayoff, 10000);
+setInterval(() => { if (typeof window.ProjectHub?.foreground !== 'function' || window.ProjectHub.foreground()) renderPositionPayoff(); }, 10000);
 $('refresh').addEventListener('click', async () => { try { await getJson('/api/market/refresh',{method:'POST'}); await loadMarket(); } catch (error) { $('statusSub').textContent = error.message; } }); $('reloadPositions').addEventListener('click', loadAccount); $('openTrade').addEventListener('click', openTrade); $('confirm').addEventListener('change', updateTradeControls); tick(); setInterval(tick,1000);
 let payoffResizeFrame; window.addEventListener('resize', () => { cancelAnimationFrame(payoffResizeFrame); payoffResizeFrame = requestAnimationFrame(() => { if (window.__latestPreview) renderPayoff(window.__latestPreview); renderPositionPayoff(); }); });
 window.__desiredQty = window.localStorage.getItem('ic-quantity') || '';

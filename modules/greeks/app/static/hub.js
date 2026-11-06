@@ -40,6 +40,7 @@
     }
   }
   const bridge = {
+    foreground,
     register(name, period, load) { tasks.set(name, {period, load, generation: 0, running: false, pending: false, timer: null}); },
     start() {
       if (started) return;
