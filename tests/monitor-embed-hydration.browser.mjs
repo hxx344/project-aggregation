@@ -1,7 +1,7 @@
 // Production workbench preview on 4175 and Monitor tests/ssr-browser-server.mjs (default 3189; start the
 // session on another fixture origin such as http://127.0.0.1:3190 to override).
 // Run via playwright-cli run-code --filename tests/monitor-embed-hydration.browser.mjs.
-// Every API is an isolated fixture. #224: first opening either market through the proxy iframe must hydrate
+// Every API is an isolated fixture. #224: first opening any market tab through the proxy iframe must hydrate
 // without React #418, and a module whose host never answers must not start any market read.
 async page => {
   const current = page.url().startsWith('http://127.0.0.1:') ? new URL(page.url()).origin : null;
@@ -15,7 +15,8 @@ async page => {
   const samples = Array.from({ length: 10 * 96 }, (_, index) => ({ time: end - (10 * 96 - 1 - index) * 900_000, brent: 110, wti: 100 }));
   const candles = { status: 'live', metadata: { source: 'Binance', currency: 'USDT', symbols: ['BZUSDT', 'CLUSDT'], interval: '15m', timezone: 'UTC', priceBasis: 'Paired completed 15-minute trade candle closes', fetchedAt: stamp, firstCommonObservation: iso(samples[0].time), lastCommonObservation: iso(end), pairedObservationRows: samples.length, expectedObservationRows: samples.length, missingObservationRows: 0 }, data: samples };
   const points = samples.filter(item => item.time % hour === 0).map(item => ({ time: item.time, adr: 45, ordinary: 400, equivalent: 40, spread: 5, premium: 12.5 }));
-  const titles = { oil: '原油价差', hynix: '海力士 ADR' }, details = { oil: '/api/monitors/oil/candles/15m', hynix: '/api/monitors/hynix/history' };
+  const titles = { oil: '原油价差', hynix: '海力士 ADR', perpetual: '合约价差' };
+  const details = { oil: '/api/monitors/oil/candles/15m', hynix: '/api/monitors/hynix/history', perpetual: '/api/monitors/perpetual/quote' };
   const report = {};
   async function visit(market, silentHost) {
     const errors = [], reads = [], listener = error => errors.push(error.stack ?? error.message);
@@ -61,7 +62,7 @@ async page => {
       } else {
         await page.goto(`${origin}/?view=project&id=monitor`);
         const panel = page.frameLocator('iframe[title="monitor模块"]').getByRole('tabpanel', { name: titles[market], exact: true });
-        await panel.getByRole('region', { name: '历史价差图表', exact: true }).waitFor();
+        await (market === 'perpetual' ? panel.getByText('合约价差套利', { exact: true }).first() : panel.getByRole('region', { name: '历史价差图表', exact: true })).waitFor();
         await page.waitForTimeout(1000);
         check(reads.includes(details[market]), `${market}: the detail history must load through the bridge`);
       }
@@ -72,6 +73,6 @@ async page => {
       await page.unroute('**/*', handler);
     }
   }
-  for (const market of ['oil', 'hynix']) { await visit(market, false); await visit(market, true); }
+  for (const market of ['oil', 'hynix', 'perpetual']) { await visit(market, false); await visit(market, true); }
   return { passed: true, monitorBuild, report };
 }
