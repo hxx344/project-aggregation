@@ -9,7 +9,7 @@ export type AnthropicRow = Snapshot["data"][number];
 type Coverage = Pick<Snapshot["metadata"], "firstObservation" | "lastObservation" | "rows">;
 export type AnthropicQuote = ReturnType<typeof validateAnthropicQuote> & QuoteFreshness & { status?: "live" | "snapshot" };
 /** A windowed read keeps only its last `windowDays` days in `rows`; `coverage` is always the complete history's range. */
-export type AnthropicHistory = { rows: AnthropicRow[]; status: "live" | "snapshot"; fetchedAt: string; windowDays: number | null; coverage: Coverage };
+export type AnthropicHistory = { rows: AnthropicRow[]; status: "live" | "snapshot"; fetchedAt: string; windowDays: number | null; coverage: Coverage; errors: Snapshot["metadata"]["errors"] };
 
 /** Widest indicator window (Bollinger bands and Z-score), and the warmup read before a selected range. */
 export const ANTHROPIC_BANDS_DAYS = 20;
@@ -27,7 +27,7 @@ export function anthropicHistory(input: unknown): AnthropicHistory {
       || !Number.isSafeInteger(value.rows) || value.rows! < rows) throw new Error("Invalid Anthropic candle coverage");
     coverage = { firstObservation: value.firstObservation, lastObservation, rows: value.rows! };
   }
-  return { rows: snapshot.data, status: snapshot.status === "snapshot" ? "snapshot" : "live", fetchedAt: snapshot.metadata.fetchedAt, windowDays, coverage };
+  return { rows: snapshot.data, status: snapshot.status === "snapshot" ? "snapshot" : "live", fetchedAt: snapshot.metadata.fetchedAt, windowDays, coverage, errors: snapshot.metadata.errors };
 }
 
 export const coversAnthropicRange = (history: AnthropicHistory, range: number | null) =>

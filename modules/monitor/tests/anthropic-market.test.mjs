@@ -1,21 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer, request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ANTHROPIC_CANDLE_ACTION, ANTHROPIC_CANDLE_MS, anthropicCandleWindow, anthropicChartRows, anthropicPremium, createAnthropicCandles,
+  ANTHROPIC_CANDLE_ACTION, ANTHROPIC_CANDLE_MS, anthropicCandleWindow, anthropicChartRows, anthropicPremium, createAnthropicCandles, createBinanceGate,
   fetchAnthropicCandles, fetchAnthropicQuote, validateAnthropicCandles, validateAnthropicQuote,
 } from '../modules/anthropic/market.mjs';
 import { openMarketStore } from '../server/market-store.mjs';
 import { openMonitorControlStore } from '../server/monitor-control.mjs';
 import { readHubSummary } from '../server/hub-summary.mjs';
+import { createHandler } from '../server/http.mjs';
+import { anthropicHistory } from '../lib/anthropic-history.ts';
 
 const BAR = ANTHROPIC_CANDLE_MS, DAY = 86_400_000;
 const NOW = Date.UTC(2026, 10, 6, 12, 7);
 const ok = body => ({ ok: true, status: 200, json: async () => body });
 const fail = status => ({ ok: false, status, json: async () => ({}) });
-const hlContext = (name, markPx) => [{ universe: [{ name: 'other' }, { name }] }, [{ markPx: '1' }, { markPx: String(markPx), funding: '0.00001', oraclePx: String(markPx) }]];
+const hlContext = (name, markPx, isDelisted = false) => [{ universe: [{ name: 'other' }, { name, isDelisted }] }, [{ markPx: '1' }, { markPx: String(markPx), funding: '0.00001', oraclePx: String(markPx) }]];
 
 /** Routes Binance GETs and Hyperliquid POSTs; `binance`/`hl` return a response or throw. */
 function fetcher({ binance, hl }) {
@@ -131,4 +134,73 @@ test('hub summary reports both premiums and names a missing leg as partial', asy
   const stale = await readHubSummary(new Map([['anthropic', { handle: async () => ({ ...quote, io: { markPx: 1670 }, errors: {} }) }]]), NOW + 60_000, 'anthropic');
   assert.equal(stale.health.state, 'stale');
   assert.equal(stale.metrics[1].value, 0);
+});
+
+test('Binance 429/418 starts a cooldown shared by quotes and candles, and a delisted Hyperliquid market is not a live quote', async () => {
+  const gate = createBinanceGate();
+  let binanceCalls = 0;
+  const limited = fetcher({ binance: () => { binanceCalls++; return fail(429); }, hl: body => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95, body.dex === 'io')) });
+  const first = await fetchAnthropicQuote({ now: NOW, fetcher: limited, gate });
+  assert.match(first.errors.binance, /429/);
+  assert.equal(first.errors.io, '合约已下架');
+  assert.equal(first.xyz.markPx, 95);
+  const cooled = await fetchAnthropicQuote({ now: NOW + 59_000, fetcher: limited, gate });
+  assert.equal(binanceCalls, 1, 'no Binance request inside the cooldown');
+  assert.equal(cooled.errors.binance, '接口限流冷却中（HTTP 429）');
+  const candles = await fetchAnthropicCandles(null, { now: NOW + 59_000, fetcher: fetcher({ binance: () => { binanceCalls++; return fail(429); }, hl: body => ok([candle(body.req.coin, lastClosed, 95)]) }), gate });
+  assert.equal(binanceCalls, 1);
+  assert.equal(candles.metadata.errors.binance, '接口限流冷却中（HTTP 429）');
+  await fetchAnthropicQuote({ now: NOW + 60_000, fetcher: limited, gate });
+  assert.equal(binanceCalls, 2, 'the cooldown ends after 60 s');
+  const banned = fetcher({ binance: () => fail(418), hl: body => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95)) });
+  await fetchAnthropicQuote({ now: NOW + 130_000, fetcher: banned, gate });
+  assert.match((await fetchAnthropicQuote({ now: NOW + 249_000, fetcher: banned, gate })).errors.binance, /冷却中（HTTP 418）/);
+});
+
+test('a failed candle leg is reported in the snapshot, survives store, window and client validation, and clears on success', async () => {
+  const gate = createBinanceGate();
+  const broken = fetcher({ binance: () => ok([kline(lastClosed, 1270)]), hl: body => body.req.coin === 'io:ANTH' ? fail(500) : ok([candle('xyz:ANT', lastClosed, 100)]) });
+  const snapshot = await fetchAnthropicCandles(null, { now: NOW, fetcher: broken, gate });
+  assert.deepEqual(snapshot.metadata.errors, { io: '接口返回 HTTP 500' });
+  assert.deepEqual(validateAnthropicCandles(JSON.parse(JSON.stringify(snapshot))).metadata.errors, { io: '接口返回 HTTP 500' });
+  assert.deepEqual(anthropicHistory(snapshot).errors, { io: '接口返回 HTTP 500' });
+  // Snapshots saved before leg errors existed still validate.
+  const legacy = JSON.parse(JSON.stringify(snapshot)); delete legacy.metadata.errors;
+  assert.deepEqual(validateAnthropicCandles(legacy).metadata.errors, {});
+  assert.throws(() => validateAnthropicCandles({ ...snapshot, metadata: { ...snapshot.metadata, errors: { other: 'x' } } }), /leg error/);
+  const healed = await fetchAnthropicCandles(snapshot, { now: NOW, fetcher: fetcher({ binance: () => ok([kline(lastClosed, 1270)]), hl: body => ok([candle(body.req.coin, lastClosed, 100)]) }), gate });
+  assert.deepEqual(healed.metadata.errors, {});
+  // Hyperliquid candles must be 15-minute bars in ascending order.
+  const duplicate = fetcher({ binance: () => fail(500), hl: body => ok([candle(body.req.coin, lastClosed, 100), candle(body.req.coin, lastClosed, 101)]) });
+  await assert.rejects(fetchAnthropicCandles(null, { now: NOW, fetcher: duplicate, gate }));
+  const hourly = fetcher({ binance: () => fail(500), hl: body => ok([{ ...candle(body.req.coin, lastClosed, 100), i: '1h' }]) });
+  await assert.rejects(fetchAnthropicCandles(null, { now: NOW, fetcher: hourly, gate }));
+});
+
+test('the candles API windows Anthropic history with its own coverage, which the client accepts', async t => {
+  const rows = Array.from({ length: 40 * 96 }, (_, index) => ({ time: lastClosed - index * BAR, binance: 1270, xyz: 100, io: 1670 })).reverse();
+  const archive = { ...createAnthropicCandles(rows, new Date(NOW).toISOString()), collection: { source: 'database', stale: false } };
+  const calls = [];
+  const services = new Map([['anthropic', { actions: { [ANTHROPIC_CANDLE_ACTION]: ['GET'], quote: ['GET'] }, async handle(action) { calls.push(action); return archive; } }]]);
+  const password = 'anthropic-window-password';
+  const server = createServer(createHandler({ services, username: 'admin', password, nextHandler: (_q, r) => r.writeHead(404).end() }));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const get = path => new Promise((resolve, reject) => {
+    httpRequest({ host: '127.0.0.1', port: server.address().port, path, headers: { Authorization: `Basic ${Buffer.from(`admin:${password}`).toString('base64')}` } }, response => {
+      const chunks = []; response.on('data', chunk => chunks.push(chunk)); response.on('end', () => resolve({ status: response.statusCode, json: JSON.parse(Buffer.concat(chunks).toString('utf8')) }));
+    }).on('error', reject).end();
+  });
+  const window = await get(`/api/monitors/anthropic/${ANTHROPIC_CANDLE_ACTION}?days=8`);
+  assert.equal(window.status, 200);
+  assert.equal(window.json.windowDays, 8);
+  const history = anthropicHistory(window.json);
+  assert.equal(history.windowDays, 8);
+  assert.deepEqual(history.coverage, { firstObservation: archive.metadata.firstObservation, lastObservation: archive.metadata.lastObservation, rows: rows.length });
+  assert.ok(history.rows.length < rows.length);
+  assert.throws(() => anthropicHistory({ ...window.json, coverage: { ...window.json.coverage, rows: 1 } }), /coverage/);
+  assert.equal(anthropicHistory((await get(`/api/monitors/anthropic/${ANTHROPIC_CANDLE_ACTION}`)).json).windowDays, null);
+  const before = calls.length;
+  for (const days of ['0', 'x', '401']) assert.equal((await get(`/api/monitors/anthropic/${ANTHROPIC_CANDLE_ACTION}?days=${days}`)).status, 400);
+  assert.equal(calls.length, before, 'an invalid window never reads the dataset');
 });

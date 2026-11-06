@@ -12,12 +12,18 @@ import { fundingExchangeFromAction, supportsFundingHistory, HISTORY_REFRESH_MS, 
 import { readExchangeFundingHistory } from './exchange-funding-service.ts';
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS, type OilHedgePrices } from './oil-hedge-prices.ts';
 import { readOilHedgePrices } from './oil-hedge-price-service.ts';
+import { fetchAnthropicCandles, fetchAnthropicQuote } from '../modules/anthropic/market.mjs';
 
 export interface DataAdapter {
   quote: () => Promise<unknown>;
   history?: () => Promise<unknown>;
   funding?: () => Promise<unknown>;
   "candles/15m"?: () => Promise<unknown>;
+}
+/** Preview candles resume from the previous read instead of refetching the whole initial window. */
+function anthropicPreviewCandles() {
+  let last: unknown = null;
+  return async () => (last = await fetchAnthropicCandles(last));
 }
 /** Add a data adapter here and a descriptor in monitors.ts to expose a new module. */
 export const dataAdapters: Record<string, DataAdapter> = {
@@ -29,6 +35,7 @@ export const dataAdapters: Record<string, DataAdapter> = {
     history: loadOilDaily,
     funding: loadOilFunding,
   },
+  anthropic: { quote: () => fetchAnthropicQuote(), "candles/15m": anthropicPreviewCandles() },
 };
 
 export function createDataReader(adapters = dataAdapters, clock = Date.now, exchangeReader = readExchangeQuote, fundingReader = readExchangeFundingHistory, pricesReader = readOilHedgePrices) {

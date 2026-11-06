@@ -63,6 +63,8 @@ export default function AnthropicPanel({ onSummary, active = true, selected = ac
   const recent = useMemo(() => dailyPoints(points).slice(-6).reverse(), [points]);
   const direction = premium === null || premium >= 0 ? "positive" : "negative";
   const legErrors = quote ? Object.entries(quote.errors).map(([key, message]) => `${legNames[key as keyof typeof legNames]}：${message}`) : [];
+  // Candle reads fail per leg; only the legs this chart compares matter here.
+  const candleErrors = data ? (["binance", leg] as const).flatMap(key => data.errors[key] ? [`${legNames[key]}：${data.errors[key]}`] : []) : [];
   const historyPending = loading || !data || (!covered && !failed);
   const symbol = ANTHROPIC_LEGS[leg].symbol;
   return <div className="site-shell" data-monitor="anthropic">
@@ -73,6 +75,7 @@ export default function AnthropicPanel({ onSummary, active = true, selected = ac
       {quoteError && <div className="notice error" role="alert"><Info size={16}/>{quoteError}</div>}
       {legErrors.length > 0 && <div className="notice error" role="alert"><Info size={16}/>部分行情缺失：{legErrors.join("；")}。缺失一侧时不计算溢价。</div>}
       {error && <div className="notice error" role="alert"><Info size={16}/>历史更新中断：{error}{covered ? " 当前保留上次成功加载的数据。" : ""}</div>}
+      {candleErrors.length > 0 && <div className="notice error" role="alert"><Info size={16}/>K 线更新失败：{candleErrors.join("；")}。图表保留已保存的收盘价，之后的时段会断开，下一轮自动重试。</div>}
       {data?.status === "snapshot" && <div className="notice"><Info size={16}/>K 线采集暂停，图表展示 {stamp(data.fetchedAt)} 保存的行情。</div>}
       <div className="hynix-chart-group"><section className="metrics readout" aria-label="最新溢价概览">
         <article className="metric primary-metric"><div className="metric-label">当前溢价<Activity size={16}/></div><div className={`metric-value ${direction}`}>{signed(premium)}</div><div className="metric-foot">Binance ÷ {symbol} − 1 <span>· 每股</span></div></article>

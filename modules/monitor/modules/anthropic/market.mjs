@@ -20,7 +20,7 @@ export const ANTHROPIC_LEGS = Object.freeze({
  * @typedef {{ markPx: number, fundingRate: number | null, oraclePx: number | null }} HyperliquidLegQuote
  * @typedef {{ fetchedAt: string, binance: BinanceLegQuote | null, xyz: HyperliquidLegQuote | null, io: HyperliquidLegQuote | null, errors: Partial<Record<'binance' | 'xyz' | 'io', string>> }} AnthropicQuote
  * @typedef {{ time: number, binance: number | null, xyz: number | null, io: number | null }} AnthropicCandleRow
- * @typedef {{ source: string, symbols: string[], interval: '15m', timezone: 'UTC', priceBasis: string, fetchedAt: string, firstObservation: string, lastObservation: string, rows: number }} AnthropicCandleMetadata
+ * @typedef {{ source: string, symbols: string[], interval: '15m', timezone: 'UTC', priceBasis: string, fetchedAt: string, firstObservation: string, lastObservation: string, rows: number, errors: Partial<Record<'binance' | 'xyz' | 'io', string>> }} AnthropicCandleMetadata
  * @typedef {{ status: 'live' | 'snapshot', metadata: AnthropicCandleMetadata, data: AnthropicCandleRow[] }} AnthropicCandles
  */
 /** Hyperliquid legs compared against Binance; the first is the default. */
@@ -54,9 +54,11 @@ const stamp = value => { if (typeof value !== 'string' || !Number.isFinite(Date.
 
 /** Short Chinese reason for a failed leg read; never echoes upstream bodies. */
 export function legError(error) {
+  if (error instanceof BinanceCooldown) return `接口限流冷却中（HTTP ${error.status}）`;
   const message = String(error?.message ?? '');
   const http = /HTTP (\d{3})/.exec(message);
   if (http) return http[1] === '451' ? '服务器所在地区被拒绝访问（HTTP 451）' : `接口返回 HTTP ${http[1]}`;
+  if (/delisted/.test(message)) return '合约已下架';
   if (error?.name === 'TimeoutError' || error?.name === 'AbortError') return '请求超时';
   return '响应无效或网络失败';
 }
@@ -105,8 +107,29 @@ export function validateAnthropicQuote(input) {
   return result;
 }
 
+class BinanceCooldown extends Error {
+  constructor(status) { super(`Binance HTTP ${status} cooldown`); this.status = status; }
+}
+/**
+ * Binance answers requests made while rate limited (429) with an escalating IP ban (418) that would
+ * also stop the oil and Hynix Binance reads, so after either status this module sends no Binance
+ * request for 60 s (429) or 120 s (418), mirroring lib/binance-quote-request.ts defaults.
+ * One gate serves the quote and candle jobs; tests pass their own.
+ */
+export const createBinanceGate = () => ({ until: 0, status: 0 });
+const sharedBinanceGate = createBinanceGate();
+async function binanceRequest(path, params, { gate = sharedBinanceGate, now, ...options }) {
+  if (now < gate.until) throw new BinanceCooldown(gate.status);
+  try { return await requestBinance(path, params, options); }
+  catch (error) {
+    const status = Number(/Binance HTTP (418|429)$/.exec(String(error?.message ?? ''))?.[1]);
+    if (status) { gate.until = Math.max(gate.until, now + (status === 418 ? 120_000 : 60_000)); gate.status = status; }
+    throw error;
+  }
+}
+
 async function readBinanceQuote(options) {
-  const item = record(await requestBinance('/fapi/v1/premiumIndex', { symbol: ANTHROPIC_LEGS.binance.symbol }, options));
+  const item = record(await binanceRequest('/fapi/v1/premiumIndex', { symbol: ANTHROPIC_LEGS.binance.symbol }, options));
   if (item.symbol !== ANTHROPIC_LEGS.binance.symbol) throw Error('Unexpected Binance symbol');
   return { markPx: positive(item.markPrice), fundingRate: rate(item.lastFundingRate), nextFundingTime: Number.isSafeInteger(item.nextFundingTime) && item.nextFundingTime > 0 ? item.nextFundingTime : null };
 }
@@ -116,13 +139,15 @@ async function readHyperliquidQuote(key, options) {
   if (!Array.isArray(response) || response.length !== 2 || !Array.isArray(response[0]?.universe) || !Array.isArray(response[1])) throw Error('Invalid Hyperliquid response');
   const index = response[0].universe.findIndex(asset => asset?.name === leg.symbol);
   if (index < 0 || !response[1][index]) throw Error('Hyperliquid market missing');
+  // A delisted market keeps its last mark price; it must not read as a live quote.
+  if (response[0].universe[index].isDelisted) throw Error('Hyperliquid market delisted');
   const context = record(response[1][index]);
   return { markPx: positive(context.markPx), fundingRate: rate(context.funding), oraclePx: context.oraclePx ? positive(context.oraclePx) : null };
 }
 
 /** One quote round; a failed leg keeps its reason so the page can say which venue is missing. Each request times out after 10 s. */
-export async function fetchAnthropicQuote({ fetcher = fetch, now = Date.now(), timeout = 10_000 } = {}) {
-  const options = { fetcher, timeout };
+export async function fetchAnthropicQuote({ fetcher = fetch, now = Date.now(), timeout = 10_000, gate = sharedBinanceGate } = {}) {
+  const options = { fetcher, timeout, gate, now };
   const reads = await Promise.allSettled([readBinanceQuote(options), ...HYPERLIQUID_LEGS.map(key => readHyperliquidQuote(key, options))]);
   const quote = { fetchedAt: new Date(now).toISOString(), errors: {} };
   LEG_KEYS.forEach((key, index) => {
@@ -139,7 +164,7 @@ export async function fetchAnthropicQuote({ fetcher = fetch, now = Date.now(), t
  * @param {'live' | 'snapshot'} status
  * @returns {AnthropicCandles}
  */
-export function createAnthropicCandles(rows, fetchedAt, status = 'live') {
+export function createAnthropicCandles(rows, fetchedAt, status = 'live', errors = {}) {
   const received = Date.parse(fetchedAt);
   if (!Number.isFinite(received) || !['live', 'snapshot'].includes(status) || !Array.isArray(rows) || !rows.length || rows.length > 100_000) throw Error('Invalid Anthropic candle snapshot');
   let previous = -1;
@@ -153,14 +178,20 @@ export function createAnthropicCandles(rows, fetchedAt, status = 'live') {
     if (LEG_KEYS.every(key => result[key] === null)) throw Error('Empty Anthropic candle');
     return result;
   });
-  return { status, metadata: { source: ANTHROPIC_SOURCE, symbols: SYMBOLS, interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute trade candle closes', fetchedAt, firstObservation: new Date(data[0].time).toISOString(), lastObservation: new Date(data.at(-1).time).toISOString(), rows: data.length }, data };
+  // Legs whose latest candle read failed; their saved closes are kept but stop advancing until a read succeeds.
+  const legErrors = {};
+  for (const [key, error] of Object.entries(record(errors))) {
+    if (!LEG_KEYS.includes(/** @type {any} */ (key)) || typeof error !== 'string' || !error || error.length > 200) throw Error('Invalid Anthropic candle leg error');
+    legErrors[key] = error;
+  }
+  return { status, metadata: { source: ANTHROPIC_SOURCE, symbols: SYMBOLS, interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute trade candle closes', fetchedAt, firstObservation: new Date(data[0].time).toISOString(), lastObservation: new Date(data.at(-1).time).toISOString(), rows: data.length, errors: legErrors }, data };
 }
 
 /** @param {unknown} input @returns {AnthropicCandles} */
 export function validateAnthropicCandles(input) {
   const value = record(input), metadata = record(value.metadata);
   if (metadata.source !== ANTHROPIC_SOURCE || JSON.stringify(metadata.symbols) !== JSON.stringify(SYMBOLS) || metadata.interval !== '15m' || metadata.timezone !== 'UTC') throw Error('Unexpected Anthropic candle source');
-  const snapshot = createAnthropicCandles(/** @type {unknown[]} */ (value.data), /** @type {string} */ (metadata.fetchedAt), /** @type {'live' | 'snapshot'} */ (value.status));
+  const snapshot = createAnthropicCandles(/** @type {unknown[]} */ (value.data), /** @type {string} */ (metadata.fetchedAt), /** @type {'live' | 'snapshot'} */ (value.status), metadata.errors ?? {});
   for (const field of ['firstObservation', 'lastObservation', 'rows']) if (snapshot.metadata[field] !== metadata[field]) throw Error('Anthropic candle metadata mismatch');
   return snapshot;
 }
@@ -170,7 +201,7 @@ export function anthropicCandleWindow(snapshot, days) {
   const { data, metadata } = validateAnthropicCandles(snapshot);
   const start = Date.parse(metadata.lastObservation) - days * DAY_MS;
   if (data[0].time >= start) return snapshot;
-  const window = createAnthropicCandles(data.filter(row => row.time >= start), metadata.fetchedAt, snapshot.status);
+  const window = createAnthropicCandles(data.filter(row => row.time >= start), metadata.fetchedAt, snapshot.status, metadata.errors);
   return { ...snapshot, ...window, windowDays: days, coverage: { firstObservation: metadata.firstObservation, lastObservation: metadata.lastObservation, rows: metadata.rows } };
 }
 
@@ -178,7 +209,7 @@ async function binanceCandles(startTime, endTime, options) {
   const result = new Map();
   let cursor = startTime;
   for (let page = 0; page < BINANCE_MAX_PAGES && cursor <= endTime; page++) {
-    const rows = await requestBinance('/fapi/v1/klines', { symbol: ANTHROPIC_LEGS.binance.symbol, interval: '15m', startTime: cursor, endTime, limit: BINANCE_PAGE }, options);
+    const rows = await binanceRequest('/fapi/v1/klines', { symbol: ANTHROPIC_LEGS.binance.symbol, interval: '15m', startTime: cursor, endTime, limit: BINANCE_PAGE }, options);
     if (!Array.isArray(rows)) throw Error('Invalid Binance candle page');
     let last = cursor - 1;
     for (const row of rows) {
@@ -197,8 +228,10 @@ async function hyperliquidCandles(key, startTime, endTime, options) {
   const rows = await requestInfo({ type: 'candleSnapshot', req: { coin: ANTHROPIC_LEGS[key].symbol, interval: '15m', startTime, endTime } }, options);
   if (!Array.isArray(rows)) throw Error('Invalid Hyperliquid candles');
   const result = new Map();
+  let last = -1;
   for (const row of rows) {
-    if (!row || row.s !== ANTHROPIC_LEGS[key].symbol || !Number.isSafeInteger(row.t) || row.t % ANTHROPIC_CANDLE_MS || row.T !== row.t + ANTHROPIC_CANDLE_MS - 1) throw Error('Invalid Hyperliquid candle');
+    if (!row || row.s !== ANTHROPIC_LEGS[key].symbol || row.i !== '15m' || !Number.isSafeInteger(row.t) || row.t <= last || row.t % ANTHROPIC_CANDLE_MS || row.T !== row.t + ANTHROPIC_CANDLE_MS - 1) throw Error('Invalid Hyperliquid candle');
+    last = row.t;
     if (row.T < endTime) result.set(row.t, positive(row.c));
   }
   return result;
@@ -208,9 +241,11 @@ async function hyperliquidCandles(key, startTime, endTime, options) {
  * Resume each leg from its own last saved close (overlapping one day), so one venue's outage
  * never leaves a permanent gap. A failed leg keeps its saved closes; the round fails only when
  * every leg fails. Each request times out after 15 s; the collector retries on its next tick.
+ * @param {unknown} [existing]
+ * @param {{ fetcher?: typeof fetch, now?: number, timeout?: number, gate?: { until: number, status: number } }} [options]
  */
-export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, now = Date.now(), timeout = 15_000 } = {}) {
-  const previous = existing ? validateAnthropicCandles(existing) : null, options = { fetcher, timeout };
+export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, now = Date.now(), timeout = 15_000, gate = sharedBinanceGate } = {}) {
+  const previous = existing ? validateAnthropicCandles(existing) : null, options = { fetcher, timeout, gate, now };
   const firstStart = Math.floor((now - ANTHROPIC_INITIAL_DAYS * DAY_MS) / ANTHROPIC_CANDLE_MS) * ANTHROPIC_CANDLE_MS;
   const startOf = key => {
     const last = previous?.data.findLast(row => row[key] !== null);
@@ -218,10 +253,10 @@ export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, 
   };
   const reads = await Promise.allSettled(LEG_KEYS.map(key => key === 'binance' ? binanceCandles(startOf(key), now, options) : hyperliquidCandles(key, startOf(key), now, options)));
   if (reads.every(read => read.status === 'rejected')) throw reads[0].reason;
-  const merged = new Map((previous?.data ?? []).map(row => [row.time, { ...row }]));
+  const merged = new Map((previous?.data ?? []).map(row => [row.time, { ...row }])), errors = {};
   LEG_KEYS.forEach((key, index) => {
     const read = reads[index];
-    if (read.status !== 'fulfilled') return;
+    if (read.status !== 'fulfilled') { errors[key] = legError(read.reason); return; }
     for (const [time, close] of read.value) {
       const row = merged.get(time) ?? Object.fromEntries([['time', time], ...LEG_KEYS.map(leg => [leg, null])]);
       row[key] = close;
@@ -230,7 +265,7 @@ export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, 
   });
   const cutoff = now - ANTHROPIC_RETENTION_DAYS * DAY_MS;
   const rows = [...merged.values()].filter(row => row.time >= cutoff).sort((a, b) => a.time - b.time);
-  return createAnthropicCandles(rows, new Date(now).toISOString());
+  return createAnthropicCandles(rows, new Date(now).toISOString(), 'live', errors);
 }
 
 /**
