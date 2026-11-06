@@ -392,6 +392,16 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 .monitor-detail .perpetual-panel, .hub-embedded .monitor-hub .monitor-detail .perpetual-panel { max-width: none; padding: 0 0 24px; }
 .monitor-detail .alert-panel { margin-bottom: 0; }
 
+.trade-summary-list { display: grid; gap: 8px; font-size: 12px; min-width: 0; max-height: 440px; overflow: auto; }
+.trade-summary { border: 1px solid var(--border); border-left: 3px solid var(--trade-color); border-radius: 4px; min-width: 0; }
+.trade-summary > summary { padding: 10px; cursor: pointer; overflow-wrap: anywhere; min-height: 44px; }
+.trade-summary > summary strong { color: var(--trade-color); margin-right: 12px; }
+.trade-summary-range { display: block; margin-top: 4px; color: var(--muted-foreground); }
+.trade-summary-totals { padding: 0 10px; max-height: 320px; overflow: auto; }
+.trade-summary-venue { padding: 8px 0; border-top: 1px solid var(--border); overflow-wrap: anywhere; }
+.trade-summary-venue p { margin: 4px 0; }
+.trade-summary > .trade-list { margin: 0 10px 10px; }
+.trade-summary-note { margin: 0; color: var(--muted-foreground); }
 .monitor-detail-side { position: sticky; top: 12px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .detail-side-panel { border: 1px solid var(--border); border-radius: 8px; background: var(--card); padding: 12px 14px; min-width: 0; font-size: 12px; }
 .detail-side-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }

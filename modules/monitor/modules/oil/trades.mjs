@@ -2,6 +2,7 @@ import { oilSpread } from './spread.mjs';
 import { decimal, decimalText, add, negate, absolute, compare, multiply, divide } from './trade-decimal.mjs';
 
 export const TRADE_GAP_MS = 10 * 60_000;
+export const tradeDate = time => new Date(Date.parse(time) + 8 * 3_600_000).toISOString().slice(0, 10);
 /** left/right are the paired bases; spread is the market's chart metric from fill prices (oil: USDT/桶, Hynix: percent). */
 export const TRADE_PAIRS = {
   oil: { left: 'BZ', right: 'CL', spread: oilSpread, priceUnit: '/桶',
@@ -69,10 +70,13 @@ function summarizeVenue(fills, pair) {
     fees: cashTotals(fills, 'fee', 'feeCurrency'), realizedPnl: cashTotals(fills, 'realizedPnl', 'priceCurrency'),
   };
 }
+function effectType(effects) {
+  const kinds = new Set(effects.map(part => part.effect));
+  return kinds.has('unknown') ? 'trade' : kinds.size > 1 ? 'rebalance' : kinds.has('open') ? 'entry' : 'exit';
+}
 function summarizeEvent(fills, pair) {
   const effects = fills.flatMap(fill => classifyFill(fill).map(part => ({ ...part, key: fill.key })));
-  const kinds = new Set(effects.map(part => part.effect));
-  const type = kinds.has('unknown') ? 'trade' : kinds.size > 1 ? 'rebalance' : kinds.has('open') ? 'entry' : 'exit';
+  const type = effectType(effects);
   const groups = new Map();
   for (const fill of fills) {
     const key = tradeVenueKey(fill);
@@ -88,14 +92,20 @@ function summarizeEvent(fills, pair) {
     stale: fills.some(fill => fill.stale),
   };
 }
-/** Cluster by adjacent fill times across all accounts; never sum quantities across venues. */
+/** Cluster same-effect timestamps within a Beijing date; never sum quantities across venues. */
 export function groupTradeEvents(items, pair = TRADE_PAIRS.oil) {
   const ordered = [...items].sort((a, b) => Date.parse(a.time) - Date.parse(b.time) || a.key.localeCompare(b.key));
-  const groups = [];
+  const timestamps = [];
   for (const fill of ordered) {
-    const previous = groups.at(-1);
-    if (!previous || Date.parse(fill.time) - Date.parse(previous.at(-1).time) > TRADE_GAP_MS) groups.push([fill]);
+    const previous = timestamps.at(-1);
+    if (!previous || Date.parse(fill.time) !== Date.parse(previous[0].time)) timestamps.push([fill]);
     else previous.push(fill);
   }
-  return groups.map(group => summarizeEvent(group, pair));
+  const groups = [];
+  for (const fills of timestamps) {
+    const previous = groups.at(-1), type = effectType(fills.flatMap(classifyFill)), time = fills[0].time;
+    if (!previous || previous.type !== type || tradeDate(time) !== tradeDate(previous.fills.at(-1).time) || Date.parse(time) - Date.parse(previous.fills.at(-1).time) > TRADE_GAP_MS) groups.push({ type, fills: [...fills] });
+    else previous.fills.push(...fills);
+  }
+  return groups.map(group => summarizeEvent(group.fills, pair));
 }

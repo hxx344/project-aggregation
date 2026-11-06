@@ -12,6 +12,7 @@ import { hynixTradeEvents, hynixTradeMarkers, type SpreadTradeMarker, type Trade
 import type { HubFillsView } from "../lib/hub-fills";
 import { TRADE_TYPES } from "../modules/oil/trades.mjs";
 import { fillsStatusText, tradeDetailLines } from "../modules/oil/trade-markers.mjs";
+import { summarizeTradeEvents } from "../lib/trade-summary";
 
 type Mode = SpreadMetric | "price";
 /** Labels per tab; the percentage tab is optional for markets that chart only the absolute spread. */
@@ -49,6 +50,7 @@ export type SpreadChartConfig = {
   tick: ModeLabels<(value: number) => string>;
   tradeEvents: (items: HubFillsView["items"]) => TradeEvent[];
   tradeMarkers: (events: TradeEvent[], points: Point[]) => SpreadTradeMarker[];
+  tradeMarket: "oil" | "hynix";
   trade: { priceUnit: string; chartLabel: string; chartNote: string; metricName: string };
   emptyText: { loading: string; hint: string };
 };
@@ -58,7 +60,7 @@ export const HYNIX_SPREAD_CHART: SpreadChartConfig = {
   tabs: { premium: "溢价率", spread: "美元价差", price: "价格对比" }, units: { premium: "% · ADR 相对正股", spread: "USD / 份 ADR", price: "USD / 份 ADR" },
   premiumName: "ADR 溢价率", spreadName: "每份价差", legs: ["ADR", "正股 ÷ 10"], zeroLabel: "0 = 平价", domainStep: 5, digits: 2, price: hynixMoney,
   tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(2))}` },
-  tradeEvents: hynixTradeEvents, tradeMarkers: hynixTradeMarkers,
+  tradeEvents: hynixTradeEvents, tradeMarkers: hynixTradeMarkers, tradeMarket: "hynix",
   trade: { priceUnit: "", chartLabel: "图表同小时溢价率", chartNote: "小时收盘，未收盘小时为未知", metricName: "溢价率" },
   emptyText: { loading: "正在载入上市以来的历史行情", hint: "统一美元口径，对齐小时收盘时间" },
 };
@@ -99,15 +101,34 @@ function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null;
 
 function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config }: { trades: HubFillsView; markers: SpreadTradeMarker[]; selected: SpreadTradeMarker | null; onSelect: (key: string) => void; chartMarkers: boolean; config: SpreadChartConfig }) {
   const titleId = useId();
+  const summaries = useMemo(() => summarizeTradeEvents(markers.map(marker => marker.event), config.tradeMarket), [markers, config.tradeMarket]);
+  const rows = [
+    ...summaries.map(summary => ({ time: summary.start, key: summary.key, summary, marker: null })),
+    ...markers.filter(marker => marker.event.type !== "entry" && marker.event.type !== "exit").map(marker => ({ time: marker.event.time, key: marker.event.key, summary: null, marker })),
+  ].sort((a, b) => b.time - a.time || a.key.localeCompare(b.key));
+  const summarySpread = (group: (typeof summaries)[number]["groups"][number]) => group.spread === null ? "未知" : `${group.spread.toFixed(3)}${config.tradeMarket === "hynix" ? "%" : ` ${group.currency}${config.trade.priceUnit}`}`;
+  const eventButton = (marker: SpreadTradeMarker) => {
+    const type = TRADE_TYPES[marker.event.type as TradeType];
+    return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
+      {`${type.symbol} ${beijing(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
+    </button>;
+  };
   return <section className="trade-panel" aria-labelledby={titleId}>
     <h3 id={titleId}>套利成交</h3>
     <p className="trade-status" role="status">{fillsStatusText(trades, beijing)}</p>
     <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === "trade" ? "成交（开平未知）" : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? "颜色只区分类型，不表示盈亏" : `切换到${spreadTabs(config)}可在图上查看标记`}</span></p>
-    <div className="trade-list" aria-label="当前区间套利成交">
+    <div className="trade-summary-list" aria-label="当前区间套利成交">
       {!markers.length && <p>{trades.status === "ok" && !trades.pending && !trades.incomplete ? "当前图表区间暂无套利成交" : "当前图表区间暂无可展示成交"}</p>}
-      {[...markers].reverse().map(marker => { const type = TRADE_TYPES[marker.event.type as TradeType]; return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
-        {`${type.symbol} ${beijing(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
-      </button>; })}
+      {rows.map(({ summary, marker }) => summary ? <details className="trade-summary" data-trade-type={summary.type} key={summary.key}>
+        <summary><strong>{TRADE_TYPES[summary.type].symbol} {TRADE_TYPES[summary.type].label}汇总</strong><span>{summary.fillCount} 笔 · {summary.groups.length === 1 ? `加权成交${config.trade.metricName} ${summarySpread(summary.groups[0])}` : `${summary.groups.length} 组账户 / 方向`}</span><span className="trade-summary-range">{beijing(summary.start)} — {beijing(summary.end)}</span></summary>
+        <div className="trade-summary-totals">{summary.groups.map((group, index) => <div className="trade-summary-venue" key={group.key}>
+          <strong>{summary.groups.length > 1 ? `${index + 1}. ` : ""}{group.source} · {group.exchange} · {group.account} · {group.scope} · {group.direction}{group.stale ? " · 保留旧数据" : ""}</strong>
+          <p>加权成交{config.trade.metricName} {summarySpread(group)}{group.spread === null ? "（缺少唯一配对的双腿）" : ""}</p>
+          {group.legs.map(leg => <p key={leg.key}>{leg.symbol} · {leg.side === "buy" ? "买" : "卖"} · {leg.positionSide === "net" ? "净持仓" : leg.positionSide === "long" ? "多头" : "空头"} · 数量 {leg.quantity} {leg.quantityUnit} · 均价 {leg.price} {group.currency}{config.trade.priceUnit}</p>)}
+        </div>)}</div>
+        <div className="trade-list" aria-label={`${TRADE_TYPES[summary.type].label}各批成交`}>{markers.filter(marker => summary.eventKeys.includes(marker.event.key)).reverse().map(eventButton)}</div>
+      </details> : marker && eventButton(marker))}
+      {summaries.length > 0 && <p className="trade-summary-note">按北京时间同日、持仓连续的同向分批成交汇总 · 均价按数量加权</p>}
     </div>
     {selected && <div className="trade-details" tabIndex={0} aria-label="套利成交明细">{tradeDetails(selected, config)}</div>}
   </section>;

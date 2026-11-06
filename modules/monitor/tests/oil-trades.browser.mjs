@@ -3,6 +3,7 @@
 async (page, options = {}) => {
   const check = (value, message) => { if (!value) throw Error(message); }, errors = [];
   page.on('pageerror', error => errors.push(error.message));
+  await page.setViewportSize({ width: 1440, height: 1050 });
   await page.goto(options.entryUrl ?? 'http://hub.localhost:39186/__host');
   const app = page.frameLocator('iframe'), markers = app.locator('.trade-marker'), details = app.locator('.trade-details');
   await markers.first().waitFor();
@@ -13,7 +14,8 @@ async (page, options = {}) => {
   check((await details.innerText()).includes('<img src=x onerror=alert(1)>'), 'account labels remain literal text');
   check(await details.locator('img').count() === 0, 'account labels cannot inject markup');
   check((await details.innerText()).includes('图表价差'), 'a single leg falls back to the containing candle');
-  await app.locator('.trade-list-item').first().click();
+  await app.locator('.trade-summary[data-trade-type="entry"] > summary').click();
+  await app.locator('.trade-summary[data-trade-type="entry"] .trade-list-item').first().click();
   check(await app.locator('.trade-list-item[aria-pressed="true"]').count() === 1, 'the list selects the matching marker');
   await app.getByRole('button', { name: '价格对比', exact: true }).click(); check(await markers.count() === 0, 'prices never show trade markers');
   check(await app.getByRole('button', { name: '百分比价差', exact: true }).count() === 0, 'oil has no percentage tab');
@@ -31,4 +33,4 @@ async (page, options = {}) => {
   if (options.screenshot) await page.screenshot({ path: options.screenshot, fullPage: false });
   check(errors.length === 0, errors.join('\n'));
   return { markerCount: await markers.count(), sizes, errors };
-};
+}

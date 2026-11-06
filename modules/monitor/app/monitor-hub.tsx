@@ -144,8 +144,8 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil" }: {
           <div className="hub-alert-settings">{monitors.filter(monitor => enabled(monitor.id) && monitor.capabilities.includes("alerts")).map(monitor => <div key={monitor.id} hidden={active !== monitor.id}>{monitorAlertAdapters[monitor.id] ? <AlertSettings active={hub.readActive && active === monitor.id} monitorId={monitor.id} title={monitor.title} adapter={monitorAlertAdapters[monitor.id]} onView={reportAlertView} openRequest={alertOpenRequests[monitor.id] ?? 0}/> : <p role="alert">该监控模块尚未接入统一告警设置。</p>}</div>)}</div>
         </div>
         {active !== "perpetual" && detailEnabled ? <aside className="monitor-detail-side">
-          {hasAlerts ? <MonitorAlertSide state={alertStates[alertId]} onOpenRules={openAlertRules}/> : null}
           <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.active} spreads={active === "oil" ? oilSpreads : active === "hynix" ? hynixSpreads : undefined}/>
+          {hasAlerts ? <MonitorAlertSide state={alertStates[alertId]} onOpenRules={openAlertRules}/> : null}
         </aside> : null}
       </div>
     </Tabs>

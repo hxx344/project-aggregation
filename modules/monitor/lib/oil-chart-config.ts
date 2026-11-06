@@ -14,7 +14,7 @@ export const OIL_SPREAD_CHART: SpreadChartConfig = {
   modes: ["spread", "price"], tabs: { spread: "价差", price: "价格对比" }, units: { spread: "USDT / 桶 · 布伦特 − WTI", price: "USDT / 桶" },
   spreadName: "价差", legs: ["布伦特", "WTI"], zeroLabel: "0 = 同价", domainStep: 1, digits: 3, price: usdt,
   tick: { spread: v => `${Number(v.toFixed(2))}`, price: v => `${Number(v.toFixed(1))}` },
-  tradeEvents: oilTradeEvents,
+  tradeEvents: oilTradeEvents, tradeMarket: "oil",
   tradeMarkers: (events: TradeEvent[], points: Point[]) => spreadTradeMarkers(events, points, { intervalMs: OIL_BAR_MS, rightPerUnit: 1, tradedBasis: "成交价差", chartBasis: "图表价差", metric: "spread" }),
   trade: { priceUnit: "/桶", chartLabel: "图表同时刻价差", chartNote: "15 分钟 K 线收盘，未收盘 K 线为未知", metricName: "价差" },
   emptyText: { loading: "正在载入 15 分钟 K 线", hint: "Binance BZUSDT / CLUSDT 同一时段已收盘 K 线" },
