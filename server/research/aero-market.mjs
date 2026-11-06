@@ -39,7 +39,7 @@ const DISCOVERY_GAUGE_BATCH = 360;
 const DISCOVERY_STATE_BATCH = 89;
 // 重新发现的真实请求错误从 30 分钟起翻倍退避，最长 6 小时。预算耗尽不计节点错误：
 // 累计 3 次发现尝试既没有新增池子/代币，也没有在同一份动态草稿里新读到 gauge/状态分片时，另行按相同范围退避，防止发现反复耗尽整轮预算而无进展。
-// 新增池子/代币（永不过期）、发现成功或更换 RPC/TVL 门槛时清零；只有动态分片进展时不累计也不清零（分片会过期，见 dynamicMaxAgeMs）；普通当前刷新不清零。
+// 新增池子/代币（永不过期）、真实请求错误、发现成功或更换 RPC/TVL 门槛时清零；只有动态分片进展时不累计也不清零（分片会过期，见 dynamicMaxAgeMs）；普通当前刷新不清零。
 const REDISCOVERY_RETRY_SEC = 30 * 60;
 const REDISCOVERY_STALL_LIMIT = 3;
 // 动态草稿时限至少容纳的发现尝试次数（刷新间隔较长时）。
@@ -378,8 +378,15 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   const dynamicProgressed = (before, after) => after.reads > before.reads && (before.dynamic === null || after.dynamic === before.dynamic);
   // 动态草稿时限：一个重新发现周期（6 小时）与 DYNAMIC_DRAFT_ATTEMPTS 个尝试间隔中的较长者。预算耗尽后让位一轮当前刷新，
   // 相邻两次尝试最多相隔两个（刷新间隔 + 整轮预算），第 3 次尝试最晚约在两个尝试间隔后开始，留出一个间隔的余量。
-  // 网络错误或无进展退避（最长 6 小时）期间草稿仍可能过期，之后从头重读：退化为修复前的"一轮读完"，不会更差。
+  // 网络错误或无进展退避（最长 6 小时）期间草稿仍可能过期，见 backOffDiscovery。
   const dynamicMaxAgeMs = () => Math.max(DISCOVERY_SEC * 1000, DYNAMIC_DRAFT_ATTEMPTS * 2 * (config.intervalMin * 60_000 + cycleDeadlineMs));
+  // 退避到期时草稿已过时限的，进入退避时就丢弃动态草稿：退避后那次尝试从无草稿开始，首次读到的分片算作进展。
+  // 否则过期重开每次都计一次无进展，无进展退避升到 6 小时后每次退避都让草稿过期，需要两次以上尝试的节点永远完不成。
+  const backOffDiscovery = (rt, retryAt) => {
+    rt.rediscoverRetryAt = retryAt;
+    const dynamic = rt.discoveryDraft?.dynamic;
+    if (dynamic && retryAt - dynamic.startedAt > dynamicMaxAgeMs()) rt.discoveryDraft.dynamic = null;
+  };
   const rediscoveryDelay = (attempt) => Math.min(REDISCOVERY_RETRY_SEC * 2 ** (attempt - 1), DISCOVERY_SEC) * 1000;
 
   // 读取已完整返回的结果照常发布，即使整轮已到期：到期只用来取消仍在途的读取，后续回填据此停止。
@@ -423,7 +430,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
               rt.rediscoverStalls += 1;
               if (rt.rediscoverStalls >= REDISCOVERY_STALL_LIMIT) {
                 rt.rediscoverPhase = 'budget_backoff';
-                rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverStalls - REDISCOVERY_STALL_LIMIT + 1);
+                backOffDiscovery(rt, now() + rediscoveryDelay(rt.rediscoverStalls - REDISCOVERY_STALL_LIMIT + 1));
               }
             }
             if (rt.backfillPhase === 'catching_up') rt.backfillPhase = 'backoff';
@@ -432,7 +439,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
           rt.rediscoverStalls = 0;
           rt.rediscoverPhase = 'backoff'; rt.rediscoverFailures += 1;
           rt.rediscoverError = `重新发现失败：${rpcDiagnostic(error, rpcUrl, 200)}`;
-          rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverFailures);
+          backOffDiscovery(rt, now() + rediscoveryDelay(rt.rediscoverFailures));
           log.warn?.({ type: 'aero-market', chain: id, err: rt.rediscoverError, failures: rt.rediscoverFailures }, 'Aero 池子重新发现未完成，沿用上次池子列表，退避后再试');
         }
       }

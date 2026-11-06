@@ -1223,6 +1223,36 @@ test('a retained gauge/state draft without new shards still backs off after thre
   assert.deepEqual(fake.chain.gaugeReads.slice(gaugeReads), [360, 219]);
 });
 
+test('a budget backoff that outlasts the gauge/state draft drops it, so a node needing several attempts still finishes', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const discoveredAt = baseOf(market).discovery.at;
+  fake.chain.t += 6 * 3600 + 1;
+  fake.chain.budget = 11; await clock.fire(); await settle(market);
+  assert.deepEqual([baseOf(market).discovery.phase, baseOf(market).discovery.stalledAttempts], ['pending', 0]);
+  // 之后每次尝试只有 4 批、读不到新分片，直到无进展退避升到 6 小时上限（第 7 次）；退避期间与让位轮次不限批数。
+  for (let round = 0; round < 60 && (baseOf(market).discovery.stalledAttempts ?? 0) < 7; round++) {
+    const d = baseOf(market).discovery;
+    const attempt = !d.refreshPending && (d.retryAt === null || fake.chain.t * 1000 >= d.retryAt);
+    fake.chain.budget = attempt ? 4 : Infinity;
+    await clock.fire(); await settle(market);
+    const next = baseOf(market).discovery;
+    fake.chain.t = Math.max(fake.chain.t + 15 * 60, next.retryAt === null ? 0 : Math.ceil(next.retryAt / 1000));
+  }
+  const d = baseOf(market).discovery;
+  assert.deepEqual([d.phase, d.stalledAttempts], ['budget_backoff', 7]);
+  // 节点恢复到每次尝试 11 批（需要三次尝试）：退避后不能因草稿过期重开而再计无进展，必须能完成。
+  const log = await rediscoverRounds(market, fake, clock, { budget: 11, done: () => baseOf(market).discovery.at !== discoveredAt });
+  t.diagnostic(JSON.stringify(log));
+  assert.notEqual(baseOf(market).discovery.at, discoveredAt, 'the rediscovery completes after the long backoff');
+  assert.deepEqual([baseOf(market).discovery.phase, baseOf(market).discovery.stalledAttempts], ['idle', 0]);
+});
+
 test('a gauge or state that fails to read is not recorded in the draft and is read again by the next attempt', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
   onlyBase(dir);
