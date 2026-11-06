@@ -219,7 +219,7 @@ function readChanges(saved) {
     buildPermissions(b.permissions);
     if (b.target !== undefined && typeof b.target !== 'string') throw new Error('批次格式不符');
     batch = { createdAt: b.createdAt, baseline: b.baseline, ...(b.target === undefined ? {} : { target: b.target }), permissions: b.permissions, transactions: b.transactions,
-      pools: (b.pools ?? []).map(String), allowances: (b.allowances ?? []).map((a) => ({ symbol: String(a.symbol), perDay: String(a.perDay), decimals: Number(a.decimals) })) };
+      pools: (b.pools ?? []).map(String), allowances: (b.allowances ?? []).map((a) => ({ ...(a.token === undefined ? {} : { token: getAddress(a.token) }), symbol: String(a.symbol), perDay: String(a.perDay), decimals: Number(a.decimals) })) };
   }
   return { schema: 1, pools, allowances, batch };
 }
@@ -239,9 +239,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
   const autoPath = path.join(directory, 'auto.json'), changesPath = path.join(directory, 'changes.json'), poolPlanPath = path.join(directory, 'pool-plan.json');
   // 白名单待变更：待加池（可多个）与额度调整，合成一份 Safe 批次；批次生成时冻结，链上核对生效后并入配置，批次之后新加的变更继续保留。
-  let changes = EMPTY_CHANGES, changesPreview = null;
+  let changes = EMPTY_CHANGES, changesPreview = null, changesWriteError = null, verifyingBatch = false;
   let auto = { config: { ...AUTO_DEFAULTS }, history: [], halted: null, reopen: null, closing: null }, autoError = null, autoWatch = [], autoNote = null, autoCheckedAt = null;
   let outSince = new Map(), autoTimer = null, autoBusy = false, autoCorrupt = null;
+  // configGeneration：每次替换 config 加一；在串行队列外等 RPC 的操作回到队列提交前，据此确认配置没被换过。
+  let configGeneration = 0;
   let config = null, configError = null, wallet = null, pending = null, job = null, snapshot = null, snapshotAt = null, snapshotError = null;
   let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [], burnSeen = new Map();
   const events = [];
@@ -294,20 +296,43 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     changesPreview = out;
     return out;
   }
-  // 批次生成时的 Safe 与 Roles；换了任一个，旧批次不能再核对。上一版迁移来的批次没有记录，只比权限。
+  // 批次生成时的 Safe 与 Roles；换了任一个，旧批次不能再核对。上一版迁移来的批次没有记录目标，无从确认它发往哪个 Safe/Roles，一律要求重新生成。
   function batchTarget(cfg) { return `${cfg.safe.toLowerCase()}|${cfg.roles.toLowerCase()}`; }
-  function batchStale(batch) {
-    return !config || batch.baseline !== JSON.stringify(config.permissions) || (batch.target !== undefined && batch.target !== batchTarget(config));
+  function staleReason(batch) {
+    if (!config) return '请先保存 Safe 配置';
+    if (typeof batch.target !== 'string') return '这份批次来自旧版本，没有记录 Safe 与 Roles 地址，不能再核对，请重新生成';
+    if (batch.target !== batchTarget(config)) return 'Safe 或 Roles 地址在生成批次后已更换，这份批次不能再核对，请重新生成';
+    if (batch.baseline !== JSON.stringify(config.permissions)) return 'Safe 权限配置在生成批次后已变化，这份批次不能再核对，请重新生成';
+    return null;
+  }
+  const permissionsKey = (p) => JSON.stringify({ roleKey: p.roleKey, pools: p.pools, swaps: p.swaps ?? [], allowances: p.allowances });
+  // 批次的权限已是当前配置（核对启用写入配置后，待变更没写进去就重启）：当作已启用，不再要求重新生成或签名。
+  function batchApplied(batch) {
+    return Boolean(config) && typeof batch.target === 'string' && batch.target === batchTarget(config) && permissionsKey(batch.permissions) === permissionsKey(config.permissions);
+  }
+  // 冻结批次与最新草稿的差异：added 只在草稿里（不在这份批次）；withdrawn 只在批次里（草稿已撤回或改了值，旧批次文件执行时仍会生效）。
+  function batchDiff(batch) {
+    const draftPools = changes.pools.map((p) => p.name);
+    const draft = changes.allowances.map((a) => ({ token: a.token, symbol: a.symbol, perDay: a.perDay, decimals: a.decimals }));
+    const same = (a, b) => (a.token && b.token ? sameAddress(a.token, b.token) : a.symbol === b.symbol) && a.perDay === b.perDay;
+    const label = ({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals });
+    return {
+      added: { pools: draftPools.filter((name) => !batch.pools.includes(name)), allowances: draft.filter((a) => !batch.allowances.some((b) => same(a, b))).map(label) },
+      withdrawn: { pools: batch.pools.filter((name) => !draftPools.includes(name)), allowances: batch.allowances.filter((b) => !draft.some((a) => same(a, b))).map(label) },
+    };
   }
   function changesView() {
     const next = changesNext(), batch = changes.batch;
     const current = (token) => config?.permissions.allowances.find((a) => sameAddress(a.token, token))?.perDay ?? null;
+    const stale = batch && staleReason(batch);
     return {
       pools: structuredClone(changes.pools), allowances: changes.allowances.map((a) => ({ ...a, current: current(a.token) })),
       preview: { transactions: next.transactions.length, usage: next.usage, error: next.error },
-      batch: batch && { createdAt: batch.createdAt, transactions: batch.transactions, pools: [...batch.pools], allowances: structuredClone(batch.allowances),
-        stale: batchStale(batch),
-        behind: Boolean(next.permissions) && JSON.stringify(next.permissions) !== JSON.stringify(batch.permissions) },
+      persistError: changesWriteError,
+      batch: batch && { createdAt: batch.createdAt, transactions: batch.transactions, pools: [...batch.pools], allowances: batch.allowances.map(({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals })),
+        stale: Boolean(stale), staleReason: stale,
+        behind: Boolean(next.permissions) && JSON.stringify(next.permissions) !== JSON.stringify(batch.permissions),
+        ...batchDiff(batch) },
     };
   }
   // 保存待变更；全空时删除文件。失败时内存保持原样。
@@ -317,25 +342,35 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       log.warn?.({ type: 'aero-safe', err: error }, 'Aero 白名单待变更保存失败');
       throw new HttpError(500, '白名单待变更保存失败，请检查数据目录权限后重试');
     }
-    changes = empty ? EMPTY_CHANGES : next;
+    changes = empty ? EMPTY_CHANGES : next; changesWriteError = null;
   }
-  // 配置变化后清掉已生效或已无意义的待变更；写不进去只记日志，下次变更时再写。
-  function settleChanges() {
+  // 配置已经写入、待变更必须跟着整理时：写不进去也按整理后的内容继续，并在页面报告；下次写入成功即清除。
+  function keepChanges(next, message) {
+    try { saveChanges(next); } catch (error) {
+      changes = next; changesWriteError = message;
+      record({ event: 'changes_write_failed', error: message });
+    }
+  }
+  // 配置变化后清掉已生效或已无意义的待变更。recognizeApplied 只在启动时为 true：
+  // 认出「核对启用写入配置后待变更没写进去」的批次；运行时手动保存出相同权限不代表批次已在 Safe 执行，仍按失效处理。
+  function settleChanges({ recognizeApplied = false } = {}) {
     if (!config) return;
-    const next = normalizeChanges(config.permissions, changes);
+    const applied = recognizeApplied && changes.batch && batchApplied(changes.batch);
+    const next = normalizeChanges(config.permissions, applied ? { ...changes, batch: null } : changes);
     if (JSON.stringify(next) === JSON.stringify(changes)) return;
-    try { saveChanges(next); } catch { changes = next; }
+    if (applied) record({ event: 'changes_batch_recognized', pools: changes.batch.pools });
+    keepChanges(next, '白名单待变更文件 aero-safe/changes.json 写入失败，页面显示的是整理后的内容；重启后会按配置重新整理。请检查数据目录权限');
   }
   // 链上读取并核验池子，返回带精度与符号的池子信息。
-  async function inspect(poolAddress) {
+  async function inspect(poolAddress, cfg) {
     let info;
-    try { info = await withBudget(chain.inspectPool(makeProvider(config.rpcUrl), poolAddress), POOL_BUDGET_MS, '链上核验池子'); } catch (error) {
+    try { info = await withBudget(chain.inspectPool(makeProvider(cfg.rpcUrl), poolAddress), POOL_BUDGET_MS, '链上核验池子'); } catch (error) {
       if (error instanceof HttpError) throw error;
       if (error instanceof chain.ExecError && error.code !== 'rpc') throw new HttpError(400, error.message);
       throw new HttpError(502, `链上核验池子失败：${error.message}`);
     }
     for (const a of [info.gauge, info.token0.address, info.token1.address]) {
-      if ([config.safe, config.roles].some((own) => sameAddress(own, a))) throw new HttpError(400, '池子的代币或 gauge 不能是 Safe 或 Roles 合约');
+      if ([cfg.safe, cfg.roles].some((own) => sameAddress(own, a))) throw new HttpError(400, '池子的代币或 gauge 不能是 Safe 或 Roles 合约');
     }
     return info;
   }
@@ -698,7 +733,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
           rmSync(poolPlanPath, { force: true });
         }
       } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 旧加池计划无法转换，已忽略'); }
-      settleChanges();
+      settleChanges({ recognizeApplied: true });
       try { const ids = readBounded(mintedPath, 64 * 1024)?.ids; minted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && /^\d{1,78}$/.test(id)).slice(0, MINTED_LIMIT) : []; } catch { minted = []; }
       try { pending = readBounded(pendingPath, 64 * 1024); } catch (error) {
         // 待确认记录损坏时不能当作没有：保留文件，禁止新操作，等人工核对。
@@ -760,43 +795,53 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       requireIdle('不能修改配置');
       if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
       const next = strictAeroSafeConfig(value);
-      atomicJson(configPath, next); config = next; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null;
+      atomicJson(configPath, next); config = next; configGeneration += 1; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null;
       settleChanges();
       void refresh();
       return state();
     }),
     // 加入待加池：链上核验池子，记下它与新代币的每日额度。不改配置、不签名；多个池子可并行等待同一份 Safe 批次。
     // allowances 为 { 代币地址: 十进制数量（代币单位）}：尚无额度的新代币必填，也可顺带改这两个代币的已有额度。
-    addPoolChange: (input, authorize = () => {}) => serial(async () => {
-      authorize();
-      requireChangesConfig();
+    // 链上核验在串行队列外等待（最长 POOL_BUDGET_MS），不挡自动调仓；回到队列后按配置代际与当前待变更重新检查再写入。
+    addPoolChange: async (input, authorize = () => {}) => {
       const body = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-      const poolAddress = address(body.pool, '池子地址');
-      if (changes.pools.some((p) => sameAddress(p.address, poolAddress))) throw new HttpError(409, '这个池子已在待加池里');
-      const info = await inspect(poolAddress);
-      if (listed(config.permissions, info)) throw new HttpError(409, '这个池子已在白名单里');
-      if (changes.pools.some((p) => listed({ pools: [{ ...p, token0: p.token0.address, token1: p.token1.address }] }, info))) throw new HttpError(409, '同一代币对与 tickSpacing 的池子已在待加池里');
-      const given = body.allowances && typeof body.allowances === 'object' && !Array.isArray(body.allowances) ? body.allowances : {};
-      const tokens = [info.token0, info.token1];
-      for (const key of Object.keys(given)) {
-        let token;
-        try { token = getAddress(key); } catch { throw new HttpError(400, '额度代币地址无效'); }
-        if (!tokens.some((t) => t.address === token)) throw new HttpError(400, `代币 ${token} 不属于这个池子`);
-      }
-      const known = (token) => config.permissions.allowances.some((a) => sameAddress(a.token, token)) || changes.allowances.some((a) => sameAddress(a.token, token));
-      const set = [];
-      for (const t of tokens) {
-        const value = Object.entries(given).find(([key]) => getAddress(key) === t.address)?.[1];
-        if (value == null && known(t.address)) continue;
-        set.push({ token: t.address, symbol: t.symbol, decimals: t.decimals, perDay: allowanceUnits(value, t.symbol, t.decimals) });
-      }
-      const name = `${info.token0.symbol}/${info.token1.symbol} ts${info.tickSpacing}`;
-      const pool = { address: info.address, name, gauge: info.gauge, tickSpacing: info.tickSpacing, token0: changeToken(info.token0), token1: changeToken(info.token1), addedAt: now() };
-      const allowances = [...changes.allowances.filter((a) => !set.some((x) => sameAddress(x.token, a.token))), ...set];
-      acceptChanges(normalizeChanges(config.permissions, { ...changes, pools: [...changes.pools, pool], allowances }));
-      record({ event: 'pool_queued', pool: name });
-      return state();
-    }),
+      const { poolAddress, generation, cfg } = await serial(() => {
+        authorize();
+        requireChangesConfig();
+        const poolAddress = address(body.pool, '池子地址');
+        if (changes.pools.some((p) => sameAddress(p.address, poolAddress))) throw new HttpError(409, '这个池子已在待加池里');
+        return { poolAddress, generation: configGeneration, cfg: config };
+      });
+      const info = await inspect(poolAddress, cfg);
+      return serial(() => {
+        authorize();
+        requireChangesConfig();
+        if (configGeneration !== generation) throw new HttpError(409, 'Safe 配置在核验池子期间已变化，请重新加入');
+        if (changes.pools.some((p) => sameAddress(p.address, poolAddress))) throw new HttpError(409, '这个池子已在待加池里');
+        if (listed(config.permissions, info)) throw new HttpError(409, '这个池子已在白名单里');
+        if (changes.pools.some((p) => listed({ pools: [{ ...p, token0: p.token0.address, token1: p.token1.address }] }, info))) throw new HttpError(409, '同一代币对与 tickSpacing 的池子已在待加池里');
+        const given = body.allowances && typeof body.allowances === 'object' && !Array.isArray(body.allowances) ? body.allowances : {};
+        const tokens = [info.token0, info.token1];
+        for (const key of Object.keys(given)) {
+          let token;
+          try { token = getAddress(key); } catch { throw new HttpError(400, '额度代币地址无效'); }
+          if (!tokens.some((t) => t.address === token)) throw new HttpError(400, `代币 ${token} 不属于这个池子`);
+        }
+        const known = (token) => config.permissions.allowances.some((a) => sameAddress(a.token, token)) || changes.allowances.some((a) => sameAddress(a.token, token));
+        const set = [];
+        for (const t of tokens) {
+          const value = Object.entries(given).find(([key]) => getAddress(key) === t.address)?.[1];
+          if (value == null && known(t.address)) continue;
+          set.push({ token: t.address, symbol: t.symbol, decimals: t.decimals, perDay: allowanceUnits(value, t.symbol, t.decimals) });
+        }
+        const name = `${info.token0.symbol}/${info.token1.symbol} ts${info.tickSpacing}`;
+        const pool = { address: info.address, name, gauge: info.gauge, tickSpacing: info.tickSpacing, token0: changeToken(info.token0), token1: changeToken(info.token1), addedAt: now() };
+        const allowances = [...changes.allowances.filter((a) => !set.some((x) => sameAddress(x.token, a.token))), ...set];
+        acceptChanges(normalizeChanges(config.permissions, { ...changes, pools: [...changes.pools, pool], allowances }));
+        record({ event: 'pool_queued', pool: name });
+        return state();
+      });
+    },
     // 设定每日额度：{ 代币地址: 十进制数量 | null }。null 撤回对已有额度的调整；待加池新代币的额度只能改不能撤。
     setAllowanceChanges: (input, authorize = () => {}) => serial(() => {
       authorize();
@@ -843,7 +888,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const createdAt = now();
       const label = (a) => ({ symbol: a.symbol, perDay: a.perDay, decimals: a.decimals });
       const batch = { createdAt, baseline: JSON.stringify(config.permissions), target: batchTarget(config), permissions: next.permissions, transactions: next.transactions.length,
-        pools: changes.pools.map((p) => p.name), allowances: changes.allowances.map(label) };
+        pools: changes.pools.map((p) => p.name), allowances: changes.allowances.map((a) => ({ token: a.token, ...label(a) })) };
       saveChanges({ ...changes, batch });
       const names = batch.pools.length ? batch.pools.join('、') : '调整额度';
       record({ event: 'changes_batched', pools: batch.pools, allowances: batch.allowances.length, transactions: batch.transactions });
@@ -852,35 +897,56 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       return { transactions: next.transactions.map((t) => ({ to: t.to, description: t.description })), builder, usage: next.usage, state: state() };
     }),
     // 硬件钱包在 Safe{Wallet} 执行批次后：以 bot 身份模拟核对批次里的权限全部已在链上生效，再并入配置。批次之后新加的变更继续保留。
-    applyChangeBatch: (authorize = () => {}) => serial(async () => {
-      authorize();
-      requireIdle('不能修改配置');
-      if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
-      const batch = changes.batch;
-      if (!batch) throw new HttpError(409, '还没有生成 Safe 批次');
-      if (batchStale(batch)) throw new HttpError(409, 'Safe 配置在生成批次后已变化，请重新生成批次');
-      if (!wallet) throw new HttpError(409, '请先填写 bot 私钥：生效核对以 bot 身份模拟');
-      let result;
+    // 模拟核对在串行队列外等待（最长 POOL_BUDGET_MS），不挡自动调仓；同一时间只跑一次。回到队列后重新检查登录、维护、
+    // 任务与未结清交易，并确认配置代际、批次与 bot 都没变，才写入配置。
+    applyChangeBatch: async (authorize = () => {}) => {
+      const ready = () => {
+        authorize();
+        requireIdle('不能修改配置');
+        const hold = holdReason();
+        if (hold) throw new HttpError(503, hold);
+        if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
+        const batch = changes.batch;
+        if (!batch) throw new HttpError(409, '还没有生成 Safe 批次');
+        const stale = staleReason(batch);
+        if (stale) throw new HttpError(409, stale);
+        if (!wallet) throw new HttpError(409, '请先填写 bot 私钥：生效核对以 bot 身份模拟');
+        return batch;
+      };
+      const plan = await serial(() => {
+        if (verifyingBatch) throw new HttpError(409, '正在核对链上权限，请等这一次结束');
+        const batch = ready();
+        verifyingBatch = true;
+        return { batch, generation: configGeneration, cfg: config, bot: wallet };
+      });
       try {
-        result = await withBudget(chain.verifyActive({ rpc: makeProvider(config.rpcUrl), safe: config.safe, roles: config.roles, bot: wallet,
-          current: buildPermissions(config.permissions), next: buildPermissions(batch.permissions), now }), POOL_BUDGET_MS, '核对链上权限');
-      } catch (error) {
-        if (error instanceof HttpError) throw error;
-        throw new HttpError(502, `核对链上权限失败：${error.message}`);
-      }
-      if (!result.ok) {
-        const failed = result.checks.filter((c) => !c.ok);
-        throw new HttpError(409, `批次尚未在链上生效（${failed.length}/${result.checks.length} 项未通过）：${failed.slice(0, 3).map((c) => `${c.label} ${c.status}`).join('；')}。请确认 Safe 已执行完整批次后再试`);
-      }
-      const next = strictAeroSafeConfig({ ...config, permissions: batch.permissions });
-      atomicJson(configPath, next);
-      config = next; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null;
-      const rest = normalizeChanges(config.permissions, { ...changes, batch: null });
-      try { saveChanges(rest); } catch (error) { changes = rest; }
-      record({ event: 'changes_applied', pools: batch.pools, allowances: batch.allowances.length, checks: result.checks.length });
-      void refresh();
-      return state();
-    }),
+        const { batch, cfg, bot } = plan;
+        let result;
+        try {
+          result = await withBudget(chain.verifyActive({ rpc: makeProvider(cfg.rpcUrl), safe: cfg.safe, roles: cfg.roles, bot,
+            current: buildPermissions(cfg.permissions), next: buildPermissions(batch.permissions), now }), POOL_BUDGET_MS, '核对链上权限');
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          throw new HttpError(502, `核对链上权限失败：${error.message}`);
+        }
+        if (!result.ok) {
+          const failed = result.checks.filter((c) => !c.ok);
+          throw new HttpError(409, `批次尚未在链上生效（${failed.length}/${result.checks.length} 项未通过）：${failed.slice(0, 3).map((c) => `${c.label} ${c.status}`).join('；')}。请确认 Safe 已执行完整批次后再试`);
+        }
+        return await serial(() => {
+          if (ready() !== batch || configGeneration !== plan.generation || wallet !== bot) throw new HttpError(409, 'Safe 配置、批次或 bot 在核对期间已变化，请重新核对');
+          const next = strictAeroSafeConfig({ ...config, permissions: batch.permissions });
+          atomicJson(configPath, next);
+          config = next; configGeneration += 1; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null;
+          // 配置已是提交点：待变更写不进去时页面报告，重启后 settleChanges 按配置认出这份已启用的批次，不要求重新签名。
+          keepChanges(normalizeChanges(config.permissions, { ...changes, batch: null }),
+            '批次已核对启用并写入配置，但待变更文件 aero-safe/changes.json 写入失败；重启后会按配置认出这份已启用的批次，不需要重新签名。请检查数据目录权限');
+          record({ event: 'changes_applied', pools: batch.pools, allowances: batch.allowances.length, checks: result.checks.length });
+          void refresh();
+          return state();
+        });
+      } finally { verifyingBatch = false; }
+    },
     // 放弃全部待变更与已生成的批次（批次如已在 Safe 执行，链上权限不会因此撤回）。
     clearChanges: (authorize = () => {}) => serial(() => {
       authorize();

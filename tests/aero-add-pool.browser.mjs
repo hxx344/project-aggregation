@@ -83,7 +83,8 @@ async (page) => {
       return send(state());
     }
     if (url.pathname === `${root}/changes/batch` && method === 'POST') {
-      batch = { createdAt: Date.now(), transactions: 4, pools: ['WETH/cbBTC ts1'], allowances: allowances.map(({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals })), stale: false, behind: false };
+      batch = { createdAt: Date.now(), transactions: 4, pools: ['WETH/cbBTC ts1'], allowances: allowances.map(({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals })), stale: false, staleReason: null, behind: false,
+        added: { pools: [], allowances: [] }, withdrawn: { pools: [], allowances: [] } };
       return send({ builder: { version: '1.0', chainId: '8453', transactions: [] }, usage: [{ label: 'Router.exactInputSingle', nodes: 29 }],
         transactions: [{ to: '0xfed', description: '限定目标 gauge WETH/cbBTC ts1' }, { to: '0xfed', description: '按条件允许 NPM.mint' }, { to: '0xfed', description: '额度 cbBTC：每 24 小时 1000000（最小单位）' },
           { to: '0xfed', description: '调整额度 USDC：每 24 小时 1000000000 → 500000000（最小单位），执行后当天可用额度按新值计满' }], state: state() });

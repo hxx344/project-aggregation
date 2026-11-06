@@ -55,9 +55,15 @@ export type AeroSafeChanges = {
   pools: AeroSafeChangePool[];
   allowances: { token: string; symbol: string; decimals: number; perDay: string; current: string | null }[];
   preview: { transactions: number; usage: { label: string; nodes: number }[]; error: string | null };
-  // stale：配置在生成后已变化，不能再核对；behind：生成后又有变更，未包含在这份批次里。
-  batch: { createdAt: number; transactions: number; pools: string[]; allowances: { symbol: string; perDay: string; decimals: number }[]; stale: boolean; behind: boolean } | null;
+  // 待变更文件写盘失败时的说明（内存里已按整理后的内容继续）；下次写入成功即为 null。
+  persistError: string | null;
+  // stale：配置在生成后已变化或批次没有记录目标地址，不能再核对，staleReason 为原因；behind：最新草稿合成的权限与这份批次不同。
+  // added：只在最新草稿里、不在这份批次的项；withdrawn：在这份批次里、草稿已撤回或改了值的项（旧批次文件执行时仍会生效）。
+  batch: { createdAt: number; transactions: number; pools: string[]; allowances: AeroSafeBatchAllowance[]; stale: boolean; staleReason: string | null; behind: boolean;
+    added: AeroSafeBatchItems; withdrawn: AeroSafeBatchItems } | null;
 };
+export type AeroSafeBatchAllowance = { symbol: string; perDay: string; decimals: number };
+export type AeroSafeBatchItems = { pools: string[]; allowances: AeroSafeBatchAllowance[] };
 // POST /changes/batch：builder 为 Safe{Wallet} Transaction Builder 可导入的批次 JSON。
 export type AeroSafeChangeBatch = { transactions: { to: string; description: string }[]; builder: unknown; usage: { label: string; nodes: number }[]; state: AeroSafeState };
 export type AeroSafePreview = {
