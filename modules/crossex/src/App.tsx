@@ -109,7 +109,8 @@ export default function App() {
       const poll = async () => { if (version !== epoch || stopped) return; const startedAt = performance.now(); await refresh(); if (version === epoch && !stopped) timer = setTimeout(poll, readPollDelay(stateFailures.current ? readRetryDelay(stateFailures.current) : Math.max(0, STATE_POLL_MS - (performance.now() - startedAt)), hub.background)); };
       void poll();
     };
-    const ageTimer = setInterval(() => { if (hub.readActive && !document.hidden) setNow(serverClock.current.now()); }, 1000);
+    // A hidden iframe still reports document.hidden=false; ageing it every second re-renders the whole tree for nothing.
+    const ageTimer = setInterval(() => { if (hub.readActive && !hub.background) setNow(serverClock.current.now()); }, 1000);
     synchronize(); const stopWake = observeReadWake(synchronize);
     return () => { stopped = true; epoch++; clearTimeout(timer); clearInterval(ageTimer); cancelRead(); stopWake(); };
   }, [hub.readActive, hub.background, tab, refresh, cancelRead]);

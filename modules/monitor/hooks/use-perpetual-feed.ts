@@ -41,12 +41,16 @@ export function usePerpetualFeed(active: boolean, paused = false) {
         setError("网络已断开，恢复连接后自动更新。");
         return;
       }
+      const switched = Boolean(controls.current) && background !== previousBackground;
+      if (switched) { controls.current?.stop(); controls.current = null; }
       if (controls.current) {
-        if (!background && (previousBackground || event?.type === 'focus' || event?.type === 'pageshow' || event?.type === 'online')) { controls.current.resume(); publisher.flush(); }
+        if (!background && (event?.type === 'focus' || event?.type === 'pageshow' || event?.type === 'online')) { controls.current.resume(); publisher.flush(); }
         return;
       }
       controls.current = startPerpetualFeed({
         fetchSnapshot: readPerpetualSnapshot,
+        // Background pages poll every 30 seconds instead of holding the per-second stream.
+        stream: !background, deferFirstRead: switched && background,
         pollIntervalMs: () => backgroundReadDelay(PERPETUAL_DISPLAY_INTERVAL_MS),
         createStream: () => {
           const source = new EventSource("/api/monitors/perpetual/stream");

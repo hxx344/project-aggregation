@@ -16,6 +16,10 @@ interface FeedOptions {
   cancel?: (timer: unknown) => void;
   monotonic?: () => number;
   pollIntervalMs?: () => number;
+  /** false: snapshot polling only, so a background page holds no SSE connection or per-second frame work. */
+  stream?: boolean;
+  /** Wait one poll interval before the first polling read, for a page that already shows data. */
+  deferFirstRead?: boolean;
 }
 
 export class PerpetualRequestError extends Error {}
@@ -265,10 +269,16 @@ export function startPerpetualFeed(options: FeedOptions) {
     } catch { switchToPolling(); }
   }
 
-  options.onConnection("connecting");
-  connect();
-  // A buffered SSE connection must not delay the first visible snapshot.
-  void loadSnapshot();
+  options.onConnection(options.stream === false ? "polling" : "connecting");
+  if (options.stream === false) {
+    fallback = true;
+    if (options.deferFirstRead) pollingTimer = schedule(() => { void loadSnapshot(); }, options.pollIntervalMs?.() ?? 5_000);
+    else void loadSnapshot();
+  } else {
+    connect();
+    // A buffered SSE connection must not delay the first visible snapshot.
+    void loadSnapshot();
+  }
   return {
     refresh: () => { clear(pollingTimer); return loadSnapshot(); },
     resume() {
@@ -279,6 +289,7 @@ export function startPerpetualFeed(options: FeedOptions) {
       if (stream && now - streamActivityAt < 12_000 || now - resumedAt < 1_000) return;
       resumedAt = now;
       clear(reconnectTimer); clear(pollingTimer);
+      if (options.stream === false) { void loadSnapshot(); return; }
       if (request && now - requestStartedAt >= 12_000) {
         request.abort(); clear(requestTimer); request = null;
       }
