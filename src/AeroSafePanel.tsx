@@ -96,6 +96,12 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
   const blocked = !state?.wallet ? '请先在 Aero「配置」填写 bot 私钥' : state.paused ? state.pauseReason : running ? `${job.label}正在执行` : state.pending && !state.pending.stale ? `上一笔交易（${state.pending.label}）等待上链` : null;
   const t0 = tokenOf(state?.chain, pool.token0.address), t1 = tokenOf(state?.chain, pool.token1.address);
   const amount = (raw: string | null | undefined, token: typeof t0) => (token ? `${units(raw, token.decimals)} ${token.symbol}` : '—');
+  // 每日额度按兑换卖出量与开仓投入量合计消耗，24 小时周期内补满。
+  const allowanceText = (p: AeroSafePreview) => {
+    const rows = (p.allowance ?? []).filter((a) => BigInt(a.need) > 0n);
+    if (!rows.length) return '';
+    return `消耗今日额度 ${rows.map((a) => { const token = tokenOf(state?.chain, a.token); return `${amount(a.need, token)}（剩 ${a.remaining == null ? '无额度' : amount(a.remaining, token)}）`; }).join('、')}。`;
+  };
 
   const runPreview = async () => {
     if (shareBps === null || capInvalid) return;
@@ -103,7 +109,7 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
     if (data) { const at = Date.now(); setPreview({ key, data, at, cap }); setClock(at); }
   };
   const open = () => {
-    if (!preview || preview.key !== key || expired || shareBps === null) return;
+    if (!preview || preview.key !== key || expired || shareBps === null || preview.data.allowanceShort) return;
     const p = preview.data;
     const slippage = (state?.config?.slippageBps ?? 50) / 100;
     const lines = [`在 ${pool.token0.symbol}/${pool.token1.symbol} CL${pool.tickSpacing} 开仓：tick ${range[0]} 至 ${range[1]}`,
@@ -134,9 +140,10 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
         <label className="as-check"><input type="checkbox" checked={rebalance} onChange={(e) => setRebalance(e.target.checked)} />按区间比例先兑换配平</label>
         <span className="as-range">tick {range[0]} 至 {range[1]}</span>
         <button type="button" className="button secondary" disabled={!!busy || shareBps === null || capInvalid || range[0] >= range[1]} onClick={() => void runPreview()}>{busy === 'preview' ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}预览</button>
-        <button type="button" className="button primary" disabled={!!busy || !!blocked || !preview || !!stale} title={blocked ?? (stale ? (expired ? '预览已过期，请重新预览' : '区间、比例或上限已改变，请重新预览') : !preview ? '请先预览' : undefined)} onClick={open}>{busy === 'open' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开仓并质押</button>
+        <button type="button" className="button primary" disabled={!!busy || !!blocked || !preview || !!stale || !!preview.data.allowanceShort} title={blocked ?? (stale ? (expired ? '预览已过期，请重新预览' : '区间、比例或上限已改变，请重新预览') : !preview ? '请先预览' : preview.data.allowanceShort ?? undefined)} onClick={open}>{busy === 'open' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开仓并质押</button>
       </div>
-      {preview && !stale ? <p className="as-muted">预览：投入 {amount(preview.data.amount0, t0)} + {amount(preview.data.amount1, t1)}{preview.data.capped ? `（已按上限 $${preview.cap?.usd.toLocaleString('zh-CN')} 缩减）` : ''}；{preview.data.swap ? `兑换 ${amount(preview.data.swap.amountIn, tokenOf(state.chain, preview.data.swap.tokenIn))}${preview.data.swap.quoted ? ` → 约 ${amount(preview.data.swap.quoted, tokenOf(state.chain, preview.data.swap.tokenOut))}` : '（授权后再报价）'}` : '无需兑换'}；预计存入约 {amount(preview.data.deposit0, t0)} + {amount(preview.data.deposit1, t1)}，零头留在 Safe。</p> : null}
+      {preview && !stale ? <p className="as-muted">预览：投入 {amount(preview.data.amount0, t0)} + {amount(preview.data.amount1, t1)}{preview.data.capped ? `（已按上限 $${preview.cap?.usd.toLocaleString('zh-CN')} 缩减）` : ''}；{preview.data.swap ? `兑换 ${amount(preview.data.swap.amountIn, tokenOf(state.chain, preview.data.swap.tokenIn))}${preview.data.swap.quoted ? ` → 约 ${amount(preview.data.swap.quoted, tokenOf(state.chain, preview.data.swap.tokenOut))}` : '（授权后再报价）'}` : '无需兑换'}；预计存入约 {amount(preview.data.deposit0, t0)} + {amount(preview.data.deposit1, t1)}，零头留在 Safe。{allowanceText(preview.data)}</p> : null}
+      {preview && !stale && preview.data.allowanceShort ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{preview.data.allowanceShort}，暂不能开仓。</span></div> : null}
       {preview && expired && preview.key === key ? <p className="as-muted">预览已超过 2 分钟，请重新预览后再开仓。</p> : null}
       {blocked && state.wallet ? <p className="as-muted">{blocked}</p> : null}
     </>;
