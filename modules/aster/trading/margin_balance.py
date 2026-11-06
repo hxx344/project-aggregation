@@ -74,10 +74,30 @@ TRANSFER_SETTLE_COOLDOWN_SECONDS = 30
 # label defer bound so a late credit can land before balances are re-planned.
 TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS = 300
 PARTIAL_BASIS = "nonce_expired_partial_receipt"
+# More than one same-amount candidate on a side: none can be attributed to
+# the original request, so it is never confirmed and waits the long cooldown.
+AMBIGUOUS_BASIS = "nonce_expired_ambiguous_receipt"
 # Why an expired write was settled. The shared row only says it no longer
 # blocks: "rejected" there is never an exchange rejection.
-SETTLE_BASES = frozenset({"late_receipt_confirmed", "nonce_expired_no_receipt", PARTIAL_BASIS,
+SETTLE_BASES = frozenset({"late_receipt_confirmed", "nonce_expired_no_receipt", PARTIAL_BASIS, AMBIGUOUS_BASIS,
                           "nonce_expired_unreadable", "identity_changed", "nonce_expired_no_follow_up"})
+# The transfer endpoint has no client transfer ID and the shared admission
+# fixes its five parameters, so without the exchange tranId a late receipt is
+# attributed by side, amount and time only. Same-amount receipts already
+# visible just before signing cannot belong to the new request; they are kept
+# as before_receipts and excluded at settlement. A receipt that appears only
+# after the snapshot (an external transfer B, or an earlier one still
+# clearing) stays indistinguishable: one such candidate is still confirmed,
+# but with an attribution note and the long cooldown, so "ambiguous
+# attribution" includes a possibly wrong success label.
+# The snapshot is best effort and only taken when a shared follow-up can use
+# it: one page per side, a short timeout and no retry. A missing budget,
+# failure, throttle or full page omits that side (an exchange throttle also
+# defers the transfer through the shared cooldown, as for any request); it
+# never blocks sending.
+TRANSFER_SNAPSHOT_TIMEOUT_SECONDS = 4
+TRANSFER_SNAPSHOT_WEIGHT = 30
+TRANSFER_SNAPSHOT_RECEIPTS_LIMIT = 100
 TRANSFER_SWEEP_SECONDS = 30
 SETTLE_WAIT = "结算前共享准入暂停该组账户的新写入，原请求不会重发"
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
@@ -666,12 +686,13 @@ class MarginBalancer:
         return result
 
     @staticmethod
-    def _income_page(broker, start, end, reconciliation, observation, *, collected=None):
+    def _income_page(broker, start, end, reconciliation, observation, *, collected=None, timeout=None):
         priority = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
         with priority:
             try:
                 rows = broker.api.call("GET", "/fapi/v3/income",
-                    {"startTime": start, "endTime": end, "limit": TRANSFER_INCOME_PAGE_ROWS}, signed=True, weight=30)
+                    {"startTime": start, "endTime": end, "limit": TRANSFER_INCOME_PAGE_ROWS}, signed=True, weight=30,
+                    **({"timeout": timeout} if timeout is not None else {}))
             except RequestNotSent:
                 raise
             except ExchangeError as exc:
@@ -833,7 +854,7 @@ class MarginBalancer:
             return max(row["createdAt"] / 1000, row["updatedAt"] / 1000, floor) + TRANSFER_NONCE_EXPIRY_SECONDS
 
         view = lambda status, reason: self._view(state, config, status, reason, blocks=True)
-        settled, in_flight = [], False
+        settled, in_flight, ambiguous, weak = [], False, False, False
         while records:
             record = records[0]
             candidates = ("aster:transfer:" + record["request_id"],
@@ -871,15 +892,20 @@ class MarginBalancer:
                     self._swept_at.pop(pair["id"], None)
                     return view("unknown", "上次划转（" + record["request_id"][:8] + "）已过有效期，流水读取等待限流（"
                         + api_wait_notice(exc)["text"] + "），稍后自动结算；" + SETTLE_WAIT)
-                record["label"] = label = {**({"receipt": list(receipt)} if receipt is not None else {"note": note}),
-                                           "basis": basis}
+                record["label"] = label = {**({"receipt": list(receipt)} if receipt is not None else {}),
+                                           **({"note": note} if note else {}), "basis": basis}
             receipt = label.get("receipt")
             receipt = receipt if isinstance(receipt, list) and len(receipt) == 2 else None
             evidence = self._evidence(record)
             basis = self._label_basis(label, receipt, evidence)
             cooldown = label.get("cooldown_until")
+            # Without the original tranId a confirmation is attribution by
+            # amount and time only: the receipt may be another transfer's
+            # while the original still clears, so wait as long as a partial.
+            attributed = receipt is not None and not record.get("transaction_id")
             if type(cooldown) not in (int, float) or not math.isfinite(cooldown) or cooldown <= 0:
-                duration = (TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS if basis == PARTIAL_BASIS
+                duration = (TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS
+                            if basis in (PARTIAL_BASIS, AMBIGUOUS_BASIS) or attributed
                             else TRANSFER_SETTLE_COOLDOWN_SECONDS)
                 label["cooldown_until"] = cooldown = time.time() + max(config["cooldown_seconds"], duration)
             label["basis"] = basis
@@ -897,6 +923,8 @@ class MarginBalancer:
             outcome = "confirmed" if receipt is not None else "rejected"
             settled.append(outcome)
             in_flight |= basis == PARTIAL_BASIS
+            ambiguous |= basis == AMBIGUOUS_BASIS
+            weak |= attributed
             self._audit_expired(pair, record["request_id"], outcome, label.get("note"), now, basis, evidence)
             for value in open_ops:
                 rows.pop(value)
@@ -957,13 +985,16 @@ class MarginBalancer:
         # Do not plan a new transfer in the same check that settled the old
         # one: balances may have moved, so wait a cooldown and read them again.
         self._invalidate(members)
-        outcome = "已由两侧流水核实到账" if settled == ["confirmed"] else "已过有效期并自动结算"
+        outcome = ("已由两侧流水核实到账" if settled == ["confirmed"] and not weak
+                   else "已按两侧同额流水记为到账" if settled == ["confirmed"] else "已过有效期并自动结算")
         return self._view(state, config, "cooldown", "上次结果未知的划转" + outcome
+                          + ("；无原交易编号，仅按金额与时间归属，可能为其他同额划转，延长冷却" if weak else "")
                           + ("；已见一侧流水，可能为迟到到账，延长冷却" if in_flight else "")
+                          + ("；同额流水多于一笔、无法归属本次请求，可能为迟到到账，延长冷却" if ambiguous else "")
                           + "；冷却结束后按最新余额重新评估，原请求不会重发")
 
     def _label_expired(self, pair, members, state, record, now, ready_at, *, defer=False):
-        """Label an expired write for audit: (receipt, None, basis) or (None, note, basis).
+        """Label an expired write for audit: (receipt, note or None, basis) or (None, note, basis).
 
         With ``defer`` a quota wait or throttle is raised instead, so the label
         comes from an actual read once the limit clears.
@@ -1004,7 +1035,17 @@ class MarginBalancer:
             current = self._receipt_matches(record,
                 {side: collected.get(side, []) for side in ("long", "short")}, state, confirm_start, end)
             if current == [source, destination]:
-                return common.pop(), None, "late_receipt_confirmed"
+                # Time and amount are not a request identity: an external
+                # same-amount transfer after the snapshot looks the same.
+                attribution = None if record.get("transaction_id") else ("无原交易编号，按金额与时间归属，可能误认其他同额划转" + (
+                    "" if self._snapshot_sides(record) == {"long", "short"} else "；缺少发送前流水快照"))
+                return common.pop(), attribution, "late_receipt_confirmed"
+        if source and destination and (len(source) > 1 or len(destination) > 1):
+            # Both sides show receipts but more than one same-amount
+            # candidate (e.g. the original and an external transfer both
+            # late): attribution is ambiguous. One-sided sets stay partial.
+            return None, ("归属歧义：同额候选流水 " + str(len(source)) + "/" + str(len(destination))
+                          + " 笔，无法确定哪笔属于本次请求" + ("；" + unreadable if unreadable else "")), AMBIGUOUS_BASIS
         if unreadable is not None and one_to_one:
             # An incomplete read may hide a conflicting receipt.
             return None, "两侧均见该笔流水，但本次读取不完整；" + unreadable, PARTIAL_BASIS
@@ -1038,6 +1079,52 @@ class MarginBalancer:
                 and all(isinstance(value, str) for value in item)
                 and item[0] in ("long", "short") and item[1] in TRANSFER_TYPES
                 and _identifier(item[2]) == item[2]] if isinstance(evidence, list) else []
+
+    @staticmethod
+    def _snapshot_sides(record):
+        """Sides whose pre-send receipt snapshot was recorded."""
+        before = record.get("before_receipts")
+        return {side for side, value in before.items() if side in ("long", "short") and isinstance(value, list)
+                } if isinstance(before, dict) else set()
+
+    def _before_receipts(self, members, plan):
+        """Best-effort pre-send snapshot of same-amount USD1 receipts, per completely read side."""
+        if not writer_for(self.engine).enabled:
+            return {}  # Standalone runs keep no unknown follow-up to settle.
+        now = time.time()
+        # Server time may run TRANSFER_CLOCK_TOLERANCE_SECONDS either way;
+        # the settlement read starts that far before the later creation time.
+        start = int((now - TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
+        end = int((now + TRANSFER_CLOCK_TOLERANCE_SECONDS) * 1000)
+        try:
+            # Admit both reads plus the transfer POST so the snapshot can
+            # never spend the budget the transfer itself needs.
+            self._require_budget(members, {side: TRANSFER_SNAPSHOT_WEIGHT + (5 if side == "long" else 0)
+                                           for side in members})
+        except Exception as exc:  # noqa: BLE001 - optional evidence; send without it
+            LOG.info("transfer receipt snapshot skipped: %s", type(exc).__name__)
+            return {}
+        amount = dec(plan["amount"])
+        result = {}
+        for side, sign in ((plan["source"], -1), (plan["destination"], 1)):
+            collected = []
+            try:
+                page = self._income_page(self.engine.broker(members[side]), start, end, False, None,
+                                         collected=collected, timeout=TRANSFER_SNAPSHOT_TIMEOUT_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - optional evidence; send without it
+                LOG.info("transfer receipt snapshot for %s incomplete: %s", side, type(exc).__name__)
+                if isinstance(exc, ExchangeError) and api_wait_notice(exc) is not None:
+                    break  # Honour the throttle; do not read the other side.
+                continue
+            if len(page) >= TRANSFER_INCOME_PAGE_ROWS:
+                # A full page may hide receipts; a recorded side must be complete.
+                LOG.info("transfer receipt snapshot for %s incomplete: full page", side)
+                continue
+            seen = sorted({(row["incomeType"], _identifier(row["tranId"])) for row in collected
+                           if dec(row["income"]) == amount * sign})
+            if len(seen) <= TRANSFER_SNAPSHOT_RECEIPTS_LIMIT:  # Bounded record; a truncated list is not complete.
+                result[side] = [list(item) for item in seen]
+        return result
 
     def _keep_evidence(self, record, rows, state, start, end):
         source, destination = self._receipt_matches(
@@ -1603,12 +1690,15 @@ class MarginBalancer:
             if plan is None:
                 self._record_success(pair, state)
                 return self._view(state, config, "waiting", self._no_transfer_reason(snapshots, config, diagnostics))
+            # Same-amount receipts visible now cannot belong to this request.
+            before_receipts = self._before_receipts(members, plan)
             # The fresh exchange withdrawal limit includes reserved funds;
             # trading recovery and archived orders cannot gate this transfer.
             require_current()
             created = time.time()
             pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": created, "status": "submitting",
-                "identity": self._fingerprint(pair, members, children, master)}
+                "identity": self._fingerprint(pair, members, children, master),
+                **({"before_receipts": before_receipts} if before_receipts else {})}
             checkpoints = {}
             for side, wallet in wallets.items():
                 checkpoint = getattr(self.engine.broker(members[side]), "transfer_ws_checkpoint", None)

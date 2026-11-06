@@ -104,6 +104,11 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.income_rows = {}
         self.income_error = False
         self.income_handler = None
+        # Pre-send receipt snapshots (4 s timeout) are recorded apart from
+        # settlement reads and answer from what was visible before sending.
+        self.snapshot_requests = []
+        self.snapshot_rows = {}
+        self.snapshot_handler = None
         self.api_instances = []
         self.balances = {"long": "3000", "short": "1000", "master": "0"}
         self.engine = SimpleNamespace(store=self.store, market=DemoMarket(), brokers={},
@@ -133,6 +138,13 @@ class ManagedMarginTransferTests(unittest.TestCase):
         aid = next(aid for aid, value in self.credentials.items() if value["user"] == credentials["user"])
 
         def respond(request):
+            if (request.method == "GET" and request.url.path.endswith("/income")
+                    and request.extensions.get("timeout", {}).get("read") == margin_balance.TRANSFER_SNAPSHOT_TIMEOUT_SECONDS):
+                params = dict(parse_qsl(request.url.query.decode()))
+                self.snapshot_requests.append((aid, params))
+                if self.snapshot_handler is not None:
+                    return self.snapshot_handler(aid, params, request)
+                return httpx.Response(200, json=self.snapshot_rows.get(aid, []))
             self.requests.append((aid, request.method, request.url.path))
             self.request_queries.append(request.url.query.decode())
             if request.method == "GET" and request.url.path.endswith("/accountWithJoinMargin"):
@@ -447,7 +459,9 @@ class ManagedMarginTransferTests(unittest.TestCase):
         result = self.balancer.tick(self.pair, self.snapshots())
         self.assertEqual(self.shared_state(operation_id), "confirmed")
         self.assertEqual(result["status"], "cooldown", result)
-        self.assertIn("核实到账", result["reason"])
+        # Without the original tranId this is attribution, not verification.
+        self.assertIn("记为到账", result["reason"])
+        self.assertIn("延长冷却", result["reason"])
         self.assertEqual(len(self.posts()), 1, result)
         self.assertEqual(len(self.income_queries()), 2)
         self.assertIn(["TRANSFER", "late-1"], self.state()["used_receipts"])
@@ -1291,6 +1305,169 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_partial_receipt")
         self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
         self.assertNotIn(["TRANSFER", "previous-B"], self.state().get("used_receipts", []))
+
+    # -- Attribution without the original tranId: pre-send snapshot (#184) --
+
+    def receipt_pair(self, tran_id, offset):
+        row = {**self.receipt(tran_id), "time": int((self.follow_up()["created_at"] + offset) * 1000)}
+        return {"long": {**row, "income": "-1000.00000000"}, "short": {**row, "income": "1000.00000000"}}
+
+    def settle_at(self, *receipts):
+        """Expire the follow-up, then serve (tranId, seconds after creation) receipts on both sides."""
+        self.due(self.SPAN + 1)
+        pairs = [self.receipt_pair(tran_id, offset) for tran_id, offset in receipts]
+        self.income_rows = {side: [pair[side] for pair in pairs] for side in ("long", "short")}
+        settled_at = time.time()
+        with patch("time.time", return_value=settled_at):
+            return self.balancer.tick(self.pair, self.snapshots()), settled_at
+
+    def reset_for_next_transfer(self):
+        """Clear the settled cooldown and request log so a subtest can time out a new transfer."""
+        self.income_rows = {}
+        self.balances.update(long="3000", short="1000")
+        self.due()
+        self.requests, self.request_queries, self.snapshot_requests = [], [], []
+
+    def test_pre_send_snapshot_is_recorded_on_the_follow_up_with_a_short_bounded_read(self):
+        self.snapshot_rows = {"long": [{"asset": "USD1", "incomeType": "TRANSFER", "tranId": "pre-B", "time": 1,
+                                        "income": "-1000.00000000"},
+                                       {"asset": "USD1", "incomeType": "TRANSFER", "tranId": "other", "time": 1,
+                                        "income": "-5.00000000"}]}
+        self.skip_timed_out_transfer()
+        record = self.follow_up()
+        self.assertNotIn("transaction_id", record)
+        # Only same-amount, same-direction receipts are kept, per read side.
+        self.assertEqual(record["before_receipts"], {"long": [["TRANSFER", "pre-B"]], "short": []})
+        self.assertEqual(sorted(aid for aid, _ in self.snapshot_requests), ["long", "short"])
+        created = int(record["created_at"] * 1000)
+        for _, params in self.snapshot_requests:
+            start, end = int(params["startTime"]), int(params["endTime"])
+            # The window covers the full clock tolerance on both sides of sending.
+            self.assertEqual(end - start, 2 * margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS * 1000)
+            self.assertLessEqual(start, created - margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS * 1000)
+            self.assertLess(created - start, (margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS + 5) * 1000)
+
+    def test_external_same_amount_transfer_after_creation_is_attributed_with_a_note_and_long_cooldown(self):
+        operation_id = self.skip_timed_out_transfer()  # A has no tranId; B is not in the snapshot.
+        result, settled_at = self.settle_at(("external-B", 5))
+        # Indistinguishable from A: still confirmed, but the label says so.
+        self.assert_settled_once(operation_id, result, "可能误认其他同额划转", outcome="confirmed")
+        settlement = self.settlement(operation_id)
+        self.assertEqual(settlement["basis"], "late_receipt_confirmed")
+        self.assertNotIn("缺少发送前流水快照", settlement["note"])
+        self.assertIn("记为到账", result["reason"])
+        self.assertIn("可能为其他同额划转", result["reason"])
+        self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        with patch("time.time", return_value=settled_at + 31):
+            result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
+
+    def test_original_and_external_receipts_late_together_are_ambiguous_not_confirmed(self):
+        operation_id = self.skip_timed_out_transfer()
+        result, settled_at = self.settle_at(("A", 5), ("external-B", 20))
+        self.assert_settled_once(operation_id, result, "归属歧义")
+        settlement = self.settlement(operation_id)
+        self.assertEqual(settlement["basis"], "nonce_expired_ambiguous_receipt")
+        self.assertIn("2/2", settlement["note"])
+        self.assertEqual(len(settlement["evidence"]), 4)
+        self.assertIn("无法归属", result["reason"])
+        self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+        self.assertEqual(self.state().get("used_receipts", []), [])
+
+    def test_snapshot_excludes_pre_send_receipts_across_sixty_seconds_of_clock_skew(self):
+        # Exchange clock ahead: an earlier B carries a time after the local
+        # send. Behind: B sits inside the early evidence window.
+        for skew in (margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS, -margin_balance.TRANSFER_CLOCK_TOLERANCE_SECONDS):
+            for original in (False, True):
+                with self.subTest(skew=skew, original=original):
+                    self.snapshot_rows = {"long": [{"asset": "USD1", "incomeType": "TRANSFER", "tranId": "pre-B",
+                                                    "time": 1, "income": "-1000.00000000"}],
+                                          "short": [{"asset": "USD1", "incomeType": "TRANSFER", "tranId": "pre-B",
+                                                     "time": 1, "income": "1000.00000000"}]}
+                    operation_id = self.skip_timed_out_transfer()
+                    # B's exchange time lands 55 s after/before the local send.
+                    result, settled_at = self.settle_at(("pre-B", 55 if skew > 0 else -55),
+                                                        *([("A-" + str(skew), 10)] if original else []))
+                    settlement = self.settlement(operation_id)
+                    if original:
+                        self.assert_settled_once(operation_id, result, "无原交易编号", outcome="confirmed")
+                        self.assertEqual(settlement["basis"], "late_receipt_confirmed")
+                        self.assertEqual(settlement["evidence"],
+                                         [["long", "TRANSFER", "A-" + str(skew)], ["short", "TRANSFER", "A-" + str(skew)]])
+                    else:
+                        self.assert_settled_once(operation_id, result, "两侧流水均无该笔划转")
+                        self.assertEqual(settlement["basis"], "nonce_expired_no_receipt")
+                        self.assertNotIn("evidence", settlement)
+                        self.assertEqual(self.state()["cooldown_until"], settled_at + 30)
+                    self.assertNotIn(["TRANSFER", "pre-B"], self.state().get("used_receipts", []))
+                    self.snapshot_rows = {}
+                    self.reset_for_next_transfer()
+
+    def test_follow_up_without_snapshot_keeps_the_previous_conservative_labels(self):
+        cases = {"old record, earlier B in the tolerance window": ([("pre-B", -55), ("A-1", 10)],
+                     "nonce_expired_ambiguous_receipt", "rejected"),
+                 "old record, original only": ([("A-2", 10)], "late_receipt_confirmed", "confirmed"),
+                 # The exchange clock running behind moves A before the local
+                 # send: never confirmed without the original tranId.
+                 "early original": ([("A-3", -50)], "nonce_expired_partial_receipt", "rejected")}
+        for name, (rows, basis, outcome) in cases.items():
+            with self.subTest(name):
+                operation_id = self.skip_timed_out_transfer()
+                if name.startswith("old record"):
+                    # Written before the snapshot existed.
+                    state = self.state()
+                    state["unsettled_transfers"][0].pop("before_receipts")
+                    self.store.put("pair_margin:gold", state)
+                result, settled_at = self.settle_at(*rows)
+                self.assert_settled_once(operation_id, result, None, outcome=outcome)
+                self.assertEqual(self.settlement(operation_id)["basis"], basis)
+                if outcome == "confirmed":
+                    self.assertIn("缺少发送前流水快照", self.settlement(operation_id)["note"])
+                self.assertEqual(self.state()["cooldown_until"], settled_at + 300)
+                self.reset_for_next_transfer()
+
+    def test_snapshot_failure_degrades_to_sending_without_it(self):
+        def network(aid, params, request):
+            raise httpx.ConnectError("injected snapshot failure", request=request)
+
+        def full_page(aid, params, request):
+            return httpx.Response(200, json=self.busy_rows(margin_balance.TRANSFER_INCOME_PAGE_ROWS,
+                                                           int(params["startTime"]), int(params["endTime"])))
+        cases = {"full page": (full_page, None, set()), "network": (network, None, set()),
+                 "budget": (None, 10 ** 6, set()),
+                 "one side": (lambda aid, params, request: network(aid, params, request) if aid == "short"
+                              else httpx.Response(200, json=[]), None, {"long"})}
+        for name, (handler, weight, sides) in cases.items():
+            with self.subTest(name):
+                self.snapshot_handler, self.snapshot_requests = handler, []
+                with patch.object(margin_balance, "TRANSFER_SNAPSHOT_WEIGHT", weight or margin_balance.TRANSFER_SNAPSHOT_WEIGHT):
+                    operation_id = self.skip_timed_out_transfer()
+                # The transfer was sent once anyway; nothing is retried.
+                self.assertEqual(len(self.posts()), 1)
+                self.assertEqual(len(self.snapshot_requests), 0 if name == "budget" else 2)
+                self.assertEqual(set(self.follow_up().get("before_receipts", {})), sides)
+                self.snapshot_handler = None
+                for api in self.api_instances:
+                    api.budget.until = 0
+                result, settled_at = self.settle_at(("A-" + name.replace(" ", "-"), 5))
+                self.assert_settled_once(operation_id, result, "缺少发送前流水快照", outcome="confirmed")
+                self.reset_for_next_transfer()
+
+    def test_throttled_snapshot_defers_the_transfer_like_any_throttle_and_never_leaves_it_unknown(self):
+        self.snapshot_handler = lambda aid, params, request: httpx.Response(
+            429, headers={"Retry-After": "1"}, json={"code": -1003, "msg": "Too many requests"})
+        result = self.balancer.tick(self.pair, self.snapshots())
+        # The other side is not read; the shared cooldown refuses the POST locally.
+        self.assertEqual([aid for aid, _ in self.snapshot_requests], ["long"])
+        self.assertEqual((result["status"], len(self.posts()), self.unresolved()), ("rejected", 0, []), result)
+        self.assertIsNone(self.state()["pending"])
+        self.snapshot_handler, self.snapshot_requests = None, []
+        for api in self.api_instances:
+            api.budget.until = 0
+        self.due()
+        result = self.balancer.tick(self.pair, self.snapshots())
+        self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 1), result)
+        self.assertEqual(sorted(aid for aid, _ in self.snapshot_requests), ["long", "short"])
 
     def test_receipt_on_one_side_with_an_unreadable_other_side_is_partial_not_unreadable(self):
         def network(request):
