@@ -651,8 +651,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     // 池子本身含 AERO 时不卖：收回的 AERO 是本金，卖掉再换回来白付两次滑点。
     const holdsReward = [pool.token0, pool.token1].some((t) => t.toLowerCase() === chain.REWARD_TOKEN.toLowerCase());
     try { result.sold = holdsReward ? null : await sellAfter(); } catch (error) {
-      if (error.signed === true) throw error;
-      throw new chain.ExecError(`撤出已完成；卖出 AERO 失败：${error.message}。${route ? '未换币，' : ''}收回的币留在 Safe`, { signed: true, code: error.code });
+      if (!(error instanceof chain.ExecError)) log.warn?.({ type: 'aero-safe', err: error }, 'Aero 撤出后卖出 AERO 异常');
+      throw new chain.ExecError(`撤出已完成；卖出 AERO ${error.signed === true ? '已签名、结果待核对' : '失败'}：${error.message}。${route ? '未换币，' : ''}收回的币留在 Safe`, { signed: true, code: error.code });
     }
     if (!route) return result;
     h.step('换币');
