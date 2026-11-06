@@ -22,9 +22,11 @@ const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5
 // A status read that failed in transport (timeout, connection, 5xx, rate limit)
 // says nothing about the order. Nothing is amended, cancelled or sent while it
 // is unread, so a resting hedge leg is kept for this window before the job
-// pauses and cancels it (which would leave the filled sibling unhedged).
-const READ_RETRY_MS = 20_000;
-const RATE_LIMIT_CODES = new Set([-1003, 10006]);
+// pauses and cancels it (which would leave the filled sibling unhedged). Both
+// bounds apply, so a read that hangs until the call deadline still gets retries.
+const READ_RETRY_MS = 20_000, READ_RETRY_ATTEMPTS = 3;
+// Binance -1003, Bybit 10006 and OKX 50011 are request-rate refusals.
+const RATE_LIMIT_CODES = new Set([-1003, 10006, 50011]);
 // Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
 const VENUE_CLOCK_TOLERANCE_MS = 300_000;
 // The client rounds the window out to whole seconds; stay inside its limit after rounding.
@@ -968,9 +970,10 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         const failed = working.map((order, index) => ({ order, result: readings[index] })).filter(({ result }) => result.status === 'rejected' || result.value === false);
         if (failed.length) {
           const detail = failed.map(({ order, result }) => `${TRADING_NAMES[order.exchange]} ${order.spec.symbol}：${result.status === 'rejected' ? safeError(result.reason) : '提交结果尚未查到'}`).join('；');
-          const since = readFailures.get(id) ?? now();
-          if (failed.every(({ result }) => result.status === 'rejected' && transientRead(result.reason)) && now() - since < READ_RETRY_MS) {
-            if (!readFailures.has(id)) { readFailures.set(id, since); const latest = jobFor(id); event(latest, `委托状态暂时读取失败（${detail}），${READ_RETRY_MS / 1000} 秒内重试，期间不追价、不下新单`); saveJob(latest); }
+          const streak = readFailures.get(id) ?? { since: now(), count: 0 };
+          if (failed.every(({ result }) => result.status === 'rejected' && transientRead(result.reason)) && (streak.count < READ_RETRY_ATTEMPTS || now() - streak.since < READ_RETRY_MS)) {
+            if (!streak.count) { const latest = jobFor(id); event(latest, `委托状态暂时读取失败（${detail}），至少重试 ${READ_RETRY_ATTEMPTS} 次、${READ_RETRY_MS / 1000} 秒，期间不追价、不下新单`); saveJob(latest); }
+            readFailures.set(id, { ...streak, count: streak.count + 1 });
             return;
           }
           readFailures.delete(id);
@@ -1008,7 +1011,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
             if (jobFor(id).status === 'stopping') break;
           }
         }
-      }
+      } else readFailures.delete(id);
       job = jobFor(id);
       if (job.status === 'stopping') { await stopping(job); return; }
       if (!['queued', 'running'].includes(job.status)) return;

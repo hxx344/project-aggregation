@@ -1683,9 +1683,9 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **根因：** 原逻辑只要任一腿 `inspectOrder()` 抛错就暂停并撤销余单，不区分超时、连接失败、5xx、限流这类与委托无关的传输失败。2026-11-07 Anthropic 跨所开仓第 1 批 Binance 0.78 已全部成交，Hyperliquid `io:ANTH` 买单仍在挂单，一次状态读取失败即暂停并撤掉 Hyperliquid 委托，留下无对冲的 Binance 空单；事件只写“委托状态读取失败或提交结果不明”，看不出是哪条腿、什么错误。
 
-**以后做法：** 只有传输类失败（`timeout`、`transport`、`upstream`、`aborted` 且服务未关闭、Binance -1003 / Bybit 10006 限流）在有界窗口（`READ_RETRY_MS` 20 秒）内跳过本轮重试，窗口内不追价、不撤单、不下新单，首次失败与恢复各记一条事件；数据格式、身份数量不一致、提交结果未查到等仍立即暂停。暂停原因和事件必须写明交易所、合约和具体错误。
+**以后做法：** 只有传输类失败（`timeout`、`transport`、`upstream`、`aborted` 且服务未关闭、Binance -1003 / Bybit 10006 / OKX 50011 限流）在有界窗口内跳过本轮重试，至少 `READ_RETRY_ATTEMPTS` 3 次且满 `READ_RETRY_MS` 20 秒才暂停（读取可能一直挂到 35 秒调用期限，只按时长会一次也不重试），窗口内不追价、不撤单、不下新单，首次失败与恢复各记一条事件；数据格式、身份数量不一致、提交结果未查到等仍立即暂停。暂停原因和事件必须写明交易所、合约和具体错误。
 
-**如何验证：** 运行 `node --test --test-name-pattern="transient status read" tests/trading-execution.test.mjs`，确认超时读取在窗口内不撤单不下单、恢复后继续完成、超过窗口才暂停，`invalid_data` 立即暂停，且原因带出 `Bybit CLUSDT：…`。
+**如何验证：** 运行 `node --test --test-name-pattern="transient status read" tests/trading-execution.test.mjs`，确认 Binance 追价腿超时或 -1003 限流读取时窗口内不改价、不撤单、不下单，恢复后继续完成，窗口内用户停止照常撤单，次数与时长都满才暂停，`invalid_data` 立即暂停，且原因带出 `Binance CLUSDT：…`。
 
 **证据：** 用户 2026-11-07 截图：任务 `991841cb-…` 03:17:02 Binance 腿最后对账（已全部成交），03:17:07 读取失败暂停，03:17:24 Hyperliquid 委托撤销 0 成交。服务器日志未落具体错误，触发腿与错误码未核实。
 

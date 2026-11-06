@@ -564,31 +564,41 @@ test('unknown or regressing fill information pauses instead of reducing recorded
 });
 
 test('a transient status read keeps the resting hedge leg for a bounded window, other read errors pause at once', async t => {
-  for (const scenario of ['recovers', 'persists', 'invalid']) {
+  for (const scenario of ['recovers', 'rate-limit', 'persists', 'stop', 'invalid']) {
     const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
-    const [filled, hedge] = [...f.records.values()]; f.fill(filled.id);
+    // The Bybit leg filled its batch; the Binance chase order is the resting hedge.
+    const hedge = [...f.records.values()].find(record => record.kind === 'order'), filled = [...f.records.values()].find(record => record.kind === 'strategy');
+    f.fill(filled.id);
+    const error = scenario === 'invalid' ? new ExecutionExchangeError('invalid_data') : scenario === 'rate-limit' ? new ExecutionExchangeError('rejected', { providerCode: -1003 }) : new ExecutionExchangeError('timeout');
     // The malformed answer comes once; the stop pass reads the order normally.
-    f.handlers['bybit:inspect'] = async () => { if (scenario === 'invalid') delete f.handlers['bybit:inspect']; throw new ExecutionExchangeError(scenario === 'invalid' ? 'invalid_data' : 'timeout'); };
-    await f.service.tick();
-    const stops = () => f.calls.filter(call => call.method === 'stop').length;
+    f.handlers['binance:inspect'] = async () => { if (scenario === 'invalid') delete f.handlers['binance:inspect']; throw error; };
+    f.markets.binance = { bid: '71', ask: '71.01' }; f.advance(1000); await f.service.tick();
+    const count = method => f.calls.filter(call => call.method === method).length;
     if (scenario === 'invalid') {
-      assert.equal(f.job.status, 'paused'); assert.equal(stops(), 1);
-      assert.ok(f.job.events.some(item => /委托状态读取失败或提交结果不明（Bybit CLUSDT：交易所响应不完整或格式无效）/.test(item.message)));
-      assert.equal(hedge.terminal, true); continue;
+      assert.equal(f.job.status, 'paused'); assert.equal(count('stop'), 1);
+      assert.ok(f.job.events.some(item => item.message === '委托状态读取失败或提交结果不明（Binance CLUSDT：交易所响应不完整或格式无效），暂停并撤销余单'));
+      continue;
     }
-    assert.equal(f.job.status, 'running'); assert.equal(stops(), 0); assert.equal(hedge.terminal, false);
-    assert.match(f.job.events.at(-1).message, /Bybit CLUSDT：交易所请求超时.*20 秒内重试/);
-    f.advance(5000); await f.service.tick();
-    assert.equal(f.job.status, 'running'); assert.equal(stops(), 0); assert.equal(f.creates.length, 2);
-    if (scenario === 'recovers') {
-      delete f.handlers['bybit:inspect']; f.advance(1000); await f.service.tick();
-      assert.equal(f.job.events.at(-1).message, '委托状态已恢复读取，继续执行');
-      f.fill(hedge.id); await f.service.tick(); assert.equal(f.job.status, 'completed');
-    } else {
-      f.advance(15_000); await f.service.tick();
+    assert.equal(f.job.status, 'running'); assert.equal(hedge.terminal, false);
+    assert.match(f.job.events.at(-1).message, /^委托状态暂时读取失败（Binance CLUSDT：交易所(请求超时|拒绝了请求)），至少重试 3 次、20 秒/);
+    // Reprice is due on every tick, yet nothing is amended, cancelled or sent while the order is unread.
+    f.advance(1000); await f.service.tick();
+    assert.equal(f.job.status, 'running'); assert.equal(count('amend'), 0); assert.equal(count('stop'), 0); assert.equal(f.creates.length, 2);
+    assert.equal(f.job.events.filter(item => item.message.startsWith('委托状态暂时读取失败')).length, 1);
+    if (scenario === 'stop') {
+      f.service.stop(f.job.id, {}); await f.service.tick();
+      assert.equal(count('stop'), 1); assert.equal(f.creates.length, 2);
+    } else if (scenario === 'persists') {
+      // A slow failure that spends the whole window still gets the minimum attempts.
+      f.advance(30_000); await f.service.tick(); assert.equal(f.job.status, 'running'); assert.equal(count('stop'), 0);
+      f.advance(1000); await f.service.tick();
       // Still unreadable while cancelling, so the job waits in attention for the slow re-check.
-      assert.equal(f.job.status, 'attention'); assert.equal(stops(), 1);
-      assert.ok(f.job.events.some(item => item.message === '委托状态读取失败或提交结果不明（Bybit CLUSDT：交易所请求超时），暂停并撤销余单'));
+      assert.equal(f.job.status, 'attention'); assert.equal(count('stop'), 1); assert.equal(f.creates.length, 2);
+      assert.ok(f.job.events.some(item => item.message === '委托状态读取失败或提交结果不明（Binance CLUSDT：交易所请求超时），暂停并撤销余单'));
+    } else {
+      delete f.handlers['binance:inspect']; f.advance(1000); await f.service.tick();
+      assert.ok(f.job.events.some(item => item.message === '委托状态已恢复读取，继续执行')); assert.equal(count('amend'), 1);
+      f.fill(hedge.id); await f.service.tick(); assert.equal(f.job.status, 'completed');
     }
   }
 });
