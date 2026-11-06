@@ -29,14 +29,21 @@ const CYCLE_DEADLINE_MS = 5 * 60_000;
 // 发现时每批读这么多个池子的地址与静态信息（约 3 + 9 次 eth_call、4–5 轮串行），每批读完即记入草稿：
 // 单批在单次超时 20 秒的慢节点上也远小于整轮预算，首次发现可以跨轮完成。
 const DISCOVERY_POOL_BATCH = 250;
-// 首次发现（还没有池子列表，没有旧数据要保护）整轮预算放大到 3 倍，即 15 分钟、等于默认刷新间隔：发现后半段（gauge、全部池子状态）
-// 必须一轮读完，约 3000 个池子时约 90 轮串行请求，按每轮 10 秒估算；放在普通 5 分钟预算里，慢节点上静态信息读完后仍每轮被截止。
+// 首次发现（还没有池子列表，没有旧数据要保护）整轮预算放大到 3 倍，即 15 分钟、等于默认刷新间隔：约 3000 个池子时发现后半段
+// （gauge、全部池子状态）约 90 轮串行请求，按每轮 10 秒估算；放大预算让快节点一轮读完，慢节点仍可按下面的动态草稿跨轮续读。
 const FIRST_DISCOVERY_DEADLINE_FACTOR = 3;
+// 发现后半段按池子分片读，每片读完记入草稿，整轮到期时最多丢掉在途的一片（Base 约 579 个池子在 20 秒一批的慢节点上一轮读不完，issue #180）。
+// gauge 每片 360 个池子 = 3 个 aggregate3（每个 120 次调用，并发 3），一轮串行；状态每池 8 次调用、外加 1 次区块时间，
+// 每片 89 个池子 = 713 次调用 = 6 个 aggregate3，两轮串行。分片后总串行轮数与整批读取基本相同（多不到一轮）。
+const DISCOVERY_GAUGE_BATCH = 360;
+const DISCOVERY_STATE_BATCH = 89;
 // 重新发现的真实请求错误从 30 分钟起翻倍退避，最长 6 小时。预算耗尽不计节点错误：
-// 连续 3 次发现尝试没有新增可续读的池子/代币时，另行按相同范围退避，防止动态阶段反复耗尽整轮预算。
-// 普通当前刷新不清零无进展次数；草稿有新增进展、发现成功或更换 RPC/TVL 门槛时清零。
+// 累计 3 次发现尝试既没有新增池子/代币，也没有在同一份动态草稿里新读到 gauge/状态分片时，另行按相同范围退避，防止发现反复耗尽整轮预算而无进展。
+// 新增池子/代币（永不过期）、真实请求错误、发现成功或更换 RPC/TVL 门槛时清零；只有动态分片进展时不累计也不清零（分片会过期，见 dynamicMaxAgeMs）；普通当前刷新不清零。
 const REDISCOVERY_RETRY_SEC = 30 * 60;
 const REDISCOVERY_STALL_LIMIT = 3;
+// 动态草稿时限至少容纳的发现尝试次数（刷新间隔较长时）。
+const DYNAMIC_DRAFT_ATTEMPTS = 3;
 // 池子列表超过这么久未更新，页面提示：说明重新发现已连续错过至少一次常规间隔。
 const DISCOVERY_STALE_SEC = 2 * DISCOVERY_SEC;
 const MANUAL_MIN_GAP_MS = 30_000;
@@ -179,7 +186,8 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
   const boot = randomUUID().slice(0, 8);
   const abort = new AbortController();
   // backfillPhase：catching_up 按短间隔追批、backoff 出错后等常规轮次（或归档读取暂停到 backfillRetryAt）、complete 已补齐；null 为尚未回填。
-  // discoveryDraft：未完成的发现已读到的池子静态信息与代币（只增不变的数据），下一轮从这里续读；发现成功后清空。
+  // discoveryDraft：未完成的发现已读到的池子静态信息与代币（只增不变的数据），以及后半段已读的 gauge/状态分片（dynamic，另有时限），
+  // 下一轮从这里续读；只在内存中，发现成功、配置代次变化或重启后清空。
   // rediscoverFailures / rediscoverError / rediscoverRetryAt：已有池子列表时重新发现的连续失败次数、最近错误与退避结束时间（毫秒）。
   // generation/configAbort 隔离 RPC + TVL 门槛的每次变更（含改回原值）；refreshPending 保证未完成发现后先更新一次当前快照。
   const runtimes = new Map(AERO_CHAINS.map((c) => [c.id, { registry: null, snapshot: null, prev: null, history: { schema: 1, points: [] }, rows: [], discoveryDraft: null,
@@ -208,7 +216,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
     // 未发布草稿随工厂、RPC 或门槛代次失效；已发布列表中的静态信息仍可复用，gauge 和当前状态每次重新核验。
     let draft = rt.discoveryDraft;
     if (!draft || draft.factory !== chain.clFactory || draft.generation !== generation) {
-      draft = { factory: chain.clFactory, rpcUrl, generation, poolCount: prior?.poolCount ?? 0, pools: structuredClone(prior?.pools ?? []), tokens: structuredClone(prior?.tokens ?? {}) };
+      draft = { factory: chain.clFactory, rpcUrl, generation, poolCount: prior?.poolCount ?? 0, pools: structuredClone(prior?.pools ?? []), tokens: structuredClone(prior?.tokens ?? {}), dynamic: null };
       rt.discoveryDraft = draft;
     }
     for (;;) {
@@ -226,19 +234,35 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       assertGeneration(rt, generation);
       tokens.forEach((t, i) => { if (t) draft.tokens[missing[i]] = { symbol: t.symbol, decimals: t.decimals }; });
     }
+    // 后半段（gauge、全部池子状态）按分片读，读到的结果记在 draft.dynamic，整轮到期后下一次尝试只读剩下的池子。
+    // 子调用失败（gauge 为 undefined、状态为 null）不记为已读，下次尝试重读，避免一次偶发失败在草稿时限内一直沿用。
+    // 失效：随草稿按工厂、RPC、门槛代次清空；开始超过 dynamicMaxAgeMs() 时整段丢弃重读，不把相隔太久的读数拼在一起。
+    if (!draft.dynamic || now() - draft.dynamic.startedAt > dynamicMaxAgeMs()) draft.dynamic = { startedAt: now(), gauges: {}, states: {}, stateBlock: null, stateTime: null, stitched: false };
+    const dynamic = draft.dynamic;
     // gauge、当前状态与跟踪集合每次发现都重读，在草稿的副本上进行：中途失败时草稿里的 gauge 仍是上次发布的值，替换检测不受影响。
     const registry = { schema: 1, factory: chain.clFactory, poolCount: draft.poolCount, pools: structuredClone(draft.pools), tokens: structuredClone(draft.tokens), active: [], discoveredAt: 0, blockTime: prior?.blockTime ?? null };
     const valid = registry.pools.filter((p) => !p.invalid);
     // gauge 可能在建池之后才创建，也可能被替换：每次发现都重读。
-    const gauges = await reads.readGauges(rpc, valid.map((p) => p.address));
-    assertGeneration(rt, generation);
-    // gauge 被替换后累计排放份额换了基准，旧的历史排放点不能再和新读数相减。
+    const gaugeUnread = valid.filter((p) => !Object.hasOwn(dynamic.gauges, p.address));
+    for (let i = 0; i < gaugeUnread.length; i += DISCOVERY_GAUGE_BATCH) {
+      const part = gaugeUnread.slice(i, i + DISCOVERY_GAUGE_BATCH);
+      const gauges = await reads.readGauges(rpc, part.map((p) => p.address));
+      assertGeneration(rt, generation);
+      part.forEach((p, j) => { if (gauges[j] !== undefined) dynamic.gauges[p.address] = gauges[j]; });
+    }
+    // gauge 被替换后累计排放份额换了基准，旧的历史排放点不能再和新读数相减。本次没读到的 gauge 沿用列表里的已知值，不判为替换。
     const replaced = [];
-    valid.forEach((p, i) => { if (p.gauge !== undefined && p.gauge && p.gauge !== gauges[i]) replaced.push(p.address); p.gauge = gauges[i]; });
+    valid.forEach((p) => { if (!Object.hasOwn(dynamic.gauges, p.address)) return; const gauge = dynamic.gauges[p.address]; if (p.gauge !== undefined && p.gauge && p.gauge !== gauge) replaced.push(p.address); p.gauge = gauge; });
     const known = valid.filter((p) => registry.tokens[p.token0] && registry.tokens[p.token1]);
-    const full = await reads.readPoolStates(rpc, known, block);
-    assertGeneration(rt, generation);
-    const states = Object.fromEntries(known.map((p, i) => [p.address, full.states[i]]).filter(([, s]) => s));
+    const stateUnread = known.filter((p) => !Object.hasOwn(dynamic.states, p.address));
+    for (let i = 0; i < stateUnread.length; i += DISCOVERY_STATE_BATCH) {
+      const part = stateUnread.slice(i, i + DISCOVERY_STATE_BATCH);
+      const read = await reads.readPoolStates(rpc, part, block);
+      assertGeneration(rt, generation);
+      part.forEach((p, j) => { if (read.states[j]) dynamic.states[p.address] = read.states[j]; });
+      if (dynamic.stateBlock === null) { dynamic.stateBlock = block; dynamic.stateTime = read.timestamp; } else if (dynamic.stateBlock !== block) dynamic.stitched = true;
+    }
+    const states = Object.fromEntries(known.map((p) => [p.address, dynamic.states[p.address]]).filter(([, s]) => s));
     const tokens = new Map(Object.entries(registry.tokens));
     const pools = known.filter((p) => states[p.address]).map((p) => ({ ...p, state: states[p.address] }));
     const prices = solvePrices({ pools, tokens, stables: chain.stables.map((s) => s.toLowerCase()) });
@@ -247,11 +271,22 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       const tvl = tvlUsd(p.state, tokens.get(p.token0), tokens.get(p.token1), prices.get(p.token0), prices.get(p.token1));
       return tvl !== null && tvl >= minTvlUsd;
     }).map((p) => p.address);
+    const active = new Set(registry.active);
+    // 一致性：拼接的状态只用于求价和筛选跟踪集合（两次发现之间跟踪集合本就整段沿用 6 小时以上，草稿时限与之同一量级）；
+    // 发布的快照必须来自同一区块：状态全在本轮区块读到时直接用，否则（续读拼接、或没有可读状态）在本轮区块整体重读跟踪集合。
+    // 这次重读不分片：拼接后的最后一次尝试至少要读一次跟踪集合加出块时间，节点慢到当前刷新都勉强完成时，这一步会反复超时并计为无进展后退避。
+    let snapshot = { t: dynamic.stateTime, block, states: Object.fromEntries(Object.entries(states).filter(([a]) => active.has(a))) };
+    if (dynamic.stitched || dynamic.stateBlock !== block) {
+      const tracked = pools.filter((p) => active.has(p.address));
+      const read = await reads.readPoolStates(rpc, tracked, block);
+      assertGeneration(rt, generation);
+      snapshot = { t: read.timestamp, block, states: Object.fromEntries(tracked.map((p, i) => [p.address, read.states[i]]).filter(([, s]) => s)) };
+    }
     const span = Math.min(10_000, block - 1);
     if (span > 100) { const [a, b] = await Promise.all([rpc.blockTimestamp(block - span), rpc.blockTimestamp(block)]); registry.blockTime = (b - a) / span; }
-    registry.discoveredAt = full.timestamp;
-    const active = new Set(registry.active);
-    return { replaced, registry, snapshot: { t: full.timestamp, block, states: Object.fromEntries(Object.entries(states).filter(([a]) => active.has(a))) } };
+    // discoveredAt 是发布这一轮的区块时间；拼接时筛选所用的 gauge/状态最早可早到 dynamic.startedAt（不超过 dynamicMaxAgeMs()）。
+    registry.discoveredAt = snapshot.t;
+    return { replaced, registry, snapshot };
   }
 
   // 7 天内还没读过的整点。按请求的整点判断是否已读：出块时间外推有偏差时，实际时间戳可能离整点超过 20 分钟，不能据此反复重读。
@@ -334,7 +369,24 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
 
   const usableRegistry = (id) => { const rt = runtimes.get(id); return rt.registry?.factory === chainById.get(id).clFactory ? rt.registry : null; };
   // 只计算下轮真正可复用的进展；重读 gauge/状态而未完成整次发现不能算作进展。
-  const discoveryProgress = (rt) => { const saved = rt.discoveryDraft ?? rt.registry; return (saved?.poolCount ?? 0) + Object.keys(saved?.tokens ?? {}).length; };
+  // statics：池子数 + 代币数，只增不减。dynamic/reads：当前动态草稿对象与其中已读的 gauge + 状态数，比较只在同一份草稿内进行。
+  const discoveryProgress = (rt) => {
+    const saved = rt.discoveryDraft ?? rt.registry, dynamic = rt.discoveryDraft?.dynamic ?? null;
+    return { statics: (saved?.poolCount ?? 0) + Object.keys(saved?.tokens ?? {}).length, dynamic, reads: dynamic ? Object.keys(dynamic.gauges).length + Object.keys(dynamic.states).length : 0 };
+  };
+  // 本次尝试在当前草稿里首次读到分片才算动态进展：草稿过期重开时基准随之换成新草稿，重开这次的重读不算；之前没有草稿时，首次读到的分片算。
+  const dynamicProgressed = (before, after) => after.reads > before.reads && (before.dynamic === null || after.dynamic === before.dynamic);
+  // 动态草稿时限：一个重新发现周期（6 小时）与 DYNAMIC_DRAFT_ATTEMPTS 个尝试间隔中的较长者。预算耗尽后让位一轮当前刷新，
+  // 相邻两次尝试最多相隔两个（刷新间隔 + 整轮预算），第 3 次尝试最晚约在两个尝试间隔后开始，留出一个间隔的余量。
+  // 网络错误或无进展退避（最长 6 小时）期间草稿仍可能过期，见 backOffDiscovery。
+  const dynamicMaxAgeMs = () => Math.max(DISCOVERY_SEC * 1000, DYNAMIC_DRAFT_ATTEMPTS * 2 * (config.intervalMin * 60_000 + cycleDeadlineMs));
+  // 退避到期时草稿已过时限的，进入退避时就丢弃动态草稿：退避后那次尝试从无草稿开始，首次读到的分片算作进展。
+  // 否则过期重开每次都计一次无进展，无进展退避升到 6 小时后每次退避都让草稿过期，需要两次以上尝试的节点永远完不成。
+  const backOffDiscovery = (rt, retryAt) => {
+    rt.rediscoverRetryAt = retryAt;
+    const dynamic = rt.discoveryDraft?.dynamic;
+    if (dynamic && retryAt - dynamic.startedAt > dynamicMaxAgeMs()) rt.discoveryDraft.dynamic = null;
+  };
   const rediscoveryDelay = (attempt) => Math.min(REDISCOVERY_RETRY_SEC * 2 ** (attempt - 1), DISCOVERY_SEC) * 1000;
 
   // 读取已完整返回的结果照常发布，即使整轮已到期：到期只用来取消仍在途的读取，后续回填据此停止。
@@ -371,10 +423,15 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
           rt.refreshPending = true;
           if (signal.aborted) {
             rt.rediscoverPhase = 'pending'; rt.rediscoverRetryAt = null;
-            rt.rediscoverStalls = discoveryProgress(rt) > progress ? 0 : rt.rediscoverStalls + 1;
-            if (rt.rediscoverStalls >= REDISCOVERY_STALL_LIMIT) {
-              rt.rediscoverPhase = 'budget_backoff';
-              rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverStalls - REDISCOVERY_STALL_LIMIT + 1);
+            // 动态分片进展只免于累计：分片会过期，若也清零，草稿每过期一次又重读一遍时退避永远不会触发。
+            const after = discoveryProgress(rt);
+            if (after.statics > progress.statics) rt.rediscoverStalls = 0;
+            else if (!dynamicProgressed(progress, after)) {
+              rt.rediscoverStalls += 1;
+              if (rt.rediscoverStalls >= REDISCOVERY_STALL_LIMIT) {
+                rt.rediscoverPhase = 'budget_backoff';
+                backOffDiscovery(rt, now() + rediscoveryDelay(rt.rediscoverStalls - REDISCOVERY_STALL_LIMIT + 1));
+              }
             }
             if (rt.backfillPhase === 'catching_up') rt.backfillPhase = 'backoff';
             return false;
@@ -382,7 +439,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
           rt.rediscoverStalls = 0;
           rt.rediscoverPhase = 'backoff'; rt.rediscoverFailures += 1;
           rt.rediscoverError = `重新发现失败：${rpcDiagnostic(error, rpcUrl, 200)}`;
-          rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverFailures);
+          backOffDiscovery(rt, now() + rediscoveryDelay(rt.rediscoverFailures));
           log.warn?.({ type: 'aero-market', chain: id, err: rt.rediscoverError, failures: rt.rediscoverFailures }, 'Aero 池子重新发现未完成，沿用上次池子列表，退避后再试');
         }
       }

@@ -1018,6 +1018,301 @@ test('discovery reads pools in batches and a deadline between batches keeps the 
   await market.close();
 });
 
+// Base 规模的慢节点（issue #180）：579 个池子，其中 100 个有 gauge 且有流动性（跟踪集合），其余低于 TVL 门槛。
+// 每次读取按 aero-market-rpc 的批量参数（每个 aggregate3 120 次调用、并发 3）折算串行批数，每批 round 毫秒；
+// 时间按 1 ms 代表 1 秒缩放：20 ms 一批即 20 秒一批，整轮预算 300 ms 即 5 分钟。读取遵守取消信号。
+const BASE_POOLS = 579, BASE_TRACKED = 100, ROUND_MS = 20;
+function baseScaleChain() {
+  // budget：每轮（每个 RPC 实例）可用的批数，用完后的读取挂起到整轮截止，结果不取决于真实计时余量；为 null 时按 round 毫秒/批计时。
+  const chain = { t: 1_800_000_000, round: 0, budget: null, gaugeReads: [], stateReads: [] };
+  const pools = Array.from({ length: BASE_POOLS }, (_, i) => '0x' + (i + 1).toString(16).padStart(40, '0'));
+  const tracked = new Set(pools.slice(0, BASE_TRACKED));
+  const gaugeOf = (address) => (tracked.has(address) ? '0xf' + address.slice(-39) : null);
+  const batches = (calls) => Math.ceil(Math.ceil(calls / 120) / 3);
+  const blockAt = (t) => Math.round((t - 1_700_000_000) / BLOCK_TIME);
+  const left = new WeakMap();
+  const wait = (n, signal) => new Promise((resolve, reject) => {
+    let timer = null;
+    const cancel = () => { clearTimeout(timer); reject(Object.assign(new Error('eth_call 超过 20 秒未响应'), { kind: 'timeout' })); };
+    if (signal?.aborted) return cancel();
+    if (chain.budget !== null) {
+      const rest = left.has(signal) ? left.get(signal) : chain.budget;
+      left.set(signal, rest >= n ? rest - n : 0);
+      if (rest >= n) setImmediate(resolve); else signal.addEventListener('abort', cancel, { once: true });
+      return;
+    }
+    timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, n * chain.round);
+    signal?.addEventListener('abort', cancel, { once: true });
+  });
+  const raw = 3000e-12;
+  const stateOf = (address) => (tracked.has(address)
+    ? { sqrtPriceX96: sqrtX96(raw), tick: tickOf(raw), liquidity: String(10n ** 18n), stakedLiquidity: String(5n * 10n ** 17n), fee: 500, unstakedFee: 100_000,
+      balance0: String(10n ** 21n), balance1: String(3n * 10n ** 12n), rewardShare: String(BigInt(chain.t - 1_700_000_000) * 10n ** 17n) }
+    : { sqrtPriceX96: sqrtX96(raw), tick: tickOf(raw), liquidity: '1000', stakedLiquidity: '0', fee: 500, unstakedFee: 100_000, balance0: '1', balance1: '1', rewardShare: null });
+  const reads = {
+    async readPoolAddresses(rpc, _factory, known, limit = Infinity) {
+      const added = pools.slice(known, known + limit);
+      await wait(1 + batches(added.length), rpc.signal);
+      return { total: pools.length, added };
+    },
+    async readPoolStatics(rpc, list) { await wait(batches(list.length * 4), rpc.signal); return list.map((a) => ({ address: a, token0: WETH, token1: USDC, tickSpacing: 100, gauge: gaugeOf(a) })); },
+    async readTokens(rpc, list) { await wait(batches(list.length * 2), rpc.signal); return list.map((t) => ({ symbol: t === WETH ? 'WETH' : 'USDC', decimals: t === USDC ? 6 : 18 })); },
+    async readGauges(rpc, list) { chain.gaugeReads.push(list.length); await wait(batches(list.length), rpc.signal); return list.map(gaugeOf); },
+    async readPoolStates(rpc, list, block) {
+      await wait(batches(list.length * 8 + 1), rpc.signal);
+      chain.stateReads.push({ block, pools: list.length });
+      return { block, timestamp: chain.t, states: list.map((p) => stateOf(p.address)) };
+    },
+    async readPoolHistory() { throw Object.assign(new Error('missing trie node'), { kind: 'node' }); },
+  };
+  // 每轮新建的 RPC 先做一次链校验再读区块号（两批）；出块时间的两次读取并行（一批）。
+  const createRpc = ({ signal }) => ({ signal, blockNumber: async () => { await wait(2, signal); return blockAt(chain.t); }, blockTimestamp: async (n) => { await wait(1, signal); return 1_700_000_000 + n * BLOCK_TIME; } });
+  return { chain, reads, createRpc, blockAt, pools, tracked, stateOf };
+}
+
+test('Base-scale rediscovery on a 20 s-per-batch node resumes its gauge/state reads across rounds and still refreshes current data', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 300 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).activeCount, BASE_TRACKED);
+  const discoveredAt = baseOf(market).discovery.at;
+  // 整批读取一次尝试要 2（链校验+区块号）+ 1（池子数）+ 2（gauge）+ 13（全部状态）+ 1（出块时间）= 19 批 = 380 ms，超过 300 ms 预算；
+  // 修复前动态阶段不能跨轮续读，重新发现永远待继续。
+  fake.chain.round = ROUND_MS;
+  fake.chain.t += 6 * 3600 + 1;
+  const gaugeReads = fake.chain.gaugeReads.length;
+  const log = [];
+  let attempts = 0;
+  for (let round = 0; round < 8 && baseOf(market).discovery.at === discoveredAt; round++) {
+    const before = baseOf(market), yielded = before.discovery.refreshPending;
+    await clock.fire(); await settle(market);
+    const base = baseOf(market);
+    log.push({ yielded, phase: base.discovery.phase, updatedAt: base.updatedAt, stalls: base.discovery.stalledAttempts });
+    assert.equal(base.status, 'ok');
+    assert.deepEqual([base.discovery.failures, base.discovery.error, base.discovery.retryAt], [0, null, null], 'budget exhaustion is not a node failure');
+    if (yielded) {
+      assert.equal(base.updatedAt, fake.chain.t * 1000, 'the round after an unfinished rediscovery refreshes the current snapshot first');
+      assert.equal(base.discovery.refreshPending, false);
+    } else {
+      attempts++;
+      if (base.discovery.at === discoveredAt) {
+        assert.equal(base.discovery.phase, 'pending');
+        assert.equal(base.discovery.stalledAttempts, 0, 'each resumed attempt retains new gauge/state shards');
+        assert.equal(base.updatedAt, before.updatedAt, 'at most one round yields its current read');
+      }
+    }
+    if (base.discovery.at === discoveredAt) fake.chain.t += 15 * 60;
+  }
+  t.diagnostic(JSON.stringify(log));
+  const base = baseOf(market);
+  assert.ok(attempts >= 2 && attempts <= 3, `rediscovery finishes within a bounded number of attempts (took ${attempts})`);
+  assert.equal(base.discovery.at, fake.chain.t * 1000, 'rediscovery completed');
+  assert.equal(base.discovery.phase, 'idle');
+  assert.equal(base.updatedAt, fake.chain.t * 1000);
+  assert.equal(base.activeCount, BASE_TRACKED);
+  assert.deepEqual(fake.chain.gaugeReads.slice(gaugeReads), [360, 219], 'gauges are read once and reused by the resumed attempt');
+  assert.deepEqual(fake.chain.stateReads.at(-1), { block: fake.blockAt(fake.chain.t), pools: BASE_TRACKED },
+    'stitched states only select the tracked set: the published snapshot is re-read in one block of the finishing round');
+  assert.equal(market.state().pools.length, BASE_TRACKED);
+});
+
+test('the resumable gauge/state draft is dropped when too old or when the RPC changes', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  fake.chain.t += 6 * 3600 + 1;
+  const asked = [], readPoolStates = fake.reads.readPoolStates;
+  // 只记读完的分片：被整轮截止打断的那片不算。
+  fake.reads.readPoolStates = async (rpc, list, block) => { const read = await readPoolStates(rpc, list, block); asked.push(list.map((p) => p.address)); return read; };
+  // 每次尝试 11 批：固定 3 批后读完 gauge（2 批）与 3 片状态（各 2 批），下一片挂起到整轮截止；随后让位的一轮照常刷新。
+  const partial = async () => {
+    const gauges = fake.chain.gaugeReads.length, states = asked.length;
+    fake.chain.budget = 11; await clock.fire(); await settle(market);
+    assert.equal(baseOf(market).discovery.phase, 'pending');
+    const read = { gauges: fake.chain.gaugeReads.slice(gauges), states: asked.slice(states) };
+    fake.chain.t += 60; fake.chain.budget = Infinity; await clock.fire(); await settle(market);
+    assert.equal(baseOf(market).updatedAt, fake.chain.t * 1000);
+    return read;
+  };
+  const first = await partial();
+  assert.deepEqual(first.gauges, [360, 219]);
+  assert.equal(first.states.length, 3);
+  assert.equal(baseOf(market).discovery.stalledAttempts, 0, 'shards first read in a new draft are progress');
+  // 默认 15 分钟间隔时草稿时限为 6 小时：超过后 gauge 与状态从头重读，不与 6 小时前的读数拼接。
+  fake.chain.t += 6 * 3600 + 1;
+  const expired = await partial();
+  assert.deepEqual(expired.gauges, [360, 219], 'an expired draft starts the gauge/state stage over');
+  assert.deepEqual(expired.states, first.states, 'states are read again from the first shard as well');
+  assert.equal(baseOf(market).discovery.stalledAttempts, 1, 're-reading after expiry is not progress, so repeated expiry still reaches the budget backoff');
+  const config = market.state().config;
+  await market.save({ ...config, chains: { ...config.chains, base: { enabled: true, rpcUrl: 'https://rpc.example/new' } } });
+  fake.chain.t += 60;
+  const from = fake.chain.gaugeReads.length;
+  await clock.fire(); await settle(market);
+  assert.deepEqual(fake.chain.gaugeReads.slice(from, from + 1), [360], 'a new RPC never resumes the old draft');
+});
+
+// 可控预算下推进重新发现：发现尝试的轮次给 budget 批，让位的当前刷新轮次不限；每轮把假时钟推进一个刷新间隔。
+async function rediscoverRounds(market, fake, clock, { budget, intervalMin = 15, done, maxRounds = 12 }) {
+  const log = [];
+  for (let round = 0; round < maxRounds && !done(); round++) {
+    const yielded = baseOf(market).discovery.refreshPending;
+    fake.chain.budget = yielded ? Infinity : budget;
+    await clock.fire(); await settle(market);
+    const { phase, stalledAttempts } = baseOf(market).discovery;
+    log.push({ yielded, phase, stalledAttempts });
+    if (!done()) fake.chain.t += intervalMin * 60;
+  }
+  return log;
+}
+
+test('with a 120-minute interval the gauge/state draft lasts for the three attempts a slow node needs', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir, { intervalMin: 120 });
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const discoveredAt = baseOf(market).discovery.at, gaugeReads = fake.chain.gaugeReads.length;
+  fake.chain.t += 6 * 3600 + 1;
+  // 每次尝试 11 批：第 1 次读完 gauge 与 3 片状态，第 2 次读完其余 4 片，第 3 次重读跟踪集合（3 批）与出块时间后发布。
+  // 第 3 次尝试在草稿开始约 8 小时后：按 max(6 小时, 3 个间隔) 的旧时限会过期重读，永远完不成。
+  const log = await rediscoverRounds(market, fake, clock, { budget: 11, intervalMin: 120, done: () => baseOf(market).discovery.at !== discoveredAt });
+  t.diagnostic(JSON.stringify(log));
+  const attempts = log.filter((r) => !r.yielded);
+  assert.deepEqual(attempts.map((r) => [r.phase, r.stalledAttempts]), [['pending', 0], ['pending', 0], ['idle', 0]]);
+  assert.deepEqual(fake.chain.gaugeReads.slice(gaugeReads), [360, 219], 'the draft is not dropped before the third attempt');
+  assert.equal(baseOf(market).discovery.at, fake.chain.t * 1000);
+  assert.equal(baseOf(market).activeCount, BASE_TRACKED);
+});
+
+test('a retained gauge/state draft without new shards still backs off after three budget-exhausted attempts', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const gaugeReads = fake.chain.gaugeReads.length;
+  fake.chain.t += 6 * 3600 + 1;
+  fake.chain.budget = 11; await clock.fire(); await settle(market);
+  assert.deepEqual([baseOf(market).discovery.phase, baseOf(market).discovery.stalledAttempts], ['pending', 0]);
+  // 之后每次尝试只有 4 批：固定 3 批后不够再读一片状态，草稿保留但没有新分片。
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    fake.chain.t += 15 * 60; fake.chain.budget = Infinity; await clock.fire(); await settle(market);
+    assert.equal(baseOf(market).updatedAt, fake.chain.t * 1000, 'the yielded round refreshes current data');
+    fake.chain.t += 15 * 60; fake.chain.budget = 4; await clock.fire(); await settle(market);
+    const d = baseOf(market).discovery;
+    assert.deepEqual([d.phase, d.stalledAttempts], [attempt < 3 ? 'pending' : 'budget_backoff', attempt]);
+    assert.equal(d.retryAt, attempt < 3 ? null : fake.chain.t * 1000 + 30 * 60 * 1000);
+  }
+  // 退避结束后草稿仍在时限内，续读完成，gauge 不重读。
+  fake.chain.t += 15 * 60; fake.chain.budget = Infinity; await clock.fire(); await settle(market);
+  fake.chain.t = baseOf(market).discovery.retryAt / 1000; await clock.fire(); await settle(market);
+  assert.deepEqual([baseOf(market).discovery.phase, baseOf(market).discovery.stalledAttempts], ['idle', 0]);
+  assert.deepEqual(fake.chain.gaugeReads.slice(gaugeReads), [360, 219]);
+});
+
+test('a budget backoff that outlasts the gauge/state draft drops it, so a node needing several attempts still finishes', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const discoveredAt = baseOf(market).discovery.at;
+  fake.chain.t += 6 * 3600 + 1;
+  fake.chain.budget = 11; await clock.fire(); await settle(market);
+  assert.deepEqual([baseOf(market).discovery.phase, baseOf(market).discovery.stalledAttempts], ['pending', 0]);
+  // 之后每次尝试只有 4 批、读不到新分片，直到无进展退避升到 6 小时上限（第 7 次）；退避期间与让位轮次不限批数。
+  for (let round = 0; round < 60 && (baseOf(market).discovery.stalledAttempts ?? 0) < 7; round++) {
+    const d = baseOf(market).discovery;
+    const attempt = !d.refreshPending && (d.retryAt === null || fake.chain.t * 1000 >= d.retryAt);
+    fake.chain.budget = attempt ? 4 : Infinity;
+    await clock.fire(); await settle(market);
+    const next = baseOf(market).discovery;
+    fake.chain.t = Math.max(fake.chain.t + 15 * 60, next.retryAt === null ? 0 : Math.ceil(next.retryAt / 1000));
+  }
+  const d = baseOf(market).discovery;
+  assert.deepEqual([d.phase, d.stalledAttempts], ['budget_backoff', 7]);
+  // 节点恢复到每次尝试 11 批（需要三次尝试）：退避后不能因草稿过期重开而再计无进展，必须能完成。
+  const log = await rediscoverRounds(market, fake, clock, { budget: 11, done: () => baseOf(market).discovery.at !== discoveredAt });
+  t.diagnostic(JSON.stringify(log));
+  assert.notEqual(baseOf(market).discovery.at, discoveredAt, 'the rediscovery completes after the long backoff');
+  assert.deepEqual([baseOf(market).discovery.phase, baseOf(market).discovery.stalledAttempts], ['idle', 0]);
+});
+
+test('a gauge or state that fails to read is not recorded in the draft and is read again by the next attempt', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  // 两个都是跟踪池：gauge 子调用失败为 undefined，状态子调用失败为 null。
+  const [gaugeMiss, stateMiss] = fake.pools;
+  const { readGauges, readPoolStates } = fake.reads, gaugeAsked = [], stateAsked = [];
+  let failing = true;
+  fake.reads.readGauges = async (rpc, list) => { gaugeAsked.push(list); const out = await readGauges(rpc, list); return out.map((g, i) => (failing && list[i] === gaugeMiss ? undefined : g)); };
+  fake.reads.readPoolStates = async (rpc, list, block) => {
+    stateAsked.push(list.map((p) => p.address));
+    const read = await readPoolStates(rpc, list, block);
+    return { ...read, states: read.states.map((s, i) => (failing && list[i].address === stateMiss ? null : s)) };
+  };
+  fake.chain.t += 6 * 3600 + 1;
+  fake.chain.budget = 11; await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).discovery.phase, 'pending');
+  failing = false;
+  fake.chain.t += 15 * 60; fake.chain.budget = Infinity; await clock.fire(); await settle(market);
+  const gauges = gaugeAsked.length, states = stateAsked.length;
+  fake.chain.t += 15 * 60; await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).discovery.phase, 'idle');
+  assert.deepEqual(gaugeAsked.slice(gauges), [[gaugeMiss]], 'only the failed gauge is read again');
+  assert.equal(stateAsked[states][0], stateMiss, 'the failed state is read again in the first unread shard');
+  assert.equal(baseOf(market).activeCount, BASE_TRACKED, 'neither failure drops a tracked pool');
+  assert.ok(market.state().pools.some((p) => p.address === gaugeMiss && p.gauge === '0xf' + gaugeMiss.slice(-39)), 'the re-read gauge is published');
+});
+
+test('a pool created while the gauge/state draft is resumed is read as a new shard and the stitched snapshot is re-read in one block', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
+  onlyBase(dir);
+  const fake = baseScaleChain(), clock = timers();
+  const market = marketWith(dir, fake, clock, { cycleDeadlineMs: 200 });
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
+  await market.initialize();
+  await clock.fire(); await settle(market);
+  const asked = [], readPoolStates = fake.reads.readPoolStates;
+  fake.reads.readPoolStates = async (rpc, list, block) => { asked.push(list.map((p) => p.address)); return readPoolStates(rpc, list, block); };
+  fake.chain.t += 6 * 3600 + 1;
+  fake.chain.budget = 11; await clock.fire(); await settle(market);
+  assert.equal(baseOf(market).discovery.phase, 'pending');
+  const extra = '0x' + (BASE_POOLS + 1).toString(16).padStart(40, '0');
+  fake.pools.push(extra); fake.tracked.add(extra);
+  fake.chain.t += 15 * 60; fake.chain.budget = Infinity; await clock.fire(); await settle(market);
+  const gauges = fake.chain.gaugeReads.length, states = asked.length;
+  fake.chain.t += 15 * 60; await clock.fire(); await settle(market);
+  const base = baseOf(market);
+  assert.equal(base.discovery.phase, 'idle');
+  assert.deepEqual([base.poolCount, base.activeCount], [BASE_POOLS + 1, BASE_TRACKED + 1]);
+  assert.deepEqual(fake.chain.gaugeReads.slice(gauges), [1], 'only the new pool needs a gauge read');
+  const shards = asked.slice(states);
+  assert.ok(shards.slice(0, -1).some((shard) => shard.includes(extra)), 'the new pool is read among the unread shards');
+  assert.deepEqual(fake.chain.stateReads.at(-1), { block: fake.blockAt(fake.chain.t), pools: BASE_TRACKED + 1 }, 'stitched states are re-read for the tracked set in this block');
+  assert.ok(shards.at(-1).includes(extra));
+});
+
 test('an RPC change cancels the old round before discovery and the new RPC starts over', async (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
   onlyBase(dir);

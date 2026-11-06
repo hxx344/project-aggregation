@@ -17,7 +17,7 @@ export type MarketChain = {
   history: { points: number; from: number | null; archive: 'archive' | 'unavailable' | 'local'; pending: number; phase?: 'catching_up' | 'backoff' | 'disabled' | 'complete' | null; nextAt?: number | null };
   // 池子列表：at 为最近一次发现完成时间；stale 为超过 12 小时未更新；failures/error/retryAt 为重新发现的连续失败次数、最近错误与下次尝试时间。旧版服务端没有此字段。
   // phase 区分发现进行中、待继续、真实失败退避、无进展预算退避与空闲；refreshPending 表示下一轮必须先刷新当前数据。
-  // stalledAttempts 只统计连续预算耗尽且无新增草稿进展的发现尝试，不计入 failures。
+  // stalledAttempts 统计预算耗尽且无新进展的发现尝试：新增池子/代币或真实请求错误时清零，只有动态分片进展时保持不变；不计入 failures。
   discovery?: { at: number | null; stale: boolean; failures: number; error: string | null; retryAt: number | null; phase?: 'idle' | 'running' | 'pending' | 'backoff' | 'budget_backoff'; refreshPending?: boolean; stalledAttempts?: number };
 };
 export type MarketSnapshot = {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { inspect } from 'node:util';
-import { createRpc, readPoolAddresses, rpcDiagnostic, scrubRpcMessage } from '../server/research/aero-market-rpc.mjs';
+import { createRpc, readGauges, readPoolAddresses, rpcDiagnostic, scrubRpcMessage } from '../server/research/aero-market-rpc.mjs';
 import { strictMarketConfig, DEFAULT_CONFIG } from '../server/research/aero-market.mjs';
 
 const LIMIT = 8 * 1024 * 1024;
@@ -231,6 +231,12 @@ test('pool addresses are read in batches from the known count', async () => {
   const last = await readPoolAddresses(rpc, '0xfactory', 500, 250);
   assert.deepEqual([last.added.length, asked[1][0], asked[1].at(-1)], [100, 500, 599]);
   assert.equal((await readPoolAddresses(rpc, '0xfactory', 0)).added.length, 600, 'no limit reads all new pools');
+});
+
+test('gauge reads tell a failed call (undefined) apart from a pool without a gauge (null)', async () => {
+  const gauge = '0x' + 'AB'.repeat(20);
+  const rpc = { async multicall() { return [{ ok: true, value: gauge }, { ok: true, value: '0x' + '0'.repeat(40) }, { ok: false }]; } };
+  assert.deepEqual(await readGauges(rpc, ['0x1', '0x2', '0x3']), [gauge.toLowerCase(), null, undefined]);
 });
 
 test('custom RPC boundary: https to any host (including a private self-hosted node) or plain http only to this machine', () => {
