@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { CircleAlert, ListPlus, LoaderCircle, Play, ScanSearch, ShieldCheck } from 'lucide-react';
 import type { MarketPool } from './aero-market-types';
 import type { AeroSafePreview } from './aero-safe-types';
-import { CHANGE_TIMEOUT_MS, exactUnits, rawUnits, same, tokenOf, units, useAeroSafe } from './aero-safe-client';
+import { CHANGE_TIMEOUT_MS, POOL_STATE_TEXT, exactUnits, policyRule, rawUnits, same, tokenOf, units, usd, useAeroSafe, type AeroSafe } from './aero-safe-client';
 import { openAeroTab } from './aero-nav';
 import './aero-safe.css';
 
@@ -64,10 +64,13 @@ function AddPool({ pool, safe }: { pool: MarketPool; safe: ReturnType<typeof use
 }
 
 
-// 池详情页里的实盘开仓：按页面上选定的区间（默认推荐区间），用 Safe 里的余额经 Roles 开仓并质押。先预览，再确认执行。
-export default function AeroSafePanel({ pool, range, onExpired }: { pool: MarketPool; range: [number, number]; onExpired: () => void }) {
-  const safe = useAeroSafe(onExpired);
-  const { state, loadError, busy, actionError, execute, preview: requestPreview } = safe;
+// 开仓表单：池详情页按选定区间开仓，「仓位」里的加仓按已有头寸的区间再开一个新头寸。先预览，再确认执行。
+// usd0/usd1：行情里的两币美元价，用于页面填的投入上限；没有时不能填投入上限（本池美元上限仍由服务端按行情价核对）。
+export function OpenForm({ safe, pool, range, usd0, usd1, verb = '开仓' }: {
+  safe: AeroSafe; pool: { address: string; token0: string; token1: string; name: string }; range: [number, number];
+  usd0: number | null; usd1: number | null; verb?: string;
+}) {
+  const { state, busy, execute, preview: requestPreview } = safe;
   const [shareText, setShareText] = useState('100');
   const [capText, setCapText] = useState('');
   const [rebalance, setRebalance] = useState(true);
@@ -77,12 +80,10 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
   const shareBps = Number.isFinite(share) && share > 0 && share <= 100 ? Math.round(share * 100) : null;
   // 投入上限（美元，选填）：按行情里的两币美元价估值，超过时两币等比缩小；开仓沿用预览时的价格。
   const capUsd = capText.trim() === '' ? null : Number(capText);
-  const priced = !!pool.token0.usd && pool.token0.usd > 0 && !!pool.token1.usd && pool.token1.usd > 0;
+  const priced = !!usd0 && usd0 > 0 && !!usd1 && usd1 > 0;
   const capInvalid = capUsd !== null && (!Number.isFinite(capUsd) || capUsd <= 0 || !priced);
-  const cap: OpenCap | null = capUsd !== null && !capInvalid ? { usd: capUsd, usd0: pool.token0.usd!, usd1: pool.token1.usd! } : null;
+  const cap: OpenCap | null = capUsd !== null && !capInvalid ? { usd: capUsd, usd0: usd0!, usd1: usd1! } : null;
   const key = `${range[0]}:${range[1]}:${shareBps}:${rebalance}:${capUsd ?? ''}`;
-  const whitelisted = state?.config?.permissions.pools.find((p) => (same(p.token0, pool.token0.address) && same(p.token1, pool.token1.address) && p.tickSpacing === pool.tickSpacing));
-  const chainPool = state?.chain?.pools.find((p) => same(p.address, pool.address));
   const job = state?.job;
   const running = job?.status === 'running';
   // 任务结束后 Safe 余额已变，旧预览作废；预览本身超过有效期也作废（服务端同样拒绝）。
@@ -93,9 +94,12 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
     return () => window.clearInterval(timer);
   }, [preview]);
   const expired = preview ? clock - preview.at > PREVIEW_TTL_MS - 10_000 : false;
-  const blocked = !state?.wallet ? '请先在 Aero「配置」填写 bot 私钥' : state.paused ? state.pauseReason : running ? `${job.label}正在执行` : state.pending && !state.pending.stale ? `上一笔交易（${state.pending.label}）等待上链` : null;
-  const t0 = tokenOf(state?.chain, pool.token0.address), t1 = tokenOf(state?.chain, pool.token1.address);
+  const rule = policyRule(state, pool.address), room = state?.policy?.rooms[pool.address.toLowerCase()];
+  const policyBlocked = state?.policy?.corrupt ?? (rule.state !== 'active' ? `本池已设为「${POOL_STATE_TEXT[rule.state]}」，不能${verb}；在「仓位」改回「运行」后再开` : null);
+  const blocked = !state?.wallet ? '请先在 Aero「配置」填写 bot 私钥' : state.paused ? state.pauseReason : policyBlocked ? policyBlocked : running ? `${job.label}正在执行` : state.pending && !state.pending.stale ? `上一笔交易（${state.pending.label}）等待上链` : null;
+  const t0 = tokenOf(state?.chain, pool.token0), t1 = tokenOf(state?.chain, pool.token1);
   const amount = (raw: string | null | undefined, token: typeof t0) => (token ? `${units(raw, token.decimals)} ${token.symbol}` : '—');
+  const limitText = (l: { capUsd: number; inPoolUsd: number; roomUsd: number }) => `本池上限 ${usd(l.capUsd)}，已有约 ${usd(l.inPoolUsd)}，还能放约 ${usd(Math.max(0, l.roomUsd))}`;
 
   const runPreview = async () => {
     if (shareBps === null || capInvalid) return;
@@ -106,8 +110,9 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
     if (!preview || preview.key !== key || expired || shareBps === null) return;
     const p = preview.data;
     const slippage = (state?.config?.slippageBps ?? 50) / 100;
-    const lines = [`在 ${pool.token0.symbol}/${pool.token1.symbol} CL${pool.tickSpacing} 开仓：tick ${range[0]} 至 ${range[1]}`,
-      `投入 Safe 余额的 ${shareBps / 100}%${preview.cap ? `，上限 $${preview.cap.usd.toLocaleString('zh-CN')}${p.capped ? '（已按上限缩减）' : '（未触及）'}` : ''}：${amount(p.amount0, t0)} + ${amount(p.amount1, t1)}`,
+    const lines = [`在 ${pool.name} ${verb}：tick ${range[0]} 至 ${range[1]}${verb === '加仓' ? '（与已有头寸同一区间，新开一个头寸）' : ''}`,
+      `投入 Safe 余额的 ${shareBps / 100}%${preview.cap ? `，投入上限 $${preview.cap.usd.toLocaleString('zh-CN')}` : ''}${p.capped ? `（已按上限 $${(p.capUsd ?? preview.cap?.usd ?? 0).toLocaleString('zh-CN')} 缩减）` : ''}：${amount(p.amount0, t0)} + ${amount(p.amount1, t1)}`,
+      ...(p.limit ? [`${limitText(p.limit)}；执行时按最新链上状态再核对一次。`] : []),
       p.swap ? `先配平兑换 ${amount(p.swap.amountIn, tokenOf(state?.chain, p.swap.tokenIn))}` : '不兑换',
       `兑换与开仓的最小成交量按报价扣 ${slippage}% 滑点；执行时余额偏离预览超过 1%、配平兑换超出预览 10% 或方向改变都会停止。`,
       '开仓后自动质押到 gauge；提前解押会被罚没部分奖励。'];
@@ -116,29 +121,43 @@ export default function AeroSafePanel({ pool, range, onExpired }: { pool: Market
     if (window.confirm(`${lines.join('\n')}\n\n确认由 bot 经 Roles 发送？`)) void execute('open', { pool: pool.address, tickLower: range[0], tickUpper: range[1], shareBps, rebalance, ...(preview.cap ? { cap: preview.cap } : {}), expect });
   };
 
+  const stale = preview && (preview.key !== key || expired);
+  return <>
+    <div className="as-row">
+      <span>Safe 余额：{amount(t0?.balance, t0)} · {amount(t1?.balance, t1)}</span>
+      <span>仓位策略：{POOL_STATE_TEXT[rule.state]} · {rule.capUsd === null ? '不限上限' : room?.error ? `上限 ${usd(rule.capUsd)}（${room.error}）` : room?.inPoolUsd !== undefined ? limitText({ capUsd: rule.capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd ?? 0 }) : `上限 ${usd(rule.capUsd)}`}</span>
+    </div>
+    <div className="as-form">
+      <label>投入比例（%）<input type="number" min={1} max={100} step={1} value={shareText} onChange={(e) => setShareText(e.target.value)} /></label>
+      <label>投入上限（美元，选填）<input inputMode="decimal" placeholder="不限" value={capText} disabled={!priced} onChange={(e) => setCapText(e.target.value)} />
+        {!priced ? <small className="as-muted">这里没有代币美元价，按本池上限执行</small> : capInvalid ? <small className="as-muted">须为正数</small> : null}</label>
+      <label className="as-check"><input type="checkbox" checked={rebalance} onChange={(e) => setRebalance(e.target.checked)} />按区间比例先兑换配平</label>
+      <span className="as-range">tick {range[0]} 至 {range[1]}</span>
+      <button type="button" className="button secondary" disabled={!!busy || shareBps === null || capInvalid || range[0] >= range[1] || !!policyBlocked} onClick={() => void runPreview()}>{busy === 'preview' ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}预览</button>
+      <button type="button" className="button primary" disabled={!!busy || !!blocked || !preview || !!stale} title={blocked ?? (stale ? (expired ? '预览已过期，请重新预览' : '区间、比例或上限已改变，请重新预览') : !preview ? '请先预览' : undefined)} onClick={open}>{busy === 'open' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}{verb}并质押</button>
+    </div>
+    {preview && !stale ? <p className="as-muted">预览：投入 {amount(preview.data.amount0, t0)} + {amount(preview.data.amount1, t1)}{preview.data.capped ? `（已按上限 $${(preview.data.capUsd ?? preview.cap?.usd ?? 0).toLocaleString('zh-CN')} 缩减）` : ''}{preview.data.limit ? `；${limitText(preview.data.limit)}` : ''}；{preview.data.swap ? `兑换 ${amount(preview.data.swap.amountIn, tokenOf(state?.chain, preview.data.swap.tokenIn))}${preview.data.swap.quoted ? ` → 约 ${amount(preview.data.swap.quoted, tokenOf(state?.chain, preview.data.swap.tokenOut))}` : '（授权后再报价）'}` : '无需兑换'}；预计存入约 {amount(preview.data.deposit0, t0)} + {amount(preview.data.deposit1, t1)}，零头留在 Safe。</p> : null}
+    {preview && expired && preview.key === key ? <p className="as-muted">预览已超过 2 分钟，请重新预览后再{verb}。</p> : null}
+    {blocked && state?.wallet ? <p className="as-muted">{blocked}</p> : null}
+  </>;
+}
+
+// 池详情页里的实盘开仓：按页面上选定的区间（默认推荐区间），用 Safe 里的余额经 Roles 开仓并质押。
+export default function AeroSafePanel({ pool, range, onExpired }: { pool: MarketPool; range: [number, number]; onExpired: () => void }) {
+  const safe = useAeroSafe(onExpired);
+  const { state, loadError, actionError } = safe;
+  const whitelisted = state?.config?.permissions.pools.find((p) => (same(p.token0, pool.token0.address) && same(p.token1, pool.token1.address) && p.tickSpacing === pool.tickSpacing));
+  const chainPool = state?.chain?.pools.find((p) => same(p.address, pool.address));
+  const job = state?.job;
+
   const body = () => {
     if (!state) return <p className="as-muted">{loadError ? `读取实盘状态失败：${loadError}` : '正在读取实盘状态…'}</p>;
     if (!state.configured) return <p className="as-muted">尚未配置 Safe 实盘。<button type="button" className="as-link" onClick={() => openAeroTab('config')}>前往「配置」</button></p>;
     if (!whitelisted) return <AddPool pool={pool} safe={safe} />;
     if (!chainPool) return <p className="as-muted">{state.chainError ? `链上读取失败：${state.chainError}` : '正在读取 Safe 链上状态…'}</p>;
-    const stale = preview && (preview.key !== key || expired);
     return <>
-      <div className="as-row">
-        <span>Safe 余额：{amount(t0?.balance, t0)} · {amount(t1?.balance, t1)}</span>
-        <span>本池头寸 {chainPool.positions.length} 个{chainPool.positions.length ? <button type="button" className="as-link" onClick={() => openAeroTab('positions')}>在「仓位」管理</button> : null}</span>
-      </div>
-      <div className="as-form">
-        <label>投入比例（%）<input type="number" min={1} max={100} step={1} value={shareText} onChange={(e) => setShareText(e.target.value)} /></label>
-        <label>投入上限（美元，选填）<input inputMode="decimal" placeholder="不限" value={capText} onChange={(e) => setCapText(e.target.value)} />
-          {capInvalid ? <small className="as-muted">{priced ? '须为正数' : '行情缺少代币美元价，暂不能按美元设上限'}</small> : null}</label>
-        <label className="as-check"><input type="checkbox" checked={rebalance} onChange={(e) => setRebalance(e.target.checked)} />按区间比例先兑换配平</label>
-        <span className="as-range">tick {range[0]} 至 {range[1]}</span>
-        <button type="button" className="button secondary" disabled={!!busy || shareBps === null || capInvalid || range[0] >= range[1]} onClick={() => void runPreview()}>{busy === 'preview' ? <LoaderCircle size={15} className="spin" /> : <ScanSearch size={15} />}预览</button>
-        <button type="button" className="button primary" disabled={!!busy || !!blocked || !preview || !!stale} title={blocked ?? (stale ? (expired ? '预览已过期，请重新预览' : '区间、比例或上限已改变，请重新预览') : !preview ? '请先预览' : undefined)} onClick={open}>{busy === 'open' ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}开仓并质押</button>
-      </div>
-      {preview && !stale ? <p className="as-muted">预览：投入 {amount(preview.data.amount0, t0)} + {amount(preview.data.amount1, t1)}{preview.data.capped ? `（已按上限 $${preview.cap?.usd.toLocaleString('zh-CN')} 缩减）` : ''}；{preview.data.swap ? `兑换 ${amount(preview.data.swap.amountIn, tokenOf(state.chain, preview.data.swap.tokenIn))}${preview.data.swap.quoted ? ` → 约 ${amount(preview.data.swap.quoted, tokenOf(state.chain, preview.data.swap.tokenOut))}` : '（授权后再报价）'}` : '无需兑换'}；预计存入约 {amount(preview.data.deposit0, t0)} + {amount(preview.data.deposit1, t1)}，零头留在 Safe。</p> : null}
-      {preview && expired && preview.key === key ? <p className="as-muted">预览已超过 2 分钟，请重新预览后再开仓。</p> : null}
-      {blocked && state.wallet ? <p className="as-muted">{blocked}</p> : null}
+      <div className="as-row"><span>本池头寸 {chainPool.positions.length} 个<button type="button" className="as-link" onClick={() => openAeroTab('positions')}>在「仓位」管理与设置上限</button></span></div>
+      <OpenForm safe={safe} pool={{ address: pool.address, token0: pool.token0.address, token1: pool.token1.address, name: `${pool.token0.symbol}/${pool.token1.symbol} CL${pool.tickSpacing}` }} range={range} usd0={pool.token0.usd ?? null} usd1={pool.token1.usd ?? null} />
     </>;
   };
   return <section className="panel as-panel" aria-label="Safe 实盘开仓">

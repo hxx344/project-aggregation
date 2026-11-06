@@ -11,7 +11,8 @@ import { allowanceChanges, batchExecuteBefore, buildUpdateBatch, conditionUsage,
 import * as executor from '../../tools/aero-roles/executor.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
-import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, POOL_CAP_NONE, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolCapOf, poolRoom, readAutoState, roomFullText, roomShortText, storedAutoConfig, strictAutoConfig, stuckReason } from './aero-auto.mjs';
+import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolRoom, readAutoState, roomFullText, roomShortText, strictAutoConfig, stuckReason, usdText } from './aero-auto.mjs';
+import { POOL_STATE_LABELS, addBlockedReason, policyOf, readPolicy, strictPoolPolicy, withPoolPolicy } from './aero-policy.mjs';
 
 const PRIVATE_KEY_PATTERN = /^(0x)?[0-9a-fA-F]{64}$/;
 const EVENT_LIMIT = 50;
@@ -36,12 +37,15 @@ export const PREVIEW_TTL_MS = 2 * 60_000;
 // 本系统开出的头寸 tokenId，只保留最新的这么多个。
 const MINTED_LIMIT = 100;
 const DEFAULTS = Object.freeze({ rpcUrl: 'https://mainnet.base.org', slippageBps: 50, autoSellRewards: true, minRewardSell: '1' });
-const ACTIONS = new Set(['open', 'close', 'stake', 'unstake', 'claim', 'sell', 'swap']);
-const actionLabels = { open: '开仓', close: '平仓', stake: '质押', unstake: '解押', claim: '领取排放', sell: '卖出 AERO', swap: '兑换', rebalance: '自动调仓' };
+const ACTIONS = new Set(['open', 'close', 'reduce', 'exitPool', 'stake', 'unstake', 'claim', 'sell', 'swap']);
+const actionLabels = { open: '开仓', close: '平仓', reduce: '减仓', exitPool: '整池平仓', stake: '质押', unstake: '解押', claim: '领取排放', sell: '卖出 AERO', swap: '兑换', rebalance: '自动调仓' };
+// 撤出后换币的默认价格冲击上限（基点）。
+export const EXIT_IMPACT_BPS = 100;
 const AUTO_TICK_MS = 30_000;
-// 这些失败不停用自动调仓，下一轮重试：维护或隔离恢复暂停了签名、TWAP 偏离或不可用、单池上限因缺价或读链失败暂时核对不了。
-const AUTO_RETRY_CODES = new Set(['halted', 'twap', 'cap']);
-const autoFile = (auto) => ({ schema: 1, ...auto, config: storedAutoConfig(auto.config) });
+// 这些失败不停用自动调仓，下一轮重试：维护或隔离恢复暂停了签名、TWAP 偏离或不可用、单池上限因缺价或读链失败暂时核对不了、
+// 仓位策略在任务启动后把本池停止或关闭了自动调仓。
+const AUTO_RETRY_CODES = new Set(['halted', 'twap', 'cap', 'policy']);
+const autoFile = ({ config, history, halted, reopen, closing }) => ({ schema: 1, config, history, halted, reopen, closing });
 
 function readBounded(file, limit) {
   if (!existsSync(file)) return null;
@@ -138,7 +142,12 @@ function parseParams(action, params, config, tokens, now = Date.now(), withExpec
       shareBps: integer(p.shareBps ?? 10_000, '投入比例（基点）', 1, 10_000), cap: parseCap(p.cap), rebalance: p.rebalance !== false, slippageBps, stake: p.stake !== false,
       ...(withExpect ? { expect: parseExpect(p.expect, now) } : {}) };
   }
-  if (action === 'close') return { tokenId: tokenId(), slippageBps, acceptPenalty: p.acceptPenalty === true };
+  // 撤出类操作可选 exitToken：撤出后把本池另一种代币（含卖 AERO 所得）换成它；maxImpactBps 为换币的价格冲击上限。
+  const exit = () => ({ exitToken: p.exitToken == null ? null : address(p.exitToken, '要换成的代币'),
+    maxImpactBps: p.maxImpactBps === undefined ? EXIT_IMPACT_BPS : integer(p.maxImpactBps, '价格冲击上限（基点）', 1, 2000) });
+  if (action === 'close') return { tokenId: tokenId(), slippageBps, acceptPenalty: p.acceptPenalty === true, ...exit() };
+  if (action === 'reduce') return { tokenId: tokenId(), shareBps: integer(p.shareBps, '减仓比例（基点）', 1, 10_000), slippageBps, acceptPenalty: p.acceptPenalty === true, ...exit() };
+  if (action === 'exitPool') return { pool: address(p.pool, '池子地址'), slippageBps, acceptPenalty: p.acceptPenalty === true, ...exit() };
   if (action === 'stake') return { tokenId: tokenId() };
   if (action === 'unstake') return { tokenId: tokenId(), acceptPenalty: p.acceptPenalty === true };
   if (action === 'claim' || action === 'sell') return { slippageBps };
@@ -250,6 +259,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
   const autoPath = path.join(directory, 'auto.json'), changesPath = path.join(directory, 'changes.json'), poolPlanPath = path.join(directory, 'pool-plan.json');
+  const policyPath = path.join(directory, 'policy.json');
+  // 仓位策略：读不出时 corrupt 为原因，所有池子不能加仓、自动调仓不动，直到人工核对文件。
+  let policy = { pools: {} };
   // 白名单待变更：待加池（可多个）与额度调整，合成一份 Safe 批次；批次生成时冻结，链上核对生效后并入配置，批次之后新加的变更继续保留。
   let changes = EMPTY_CHANGES, changesPreview = null, changesWriteError = null, verifyingBatch = false;
   let auto = { config: { ...AUTO_DEFAULTS }, history: [], halted: null, reopen: null, closing: null }, autoError = null, autoWatch = [], autoNote = null, autoCheckedAt = null;
@@ -287,10 +299,43 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       job: job && structuredClone(job), chain: snapshot && structuredClone(snapshot), chainAt: snapshotAt, chainError: snapshotError, refreshing: Boolean(refreshing),
       events: structuredClone(events), ledger: ledger(), serverNow: now(),
       changes: changesView(),
+      policy: policyView(),
       auto: { config: { ...auto.config }, defaults: AUTO_DEFAULTS, error: autoError, halted: auto.halted && { ...auto.halted }, reopen: auto.reopen && { ...auto.reopen }, closing: auto.closing && { ...auto.closing }, stuck: stuckReason(auto),
         history: auto.history.slice(-10).reverse(), watch: structuredClone(autoWatch), note: autoNote, checkedAt: autoCheckedAt, intervalMs: AUTO_TICK_MS },
     };
   }
+  // 仓位策略与各池上限的占用（按最新快照与行情价估算，只供页面显示；执行时按最新链上状态再算）。
+  function policyView() {
+    const rooms = {};
+    let prices = null;
+    try { prices = readPrices(); } catch {}
+    for (const pool of snapshot?.pools ?? []) {
+      const rule = policyOf(policy, pool.address);
+      if (rule.capUsd === null) continue;
+      const room = poolRoom({ chain: snapshot, prices, pool: pool.address, capUsd: rule.capUsd, now: now() });
+      rooms[pool.address.toLowerCase()] = room.error ? { error: room.error } : { error: null, capUsd: room.capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd };
+    }
+    return { pools: structuredClone(policy.pools), corrupt: policy.corrupt ?? null, rooms };
+  }
+  // 按仓位策略核对手动开仓、加仓：池子须为「运行」；设了美元上限时按最新链上状态与行情价算出剩余空间，
+  // 与页面填的投入上限取小，交给 openPosition 等比缩小投入量。返回 { cap, limit }，limit 供预览显示。
+  async function openLimit(ctx, poolAddress, userCap) {
+    const blocked = addBlockedReason(policy, poolAddress);
+    if (blocked) throw new chain.ExecError(blocked);
+    const { capUsd } = policyOf(policy, poolAddress);
+    if (capUsd === null) return { cap: userCap, limit: null };
+    let fresh, prices = null;
+    try { fresh = serialize(await withBudget(chain.readState(ctx, { knownIds: minted }), REFRESH_BUDGET_MS, '读取链上状态'), ctx); } catch (error) {
+      throw new chain.ExecError(`核对单池上限时读取链上状态失败（${error.message}），未开仓`);
+    }
+    try { prices = readPrices(); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 行情价格读取失败'); }
+    const room = poolRoom({ chain: fresh, prices, pool: poolAddress, capUsd, now: now() });
+    if (room.error) throw new chain.ExecError(`${room.error}，未开仓`);
+    if (!(room.roomUsd > 0)) throw new chain.ExecError(`${roomFullText(room)}，不能再开仓或加仓；可在「仓位」调高本池上限`);
+    const usd = Math.min(room.roomUsd, userCap?.usd ?? Infinity);
+    return { cap: { usd, usd0: room.usd0, usd1: room.usd1 }, limit: { capUsd, inPoolUsd: room.inPoolUsd, roomUsd: room.roomUsd } };
+  }
+
   // 待变更合成后的权限、批次笔数与条件节点用量；按配置与待变更缓存，不在每次轮询时重算。额度那几笔的参数要读链，生成批次时才算。
   function changesNext() {
     // 批次每笔发往 config.roles、由 config.safe 执行：二者也是缓存键的一部分。
@@ -536,8 +581,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         const minAmount = parseUnits(config.minRewardSell, ctx.tokens.get(chain.REWARD_TOKEN)?.decimals ?? 18);
         return chain.sellRewards(ctx, h, { slippageBps: params.slippageBps ?? config.slippageBps, minAmount, maxAmount });
       };
-      if (action === 'open') result = await chain.openPosition(ctx, h, params);
-      else if (action === 'close') { result = await chain.closePosition(ctx, h, params); result.sold = await sellAfter(); }
+      if (action === 'open') {
+        h.step('核对仓位策略');
+        const { cap } = await openLimit(ctx, params.pool, params.cap);
+        result = await chain.openPosition(ctx, h, { ...params, cap });
+      } else if (action === 'close' || action === 'reduce' || action === 'exitPool') result = await withdraw(ctx, h, action, params, sellAfter);
       else if (action === 'stake') result = await chain.stakePosition(ctx, h, params);
       else if (action === 'unstake') { result = await chain.unstakePosition(ctx, h, params); result.sold = await sellAfter(); }
       else if (action === 'claim') { h.step('领取排放'); result = await chain.claimRewards(ctx, h); result.sold = await sellAfter(); }
@@ -562,6 +610,64 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     await refresh();
   }
 
+  // 撤出：平仓、减仓或整池平仓，之后按设置卖出 AERO，再可选地把本池另一种代币换成 exitToken。
+  // 换币只卖这次任务新增到 Safe 的部分（撤出所得与卖 AERO 所得），不超过今日剩余额度；额度不够、价格冲击过大或报价失败时
+  // 未换的币留在 Safe，任务仍算完成并写明原因。换币路径与罚没期在签名前先核对。
+  async function withdraw(ctx, h, action, params, sellAfter) {
+    let pool, ids;
+    if (action === 'exitPool') {
+      pool = ctx.pools.find((p) => p.address.toLowerCase() === params.pool.toLowerCase());
+      if (!pool) throw new chain.ExecError('池子不在白名单里');
+      h.step('读取本池头寸');
+      let fresh;
+      try { fresh = await withBudget(chain.readState(ctx, { knownIds: minted }), REFRESH_BUDGET_MS, '读取链上状态'); } catch (error) { throw new chain.ExecError(`读取本池头寸失败：${error.message}，未操作`); }
+      const positions = fresh.pools.find((p) => p.address.toLowerCase() === pool.address.toLowerCase())?.positions ?? [];
+      if (!positions.length) throw new chain.ExecError('Safe 在本池没有头寸');
+      const locked = positions.filter((x) => x.staked && x.penaltyUntilBlock != null && BigInt(fresh.blockNumber) < BigInt(x.penaltyUntilBlock));
+      if (locked.length && !params.acceptPenalty) throw new chain.ExecError(`头寸 ${locked.map((x) => `#${x.tokenId}`).join('、')} 仍在提前解押罚没期内，确认接受罚没后再整池平仓，未操作`, { code: 'penalty' });
+      ids = positions.map((x) => BigInt(x.tokenId));
+    } else {
+      ({ pool } = await chain.locate(ctx, params.tokenId));
+      ids = [params.tokenId];
+    }
+    const route = params.exitToken ? chain.exitRoute(ctx, pool, params.exitToken) : null;
+    const before = route ? (await chain.safeBalances(ctx, [route.tokenIn]))[0] : 0n;
+    const result = { pool: pool.address };
+    if (action === 'reduce' && params.shareBps < 10_000) Object.assign(result, await chain.reducePosition(ctx, h, params));
+    else {
+      for (const tokenId of ids) {
+        if (ids.length > 1) h.step(`平仓 #${tokenId}`);
+        await chain.closePosition(ctx, h, { tokenId, slippageBps: params.slippageBps, acceptPenalty: params.acceptPenalty });
+      }
+      result.closed = ids.map(String);
+    }
+    result.sold = await sellAfter();
+    if (!route) return result;
+    h.step('换币');
+    const symbol = (t) => ctx.tokens.get(t)?.symbol ?? t;
+    const what = `${symbol(route.tokenIn)} → ${symbol(route.tokenOut)}`;
+    const after = (await chain.safeBalances(ctx, [route.tokenIn]))[0];
+    const gained = after > before ? after - before : 0n;
+    const remaining = await chain.remainingAllowance(ctx, route.tokenIn);
+    const amountIn = gained < remaining ? gained : remaining;
+    const exit = { tokenIn: route.tokenIn, tokenOut: route.tokenOut, gained: String(gained), amountIn: String(amountIn), received: null, left: String(gained - amountIn), reason: null };
+    result.exit = exit;
+    if (gained === 0n) { exit.reason = `没有新收回的 ${symbol(route.tokenIn)}，无需兑换`; return result; }
+    if (amountIn === 0n) { exit.reason = `${symbol(route.tokenIn)} 今日额度已用完，未兑换，收回的币留在 Safe，额度恢复后可手动兑换`; return result; }
+    try {
+      const swapped = await chain.swap(ctx, h, { tokenIn: route.tokenIn, tokenOut: route.tokenOut, amountIn, slippageBps: params.slippageBps, maxImpactBps: params.maxImpactBps });
+      exit.received = String(swapped.received);
+    } catch (error) {
+      // 兑换已签名而结果未知时照常报错：交给台账与人工核对。没签名的失败（价格冲击、报价、额度）只记原因，撤出已经完成。
+      if (error.signed === true) throw error;
+      exit.left = String(gained); exit.amountIn = '0';
+      exit.reason = `${what} 未兑换：${error.message}，收回的币留在 Safe`;
+      return result;
+    }
+    if (gained > amountIn) exit.reason = `${symbol(route.tokenIn)} 今日额度只够兑换一部分，其余留在 Safe，额度恢复后可手动兑换`;
+    return result;
+  }
+
   // ---- 自动调仓 ----
   // 返回是否写入成功。写不进去时停用：进度与次数统计只在内存里，重启会丢。
   function saveAuto() {
@@ -584,21 +690,21 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   // 单池上限：按最新链上状态（平仓收回的币已回到 Safe，总资产基本不变）与行情价算出本池还能放多少，把重开数量等比缩进去，余下的留在 Safe。
   // 没设上限时返回 null。缺价、价格过期或读链失败时下一轮重试（code 'cap'），本池其他头寸已占满上限时停用等人工处理。
   async function fitPoolCap(ctx, h, pool, amounts, closed) {
-    const capBps = poolCapOf(auto.config, pool.address);
-    if (capBps >= POOL_CAP_NONE) return null;
+    const { capUsd } = policyOf(policy, pool.address);
+    if (capUsd === null) return null;
     h.step('核对单池上限');
     let fresh, prices = null;
     try { fresh = serialize(await withBudget(chain.readState(ctx, { knownIds: minted }), REFRESH_BUDGET_MS, '读取链上状态'), ctx); } catch (error) {
       throw new chain.ExecError(`核对单池上限时读取链上状态失败（${error.message}），暂不重开`, { code: 'cap' });
     }
     try { prices = readPrices(); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 行情价格读取失败'); }
-    const room = poolRoom({ chain: fresh, prices, pool: pool.address, capBps, exclude: closed, now: now() });
+    const room = poolRoom({ chain: fresh, prices, pool: pool.address, capUsd, exclude: closed, now: now() });
     if (room.error) throw new chain.ExecError(`${room.error}，暂不重开`, { code: 'cap' });
     const fit = fitToRoom({ ...amounts, token0: pool.token0, token1: pool.token1, room, valueOf: room.valueOf });
     const short = roomShortText(room, fit.valueUsd);
     if (short) throw new chain.ExecError(`${short}，未重开，收回的币留在 Safe。可调高上限后重新启用，或放弃待重开记录`);
     if (fit.amount0 === 0n && fit.amount1 === 0n) throw new chain.ExecError('按单池上限缩减后数量过小，未重开，收回的币留在 Safe');
-    if (fit.capped) h.log({ event: 'auto_pool_capped', pool: pool.address, capBps, totalUsd: Math.round(room.totalUsd), roomUsd: Math.round(room.roomUsd), valueUsd: Math.round(fit.valueUsd), ...(room.unpriced.length ? { unpriced: room.unpriced } : {}) });
+    if (fit.capped) h.log({ event: 'auto_pool_capped', pool: pool.address, capUsd, roomUsd: Math.round(room.roomUsd), valueUsd: Math.round(fit.valueUsd) });
     return fit;
   }
   // 调仓：核对 TWAP → 记一次并落盘"平仓中"（计入次数与冷却）→ 平仓 → 按余额变化落盘"待重开" → 卖出本次领到的 AERO 并计入 → 按单池上限缩减 → 再核对 TWAP → 居中重开并质押。
@@ -608,6 +714,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     const stuck = stuckReason(auto);
     if (stuck) throw new chain.ExecError(stuck);
     if (!auto.reopen && params.kind !== 'rebalance') return { skipped: '没有待重开的记录' };
+    // 判定之后、任务启动前仓位策略可能已变：已停止或关闭了自动调仓的池子不平仓也不重开（尚未签名，下一轮按新策略判定）。
+    const rule = policyOf(policy, auto.reopen?.pool ?? params.pool);
+    if (policy.corrupt || rule.state === 'stopped' || !rule.auto) throw new chain.ExecError(policy.corrupt ?? `本池${rule.state === 'stopped' ? POOL_STATE_LABELS.stopped : '关闭了自动调仓'}，未调仓`, { code: 'policy' });
     if (!auto.reopen) {
       const pool = poolOf(params.pool);
       if (!pool) throw new chain.ExecError('池子不在白名单里');
@@ -719,7 +828,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (!snapshot || snapshotError) { autoNote = `链上读取失败：${snapshotError ?? '尚无数据'}`; return; }
       let prices = null;
       try { prices = readPrices(); } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 行情价格读取失败'); }
-      const result = evaluateAuto({ config: auto.config, chain: snapshot, outSince, history: auto.history, reopen: auto.reopen, closing: auto.closing, prices, now: now() });
+      const result = evaluateAuto({ config: auto.config, policy, chain: snapshot, outSince, history: auto.history, reopen: auto.reopen, closing: auto.closing, prices, now: now() });
       outSince = result.outSince; autoWatch = result.watch; autoNote = result.note;
       if (!result.due) return;
       const ctx = await connection();
@@ -786,6 +895,20 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         autoError = autoCorrupt = auto.halted.reason;
         log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录无法读取');
       }
+      // 仓位策略读不出时不能当作"不限"：所有池子不能加仓、自动调仓不动，等人工核对文件。
+      try { const saved = readBounded(policyPath, 64 * 1024); if (saved) policy = readPolicy(saved); } catch (error) {
+        policy = { pools: {}, corrupt: `仓位策略 aero-safe/policy.json 无法读取（${error.message}），开仓、加仓与自动调仓暂停；请核对或删除该文件后重启` };
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 仓位策略无法读取');
+      }
+      // 旧版按总资产比例的单池上限不再生效：启用中的自动调仓先停用，等在「仓位」按池子设好美元上限再启用，免得悄悄变成不限。
+      if (auto.legacyCaps) {
+        delete auto.legacyCaps;
+        if (auto.config.enabled && !auto.halted && !autoCorrupt) {
+          auto.halted = { at: now(), reason: '单池上限已改为在「仓位」按池子设置美元上限，原按总资产比例的上限不再生效；请设置后重新启用自动调仓' };
+          record({ event: 'auto_halted', error: auto.halted.reason });
+        }
+        saveAuto();
+      }
       // 上次在平仓中或兑换/开仓结果未定时退出（停机、崩溃）：停用并写明要核对什么。
       const stuck = stuckReason(auto);
       if (stuck && !autoCorrupt && !auto.halted) { auto.halted = { at: now(), reason: stuck }; saveAuto(); record({ event: 'auto_halted', error: stuck }); }
@@ -809,6 +932,21 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (!next.enabled) { outSince = new Map(); autoWatch = []; autoNote = null; }
       record({ event: next.enabled ? 'auto_enabled' : 'auto_disabled' });
       if (next.enabled) setTimeout(() => { void autoTick(); }, 0).unref?.();
+      return state();
+    }),
+    // 保存一个池子的仓位策略 { pool, state, capUsd, auto }：立即生效，不需要 Safe 签名。
+    // 不等进行中的任务：任务在开仓、重开前按最新策略再核对；已签名的步骤不受影响。
+    setPolicy: (value, authorize = () => {}) => serial(() => {
+      authorize();
+      if (policy.corrupt) throw new HttpError(409, policy.corrupt);
+      const entry = strictPoolPolicy(value);
+      const next = withPoolPolicy(policy, entry);
+      try { atomicJson(policyPath, { schema: 1, pools: next.pools }); } catch (error) {
+        log.warn?.({ type: 'aero-safe', err: error }, 'Aero 仓位策略保存失败');
+        throw new HttpError(500, '仓位策略保存失败，请检查数据目录权限后重试');
+      }
+      policy = next;
+      record({ event: 'pool_policy', pool: entry.pool, state: entry.state, capUsd: entry.capUsd, auto: entry.auto });
       return state();
     }),
     // 放弃进行中调仓的记录（平仓中断、待重开）：人工核对 Safe 后使用，之后自动调仓不再续做这一次。
@@ -1064,7 +1202,10 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const parsed = parseParams('open', params, config ?? DEFAULTS, null);
       let ctx;
       try { ctx = await connection(); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
-      try { return jsonable({ ...(await chain.previewOpen(ctx, parsed)), previewedAt: now() }); } catch (error) {
+      try {
+        const { cap, limit } = await openLimit(ctx, parsed.pool, parsed.cap);
+        return jsonable({ ...(await chain.previewOpen(ctx, { ...parsed, cap })), capUsd: cap?.usd ?? null, limit, previewedAt: now() });
+      } catch (error) {
         if (error instanceof chain.ExecError) throw new HttpError(400, error.message);
         throw new HttpError(502, `预览失败：${error.message}`);
       }

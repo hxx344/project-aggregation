@@ -22,11 +22,17 @@ export type AeroSafeChain = {
   allowances: { token: string; symbol: string; perDay: string; remaining: string; maxRefill: string; refillAt: number | null }[];
   pools: AeroSafePool[];
 };
-export type AeroSafeAction = 'open' | 'close' | 'stake' | 'unstake' | 'claim' | 'sell' | 'swap' | 'rebalance';
+export type AeroSafeAction = 'open' | 'close' | 'reduce' | 'exitPool' | 'stake' | 'unstake' | 'claim' | 'sell' | 'swap' | 'rebalance';
+// 仓位策略（server/automation/aero-policy.mjs）：键为小写池子地址，没写的池子为 运行 / 不限 / 参与自动调仓。
+export type AeroPoolState = 'active' | 'reduce' | 'stopped';
+export type AeroPoolPolicy = { state: AeroPoolState; capUsd: number | null; auto: boolean };
+// rooms：设了上限的池子按最新快照与行情价估算的占用；读不出时 error 为原因。
+export type AeroPolicyRoom = { error: string | null; capUsd?: number; inPoolUsd?: number; roomUsd?: number };
+export type AeroPolicyState = { pools: Record<string, AeroPoolPolicy>; corrupt: string | null; rooms: Record<string, AeroPolicyRoom> };
+// 撤出后的换币结果（原始单位字符串）；reason 为未换或只换了一部分的原因。
+export type AeroExitResult = { tokenIn: string; tokenOut: string; gained: string; amountIn: string; received: string | null; left: string; reason: string | null };
 // 自动调仓（server/automation/aero-auto.mjs）。
-export type AeroAutoConfig = { enabled: boolean; triggerMinutes: number; cooldownMinutes: number; maxPerDay: number; acceptPenalty: boolean; twapSeconds: number; maxTwapDeviationBps: number;
-  // 单池上限（基点，10000 即不限）；poolCaps 按池子地址（小写）单独设置。
-  poolCapBps: number; poolCaps: Record<string, number> };
+export type AeroAutoConfig = { enabled: boolean; triggerMinutes: number; cooldownMinutes: number; maxPerDay: number; acceptPenalty: boolean; twapSeconds: number; maxTwapDeviationBps: number };
 export type AeroAutoState = {
   config: AeroAutoConfig; defaults: AeroAutoConfig; error: string | null; halted: { at: number; reason: string } | null;
   reopen: { pool: string; cells: number; amount0: string; amount1: string; closed: string | null; at: number; minted: string | null; inflight: 'swap' | 'mint' | null } | null;
@@ -48,7 +54,7 @@ export type AeroSafeState = {
   pending: { hash: string; nonce: number; label: string; at: number; stale: boolean } | null;
   ledgerError?: string | null; job: AeroSafeJob | null; chain: AeroSafeChain | null; chainAt: number | null; chainError: string | null; refreshing: boolean;
   events: AeroSafeEvent[]; ledger: AeroSafeLedger[]; serverNow: number; auto?: AeroAutoState;
-  changes?: AeroSafeChanges;
+  changes?: AeroSafeChanges; policy?: AeroPolicyState;
 };
 type ChangeToken = { address: string; symbol: string; decimals: number };
 // gaugeStatus：加池时 Voter.isActivated 与 CLGaugeFactory.emissionCap 的读数；unknown 表示无法确认 gauge 是否已被停用（调用回滚、返回值不合规、gauge 未在工厂登记或读取失败），已停用的池子加不进来。
@@ -81,4 +87,7 @@ export type AeroSafeChangeBatch = { transactions: { to: string; description: str
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string; capped?: boolean;
   swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string; previewedAt: number;
+  capUsd?: number | null; // 实际生效的投入上限（页面填的与本池剩余空间取小）
+  // 本池设了美元上限时的占用：capUsd 上限、inPoolUsd 本池已有、roomUsd 还能放（投入已按它缩小）。
+  limit?: { capUsd: number; inPoolUsd: number; roomUsd: number } | null;
 };

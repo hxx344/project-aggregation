@@ -40,3 +40,7 @@
 .as-table td.num,.as-table th.num{text-align:right}
 .as-table .up{color:var(--emerald)}
 .as-table .down{color:var(--error)}
+.as-policy{margin:6px 0 10px;align-items:center}
+.as-policy>.as-muted{flex:1 1 220px}
+.as-inline{padding:10px 0;align-items:center}
+.as-subrow>td{background:var(--surface-1)}
