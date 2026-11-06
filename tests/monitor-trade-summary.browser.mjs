@@ -62,10 +62,8 @@ async page => {
     await page.goto(`${origin}/?view=project&id=monitor`);
     const frame = page.frameLocator('iframe[title="monitor模块"]');
     await frame.locator('.trade-summary').first().waitFor();
-    // #224 reproduces once on the unchanged 0c1cbcc production build as well.
-    // Keep it explicit and bounded; every subsequent interaction must be error-free.
-    const bootstrapErrors = errors.splice(0);
-    check(bootstrapErrors.length <= 1 && bootstrapErrors.every(error => error.includes('Minified React error #418') && error.includes(`${moduleOrigin}/assets/index-`)), bootstrapErrors.join('\n'));
+    // #224: the first embedded hydration must not fall back to a client re-render.
+    check(errors.length === 0, errors.join('\n'));
     for (const [market, title, expected] of [['oil', '原油价差', '21.250 USDT/桶'], ['hynix', '海力士 ADR', '12.500%']]) {
       await frame.getByRole('tab', { name: title, exact: true }).click();
       const panel = frame.getByRole('tabpanel', { name: title, exact: true }), entries = panel.locator('.trade-summary[data-trade-type="entry"]'), entry = entries.first(), exit = panel.locator('.trade-summary[data-trade-type="exit"]');
@@ -100,7 +98,7 @@ async page => {
     }
     check(markets.includes('oil') && markets.includes('hynix'), 'both markets read fills through the real workbench bridge');
     check(errors.length === 0, errors.join('\n'));
-    return { passed: true, markets: [...new Set(markets)], checks: ['same-day continuous entry and exit summaries', 'weighted prices', 'separate dates', 'native workbench bridge', 'batch and chart selection', 'range changes', 'card order', 'keyboard expansion', '390px layout'], errors, knownInitialIssue224: bootstrapErrors.length };
+    return { passed: true, markets: [...new Set(markets)], checks: ['same-day continuous entry and exit summaries', 'weighted prices', 'separate dates', 'native workbench bridge', 'batch and chart selection', 'range changes', 'card order', 'keyboard expansion', '390px layout'], errors };
   } finally {
     page.off('pageerror', listener);
     await page.unroute('**/*', handler);

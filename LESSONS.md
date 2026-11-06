@@ -1646,6 +1646,19 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `arb-auto-bounds-20261106`；首次合并前审查发现，未逃逸到正式版。
 
+### L101：服务端与嵌入客户端首轮状态不同时，渲染分支先按服务端值水合，读取门控仍用真实状态
+
+**适用条件：** 服务端渲染、再嵌入工作台 iframe 的模块页面，首轮状态由宿主桥接决定（服务端看不到宿主而假定可读，可信嵌入客户端要等宿主回复），且该状态同时决定渲染分支与数据读取，如 Monitor 的 `useHubBridge` 的 `readActive`、`app/oil-panel.tsx` 与 `app/dashboard.tsx` 的 `hasOpened` 和 `<Activity mode>`。
+
+**根因：** 服务端令 `readActive=true`，嵌入客户端初值为 false，选中面板的 `active` 两边不同；`hasOpened` 初值与 `<Activity mode>` 都依赖它，首轮客户端树与服务端 HTML 不一致，React 报 #418 后整树改为客户端重建。单改 `hasOpened` 不够，`mode` 也参与了不一致。
+
+**以后做法：** 渲染分支在水合这一轮按服务端会用的值（选中与否）输出，水合完成后再跟随真实状态（`useHydrated()`）；数据读取、首次打开标记等门控继续只用真实状态，不能为了消除不一致把客户端初值改成“可读”，否则后台预载的 iframe 会在宿主回复前提前读取。水合这一轮输出的只能是不挂载重组件、不发读取的占位。
+
+**如何验证：** 构建工作台与 Monitor，用 `tests/monitor-embed-hydration.browser.mjs` 经真实工作台桥接首次打开原油与海力士，断言没有 pageerror，并用永不回复的宿主断言 3 秒内 API 读取为 0；改动这条路径时做因果变异：只令客户端桥接初值等于服务端时 #418 消失，回退修复后该回归失败于 #418。
+
+**证据：** 本仓 issue #224，基线 `0c1cbcc` 与 `0169408` 在独立 Windows 工作树经工作台 4175 与 Monitor 夹具 3190 的代理子域 iframe 复现，原油与海力士首次打开各一次 `Minified React error #418`；`tests/monitor-trade-summary.browser.mjs` 原先放行 1 次 #418，现要求 0 错误。
+
+**事件记录：** `monitor-embed-hydration-20261106`；回归浏览器验收发现，正式版首屏可恢复但会整树重建。
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。
