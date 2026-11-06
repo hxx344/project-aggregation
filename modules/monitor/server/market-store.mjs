@@ -7,10 +7,13 @@ import { OIL_CANDLE_ACTION, validateIntradaySnapshot } from '../modules/oil/intr
 import { exchangeFundingAction, fundingHistoryExchanges, validateExchangeFundingHistory } from '../lib/exchange-funding-history.ts';
 import { OIL_HEDGE_PRICES_ACTION, validateOilHedgePrices } from '../lib/oil-hedge-prices.ts';
 import { staleMarketError } from './market-stale.mjs';
+import { ANTHROPIC_CANDLE_ACTION, validateAnthropicCandles, validateAnthropicQuote } from '../modules/anthropic/market.mjs';
 
 const validators = { 'hynix/quote': validateHynixQuote, 'hynix/history': validateHynixHistory, 'hynix/funding': validateHynixFunding, 'oil/quote': validateOilQuote, 'oil/history': validateOilHistory, 'oil/funding': validateOilFunding };
 validators[`oil/${OIL_CANDLE_ACTION}`] = validateIntradaySnapshot;
 validators[`oil/${OIL_HEDGE_PRICES_ACTION}`] = validateOilHedgePrices;
+validators['anthropic/quote'] = validateAnthropicQuote;
+validators[`anthropic/${ANTHROPIC_CANDLE_ACTION}`] = validateAnthropicCandles;
 for (const id of ['oil', 'hynix']) for (const exchange of comparisonExchanges(id)) validators[`${id}/${exchangeAction(exchange)}`] = value => validateComparisonQuote(value, exchange, id);
 for (const id of ['oil', 'hynix']) for (const exchange of fundingHistoryExchanges(id)) validators[`${id}/${exchangeFundingAction(exchange)}`] = value => validateExchangeFundingHistory(value, exchange, id);
 export const datasetKeys = Object.keys(validators);

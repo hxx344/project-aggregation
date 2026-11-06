@@ -1,6 +1,6 @@
 import type { PositionCycle, TradingPositionsResponse } from './trading-positions-types';
 
-export const POSITION_MARKETS = ['oil', 'hynix', 'perpetual'] as const;
+export const POSITION_MARKETS = ['oil', 'hynix', 'anthropic', 'perpetual'] as const;
 export type PositionMarket = typeof POSITION_MARKETS[number];
 export type PositionsStatus = 'ok' | 'unavailable' | 'unauthorized';
 /** Why a read is unavailable, so the module can name the failing layer. 'background': the host page was not in the foreground. */

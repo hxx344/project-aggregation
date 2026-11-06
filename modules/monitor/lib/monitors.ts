@@ -12,6 +12,7 @@ export interface MonitorDefinition {
 export const monitors: readonly MonitorDefinition[] = [
   { id: "oil", title: "原油价差", subtitle: "BRENT / WTI", category: "能源", accent: "#087f83", quoteIntervalMs: 10_000, capabilities: ["quote", "history", "candles/15m", "funding", "alerts"] },
   { id: "hynix", title: "海力士 ADR", subtitle: "SKHY / SKHX", category: "半导体", accent: "#356dc4", quoteIntervalMs: 10_000, capabilities: ["quote", "history", "funding", "indicators", "alerts"] },
+  { id: "anthropic", title: "Anthropic 价差", subtitle: "ANTHROPIC · 每股", category: "盘前股权", accent: "#c4673f", quoteIntervalMs: 10_000, capabilities: ["quote", "candles/15m"] },
   { id: "perpetual", title: "合约价差", subtitle: "CEX / DEX", category: "永续合约", accent: "#356dc4", quoteIntervalMs: 1_000, capabilities: ["quote"] },
 ];
 

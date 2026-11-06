@@ -22,6 +22,7 @@ import { exchangeFundingAction, fundingExchangeFromAction, fundingHistoryExchang
 import { OIL_HEDGE_PRICES_ACTION, HEDGE_PRICES_REFRESH_MS } from '../lib/oil-hedge-prices.ts';
 import { createVariationalSession, openVariationalSessionStore } from './variational-session.mjs';
 import { fetchVariational } from './variational-transport.mjs';
+import { ANTHROPIC_CANDLE_ACTION } from '../modules/anthropic/market.mjs';
 
 const OBSERVATION_PRUNE_DELAY_MS = 60_000, OBSERVATION_PRUNE_INTERVAL_MS = 86_400_000;
 const exchangeActions = market => Object.fromEntries(comparisonExchanges(market).map(exchange => [exchangeAction(exchange), ["GET"]]));
@@ -118,6 +119,14 @@ export async function createMonitorServices(directory, { externallyLocked = fals
         actions: { quote: ["GET"], history: ["GET"], funding: ["GET"], 'exchanges/variational/session': ['GET', 'PUT'], [OIL_CANDLE_ACTION]: ["GET"], [OIL_HEDGE_PRICES_ACTION]: ["GET"], ...exchangeActions('oil'), ...exchangeFundingActions('oil'), status: ["GET"], config: ["GET", "PUT"], events: ["GET"], "test-notification": ["POST"] },
       }],
     ]);
+    // Read-only: quotes and candles come from the shared collector; no alerts or own schedule.
+    services.set('anthropic', {
+      start() {}, stop() {}, healthy: () => true,
+      async handle(action, method) {
+        if ((action === 'quote' || action === ANTHROPIC_CANDLE_ACTION) && method === 'GET') return read('anthropic', action);
+      },
+      actions: { quote: ['GET'], [ANTHROPIC_CANDLE_ACTION]: ['GET'] },
+    });
     services.notifications = notifications;
     let pruneTimer = null, pruning = null;
     const pruneControl = new AbortController();

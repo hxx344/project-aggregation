@@ -53,7 +53,7 @@ export const postHubMessage = post;
 export function hubChanged() { post({ type: 'changed', scope: 'summary' }); }
 export function hubNavigate(projectId: HubProject, query: HubQuery) { const clean = cleanHubQuery(query); if (clean) post({ type: 'navigate', projectId, query: clean }); }
 
-export type PositionsMarket = 'oil' | 'hynix' | 'perpetual';
+export type PositionsMarket = 'oil' | 'hynix' | 'anthropic' | 'perpetual';
 /** Realized results since the position last opened from zero; signed cash flows in `currency`, `net` null when a part is unknown. */
 export type HubPositionCycle = {
   status: 'loading' | 'complete' | 'partial' | 'unavailable'; since: string | null;
@@ -77,7 +77,7 @@ export type HubUnavailableReason = 'background' | 'timeout' | 'http' | 'network'
 export type HubPositionsReply = { requestId: string; market: PositionsMarket; status: 'ok' | 'unavailable' | 'unauthorized'; generatedAt: string | null; incomplete: boolean; sourcesIncomplete?: boolean; items: HubPositionItem[]; timedOut?: boolean;
   reason?: HubUnavailableReason; httpStatus?: number } & Partial<PositionsRange>;
 const UNAVAILABLE_REASONS: ReadonlySet<string> = new Set(['background', 'timeout', 'http', 'network', 'malformed']);
-const POSITION_MARKETS: ReadonlySet<string> = new Set(['oil', 'hynix', 'perpetual']);
+const POSITION_MARKETS: ReadonlySet<string> = new Set(['oil', 'hynix', 'anthropic', 'perpetual']);
 const REQUEST_ID = /^[A-Za-z0-9-]{1,64}$/, POSITION_BASE = /^[A-Z0-9]{1,20}$/;
 // Outlasts the host's own positions read deadline (15 s) so a slow but answered read is not reported as silence.
 export const POSITIONS_TIMEOUT_MS = 20_000, POSITIONS_REFRESH_MS = 60_000;

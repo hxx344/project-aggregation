@@ -50,7 +50,8 @@ export type SpreadChartConfig = {
   tick: ModeLabels<(value: number) => string>;
   tradeEvents: (items: HubFillsView["items"]) => TradeEvent[];
   tradeMarkers: (events: TradeEvent[], points: Point[]) => SpreadTradeMarker[];
-  tradeMarket: "oil" | "hynix";
+  /** Null for markets without fill markers; the trade panel is then never shown. */
+  tradeMarket: "oil" | "hynix" | null;
   trade: { priceUnit: string; chartLabel: string; chartNote: string; metricName: string };
   emptyText: { loading: string; hint: string };
 };
@@ -99,14 +100,14 @@ function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null;
   </g>;
 }
 
-function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config }: { trades: HubFillsView; markers: SpreadTradeMarker[]; selected: SpreadTradeMarker | null; onSelect: (key: string) => void; chartMarkers: boolean; config: SpreadChartConfig }) {
+function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config, market }: { trades: HubFillsView; markers: SpreadTradeMarker[]; selected: SpreadTradeMarker | null; onSelect: (key: string) => void; chartMarkers: boolean; config: SpreadChartConfig; market: "oil" | "hynix" }) {
   const titleId = useId();
-  const summaries = useMemo(() => summarizeTradeEvents(markers.map(marker => marker.event), config.tradeMarket), [markers, config.tradeMarket]);
+  const summaries = useMemo(() => summarizeTradeEvents(markers.map(marker => marker.event), market), [markers, market]);
   const rows = [
     ...summaries.map(summary => ({ time: summary.start, key: summary.key, summary, marker: null })),
     ...markers.filter(marker => marker.event.type !== "entry" && marker.event.type !== "exit").map(marker => ({ time: marker.event.time, key: marker.event.key, summary: null, marker })),
   ].sort((a, b) => b.time - a.time || a.key.localeCompare(b.key));
-  const summarySpread = (group: (typeof summaries)[number]["groups"][number]) => group.spread === null ? "未知" : `${group.spread.toFixed(3)}${config.tradeMarket === "hynix" ? "%" : ` ${group.currency}${config.trade.priceUnit}`}`;
+  const summarySpread = (group: (typeof summaries)[number]["groups"][number]) => group.spread === null ? "未知" : `${group.spread.toFixed(3)}${market === "hynix" ? "%" : ` ${group.currency}${config.trade.priceUnit}`}`;
   const eventButton = (marker: SpreadTradeMarker) => {
     const type = TRADE_TYPES[marker.event.type as TradeType];
     return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
@@ -268,7 +269,7 @@ function SpreadChart({ data, loading, range, onRangeChange, trades, config = HYN
           overlay={({ x, y }) => plotted.map(({ marker, y: value }) => <TradeMark key={marker.event.key} cx={x(marker.event.time)} cy={y(value)} marker={marker} selected={selectedKey === marker.event.key} onSelect={setSelectedKey}/>)}/>}
     </div>
     <div className="chart-caption"><span>{mode === "price" ? <><i className="legend-dot adr"/>{config.legs[0]} <i className="legend-dot ordinary"/>{config.legs[1]}</> : <><i className="legend-dot premium"/>{metricName}<span className="zero-line"/>{config.zeroLabel}</>}</span><span>{points.length ? `${date(points[0].time,true)} — ${date(points.at(-1)!.time,true)} · ${config.span(points.length)}${sampled.length < chartPoints.length ? ` · 绘图保留极值与缺口共 ${sampled.length.toLocaleString()} 点，读数与统计使用全部记录` : ""}` : `${config.bar}收盘 · UTC`}</span></div>
-    {trades && <TradePanel trades={trades} markers={markers} selected={selected} onSelect={setSelectedKey} chartMarkers={mode !== "price"} config={config}/>}
+    {trades && config.tradeMarket && <TradePanel trades={trades} markers={markers} selected={selected} onSelect={setSelectedKey} chartMarkers={mode !== "price"} config={config} market={config.tradeMarket}/>}
     {mode !== "price" && enabled.zscore && <div className="zscore-panel" aria-label="Z-score 历史走势">
       <div className="zscore-heading"><h3><span className="sample-line z-line"/>Z-score <span>20 日</span></h3><span>0 = 近期均值 · 虚线 = ±2σ</span></div>
       <div className="zscore-chart">
