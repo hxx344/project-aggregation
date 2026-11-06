@@ -9,7 +9,7 @@ import { AERO } from '../tools/aero-roles/addresses.mjs';
 import { buildPermissions } from '../tools/aero-roles/permissions.mjs';
 import * as executor from '../tools/aero-roles/executor.mjs';
 import { ROLES_ABI } from '../tools/aero-roles/roles-calls.mjs';
-import { CHANGE_BUDGET_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
+import { CHANGE_BUDGET_MS, CHANGE_DEADLINE_MARGIN_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
 import { createApp } from '../server/app.mjs';
 import { FORWARD_BUDGET } from '../server/runtime/data-client.mjs';
 
@@ -1216,6 +1216,111 @@ test('change requests answer before the API forward timeout, and the page waits 
   const pageMs = Number(page[1].replaceAll('_', ''));
   assert.ok(CHANGE_BUDGET_MS + 5_000 <= FORWARD_BUDGET, 'the server gives up and explains why before the API forward times out');
   assert.ok(pageMs >= FORWARD_BUDGET + 5_000, 'the page waits for the API reply, including its own timeout reply');
+  assert.equal(FORWARD_BUDGET - CHANGE_DEADLINE_MARGIN_MS, CHANGE_BUDGET_MS, 'counted from the API receipt, the forwarded deadline gives the same budget');
+});
+
+// Each step gets only what is left of the one deadline: a slow read after a long queue wait, or a held queue after a slow read,
+// still answers within the budget. A step that used the full budget again would answer about HELD ms later.
+test('time spent queueing or reading shortens what is left for the next step of add-pool, batch and apply; nothing is written after the timeout', { timeout: 30_000 }, async () => {
+  const BUDGET = 900, HELD = 600, SLACK = 250;
+  const directory = fixtureDir();
+  const { WETH, POOL, infos } = twoPools();
+  const gates = { preview: null, inspect: null, read: null, verify: null }, calls = { inspect: 0, read: 0, verify: 0 };
+  const wait = (name) => gates[name]?.promise;
+  const chain = { ...fakeChain(),
+    previewOpen: async () => { await wait('preview'); return { amount0: 1n }; },
+    inspectPool: async (_rpc, address) => { calls.inspect++; await wait('inspect'); return infos[address]; },
+    readAllowances: async (_rpc, _roles, keys) => { calls.read++; await wait('read');
+      return { blockNumber: 1, now: 1_800_000_000n, allowances: new Map(keys.map((key) => [key, { refill: 0n, maxRefill: 0n, period: 0n, balance: 0n, timestamp: 0n }])) }; },
+    verifyActive: async () => { calls.verify++; await wait('verify'); return { ok: true, checks: [] }; } };
+  const { manager } = managerWith(directory, { chain, manager: { changeBudgetMs: BUDGET } });
+  const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
+  const file = (name) => join(directory, 'aero-safe', name);
+  const count = (name) => manager.state().events.filter((e) => e.event === name).length;
+  const onDisk = () => [readFileSync(file('config.json'), 'utf8'), existsSync(file('changes.json')) ? readFileSync(file('changes.json'), 'utf8') : null];
+  const hold = () => { gates.preview = deferred(); const previewing = manager.preview(open); return () => { gates.preview.resolve(); gates.preview = null; return previewing; }; };
+  const drain = () => manager.preview(open);
+  // Late answers are collected and checked at the end, so one run reports every step that overran.
+  const late = [];
+  const ops = {
+    add: { run: () => manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } }), gate: 'inspect', what: '加池', event: 'pool_queued' },
+    batch: { run: () => manager.buildChangeBatch(), gate: 'read', what: '生成批次', event: 'changes_batched' },
+    apply: { run: () => manager.applyChangeBatch(), gate: 'verify', what: '核对启用', event: 'changes_applied' },
+  };
+  async function scenario(op, queueFirst) {
+    const { run, gate, what, event } = ops[op], label = `${op} ${queueFirst ? 'queue then slow read' : 'slow read then queue'}`;
+    const reads = calls[gate], events = count(event), disk = onDisk(), state = JSON.stringify(manager.state().changes);
+    gates[gate] = deferred();
+    let free = queueFirst ? hold() : null;
+    const started = Date.now();
+    const pending = run();
+    if (queueFirst) { await delay(HELD); await free(); } else {
+      await until(() => calls[gate] === reads + 1);
+      await delay(HELD);
+      free = hold();
+      gates[gate].resolve();
+    }
+    await assert.rejects(pending, (error) => error.status === 504 && new RegExp(`^${what}超过 ${BUDGET / 1000} 秒（含排队等待其他操作）`).test(error.message), label);
+    const elapsed = Date.now() - started;
+    if (elapsed > BUDGET + SLACK) late.push(`${label}: answered after ${elapsed}ms`);
+    gates[gate].resolve(); gates[gate] = null;
+    if (!queueFirst) await free();
+    await drain();
+    assert.equal(calls[gate], reads + 1, `${label}: one read`);
+    assert.deepEqual([count(event), JSON.stringify(manager.state().changes), onDisk()], [events, state, disk], `${label}: nothing written`);
+  }
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    await until(() => manager.state().chain);
+    for (const op of ['add', 'batch', 'apply']) {
+      await scenario(op, true);
+      await scenario(op, false);
+      await ops[op].run();
+      assert.equal(count(ops[op].event), 1, `${op} completes on an idle queue`);
+    }
+    assert.equal(manager.state().config.permissions.pools.length, 2);
+    assert.deepEqual(late, [], 'every step answered within the budget');
+  } finally { for (const gate of Object.values(gates)) gate?.resolve(); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('the request deadline forwarded by the API, less the margin, caps the change budget; a missing or malformed one is ignored', { timeout: 15_000 }, async () => {
+  const directory = fixtureDir();
+  const { WETH, POOL, infos } = twoPools();
+  let inspectGate = null, verifyGate = null;
+  const chain = { ...fakeChain(),
+    inspectPool: async (_rpc, address) => { await inspectGate?.promise; return infos[address]; },
+    verifyActive: async () => { await verifyGate?.promise; return { ok: true, checks: [] }; } };
+  const { manager } = managerWith(directory, { chain });
+  const soon = () => Date.now() + CHANGE_DEADLINE_MARGIN_MS + 300;
+  const add = (options) => manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } }, undefined, options);
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    await until(() => manager.state().chain);
+    // The API gives up soon: the server answers first, well before its own 50 s budget, and queues nothing.
+    inspectGate = deferred();
+    let started = Date.now();
+    await assert.rejects(add({ deadline: soon() }), (error) => error.status === 504 && /^加池超过 50 秒/.test(error.message));
+    assert.ok(Date.now() - started < 2_000);
+    inspectGate.resolve(); inspectGate = null;
+    assert.equal(manager.state().changes.pools.length, 0);
+    // A malformed deadline falls back to the server budget: a read slower than it would allow still completes.
+    for (const deadline of ['soon', Number.NaN, 1.5]) {
+      inspectGate = deferred();
+      const adding = add({ deadline });
+      await delay(400); inspectGate.resolve(); inspectGate = null;
+      await adding;
+      await manager.removePoolChange({ pool: POOL });
+    }
+    await add();
+    await manager.buildChangeBatch(undefined, { deadline: Date.now() + 60_000 });
+    verifyGate = deferred(); started = Date.now();
+    await assert.rejects(manager.applyChangeBatch(undefined, { deadline: soon() }), (error) => error.status === 504 && /^核对启用超过 50 秒/.test(error.message));
+    assert.ok(Date.now() - started < 2_000);
+    verifyGate.resolve(); verifyGate = null;
+    assert.equal(manager.state().config.permissions.pools.length, 1);
+    const state = await manager.applyChangeBatch(undefined, { deadline: Date.now() + 60_000 });
+    assert.equal(state.config.permissions.pools.length, 2);
+  } finally { inspectGate?.resolve(); verifyGate?.resolve(); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 test('a queued pool records the gauge liveness reading; unknown survives a restart and old entries read as unknown', async () => {
   const directory = fixtureDir();

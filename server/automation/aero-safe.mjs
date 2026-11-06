@@ -26,6 +26,9 @@ const REFRESH_BUDGET_MS = 60_000;
 // （单次读取另有 20 秒超时、最多 2 次）：须短于 API 转发时限（60 秒），超时即不写盘，
 // 避免浏览器或 API 已放弃后仍在后台加入待加池、冻结批次或启用批次。页面等待时间相应长于 API 时限。
 export const CHANGE_BUDGET_MS = 50_000;
+// API 从收到请求起 60 秒放弃，并随转发带来截止时间：服务端期限不晚于它减去这段余量，
+// 收到请求前已花的时间（读请求体、排队转发）也计入，由服务端先回复。
+export const CHANGE_DEADLINE_MARGIN_MS = 10_000;
 // 已签名未上链超过这个时长后，允许新操作用同一 nonce 提价替换（两笔最多只有一笔上链）。
 export const PENDING_STALE_MS = 10 * 60_000;
 // 开仓确认基于预览数字：预览超过这个时长后须重新预览。
@@ -372,10 +375,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     if (applied) record({ event: 'changes_batch_recognized', pools: changes.batch.pools });
     keepChanges(next, '白名单待变更文件 aero-safe/changes.json 写入失败，页面显示的是整理后的内容；重启后会按配置重新整理。请检查数据目录权限');
   }
-  // 一次白名单变更请求的整体期限（changeBudgetMs，从开始处理起）：两次排队与队列外读链都计入，超时返回 504。
+  // 一次白名单变更请求的整体期限（changeBudgetMs，从开始处理起；有请求截止时间 requestDeadline 时不晚于它减去余量）：
+  // 两次排队与队列外读链都计入，超时返回 504。提示里的秒数按从 API 收到请求起算。
   // 超时后才轮到的队列回调直接放弃、不写盘。queued 的回调须同步完成写盘，开始写盘后期限不会打断它，不会半写。
-  function changeBudget(what, undone) {
-    const deadline = now() + changeBudgetMs;
+  function changeBudget(what, undone, requestDeadline) {
+    const own = now() + changeBudgetMs;
+    const deadline = Number.isSafeInteger(requestDeadline) ? Math.min(own, requestDeadline - CHANGE_DEADLINE_MARGIN_MS) : own;
     let abandoned = false;
     const late = () => { abandoned = true; return new HttpError(504, `${what}超过 ${changeBudgetMs / 1000} 秒（含排队等待其他操作），${undone}，请稍后重试`); };
     const left = () => { const ms = deadline - now(); if (ms <= 0) throw late(); return ms; };
@@ -839,9 +844,10 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     // allowances 为 { 代币地址: 十进制数量（代币单位）}：尚无额度的新代币必填，也可顺带改这两个代币的已有额度。
     // 链上核验在串行队列外等待，不挡自动调仓；回到队列后按配置代际与当前待变更重新检查再写入。
     // 从开始处理起整体（两次排队与读链）不超过 changeBudgetMs，超时返回 504，之后轮到的回调不再写入。
-    addPoolChange: async (input, authorize = () => {}) => {
+    // deadline：API 转发带来的请求截止时间（毫秒时间戳），没有时只按 changeBudgetMs。
+    addPoolChange: async (input, authorize = () => {}, { deadline } = {}) => {
       const body = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-      const budget = changeBudget('加池', '未加入待加池');
+      const budget = changeBudget('加池', '未加入待加池', deadline);
       const { poolAddress, generation, cfg } = await budget.queued(() => {
         authorize();
         requireChangesConfig();
@@ -919,8 +925,8 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     // 要 setAllowance 的额度先在串行队列外读链上当前额度（读不到即拒绝生成，不按满额猜），按本期已用折算新余额；
     // 回到队列后确认配置代际与待变更都没变才冻结。从开始处理起整体（两次排队与读链）不超过 changeBudgetMs，
     // 须短于 API 转发时限（60 秒）；超时即返回 504，排在队列里的回调之后轮到时也不再冻结。
-    buildChangeBatch: async (authorize = () => {}) => {
-      const budget = changeBudget('生成批次', '未生成批次');
+    buildChangeBatch: async (authorize = () => {}, { deadline } = {}) => {
+      const budget = changeBudget('生成批次', '未生成批次', deadline);
       const plan = await budget.queued(() => {
         authorize();
         requireChangesConfig();
@@ -966,11 +972,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       });
     },
     // 硬件钱包在 Safe{Wallet} 执行批次后：以 bot 身份模拟核对批次里的权限全部已在链上生效，再并入配置。批次之后新加的变更继续保留。
-    // 模拟核对在串行队列外等待，不挡自动调仓；同一时间只跑一次。回到队列后重新检查登录、维护、
+    // 模拟核对在串行队列外等待，不挡自动调仓。核对进行中再次请求会被拒绝；但读链超时后核对标记即释放，
+    // 重试可能与上一次未结束、结果已丢弃的只读核对并行，同一时间仍只有一次能写入配置。回到队列后重新检查登录、维护、
     // 任务与未结清交易，并确认配置代际、批次与 bot 都没变，才写入配置。
     // 从开始处理起整体（两次排队与模拟核对）不超过 changeBudgetMs，超时返回 504，之后轮到的回调不再写入配置。
-    applyChangeBatch: async (authorize = () => {}) => {
-      const budget = changeBudget('核对启用', '未启用批次');
+    applyChangeBatch: async (authorize = () => {}, { deadline } = {}) => {
+      const budget = changeBudget('核对启用', '未启用批次', deadline);
       const ready = () => {
         authorize();
         requireIdle('不能修改配置');
