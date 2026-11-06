@@ -15,7 +15,7 @@ import { createInProcessClient } from '../server/runtime/supervisor-client.mjs';
 import http from 'node:http';
 import net from 'node:net';
 import { createDataPlane, API_STATS_MAX_AGE_MS } from '../server/runtime/data-plane.mjs';
-import { createExecutionJobsReader } from '../server/control/execution-jobs.mjs';
+import { createExecutionJobsReader, UNFINISHED_EXECUTION_JOB_SQL } from '../server/control/execution-jobs.mjs';
 
 const PASSWORD = 'test-password-not-a-real-secret';
 const generatedAt = '2026-10-24T00:00:00.000Z';
@@ -412,6 +412,12 @@ test('the idle check reads job states from the database and counts unreadable ro
   db.exec('CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL)');
   const insert = db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)');
   insert.run('a', JSON.stringify({ status: 'completed', plan: {} })); insert.run('b', '{'); insert.run('c', '{}');
-  assert.deepEqual(reader.state().jobs.map(job => job.status), ['completed', 'unknown', 'unknown']);
+  assert.deepEqual(reader.state().jobs.map(job => job.status), ['unknown', 'unknown'], 'finished jobs are left out');
+  // With the executor's partial index only unfinished rows are read, and SQLite rejects malformed JSON while it exists.
+  db.prepare("DELETE FROM execution_jobs WHERE id='b'").run();
+  db.exec(`CREATE INDEX execution_jobs_unfinished ON execution_jobs(json_extract(json,'$.createdAt')) WHERE ${UNFINISHED_EXECUTION_JOB_SQL}`);
+  assert.throws(() => insert.run('d', '{'), /malformed JSON/);
+  insert.run('e', JSON.stringify({ status: 'running' }));
+  assert.deepEqual(reader.state().jobs.map(job => job.status), ['unknown', 'running']);
   db.close();
 });

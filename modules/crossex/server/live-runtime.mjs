@@ -169,12 +169,44 @@ export function createLiveRuntime(store, { market, clientFactory = createGateCli
     if (!order.external) resolveOperation(createOperation(order), ticket, order.writerRejectedState ? 'rejected' : 'confirmed');
     if (order.writerCancelId && !order.writerCancelPrepared && TERMINAL.has(order.status)) resolveOperation(order.writerCancelId, ticket);
   }
+  // The shared registry decides which finished orders still need recovery: one
+  // of their operations is still sending or unknown there, even when the
+  // private record already holds the final result. Every other finished order
+  // was settled in the registry and is skipped. Create ids carry the order
+  // text and cancel ids the request or order id. A request id may itself start
+  // with "legacy:", so a cancel id is tried both ways. An open operation that no
+  // stored order of this connection owns falls back to reading the whole
+  // connection history.
+  function pendingOrderIds(operationId) {
+    if (operationId.startsWith('crossex:create:')) return [store.prepare('SELECT id FROM live_orders WHERE text=?').get(operationId.slice('crossex:create:'.length))?.id];
+    if (!operationId.startsWith('crossex:cancel:')) return [];
+    const requestId = operationId.slice('crossex:cancel:'.length), row = store.prepare("SELECT result FROM live_requests WHERE id=? AND kind='cancel'").get(requestId);
+    let requested;
+    try { requested = row ? JSON.parse(row.result).orderId : undefined; } catch { requested = undefined; }
+    return [requested, requestId.startsWith('legacy:') ? requestId.slice('legacy:'.length) : undefined];
+  }
+  function writerHistoryOrders(record, active) {
+    const owned = new Set(active.flatMap(order => [createOperation(order), order.writerCancelId]));
+    const finished = [];
+    for (const { operationId } of accountWriter.unresolved(writerTicket)) {
+      if (owned.has(operationId)) continue;
+      const owner = pendingOrderIds(operationId).filter(orderId => typeof orderId === 'string')
+        .map(orderId => store.prepare('SELECT json FROM live_orders WHERE id=?').get(orderId)).filter(Boolean).map(row => JSON.parse(row.json))
+        .find(order => order.version === record.version && (createOperation(order) === operationId || order.writerCancelId === operationId));
+      if (!owner) return orderRecords().filter(order => order.version === record.version);
+      finished.push(owner.id);
+    }
+    // The two sets are disjoint; UNION ALL lets SQLite read the first through live_orders_unfinished.
+    return parsed(store.prepare(`SELECT json FROM live_orders WHERE rowid IN (SELECT rowid FROM live_orders WHERE state NOT IN (${TERMINAL_SQL}) AND version=? UNION ALL SELECT rowid FROM live_orders WHERE id IN (SELECT value FROM json_each(?)) AND version=?) ORDER BY updated_at DESC, rowid`)
+      .all(record.version ?? null, JSON.stringify(finished), record.version ?? null));
+  }
   function importWriterHistory(record) {
     if (!accountWriter) return;
     if (!record?.enabled) { writerHistoryReady = true; return; }
     if (!writerTicket) return;
-    if (activeOrders().some(order => order.version !== record.version)) throw writerFailure();
-    for (const order of orderRecords().filter(order => order.version === record.version)) {
+    const active = activeOrders();
+    if (active.some(order => order.version !== record.version)) throw writerFailure();
+    for (const order of writerHistoryOrders(record, active)) {
       if (order.writerCancelPrepared) {
         resolveOperation(order.writerCancelId, writerTicket, 'rejected');
         delete order.writerCancelId; delete order.writerCancelPrepared;

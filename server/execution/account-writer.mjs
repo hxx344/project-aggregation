@@ -701,6 +701,15 @@ export class AccountWriter {
       return { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations, recovery, writerRetired: this.retired };
     } catch (error) { this._error(error); }
   }
+  // Startup recovery maps these ids back to the private records that still
+  // hold their evidence, instead of rereading every finished record.
+  pendingOperationIds() {
+    if (this.closed) fail('WRITER_CLOSED');
+    try {
+      this._checkRegistryFile();
+      return this.db.prepare("SELECT operation_id FROM aw_operations WHERE module_id=? AND state IN ('sending','unknown') ORDER BY created_at,operation_id").all(this.moduleId).map((row) => row.operation_id);
+    } catch (error) { this._error(error); }
+  }
   close() {
     // The adapter must stop new requests and drain all in-flight transport before close.
     if (this.closed) return;
