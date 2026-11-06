@@ -1615,7 +1615,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
     def test_frequent_account_events_count_consecutive_skips_and_escalate_at_the_threshold(self):
         threshold = margin_balance.TRANSFER_SNAPSHOT_REVOKED_WARN_SKIPS
         self.busy_account_events()
-        for count in range(1, threshold + 2):
+        for count in range(1, 2 * threshold + 2):
             with self.subTest(count=count):
                 if count == threshold:
                     # The streak is durable: a restarted balancer keeps counting.
@@ -1625,8 +1625,8 @@ class ManagedMarginTransferTests(unittest.TestCase):
                 self.assertEqual(self.state()["snapshot_revoked_skips"], count)
                 self.assertIn(f"已连续 {count} 次因此未发送", result["reason"])
                 self.assertEqual("请留意较薄一侧的保证金" in result["reason"], count >= threshold, result["reason"])
-                # One WARNING when the streak reaches the threshold, not on every later skip.
-                self.assertEqual(levels, ["WARNING" if count == threshold else "INFO"])
+                # A WARNING each time the streak reaches a multiple of the threshold, INFO otherwise.
+                self.assertEqual(levels, ["WARNING" if count % threshold == 0 else "INFO"])
                 # Never prepared: no shared operation, unknown write or pending follow-up.
                 self.assertIsNone(self.state().get("pending"))
                 self.assertEqual((self.shared_operations(), self.unresolved()), ([], []))
