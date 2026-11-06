@@ -30,7 +30,9 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
   useEffect(() => {
     setDrafts((prev) => Object.fromEntries(rows.map((r) => {
       const base = shown(r), old = prev[r.token];
-      if (!old || old.value === old.base || old.value === base) return [r.token, { value: base, base, decimals: r.decimals, recheck: false }];
+      // 按最小单位判断已收敛：输入 750.120 提交后服务端显示 750.12，同一数量不能一直算作未提交。
+      const converged = old && r.decimals !== null && rawUnits(old.value, r.decimals) === (r.pending ?? r.current);
+      if (!old || old.value === old.base || old.value === base || converged) return [r.token, { value: base, base, decimals: r.decimals, recheck: false }];
       return [r.token, { value: old.value, base, decimals: r.decimals, recheck: old.recheck || old.decimals !== r.decimals }];
     })));
   }, [signature]); // eslint-disable-line react-hooks/exhaustive-deps

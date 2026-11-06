@@ -784,6 +784,26 @@ test('a failed pending-changes write after apply is reported, and a restart reco
   } finally { rmSync(blocker, { recursive: true, force: true }); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('a runtime save that matches the batch permissions does not mark the unexecuted batch as applied', async () => {
+  const directory = fixtureDir();
+  const { WETH, POOL, infos } = twoPools();
+  const chain = { ...fakeChain(), inspectPool: async (_rpc, address) => infos[address], verifyActive: async () => ({ ok: true, checks: [] }) };
+  const { manager } = managerWith(directory, { chain });
+  try {
+    await manager.initialize();
+    await manager.save(baseConfig);
+    await manager.setKey(KEY);
+    await manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+    await manager.buildChangeBatch();
+    const { permissions } = JSON.parse(readFileSync(join(directory, 'aero-safe/changes.json'), 'utf8')).batch;
+    // 手动保存出与批次相同的权限：批次未必已在 Safe 执行，不能静默丢弃，仍作失效保留提示。
+    const state = await manager.save({ ...baseConfig, permissions });
+    assert.ok(state.changes.batch, 'the batch is kept');
+    assert.equal(state.changes.batch.stale, true);
+    assert.ok(!state.events.some((e) => e.event === 'changes_batch_recognized'));
+  } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('the batch view separates frozen items from draft additions and withdrawals, for pools and allowances', async () => {
   const directory = fixtureDir();
   const { WETH, CBBTC, POOL, POOL2, infos } = twoPools();

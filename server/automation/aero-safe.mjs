@@ -351,10 +351,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       record({ event: 'changes_write_failed', error: message });
     }
   }
-  // 配置变化后清掉已生效或已无意义的待变更（含已并入配置的批次）。
-  function settleChanges() {
+  // 配置变化后清掉已生效或已无意义的待变更。recognizeApplied 只在启动时为 true：
+  // 认出「核对启用写入配置后待变更没写进去」的批次；运行时手动保存出相同权限不代表批次已在 Safe 执行，仍按失效处理。
+  function settleChanges({ recognizeApplied = false } = {}) {
     if (!config) return;
-    const applied = changes.batch && batchApplied(changes.batch);
+    const applied = recognizeApplied && changes.batch && batchApplied(changes.batch);
     const next = normalizeChanges(config.permissions, applied ? { ...changes, batch: null } : changes);
     if (JSON.stringify(next) === JSON.stringify(changes)) return;
     if (applied) record({ event: 'changes_batch_recognized', pools: changes.batch.pools });
@@ -732,7 +733,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
           rmSync(poolPlanPath, { force: true });
         }
       } catch (error) { log.warn?.({ type: 'aero-safe', err: error }, 'Aero 旧加池计划无法转换，已忽略'); }
-      settleChanges();
+      settleChanges({ recognizeApplied: true });
       try { const ids = readBounded(mintedPath, 64 * 1024)?.ids; minted = Array.isArray(ids) ? ids.filter((id) => typeof id === 'string' && /^\d{1,78}$/.test(id)).slice(0, MINTED_LIMIT) : []; } catch { minted = []; }
       try { pending = readBounded(pendingPath, 64 * 1024); } catch (error) {
         // 待确认记录损坏时不能当作没有：保留文件，禁止新操作，等人工核对。
