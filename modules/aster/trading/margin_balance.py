@@ -109,6 +109,11 @@ TRANSFER_SNAPSHOT_FRESHNESS_RESERVE_SECONDS = 3
 ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS = 8
 TRANSFER_SNAPSHOT_WEIGHT = 30
 TRANSFER_SNAPSHOT_RECEIPTS_LIMIT = 100
+# Busy accounts can revoke the balance reads during every snapshot wait, so
+# each check skips its send. Dropping the snapshot after a streak would weaken
+# the attribution of a later unknown transfer, so a streak only escalates:
+# the persisted count shows on the page and logs a WARNING from this length.
+TRANSFER_SNAPSHOT_REVOKED_WARN_SKIPS = 5
 TRANSFER_SWEEP_SECONDS = 30
 SETTLE_WAIT = "结算前共享准入暂停该组账户的新写入，原请求不会重发"
 REJECTION_CODES = frozenset({-1002, -1003, -1011, -1015, -1020, -1022, -1100, -1101,
@@ -1468,8 +1473,10 @@ class MarginBalancer:
             if held is not None:
                 return held
             if not config["enabled"]:
+                self._forget_revoked_skips(pair, state)
                 return self._view(state, config, "disabled", "自动保证金平衡未启用")
             if not margin_running(pair, self.store.get("pair_margin_control:" + pair["id"])):
+                self._forget_revoked_skips(pair, state)
                 return self._view(state, config, "paused", "配对组已暂停，不发起新划转；已有划转仍继续只读核对，需启动配对组后才重新评估新划转")
             if any(not self.engine.live_allowed(member) for member in members.values()):
                 return self._view(state, config, "blocked", "实盘全局开关未开启，禁止划转", blocks=True)
@@ -1605,7 +1612,19 @@ class MarginBalancer:
         state.pop("api_notice", None)
         state.pop("blocked_reason", None)
         state.pop("retry_without_blocking", None)
+        state.pop("snapshot_revoked_skips", None)
         self.store.put("pair_margin:" + pair["id"], state)
+
+    @staticmethod
+    def _revoked_skips(state):
+        count = state.get("snapshot_revoked_skips")
+        return count if type(count) is int and count > 0 else 0
+
+    def _forget_revoked_skips(self, pair, state):
+        """A stopped balancer ends the streak; the next run counts afresh."""
+        if "snapshot_revoked_skips" in state:
+            state.pop("snapshot_revoked_skips")
+            self.store.put("pair_margin:" + pair["id"], state)
 
     @staticmethod
     def _apply_api_wait(state, exc):
@@ -1619,7 +1638,7 @@ class MarginBalancer:
                 deadline = 0
             state["next_check_at"] = max(deadline, time.time() + delay)
 
-    def _record_failure(self, pair, state, reason, *, exc=None, soft=False):
+    def _record_failure(self, pair, state, reason, *, exc=None, soft=False, updates=None):
         # Re-read durable state: a rolled-back paper transfer or failed receipt
         # commit must never be saved as completed by an error handler.
         try:
@@ -1627,11 +1646,13 @@ class MarginBalancer:
             if isinstance(durable, dict):
                 durable["blocked_reason"] = reason
                 durable["retry_without_blocking"] = bool(soft and (durable.get("pending") is None or self.resume_ready(durable)))
+                durable.update(updates or {})
                 self._apply_api_wait(durable, exc)
                 self.store.put("pair_margin:" + pair["id"], durable)
                 return durable
         except Exception:
             pass
+        state.update(updates or {})
         self._apply_api_wait(state, exc)
         return state
 
@@ -1745,10 +1766,16 @@ class MarginBalancer:
                 # An account event during the snapshot wait revoked the reads
                 # this plan used. Nothing is prepared or sent yet, so skip
                 # without blocking and plan again from the next fresh read.
+                skips = self._revoked_skips(state) + 1
                 reason = ("本次划转未发送：发送前流水快照期间账户发生变化，余额预读已失效；"
-                          "下一轮重新读取余额后再规划，交易不受影响")
-                LOG.info("pair %s transfer skipped: account reads revoked during receipt snapshot", pair["id"])
-                state = self._record_failure(pair, state, reason, soft=True)
+                          f"下一轮重新读取余额后再规划，交易不受影响（已连续 {skips} 次因此未发送）")
+                if skips >= TRANSFER_SNAPSHOT_REVOKED_WARN_SKIPS:
+                    reason += ("；账户事件持续频繁，两侧保证金差额一直未划转，请留意较薄一侧的保证金与强平距离，"
+                               "必要时在交易所手动划转")
+                LOG.log(logging.WARNING if skips % TRANSFER_SNAPSHOT_REVOKED_WARN_SKIPS == 0 else logging.INFO,
+                        "pair %s transfer skipped: account reads revoked during receipt snapshot (%d consecutive)",
+                        pair["id"], skips)
+                state = self._record_failure(pair, state, reason, soft=True, updates={"snapshot_revoked_skips": skips})
                 return self._view(state, config, "waiting", reason, blocks=not state.get("retry_without_blocking"))
             created = time.time()
             pending = {**plan, "request_id": uuid.uuid4().hex, "created_at": created, "status": "submitting",
@@ -1765,6 +1792,7 @@ class MarginBalancer:
             state.update(pending=pending, last_transfer=pending, cooldown_until=created + config["cooldown_seconds"])
             state.pop("api_notice", None)
             state.pop("blocked_reason", None)
+            state.pop("snapshot_revoked_skips", None)
             self.store.put(key, state)  # Must commit before any signed mutation.
             transfer = TransferAPI(master, budget=api.budget, before_submit=require_current)
             transfer.workspace_control = self.engine.workspace
