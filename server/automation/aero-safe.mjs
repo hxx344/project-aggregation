@@ -11,7 +11,7 @@ import { allowanceChanges, batchExecuteBefore, buildUpdateBatch, conditionUsage,
 import * as executor from '../../tools/aero-roles/executor.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
-import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolRoom, readAutoState, roomFullText, roomShortText, strictAutoConfig, stuckReason, usdText } from './aero-auto.mjs';
+import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolRoom, readAutoState, roomFullText, roomShortText, strictAutoConfig, stuckReason } from './aero-auto.mjs';
 import { POOL_STATE_LABELS, addBlockedReason, policyOf, readPolicy, strictPoolPolicy, withPoolPolicy } from './aero-policy.mjs';
 
 const PRIVATE_KEY_PATTERN = /^(0x)?[0-9a-fA-F]{64}$/;
