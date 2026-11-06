@@ -466,20 +466,19 @@ test('a new-token allowance that already ran on chain is not reset by a regenera
   assert.throws(() => buildUpdateBatch({ current: permissions, next, roles: ROLES_ADDR, allowanceState: missing }), /allowance state for WETH is missing/);
 });
 
-test('gauge liveness: Voter.isActivated and CLGaugeFactory.emissionCap at one block; anything unreadable is unknown', async () => {
+test('gauge liveness: Voter.isActivated and CLGaugeFactory.emissionCap read in parallel at latest; anything unreadable is unknown', async () => {
   const STATUS_I = new Interface(['function isGauge(address) view returns (bool)', 'function emissionCap(address) view returns (uint128)', 'function isActivated(address) view returns (bool)']);
   const word = (v) => '0x' + v.toString(16).padStart(64, '0');
   const REAL_CAP = 0x02d8e952e562d20cn; // Base mainnet reading for a live gauge at block 53882083
   const healthy = { isGauge: word(1n), emissionCap: word(REAL_CAP), isActivated: word(1n) };
-  const BLOCK = 53_880_141;
-  // Each read answers from `answers[fn]` (a string or a function that throws); every call must hit the right contract at the same block.
+  // Each read answers from `answers[fn]` (a string or a function that throws); every call must hit the right contract at latest.
   const rpcWith = (answers) => ({
-    getBlockNumber: async () => BLOCK,
+    getBlockNumber: async () => assert.fail('no separate block-number round trip'),
     call: async ({ to, data, blockTag }) => {
       const tx = STATUS_I.parseTransaction({ data });
       assert.equal(to, tx.name === 'isActivated' ? AERO.voter : AERO.gaugeFactory, tx.name);
       assert.equal(tx.args[0], GAUGE);
-      assert.equal(blockTag, BLOCK);
+      assert.equal(blockTag, 'latest');
       const answer = { ...healthy, ...answers }[tx.name];
       return typeof answer === 'function' ? answer() : answer;
     },
@@ -493,11 +492,14 @@ test('gauge liveness: Voter.isActivated and CLGaugeFactory.emissionCap at one bl
   assert.equal((await read({ isActivated: word(1n).toUpperCase().replace('0X', '0x') })).state, 'alive');
 
   const capZero = await read({ emissionCap: word(0n) });
-  assert.deepEqual([capZero.state, /emissionCap = 0.*已被清零/.test(capZero.note)], ['killed', true]);
+  assert.deepEqual([capZero.state, /已被清零.*emissionCap = 0/.test(capZero.note)], ['killed', true]);
   const inactive = await read({ isActivated: word(0n) });
-  assert.deepEqual([inactive.state, /isActivated = false.*未激活/.test(inactive.note)], ['killed', true]);
+  assert.deepEqual([inactive.state, /尚未在 Voter 激活.*激活后可重新加入.*isActivated = false/.test(inactive.note)], ['killed', true]);
   const both = await read({ isActivated: word(0n), emissionCap: word(0n) });
-  assert.deepEqual([both.state, /未激活.*emissionCap = 0/.test(both.note)], ['killed', true]);
+  assert.deepEqual([both.state, /尚未在 Voter 激活.*排放上限也为 0.*emissionCap = 0/.test(both.note)], ['killed', true]);
+  // Not activated refuses whether or not the factory knows the address.
+  const unknownInactive = await read({ isGauge: word(0n), emissionCap: word(0n), isActivated: word(0n) });
+  assert.deepEqual([unknownInactive.state, /激活后可重新加入/.test(unknownInactive.note)], ['killed', true]);
   // An address the factory never created also reads cap 0; that says nothing about whether it was stopped.
   const unregistered = await read({ isGauge: word(0n), emissionCap: word(0n) });
   assert.deepEqual([unregistered.state, /不在 CLGaugeFactory .* 登记/.test(unregistered.note)], ['unknown', true]);
@@ -533,8 +535,6 @@ test('gauge liveness: Voter.isActivated and CLGaugeFactory.emissionCap at one bl
   assert.deepEqual([clearedVoterUnreadable.state, /emissionCap = 0/.test(clearedVoterUnreadable.note)], ['killed', true]);
   // A zero cap only counts once the factory confirms the gauge is registered.
   assert.equal((await read({ emissionCap: word(0n), isGauge: revert })).state, 'unknown');
-  const noBlock = await gaugeLiveness({ getBlockNumber: async () => { throw new Error('socket hang up'); }, call: async () => assert.fail('no read without a block') }, GAUGE);
-  assert.deepEqual([noBlock.state, /读取最新区块号失败（socket hang up）/.test(noBlock.note)], ['unknown', true]);
 });
 
 test('readAllowances reads every key at one block and fails instead of guessing', async () => {

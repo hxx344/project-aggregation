@@ -232,7 +232,7 @@ export async function inspectPool(rpc, address) {
   if (getAddress(gaugePool) !== address) throw new ExecError(`gauge ${gaugeAddress} 不指向这个池子`);
   if (getAddress(nft) !== AERO.nft || getAddress(voter) !== AERO.voter) throw new ExecError(`gauge ${gaugeAddress} 的 NFT / voter 与固定地址不符`);
   const gaugeStatus = await gaugeLiveness(rpc, gaugeAddress);
-  if (gaugeStatus.state === 'killed') throw new ExecError(`gauge ${gaugeAddress} 已停用（${gaugeStatus.note}），不能加入白名单`);
+  if (gaugeStatus.state === 'killed') throw new ExecError(`gauge ${gaugeAddress} 不能加入白名单：${gaugeStatus.note}`);
   const token = async (a) => {
     const [[decimals], [symbol]] = await read(`代币 ${a}`, () => Promise.all([call(rpc, ERC20_I, a, 'decimals'), call(rpc, ERC20_I, a, 'symbol')]));
     return { address: a, decimals: Number(decimals), symbol: String(symbol).replace(/[^\x20-\x7e]/g, '').trim().slice(0, SYMBOL_MAX) || a.slice(0, 8) };
@@ -253,16 +253,16 @@ const GAUGE_STATUS_READS = [
 // gauge 是否已停用。固定 Voter 0x3824… 是 LeafVoter，没有 isAlive / isGauge / killGauge，停用信号是两项读数：
 // - Voter.isActivated(gauge) = false：投票路由到 ZERO_GAUGE，gauge 拿不到排放（源码没有取消激活的路径）；
 // - CLGaugeFactory.emissionCap(gauge) = 0：紧急委员会 / CAP_ADMIN 清零后排放全部转入 surplus，等价旧版 killGauge（CAP_OPERATOR 不能设为 0）。
-// 未登记的地址读 emissionCap 也是 0，所以先用 CLGaugeFactory.isGauge 确认登记；未登记时排放上限没有意义，报 unknown。
+// 未登记的地址读 emissionCap 也是 0，所以排放上限只在 CLGaugeFactory.isGauge 确认登记后才算停用信号；未激活则不论登记与否都拒绝。
 // 上限不为 0 只说明没有被清零，不代表本期一定有排放；零排放（本周期没有投票）不拿来推断停用。
-// 三项读数钉在同一区块；每次读取单次、受 provider 20 秒超时约束，不重试。其余情况下回滚、返回值不合规或读取失败都报 unknown（不当作正常，也不拒绝）。
+// 三项读数并行读 latest、不钉区块：isGauge 只会置 true、isActivated 是单向的，钉区块带不来一致性，反而多一次串行往返，
+// 负载均衡的公共 RPC 上还会因节点落后报 block not found。每次读取单次、受 provider 20 秒超时约束，不重试。
+// 其余情况下回滚、返回值不合规或读取失败都报 unknown（不当作正常，也不拒绝）。
 // 返回值须恰好是一个 32 字节字，bool 只认 0 / 1，uint128 高 128 位须为 0：ethers 解码会把非零字当 true、也不管多出的字节，不按它解码。
 export async function gaugeLiveness(rpc, gauge) {
   gauge = getAddress(gauge);
   const unknown = (why) => ({ state: 'unknown', note: `${why}，无法确认 gauge 是否已被停用` });
-  let blockTag;
-  try { blockTag = await rpc.getBlockNumber(); } catch (error) { return unknown(`读取最新区块号失败（${errorText(error)}）`); }
-  const results = await Promise.allSettled(GAUGE_STATUS_READS.map(({ fn, to }) => rpc.call({ to, data: GAUGE_STATUS_I.encodeFunctionData(fn, [gauge]), blockTag })));
+  const results = await Promise.allSettled(GAUGE_STATUS_READS.map(({ fn, to }) => rpc.call({ to, data: GAUGE_STATUS_I.encodeFunctionData(fn, [gauge]), blockTag: 'latest' })));
   // 每项读数要么是合规的字，要么是失败原因；一项明确的停用读数足以拒绝，不因另一项读不到而降为 unknown。
   const [registered, cap, activated] = results.map((result, i) => {
     const { label, max } = GAUGE_STATUS_READS[i];
@@ -271,8 +271,8 @@ export async function gaugeLiveness(rpc, gauge) {
     return word === null || word > max ? { failure: `${label} 的返回值不是 32 字节的${max === 1n ? ' 0 或 1' : ' uint128'}` } : { word };
   });
   const capCleared = registered.word === 1n && cap.word === 0n;
-  if (activated.word === 0n) return { state: 'killed', note: `Voter.isActivated = false（gauge 未激活，投票不会路由到它）${capCleared ? '，且 CLGaugeFactory.emissionCap = 0' : ''}` };
-  if (capCleared) return { state: 'killed', note: 'CLGaugeFactory.emissionCap = 0（排放上限已被清零，排放全部转入 surplus）' };
+  if (activated.word === 0n) return { state: 'killed', note: `尚未在 Voter 激活，投票不会路由到它${capCleared ? '，排放上限也为 0' : '，激活后可重新加入'}（Voter.isActivated = false${capCleared ? '，CLGaugeFactory.emissionCap = 0' : ''}）` };
+  if (capCleared) return { state: 'killed', note: '排放上限已被清零，排放全部转入 surplus（CLGaugeFactory.emissionCap = 0）' };
   const failed = [registered, cap, activated].find((r) => r.failure);
   if (failed) return unknown(failed.failure);
   if (registered.word === 0n) return unknown(`gauge 不在 CLGaugeFactory ${AERO.gaugeFactory} 登记，读不到它的排放上限`);

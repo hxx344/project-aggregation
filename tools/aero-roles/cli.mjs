@@ -80,7 +80,7 @@ export async function verifyOnChain(rpc, { permissions, ...input }) {
     if (getAddress(poolGauge) !== pool.gauge || getAddress(factory) !== AERO.clFactory || getAddress(registered) !== getAddress(poolAddress)) problems.push(`${pool.name}: pool.gauge/factory/getPool 不符`);
     if (getAddress(t0) !== pool.token0 || getAddress(t1) !== pool.token1 || Number(spacing) !== pool.tickSpacing) problems.push(`${pool.name}: 池子代币或 tickSpacing 与配置不符`);
     const liveness = await gaugeLiveness(rpc, pool.gauge);
-    if (liveness.state === 'killed') problems.push(`${pool.name}: gauge 已停用（${liveness.note}）`);
+    if (liveness.state === 'killed') problems.push(`${pool.name}: gauge 不可用：${liveness.note}`);
     lines.push(`做市池 ${pool.name}：${poolAddress}（tickSpacing ${pool.tickSpacing}），gauge ${pool.gauge}${liveness.state === 'alive' ? '' : `（gauge 状态未知：${liveness.note}）`}`);
   }
   const factory = new Contract(AERO.clFactory, FACTORY_ABI, rpc);
