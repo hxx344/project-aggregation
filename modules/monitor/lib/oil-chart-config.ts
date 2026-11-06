@@ -1,6 +1,7 @@
 import type { SpreadChartConfig } from "../app/spread-chart";
 import { oilTradeEvents, spreadTradeMarkers, type TradeEvent } from "./hynix-trades";
 import type { Point } from "./market";
+import { OIL_BANDS_DAYS } from "./oil-history";
 
 export const OIL_BAR_MS = 900_000;
 const BARS_PER_DAY = 86_400_000 / OIL_BAR_MS;
@@ -8,7 +9,7 @@ const usdt = (v: number) => `${v.toFixed(3)} USDT`;
 
 /** Brent (`adr`) against WTI (`equivalent`) on completed 15-minute Binance candles. */
 export const OIL_SPREAD_CHART: SpreadChartConfig = {
-  intervalMs: OIL_BAR_MS, periods: { sma: 7 * BARS_PER_DAY, bands: 20 * BARS_PER_DAY }, kicker: "SPREAD MONITOR", bar: "15 分钟",
+  intervalMs: OIL_BAR_MS, periods: { sma: 7 * BARS_PER_DAY, bands: OIL_BANDS_DAYS * BARS_PER_DAY }, kicker: "SPREAD MONITOR", bar: "15 分钟",
   span: count => `${(count / 4).toLocaleString()} 小时`, bars: count => `${count.toLocaleString()} 根连续 15 分钟 K 线`, checkCadence: "每分钟检查更新",
   // Oil charts only the absolute Brent − WTI spread; there is no percentage tab.
   modes: ["spread", "price"], tabs: { spread: "价差", price: "价格对比" }, units: { spread: "USDT / 桶 · 布伦特 − WTI", price: "USDT / 桶" },

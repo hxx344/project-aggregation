@@ -2,6 +2,7 @@ import { gzip } from 'node:zlib';
 import { promisify } from 'node:util';
 import { readHubSummary } from './hub-summary.mjs';
 import { monitors } from '../lib/monitors.ts';
+import { intradayWindow, OIL_CANDLE_ACTION, parseCandleWindowDays } from '../modules/oil/intraday.mjs';
 const compress = promisify(gzip);
 import { timingSafeEqual } from "node:crypto";
 
@@ -93,10 +94,16 @@ export function createHandler({ service, services, username, password, pageHandl
           }
           const historicalRead = !writing && ['oil', 'hynix'].includes(id)
             && (/(?:^|\/)(?:history|funding|trend)$/.test(action) || action.startsWith('candles/'));
+          let candleDays = null;
+          if (id === 'oil' && action === OIL_CANDLE_ACTION && !writing) {
+            try { candleDays = parseCandleWindowDays(new URL(request.url, 'http://localhost').searchParams.get('days')); }
+            catch { return json(response, 400, { error: 'K 线区间参数无效' }); }
+          }
           try {
             let input;
             if (writing) input = await body(request);
-            return await json(response, 200, await backend.handle(action, request.method, input), historicalRead || action === 'opportunities-v2' || (id === 'perpetual' && action === 'quote') ? request : undefined);
+            const value = await backend.handle(action, request.method, input);
+            return await json(response, 200, candleDays === null ? value : intradayWindow(value, candleDays), historicalRead || action === 'opportunities-v2' || (id === 'perpetual' && action === 'quote') ? request : undefined);
           }
           catch (error) { return json(response, error.status || (writing ? action.includes("test") ? 502 : 400 : 503), { error: writing ? error.message : "监控服务暂不可用" }); }
         }

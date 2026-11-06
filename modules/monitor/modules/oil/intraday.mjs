@@ -53,6 +53,28 @@ export function validateIntradaySnapshot(input) {
   return snapshot;
 }
 
+const DAY_MS = 86_400_000, MAX_WINDOW_DAYS = 400;
+
+/** `days` query of a windowed candle read; null reads the complete history. */
+export function parseCandleWindowDays(value) {
+  if (value === null || value === undefined) return null;
+  const days = /^\d{1,3}$/.test(value) ? Number(value) : NaN;
+  if (!Number.isInteger(days) || days < 1 || days > MAX_WINDOW_DAYS) throw Object.assign(Error('Invalid candle window'), { status: 400 });
+  return days;
+}
+
+/**
+ * Rows opening within `days` before the last paired bar, as a validated snapshot of their own.
+ * `coverage` keeps the complete history's range; a window covering everything returns the snapshot unchanged.
+ */
+export function intradayWindow(snapshot, days) {
+  const { data, metadata } = validateIntradaySnapshot(snapshot);
+  const start = Date.parse(metadata.lastCommonObservation) - days * DAY_MS;
+  if (data[0].time >= start) return snapshot;
+  const window = createIntradaySnapshot(data.filter(row => row.time >= start), metadata.fetchedAt, snapshot.status);
+  return { ...snapshot, ...window, windowDays: days, coverage: { firstCommonObservation: metadata.firstCommonObservation, lastCommonObservation: metadata.lastCommonObservation, pairedObservationRows: metadata.pairedObservationRows } };
+}
+
 /**
  * Resume from SQLite, overlap recent bars, and repair recoverable older gaps without trimming saved history.
  * @param {ReturnType<typeof createIntradaySnapshot> | null} existing

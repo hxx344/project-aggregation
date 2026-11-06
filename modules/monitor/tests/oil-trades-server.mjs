@@ -57,7 +57,7 @@ const server = createServer(async (request, response) => {
     const html = await vite.transformIndexHtml('/__monitor', '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>原油成交</title><body style="margin:0;background:var(--background)"><div id="root"></div><script type="module" src="/tests/oil-trades-fixture.tsx"></script></body></html>');
     response.setHeader('Content-Type', 'text/html; charset=utf-8'); response.end(html); return;
   }
-  if (request.url === '/api/monitors/oil/candles/15m') { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(candles)); return; }
+  if (new URL(request.url, 'http://fixture').pathname === '/api/monitors/oil/candles/15m') { response.setHeader('Content-Type', 'application/json'); response.end(JSON.stringify(candles)); return; }
   if (request.url.startsWith('/api/')) { response.writeHead(503).end('{}'); return; }
   vite.middlewares(request, response, () => response.writeHead(404).end());
 });

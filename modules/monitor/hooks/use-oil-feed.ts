@@ -27,14 +27,17 @@ function readQuote(input: unknown): OilQuote {
 
 /**
  * Quote polling serves both the overview card and the detail; 15-minute candles only poll while the detail is open.
- * The first render embeds only the overview trend, so the full candles are always read from the API.
+ * The first render embeds only the overview trend, so candles are always read from the API: the last
+ * `windowDays` days, or the complete history when it is null.
  */
-export function useOilFeed(initial?: InitialMarketData["oil"], active = true, summaryActive = active) {
+export function useOilFeed(initial?: InitialMarketData["oil"], active = true, summaryActive = active, windowDays: number | null = null) {
   const [data, setData] = useState<OilHistory | null>(null);
   const [quote, setQuote] = useState<OilQuote | null>(initial?.quote ?? null);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [quoteLoading, setQuoteLoading] = useState(!initial?.quote);
   const [error, setError] = useState("");
+  // The window whose read set `error`, so a failure is not attributed to a later selection.
+  const [errorWindow, setErrorWindow] = useState<number | null>(null);
   const [quoteError, setQuoteError] = useState(initial?.quote?.status === "snapshot" ? retainedQuote : "");
   const controls = useRef<{ history?: () => void; quote?: () => void }>({});
   const latest = useRef<OilQuote | null>(initial?.quote ?? null);
@@ -64,18 +67,18 @@ export function useOilFeed(initial?: InitialMarketData["oil"], active = true, su
     const history = startActivityPolling({
       intervalMs: HISTORY_REFRESH_MS,
       timeoutMs: HISTORY_TIMEOUT_MS,
-      load: async signal => oilHistory(await request(`/api/monitors/oil/${OIL_CANDLE_ACTION}`, signal)),
+      load: async signal => oilHistory(await request(`/api/monitors/oil/${OIL_CANDLE_ACTION}${windowDays === null ? "" : `?days=${windowDays}`}`, signal)),
       onData: next => { setData(previous => retainOilHistory(previous, next)); setError(""); },
       // Validation errors are internal English text; only user-facing (Chinese) messages are shown as-is.
-      onError: cause => setError(cause instanceof Error && /[\u4e00-\u9fff]/.test(cause.message) ? cause.message : "15 分钟 K 线校验失败，将在下一轮自动重试。"),
+      onError: cause => { setError(cause instanceof Error && /[\u4e00-\u9fff]/.test(cause.message) ? cause.message : "15 分钟 K 线校验失败，将在下一轮自动重试。"); setErrorWindow(windowDays); },
       onSettled: () => setHistoryLoading(false),
     });
     controls.current.history = () => { void history.refresh(); };
     return () => { controls.current.history = undefined; history.stop(); };
-  }, [active]);
+  }, [active, windowDays]);
 
   return {
-    data, quote, error, quoteError, loading: historyLoading || quoteLoading,
+    data, quote, error, errorWindow, quoteError, loading: historyLoading || quoteLoading,
     refresh: () => { setHistoryLoading(true); setQuoteLoading(true); controls.current.history?.(); controls.current.quote?.(); },
   };
 }
