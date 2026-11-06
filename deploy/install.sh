@@ -3065,7 +3065,8 @@ drop_pending_previous() {
 # environment snapshot leaves only its own record "<candidate> - <scope>": no
 # release has ever succeeded here, so there is no environment to roll back to.
 # Retry as a first install instead of refusing every attempt; a failed retry
-# then removes the candidate and the units like any failed first install (#185).
+# then removes the candidate's current link and units (the release directory
+# stays) like any failed first install (#185).
 resume_interrupted_first_install() {
   local target previous scope extra
   # .deployed-state is written only by a successful run and never removed.
@@ -3073,7 +3074,7 @@ resume_interrupted_first_install() {
      -f "$APP_DIR/.pending-previous" && ! -L "$APP_DIR/previous" && ! -e "$APP_DIR/.api-cutover" ]] || return 0
   read -r target previous scope extra < "$APP_DIR/.pending-previous" || return 0
   [[ "$target" == "$old_release" && "$previous" == - && -z "$extra" ]] || return 0
-  log '上次首次安装在切换版本后、保存配置快照前中断；按首次安装重试，失败时移除未完成的版本和服务单元，配置与数据保留。'
+  log '上次首次安装在切换版本后、保存配置快照前中断；按首次安装重试，失败时移除未完成版本的 current 链接和服务单元，版本目录、配置与数据保留。'
   first_install_candidate=$old_release
   old_release= previous_release=
   old_unit_backup= old_api_unit_backup= old_entry_unit_backup= old_slot_unit_backup= old_layout=single
