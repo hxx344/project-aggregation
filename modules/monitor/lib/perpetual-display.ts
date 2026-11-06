@@ -4,9 +4,12 @@ import { PERPETUAL_FUNDING_MAX_AGE_MS, PERPETUAL_LEG_SKEW_MS, normalizedFunding8
 export const PERPETUAL_DISPLAY_INTERVAL_MS = 20_000;
 // Publish before the one-second display clock can render a held-back expiry.
 const EXPIRY_MARGIN_MS = 1_000;
-// A waiting pair that realigns once per display interval is due again exactly when its reservation
-// would lapse; one display tick lets that frame arrive before the budget timer serves a newer pair.
+// A strictly periodic waiting pair is due again exactly one observed realignment gap after its last
+// realignment; one display tick lets that frame arrive before the budget timer serves a newer pair.
 const RESERVATION_GRACE_MS = 1_000;
+// Six baseline intervals: covers realignment periods up to two minutes, and bounds how long one pair
+// that stops realigning after a long skew can hold the shared recovery budget against newer pairs.
+const RESERVATION_GAP_MAX_MS = 6 * PERPETUAL_DISPLAY_INTERVAL_MS;
 const PRICE_MODES: PerpetualPriceMode[] = ['book', 'mark'];
 
 type SkewedPair = { mode: PerpetualPriceMode; base: string; first: string; second: string };
@@ -60,7 +63,9 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   let displayed = new Map<string, PerpetualQuote>();
   // Actual publications own recovery history; the HEAD baseline above owns only its cadence.
   let shown: PerpetualSnapshot | null = null, shownSource = 0, recoveredAt = -Infinity, recoveryUsed = false;
-  const skewed = new Map<string, SkewedPair & { since: number; lastReadyAt: number }>();
+  // lastReadyAt and gap (the longest wait between two such realignments, 0 until observed) count
+  // only realignments in frames that pass every recovery safety check.
+  const skewed = new Map<string, SkewedPair & { since: number; lastReadyAt: number; gap: number }>();
   let timer: unknown, dueAt = Infinity, stopped = false;
   let recoveryTimer: unknown, recoveryDueAt = Infinity;
   const clear = () => { if (timer !== undefined) cancel(timer); timer = undefined; dueAt = Infinity; };
@@ -68,24 +73,33 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   const candidatesIn = (snapshot: PerpetualSnapshot, isPublication = false) => {
     const ready = new Set<string>();
     if (!skewed.size) return ready;
-    const at = sourceNow?.() ?? 0, checkedAt = now(), live = liveVenues(snapshot), quotes = new Map(snapshot.quotes.map(quote => [quoteKey(quote), quote]));
+    const at = sourceNow?.() ?? 0, live = liveVenues(snapshot), quotes = new Map(snapshot.quotes.map(quote => [quoteKey(quote), quote]));
     for (const [key, pair] of skewed) {
       const left = quotes.get(pair.first), right = quotes.get(pair.second);
       if (snapshot.status === 'unavailable' || !left || !right || left.base !== pair.base || right.base !== pair.base
         || !rankable(left, live, pair.mode, at, snapshot.staleAfterMs) || !rankable(right, live, pair.mode, at, snapshot.staleAfterMs)) {
         skewed.delete(key);
       } else if (aligned(left, right, pair.mode)) {
-        if (isPublication) skewed.delete(key); else { pair.lastReadyAt = checkedAt; ready.add(key); }
+        if (isPublication) skewed.delete(key); else ready.add(key);
       }
     }
     return ready;
+  };
+  const noteSafeRealignment = (ready: Set<string>) => {
+    const checkedAt = now();
+    for (const key of ready) {
+      const pair = skewed.get(key)!;
+      // Keeping the longest gap means consecutive ready frames of one realignment cannot shorten it.
+      if (Number.isFinite(pair.lastReadyAt)) pair.gap = Math.max(pair.gap, checkedAt - pair.lastReadyAt);
+      pair.lastReadyAt = checkedAt;
+    }
   };
   const show = (snapshot: PerpetualSnapshot) => {
     const at = sourceNow?.() ?? 0, since = now();
     candidatesIn(snapshot, true);
     if (shown && sourceNow) for (const pair of skewDroppedPairs(shown, shownSource, snapshot, at)) {
       const key = pairKey(pair);
-      if (!skewed.has(key)) skewed.set(key, { ...pair, since, lastReadyAt: -Infinity });
+      if (!skewed.has(key)) skewed.set(key, { ...pair, since, lastReadyAt: -Infinity, gap: 0 });
     }
     shown = snapshot; shownSource = at;
     onData(snapshot);
@@ -139,20 +153,20 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
    * Recover skew without rotating which pairs are excluded or advancing another quote's expiry.
    * This is an additional whole-frame publication; the baseline timer and expiry protection remain
    * intact. At most one recovery is allowed between baseline publications and in any rolling 20s.
-   * An older candidate that missed its last realignment can reserve the next slot for at most
-   * 20s plus one display tick after that observation. This lets LATE precede a newly dropped EARLY,
-   * including when LATE realigns once per interval one second after EARLY (#187), without letting a
-   * permanently skewed pair block the queue. One whole frame serves all currently ready pairs.
+   * The longest-waiting candidate goes first: an older candidate that missed its last realignment
+   * reserves the next slot until one realignment gap (its longest observed gap, at least 20s and at
+   * most RESERVATION_GAP_MAX_MS) plus one display tick after that observation. A pair whose
+   * realignments recur within its longest gap so far, such as a strictly periodic one within that
+   * limit, is therefore ready again before its reservation lapses (#187), while a pair that stops
+   * realigning blocks newer pairs for at most one such gap. Only realignments in frames that pass
+   * every safety check count, so a pair whose frames are always refused, or that was never seen
+   * realigned, reserves nothing.
+   * One whole frame serves all currently ready pairs.
    */
   const recoveryWait = (next: PerpetualSnapshot) => {
     const ready = candidatesIn(next);
-    if (!sourceNow || !ready.size || !published || next.quotes === published.quotes || recoveryUsed) return Infinity;
-    const at = sourceNow(), checkedAt = now(), live = liveVenues(next), quotes = new Map(next.quotes.map(quote => [quoteKey(quote), quote]));
-    let oldestReady = Infinity, wait = Math.max(0, recoveredAt + PERPETUAL_DISPLAY_INTERVAL_MS - checkedAt);
-    for (const key of ready) oldestReady = Math.min(oldestReady, skewed.get(key)!.since);
-    for (const pair of skewed.values()) if (pair.since < oldestReady) {
-      wait = Math.max(wait, pair.lastReadyAt + PERPETUAL_DISPLAY_INTERVAL_MS + RESERVATION_GRACE_MS - checkedAt);
-    }
+    if (!sourceNow || !ready.size || !published || next.quotes === published.quotes) return Infinity;
+    const at = sourceNow(), live = liveVenues(next), quotes = new Map(next.quotes.map(quote => [quoteKey(quote), quote]));
     if (expiryPending(next, at)) return Infinity;
     const previousLive = liveVenues(published);
     for (const shown of published.quotes) {
@@ -169,7 +183,17 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
       if (normalizedFunding8h(shown, at) !== null && (!quote || normalizedFunding8h(quote, at) === null
         || quote.fundingAt! < shown.fundingAt!)) return Infinity;
     }
-    return skewDroppedPairs(published, at, next, at).length ? Infinity : wait;
+    if (skewDroppedPairs(published, at, next, at).length) return Infinity;
+    noteSafeRealignment(ready);
+    if (recoveryUsed) return Infinity;
+    const checkedAt = now();
+    let oldestReady = Infinity, wait = Math.max(0, recoveredAt + PERPETUAL_DISPLAY_INTERVAL_MS - checkedAt);
+    for (const key of ready) oldestReady = Math.min(oldestReady, skewed.get(key)!.since);
+    for (const pair of skewed.values()) if (pair.since < oldestReady) {
+      const gap = Math.min(RESERVATION_GAP_MAX_MS, Math.max(PERPETUAL_DISPLAY_INTERVAL_MS, pair.gap));
+      wait = Math.max(wait, pair.lastReadyAt + gap + RESERVATION_GRACE_MS - checkedAt);
+    }
+    return wait;
   };
   const recover = () => {
     // An overdue recovery must not duplicate or move the already-due baseline publication.
