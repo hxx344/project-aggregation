@@ -9,8 +9,9 @@ import { AERO } from '../tools/aero-roles/addresses.mjs';
 import { buildPermissions } from '../tools/aero-roles/permissions.mjs';
 import * as executor from '../tools/aero-roles/executor.mjs';
 import { ROLES_ABI } from '../tools/aero-roles/roles-calls.mjs';
-import { BATCH_BUDGET_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
+import { CHANGE_BUDGET_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
 import { createApp } from '../server/app.mjs';
+import { FORWARD_BUDGET } from '../server/runtime/data-client.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
 const permissionsConfig = JSON.parse(readFileSync(new URL('../tools/aero-roles/config.example.json', import.meta.url), 'utf8'));
@@ -1057,11 +1058,11 @@ test('the batch reads the on-chain allowance first: an adjustment keeps this per
     release(); gate = null;
     await assert.rejects(building, (error) => error.status === 409 && /读取链上额度期间已变化/.test(error.message));
 
-    // The whole request, queueing included, is bounded by BATCH_BUDGET_MS from its arrival: past it nothing is frozen.
+    // The whole request, queueing included, is bounded by CHANGE_BUDGET_MS from its arrival: past it nothing is frozen.
     gate = new Promise((resolve) => { release = resolve; });
     building = restarted.buildChangeBatch();
     await until(() => reads.length === seen + 2);
-    clock += BATCH_BUDGET_MS;
+    clock += CHANGE_BUDGET_MS;
     release(); gate = null;
     await assert.rejects(building, (error) => error.status === 504 && /含排队等待/.test(error.message));
     assert.equal(restarted.state().changes.batch, null);
@@ -1079,7 +1080,7 @@ test('waiting in the serial queue counts toward the batch budget, and a callback
       await readGate;
       return { blockNumber: 9, now: day0 + 3600n, allowances: new Map(keys.map((key) => [key, { refill: 1_000_000_000n, maxRefill: 1_000_000_000n, period: DAY, balance: 700_000_000n, timestamp: day0 }])) };
     } };
-  const { manager } = managerWith(directory, { chain, manager: { now: () => Number(day0 + 3600n) * 1000, batchBudgetMs: 300 } });
+  const { manager } = managerWith(directory, { chain, manager: { now: () => Number(day0 + 3600n) * 1000, changeBudgetMs: 300 } });
   const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
   const batched = () => manager.state().events.filter((e) => e.event === 'changes_batched').length;
   try {
@@ -1116,6 +1117,105 @@ test('waiting in the serial queue counts toward the batch budget, and a callback
     const out = await manager.buildChangeBatch();
     assert.deepEqual([out.state.changes.batch.transactions, batched()], [1, 1]);
   } finally { await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+// A regression that lets a late callback wait for the held queue deadlocks the hold/release steps: the timeout turns that into a failure.
+test('add-pool and apply count queue waits and slow reads toward the change budget; a callback that runs after the timeout writes nothing', { timeout: 15_000 }, async () => {
+  const directory = fixtureDir();
+  const { WETH, POOL, infos } = twoPools();
+  let previewGate = null, inspectGate = null, verifyGate = null;
+  const inspected = [], verified = [];
+  const chain = { ...fakeChain(),
+    previewOpen: async () => { await previewGate?.promise; return { amount0: 1n }; },
+    inspectPool: async (_rpc, address) => { inspected.push(address); await inspectGate?.promise; return infos[address]; },
+    verifyActive: async () => { verified.push(1); await verifyGate?.promise; return { ok: true, checks: [] }; } };
+  const { manager } = managerWith(directory, { chain, manager: { changeBudgetMs: 300 } });
+  const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
+  const file = (name) => join(directory, 'aero-safe', name);
+  const queuedOnDisk = () => (existsSync(file('changes.json')) ? JSON.parse(readFileSync(file('changes.json'), 'utf8')).pools.length : 0);
+  const listedOnDisk = () => JSON.parse(readFileSync(file('config.json'), 'utf8')).permissions.pools.length;
+  const count = (name) => manager.state().events.filter((e) => e.event === name).length;
+  const timedOut = (what) => (error) => error.status === 504 && new RegExp(`^${what}超过 0.3 秒（含排队等待其他操作）`).test(error.message);
+  // A long preview holds the serial queue; the returned function lets it go.
+  const hold = () => { previewGate = deferred(); const previewing = manager.preview(open); return () => { previewGate.resolve(); previewGate = null; return previewing; }; };
+  // Any queued callback left behind has run once a later queued step completes.
+  const drain = () => manager.preview(open);
+  const add = () => manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    await until(() => manager.state().chain);
+
+    // 加池 1：队列被占住，第一步排不上；之后轮到也不读链、不写入。
+    let free = hold(), started = Date.now();
+    await assert.rejects(add(), timedOut('加池'));
+    assert.ok(Date.now() - started < 2_000, 'the first queue wait is bounded by the budget');
+    await free(); await drain();
+    assert.deepEqual([inspected.length, manager.state().changes.pools.length, queuedOnDisk()], [0, 0, 0]);
+
+    // 加池 2：节点慢，核验池子超过剩余时间；核验结果晚到也不写入。
+    inspectGate = deferred(); started = Date.now();
+    await assert.rejects(add(), timedOut('加池'));
+    assert.ok(Date.now() - started < 2_000, 'a slow inspection is bounded by the budget');
+    inspectGate.resolve(); inspectGate = null; await drain();
+    assert.deepEqual([manager.state().changes.pools.length, queuedOnDisk(), count('pool_queued')], [0, 0, 0]);
+
+    // 加池 3：核验返回了，但回到队列前队列又被占住；超时后轮到的回调不写入。
+    inspectGate = deferred();
+    const adding = add();
+    await until(() => inspected.length === 2);
+    free = hold();
+    inspectGate.resolve(); inspectGate = null;
+    await assert.rejects(adding, timedOut('加池'));
+    await free(); await drain();
+    assert.deepEqual([manager.state().changes.pools.length, queuedOnDisk(), count('pool_queued')], [0, 0, 0], 'the abandoned callback queued nothing');
+
+    // 队列空闲、节点正常时照常加入并生成批次。
+    await add();
+    await manager.buildChangeBatch();
+    assert.equal(queuedOnDisk(), 1);
+    const kept = () => [manager.state().config.permissions.pools.length, listedOnDisk(), !!manager.state().changes.batch, count('changes_applied')];
+
+    // 启用 1：队列被占住，第一步排不上；之后轮到也不核对、不占用核对标记。
+    free = hold(); started = Date.now();
+    await assert.rejects(manager.applyChangeBatch(), timedOut('核对启用'));
+    assert.ok(Date.now() - started < 2_000);
+    await free(); await drain();
+    assert.equal(verified.length, 0);
+    assert.deepEqual(kept(), [1, 1, true, 0]);
+
+    // 启用 2：节点慢，模拟核对超过剩余时间；核对结果晚到也不写配置。
+    verifyGate = deferred(); started = Date.now();
+    await assert.rejects(manager.applyChangeBatch(), timedOut('核对启用'));
+    assert.ok(Date.now() - started < 2_000, 'a slow verification is bounded by the budget');
+    verifyGate.resolve(); verifyGate = null; await drain();
+    assert.deepEqual(kept(), [1, 1, true, 0]);
+
+    // 启用 3：核对通过了，但回到队列前队列又被占住；超时后轮到的回调不写配置，批次保留。
+    verifyGate = deferred();
+    const applying = manager.applyChangeBatch();
+    await until(() => verified.length === 2);
+    free = hold();
+    verifyGate.resolve(); verifyGate = null;
+    await assert.rejects(applying, timedOut('核对启用'));
+    await free(); await drain();
+    assert.deepEqual(kept(), [1, 1, true, 0], 'the abandoned callback wrote no config');
+
+    // 核对进行中再点两次都被拒：被拒的请求不清除进行中那一次的核对标记；队列空闲时这一次照常启用。
+    verifyGate = deferred();
+    const first = manager.applyChangeBatch();
+    await until(() => verified.length === 3);
+    for (let i = 0; i < 2; i++) await assert.rejects(manager.applyChangeBatch(), (error) => error.status === 409 && /正在核对/.test(error.message));
+    verifyGate.resolve(); verifyGate = null;
+    const state = await first;
+    assert.deepEqual([state.config.permissions.pools.length, listedOnDisk(), state.changes.batch, count('changes_applied')], [2, 2, null, 1]);
+  } finally { previewGate?.resolve(); inspectGate?.resolve(); verifyGate?.resolve(); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('change requests answer before the API forward timeout, and the page waits longer than both', () => {
+  const page = /export const CHANGE_TIMEOUT_MS = ([\d_]+);/.exec(readFileSync(new URL('../src/aero-safe-client.ts', import.meta.url), 'utf8'));
+  assert.ok(page, 'the page timeout constant is declared');
+  const pageMs = Number(page[1].replaceAll('_', ''));
+  assert.ok(CHANGE_BUDGET_MS + 5_000 <= FORWARD_BUDGET, 'the server gives up and explains why before the API forward times out');
+  assert.ok(pageMs >= FORWARD_BUDGET + 5_000, 'the page waits for the API reply, including its own timeout reply');
 });
 test('a queued pool records the gauge liveness reading; unknown survives a restart and old entries read as unknown', async () => {
   const directory = fixtureDir();

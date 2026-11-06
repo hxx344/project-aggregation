@@ -22,11 +22,10 @@ const REFRESH_MIN_MS = 5_000;
 // 头寸判为已销毁后，须隔这么久、且区块号前进后再次判定才删除记录（防负载均衡后面滞后的节点）。
 const BURN_CONFIRM_MS = 60_000;
 const REFRESH_BUDGET_MS = 60_000;
-// 加池：链上核验与生效核对各自的总时限（单次读取另有 20 秒超时、最多 2 次）。
-const POOL_BUDGET_MS = 90_000;
-// 生成批次从收到请求起的总时限，含两次排队等待与读链：须短于 API 转发时限（60 秒），超时即不冻结批次，
-// 避免浏览器或 API 已放弃后批次仍在后台生成。页面等待时间相应长于 API 时限。
-export const BATCH_BUDGET_MS = 50_000;
+// 白名单变更中要读链的请求（加池、生成批次、核对启用）从开始处理起的总时限，含两次排队等待与队列外读链
+// （单次读取另有 20 秒超时、最多 2 次）：须短于 API 转发时限（60 秒），超时即不写盘，
+// 避免浏览器或 API 已放弃后仍在后台加入待加池、冻结批次或启用批次。页面等待时间相应长于 API 时限。
+export const CHANGE_BUDGET_MS = 50_000;
 // 已签名未上链超过这个时长后，允许新操作用同一 nonce 提价替换（两笔最多只有一笔上链）。
 export const PENDING_STALE_MS = 10 * 60_000;
 // 开仓确认基于预览数字：预览超过这个时长后须重新预览。
@@ -243,7 +242,7 @@ function migratePoolPlan(saved) {
 
 // readPrices：行情扫描的 Base 代币美元价 { at, usd: { 小写地址: 美元价 } } 或 null，只用于按总资产比例核对单池上限。
 export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = () => false, readAdmission = () => true, readPrices = () => null, log = console, now = Date.now,
-  chain = executor, makeProvider = executor.provider, batchBudgetMs = BATCH_BUDGET_MS } = {}) {
+  chain = executor, makeProvider = executor.provider, changeBudgetMs = CHANGE_BUDGET_MS } = {}) {
   const directory = path.join(dataDir, 'aero-safe');
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
@@ -373,10 +372,34 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     if (applied) record({ event: 'changes_batch_recognized', pools: changes.batch.pools });
     keepChanges(next, '白名单待变更文件 aero-safe/changes.json 写入失败，页面显示的是整理后的内容；重启后会按配置重新整理。请检查数据目录权限');
   }
+  // 一次白名单变更请求的整体期限（changeBudgetMs，从开始处理起）：两次排队与队列外读链都计入，超时返回 504。
+  // 超时后才轮到的队列回调直接放弃、不写盘。queued 的回调须同步完成写盘，开始写盘后期限不会打断它，不会半写。
+  function changeBudget(what, undone) {
+    const deadline = now() + changeBudgetMs;
+    let abandoned = false;
+    const late = () => { abandoned = true; return new HttpError(504, `${what}超过 ${changeBudgetMs / 1000} 秒（含排队等待其他操作），${undone}，请稍后重试`); };
+    const left = () => { const ms = deadline - now(); if (ms <= 0) throw late(); return ms; };
+    const queued = (fn) => {
+      let ms;
+      try { ms = left(); } catch (error) { return Promise.reject(error); }
+      let timer;
+      const budget = new Promise((_, reject) => { timer = setTimeout(() => reject(late()), ms); timer.unref?.(); });
+      return Promise.race([serial(() => { if (abandoned || now() >= deadline) throw late(); return fn(); }), budget]).finally(() => clearTimeout(timer));
+    };
+    // start 在确认还有剩余时间后才调用，免得已超时仍发出读链请求。
+    const read = async (start, label) => {
+      const ms = left();
+      try { return await withBudget(start(), ms, label); } catch (error) {
+        if (error instanceof HttpError && error.status === 504) throw late();
+        throw error;
+      }
+    };
+    return { queued, read };
+  }
   // 链上读取并核验池子，返回带精度与符号的池子信息。
-  async function inspect(poolAddress, cfg) {
+  async function inspect(poolAddress, cfg, budget) {
     let info;
-    try { info = await withBudget(chain.inspectPool(makeProvider(cfg.rpcUrl), poolAddress), POOL_BUDGET_MS, '链上核验池子'); } catch (error) {
+    try { info = await budget.read(() => chain.inspectPool(makeProvider(cfg.rpcUrl), poolAddress), '链上核验池子'); } catch (error) {
       if (error instanceof HttpError) throw error;
       if (error instanceof chain.ExecError && error.code !== 'rpc') throw new HttpError(400, error.message);
       throw new HttpError(502, `链上核验池子失败：${error.message}`);
@@ -814,18 +837,20 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     }),
     // 加入待加池：链上核验池子，记下它与新代币的每日额度。不改配置、不签名；多个池子可并行等待同一份 Safe 批次。
     // allowances 为 { 代币地址: 十进制数量（代币单位）}：尚无额度的新代币必填，也可顺带改这两个代币的已有额度。
-    // 链上核验在串行队列外等待（最长 POOL_BUDGET_MS），不挡自动调仓；回到队列后按配置代际与当前待变更重新检查再写入。
+    // 链上核验在串行队列外等待，不挡自动调仓；回到队列后按配置代际与当前待变更重新检查再写入。
+    // 从开始处理起整体（两次排队与读链）不超过 changeBudgetMs，超时返回 504，之后轮到的回调不再写入。
     addPoolChange: async (input, authorize = () => {}) => {
       const body = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
-      const { poolAddress, generation, cfg } = await serial(() => {
+      const budget = changeBudget('加池', '未加入待加池');
+      const { poolAddress, generation, cfg } = await budget.queued(() => {
         authorize();
         requireChangesConfig();
         const poolAddress = address(body.pool, '池子地址');
         if (changes.pools.some((p) => sameAddress(p.address, poolAddress))) throw new HttpError(409, '这个池子已在待加池里');
         return { poolAddress, generation: configGeneration, cfg: config };
       });
-      const info = await inspect(poolAddress, cfg);
-      return serial(() => {
+      const info = await inspect(poolAddress, cfg, budget);
+      return budget.queued(() => {
         authorize();
         requireChangesConfig();
         if (configGeneration !== generation) throw new HttpError(409, 'Safe 配置在核验池子期间已变化，请重新加入');
@@ -892,20 +917,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     }),
     // 生成 Safe 批次（Transaction Builder JSON）：配置 → 全部待变更的增量，冻结下来供执行后核对。不改配置、不签名。
     // 要 setAllowance 的额度先在串行队列外读链上当前额度（读不到即拒绝生成，不按满额猜），按本期已用折算新余额；
-    // 回到队列后确认配置代际与待变更都没变才冻结。从开始处理起整体（两次排队与读链）不超过 batchBudgetMs，
+    // 回到队列后确认配置代际与待变更都没变才冻结。从开始处理起整体（两次排队与读链）不超过 changeBudgetMs，
     // 须短于 API 转发时限（60 秒）；超时即返回 504，排在队列里的回调之后轮到时也不再冻结。
     buildChangeBatch: async (authorize = () => {}) => {
-      const deadline = now() + batchBudgetMs;
-      let abandoned = false;
-      const late = () => { abandoned = true; return new HttpError(504, `生成批次超过 ${batchBudgetMs / 1000} 秒（含排队等待其他操作），未生成批次，请稍后重试`); };
-      const queued = (fn) => {
-        const left = deadline - now();
-        if (left <= 0) return Promise.reject(late());
-        let timer;
-        const budget = new Promise((_, reject) => { timer = setTimeout(() => reject(late()), left); timer.unref?.(); });
-        return Promise.race([serial(() => { if (abandoned || now() >= deadline) throw late(); return fn(); }), budget]).finally(() => clearTimeout(timer));
-      };
-      const plan = await queued(() => {
+      const budget = changeBudget('生成批次', '未生成批次');
+      const plan = await budget.queued(() => {
         authorize();
         requireChangesConfig();
         const next = changesNext();
@@ -916,14 +932,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       });
       let allowanceState = null;
       if (plan.keys.length) {
-        const left = deadline - now();
-        if (left <= 0) throw late();
-        try { allowanceState = await withBudget(chain.readAllowances(makeProvider(plan.cfg.rpcUrl), plan.cfg.roles, plan.keys), left, '读取链上额度'); } catch (error) {
-          if (error instanceof HttpError) throw error.status === 504 ? late() : new HttpError(error.status, `${error.message}；未生成批次`);
+        try { allowanceState = await budget.read(() => chain.readAllowances(makeProvider(plan.cfg.rpcUrl), plan.cfg.roles, plan.keys), '读取链上额度'); } catch (error) {
+          if (error instanceof HttpError) throw error.status === 504 ? error : new HttpError(error.status, `${error.message}；未生成批次`);
           throw new HttpError(502, `读取链上额度失败，未生成批次：${error.message}`);
         }
       }
-      return queued(() => {
+      return budget.queued(() => {
         authorize();
         requireChangesConfig();
         const next = changesNext();
@@ -952,9 +966,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       });
     },
     // 硬件钱包在 Safe{Wallet} 执行批次后：以 bot 身份模拟核对批次里的权限全部已在链上生效，再并入配置。批次之后新加的变更继续保留。
-    // 模拟核对在串行队列外等待（最长 POOL_BUDGET_MS），不挡自动调仓；同一时间只跑一次。回到队列后重新检查登录、维护、
+    // 模拟核对在串行队列外等待，不挡自动调仓；同一时间只跑一次。回到队列后重新检查登录、维护、
     // 任务与未结清交易，并确认配置代际、批次与 bot 都没变，才写入配置。
+    // 从开始处理起整体（两次排队与模拟核对）不超过 changeBudgetMs，超时返回 504，之后轮到的回调不再写入配置。
     applyChangeBatch: async (authorize = () => {}) => {
+      const budget = changeBudget('核对启用', '未启用批次');
       const ready = () => {
         authorize();
         requireIdle('不能修改配置');
@@ -968,18 +984,20 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         if (!wallet) throw new HttpError(409, '请先填写 bot 私钥：生效核对以 bot 身份模拟');
         return batch;
       };
-      const plan = await serial(() => {
-        if (verifyingBatch) throw new HttpError(409, '正在核对链上权限，请等这一次结束');
-        const batch = ready();
-        verifyingBatch = true;
-        return { batch, generation: configGeneration, cfg: config, bot: wallet };
-      });
+      // 只有本次请求占用了核对标记才在结束时清除，排队超时被放弃的请求不能清掉别人正在进行的核对。
+      let claimed = false;
       try {
+        const plan = await budget.queued(() => {
+          if (verifyingBatch) throw new HttpError(409, '正在核对链上权限，请等这一次结束');
+          const batch = ready();
+          verifyingBatch = claimed = true;
+          return { batch, generation: configGeneration, cfg: config, bot: wallet };
+        });
         const { batch, cfg, bot } = plan;
         let result;
         try {
-          result = await withBudget(chain.verifyActive({ rpc: makeProvider(cfg.rpcUrl), safe: cfg.safe, roles: cfg.roles, bot,
-            current: buildPermissions(cfg.permissions), next: buildPermissions(batch.permissions), now }), POOL_BUDGET_MS, '核对链上权限');
+          result = await budget.read(() => chain.verifyActive({ rpc: makeProvider(cfg.rpcUrl), safe: cfg.safe, roles: cfg.roles, bot,
+            current: buildPermissions(cfg.permissions), next: buildPermissions(batch.permissions), now }), '核对链上权限');
         } catch (error) {
           if (error instanceof HttpError) throw error;
           throw new HttpError(502, `核对链上权限失败：${error.message}`);
@@ -988,7 +1006,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
           const failed = result.checks.filter((c) => !c.ok);
           throw new HttpError(409, `批次尚未在链上生效（${failed.length}/${result.checks.length} 项未通过）：${failed.slice(0, 3).map((c) => `${c.label} ${c.status}`).join('；')}。请确认 Safe 已执行完整批次后再试`);
         }
-        return await serial(() => {
+        return await budget.queued(() => {
           if (ready() !== batch || configGeneration !== plan.generation || wallet !== bot) throw new HttpError(409, 'Safe 配置、批次或 bot 在核对期间已变化，请重新核对');
           const next = strictAeroSafeConfig({ ...config, permissions: batch.permissions });
           atomicJson(configPath, next);
@@ -1000,7 +1018,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
           void refresh();
           return state();
         });
-      } finally { verifyingBatch = false; }
+      } finally { if (claimed) verifyingBatch = false; }
     },
     // 放弃全部待变更与已生成的批次（批次如已在 Safe 执行，链上权限不会因此撤回）。
     clearChanges: (authorize = () => {}) => serial(() => {

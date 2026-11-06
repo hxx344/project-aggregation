@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Download, ListChecks, LoaderCircle, Save, ShieldCheck, Trash2, X } from 'lucide-react';
 import type { AeroSafe } from './aero-safe-client';
-import { exactUnits, rawUnits, same, units } from './aero-safe-client';
+import { CHANGE_TIMEOUT_MS, exactUnits, rawUnits, same, units } from './aero-safe-client';
 import type { AeroSafeAllowanceEffect, AeroSafeBatchItems, AeroSafeChangeBatch } from './aero-safe-types';
 
 type Row = { token: string; symbol: string; decimals: number | null; current: string | null; pending: string | null; remaining: string | null };
@@ -136,7 +136,7 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
           {batch.behind && !hasItems(batch.withdrawn) && !hasItems(batch.added) ? <p className="as-muted">最新草稿合成的权限与这份批次不同，请核对后再执行。</p> : null}
         </>}
         <div className="as-form">
-          {!batch.stale ? <button type="button" className="button primary" disabled={!!busy || running || !state.wallet} title={!state.wallet ? '请先填写 bot 私钥' : undefined} onClick={() => void call('apply', '/changes/apply', 'POST', {}, 120_000)}>{busy === 'apply' ? <LoaderCircle size={15} className="spin" /> : <ShieldCheck size={15} />}已执行，核对并启用</button> : null}
+          {!batch.stale ? <button type="button" className="button primary" disabled={!!busy || running || !state.wallet} title={!state.wallet ? '请先填写 bot 私钥' : undefined} onClick={() => void call('apply', '/changes/apply', 'POST', {}, CHANGE_TIMEOUT_MS)}>{busy === 'apply' ? <LoaderCircle size={15} className="spin" /> : <ShieldCheck size={15} />}已执行，核对并启用</button> : null}
         </div>
       </> : null}
       {pendingCount || batch ? <div className="as-form"><button type="button" className="button secondary" disabled={!!busy} onClick={() => { if (window.confirm('放弃全部待变更与已生成的批次？已在 Safe 执行的批次不会因此撤回。')) { setBuilt(null); void call('clearChanges', '/changes/clear', 'POST', {}); } }}><Trash2 size={15} />全部放弃</button></div> : null}
