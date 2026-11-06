@@ -1,0 +1,322 @@
+import { existsSync, lstatSync, mkdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { atomicJson } from '../tools/entropy-lighter-lab/core.mjs';
+import { HttpError } from './http-common.mjs';
+import { decimal } from './trading-decimal.mjs';
+import { EXECUTION_VENUE_SYMBOLS, TRADING_NAMES } from './trading-markets.mjs';
+
+// Anthropic arbitrage positions and their liquidation watch. Read only: the
+// Binance/OKX legs come from the read-only accounts (trading.anthropic()), the
+// Hyperliquid legs from the public info endpoint for the master address of the
+// live connection. Alerts go through the Feishu digest's robot.
+// https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals
+const HL_INFO = 'https://api.hyperliquid.xyz/info';
+const HL_SYMBOLS = EXECUTION_VENUE_SYMBOLS.hyperliquid;
+const HL_DEXES = [...new Set(HL_SYMBOLS.map(symbol => symbol.split(':')[0]))];
+const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_ROWS = 2000;
+const FILE_LIMIT = 256 * 1024;
+const HISTORY_LIMIT = 20;
+// Same freshness window as the read-only ledger (POSITION_STALE).
+const LIVE_MS = 75_000;
+// Monitoring counts as interrupted after this long without a fresh read.
+const STALE_ALERT_MS = 180_000;
+// An alert clears only once the distance is this many percentage points above the threshold.
+const HYSTERESIS = 2;
+const FAILURE_RETRY_MS = 60_000;
+export const ANTHROPIC_ALERT_DEFAULTS = Object.freeze({ enabled: false, thresholdPercent: 20, repeatMinutes: 30 });
+const SOURCES = Object.freeze(['binance', 'okx', 'hyperliquid']);
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const iso = time => new Date(time).toISOString();
+const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+
+export function validateAlertConfig(value) {
+  if (!object(value) || Object.keys(value).length !== 3 || !['enabled', 'thresholdPercent', 'repeatMinutes'].every(key => Object.hasOwn(value, key))) throw new Error('预警设置格式不正确');
+  const { enabled, thresholdPercent, repeatMinutes } = value;
+  if (typeof enabled !== 'boolean') throw new Error('预警开关格式不正确');
+  if (typeof thresholdPercent !== 'number' || !Number.isFinite(thresholdPercent) || thresholdPercent < 1 || thresholdPercent > 90) throw new Error('预警距离需要 1% 到 90%');
+  if (!Number.isInteger(repeatMinutes) || repeatMinutes < 5 || repeatMinutes > 1440) throw new Error('重复提醒间隔需要 5 到 1440 分钟');
+  return { enabled, thresholdPercent: Math.round(thresholdPercent * 100) / 100, repeatMinutes };
+}
+
+/** Percent the mark can move against the position before the liquidation price; negative once past it. */
+export function liquidationDistance({ side, markPrice, liquidationPrice }) {
+  const mark = Number(markPrice), liquidation = Number(liquidationPrice);
+  if (markPrice === null || liquidationPrice === null || !(mark > 0) || !(liquidation > 0)) return null;
+  return (side === 'long' ? mark - liquidation : liquidation - mark) / mark * 100;
+}
+
+/** Display mark derived from positionValue ÷ size, kept to eight significant digits. */
+function significant(value) {
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const digits = Math.min(18, Math.max(0, 7 - Math.floor(Math.log10(value))));
+  return decimal(value.toFixed(digits).replace(/(\.\d*?)0+$/, '$1').replace(/\.$/, ''));
+}
+
+/** Positions of the Anthropic coins in one HIP-3 dex's clearinghouseState. */
+export function parseHyperliquidState(state, dex) {
+  if (!object(state) || !Array.isArray(state.assetPositions) || state.assetPositions.length > MAX_ROWS) throw new Error('invalid_state');
+  const rows = [], seen = new Set();
+  for (const entry of state.assetPositions) {
+    if (!object(entry) || !object(entry.position) || typeof entry.position.coin !== 'string') throw new Error('invalid_state');
+    const { coin } = entry.position;
+    if (!HL_SYMBOLS.includes(coin) || !coin.startsWith(`${dex}:`)) continue;
+    if (seen.has(coin)) throw new Error('duplicate_position');
+    seen.add(coin);
+    const p = entry.position, size = decimal(p.szi);
+    if (size === '0') continue;
+    const side = size.startsWith('-') ? 'short' : 'long', quantity = side === 'short' ? size.slice(1) : size;
+    const notional = decimal(p.positionValue, { nonnegative: true });
+    const optional = (value, options) => value === null || value === undefined ? null : decimal(value, options);
+    const leverage = object(p.leverage) && ['cross', 'isolated'].includes(p.leverage.type) && Number.isSafeInteger(p.leverage.value) && p.leverage.value > 0 ? p.leverage : null;
+    const liquidation = optional(p.liquidationPx, { nonnegative: true });
+    rows.push({ id: `hyperliquid:${coin}:${side}`, exchange: 'hyperliquid', symbol: coin, side, quantity, quantityUnit: null,
+      entryPrice: optional(p.entryPx, { nonnegative: true }), markPrice: significant(Number(notional) / Number(quantity)), notional,
+      unrealizedPnl: optional(p.unrealizedPnl), leverage: leverage ? String(leverage.value) : null, marginMode: leverage?.type ?? null,
+      marginUsed: optional(p.marginUsed, { nonnegative: true }), liquidationPrice: liquidation === '0' ? null : liquidation });
+  }
+  return rows;
+}
+
+// Reads at most MAX_BODY_BYTES of the body as it streams; the fetch signal also aborts the read.
+async function readLimited(response) {
+  const length = response.headers?.get?.('content-length');
+  if (length && Number(length) > MAX_BODY_BYTES) throw new Error('Hyperliquid 响应过大');
+  if (!response.body?.getReader) throw new Error('Hyperliquid 仓位数据无法识别');
+  const reader = response.body.getReader(), chunks = [];
+  let size = 0, done = false;
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) { done = true; break; }
+      size += chunk.value.byteLength;
+      if (size > MAX_BODY_BYTES) throw new Error('Hyperliquid 响应过大');
+      chunks.push(Buffer.from(chunk.value));
+    }
+    return Buffer.concat(chunks, size).toString('utf8');
+  } finally {
+    if (!done) void reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
+function readBounded(file) {
+  if (!existsSync(file)) return null;
+  const info = lstatSync(file);
+  if (!info.isFile() || info.isSymbolicLink() || info.size > FILE_LIMIT) throw new Error('invalid_anthropic_watch_file');
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+const fmt = value => value === null ? '—' : String(value);
+const sideName = side => side === 'long' ? '做多' : '做空';
+const legName = row => `${TRADING_NAMES[row.exchange]} ${row.symbol} ${sideName(row.side)}`;
+function eventLine(event, threshold) {
+  if (event.type === 'alert' || event.type === 'repeat') {
+    const row = event.row;
+    return `🔴 ${legName(row)}：${event.type === 'repeat' ? '仍' : ''}距强平 ${event.distance.toFixed(2)}%（阈值 ${threshold}%）\n　　标记价 ${fmt(row.markPrice)} · 强平价 ${fmt(row.liquidationPrice)} · 数量 ${row.quantity}${row.quantityUnit ? ` ${row.quantityUnit}` : ''}${row.leverage ? ` · ${row.leverage}×` : ''}${row.marginMode ? ` ${row.marginMode === 'isolated' ? '逐仓' : '全仓'}` : ''}`;
+  }
+  if (event.type === 'recover') return event.distance === null ? `🟢 ${legName(event.row)}：交易所不再提供强平价（通常是保证金已充足），解除预警`
+    : `🟢 ${legName(event.row)}：距强平已回到 ${event.distance.toFixed(2)}%，解除预警`;
+  if (event.type === 'gone') return `⚠️ ${event.label}：仓位已不在账户中（可能已平仓或被强平），请到交易所核对`;
+  if (event.type === 'stale') return `⚠️ ${TRADING_NAMES[event.source]}：仓位读取已中断${event.minutes ? ` ${event.minutes} 分钟` : ''}，暂时无法监控强平距离`;
+  return `🟢 ${TRADING_NAMES[event.source]}：仓位读取已恢复`;
+}
+export function alertCard(events, { title, threshold, at, test = false }) {
+  const danger = test || events.some(event => ['alert', 'repeat', 'gone', 'stale'].includes(event.type));
+  const clock = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(at));
+  const lines = test ? ['这是一条测试消息：Anthropic 强平预警会通过这个机器人发送。', ...events.map(line => `· ${line}`)] : events.map(event => eventLine(event, threshold));
+  return { config: { wide_screen_mode: true },
+    header: { template: danger ? 'red' : 'green', title: { tag: 'plain_text', content: `${title} · Anthropic 强平预警${test ? '（测试）' : ''} ${clock}` } },
+    elements: [{ tag: 'div', text: { tag: 'plain_text', content: lines.join('\n') } }, { tag: 'hr' },
+      { tag: 'note', elements: [{ tag: 'plain_text', content: `距强平 = 标记价到强平价的距离 ÷ 标记价；阈值 ${threshold}%。数据来自工作台最新读取，时间为北京时间。` }] }] };
+}
+
+export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
+  const directory = path.join(dataDir, 'anthropic-watch');
+  const configPath = path.join(directory, 'config.json'), statePath = path.join(directory, 'state.json');
+  let config = { ...ANTHROPIC_ALERT_DEFAULTS }, loadError = null, stateError = null;
+  // active: leg id → { sentAt, label }; stale: source → sentAt. Both are claimed on disk before a send.
+  let alerts = { active: {}, stale: {} }, history = [], failedAt = 0, lastError = null;
+  let hl = { address: null, rows: [], fetchedAt: null, lastAttemptAt: null, error: null };
+  let timer = null, first = null, closed = false, polling = null, sending = null, testing = false;
+  // epoch changes on every saved setting, so a refused send cannot restore alerts a save just cleared.
+  // notLiveSince: source → first time this process saw it without a fresh read; startedAt bounds both.
+  let epoch = 0, startedAt = now();
+  const notLiveSince = {};
+  const controller = new AbortController();
+
+  function persist(next = alerts) {
+    try { atomicJson(statePath, { alerts: next, history }); stateError = null; return true; }
+    catch (error) { stateError = '预警状态无法保存，预警暂停发送，存储恢复后继续'; log.warn({ err: error, type: 'anthropic-watch' }, stateError); return false; }
+  }
+
+  async function readDex(address, dex, signal) {
+    const response = await fetcher(HL_INFO, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'clearinghouseState', user: address, dex }),
+      redirect: 'error', cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
+    if (response.status === 429) throw new Error('Hyperliquid 请求过于频繁，稍后自动重试');
+    if (!response.ok) throw new Error(`Hyperliquid 返回 HTTP ${response.status}`);
+    const text = await readLimited(response);
+    try { return parseHyperliquidState(JSON.parse(text), dex); } catch { throw new Error('Hyperliquid 仓位数据无法识别'); }
+  }
+  async function readHyperliquid() {
+    let address = null;
+    try { address = readAddress(); } catch { address = null; }
+    if (typeof address !== 'string' || !/^0x[0-9a-f]{40}$/.test(address)) address = null;
+    if (address !== hl.address) {
+      // Another account's legs never vanish from this one: a changed or removed connection drops their alerts.
+      if (hl.address) {
+        const active = Object.fromEntries(Object.entries(alerts.active).filter(([id]) => !id.startsWith('hyperliquid:')));
+        const { hyperliquid: staleSince, ...stale } = alerts.stale;
+        if (Object.keys(active).length !== Object.keys(alerts.active).length || staleSince !== undefined) { const next = { active, stale }; if (persist(next)) alerts = next; }
+      }
+      hl = { address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null };
+    }
+    if (!address) return;
+    hl.lastAttemptAt = iso(now());
+    try {
+      const rows = (await Promise.all(HL_DEXES.map(dex => readDex(address, dex, controller.signal)))).flat();
+      if (hl.address === address) hl = { ...hl, rows, fetchedAt: iso(now()), error: null };
+    } catch (error) {
+      if (closed || hl.address !== address) return;
+      hl.error = error?.name === 'TimeoutError' ? 'Hyperliquid 读取超时，保留上次仓位' : error instanceof Error && /^Hyperliquid/.test(error.message) ? error.message : 'Hyperliquid 读取失败，保留上次仓位';
+    }
+  }
+
+  function sources() {
+    const current = now();
+    let cex = [];
+    try { cex = readCex(); } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 只读仓位读取失败'); }
+    const hlState = !hl.address ? 'unconfigured' : !hl.fetchedAt ? hl.error ? 'error' : 'loading' : hl.error || current - timeOf(hl.fetchedAt) > LIVE_MS ? 'stale' : 'live';
+    const list = [...cex.map(item => ({ exchange: item.exchange, connected: item.connected, state: item.state, fetchedAt: item.fetchedAt, error: item.error, refreshing: !!item.refreshing,
+      positions: item.positions.map(row => ({ ...row, quantityUnit: row.quantityUnit ?? null, marginMode: row.marginMode ?? null, marginUsed: null })) })),
+    { exchange: 'hyperliquid', connected: !!hl.address, address: hl.address, state: hlState, fetchedAt: hl.fetchedAt, error: hl.error, refreshing: !!polling, positions: hl.rows }];
+    return SOURCES.map(exchange => list.find(item => item.exchange === exchange)).filter(Boolean);
+  }
+
+  function evaluate(list) {
+    const threshold = config.thresholdPercent, repeatMs = config.repeatMinutes * 60_000, current = now();
+    const events = [], next = { active: { ...alerts.active }, stale: { ...alerts.stale } };
+    for (const source of list) {
+      const ids = new Set(source.positions.map(row => row.id));
+      const watched = source.positions.length > 0 || Object.keys(next.active).some(id => id.startsWith(`${source.exchange}:`));
+      if (source.state === 'live') delete notLiveSince[source.exchange];
+      else notLiveSince[source.exchange] ??= current;
+      if (source.state === 'live') {
+        if (next.stale[source.exchange]) { events.push({ type: 'stale-recover', source: source.exchange }); delete next.stale[source.exchange]; }
+        for (const row of source.positions) {
+          const distance = liquidationDistance(row), active = next.active[row.id];
+          if (distance === null) {
+            if (active) { events.push({ type: 'recover', row, distance: null }); delete next.active[row.id]; }
+            continue;
+          }
+          if (distance <= threshold) {
+            if (!active || current - active.sentAt >= repeatMs) { events.push({ type: active ? 'repeat' : 'alert', row, distance }); next.active[row.id] = { sentAt: current, label: legName(row) }; }
+          } else if (active && distance > threshold + HYSTERESIS) { events.push({ type: 'recover', row, distance }); delete next.active[row.id]; }
+        }
+        for (const [id, active] of Object.entries(next.active)) {
+          if (id.startsWith(`${source.exchange}:`) && !ids.has(id)) { events.push({ type: 'gone', label: active.label }); delete next.active[id]; }
+        }
+      } else if (watched && !next.stale[source.exchange]) {
+        // Counted from the last fresh read, but never from before this process saw the source; a source
+        // still loading or failing its first read waits the same window, so a restart or reconnect is quiet.
+        const read = timeOf(source.fetchedAt), since = Math.max(read ?? notLiveSince[source.exchange], startedAt);
+        if (current - since >= STALE_ALERT_MS) {
+          events.push({ type: 'stale', source: source.exchange, minutes: read === null ? null : Math.floor((current - read) / 60_000) });
+          next.stale[source.exchange] = current;
+        }
+      }
+    }
+    return { events, next };
+  }
+
+  async function deliver(events, next) {
+    const channel = feishu.alertChannel();
+    const previous = alerts, claimed = epoch;
+    // Claim before sending (L090): a failed claim sends nothing and keeps the events eligible.
+    if (!persist(next)) return;
+    alerts = next;
+    const entry = { at: iso(now()), status: 'sent', count: events.length, summary: events.map(event => eventLine(event, config.thresholdPercent).split('\n')[0]).slice(0, 6), error: null };
+    try { await feishu.postAlert(alertCard(events, { title: channel.title, threshold: config.thresholdPercent, at: now() }), { signal: controller.signal }); failedAt = 0; lastError = null; }
+    catch (error) {
+      entry.status = error?.uncertain ? 'uncertain' : 'failed'; entry.error = String(error?.message || '飞书发送失败').slice(0, 200); lastError = entry.error;
+      // A definite refusal releases the claim so the next check sends again; an uncertain one may have arrived.
+      if (!error?.uncertain && !closed) { failedAt = now(); if (claimed === epoch) alerts = previous; }
+      log.warn({ status: entry.status, error: entry.error, type: 'anthropic-watch' }, 'Anthropic 强平预警发送失败');
+    }
+    history = [entry, ...history].slice(0, HISTORY_LIMIT);
+    persist();
+  }
+
+  async function poll() {
+    if (closed || polling) return polling;
+    polling = (async () => {
+      await readHyperliquid();
+      if (closed || sending || !config.enabled || loadError) return;
+      const channel = feishu.alertChannel();
+      if (!channel.configured || failedAt && now() - failedAt < FAILURE_RETRY_MS) return;
+      const { events, next } = evaluate(sources());
+      if (!events.length) return;
+      sending = deliver(events, next).finally(() => { sending = null; });
+      await sending;
+    })().catch(error => log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 仓位检查失败')).finally(() => { polling = null; });
+    return polling;
+  }
+
+  function state() {
+    const list = sources(), channel = feishu.alertChannel();
+    return { schema: 1, generatedAt: iso(now()), sources: list.map(source => ({ ...source, positions: source.positions.map(row => {
+      const distance = liquidationDistance(row);
+      return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), alerting: Object.hasOwn(alerts.active, row.id) };
+    }) })), alerts: { config: { ...config }, channel: { configured: channel.configured }, history: structuredClone(history), error: loadError ?? stateError ?? lastError,
+      staleAfterSeconds: STALE_ALERT_MS / 1000, hysteresisPercent: HYSTERESIS } };
+  }
+
+  return {
+    state,
+    poll,
+    initialize() {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      startedAt = now();
+      try { const saved = readBounded(configPath); if (saved) config = validateAlertConfig(saved); }
+      catch (error) { loadError = '已保存的预警设置无法读取，预警已停用，重新保存后恢复'; config = { ...ANTHROPIC_ALERT_DEFAULTS }; log.warn({ err: error, type: 'anthropic-watch' }, loadError); }
+      try {
+        const saved = readBounded(statePath);
+        if (saved && object(saved.alerts) && object(saved.alerts.active) && object(saved.alerts.stale)) alerts = { active: saved.alerts.active, stale: saved.alerts.stale };
+        if (saved && Array.isArray(saved.history)) history = saved.history.slice(0, HISTORY_LIMIT);
+      } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警状态无法读取，从空状态开始'); }
+      if (intervalMs > 0) {
+        timer = setInterval(() => void poll(), intervalMs); timer.unref?.();
+        first = setTimeout(() => void poll(), 1000); first.unref?.();
+      }
+    },
+    save(value) {
+      let next;
+      try { next = validateAlertConfig(value); } catch (error) { throw new HttpError(400, error.message); }
+      if (next.enabled && !feishu.alertChannel().configured) throw new HttpError(409, '启用前请先在「系统 → 飞书汇总」保存飞书机器人 Webhook');
+      try { atomicJson(configPath, next); }
+      catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警设置写入失败'); throw new HttpError(503, '预警设置无法保存，请恢复存储后重试'); }
+      // Switching off forgets open alerts, so switching on again reports the current situation afresh.
+      if (!next.enabled) { alerts = { active: {}, stale: {} }; persist(); }
+      config = next; loadError = null; failedAt = 0; lastError = null; epoch += 1;
+      return state();
+    },
+    async test() {
+      const channel = feishu.alertChannel();
+      if (!channel.configured) throw new HttpError(409, '请先在「系统 → 飞书汇总」保存飞书机器人 Webhook');
+      if (testing) throw new HttpError(409, '测试消息正在发送，请稍候');
+      const lines = sources().flatMap(source => source.positions.map(row => {
+        const distance = liquidationDistance(row);
+        return `${legName(row)}：距强平 ${distance === null ? '未提供强平价' : `${distance.toFixed(2)}%`}`;
+      }));
+      testing = true;
+      try { await feishu.postAlert(alertCard(lines.length ? lines : ['当前没有读取到 Anthropic 仓位。'], { title: channel.title, threshold: config.thresholdPercent, at: now(), test: true }), { signal: controller.signal }); }
+      catch (error) { throw new HttpError(error?.uncertain ? 504 : 502, String(error?.message || '飞书发送失败')); }
+      finally { testing = false; }
+      return state();
+    },
+    async close() {
+      closed = true; clearInterval(timer); clearTimeout(first); controller.abort();
+      await polling?.catch(() => {});
+    },
+  };
+}

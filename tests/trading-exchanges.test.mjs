@@ -101,6 +101,16 @@ for (const exchange of ['binance', 'bybit']) {
     assert.deepEqual((await client.positions(credentials)).positions.map(row => row.symbol), ['CLUSDT', 'BZUSDT']);
   });
 }
+test('Binance Anthropic positions recheck read-only permission and request only ANTHROPICUSDT; Bybit refuses', async () => {
+  const { client, calls } = healthy('binance');
+  const result = await client.anthropicPositions(credentials);
+  assert.deepEqual(result.positions.map(row => [row.symbol, row.quantity]), [['ANTHROPICUSDT', '2.5']]);
+  assert.ok(calls[0].url.pathname.endsWith('apiRestrictions'));
+  assert.deepEqual(calls.filter(call => call.url.pathname.endsWith('positionRisk')).map(call => call.url.searchParams.get('symbol')), ['ANTHROPICUSDT']);
+  const bybit = healthy('bybit');
+  await assert.rejects(bybit.client.anthropicPositions(credentials), error => error instanceof TradingExchangeError && error.code === 'input');
+  assert.equal(bybit.calls.length, 0);
+});
 test('SK hynix position reads stop at a write-enabled key', async () => {
   const { client, calls } = harness('binance', () => ({ ...permission(), enableFutures: true }));
   await assert.rejects(client.hynixPositions(credentials), error => error instanceof TradingExchangeError && error.code === 'permissions');

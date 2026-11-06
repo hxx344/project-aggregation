@@ -520,6 +520,16 @@ test('OKX execution trades SK hynix share contracts while the read-only ledger s
   assert.deepEqual([...new Set(readOnly.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['CL-USDT-SWAP', 'BZ-USDT-SWAP']);
 });
 
+test('OKX read-only Anthropic positions read only ANTHROPIC-USDT-SWAP with its liquidation price', async () => {
+  const h = harness({ readOnly: true, handler: call => call.url.pathname.endsWith('/instruments') ? [rule(call.parameters.instId, { ctValCcy: 'ANTHROPIC', ctVal: '1', tickSz: '0.01', lotSz: '0.01', minSz: '0.01' })]
+    : call.url.pathname.endsWith('/positions') ? [position('ANTHROPIC-USDT-SWAP', { pos: '-30', markPx: '183.5', liqPx: '260.1', upl: '-12' })] : undefined });
+  const result = await h.client.anthropicPositions(credentials);
+  assert.deepEqual(result.positions.map(row => [row.symbol, row.instrumentId, row.side, row.quantity, row.liquidationPrice]), [['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'short', '30', '260.1']]);
+  assert.deepEqual([...new Set(h.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['ANTHROPIC-USDT-SWAP']);
+  h.state.config.perm = 'read_only,trade';
+  await assert.rejects(h.client.anthropicPositions(credentials), error => error instanceof TradingExchangeError && error.code === 'permissions');
+});
+
 test('OKX read-only SK hynix positions use share contracts and recheck the read-only permission', async () => {
   const hynixRule = instId => rule(instId, { ctValCcy: instId.split('-')[0], ctVal: '1', tickSz: instId.startsWith('SKHYNIX-') ? '0.1' : '0.01', lotSz: '0.001', minSz: '0.001' });
   const h = harness({ readOnly: true, handler: call => call.url.pathname.endsWith('/instruments') ? [hynixRule(call.parameters.instId)]

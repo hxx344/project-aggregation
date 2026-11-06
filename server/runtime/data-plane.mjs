@@ -10,6 +10,7 @@ import { createAssetPositions } from '../asset-positions.mjs';
 import { createAssetFills, ASSET_FILLS_BACKGROUND_MS, FILL_MARKETS } from '../asset-fills.mjs';
 import { createTradingExecution } from '../trading-execution.mjs';
 import { createTradingAuto } from '../trading-auto.mjs';
+import { createAnthropicWatch } from '../trading-anthropic-watch.mjs';
 import { ExecutionError } from '../trading-execution-plan.mjs';
 import { normalizeTradingPair } from '../trading-markets.mjs';
 import { UpdateError } from '../updates.mjs';
@@ -137,6 +138,9 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
     positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
+  // Anthropic legs: read-only Binance/OKX accounts plus the live Hyperliquid connection's public positions.
+  const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0, readCex: () => trading.anthropic(),
+    readAddress: () => { const row = execution.state().connections.find(item => item.exchange === 'hyperliquid'); return row?.connected && typeof row.identity === 'string' ? row.identity.toLowerCase() : null; } });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
     close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),
@@ -378,6 +382,20 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         return reply(200, { schemaVersion: 1, embeddedModules, modules, accountWriterVersion: sharedAccountWriter ? 1 : null, recoveryProtectionVersion: sharedAccountWriter?.recoveryProtectionVersion ?? null });
       } finally { controllers.delete(controller); }
     }
+    if (pathname === '/api/trading/anthropic' || pathname.startsWith('/api/trading/anthropic/')) {
+      if (url.search) throw new HttpError(400, 'Anthropic 仓位接口不接受查询参数');
+      if (pathname === '/api/trading/anthropic' && method === 'GET') return reply(200, anthropicWatch.state());
+      const action = pathname === '/api/trading/anthropic/alerts' && method === 'PUT' ? 'save' : pathname === '/api/trading/anthropic/alerts/test' && method === 'POST' ? 'test' : null;
+      if (!action) throw new HttpError(404, 'Anthropic 仓位接口不存在');
+      const body = await bodyOf();
+      if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+      if (action === 'save') {
+        if (!body || Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供预警设置');
+        return reply(200, anthropicWatch.save(body.config));
+      }
+      if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
+      return reply(200, await anthropicWatch.test());
+    }
     if (pathname === '/api/trading/positions') {
       if (method !== 'GET') throw new HttpError(405, '仓位接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '仓位接口不接受查询参数');
@@ -491,7 +509,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
     prepareStop: async () => { await aeroSafe.prepareStop(); },
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); anthropicWatch.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -503,6 +521,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await anthropicWatch.close(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

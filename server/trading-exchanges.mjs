@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto';
 import { decimal, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createOkxTradingClient } from './trading-okx-readonly.mjs';
-import { TRADING_HYNIX_SYMBOLS } from './trading-markets.mjs';
+import { TRADING_ANTHROPIC_SYMBOLS, TRADING_HYNIX_SYMBOLS } from './trading-markets.mjs';
 
 const SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
 const BYBIT_BASE_COINS = Object.freeze({ CLUSDT: 'CL', BZUSDT: 'BZ' });
@@ -390,6 +390,15 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     catch (error) { throw withDiagnostic(error, 'positions', accountMode); }
   }
 
+  // Bybit lists no Anthropic contract; only Binance reads it.
+  async function anthropicPositions(credentials, { signal, accountMode: requestedMode } = {}) {
+    if (exchange !== 'binance') throw new TradingExchangeError('该交易所没有 Anthropic 合约', 'input');
+    const accountMode = modeOf(requestedMode);
+    await permissions(credentials, signal, undefined, accountMode);
+    try { return await readPositions(credentials, signal, accountMode, TRADING_ANTHROPIC_SYMBOLS); }
+    catch (error) { throw withDiagnostic(error, 'positions', accountMode); }
+  }
+
   async function funding(credentials, { start, end, signal, accountMode: requestedMode, onProgress } = {}) {
     const accountMode = modeOf(requestedMode);
     checkAbort(signal);
@@ -457,5 +466,5 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     return snapshot(diagnostic === null, diagnostic);
   }
 
-  return Object.freeze({ verify, positions, hynixPositions, funding });
+  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding });
 }
