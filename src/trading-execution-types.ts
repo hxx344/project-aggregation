@@ -1,39 +1,53 @@
 import type { OilSymbol, TradingAccountMode, TradingExchange } from './trading-types';
 
-export type ExecutionMarket = 'oil' | 'hynix';
-export type ExecutionSymbol = OilSymbol | 'SKHYUSDT' | 'SKHYNIXUSDT';
+export type ExecutionMarket = 'oil' | 'hynix' | 'anthropic';
+/** Anthropic pre-IPO contracts: Binance/OKX ANTHROPICUSDT, Hyperliquid HIP-3 io:ANTH (Entropy) and xyz:ANT (trade.xyz). */
+export type AnthropicSymbol = 'ANTHROPICUSDT' | 'io:ANTH' | 'xyz:ANT';
+export type ExecutionSymbol = OilSymbol | 'SKHYUSDT' | 'SKHYNIXUSDT' | AnthropicSymbol;
+/** Live trading venues: the read-only venues plus Hyperliquid (API wallet). */
+export type ExecutionExchange = TradingExchange | 'hyperliquid';
+/** Hyperliquid connects an API (agent) wallet; the other venues keep their account modes. */
+export type ExecutionAccountMode = TradingAccountMode | 'agent';
+/** Share-count assumptions in billions; editable, they are estimates until the listing documents fix them. */
+export type AnthropicShares = { outstanding: string; diluted: string };
+export type ExecutionLeverage = { type: 'cross' | 'isolated'; value: number };
 export type ExecutionPreset = 'four-leg' | 'same-exchange' | 'cross-exchange';
 export type ExecutionAction = 'open' | 'close';
 export type ExecutionSide = 'long' | 'short';
 export type ExecutionConnection = {
-  exchange: TradingExchange; connected: boolean; revision: number; accountMode: TradingAccountMode;
+  exchange: ExecutionExchange; connected: boolean; revision: number; accountMode: ExecutionAccountMode;
   identity: string | null; keyLabel: string | null; verifiedAt: string | null; locked: boolean;
 };
 export type ExecutionPosition = {
-  exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string; fetchedAt: string;
+  exchange: ExecutionExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string; fetchedAt: string;
 };
 /** chase: passive limit order that follows the book; market: one taker order per batch. */
 export type ExecutionOrderType = 'chase' | 'market';
 export type ExecutionLegInput = {
-  exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string;
+  exchange: ExecutionExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string;
   orderType: ExecutionOrderType;
   /** Chase limit; null = follow the book without a limit. Always null for market legs. */
   stopPrice: string | null;
 };
-/** With equalSize the server sizes every leg: oil in barrels, SK hynix in USDT notional. */
+/** With equalSize the server sizes every leg: oil in barrels, SK hynix in USDT notional, Anthropic in estimated shares. */
 export type ExecutionPlanInput = {
   market: ExecutionMarket; preset: ExecutionPreset; action: ExecutionAction;
   legs: (Omit<ExecutionLegInput, 'quantity' | 'stopPrice'> & { quantity?: string; stopPrice?: string })[]; equalSize?: string;
+  /** Required for Anthropic, refused for every other market. */
+  shares?: AnthropicShares;
   batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
 };
 export type ExecutionPreviewLeg = ExecutionLegInput & {
   id: string; orderSide: 'buy' | 'sell'; positionMode: 'one-way' | 'hedge'; accountRevision: number;
   currentQuantity: string; batchQuantities: string[]; estimatedNotional: string;
   bid: string; ask: string; quoteAt: string;
-  rule?: { instrumentId?: string; quantityUnit?: string; contractSize?: string };
+  rule?: { instrumentId?: string; quantityUnit?: string; contractSize?: string; quoteAsset?: string };
+  /** Hyperliquid only: the account's current margin mode and leverage, which this hub never changes. */
+  leverage?: ExecutionLeverage;
 };
 export type ExecutionPreview = {
   id: string; expiresAt: string; market: ExecutionMarket; equalSize: string | null; preset: ExecutionPreset; action: ExecutionAction; resumeJobId?: string | null;
+  shares?: AnthropicShares;
   batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
   connections: ExecutionConnection[]; legs: ExecutionPreviewLeg[]; notes: string[];
 };
@@ -61,10 +75,11 @@ export type ExecutionState = {
 };
 
 /** One top-of-book read; a failed read carries only `error`. */
-export type ExecutionQuoteBook = { exchange: TradingExchange; symbol: ExecutionSymbol; bid?: string; ask?: string; at?: string; error?: string };
+export type ExecutionQuoteBook = { exchange: ExecutionExchange; symbol: ExecutionSymbol; bid?: string; ask?: string; at?: string; error?: string };
 export type ExecutionQuotes = { generatedAt: string; maxAgeMs: number; books: ExecutionQuoteBook[] };
 
-export type AutoMarket = ExecutionMarket;
+/** Automatic rules cover the fixed-pair markets only; Anthropic is manual. */
+export type AutoMarket = Exclude<ExecutionMarket, 'anthropic'>;
 export type AutoDirection = 'short' | 'long';
 export type AutoPhase = 'idle' | 'opening' | 'holding' | 'closing' | 'review';
 export type AutoRuleConfig = {

@@ -6,10 +6,12 @@ import { decimal, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 // https://www.okx.com/docs-v5/en/#overview-rest-authentication
 // https://www.okx.com/docs-v5/en/#public-data-rest-api-get-instruments
 // The read-only ledger stays on oil; execution also trades the SK hynix
-// ADR/ordinary pair (public instruments checked 2026-10-28, ctVal 1 share).
+// ADR/ordinary pair (public instruments checked 2026-10-28, ctVal 1 share)
+// and the Anthropic pre-market swap (checked 2026-11-07: linear, ctVal 1,
+// ctValCcy ANTHROPIC, price = valuation / 10B reference shares).
 export const OKX_SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
-export const OKX_EXECUTION_SYMBOLS = Object.freeze([...OKX_SYMBOLS, 'SKHYUSDT', 'SKHYNIXUSDT']);
-const INSTRUMENTS = Object.freeze({ CLUSDT: 'CL-USDT-SWAP', BZUSDT: 'BZ-USDT-SWAP', SKHYUSDT: 'SKHY-USDT-SWAP', SKHYNIXUSDT: 'SKHYNIX-USDT-SWAP' });
+export const OKX_EXECUTION_SYMBOLS = Object.freeze([...OKX_SYMBOLS, 'SKHYUSDT', 'SKHYNIXUSDT', 'ANTHROPICUSDT']);
+const INSTRUMENTS = Object.freeze({ CLUSDT: 'CL-USDT-SWAP', BZUSDT: 'BZ-USDT-SWAP', SKHYUSDT: 'SKHY-USDT-SWAP', SKHYNIXUSDT: 'SKHYNIX-USDT-SWAP', ANTHROPICUSDT: 'ANTHROPIC-USDT-SWAP' });
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const SCALE = 10n ** 18n;
 const ROUTES = Object.freeze({

@@ -1,11 +1,34 @@
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { TRADING_EXCHANGES, TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_ALL_SYMBOLS } from './trading-markets.mjs';
+import { EXECUTION_EXCHANGES as VENUES, TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_ALL_SYMBOLS, venueSupports } from './trading-markets.mjs';
 
 const SCALE = 10n ** 18n;
-export const EXECUTION_EXCHANGES = TRADING_EXCHANGES;
+export const EXECUTION_EXCHANGES = VENUES;
 export const EXECUTION_SYMBOLS = EXECUTION_ALL_SYMBOLS;
-// Oil legs hedge equal barrels; SK hynix ADR/ordinary legs hedge equal USDT notional.
-export const EQUAL_SIZE_UNITS = Object.freeze({ oil: '桶', hynix: 'USDT' });
+// Oil legs hedge equal barrels; SK hynix ADR/ordinary legs hedge equal USDT
+// notional; Anthropic legs hedge equal estimated shares.
+export const EQUAL_SIZE_UNITS = Object.freeze({ oil: '桶', hynix: 'USDT', anthropic: '股' });
+/**
+ * Anthropic shares one native unit stands for, under the caller's share-count
+ * assumptions (billions). Binance quotes valuation per 1B reference shares,
+ * OKX per 10B (rebased 2026-06-30), Entropy io per 1B fully diluted shares
+ * after the IPO (its documented conversion), trade.xyz one Class A share.
+ * These are assumptions about a future listing, not venue guarantees.
+ */
+const SHARE_BASIS = Object.freeze({ 'binance:ANTHROPICUSDT': ['outstanding', '1'], 'okx:ANTHROPICUSDT': ['outstanding', '10'], 'hyperliquid:io:ANTH': ['diluted', '1'], 'hyperliquid:xyz:ANT': [null, '1'] });
+export const SHARE_LIMITS = Object.freeze({ min: '1', max: '100' });
+export function sharesPerUnit(leg, shares, contractSize = '1') {
+  const basis = SHARE_BASIS[`${leg.exchange}:${leg.symbol}`];
+  if (!basis || !shares) throw new ExecutionError(400, '该合约缺少股数换算假设');
+  const [field, divisor] = basis, base = field ? units(shares[field]) : SCALE;
+  return fromUnits(base * units(contractSize) / units(divisor));
+}
+function normalizeShares(value) {
+  exactKeys(value, ['outstanding', 'diluted']);
+  const outstanding = positive(value.outstanding, '流通股数'), diluted = positive(value.diluted, '完全稀释股数');
+  for (const item of [outstanding, diluted]) if (compareDecimals(item, SHARE_LIMITS.min) < 0 || compareDecimals(item, SHARE_LIMITS.max) > 0) throw new ExecutionError(400, `股数假设须在 ${SHARE_LIMITS.min} 至 ${SHARE_LIMITS.max} 十亿股之间`);
+  if (compareDecimals(diluted, outstanding) < 0) throw new ExecutionError(400, '完全稀释股数不能小于流通股数');
+  return { outstanding, diluted };
+}
 export const MAX_BATCHES = 200;
 export const QUOTE_MAX_AGE = 10_000;
 /** Per-leg order type: 'chase' posts passively and follows the book; 'market' takes liquidity once. */
@@ -51,18 +74,22 @@ export const orderSide = (action, side) => (action === 'open') === (side === 'lo
 export const positionSide = leg => leg.positionMode === 'one-way' ? 'BOTH' : leg.side === 'long' ? 'LONG' : 'SHORT';
 
 export function normalizeIntent(body) {
-  exactKeys(body, ['market', 'preset', 'action', 'legs', 'equalSize', 'batchCount', 'batchIntervalMs', 'repriceIntervalMs', 'timeoutMs']);
+  exactKeys(body, ['market', 'preset', 'action', 'legs', 'equalSize', 'shares', 'batchCount', 'batchIntervalMs', 'repriceIntervalMs', 'timeoutMs']);
   // Requests from before the market selector are oil-only.
   const market = body.market ?? 'oil';
-  if (!Object.hasOwn(EXECUTION_MARKETS, market)) throw new ExecutionError(400, '请选择支持的交易品种');
-  const symbols = EXECUTION_MARKETS[market].symbols;
+  // hasOwn coerces its key, so an array like ['oil'] would pass without the type check.
+  if (typeof market !== 'string' || !Object.hasOwn(EXECUTION_MARKETS, market)) throw new ExecutionError(400, '请选择支持的交易品种');
+  const symbols = EXECUTION_MARKETS[market].symbols, anthropic = market === 'anthropic';
   if (!['four-leg', 'same-exchange', 'cross-exchange'].includes(body.preset) || !['open', 'close'].includes(body.action)) throw new ExecutionError(400, '请选择支持的交易预设与开平仓操作');
+  if (anthropic && body.preset === 'four-leg') throw new ExecutionError(400, 'Anthropic 只支持两腿组合');
+  if (anthropic === (body.shares === undefined)) throw new ExecutionError(400, anthropic ? '请填写流通股与完全稀释股数假设' : '该品种不使用股数假设');
+  const shares = anthropic ? normalizeShares(body.shares) : null;
   if (!Array.isArray(body.legs) || body.legs.length !== (body.preset === 'four-leg' ? 4 : 2)) throw new ExecutionError(400, '交易腿数与所选预设不一致');
-  const equalSize = body.equalSize === undefined ? null : positive(body.equalSize, market === 'oil' ? '每腿桶数' : '每腿名义金额');
+  const equalSize = body.equalSize === undefined ? null : positive(body.equalSize, market === 'oil' ? '每腿桶数' : anthropic ? '每腿股数' : '每腿名义金额');
   const identities = new Set();
   const legs = body.legs.map(value => {
     exactKeys(value, ['exchange', 'symbol', 'side', 'quantity', 'orderType', 'stopPrice']);
-    if (!EXECUTION_EXCHANGES.includes(value.exchange) || !symbols.includes(value.symbol) || !['long', 'short'].includes(value.side)) throw new ExecutionError(400, '合约、交易所或仓位方向无效');
+    if (!EXECUTION_EXCHANGES.includes(value.exchange) || !symbols.includes(value.symbol) || !venueSupports(value.exchange, value.symbol) || !['long', 'short'].includes(value.side)) throw new ExecutionError(400, '合约、交易所或仓位方向无效');
     const identity = `${value.exchange}:${value.symbol}`;
     if (identities.has(identity)) throw new ExecutionError(400, '同一交易所合约不能重复加入本次交易');
     identities.add(identity);
@@ -84,9 +111,10 @@ export function normalizeIntent(body) {
     for (const symbol of symbols) if (new Set(legs.filter(leg => leg.symbol === symbol).map(leg => leg.side)).size !== 2) throw new ExecutionError(400, '四腿预设要求同品种跨所方向相反');
   } else {
     const [a, b] = legs;
-    if (a.side === b.side || (body.preset === 'same-exchange' ? a.exchange !== b.exchange || a.symbol === b.symbol : a.exchange === b.exchange || a.symbol !== b.symbol)) throw new ExecutionError(400, '双腿方向或合约组合与预设不一致');
+    // Anthropic venues list differently named contracts for the same company, so a cross-venue pair may differ in symbol.
+    if (a.side === b.side || (body.preset === 'same-exchange' ? a.exchange !== b.exchange || a.symbol === b.symbol : a.exchange === b.exchange || !anthropic && a.symbol !== b.symbol)) throw new ExecutionError(400, '双腿方向或合约组合与预设不一致');
   }
-  return { market, preset: body.preset, action: body.action, legs, equalSize,
+  return { market, preset: body.preset, action: body.action, legs, equalSize, ...(shares ? { shares } : {}),
     batchCount: integer(body.batchCount, 1, MAX_BATCHES, '批次数'),
     batchIntervalMs: integer(body.batchIntervalMs, 0, 600_000, '批次间隔毫秒数'),
     repriceIntervalMs: integer(body.repriceIntervalMs, 1000, 60_000, '本地追价间隔毫秒数'),
@@ -107,6 +135,11 @@ export function normalizeMarket(value, symbol, now) {
     rule.instrumentId = value.rule.instrumentId;
   }
   if (value.rule.quantityUnit === '张') rule.quantityUnit = '张';
+  if (value.rule.assetId !== undefined) {
+    if (!Number.isSafeInteger(value.rule.assetId) || value.rule.assetId < 0) throw new ExecutionError(502, '合约编号无效');
+    rule.assetId = value.rule.assetId;
+  }
+  if (value.rule.quoteAsset === 'USDC') rule.quoteAsset = 'USDC';
   // null: the venue does not offer market orders for this contract.
   rule.maxMarketQuantity = value.rule.maxMarketQuantity === undefined || value.rule.maxMarketQuantity === null ? null : positive(value.rule.maxMarketQuantity, '合约规则');
   try {
@@ -135,10 +168,14 @@ export function checkChildQuantity(quantity, market, action, orderType = 'chase'
   const { rule } = market, max = maxOrderQuantity(rule, orderType);
   if (!isMultiple(quantity, rule.quantityStep)) throw new ExecutionError(409, `下单数量须按 ${rule.quantityStep} 的步长填写`);
   if (compareDecimals(quantity, rule.minQuantity) < 0 || compareDecimals(quantity, max) > 0) throw new ExecutionError(409, `单批${orderType === 'market' ? '市价单' : ''}数量须在 ${rule.minQuantity} 至 ${max} 之间`);
-  if (action === 'open' && compareNotional(quantity, market.bid, rule.minNotional, rule.contractSize) < 0n) throw new ExecutionError(409, `单批名义金额低于 ${rule.minNotional} USDT`);
+  if (action === 'open' && compareNotional(quantity, market.bid, rule.minNotional, rule.contractSize) < 0n) throw new ExecutionError(409, `单批名义金额低于 ${rule.minNotional} ${rule.quoteAsset ?? 'USDT'}`);
   if (rule.maxNotional !== null && compareNotional(quantity, market.ask, rule.maxNotional, rule.contractSize) > 0n) throw new ExecutionError(409, '单批名义金额超过合约允许值');
 }
 export function checkContract(leg, market) {
+  if (leg.exchange === 'hyperliquid') {
+    if (!Number.isSafeInteger(leg.rule?.assetId) || leg.rule.assetId !== market.rule.assetId || compareDecimals(leg.rule.quantityStep, market.rule.quantityStep) !== 0) throw new ExecutionError(409, 'Hyperliquid 合约编号或数量精度已改变，请重新预览');
+    return;
+  }
   if (leg.exchange !== 'okx') return;
   if (!leg.rule?.contractSize || !market.rule.contractSize || leg.rule.instrumentId !== market.rule.instrumentId
     || compareDecimals(leg.rule.contractSize, market.rule.contractSize) !== 0) throw new ExecutionError(409, 'OKX 合约乘数或代码已改变，请重新预览');
@@ -173,9 +210,11 @@ export function ensureNoExternalOrders(account, symbol, ownedIds = new Set()) {
  * The whole group, each symbol across venues and each venue's own pair must
  * balance, so one venue's unit mistake cannot hide behind another's.
  */
-function hedgeBalance(market, legs) {
-  const exposure = (leg, quantity) => market === 'oil' ? units(quantity) * units(leg.rule.contractSize ?? '1') / SCALE : units(notional(quantity, leg.orderSide === 'buy' ? leg.bid : leg.ask, leg.rule.contractSize ?? '1'));
-  const unit = market === 'oil' ? ' 桶' : ' USDT';
+function hedgeBalance(market, legs, shares) {
+  const exposure = (leg, quantity) => market === 'oil' ? units(quantity) * units(leg.rule.contractSize ?? '1') / SCALE
+    : market === 'anthropic' ? units(quantity) * units(sharesPerUnit(leg, shares, leg.rule.contractSize ?? '1')) / SCALE
+    : units(notional(quantity, leg.orderSide === 'buy' ? leg.bid : leg.ask, leg.rule.contractSize ?? '1'));
+  const unit = market === 'oil' ? ' 桶' : market === 'anthropic' ? ' 股' : ' USDT';
   const measure = (label, group) => {
     const total = side => group.filter(leg => leg.side === side).reduce((sum, leg) => sum + exposure(leg, leg.quantity), 0n);
     const long = total('long'), short = total('short'), larger = long > short ? long : short, gap = long > short ? long - short : short - long;
@@ -200,6 +239,12 @@ export function equalQuantity(intent, leg, market) {
     if (!isMultiple(quantity, rule.quantityStep)) throw new ExecutionError(400, `${name} 每腿桶数须为 ${notional(rule.quantityStep, '1', contractSize)} 桶的整数倍`);
     return quantity;
   }
+  if (intent.market === 'anthropic') {
+    const perUnit = sharesPerUnit(leg, intent.shares, contractSize);
+    const lots = units(intent.equalSize) * SCALE / (units(perUnit) * units(rule.quantityStep));
+    if (lots <= 0n) throw new ExecutionError(400, `${name} 每腿股数不足一个下单步长（每单位约 ${perUnit} 股）`);
+    return fromUnits(lots * units(rule.quantityStep));
+  }
   // Size from the price the order will trade at (passive for chase, taker for
   // market), rounded down to the venue step.
   const taker = legOrderType(leg) === 'market';
@@ -209,13 +254,20 @@ export function equalQuantity(intent, leg, market) {
   return fromUnits(lots * units(rule.quantityStep));
 }
 
+// Hyperliquid margin mode and leverage are the account's own settings; this module only reports them.
+function leverageOf(account, symbol) {
+  const value = account?.leverage?.[symbol];
+  if (!object(value) || !['cross', 'isolated'].includes(value.type) || !Number.isSafeInteger(value.value) || value.value < 1 || value.value > 100) throw new ExecutionError(502, `无法读取 Hyperliquid ${symbol} 当前杠杆，暂不下单`);
+  return { type: value.type, value: value.value };
+}
 export function buildPlan(intent, snapshots, markets, connections, now, { resume = false } = {}) {
   let count = intent.batchCount;
   const prepared = intent.legs.map(input => {
     const account = snapshots.get(input.exchange), connection = connections.get(input.exchange);
     if (!connection?.connected) throw new ExecutionError(409, `${input.exchange} 尚未连接实盘账户`);
     const market = normalizeMarket(markets.get(`${input.exchange}:${input.symbol}`), input.symbol, now);
-    const leg = { ...input, id: legId(input), orderType: legOrderType(input), stopPrice: input.stopPrice ?? null, orderSide: orderSide(intent.action, input.side), positionMode: account?.modes?.[input.symbol], accountRevision: connection.revision };
+    const leg = { ...input, id: legId(input), orderType: legOrderType(input), stopPrice: input.stopPrice ?? null, orderSide: orderSide(intent.action, input.side), positionMode: account?.modes?.[input.symbol], accountRevision: connection.revision,
+      ...(input.exchange === 'hyperliquid' ? { leverage: leverageOf(account, input.symbol) } : {}) };
     if (intent.equalSize) leg.quantity = equalQuantity(intent, leg, market);
     const currentQuantity = checkPosition(account, leg, intent.action, leg.quantity);
     ensureNoExternalOrders(account, leg.symbol);
@@ -234,22 +286,28 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
     for (const quantity of batchQuantities) checkChildQuantity(quantity, market, intent.action, leg.orderType);
     return { ...leg, batchQuantities, estimatedNotional: notional(leg.quantity, (leg.orderSide === 'buy') !== (legOrderType(leg) === 'market') ? market.bid : market.ask, market.rule.contractSize), bid: market.bid, ask: market.ask, quoteAt: market.at, rule: market.rule };
   });
-  const balance = intent.equalSize ? null : hedgeBalance(intent.market, legs);
+  // Anthropic legs are always measured in shares: independent rounding of each venue's step can leave a visible gap.
+  const balance = intent.equalSize && intent.market !== 'anthropic' ? null : hedgeBalance(intent.market, legs, intent.shares);
   // Per-leg sizes are native units (OKX in contracts). A fresh open where any
   // hedged group differs by more than 5% or one order step is a unit mistake.
-  if (balance && intent.action === 'open' && !resume && !balance.balanced) throw new ExecutionError(400, `多空两侧不平衡：${balance.failed}，请核对各所合约单位（OKX 按张）或改用${intent.market === 'oil' ? '等桶' : '等金额'}`);
-  const sizing = balance ? [`逐腿数量：${balance.text}${balance.balanced ? '。' : `；${balance.failed}，两侧不平衡，请确认这是有意的数量。`}`] : intent.market === 'oil'
+  if (balance && intent.action === 'open' && !resume && !balance.balanced) throw new ExecutionError(400, `多空两侧不平衡：${balance.failed}，请核对各所合约单位（OKX 按张）或改用${intent.market === 'oil' ? '等桶' : intent.market === 'anthropic' ? '等股数' : '等金额'}`);
+  const sizing = intent.market === 'anthropic' ? [
+    `股数假设：流通 ${intent.shares.outstanding} 十亿股、完全稀释 ${intent.shares.diluted} 十亿股；每单位折合 ${legs.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${sharesPerUnit(leg, intent.shares, leg.rule.contractSize ?? '1')} 股`).join('、')}。`,
+    `${intent.equalSize ? `等股数配腿：每腿目标 ${intent.equalSize} 股，按下单步长向下取整；` : '逐腿数量：'}${balance.text}${balance.balanced ? '。' : `；${balance.failed}，两侧不平衡，请确认这是有意的数量。`}`,
+    '换算按上市后结算口径假设，不保证各所价格收敛；价差、资金费和逐仓保证金风险需另行评估。',
+  ] : balance ? [`逐腿数量：${balance.text}${balance.balanced ? '。' : `；${balance.failed}，两侧不平衡，请确认这是有意的数量。`}`] : intent.market === 'oil'
     ? [`等桶配腿：每腿 ${intent.equalSize} 桶，已按各所每张合约桶数换算为原生数量。`]
     : [`等金额配腿：每腿目标 ${intent.equalSize} USDT，按预览盘口向下取整到下单步长；各腿预估名义金额为 ${legs.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${leg.estimatedNotional}`).join('、')} USDT，成交价变动后实际金额会偏离。`];
-  const chase = legs.filter(leg => leg.orderType === 'chase'), takers = legs.filter(leg => leg.orderType === 'market');
+  const chase = legs.filter(leg => leg.orderType === 'chase'), takers = legs.filter(leg => leg.orderType === 'market'), wallets = legs.filter(leg => leg.leverage);
   const names = group => group.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol}`).join('、');
   return { ...intent, batchCount: count, legs,
     notes: [
       ...sizing,
-      ...(chase.length ? [`追价限价腿：${names(chase)}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量。`] : []),
+      ...(chase.length ? [`追价限价腿：${names(chase)}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量；Hyperliquid 以只挂单（ALO）挂在同侧最优价，价格变化时按原订单号撤单、确认结束后对剩余数量重新挂单。`] : []),
       ...(chase.some(leg => leg.stopPrice !== null) ? ['追价界限用于触达后停止追价并撤销余单，不是对所有成交价格的硬保证。'] : []),
       ...(chase.some(leg => leg.stopPrice === null) ? [`未设追价界限：${names(chase.filter(leg => leg.stopPrice === null))} 会一直跟随盘口，直到成交、手动停止或达到最长执行时间。`] : []),
-      ...(takers.length ? [`市价腿：${names(takers)}。每批发送一次市价单，按对手盘吃单成交，不设价格界限，成交价可能明显偏离预览盘口；未全部成交（流动性不足或交易所价格保护）时暂停后续批次，不自动补单。`] : []),
+      ...(takers.length ? [`市价腿：${names(takers)}。每批发送一次市价单，按对手盘吃单成交，不设价格界限，成交价可能明显偏离预览盘口；未全部成交（流动性不足或交易所价格保护）时暂停后续批次，不自动补单。${takers.some(leg => leg.exchange === 'hyperliquid') ? 'Hyperliquid 没有原生市价单，按对手价 ±1% 的立即成交否则取消（IOC）委托发送。' : ''}`] : []),
+      ...(wallets.length ? [`Hyperliquid 按账户当前保证金模式与杠杆成交，本系统不修改：${wallets.map(leg => `${leg.symbol} ${leg.leverage.type === 'isolated' ? '逐仓' : '全仓'} ${leg.leverage.value}x`).join('、')}；逐仓仓位单独承担强平风险，请先在 Hyperliquid 确认保证金与杠杆。`] : []),
       '失败时不用市价补齐或回滚。',
       '同一批所有腿完成且委托终结后才进入下一批；任一腿失败会暂停后续批次并撤销余单，已成交仓位不会自动撤回。',
       ...(count > intent.batchCount ? [`按交易所单笔数量上限，批次数已从 ${intent.batchCount} 增加至 ${count}，请核对预览。`] : []),

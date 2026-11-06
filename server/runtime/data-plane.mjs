@@ -411,7 +411,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (autoRule && !autoRule[2] && method === 'PUT') return reply(200, executionAuto.update(autoRule[1], await signedBody()));
       if (autoRule && !autoRule[2] && method === 'DELETE') return reply(200, executionAuto.remove(autoRule[1], await signedBody()));
       if (autoRule && autoRule[2] && method === 'POST') return reply(200, executionAuto.act(autoRule[1], autoRule[2], await signedBody()));
-      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx)$/);
+      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx|hyperliquid)$/);
       const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
       if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));
       if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId)));
