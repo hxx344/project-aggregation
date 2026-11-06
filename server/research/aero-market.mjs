@@ -10,7 +10,7 @@ import { HttpError } from '../http-common.mjs';
 import { AERO_BASE, AERO_CHAINS, chainById } from './aero-market-chains.mjs';
 import { emissionRate, liquiditySegments, priceChange, realizedVol, solvePrices, tvlUsd } from './aero-market-core.mjs';
 import * as chainReads from './aero-market-rpc.mjs';
-import { scrubRpcMessage } from './aero-market-rpc.mjs';
+import { rpcDiagnostic } from './aero-market-rpc.mjs';
 import { openMarketSamples, SAMPLE_WINDOWS } from './aero-market-samples.mjs';
 import { MIN_REPLAY_HOURS, rebalanceCostFraction, replayPool } from './aero-market-replay.mjs';
 
@@ -293,7 +293,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
         // 节点明确拒绝历史状态（非归档节点）时停止回填，6 小时后再试并改用本机样本；
         // 超时、限流等瞬时错误只结束本轮回填，下一轮继续。都不影响本轮当前数据。
         if (error?.kind === 'node') {
-          rt.archive = { ok: false, failedAt: nowSec, error: scrubRpcMessage(error?.message || error, rpcUrl) };
+          rt.archive = { ok: false, failedAt: nowSec, error: rpcDiagnostic(error, rpcUrl) };
           rt.backfillRetryAt = (nowSec + DISCOVERY_SEC) * 1000;
           log.warn?.({ type: 'aero-market', chain: id, err: rt.archive.error }, 'Aero 历史区块读取失败，改用本机累计样本');
           rt.backfillPending = 0;
@@ -381,7 +381,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
           }
           rt.rediscoverStalls = 0;
           rt.rediscoverPhase = 'backoff'; rt.rediscoverFailures += 1;
-          rt.rediscoverError = `重新发现失败：${scrubRpcMessage(error?.message || error, rpcUrl, 200)}`;
+          rt.rediscoverError = `重新发现失败：${rpcDiagnostic(error, rpcUrl, 200)}`;
           rt.rediscoverRetryAt = now() + rediscoveryDelay(rt.rediscoverFailures);
           log.warn?.({ type: 'aero-market', chain: id, err: rt.rediscoverError, failures: rt.rediscoverFailures }, 'Aero 池子重新发现未完成，沿用上次池子列表，退避后再试');
         }
@@ -435,7 +435,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       } catch (error) {
         if (closed || rt.generation !== attempt.generation) return;
         rt.status = 'error'; rt.errorAt = now();
-        rt.error = deadline.aborted ? `本轮扫描超过 ${deadlineMs / 60_000} 分钟未完成，已取消，${rt.registry ? '保留上次数据' : '已读的池子进度保留，下一轮继续'}` : scrubRpcMessage(error?.message || error, attempt.rpcUrl);
+        rt.error = deadline.aborted ? `本轮扫描超过 ${deadlineMs / 60_000} 分钟未完成，已取消，${rt.registry ? '保留上次数据' : '已读的池子进度保留，下一轮继续'}` : rpcDiagnostic(error, attempt.rpcUrl);
         if (rt.backfillPhase === 'catching_up') rt.backfillPhase = 'backoff';
         log.warn?.({ type: 'aero-market', chain: id, err: rt.error }, 'Aero 市场扫描失败，保留上次数据');
         schedule(id, Math.min(RETRY_SEC[Math.min(rt.failures++, RETRY_SEC.length - 1)], config.intervalMin * 60));
@@ -552,7 +552,7 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
             from: read.from, to: read.to, initialized: read.ticks.length, segments: liquiditySegments(read) };
         } catch (reason) {
           if (liquidityCache.get(id) === entry) liquidityCache.delete(id);
-          throw new HttpError(502, `读取流动性分布失败：${scrubRpcMessage(reason?.message || reason, rpcUrl, 200)}`);
+          throw new HttpError(502, `读取流动性分布失败：${rpcDiagnostic(reason, rpcUrl, 200)}`);
         } finally { entry.pending = false; entry.at = now(); }
       })();
       liquidityCache.delete(id); liquidityCache.set(id, entry);
