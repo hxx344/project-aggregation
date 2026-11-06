@@ -779,6 +779,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `monitor-initial-history-payload-20261015`；一次实际慢加载定位，不推进主线复盘检查点。
 **状态补充（2026-11）：** 金油比监控已于 2026-11 移除，首屏不再输出 `cl-xau` 数据；概览与详情分离的契约仍适用于原油、海力士和合约页面。
+**轮询补充（#166，2026-11-06）：** 契约不只管首屏，也管之后的轮询：海力士概览原先用 `useMarketFeed(initial.hynix, active || summaryActive)`，任何页签下都每 60 秒读一次完整 `/api/monitors/hynix/history`。现在完整历史只在详情打开时轮询，概览改读 `/api/monitors/hynix/trend`（与首屏 `hynix.trend` 同一函数、168 点、保留 `status` 与 `fetchedAt`，历史缺失返回 503），并拒收乱序的旧响应；卡片取三份读数中源时间最新的一份，是否过期看当前负责更新卡片的读取。本地种子数据每次读取 196,645 B / gzip 43,781 B → 8,344 B / gzip 2,221 B。验证：`modules/monitor/tests/monitor-summary-refresh.browser.mjs` 断言原油页签 60 秒内 trend 2 次、history 0 次，打开详情才读历史。
 **补充（Issue #141，2026-11-05）：** 海力士首屏改为只内嵌 168 点 `hynix.trend`。拆分后详情 hook 不能再把首屏数据当作已加载的完整历史：首次成功读取前，概览沿用首屏趋势及其真实时间，读取失败标为过期；详情图与表格显示加载中，不能显示“暂无可用行情 / 暂无记录”。[浏览器回归](modules/monitor/tests/hynix-initial-fallback.browser.mjs) 让首次历史请求返回 503 后再成功，去掉回退或未加载状态时会失败。原油 `oil.candles` 仍整份内嵌，属同类余项。
 **补充（Issue #166，2026-11-05）：** 原油首屏改为只内嵌 672 点（7 天 × 96）`oil.trend`，由服务端从已校验的 15 分钟 K 线生成并保留源状态与 `fetchedAt`；详情首次挂载即读取完整 K 线，成功前图表与表格显示加载中。本地仓库种子数据下内嵌 JSON 由 798,942 降到 33,611 字节，客户端挂载解析与初始计算中位数约 80–95ms 降到 0.5ms。[浏览器回归](modules/monitor/tests/oil-initial-fallback.browser.mjs) 同样以首次 503、下一轮成功验证回退与加载状态。海力士概览每 60 秒仍拉完整历史，未改。
 
@@ -1659,6 +1660,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation 基线 `dee1e20`。2026-11-06 用户反馈打开工作台后其他工作台标签页与其他网站都变卡，访问地址为 `http://hub.localhost:3100/`（HTTP/1.1，经端口转发到服务器）。本机用 3000 条报价、每秒一帧补丁的夹具测量隐藏的监控 iframe：主线程任务占比由约 1.1% 降至 0.4%，后台推送帧由 30 秒 30 帧降至 0；前台约 2%。这只证明隐藏模块的开销下降，不能断言"其他网站变卡"主要来自这里，现场浏览器任务管理器数据未取得。
 
 **事件记录：** `hub-background-connections-20261106`；用户反馈；不推进主线复盘检查点。
+
+### L102：服务端与嵌入客户端首轮状态不同时，渲染分支先按服务端值水合，读取门控仍用真实状态
+
+**适用条件：** 服务端渲染、再嵌入工作台 iframe 的模块页面，首轮状态由宿主桥接决定（服务端看不到宿主而假定可读，可信嵌入客户端要等宿主回复），且该状态同时决定渲染分支与数据读取，如 Monitor 的 `useHubBridge` 的 `readActive`、`app/oil-panel.tsx` 与 `app/dashboard.tsx` 的 `hasOpened` 和 `<Activity mode>`。
+
+**根因：** 服务端令 `readActive=true`，嵌入客户端初值为 false，选中面板的 `active` 两边不同；`hasOpened` 初值与 `<Activity mode>` 都依赖它，首轮客户端树与服务端 HTML 不一致，React 报 #418 后整树改为客户端重建。单改 `hasOpened` 不够，`mode` 也参与了不一致。
+
+**以后做法：** 渲染分支在水合这一轮按服务端会用的值（选中与否）输出，水合完成后再跟随真实状态（`useHydrated()`）；数据读取、首次打开标记等门控继续只用真实状态，不能为了消除不一致把客户端初值改成“可读”，否则后台预载的 iframe 会在宿主回复前提前读取。水合这一轮输出的只能是不挂载重组件、不发读取的占位。
+
+**如何验证：** 构建工作台与 Monitor，用 `tests/monitor-embed-hydration.browser.mjs` 经真实工作台桥接首次打开原油与海力士，断言没有 pageerror，并用永不回复的宿主断言 3 秒内 API 读取为 0；改动这条路径时做因果变异：只令客户端桥接初值等于服务端时 #418 消失，回退修复后该回归失败于 #418。
+
+**证据：** 本仓 issue #224，基线 `0c1cbcc` 与 `0169408` 在独立 Windows 工作树经工作台 4175 与 Monitor 夹具 3190 的代理子域 iframe 复现，原油与海力士首次打开各一次 `Minified React error #418`；`tests/monitor-trade-summary.browser.mjs` 原先放行 1 次 #418，现要求 0 错误。
+
+**事件记录：** `monitor-embed-hydration-20261106`；回归浏览器验收发现，正式版首屏可恢复但会整树重建。
 
 ## 已归档
 

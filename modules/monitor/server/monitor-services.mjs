@@ -8,6 +8,7 @@ import { createNotificationService } from "./notification-service.mjs";
 import { openMarketStore } from "./market-store.mjs";
 import { staleMarketError } from "./market-stale.mjs";
 import { createMarketCollector, marketJobs, seedMarketDatabase } from "./market-collector.mjs";
+import { hynixTrend } from "./initial-market.mjs";
 import { comparisonExchanges, exchangeAction, exchangeFromAction, EXCHANGE_REFRESH_MS } from "../lib/exchange-quotes.ts";
 import { OIL_CANDLE_ACTION, OIL_CANDLE_REFRESH_MS } from "../modules/oil/intraday.mjs";
 import { openPerpetualStore } from './perpetual-store.mjs';
@@ -87,11 +88,17 @@ export async function createMonitorServices(directory, { externallyLocked = fals
         start() { hynixRunning = true; hynix.start(); }, stop() { hynixRunning = false; return hynix.stop(); }, healthy: () => hynix.healthy(),
         async handle(action, method, input) {
           if ((["quote", "history", "funding"].includes(action) || exchangeFromAction(action) || fundingExchangeFromAction(action, 'hynix')) && method === "GET") return read("hynix", action);
+          if (action === "trend" && method === "GET") {
+            // The overview card's seven-day window of the same persisted history, without serializing all of it.
+            const trend = hynixTrend(read("hynix", "history"));
+            if (!trend) throw new Error("Hynix history unavailable");
+            return trend;
+          }
           if (action === "alerts" && method === "GET") return hynix.view();
           if (action === "alerts" && method === "PUT") return hynix.update(input);
           if (action === "alerts/test" && method === "POST") return hynix.test();
         },
-        actions: { quote: ["GET"], history: ["GET"], funding: ["GET"], ...exchangeActions('hynix'), ...exchangeFundingActions('hynix'), alerts: ["GET", "PUT"], "alerts/test": ["POST"] },
+        actions: { quote: ["GET"], history: ["GET"], trend: ["GET"], funding: ["GET"], ...exchangeActions('hynix'), ...exchangeFundingActions('hynix'), alerts: ["GET", "PUT"], "alerts/test": ["POST"] },
       }],
       ["oil", {
         start() { oilRunning = true; oil.start(); }, healthy: () => !oil.storageError, async stop() { oilRunning = false; await Promise.all([oil.stop(), variationalSession.stop()]); },

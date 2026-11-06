@@ -129,7 +129,7 @@ async page => {
           config: { requireSpotTransfer: false, blockedBases: [] }, error: '', spotTransferPairs: [], venues: ['binance', 'gate'].map(exchange => ({ exchange, state: 'live', checkedAt: monitorNow(), error: '' })) });
         if (path.endsWith('/perpetual/fx')) return send({ baseCurrency: 'USDT', generatedAt: monitorNow(), staleAfterMs: 180_000, rates: { USDC: { bid: 1, ask: 1, at: monitorNow(), source: 'local fixture' } } });
         if (path === '/api/monitors') return send({ schemaVersion: 1, monitors: [] });
-        if (['/api/monitors/oil/quote', '/api/monitors/hynix/quote', '/api/monitors/hynix/history', '/api/monitors/perpetual/summary'].includes(path)) return send({ error: 'Inactive overview in import fixture' }, 503);
+        if (['/api/monitors/oil/quote', '/api/monitors/hynix/quote', '/api/monitors/hynix/history', '/api/monitors/hynix/trend', '/api/monitors/perpetual/summary'].includes(path)) return send({ error: 'Inactive overview in import fixture' }, 503);
         if (path.endsWith('/perpetual/alerts')) return send({ available: false, revision: 0, config: { enabled: false, rules: [] }, events: [], error: '' });
         if (path === '/api/notifications/feishu') return send({ available: false, revision: 0, webhookConfigured: false, signingSecretConfigured: false, candidates: [], migratedFrom: [], reason: 'Fixture disabled' });
       }

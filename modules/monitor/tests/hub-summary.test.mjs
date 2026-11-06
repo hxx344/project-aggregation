@@ -40,7 +40,7 @@ test('selected module summaries preserve legacy keys, units and source time with
 
 const compressedRoutes = [
   ['perpetual', 'opportunities-v2'], ['perpetual', 'quote'],
-  ['oil', 'history'], ['oil', 'candles/15m'], ['hynix', 'history'], ['hynix', 'funding'],
+  ['oil', 'history'], ['oil', 'candles/15m'], ['hynix', 'history'], ['hynix', 'trend'], ['hynix', 'funding'],
 ];
 for (const [id, action] of compressedRoutes) test(`${id}/${action} compression negotiates gzip and preserves source times and the full JSON envelope`, async t => {
   const payload = { schemaVersion: action === 'quote' ? 1 : 2, generatedAt: now, monitorId: id, staleAfterMs: 30000,

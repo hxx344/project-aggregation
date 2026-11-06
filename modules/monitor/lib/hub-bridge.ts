@@ -240,6 +240,8 @@ export function observeNetworkActivity(update: () => void, source: Pick<Window, 
   return () => { source.removeEventListener('online', update); source.removeEventListener('offline', update); };
 }
 export function useHubBridge(projectId: HubProject) {
+  // The server cannot see the host, so its HTML assumes a readable page while an embedded client starts inactive
+  // to keep reads off until the host replies. Render branches on these flags must hydrate from the server value.
   const [state, setState] = useState(() => ({ connected: false, active: typeof window === 'undefined' || (!trustedHubOrigin(window.location, window.parent !== window) && !document.hidden && navigator.onLine), readActive: typeof window === 'undefined' || (!trustedHubOrigin(window.location, window.parent !== window) && navigator.onLine) }));
   useEffect(() => {
     const origin = trustedHubOrigin(window.location, window.parent !== window);

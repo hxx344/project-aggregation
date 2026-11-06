@@ -5,7 +5,11 @@
 async page => {
   const origin = 'http://127.0.0.1:3189';
   const counts = new Map();
-  let now = Date.UTC(2026, 8, 24), failQuote = false, snapshot = false;
+  let now = Date.UTC(2026, 8, 24), failQuote = false, snapshot = false, failTrend = false, failHistory = false;
+  let holdTrend = null, holdHistory = null;
+  const gate = () => { let open; const promise = new Promise(resolve => { open = resolve; }); return { promise, open }; };
+  // Completed hourly bars ending just before the controlled clock, so a successful read is never time-expired.
+  const recentHours = () => [2, 1, 0].map(back => Math.floor(now / 3_600_000) * 3_600_000 - (back + 1) * 3_600_000);
   const count = action => counts.get(`/api/monitors/hynix/${action}`) ?? 0;
   const check = (condition, message) => { if (!condition) throw new Error(message); };
   await page.goto('about:blank');
@@ -23,8 +27,15 @@ async page => {
           funding: { fetchedAt, annualizedRate: count('quote') / 100 } } });
       }
       if (path === '/api/monitors/hynix/history') {
+        if (holdHistory) await holdHistory.promise;
+        if (failHistory) return route.fulfill({ status: 503, json: { error: 'Controlled history failure' } });
         return route.fulfill({ json: { status: 'live', fetchedAt, interval: '1h', firstAvailable: '2026-09-23T00:00:00.000Z', warnings: [],
-          points: [0, 1, 2].map(index => ({ time: Date.UTC(2026, 8, 23, index), ordinary: 1000, adr: 120 + index, equivalent: 100, spread: 20 + index, premium: 20 + index })) } });
+          points: recentHours().map((time, index) => ({ time, ordinary: 1000, adr: 120 + index, equivalent: 100, spread: 20 + index, premium: 20 + index })) } });
+      }
+      if (path === '/api/monitors/hynix/trend') {
+        if (holdTrend) await holdTrend.promise;
+        if (failTrend) return route.fulfill({ status: 503, json: { error: 'Controlled trend failure' } });
+        return route.fulfill({ json: { status: 'live', fetchedAt, points: recentHours().map((time, index) => ({ time, value: 20 + index })) } });
       }
       // Unrelated panels are deliberately unavailable; they must not block Hynix.
       return route.fulfill({ status: 503, json: { error: 'Controlled unavailable response' } });
@@ -41,22 +52,27 @@ async page => {
     await waitReading('+21.00%');
     check(count('quote') === 1, 'Oil startup must request Hynix once without opening its detail');
     for (let cycle = 0; cycle < 6; cycle++) { await tick(); await waitReading(`+${22 + cycle}.00%`); }
-    check(count('quote') === 7 && count('history') === 2, 'One quote per 10s and one history read per 60s');
+    check(count('quote') === 7 && count('trend') === 2, 'One quote per 10s and one overview trend read per 60s');
+    check(count('history') === 0, 'The overview card must not read the full history while its detail is closed');
     check(count('funding') === 0, 'Hidden Hynix detail must not request funding history');
     check((await card.innerText()).includes('实时'), 'The visible card must remain live beyond the stale threshold');
     check(await stamp() === new Date(now).toISOString(), 'Show the actual latest quote time');
 
     const fundingOpened = page.waitForRequest('**/api/monitors/hynix/funding', { timeout: 10_000 });
+    const historyOpened = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
     await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
     // Let React's lazy chart boundary commit before switching back.
     now += 1000; await page.clock.runFor(1000);
-    await fundingOpened;
+    await fundingOpened; await historyOpened;
     await page.getByRole('tabpanel', { name: '海力士 ADR', exact: true }).waitFor();
+    const trendReads = count('trend'), trendResumed = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
     await page.getByRole('tab', { name: '原油价差', exact: true }).click();
+    await trendResumed;
     check(count('quote') === 7, 'Switching details must not restart or duplicate the shared quote feed');
-    const fundingReads = count('funding');
+    const fundingReads = count('funding'), historyReads = count('history');
     await tick(); await waitReading('+28.00%');
     check(count('quote') === 8 && count('funding') === fundingReads, 'Returning to oil must retain one Hynix quote poller');
+    check(count('history') === historyReads && count('trend') === trendReads + 1, 'Closing the detail returns the card to the overview trend');
 
     const retainedReading = await reading(), retainedTime = await stamp();
     failQuote = true;
@@ -90,8 +106,88 @@ async page => {
     await page.setViewportSize({ width: 390, height: 844 });
     await tick(); await waitReading('+36.00%');
     check(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), 'Mobile overview must fit its viewport');
+
+    // #166: with the detail closed the trend reader alone decides whether the card's history is retained.
+    const sparkStatus = () => page.evaluate(() => [...document.querySelectorAll('.hub-summary-card')].find(node => node.textContent.includes('海力士 ADR'))?.querySelector('.spark-history-status')?.textContent ?? '');
+    const waitSpark = expected => page.waitForFunction(expected => {
+      const card = [...document.querySelectorAll('.hub-summary-card')].find(node => node.textContent.includes('海力士 ADR'));
+      return (card?.querySelector('.spark-history-status')?.textContent ?? '') === expected;
+    }, expected, { timeout: 10_000 });
+    const tickUntilRead = async action => {
+      const before = count(action);
+      for (let step = 0; step < 7 && count(action) === before; step++) await tick();
+      check(count(action) > before, `Expected another ${action} read within one refresh interval`);
+    };
+    const sparkline = card.locator('svg[role="img"]');
+    await tickUntilRead('trend'); await waitSpark('');
+    const liveTrend = await sparkline.getAttribute('aria-label');
+    failTrend = true;
+    await tickUntilRead('trend'); await waitSpark(' · 保留历史');
+    const retainedTrend = await sparkline.getAttribute('aria-label');
+    check(retainedTrend.includes('保留历史') && retainedTrend.replace(' · 保留历史', '') === liveTrend, 'A failed trend read must keep the last trend and its close time, labelled retained');
+    failTrend = false;
+    await tickUntilRead('trend'); await waitSpark('');
+
+    // Pausing and resuming the same reader keeps its failure until it answers successfully.
+    failTrend = true;
+    await tickUntilRead('trend'); await waitSpark(' · 保留历史');
+    await page.context().setOffline(true);
+    await tick();
+    failTrend = false; holdTrend = gate();
+    const trendRetried = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
+    await page.context().setOffline(false);
+    await trendRetried;
+    check(await sparkStatus() === ' · 保留历史', 'Reconnecting must keep the trend failure until a new trend arrives');
+    holdTrend.open(); holdTrend = null;
+    await waitSpark('');
+
+    // Same for the detail's history: while paused, and after reconnecting until a successful history clears it.
+    await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
+    now += 1000; await page.clock.runFor(1000);
+    await waitSpark('');
+    failHistory = true;
+    await tickUntilRead('history'); await waitSpark(' · 保留历史');
+    await page.context().setOffline(true);
+    await tick();
+    check(await sparkStatus() === ' · 保留历史', 'Pausing must keep the history failure while the trend reader has none');
+    failHistory = false; holdHistory = gate();
+    const historyRetried = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
+    await page.context().setOffline(false);
+    await historyRetried;
+    check(await sparkStatus() === ' · 保留历史', 'Reconnecting must keep the history failure until a new history arrives');
+    holdHistory.open(); holdHistory = null;
+    await waitSpark('');
+    const trendBack = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
+    await page.getByRole('tab', { name: '原油价差', exact: true }).click();
+    await trendBack; await waitSpark('');
+
+    // A reader's failure must not label the card once another reader serves it and before that reader answers.
+    failTrend = true;
+    await tickUntilRead('trend'); await waitSpark(' · 保留历史');
+    await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
+    now += 1000; await page.clock.runFor(1000);
+    await waitSpark('');
+    failHistory = true;
+    await tickUntilRead('history'); await waitSpark(' · 保留历史');
+    holdTrend = gate();
+    const trendPending = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
+    await page.getByRole('tab', { name: '原油价差', exact: true }).click();
+    await trendPending;
+    check(await sparkStatus() === '', 'Closing the detail must not carry the earlier trend failure onto the card');
+    failTrend = false; holdTrend.open(); holdTrend = null;
+    await waitSpark('');
+    failHistory = false; holdHistory = gate();
+    const historyPending = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
+    await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
+    await historyPending;
+    check(await sparkStatus() === '', 'Opening the detail must not carry its earlier history failure onto the card');
+    holdHistory.open(); holdHistory = null;
+    now += 1000; await page.clock.runFor(1000);
+    await waitSpark('');
+    await page.getByRole('tab', { name: '原油价差', exact: true }).click();
     return { passed: true, requests: Object.fromEntries(counts), lastQuoteTime: await stamp(), value: await reading() };
   } finally {
+    holdTrend?.open(); holdHistory?.open();
     await page.context().setOffline(false);
     // CLI captures page state after execution, which also needs animation frames.
     await page.clock.resume();

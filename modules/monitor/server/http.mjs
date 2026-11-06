@@ -92,7 +92,7 @@ export function createHandler({ service, services, username, password, pageHandl
             if (!/^application\/json(?:;|$)/i.test(request.headers["content-type"] || "")) return json(response, 415, { error: "请使用 JSON 请求" });
           }
           const historicalRead = !writing && ['oil', 'hynix'].includes(id)
-            && (/(?:^|\/)(?:history|funding)$/.test(action) || action.startsWith('candles/'));
+            && (/(?:^|\/)(?:history|funding|trend)$/.test(action) || action.startsWith('candles/'));
           try {
             let input;
             if (writing) input = await body(request);
