@@ -40,6 +40,7 @@ function AddPool({ pool, safe }: { pool: MarketPool; safe: ReturnType<typeof use
     const newTokens = [queued.token0, queued.token1].filter((t) => !known.some((a) => same(a.token, t.address)));
     return <>
       <p className="as-muted">这个池子已在待加池里（{new Date(queued.addedAt).toLocaleString('zh-CN')} 加入）{others ? `，另有 ${others} 个待加池` : ''}。在「配置」→ 白名单变更里生成 Safe 批次，由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后核对启用。</p>
+      {queued.gaugeStatus?.state !== 'alive' ? <div className="lp-callout warning" role="status">gauge 状态未知：{queued.gaugeStatus?.note ?? '加入时未核对 gauge 是否已被停用'}。零排放不一定是停用，请自行确认该池 gauge 仍在发放排放后再执行批次。</div> : null}
       {newTokens.length ? <p className="as-muted">新代币每日额度：{newTokens.map((t) => { const a = pendingOf(t.address); return `${t.symbol} ${a ? exactUnits(a.perDay, a.decimals) : '—'}`; }).join('；')}（可在白名单变更里修改）</p> : null}
       <div className="as-form">
         <button type="button" className="button primary" onClick={() => openAeroTab('config')}><ShieldCheck size={15} />前往「配置」生成批次</button>
@@ -48,7 +49,7 @@ function AddPool({ pool, safe }: { pool: MarketPool; safe: ReturnType<typeof use
     </>;
   }
   return <>
-    <p className="as-muted">这个池子不在 Roles 白名单里，bot 还不能在此开仓。加入待加池后，可与其他待加池、额度调整合成一份 Safe 批次：增加该池的 gauge、开仓与质押权限、新代币的授权与每日额度，以及该池两个方向的配平兑换；由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后启用。</p>
+    <p className="as-muted">这个池子不在 Roles 白名单里，bot 还不能在此开仓。加入待加池后，可与其他待加池、额度调整合成一份 Safe 批次：增加该池的 gauge、开仓与质押权限、新代币的授权与每日额度，以及该池两个方向的配平兑换；由硬件钱包在 Safe{'{'}Wallet{'}'} 执行后启用。加入时会向 Voter 核对 gauge 是否已被停用：已停用的拒绝，读不到停用状态时标为「gauge 状态未知」。</p>
     {others ? <p className="as-muted">已有 {others} 个待加池，会合进同一份批次。</p> : null}
     <div className="as-form">
       {fresh.map((t) => <label key={t.address}>{t.symbol} 每日额度

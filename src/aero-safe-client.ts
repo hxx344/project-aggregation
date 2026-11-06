@@ -93,7 +93,7 @@ export function useAeroSafe(onExpired: () => void) {
     if (busyRef.current || !signal || signal.aborted) return null;
     busyRef.current = 'batch'; setBusy('batch'); setActionError('');
     generation.current++;
-    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: 30_000 }); if (!signal.aborted) setState(data.state); return data; }
+    try { const data = await api<AeroSafeChangeBatch>(`${AERO_SAFE_ROOT}/changes/batch`, { method: 'POST', body: '{}', signal, timeoutMs: 120_000 }); if (!signal.aborted) setState(data.state); return data; }
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);

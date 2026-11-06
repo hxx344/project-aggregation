@@ -2,6 +2,7 @@
 import { AbiCoder, Interface, ZeroAddress, concat, getAddress, getCreate2Address, keccak256, solidityPacked, toBeHex, zeroPadValue } from 'ethers';
 import { BASE_CHAIN_ID, MULTISEND_SELECTOR, ROLES, SAFE } from './addresses.mjs';
 import { flatten } from './conditions.mjs';
+import { accrue } from './policy.mjs';
 
 const coder = AbiCoder.defaultAbiCoder();
 export const ROLES_ABI = new Interface([
@@ -86,8 +87,8 @@ const functionCall = (roleKey, target, f) => (f.condition
 
 // 已部署 Roles 的增量批次（加池、调额度）：current / next 均为 buildPermissions 的结果，权限只允许增加。
 // 新目标 scopeTarget 加全部函数；已有目标上条件变化或新增的函数重下 scopeFunction / allowFunction（整体替换该函数的条件）；
-// 新代币与每日数量变化的代币 setAllowance。数量未变的额度不重下：setAllowance 会把当前余额重置为满额。
-export function buildUpdateBatch({ current, next, roles }) {
+// 新代币与每日数量变化的代币 setAllowance（见 allowancePlan）。数量未变的额度不重下。
+function permissionCalls({ current, next, roles }) {
   roles = getAddress(roles);
   if (current.roleKeyBytes !== next.roleKeyBytes) throw new Error('roleKey must not change');
   const roleKey = next.roleKeyBytes;
@@ -108,12 +109,68 @@ export function buildUpdateBatch({ current, next, roles }) {
       add(data, `${old?.has(f.selector) ? '更新条件' : f.condition ? '按条件允许' : '允许'} ${target.label}.${f.label}`);
     }
   }
+  return txs;
+}
+
+// 需要 setAllowance 的额度：新代币与每日数量变化的代币。previous 为配置里的旧每日数量（新代币为 null）。
+export function allowanceChanges({ current, next }) {
+  for (const a of current.allowances) if (!next.allowances.some((x) => x.key === a.key)) throw new Error(`update would drop the allowance for ${a.symbol}`);
+  const out = [];
   for (const a of next.allowances) {
     const old = current.allowances.find((x) => x.key === a.key);
-    if (old && old.perDay !== a.perDay) add(ROLES_ABI.encodeFunctionData('setAllowance', [a.key, a.perDay, a.perDay, a.perDay, next.allowancePeriod, 0]), `调整额度 ${a.symbol}：每 24 小时 ${old.perDay} → ${a.perDay}（最小单位），执行后当天可用额度按新值计满`);
-    if (!old) add(ROLES_ABI.encodeFunctionData('setAllowance', [a.key, a.perDay, a.perDay, a.perDay, next.allowancePeriod, 0]), `额度 ${a.symbol}：每 24 小时 ${a.perDay}（最小单位）`);
+    if (!old || old.perDay !== a.perDay) out.push({ allowance: a, previous: old ? old.perDay : null });
   }
-  for (const a of current.allowances) if (!next.allowances.some((x) => x.key === a.key)) throw new Error(`update would drop the allowance for ${a.symbol}`);
+  return out;
+}
+
+// 批次笔数（不读链）：供待变更预览显示。
+export function updateBatchSize({ current, next, roles }) {
+  return permissionCalls({ current, next, roles }).length + allowanceChanges({ current, next }).length;
+}
+
+const isUnset = (r) => r.refill === 0n && r.maxRefill === 0n && r.period === 0n && r.balance === 0n && r.timestamp === 0n;
+
+// 一个额度的 setAllowance 参数与执行效果。onchain 为生成批次时 Roles.allowances(key) 的读数，now 为读数所在区块时间（秒），均为 bigint。
+// - 链上尚未设置：首次设置，balance = refill = maxRefill = perDay、timestamp 0（补充时刻对齐 UTC 0 点），本期可用 perDay。
+// - 链上已有：按 Roles 规则折算到 now，本期已用 = 本期上限（refill 与 maxRefill 取大，偏保守）− 折算余额；
+//   新 balance = max(0, perDay − 已用)，timestamp 保持本期起点，执行后本期累计不超过新额度、不在本期重新计满，下一个补充时刻起按 perDay 补满。
+//   批次在之后的周期才执行时，Roles 从这个起点补一次即到 perDay，与正常换期相同。
+// 链上 Roles 不提供"读数未变才执行"的前置条件：生成后到执行前 bot 又有消耗、或同一批次被重复签名执行，每执行一次本期最多可再花 balance，
+// 在之后的周期执行则当期重新计满为 perDay；replay 字段列出这两个上限，供界面单列。
+export function allowancePlan({ perDay, period, onchain, now }) {
+  perDay = BigInt(perDay); period = BigInt(period);
+  if (!onchain || typeof now !== 'bigint') throw new Error('allowance state required');
+  if (isUnset(onchain)) return { first: true, balance: perDay, timestamp: 0n, used: 0n, nextRefill: null, replay: { samePeriod: perDay, laterPeriod: perDay } };
+  const { balance: accrued, timestamp: start } = accrue(onchain, now);
+  const cap = onchain.refill > onchain.maxRefill ? onchain.refill : onchain.maxRefill;
+  const used = cap > accrued ? cap - accrued : 0n;
+  const balance = perDay > used ? perDay - used : 0n;
+  const timestamp = onchain.period > 0n ? start : now;
+  return { first: false, balance, timestamp, used, nextRefill: timestamp + period, replay: { samePeriod: balance, laterPeriod: perDay } };
+}
+
+const utc = (seconds) => new Date(Number(seconds) * 1000).toISOString().replace('T', ' ').slice(0, 16) + ' UTC';
+
+// allowanceState：{ now: 区块时间（bigint 秒）, allowances: Map<key, Roles.allowances 读数> }，有额度要设时必填；缺任何一个读数即拒绝生成，
+// 不按满额猜。额度那几笔另带 allowance（执行效果），供界面单列；toTransactionBuilderJson 只取 to / value / data。
+export function buildUpdateBatch({ current, next, roles, allowanceState }) {
+  const txs = permissionCalls({ current, next, roles });
+  const changes = allowanceChanges({ current, next });
+  if (changes.length && (!allowanceState || typeof allowanceState.now !== 'bigint')) throw new Error('allowance state required: read Roles.allowances before building the batch');
+  const to = getAddress(roles);
+  for (const { allowance: a, previous } of changes) {
+    const onchain = allowanceState.allowances.get(a.key);
+    if (!onchain) throw new Error(`allowance state for ${a.symbol} is missing`);
+    const plan = allowancePlan({ perDay: a.perDay, period: next.allowancePeriod, onchain, now: allowanceState.now });
+    const head = previous === null ? `额度 ${a.symbol}：每 24 小时 ${a.perDay}（最小单位）` : `调整额度 ${a.symbol}：每 24 小时 ${previous} → ${a.perDay}（最小单位）`;
+    const effect = plan.first ? `链上尚无此额度，执行后本期可用 ${a.perDay}`
+      : `按生成时链上读数本期已用 ${plan.used}，执行后本期剩余 ${plan.balance}（不在本期重新计满），${utc(plan.nextRefill)} 起按 ${a.perDay} 补满`;
+    txs.push({ to, value: '0', data: ROLES_ABI.encodeFunctionData('setAllowance', [a.key, plan.balance, BigInt(a.perDay), BigInt(a.perDay), next.allowancePeriod, plan.timestamp]),
+      description: `${head}；${effect}`,
+      allowance: { key: a.key, token: a.token, symbol: a.symbol, previous: previous === null ? null : String(previous), perDay: String(a.perDay), first: plan.first, used: String(plan.used), balance: String(plan.balance),
+        nextRefill: plan.nextRefill === null ? null : Number(plan.nextRefill), readAt: Number(allowanceState.now),
+        replay: { samePeriod: String(plan.replay.samePeriod), laterPeriod: String(plan.replay.laterPeriod) } } });
+  }
   return txs;
 }
 

@@ -2,7 +2,8 @@
 // playwright-cli -s=aero-add-pool run-code --filename tests/aero-add-pool.browser.mjs
 // Every API is an isolated fixture; nothing reaches an RPC, the Safe or Roles.
 // Covers: queueing a pool from its detail page (and removing it again), the 已加池/待加池 tags in the market list,
-// adjusting an existing daily allowance in 配置 → 白名单变更, one Safe batch for all pending changes, a failed and a passing apply,
+// adjusting an existing daily allowance in 配置 → 白名单变更, one Safe batch for all pending changes with its per-token allowance effects,
+// the unknown gauge liveness warning, a failed and a passing apply,
 // and the optional USD cap of the open form.
 async (page) => {
   const origin = 'http://127.0.0.1:4180', market = '/api/research/aero-market', root = '/api/automation/aero-safe';
@@ -28,7 +29,8 @@ async (page) => {
   // Fixture server model.
   let queued = [], allowances = [], batch = null, merged = false, failApply = true, usdcPerDay = '1000000000';
   const requests = [], errors = [], previews = [];
-  const queuedPool = () => ({ address: POOL, name: 'WETH/cbBTC ts1', gauge: GAUGE, tickSpacing: 1, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: CBBTC, symbol: 'cbBTC', decimals: 8 }, addedAt: Date.now() });
+  const queuedPool = () => ({ address: POOL, name: 'WETH/cbBTC ts1', gauge: GAUGE, tickSpacing: 1, token0: { address: WETH, symbol: 'WETH', decimals: 18 }, token1: { address: CBBTC, symbol: 'cbBTC', decimals: 8 }, addedAt: Date.now(),
+    gaugeStatus: { state: 'unknown', note: 'Voter 不提供 isAlive（调用回滚），无法确认 gauge 是否已被停用' } });
   const permissions = () => ({ roleKey: 'aero-lp-bot', swaps: [],
     allowances: [{ token: WETH, symbol: 'WETH', perDay: '1000000000000000000' }, { token: USDC, symbol: 'USDC', perDay: usdcPerDay }, ...(merged ? [{ token: CBBTC, symbol: 'cbBTC', perDay: '1000000' }] : [])],
     pools: [{ name: 'WETH/USDC ts100', token0: WETH, token1: USDC, tickSpacing: 100, gauge: listedPool.gauge }, ...(merged ? [{ name: 'WETH/cbBTC ts1', token0: WETH, token1: CBBTC, tickSpacing: 1, gauge: GAUGE }] : [])] });
@@ -85,9 +87,12 @@ async (page) => {
     if (url.pathname === `${root}/changes/batch` && method === 'POST') {
       batch = { createdAt: Date.now(), transactions: 4, pools: ['WETH/cbBTC ts1'], allowances: allowances.map(({ symbol, perDay, decimals }) => ({ symbol, perDay, decimals })), stale: false, staleReason: null, behind: false,
         added: { pools: [], allowances: [] }, withdrawn: { pools: [], allowances: [] } };
+      const effect = (symbol, decimals, previous, perDay, used, balance, first) => ({ key: `0x${symbol}`, token: symbol, symbol, decimals, previous, perDay, first, used, balance,
+        nextRefill: first ? null : 1_800_057_600, readAt: 1_800_000_000, replay: { samePeriod: balance, laterPeriod: perDay } });
       return send({ builder: { version: '1.0', chainId: '8453', transactions: [] }, usage: [{ label: 'Router.exactInputSingle', nodes: 29 }],
+        allowances: [effect('cbBTC', 8, null, '1000000', '0', '1000000', true), effect('USDC', 6, '1000000000', '500000000', '600000000', '0', false)],
         transactions: [{ to: '0xfed', description: '限定目标 gauge WETH/cbBTC ts1' }, { to: '0xfed', description: '按条件允许 NPM.mint' }, { to: '0xfed', description: '额度 cbBTC：每 24 小时 1000000（最小单位）' },
-          { to: '0xfed', description: '调整额度 USDC：每 24 小时 1000000000 → 500000000（最小单位），执行后当天可用额度按新值计满' }], state: state() });
+          { to: '0xfed', description: '调整额度 USDC：每 24 小时 1000000000 → 500000000（最小单位）；按生成时链上读数本期已用 600000000，执行后本期剩余 0（不在本期重新计满）' }], state: state() });
     }
     if (url.pathname === `${root}/changes/apply` && method === 'POST') {
       if (failApply) return send({ error: '批次尚未在链上生效（2/14 项未通过）：gauge deposit、额度 cbBTC' }, 409);
@@ -120,6 +125,7 @@ async (page) => {
     await add.click();
     await page.getByText('这个池子已在待加池里', { exact: false }).waitFor();
     await page.getByText('新代币每日额度：cbBTC 0.01', { exact: false }).waitFor();
+    await page.getByText('gauge 状态未知：Voter 不提供 isAlive', { exact: false }).waitFor();
     await page.getByRole('button', { name: '移出待加池' }).click();
     await add.waitFor();
     await page.getByLabel('cbBTC 每日额度').fill('0.01');
@@ -151,6 +157,11 @@ async (page) => {
     await page.getByText('批次共 4 笔，条件树最多用到 29/255 个节点', { exact: false }).waitFor();
     await page.getByText('批次明细').click();
     await page.getByText('调整额度 USDC：每 24 小时 1000000000 → 500000000', { exact: false }).waitFor();
+    // 额度的执行效果单列：本期已用 600 时调到 500，本期不再可用；重复执行的上限逐个代币列出。
+    await page.getByText('USDC：每日 1000 USDC → 500 USDC；本期已用 600 USDC，执行后本期剩余 0 USDC', { exact: false }).waitFor();
+    await page.getByText('cbBTC：链上尚无此额度，首次设置为每日 0.01 cbBTC', { exact: false }).waitFor();
+    await page.getByText('USDC 每多执行一次本期最多再花 0 USDC，到之后的周期再执行则当期重新计满 500 USDC', { exact: false }).waitFor();
+    assert(await page.locator('.as-list .as-warn', { hasText: 'gauge 状态未知' }).count() === 1, 'the pending pool list flags the unknown gauge');
     const download = page.waitForEvent('download');
     await page.getByRole('button', { name: '下载批次 JSON' }).click();
     const file = await download;

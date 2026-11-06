@@ -239,18 +239,19 @@ Aero → 配置 → 自动调仓，默认关闭；判定在 `server/automation/a
     - 池子由 CL 工厂按 (token0, token1, tickSpacing) 登记；
     - 有 gauge，没有 gauge 的池子拒绝；
     - gauge 是已审实现的 EIP-1167 克隆，与池子互相指向，NFT 与 voter 是固定地址。
+    - 向 Voter 读 `isAlive(gauge)`（单次，不重试）：`false` 拒绝；`true` 记为正常；调用回滚（PR #190 记录固定 Voter 0x3824… 不提供该方法）、返回值无法解析或读取失败都记为「gauge 状态未知」，待加池与配置页照此展示，不当作正常，也不拿零排放推断停用。`cli.mjs plan` 同样读取并在摘要行标出未知。
     - 代币和 gauge 不能是 Safe、Roles、固定的协议合约，也不能与已有目标重合（同一地址出现两次时，后下发的 `scopeFunction` 会覆盖前一个）；`buildPermissions` 对所有配置都做这项检查。
   - 配置和其他待加池里都没有额度的新代币必须填每日额度，页面按约 1000 美元预填；也可顺带填这两个代币的已有额度。已在白名单、已在待加池、或同代币对同 tickSpacing 已在待加池的拒绝；合成后条件树超限返回 409「白名单已满」，不加入。
 - 调额度（`POST /changes/allowances`，`{ allowances: { 代币地址: 每日数量 | null } }`）：已有代币改回配置值或传 null 即撤回；待加池新代币的额度只能改，不需要时移出对应池子。
 - 移出待加池（`POST /changes/remove`，`{ pool }`）：只有它用到的新代币额度一并移除。全部放弃：`POST /changes/clear`。
 - 合成规则（`applyChanges`）：依次加池子，该代币对两个方向没有兑换路径时按本池 tickSpacing 补上（已有路径沿用）；再按待改额度替换已有值或追加新代币。配置变化后（保存、启用）自动去掉已生效的项：已进白名单的池子、与配置相同的额度、待加池移出后孤立的新代币额度。
-- 生成批次（`POST /changes/batch`）：`buildUpdateBatch` 比较配置与合成后的权限，只生成差异：
+- 生成批次（`POST /changes/batch`）：`buildUpdateBatch` 比较配置与合成后的权限，只生成差异。有额度要设时先在串行队列外读同一区块的 `Roles.allowances(key)` 与区块时间（`executor.readAllowances`：每步 20 秒超时、最多 2 次，总时限 90 秒），任一读不到即拒绝生成，不按满额猜：
   - 新目标：`scopeTarget` 加全部函数；
   - 已有目标上条件变化的函数：重下 `scopeFunction`（整体替换）；
-  - 新额度与改动的额度：`setAllowance(key, perDay, perDay, perDay, 86400, 0)`，执行后当天可用额度按新值计满（调低也一样）；未改动的额度不重下。
+  - 新额度与改动的额度（`allowancePlan`）：链上尚无该额度时 `setAllowance(key, perDay, perDay, perDay, 86400, 0)`；链上已有时按 Roles 规则折算到读数时刻，本期已用 = 本期上限 − 余额，`setAllowance(key, max(0, perDay − 已用), perDay, perDay, 86400, 本期起点)`，执行后本期累计不超过新额度，下一个补充时刻起按新额度补满；批次在之后的周期才执行时，Roles 从本期起点补一次即满。未改动的额度不重下。
   - 减少权限（删池、删路径、删额度）一律拒绝。
   - 批次冻结存入 `changes.json`，返回 Transaction Builder JSON；不改配置、不签名。已有未启用批次时再生成会提示：旧批次如已执行应先核对启用，否则新批次会重复其中的额度设置。页面把冻结内容与最新草稿分开显示：生成后新增的变更不进这份批次，启用后继续保留，可再生成下一份；生成后从草稿撤回或改了值的池子与额度单独警示，已生成的批次文件仍包含它们，在 Safe 执行仍会生效，不想执行须重新生成并只执行新文件。
-- 执行：页面下载 JSON，在 Safe{Wallet} → Transaction Builder 导入，核对后用硬件钱包签名执行。同一批次只执行一次：重复执行会把相关代币当天的额度重置为满额。
+- 执行：页面下载 JSON，在 Safe{Wallet} → Transaction Builder 导入，核对后用硬件钱包签名执行。同一批次只执行一次：Roles 没有「读数未变才执行」的前置条件，重复执行或生成后到执行前 bot 又有消耗时，本期累计会超过新额度。页面与批次说明逐个代币单列：同一周期内每多执行一次最多再花「执行后本期剩余」，到之后的周期再执行则当期重新计满为新每日额度。
 - 启用（`POST /changes/apply`）：只核对冻结的批次，全部通过才并入配置。以 bot 身份 `eth_call` `Roles.execTransactionWithRole(…, shouldRevert = true)`，金额一律为 0，不动资产。逐项核对：
   - 新池 `mint`、`NPM.approve → 新 gauge`；
   - 新 gauge 的 5 个函数；

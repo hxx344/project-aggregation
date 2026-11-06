@@ -51,7 +51,9 @@ export type AeroSafeState = {
   changes?: AeroSafeChanges;
 };
 type ChangeToken = { address: string; symbol: string; decimals: number };
-export type AeroSafeChangePool = { address: string; name: string; gauge: string; tickSpacing: number; token0: ChangeToken; token1: ChangeToken; addedAt: number };
+// gaugeStatus：加池时 Voter.isAlive 的读数；unknown 表示无法确认 gauge 是否已被停用（Voter 不提供该方法或读取失败），已停用的池子加不进来。
+export type AeroSafeChangePool = { address: string; name: string; gauge: string; tickSpacing: number; token0: ChangeToken; token1: ChangeToken; addedAt: number;
+  gaugeStatus?: { state: 'alive' | 'unknown'; note: string } };
 // 白名单待变更：待加池与额度调整（perDay / current 为最小单位；current 为配置里的现值，新代币为 null）。
 export type AeroSafeChanges = {
   pools: AeroSafeChangePool[];
@@ -66,8 +68,13 @@ export type AeroSafeChanges = {
 };
 export type AeroSafeBatchAllowance = { symbol: string; perDay: string; decimals: number };
 export type AeroSafeBatchItems = { pools: string[]; allowances: AeroSafeBatchAllowance[] };
+// 批次里一个额度的执行效果（最小单位字符串）：按生成时链上读数（readAt，区块时间秒）的本期已用 used 折算，执行后本期剩余 balance，
+// nextRefill（秒）起按 perDay 补满；first 为链上尚无此额度的首次设置。replay：同一批次重复执行或执行前 bot 再消耗时，
+// 同一周期内每执行一次最多再花 samePeriod，到之后的周期再执行则当期计满 laterPeriod。decimals 读不到时为 null。
+export type AeroSafeAllowanceEffect = { key: string; token: string; symbol: string; decimals: number | null; previous: string | null; perDay: string; first: boolean;
+  used: string; balance: string; nextRefill: number | null; readAt: number; replay: { samePeriod: string; laterPeriod: string } };
 // POST /changes/batch：builder 为 Safe{Wallet} Transaction Builder 可导入的批次 JSON。
-export type AeroSafeChangeBatch = { transactions: { to: string; description: string }[]; builder: unknown; usage: { label: string; nodes: number }[]; state: AeroSafeState };
+export type AeroSafeChangeBatch = { transactions: { to: string; description: string }[]; allowances: AeroSafeAllowanceEffect[]; builder: unknown; usage: { label: string; nodes: number }[]; state: AeroSafeState };
 export type AeroSafePreview = {
   pool: string; tick: number; sqrtPriceX96: string; tickLower: number; tickUpper: number; amount0: string; amount1: string; capped?: boolean;
   swap: { tokenIn: string; tokenOut: string; amountIn: string; quoted: string | null } | null; deposit0: string; deposit1: string; previewedAt: number;

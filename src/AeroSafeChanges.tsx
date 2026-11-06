@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Download, ListChecks, LoaderCircle, Save, ShieldCheck, Trash2, X } from 'lucide-react';
 import type { AeroSafe } from './aero-safe-client';
 import { exactUnits, rawUnits, same, units } from './aero-safe-client';
-import type { AeroSafeBatchItems, AeroSafeChangeBatch } from './aero-safe-types';
+import type { AeroSafeAllowanceEffect, AeroSafeBatchItems, AeroSafeChangeBatch } from './aero-safe-types';
 
 type Row = { token: string; symbol: string; decimals: number | null; current: string | null; pending: string | null; remaining: string | null };
 // 每行输入：value 为输入框内容，base 为上次与服务端同步时的显示值（value 与之不同即未提交的改动），decimals 为同步时的精度；
@@ -10,6 +10,9 @@ type Row = { token: string; symbol: string; decimals: number | null; current: st
 type Draft = { value: string; base: string; decimals: number | null; recheck: boolean };
 const itemsText = (items: AeroSafeBatchItems) => [items.pools.length ? `加池 ${items.pools.join('、')}` : '', items.allowances.length ? `额度 ${items.allowances.map((a) => `${a.symbol} ${exactUnits(a.perDay, a.decimals)}`).join('、')}` : ''].filter(Boolean).join('；');
 const hasItems = (items: AeroSafeBatchItems | undefined) => Boolean(items && (items.pools.length || items.allowances.length));
+const effectAmount = (a: AeroSafeAllowanceEffect, raw: string) => (a.decimals === null ? `${raw}（最小单位）` : `${exactUnits(raw, a.decimals)} ${a.symbol}`);
+const effectText = (a: AeroSafeAllowanceEffect) => (a.first ? `${a.symbol}：链上尚无此额度，首次设置为每日 ${effectAmount(a, a.perDay)}，执行后本期可用 ${effectAmount(a, a.perDay)}`
+  : `${a.symbol}：每日 ${a.previous === null ? '' : `${effectAmount(a, a.previous)} → `}${effectAmount(a, a.perDay)}；本期已用 ${effectAmount(a, a.used)}，执行后本期剩余 ${effectAmount(a, a.balance)}，不在本期重新计满${a.nextRefill === null ? '' : `，${new Date(a.nextRefill * 1000).toLocaleString('zh-CN')} 起按新额度补满`}`);
 
 // 白名单变更：调整每日额度、查看待加池，合成一份增量 Safe 批次；硬件钱包在 Safe{Wallet} 执行后核对生效并并入配置。
 export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
@@ -49,8 +52,8 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
   const batch = changes?.batch ?? null;
   const pendingCount = (changes?.pools.length ?? 0) + (changes?.allowances.length ?? 0);
   const generate = async () => {
-    if (batch && !window.confirm(batch.stale ? '已有一份批次因 Safe 配置变化而失效。它如已在 Safe 执行，新批次会重复其中的额度设置，再执行会把相关代币当天额度重置为满额。\n\n仍要重新生成？'
-      : '已有一份未核对启用的批次。它如已在 Safe 执行，请先点「已执行，核对并启用」；新批次会重复其中的额度设置，再执行会把相关代币当天额度重置为满额。\n\n仍要重新生成？')) return;
+    if (batch && !window.confirm(batch.stale ? '已有一份批次因 Safe 配置变化而失效。新批次按链上当前额度折算；旧批次文件不要再执行，否则会把相关代币本期可用额度重新放开。\n\n仍要重新生成？'
+      : '已有一份未核对启用的批次。它如已在 Safe 执行，请先点「已执行，核对并启用」。新批次按链上当前额度折算；旧批次文件不要再执行，否则会把相关代币本期可用额度重新放开。\n\n仍要重新生成？')) return;
     const data = await buildBatch();
     if (data) setBuilt(data);
   };
@@ -70,7 +73,7 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
   return <section className="panel lp-section" aria-label="白名单变更">
     <div className="panel-heading"><h2>白名单变更</h2><span className="muted">{pendingCount ? `${changes.pools.length} 个待加池 · ${changes.allowances.length} 项额度待改` : '没有待变更'}</span></div>
     <div className="as-panel-body">
-      <p className="as-muted">每日额度是 bot 每 24 小时最多能投入开仓或兑换卖出的数量，bot 私钥泄露时每个代币每天的损失也以此为上限。改动先记为待变更，与待加池合成一份 Safe 批次，由硬件钱包执行后生效；执行后当天可用额度按新值计满。</p>
+      <p className="as-muted">每日额度是 bot 每 24 小时最多能投入开仓或兑换卖出的数量，bot 私钥泄露时每个代币每天的损失也以此为上限。改动先记为待变更，与待加池合成一份 Safe 批次，由硬件钱包执行后生效。生成批次时读取链上本期已用，执行后本期累计不超过新额度，下一个补充时刻起按新额度补满。</p>
       <div className="lp-table-scroll"><table className="lp-table as-table"><thead><tr><th>代币</th><th className="num">当前每日额度</th><th className="num">今日剩余</th><th className="num">新额度（代币数量）</th></tr></thead><tbody>
         {rows.map((r) => <tr key={r.token}>
           <td>{r.symbol}{r.current === null ? <small className="as-muted"> 新代币</small> : null}</td>
@@ -91,6 +94,7 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
       <h3>待加池</h3>
       {changes.pools.length ? <ul className="as-list">{changes.pools.map((p) => <li key={p.address}>
         <strong>{p.name}</strong> <small className="as-muted">{p.address}</small>
+        {p.gaugeStatus?.state !== 'alive' ? <small className="as-warn" role="status">gauge 状态未知：{p.gaugeStatus?.note ?? '加入时未核对 gauge 是否已被停用'}</small> : null}
         <button type="button" className="as-link" disabled={!!busy || running} aria-label={`移出 ${p.name}`} onClick={() => void call('unqueue', '/changes/remove', 'POST', { pool: p.address })}><X size={13} />移出</button>
       </li>)}</ul> : <p className="as-muted">没有待加池。在 Aero「市场」打开池子详情，不在白名单的池子可以加入待加池，多个池子可同时等待。</p>}
 
@@ -103,6 +107,11 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
       </div>
       {fresh ? <>
         <p className="as-muted">批次共 {fresh.transactions.length} 笔{usage !== null ? `，条件树最多用到 ${usage}/255 个节点` : ''}。下载后在 Safe{'{'}Wallet{'}'} →「应用」→ Transaction Builder 拖入 JSON（提示无法校验 checksum 属正常），逐笔核对后用硬件钱包签名执行；同一批次只执行一次。</p>
+        {fresh.allowances?.length ? <div className="lp-callout warning" role="status">
+          <p>执行该批次后的每日额度（按 {new Date(fresh.allowances[0].readAt * 1000).toLocaleString('zh-CN')} 的链上读数）：</p>
+          <ul>{fresh.allowances.map((a) => <li key={a.key}>{effectText(a)}</li>)}</ul>
+          <p>链上无法阻止重复执行：同一批次再执行一次，或生成后到执行前 bot 又有开仓兑换，本期累计会超过新额度。{fresh.allowances.map((a) => `${a.symbol} 每多执行一次本期最多再花 ${effectAmount(a, a.replay.samePeriod)}，到之后的周期再执行则当期重新计满 ${effectAmount(a, a.replay.laterPeriod)}`).join('；')}。请只执行一次；生成后到执行前不想多花，可先关闭自动调仓。</p>
+        </div> : null}
         <details className="as-muted"><summary>批次明细</summary><ol>{fresh.transactions.map((t, i) => <li key={i}>{t.description}</li>)}</ol></details>
       </> : null}
       {batch ? <>
