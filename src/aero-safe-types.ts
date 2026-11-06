@@ -51,7 +51,7 @@ export type AeroSafeState = {
   changes?: AeroSafeChanges;
 };
 type ChangeToken = { address: string; symbol: string; decimals: number };
-// gaugeStatus：加池时 Voter.isAlive 的读数；unknown 表示无法确认 gauge 是否已被停用（Voter 不提供该方法或读取失败），已停用的池子加不进来。
+// gaugeStatus：加池时 Voter.isActivated 与 CLGaugeFactory.emissionCap 的读数；unknown 表示无法确认 gauge 是否已被停用（调用回滚、返回值不合规、gauge 未在工厂登记或读取失败），已停用的池子加不进来。
 export type AeroSafeChangePool = { address: string; name: string; gauge: string; tickSpacing: number; token0: ChangeToken; token1: ChangeToken; addedAt: number;
   gaugeStatus?: { state: 'alive' | 'unknown'; note: string } };
 // 白名单待变更：待加池与额度调整（perDay / current 为最小单位；current 为配置里的现值，新代币为 null）。
