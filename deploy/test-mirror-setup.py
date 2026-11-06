@@ -16,17 +16,44 @@ ROOT = Path(__file__).resolve().parents[1]
 BASH = os.environ.get('MIRROR_TEST_BASH') or ('D:/Git/bin/bash.exe' if os.name == 'nt' else shutil.which('bash'))
 WINDOWS = os.name == 'nt'
 CAN_RUN = bool(BASH) and (WINDOWS or (os.geteuid() == 0 and 'microsoft' not in os.uname().release.lower()))
+# Every stub answers this probe instead of doing its job (Harness.verify_commands).
+STUB_PROBE = 'MIRROR_STUB_PROBE'
+_relocation_reported = False
+
+
+def mount_options(path):
+    """The mount point and options holding path, for diagnostics only."""
+    try:
+        result = subprocess.run(['findmnt', '-no', 'TARGET,OPTIONS', '-T', str(path)],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # The longest mount point containing path; options are field 6 of mountinfo.
+    best = None
+    try:
+        with open('/proc/self/mountinfo', encoding='utf-8') as mounts:
+            for line in mounts:
+                fields = line.split()
+                target = fields[4]
+                if (str(path) + '/').startswith(target.rstrip('/') + '/') and (best is None or len(target) >= len(best[0])):
+                    best = (target, fields[5])
+    except OSError as error:
+        return f'mount table unavailable: {error}'
+    return ' '.join(best) if best else 'unknown'
 
 
 class Harness:
     def __init__(self, test):
+        self.test = test
         # Hosted runners may grant shared write access/default ACLs under /opt.
         # Keep the fixture under the same root-controlled runtime parent as production.
         temporary = tempfile.TemporaryDirectory(prefix='mirror-setup-', dir=ROOT if WINDOWS else '/run')
         test.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
-        self.commands = self.root / 'commands'
-        self.commands.mkdir()
+        self.stubs = []
+        self.commands = self.executable_directory()
         self.log = self.root / 'commands.log'
         self.config = self.root / 'etc/project-aggregation/release-mirror.conf'
         self.override = self.root / 'etc/systemd/system/project-aggregation.service.d/mirror.conf'
@@ -80,19 +107,76 @@ from pathlib import Path
 with Path(os.environ['COMMAND_LOG']).open('a') as f: f.write('verify ' + ' '.join(sys.argv[1:]) + '\\n')
 sys.exit(int(os.environ.get('VERIFY_FAIL', '0')))
 ''', encoding='utf-8')
+        self.verify_commands()
 
     @staticmethod
     def quote(value):
         return "'" + value.replace("'", "'\\''") + "'"
 
+    def executable_directory(self):
+        """A stub directory whose programs a PATH lookup really runs.
+
+        On a noexec mount (some hosts and runners mount /run noexec) the lookup
+        silently skips the stubs and runs the real nginx/systemctl (#175), so
+        the stubs move to a private temporary directory, checked the same way.
+        """
+        global _relocation_reported
+        preferred = self.root / 'commands'
+        preferred.mkdir()
+        if WINDOWS or self.probe(preferred):
+            return preferred
+        fallback = Path(tempfile.mkdtemp(prefix='mirror-commands-'))
+        self.test.addCleanup(shutil.rmtree, fallback, True)
+        if not _relocation_reported:
+            _relocation_reported = True
+            print(f'mirror-setup: stubs in {preferred} do not execute (mount: {mount_options(preferred)}); '
+                  f'using {fallback} (mount: {mount_options(fallback)}).', file=sys.stderr)
+        if self.probe(fallback):
+            return fallback
+        self.test.fail(f'No executable stub directory: {preferred} (mount: {mount_options(preferred)}), '
+                       f'{fallback} (mount: {mount_options(fallback)}). Refusing to run against real commands.')
+
+    @staticmethod
+    def probe(directory):
+        probe = directory / 'mirror-command-probe'
+        probe.write_text('#!/usr/bin/env bash\nprintf probed\n', encoding='utf-8', newline='\n')
+        probe.chmod(0o755)
+        try:
+            result = subprocess.run([BASH, '-c', 'command -v mirror-command-probe >/dev/null && mirror-command-probe'],
+                                    env={**os.environ, 'PATH': str(directory) + os.pathsep + os.environ['PATH']},
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
+            return result.returncode == 0 and result.stdout == 'probed'
+        finally:
+            probe.unlink()
+
+    def verify_commands(self):
+        """Before any script runs, every stub must be what PATH finds and must run."""
+        check = '''for name; do
+  found=$(command -v -- "$name") || { printf '%s: not found\\n' "$name"; exit 1; }
+  if [[ $CHECK_PATH == 1 && $found != "$MOCK_COMMANDS/$name" ]]; then printf '%s resolves to %s\\n' "$name" "$found"; exit 1; fi
+  [[ $("$name" 2>&1) == "stub:$name" ]] || { printf '%s at %s did not run the stub\\n' "$name" "$found"; exit 1; }
+done'''
+        result = subprocess.run([BASH, '-c', check, 'verify-commands', *self.stubs],
+                                env=self.environment(**{STUB_PROBE: '1', 'CHECK_PATH': '0' if WINDOWS else '1'}),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
+        if result.returncode != 0:
+            self.test.fail(f'Command stubs are bypassed: {result.stdout.strip()}; stub directory {self.commands} '
+                           f'(mount: {mount_options(self.commands)}). Refusing to run against real commands.')
+
     def script(self, name, body):
         path = self.commands / name
-        path.write_text('#!/usr/bin/env bash\n' + body + '\n', encoding='utf-8', newline='\n')
+        probe = f'if [[ ${{{STUB_PROBE}:-}} == 1 ]]; then printf "stub:%s\\n" {self.quote(name)}; exit 0; fi\n'
+        path.write_text('#!/usr/bin/env bash\n' + probe + body + '\n', encoding='utf-8', newline='\n')
         path.chmod(0o755)
+        self.stubs.append(name)
+
+    def environment(self, **env):
+        environment = {k: v for k, v in os.environ.items() if not k.startswith(('RELEASE_MIRROR_', 'RELEASE_CACHE_', STUB_PROBE))}
+        environment.update(PATH=str(self.commands) + os.pathsep + os.environ['PATH'], MOCK_COMMANDS=str(self.commands), COMMAND_LOG=str(self.log), **env)
+        return environment
 
     def run(self, kind='configure', *args, **env):
-        environment = {k: v for k, v in os.environ.items() if not k.startswith(('RELEASE_MIRROR_', 'RELEASE_CACHE_'))}
-        environment.update(PATH=str(self.commands) + os.pathsep + os.environ['PATH'], MOCK_COMMANDS=str(self.commands), COMMAND_LOG=str(self.log), **env)
+        environment = self.environment(**env)
         return subprocess.run([BASH, str(self.root / (kind + '-release-mirror.sh')), *args],
                               env=environment, input='', text=True, encoding='utf-8', errors='replace',
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=20)

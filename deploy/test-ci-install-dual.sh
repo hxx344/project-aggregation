@@ -3,8 +3,10 @@
 # a stateful fake systemd, entry and API slots: the layout gate, first enable,
 # API-only switches, full updates, the scope refusal, a failed candidate, a
 # failure after the slot record moved, interrupted switches and a failed full
-# update. test-slots-systemd.sh runs these units under real systemd, but calls
-# the activation helpers directly, never main().
+# update, a resumed activation replaced by another failing release, the retired
+# Aero LP wallet notice and an interrupted first install. test-slots-systemd.sh
+# runs these units under real systemd, but calls the activation helpers
+# directly, never main().
 set -Eeuo pipefail
 [[ $(uname -s) == Linux && $EUID == 0 ]] || { echo 'Run this fixture with sudo on Linux.' >&2; exit 1; }
 repository=$(cd -- "$(dirname -- "$0")/.." && pwd)
@@ -793,20 +795,89 @@ in_order '^scope full$' '^activate_dual_full$' '^restore_dual_units$'
 no_call '^finish_activation'
 [[ $(link current) == "$r8" && $(link previous) == "$r6" ]]
 [[ $(cat "$app/.pending-previous") == "$r8 $r7 full" ]]
+# A different release r9 then fails too (#191). Its activation overwrote the
+# record with "r9 r8"; the rollback returns to the unfinished r8, so the record
+# r8 still needs comes back instead of being dropped. Going back to r8 must
+# then restore r7 as previous, not the older r6.
+cp "$fixture/release-manifest.json" "$fixture/r8-manifest.json"; cp "$fixture/package.tar.gz" "$fixture/r8-package.tar.gz"
+new_package runtime-five five
+r9=$(release_path runtime-five)
+printf '%s\n' "$r9" > "$fixture/unready-release"
+run_install
+rm -f -- "$fixture/unready-release"
+expect_code 1
+in_order '^scope full$' '^activate_dual_full$' "^systemctl start $service$" '^restore_dual_units$'
+no_call '^finish_activation'
+[[ $(link current) == "$r8" && $(link previous) == "$r6" && $(unit_state "$service" release) == "$r8" ]]
+[[ $(cat "$app/.pending-previous") == "$r8 $r7 full" ]]
+cp "$fixture/r8-manifest.json" "$fixture/release-manifest.json"; cp "$fixture/r8-package.tar.gz" "$fixture/package.tar.gz"
 run_install
 expect_code 0
 has_call '^scope full$'
 expect_dual "$before_slot" "$r8" "$r7"
 [[ ! -e "$app/.pending-previous" ]]
 
-# 12. A fresh install with an update service that knows the layout starts on
-# the dual-slot units, slot a.
+# 11a. A data root that still holds the retired Aero LP wallet (#209): every
+# successful run names it and the manual checks, never prints its contents and
+# leaves the file, its mode and the directory exactly as they were.
+mkdir -p -m 0700 "$fixture/data/aero-lp"
+printf '{"schema":1,"address":"0xfixture","key":"FIXTURE-SECRET-SENTINEL"}\n' > "$fixture/data/aero-lp/wallet.json"
+chmod 0600 "$fixture/data/aero-lp/wallet.json"
+cp -p "$fixture/data/aero-lp/wallet.json" "$fixture/wallet.before"
+wallet_mode=$(stat -c '%a %s %Y' "$fixture/data/aero-lp/wallet.json")
+run_install
+expect_code 0
+grep -Fq "旧 Aero LP 模块遗留的加密钱包文件 $fixture/data/aero-lp/wallet.json" "$fixture/last.log"
+grep -Fq '手工核对：' "$fixture/last.log"
+grep -Fq '保管：' "$fixture/last.log"
+if grep -Eq 'FIXTURE-SECRET-SENTINEL|0xfixture' "$fixture/last.log"; then printf 'The retired wallet contents were printed.\n' >&2; false; fi
+cmp -s "$fixture/data/aero-lp/wallet.json" "$fixture/wallet.before"
+[[ $(stat -c '%a %s %Y' "$fixture/data/aero-lp/wallet.json") == "$wallet_mode" && $(ls -A "$fixture/data/aero-lp") == wallet.json ]]
+rm -rf -- "$fixture/data/aero-lp"
+run_install
+expect_code 0
+if grep -Fq 'Aero LP' "$fixture/last.log"; then printf 'The retired wallet notice outlived the wallet.\n' >&2; false; fi
+
+# 12a. A first install killed after it moved current but before it saved the
+# environment snapshot (#185). The retry has no successful environment to roll
+# back to; it must not refuse forever. A failed retry removes the candidate and
+# the units like a failed first install and keeps the configuration and data.
 make_package fresh
+fresh=$(release_path fresh "$fixture/fresh-application")
+printf 'systemctl start %s\n' "$service" > "$fixture/crash-on"
+run_install FRESH_INSTALL=1
+expect_code 137
+[[ $(readlink "$fixture/fresh-application/current") == "$fresh" && ! -e "$fixture/fresh-application/.last-successful.env" ]]
+[[ $(cat "$fixture/fresh-application/.pending-previous") == "$fresh - full" && -f "$fixture/fresh-unit" ]]
+cp "$fixture/fresh-environment" "$fixture/fresh-environment.before"
+printf '%s\n' "$fresh" > "$fixture/unready-release"
+run_install FRESH_INSTALL=1
+rm -f -- "$fixture/unready-release"
+expect_code 1
+grep -Fq '上次首次安装在切换版本后、保存配置快照前中断' "$fixture/last.log"
+grep -Fq '首次安装未成功；保留配置和数据以便重试。' "$fixture/last.log"
+in_order '^scope full$' '^activate_dual_full$' "^systemctl start $service$" "^systemctl disable $service$" '^dual_teardown$'
+no_call '^(finish_activation|restore_dual_units)'
+[[ ! -e "$fixture/fresh-application/current" && ! -L "$fixture/fresh-application/current" && ! -e "$fixture/fresh-application/.last-successful.env" ]]
+[[ ! -e "$fixture/fresh-unit" && ! -e "$fixture/fresh-entry-unit" && ! -e "$fixture/fresh-slot-unit" && ! -e "$fixture/fresh-api-unit" ]]
+[[ ! -e "$fixture/fresh-systemd/active/$service" && ! -e "$fixture/fresh-systemd/enabled/$service-api@a" ]]
+cmp -s "$fixture/fresh-environment" "$fixture/fresh-environment.before"
+[[ -d "$fixture/fresh-application/releases" && -f "$fresh/.managed-release" ]]
+# Interrupted the same way again, the next retry resumes and succeeds.
+printf 'systemctl start %s\n' "$service" > "$fixture/crash-on"
+run_install FRESH_INSTALL=1
+expect_code 137
+[[ $(readlink "$fixture/fresh-application/current") == "$fresh" && ! -e "$fixture/fresh-application/.last-successful.env" ]]
+
+# 12. A fresh install with an update service that knows the layout starts on
+# the dual-slot units, slot a. Here it resumes the interrupted first install.
 run_install FRESH_INSTALL=1
 expect_code 0
+grep -Fq '上次首次安装在切换版本后、保存配置快照前中断' "$fixture/last.log"
 in_order '^layout dual$' '^scope full$' '^activate_dual_full$' "^systemctl start $service$" '^finish_activation'
-fresh=$(release_path fresh "$fixture/fresh-application")
+[[ ! -e "$fixture/fresh-application/.pending-previous" && ! -L "$fixture/fresh-application/previous" ]]
+cmp -s "$fixture/fresh-application/.last-successful.env" "$fixture/fresh-environment"
 [[ $(cat "$fixture/fresh-application/.api-slot") == "{\"slot\":\"a\",\"release\":\"$fresh\"}" ]]
 [[ $(readlink "$fixture/fresh-application/current") == "$fresh" && -f "$fixture/fresh-entry-unit" && ! -e "$fixture/fresh-api-unit" ]]
 [[ -f "$fixture/fresh-systemd/active/$service-api@a" && -f "$fixture/fresh-systemd/enabled/$service-api@a" ]]
-printf 'Dual-slot main(): layout gate, first enable, API-only and full updates, scope refusal, failed candidate, rollback after the record moved, interrupted switches and failed full update passed.\n'
+printf 'Dual-slot main(): layout gate, first enable, API-only and full updates, scope refusal, failed candidate, rollback after the record moved, interrupted switches, failed full update, retained pending rollback target, retired wallet notice and resumed first install passed.\n'

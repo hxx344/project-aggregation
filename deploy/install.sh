@@ -65,6 +65,11 @@ slot_instance=
 probe_failures=
 activation_scope=
 pending_activation_scope=
+# An interrupted activation's .pending-previous for the release current names,
+# kept when this run activates another release (restore_pending_previous).
+inherited_pending_previous=
+# The release an interrupted first install left in current (resume_interrupted_first_install).
+first_install_candidate=
 old_environment=
 old_health_url=
 work_dir=
@@ -1464,7 +1469,12 @@ rollback() {
       systemctl restart "$SERVICE" || true
       if wait_healthy; then log '已恢复上次成功的程序和配置；持久数据保持原样。'; else log '旧版本尚未恢复健康，请查看服务日志。'; fi
     else
-      if [[ -L "$APP_DIR/current" && "$(readlink "$APP_DIR/current")" == "${release:-}" ]]; then rm -f -- "$APP_DIR/current"; fi
+      # A resumed first install also removes the candidate it found in current:
+      # left there, every retry would need an environment snapshot it never had.
+      if [[ -L "$APP_DIR/current" ]] && [[ "$(readlink "$APP_DIR/current")" == "${release:-}" ||
+            ( -n "$first_install_candidate" && "$(readlink "$APP_DIR/current")" == "$first_install_candidate" ) ]]; then
+        rm -f -- "$APP_DIR/current"
+      fi
       systemctl daemon-reload || true
       log '首次安装未成功；保留配置和数据以便重试。'
     fi
@@ -3031,15 +3041,41 @@ restore_pending_previous() {
   if [[ "$target" == "$release" && "$old_release" == "$release" ]]; then
     previous_release=${previous#-}
     pending_activation_scope=$scope
+  elif [[ "$target" == "$old_release" ]]; then
+    # Another release replaces the unfinished one and overwrites the record.
+    # A rollback returns to the unfinished release, which still needs it (#191).
+    inherited_pending_previous="$target $previous $scope"
   fi
 }
 # After a rollback restored current to where this run found it. A record this
 # run wrote describes only the failed attempt, and a leftover copy would only
 # block the next no-op check. A record inherited from an interrupted activation (current was
 # already the candidate, so the rollback restored only the candidate) is the
-# sole copy of the release it replaced and stays for the next attempt.
+# sole copy of the release it replaced and stays for the next attempt; one this
+# run overwrote for another release is written back.
 drop_pending_previous() {
-  [[ -n "$pending_activation_scope" ]] || rm -f -- "$APP_DIR/.pending-previous"
+  if [[ -n "$pending_activation_scope" ]]; then return 0; fi
+  if [[ -n "$inherited_pending_previous" ]]; then
+    atomic_record "$APP_DIR/.pending-previous" "$inherited_pending_previous"
+    return
+  fi
+  rm -f -- "$APP_DIR/.pending-previous"
+}
+# A first install killed after it moved current but before it saved the
+# environment snapshot leaves only its own record "<candidate> - <scope>": no
+# release has ever succeeded here, so there is no environment to roll back to.
+# Retry as a first install instead of refusing every attempt; a failed retry
+# then removes the candidate and the units like any failed first install (#185).
+resume_interrupted_first_install() {
+  local target previous scope extra
+  [[ -n "$old_release" && ! -e "$APP_DIR/.last-successful.env" && -f "$APP_DIR/.pending-previous" &&
+     ! -L "$APP_DIR/previous" && ! -e "$APP_DIR/.api-cutover" ]] || return 0
+  read -r target previous scope extra < "$APP_DIR/.pending-previous" || return 0
+  [[ "$target" == "$old_release" && "$previous" == - && -z "$extra" ]] || return 0
+  log '上次首次安装在切换版本后、保存配置快照前中断；按首次安装重试，失败时移除未完成的版本和服务单元，配置与数据保留。'
+  first_install_candidate=$old_release
+  old_release= previous_release=
+  old_unit_backup= old_api_unit_backup= old_entry_unit_backup= old_slot_unit_backup= old_layout=single
 }
 # Whether the admitted scope covers the activation: an api-scope update never widens.
 scope_admitted() {
@@ -3198,6 +3234,19 @@ prune_caches() {
   (( removed == 0 )) || log "已清理 $removed 项旧部署缓存或失败安装残留。"
   (( failed == 0 )) || { log "有 $failed 项旧缓存未能删除。"; return 1; }
 }
+# The Aero LP module (removed in #190) kept its signer key encrypted with the
+# data root's credentials.key in aero-lp/wallet.json. Nothing reads it any more,
+# yet its address may still hold funds or positions: name the file and the
+# manual checks on every successful run while it exists. Only its presence is
+# tested; the contents are never read and nothing is moved or deleted (#209).
+retired_aero_lp_notice() {
+  local directory="$DATA_PATH/aero-lp"
+  [[ -e "$directory/wallet.json" || -L "$directory/wallet.json" ]] || return 0
+  log "提示：发现已下线的旧 Aero LP 模块遗留的加密钱包文件 $directory/wallet.json。新版本不再使用它；安装器只检查文件是否存在，不读取内容，不移动也不删除。"
+  log '该文件保存旧 LP 机器人的私钥，用同一数据目录的 credentials.key 加密。旧地址上可能仍有余额、LP 头寸或未领取的 AERO 奖励；这条提示不表示密钥已撤销或已泄露。'
+  log "保管：保持 $directory 与 credentials.key 仅 root 和服务账号可读，不要复制到其他位置、上传或发给他人；备份时两者分开保管。"
+  log "手工核对：1）用当时在页面填写的私钥在自己的钱包中确认该地址；2）在 Base 区块浏览器核对余额、LP NFT 头寸和未领奖励；3）如有资产，在自己的钱包中撤出并转走；4）确认地址已清空且不再使用后，再自行离线备份或删除 $directory，此后不再提示。"
+}
 main() {
   case "$PROJECT_DEPLOY_MODE" in source|ci) ;; *) fail 'PROJECT_DEPLOY_MODE 必须是 ci 或 source。'; return 1 ;; esac
   case "$PROJECT_DEPLOY_TESTS" in
@@ -3302,6 +3351,7 @@ main() {
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
     finish_update_service "$old_release"
     prune_caches || log '部分旧缓存未能清理；已上线版本不受影响，下次成功部署会重试。'
+    retired_aero_lp_notice
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -3334,6 +3384,7 @@ main() {
     log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
     finish_update_service "$release"
     prune_caches || log '部分旧缓存未能清理；已上线版本不受影响，下次成功部署会重试。'
+    retired_aero_lp_notice
     rm -rf -- "$work_dir"
     trap - ERR INT TERM
     return
@@ -3348,6 +3399,7 @@ main() {
     log "已准备正式版本 ${commit:0:12}：下载、依赖、验证和构建已完成，尚未切换，服务保持运行。"
     return "$DEPLOY_PREPARED"
   fi
+  resume_interrupted_first_install
   prepare_environment_rollback
   ci_update_progress switch
   if dual_installed; then
@@ -3356,7 +3408,8 @@ main() {
     old_slot_record=$(read_slot_record) || old_slot_record=
     # Refresh both pointers even when current had moved before the interruption.
     # A recovered cutover persisted the previous pointer for its intent.
-    if [[ -L "$APP_DIR/current" ]]; then
+    # A resumed first install keeps no earlier release.
+    if [[ -L "$APP_DIR/current" && -z "$first_install_candidate" ]]; then
       old_release=$(realpath -e "$APP_DIR/current")
       [[ "$old_release" == "$APP_DIR/releases/"* && -f "$old_release/.managed-release" ]] || fail 'current 指向未知目录，停止更新。'
       if [[ "$old_release" != "$release" ]]; then
@@ -3442,6 +3495,7 @@ main() {
   local api_journal=$API_SERVICE
   [[ "$slot_layout" != dual ]] || api_journal="$API_SERVICE@*"
   log "首次登录密码请在服务器运行：sudo journalctl -u '$api_journal' --no-pager -n 30"
+  retired_aero_lp_notice
 }
 
 # CI may source pure helpers without changing its host.
