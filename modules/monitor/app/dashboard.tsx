@@ -37,11 +37,11 @@ export default function Dashboard({ onSummary, active = true, selected = active,
   const charts = hasOpened || shown;
   // The overview card stays visible while another market's detail is selected.
   // Share its quotes with the detail; only the open detail reads the full history and funding.
-  const { data, trend: overviewTrend, quote, loading, error, trendError, quoteError, refresh } = useMarketFeed(initial?.hynix, active, summaryActive);
+  const { data, trend: overviewTrend, quote, loading, error, trendRetained, quoteError, refresh } = useMarketFeed(initial?.hynix, active, summaryActive);
   const initialTrend = initial?.hynix?.trend ?? undefined;
   const fullTrend = useMemo(() => data ? { points: data.points.map(point => ({ time: point.time, value: point.premium })), status: data.status, fetchedAt: data.fetchedAt } : undefined, [data]);
-  // Show the most recent read with its real source time; the reader currently serving the card decides whether it is stale.
-  const trend = useMemo(() => createTrend(latestTrend(fullTrend, overviewTrend, initialTrend), hynixTrendOptions, active ? Boolean(error) : trendError), [fullTrend, overviewTrend, initialTrend, active, error, trendError]);
+  // Show the most recent read with its real source time; the reader serving the card decides whether it is stale.
+  const trend = useMemo(() => createTrend(latestTrend(fullTrend, overviewTrend, initialTrend), hynixTrendOptions, trendRetained), [fullTrend, overviewTrend, initialTrend, trendRetained]);
   useEffect(() => { onSummary?.(hynixSummary(quote, quoteError, trend)); }, [onSummary, quote, quoteError, trend]);
   const [range,setRange] = useState<number | null>(null);
   const trades = useHubFills("hynix", tradesActive);

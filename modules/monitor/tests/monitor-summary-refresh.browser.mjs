@@ -141,6 +141,26 @@ async page => {
     holdTrend.open(); holdTrend = null;
     await waitSpark('');
 
+    // Same for the detail's history: while paused, and after reconnecting until a successful history clears it.
+    await page.getByRole('tab', { name: '海力士 ADR', exact: true }).click();
+    now += 1000; await page.clock.runFor(1000);
+    await waitSpark('');
+    failHistory = true;
+    await tickUntilRead('history'); await waitSpark(' · 保留历史');
+    await page.context().setOffline(true);
+    await tick();
+    check(await sparkStatus() === ' · 保留历史', 'Pausing must keep the history failure while the trend reader has none');
+    failHistory = false; holdHistory = gate();
+    const historyRetried = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
+    await page.context().setOffline(false);
+    await historyRetried;
+    check(await sparkStatus() === ' · 保留历史', 'Reconnecting must keep the history failure until a new history arrives');
+    holdHistory.open(); holdHistory = null;
+    await waitSpark('');
+    const trendBack = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
+    await page.getByRole('tab', { name: '原油价差', exact: true }).click();
+    await trendBack; await waitSpark('');
+
     // A reader's failure must not label the card once another reader serves it and before that reader answers.
     failTrend = true;
     await tickUntilRead('trend'); await waitSpark(' · 保留历史');
@@ -149,15 +169,6 @@ async page => {
     await waitSpark('');
     failHistory = true;
     await tickUntilRead('history'); await waitSpark(' · 保留历史');
-    await page.context().setOffline(true);
-    await tick();
-    holdHistory = gate();
-    const historyRetried = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
-    await page.context().setOffline(false);
-    await historyRetried;
-    check(await sparkStatus() === ' · 保留历史', 'Reconnecting must keep the history failure until a new history arrives');
-    holdHistory.open(); holdHistory = null;
-    await tick(); await waitSpark(' · 保留历史');
     holdTrend = gate();
     const trendPending = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
     await page.getByRole('tab', { name: '原油价差', exact: true }).click();

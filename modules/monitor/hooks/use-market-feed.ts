@@ -38,6 +38,8 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], active = tru
     setLastReader(reader);
     if (reader === "history") setError(""); else setTrendError(false);
   }
+  // While every read is paused the card still shows what its last reader served.
+  const trendRetained = (reader ?? lastReader) === "history" ? Boolean(error) : trendError;
 
   useEffect(() => {
     if (!quoteActive) return;
@@ -83,7 +85,7 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], active = tru
   },[trendActive]);
 
   return {
-    data, trend, quote, error, trendError, quoteError, loading: historyLoading || quoteLoading,
+    data, trend, quote, error, trendRetained, quoteError, loading: historyLoading || quoteLoading,
     refresh: () => { setHistoryLoading(true); setQuoteLoading(true); controls.current.history?.(); controls.current.quote?.(); },
   };
 }
