@@ -128,6 +128,19 @@ async page => {
     failTrend = false;
     await tickUntilRead('trend'); await waitSpark('');
 
+    // Pausing and resuming the same reader keeps its failure until it answers successfully.
+    failTrend = true;
+    await tickUntilRead('trend'); await waitSpark(' · 保留历史');
+    await page.context().setOffline(true);
+    await tick();
+    failTrend = false; holdTrend = gate();
+    const trendRetried = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
+    await page.context().setOffline(false);
+    await trendRetried;
+    check(await sparkStatus() === ' · 保留历史', 'Reconnecting must keep the trend failure until a new trend arrives');
+    holdTrend.open(); holdTrend = null;
+    await waitSpark('');
+
     // A reader's failure must not label the card once another reader serves it and before that reader answers.
     failTrend = true;
     await tickUntilRead('trend'); await waitSpark(' · 保留历史');
@@ -136,6 +149,15 @@ async page => {
     await waitSpark('');
     failHistory = true;
     await tickUntilRead('history'); await waitSpark(' · 保留历史');
+    await page.context().setOffline(true);
+    await tick();
+    holdHistory = gate();
+    const historyRetried = page.waitForRequest('**/api/monitors/hynix/history', { timeout: 10_000 });
+    await page.context().setOffline(false);
+    await historyRetried;
+    check(await sparkStatus() === ' · 保留历史', 'Reconnecting must keep the history failure until a new history arrives');
+    holdHistory.open(); holdHistory = null;
+    await tick(); await waitSpark(' · 保留历史');
     holdTrend = gate();
     const trendPending = page.waitForRequest('**/api/monitors/hynix/trend', { timeout: 10_000 });
     await page.getByRole('tab', { name: '原油价差', exact: true }).click();

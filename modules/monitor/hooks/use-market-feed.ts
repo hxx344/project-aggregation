@@ -30,6 +30,14 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], active = tru
   const [quoteError,setQuoteError] = useState(initial?.quote?.status === "snapshot" ? retainedQuote : "");
   const controls = useRef<{ history?: () => void; quote?: () => void }>({});
   const quoteActive = active || summaryActive, trendActive = summaryActive && !active;
+  // A failure flag outlives pauses (offline, hidden) of its own reader and clears only on that reader's success,
+  // but another reader taking over the card must not inherit a flag it never raised.
+  const reader = active ? "history" : trendActive ? "trend" : null;
+  const [lastReader,setLastReader] = useState(reader);
+  if (reader && reader !== lastReader) {
+    setLastReader(reader);
+    if (reader === "history") setError(""); else setTrendError(false);
+  }
 
   useEffect(() => {
     if (!quoteActive) return;
@@ -59,8 +67,7 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], active = tru
       onSettled: () => setHistoryLoading(false),
     });
     controls.current.history = () => { void history.refresh(); };
-    // A failure belongs to the reader that saw it; the next reader serving the card starts unflagged.
-    return () => { controls.current.history = undefined; history.stop(); setError(""); };
+    return () => { controls.current.history = undefined; history.stop(); };
   },[active]);
 
   useEffect(() => {
@@ -72,7 +79,7 @@ export function useMarketFeed(initial?: InitialMarketData["hynix"], active = tru
       onData: next => { setTrend(previous => previous && Date.parse(next.fetchedAt) < Date.parse(previous.fetchedAt) ? previous : next); setTrendError(false); },
       onError: () => setTrendError(true),
     });
-    return () => { overview.stop(); setTrendError(false); };
+    return () => overview.stop();
   },[trendActive]);
 
   return {
