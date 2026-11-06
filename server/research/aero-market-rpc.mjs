@@ -58,10 +58,10 @@ function decodeFragment(value) {
 
 // RPC 诊断统一入口：先去密钥再裁剪/归一空白，兼容原文、解码回显和大小写混用的百分号转义。
 // 路径段和查询值均可能是短密钥，不按长度猜测；URL 无法解析或诊断过长时只保留固定类别。
-// 短片段（不足 SHORT_SECRET_LENGTH）只在前后不紧邻字母数字时按独立片段替换；
+// 短片段（不足 SHORT_SECRET_LENGTH）只在前后不紧邻字母、数字或下划线时按独立片段替换；
 // 嵌在更长单词里（如 /e 命中 trie）既不能逐处打星号也不能放过，整条改为固定类别。
 const SHORT_SECRET_LENGTH = 8;
-const isWordChar = (char) => /[A-Za-z0-9]/.test(char ?? '');
+const isWordChar = (char) => /[\p{L}\p{N}_]/u.test(char ?? '');
 function embeddedIn(text, secret) {
   for (let at = text.indexOf(secret); at !== -1; at = text.indexOf(secret, at + 1)) {
     if (isWordChar(text[at - 1]) || isWordChar(text[at + secret.length])) return true;
@@ -96,6 +96,13 @@ export function scrubRpcMessage(text, url, limit = 240) {
   if (short.some((secret) => embeddedIn(out, secret))) return 'RPC 错误（诊断原文含配置地址片段，已隐藏）';
   for (const secret of short) out = out.split(secret).join('***');
   return out.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+// 外层展示用：RpcError 的文字只由固定文案、数字、方法名和创建时已脱敏的节点回显组成，
+// 再脱敏一次会把 eth_call 等自带文字按短片段折叠，丢掉错误类型；其余来源的错误照常脱敏。
+export function rpcDiagnostic(error, url, limit = 240) {
+  if (error instanceof RpcError) return error.message.replace(/\s+/g, ' ').trim().slice(0, limit);
+  return scrubRpcMessage(error?.message || error, url, limit);
 }
 
 export function createRpc({ url, chainId, fetchImpl = fetch, timeoutMs = RPC_TIMEOUT_MS, retryDelayMs = RETRY_DELAY_MS, signal } = {}) {

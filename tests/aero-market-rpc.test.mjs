@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
 import { inspect } from 'node:util';
-import { createRpc, readPoolAddresses, scrubRpcMessage } from '../server/research/aero-market-rpc.mjs';
+import { createRpc, readPoolAddresses, rpcDiagnostic, scrubRpcMessage } from '../server/research/aero-market-rpc.mjs';
 import { strictMarketConfig, DEFAULT_CONFIG } from '../server/research/aero-market.mjs';
 
 const LIMIT = 8 * 1024 * 1024;
@@ -168,10 +168,28 @@ for (const row of [
   { name: 'standalone short segment is starred', url: `https://rpc.example/v2/${encodedSecret}`, message: `v2 quota denied: ${decodedSecret}`, expected: '*** quota denied: ***' },
   { name: 'short segment absent keeps the diagnosis', url: `https://rpc.example/v2/${encodedSecret}`, message: `missing trie node ${decodedSecret}`, expected: 'missing trie node ***' },
   { name: 'short segment only inside an echoed address', url: 'https://rpc.example/zq', message: 'quota denied at https://rpc.example/zq', expected: 'quota denied at <地址>' },
+  { name: 'underscore and non-ASCII letters count as word characters', url: 'https://rpc.example/abc', message: '_abc_ éabcé', expected: 'RPC 错误（诊断原文含配置地址片段，已隐藏）' },
 ]) test(`rpc short credential fragments: ${row.name}`, () => {
   const out = scrubRpcMessage(row.message, row.url);
-  assert.doesNotMatch(out, /\*\*\*[a-z]|[a-z]\*\*\*/i, 'no partially starred words');
+  assert.doesNotMatch(out, /\*\*\*[\p{L}\p{N}_]|[\p{L}\p{N}_]\*\*\*/u, 'no partially starred words');
   assert.equal(out, row.expected);
+});
+
+// 外层展示经 rpcDiagnostic：RpcError 自带的方法名与错误类型不被短片段折叠，节点回显仍只在内层脱敏一次。
+for (const row of [
+  { name: 'timeout keeps the method', url: 'https://rpc.example/e', fail: () => { throw Object.assign(new Error('t'), { name: 'TimeoutError' }); }, expected: /^eth_chainId 超过 \d+ 秒未响应$/ },
+  { name: 'redirect keeps the hint', url: 'https://rpc.example/e', fail: () => new Response(null, { status: 302 }), expected: /^eth_chainId 节点返回跳转（HTTP 302），已拒绝；请填写跳转后的最终地址$/ },
+  { name: 'nested fixed category is not starred', url: 'https://rpc.example/RPC', fail: (id) => new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message: 'RPCx failed' } })), expected: /^eth_chainId 节点错误：RPC 错误（诊断原文含配置地址片段，已隐藏）$/ },
+  { name: 'node echo of a short key stays hidden', url: 'https://rpc.example/rpc?k=zq', fail: (id) => new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32000, message: 'bad key zq' } })), expected: /^eth_chainId 节点错误：bad key \*\*\*$/ },
+]) test(`rpc outer diagnostic: ${row.name}`, async () => {
+  const rpc = createRpc({ url: row.url, chainId: 8453, retryDelayMs: 0, fetchImpl: async (_url, init) => row.fail(JSON.parse(init.body).id) });
+  const error = await rpc.blockNumber().catch((reason) => reason);
+  assert.match(rpcDiagnostic(error, row.url), row.expected);
+});
+
+test('rpc outer diagnostic still scrubs errors that are not RpcError', () => {
+  const url = `https://rpc.example/v2/${encodedSecret}`;
+  assert.equal(rpcDiagnostic(new Error(`boom ${decodedSecret} at ${url}`), url), 'boom *** at <地址>');
 });
 
 for (const mode of ['network', 'body', 'node-code', 'result']) test(`RPC error metadata cannot carry a credential: ${mode}`, async () => {
