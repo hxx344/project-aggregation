@@ -236,6 +236,29 @@ test('a candidate slot answers only the probe reads without writing, and serves 
   assert.deepEqual([...failures, ...bFailures], []);
 });
 
+test('the runtime marks hub.sqlite version 1, and a candidate slot refuses a newer version', { skip, timeout: 90_000 }, async t => {
+  const { dataDir, env } = await runtimeFixture(t);
+  const file = path.join(dataDir, 'hub.sqlite');
+  const raw = new DatabaseSync(file);
+  t.after(() => raw.close());
+  assert.equal(raw.prepare('PRAGMA user_version').get().user_version, 1);
+  const record = path.join(dataDir, '.api-slot'), slots = {};
+  for (const name of ['a', 'b']) {
+    const release = path.join(dataDir, `release-${name}`); mkdirSync(release);
+    const dir = path.join(dataDir, `slot-${name}`); mkdirSync(dir, { mode: 0o700 });
+    slots[name] = { slot: name, dir, record, release: realpathSync(release) };
+  }
+  writeFileSync(record, JSON.stringify({ slot: 'a', release: slots.a.release }));
+  const start = name => startApi({ dataDir, logger: quiet, env, distDir: path.join(dataDir, 'dist'), slot: slots[name], fail: () => {},
+    updatesClient: { status: async () => unavailableUpdateState() } });
+  const a = await start('a');
+  t.after(() => a.close());
+  raw.exec('PRAGMA user_version=2');
+  await assert.rejects(start('b'), /工作台数据库版本 2 高于本程序支持的版本 1/);
+  assert.equal(existsSync(slotSockets(slots.b.dir).http), false);
+  raw.exec('PRAGMA user_version=1');
+});
+
 test('a query-only hub database must have every table and column, and the seeds must be complete', { skip }, async t => {
   const dir = await mkdtemp('/tmp/slot-db-'); t.after(() => rm(dir, { recursive: true, force: true }));
   const file = path.join(dir, 'hub.sqlite');

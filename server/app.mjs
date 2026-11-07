@@ -13,6 +13,7 @@ import { createApiServer, resolveLoginLimits } from './api/server.mjs';
 import { BASELINE_INTERVAL_MS, validateBaselineInterval } from './observability.mjs';
 import { assertRecoveryStartup } from './recovery/startup.mjs';
 import { openHubDatabase, seedProjects } from './control/schema.mjs';
+import { markHubSchema } from './control/hub-schema.mjs';
 import { createControlStore } from './control/store.mjs';
 import { createProjectCatalog } from './control/projects.mjs';
 import { ensurePassword } from './control/password.mjs';
@@ -57,6 +58,8 @@ export async function createApp({ embeddedModules = false, dataDir = process.env
   await dataPlane.initialize();
   await api.initialize();
   dataPlane.startBaseline();
+  // Every hub.sqlite creator has run now (the baseline last).
+  markHubSchema(db, { log });
   const { trading, execution, assetSync, check, refresh } = dataPlane;
   return {
     server: api.server, check, refresh, assetSync, trading, execution, baseline: dataPlane.baseline, dataDir: resolvedData, resynchronizeModules: api.updates.resynchronize,

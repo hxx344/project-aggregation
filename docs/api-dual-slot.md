@@ -103,7 +103,7 @@ B 被排除的关键是没有单一切换点与停服语义；C 是没有切换�
 
 | 模式 | 行为 |
 | --- | --- |
-| 候选 | 只创建 `probe.sock` 与 `ctl.sock`，不创建 `http.sock`，入口连接它只会得到 `ENOENT` 并按 3.7 等待。库连接设 `PRAGMA query_only=ON`，不执行 `openHubDatabase` 的建表事务（`server/control/schema.mjs:34`），改为核对必需的表与列（`hub.sqlite` 目前没有 schema 版本号，不另造）；不调用 `ensurePassword`/`seedProjects`，只核对管理员密码与项目种子已存在；不构造更新协调器：它在构造时就缓存 `pendingPlanId` 与维护值，并可能写回设置（`server/updates.mjs:193-195`、`:242`、`:250`），所以候选不轮询更新、不同步维护，也不会带着候选启动时的缓存进入服务；不上报 SSE 计数；Portal 不签发也不消费 ticket/grant（含 `GET /__hub/authorize`，`server/portal.mjs:451-452`），返回 503，并停掉每 60 s 的 `pruneStored` 清理（`:141-142`）；其余写请求返回 503。任一核对失败即退出 |
+| 候选 | 只创建 `probe.sock` 与 `ctl.sock`，不创建 `http.sock`，入口连接它只会得到 `ENOENT` 并按 3.7 等待。库连接设 `PRAGMA query_only=ON`，不执行 `openHubDatabase` 的建表事务（`server/control/schema.mjs:34`），改为核对必需的表与列，并拒绝 `user_version` 高于本程序支持版本的库（`assertCandidateSchema`，`server/control/hub-schema.mjs`；该文件属于运行时组件，只切 API 槽时新旧槽版本必然相同，这是防御性检查）；不调用 `ensurePassword`/`seedProjects`，只核对管理员密码与项目种子已存在；不构造更新协调器：它在构造时就缓存 `pendingPlanId` 与维护值，并可能写回设置（`server/updates.mjs:193-195`、`:242`、`:250`），所以候选不轮询更新、不同步维护，也不会带着候选启动时的缓存进入服务；不上报 SSE 计数；Portal 不签发也不消费 ticket/grant（含 `GET /__hub/authorize`，`server/portal.mjs:451-452`），返回 503，并停掉每 60 s 的 `pruneStored` 清理（`:141-142`）；其余写请求返回 503。任一核对失败即退出 |
 | 服务 | 现有 API 行为：建表、协调器、计数上报、写入按准入提交。整体更新与首次启动仍在服务模式下执行 `ensurePassword`/`seedProjects`（受控准备阶段） |
 
 `POST /promote`：槽重新读取 `.api-slot`，与自身一致才执行：关闭 `query_only`，此时才构造更新协调器（从库内读取当前持久值）并等待 `initialize()` 结束（失败沿用现有处理：记警告，相关写入暂拒），启动 Portal 清理，再创建 `http.sock` 并返回 `mode=serving`；不一致返回 409；重复调用幂等。

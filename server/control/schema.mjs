@@ -46,7 +46,8 @@ export function openHubDatabase(dbPath, { create = true } = {}) {
   return db;
 }
 
-// Every table and column TABLES creates must exist; hub.sqlite has no schema version.
+// Every table and column TABLES creates must exist. The version of the whole
+// layout is checked separately (server/control/hub-schema.mjs).
 function assertTables(db) {
   const expected = new DatabaseSync(':memory:');
   try {
