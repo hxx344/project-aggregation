@@ -112,7 +112,8 @@ export async function createEmbeddedFundingFixture({ alias = false } = {}) {
     close() { if (this.readyState === 3) return; this.readyState = 3; this.emit('close'); }
   }
   function noPrivateClient() { stats.privateClients.push({ at: Date.now() }); throw new Error('Private account access is disabled in this fixture'); }
-  const noHubClient = () => new Proxy({}, { get: () => noPrivateClient });
+  // Releasing an inert fixture client is lifecycle cleanup, not account access.
+  const noHubClient = () => new Proxy({}, { get: (_target, method) => method === 'close' ? () => {} : noPrivateClient });
   function record(req) { return { method: req.method, path: req.url, host: req.headers.host,
     workspaceAuthorized: req.headers['x-workspace-key'] === crossexSecret, authorization: req.headers.authorization }; }
 
