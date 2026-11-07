@@ -286,7 +286,7 @@ test('Anthropic positions use the Binance and OKX read-only accounts, never Bybi
   await f.connect('binance'); await f.connect('bybit'); await f.connect('okx', { ...credentials('okx'), passphrase: 'private_fixture_passphrase' });
   const { status, data } = await f.request('/api/trading/anthropic');
   assert.equal(status, 200);
-  assert.deepEqual(data.sources.map(source => [source.exchange, source.state]), [['binance', 'live'], ['okx', 'live'], ['hyperliquid', 'unconfigured']]);
+  assert.deepEqual(data.sources.map(source => [source.exchange, source.state]), [['binance', 'live'], ['okx', 'live'], ['hyperliquid', 'unconfigured'], ['rh-lighter', 'unconfigured']]);
   const [leg] = data.sources[1].positions;
   assert.deepEqual([leg.symbol, leg.side, leg.liquidationPrice, leg.distancePercent, leg.alerting], ['ANTHROPICUSDT', 'short', '220.2', '20.00', false]);
   assert.ok(!f.calls.some(call => call.method === 'anthropicPositions' && call.exchange === 'bybit'));
