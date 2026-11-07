@@ -49,7 +49,7 @@ async (page) => {
   const section = page.locator('section.trading-hynix-positions');
   const oilRows = page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions) .trading-position-table tbody tr');
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await section.getByRole('heading', { name: '海力士仓位', exact: true }).waitFor();
   assert(await oilRows.count() === 4, 'oil table keeps exactly its four legs');
   assert(!(await page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions)').innerText()).includes('SKHY'), 'SK hynix rows never enter the oil table');
@@ -59,7 +59,7 @@ async (page) => {
   assert(texts[0].includes('SKHYUSDT') && texts[0].includes('做多') && texts[0].includes('3,825') && texts[0].includes('+125'), `Binance ADR long row: ${texts[0]}`);
   assert(texts[1].includes('SKHYNIXUSDT') && texts[1].includes('无持仓'), `Binance ordinary-share empty row: ${texts[1]}`);
   assert(texts[3].includes('SKHYNIXUSDT') && texts[3].includes('做空') && texts[3].includes('−25'), `Bybit ordinary-share short row: ${texts[3]}`);
-  assert((await section.innerText()).includes('不计入下方原油总盈亏与资金费'), 'section states that SK hynix stays out of oil PnL and funding');
+  assert((await section.innerText()).includes('不计入「盈亏资金费」中的原油总盈亏与资金费'), 'section states that SK hynix stays out of oil PnL and funding');
 
   bybitFailure = true; await refreshCache();
   await section.getByText('Bybit 仓位读取失败（HTTP 400，Bybit 10001）', { exact: false }).waitFor();

@@ -4,6 +4,7 @@ import { BellRing, CircleAlert, KeyRound, LoaderCircle, Send } from 'lucide-reac
 import { api, ApiError } from './api';
 import type { AnthropicShares } from './trading-execution-types';
 import { contractKey, findContract, sharesPerUnit } from './trading-anthropic';
+import { amount, beijingTime, polarity } from './trading-format';
 
 type Source = 'binance' | 'okx' | 'hyperliquid' | 'rh-lighter';
 type ReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
@@ -21,19 +22,9 @@ type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { confi
 const BASE = '/api/trading/anthropic';
 const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' };
 const STATES: Record<ReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
-const UNCONNECTED: Record<Source, string> = { binance: '在下方「账户连接」连接 Binance 只读账户后显示。', okx: '在下方「账户连接」连接 OKX 只读账户后显示。', hyperliquid: '在上方实盘执行区连接 Hyperliquid 后，按主账户地址读取。', 'rh-lighter': '在上方实盘执行区连接 Lighter RH 后，按钱包地址读取其下全部账户。' };
+const UNCONNECTED: Record<Source, string> = { binance: '在「账户连接」标签连接 Binance 只读账户后显示。', okx: '在「账户连接」标签连接 OKX 只读账户后显示。', hyperliquid: '在「价差下单」标签的实盘账户连接中连接 Hyperliquid 后，按主账户地址读取。', 'rh-lighter': '在「价差下单」标签的实盘账户连接中连接 Lighter RH 后，按钱包地址读取其下全部账户。' };
 const HISTORY: Record<HistoryEntry['status'], string> = { sent: '已发送', failed: '发送失败', uncertain: '结果未知' };
-const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
-const formatDate = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? dateFormat.format(new Date(value)) : '尚未读取';
-// Exchange decimal strings are shown as sent; only the share estimate is a float.
-function amount(value: string | null, signed = false) {
-  if (value === null || !/^-?\d+(?:\.\d+)?$/.test(value)) return '—';
-  const negative = value.startsWith('-'), nonzero = /[1-9]/.test(value);
-  const [integer, fraction] = value.replace(/^-/, '').split('.');
-  const decimals = fraction?.replace(/0+$/, '');
-  return `${negative && nonzero ? '−' : signed && nonzero ? '+' : ''}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${decimals ? `.${decimals}` : ''}`;
-}
-const polarity = (value: string | null) => value === null || !/[1-9]/.test(value) ? '' : value.startsWith('-') ? 'trading-negative' : 'trading-positive';
+const formatDate = (value: string | null) => beijingTime(value);
 const shareText = (value: number) => value.toLocaleString('zh-CN', { maximumFractionDigits: value < 100 ? 2 : 0 });
 
 /** Estimated shares a leg stands for under the page's share-count assumption; null when unknown. */
@@ -138,7 +129,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         </tr>;
       })}</tbody></table></div> : <p className="trading-anthropic-empty">{data.sources.some(source => source.state === 'live') ? '已连接的账户当前没有 Anthropic 仓位。' : '尚无可确认的 Anthropic 仓位数据。'}</p>}
       {positions.length ? <div className={`trading-structure ${Number.isFinite(longShares) && Number.isFinite(shortShares) ? 'opposed' : 'incomplete'}`}><span>多空股数</span><strong>{Number.isFinite(longShares) && Number.isFinite(shortShares)
-        ? `多头 ≈ ${shareText(longShares)} 股 · 空头 ≈ ${shareText(shortShares)} 股 · 差 ${shareText(Math.abs(longShares - shortShares))} 股（按上方股数假设 ${shares.outstanding}B / ${shares.diluted}B 估算）`
+        ? `多头 ≈ ${shareText(longShares)} 股 · 空头 ≈ ${shareText(shortShares)} 股 · 差 ${shareText(Math.abs(longShares - shortShares))} 股（按「价差下单」中的股数假设 ${shares.outstanding}B / ${shares.diluted}B 估算）`
         : '股数假设无效，暂不估算多空股数'}</strong></div> : null}
 
       <div className="trading-anthropic-alerts">

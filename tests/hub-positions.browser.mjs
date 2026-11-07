@@ -208,7 +208,7 @@ async (page) => {
     neverRespond = false; release();
 
     await ask(monitor, { type: 'open-trading', market: 'oil' });
-    await page.getByRole('heading', { name: '交易所仓位', exact: true }).waitFor();
+    await page.getByRole('heading', { name: '交易中心', exact: true }).waitFor();
     const target = new URL(page.url()).searchParams;
     assert(target.get('view') === 'trading' && target.get('tradingSection') === 'positions' && [...target.keys()].length === 2, `open-trading url ${page.url()}`);
 

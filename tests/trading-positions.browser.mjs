@@ -61,8 +61,11 @@ async (page) => {
   await page.clock.install({ time: new Date(base) });
   try {
   await page.setViewportSize({ width: 1440, height: 1000 });
+  const tab = name => page.getByRole('tab', { name, exact: true });
+  const selected = async name => await tab(name).getAttribute('aria-selected') === 'true';
   await page.goto(`${origin}/?view=trading`);
-  await page.getByRole('heading', { name: '交易所仓位', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '交易中心', exact: true }).waitFor();
+  assert(await selected('全部仓位'), 'trading center opens on the all-positions tab');
   await page.locator('[data-position-id="btc-long"]').waitFor();
   assert(oilReads() === 0, 'default trading entry must not fetch oil or execution data');
   assert(await page.locator('.execution-panel,.trading-pnl,input[type="password"]').count() === 0, 'default positions has no execution, charts or credential fields');
@@ -105,25 +108,39 @@ async (page) => {
   await page.getByRole('button', { name: '在 Asset 备用账本 管理账户', exact: true }).click();
   assert(new URL(page.url()).searchParams.get('id') === 'asset-two', 'manage account navigates to selected Asset project');
   await page.getByRole('button', { name: '交易中心', exact: true }).click();
-  await page.getByRole('heading', { name: '交易所仓位', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '交易中心', exact: true }).waitFor();
   await page.locator('[data-position-id="btc-long"]').waitFor();
   assert(new URL(page.url()).searchParams.get('tradingSection') === 'positions' && oilReads() === 0, 'main navigation enters positions explicitly');
 
   await page.goto(`${origin}/?view=trading&tradingDays=30&tradingPair=binance,okx`);
-  await page.getByRole('heading', { name: '套利交易', exact: true }).waitFor();
+  await page.getByRole('heading', { name: '组合交易', exact: true }).waitFor();
+  assert(await selected('价差下单'), 'legacy oil links open the trade tab');
+  await tab('盈亏资金费').click();
   await page.locator('.trading-funding').waitFor();
   assert(requests.some(request => request.path === '/api/trading' && new URLSearchParams(request.search).get('days') === '30' && new URLSearchParams(request.search).get('pair') === 'binance,okx'), 'legacy oil links preserve range and pair');
-  await page.getByRole('button', { name: '交易所仓位', exact: true }).click();
+  await tab('全部仓位').click();
   await page.locator('[data-position-id="btc-long"]').waitFor();
   assert(new URL(page.url()).searchParams.get('tradingSection') === 'positions', 'explicit positions overrides old oil parameters');
+  assert(await page.locator('.trading-page').count() === 1 && await page.locator('.trading-page').isHidden(), 'arbitrage tabs stay mounted but hidden on the positions tab');
   await page.goBack();
-  await page.getByRole('heading', { name: '套利交易', exact: true }).waitFor();
+  await page.locator('.trading-funding').waitFor();
+  assert(await selected('盈亏资金费'), 'history restores the previous tab');
   await page.goForward();
   await page.locator('[data-position-id="btc-long"]').waitFor();
-  await page.getByRole('button', { name: '套利交易', exact: true }).click();
-  await page.getByRole('heading', { name: '套利交易', exact: true }).waitFor();
+  await tab('价差下单').click();
+  await page.getByRole('heading', { name: '组合交易', exact: true }).waitFor();
   assert(new URL(page.url()).searchParams.get('tradingDays') === '30', 'return to oil preserves cached range');
-  await page.getByRole('button', { name: '交易所仓位', exact: true }).click();
+  await tab('全部仓位').click();
+  await page.locator('[data-position-id="btc-long"]').waitFor();
+  // A history step onto a positions entry without pair parameters (like main navigation) must not reset the mounted arbitrage selection.
+  await page.evaluate(() => { history.pushState(null, '', '?view=trading&tradingSection=positions'); history.pushState(null, '', '?view=trading&tradingSection=positions&step=1'); });
+  await page.goBack();
+  await page.waitForFunction(() => !location.search.includes('step='));
+  await tab('价差下单').click();
+  await page.getByRole('heading', { name: '组合交易', exact: true }).waitFor();
+  const kept = new URL(page.url()).searchParams;
+  assert(kept.get('tradingPair') === 'binance,okx' && kept.get('tradingDays') === '30', 'history on the positions tab keeps the arbitrage pair and range');
+  await tab('全部仓位').click();
   await page.locator('[data-position-id="btc-long"]').waitFor();
 
   await page.setViewportSize({ width: 390, height: 844 });
@@ -141,7 +158,7 @@ async (page) => {
   const inactiveOilReads = oilReads(), foreground = positionsReads();
   elapsed += 15_000; await page.clock.runFor(15_000);
   assert(positionsReads() >= foreground + 2, 'foreground checks positions every five seconds');
-  assert(oilReads() === inactiveOilReads, 'unmounted oil page stops all polling');
+  assert(oilReads() > inactiveOilReads, 'visited arbitrage tabs stay mounted and keep their cache current');
   await page.evaluate(() => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => true }); document.dispatchEvent(new Event('visibilitychange')); });
   const hiddenReads = positionsReads(); elapsed += 15_000; await page.clock.runFor(15_000);
   assert(positionsReads() === hiddenReads, 'hidden page slows polling');

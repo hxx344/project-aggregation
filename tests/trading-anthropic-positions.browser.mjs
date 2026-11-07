@@ -54,7 +54,7 @@ async (page) => {
   const section = page.locator('section.trading-anthropic-positions');
   const rows = section.locator('.trading-position-table tbody tr');
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await section.getByRole('heading', { name: 'Anthropic 套利仓位', exact: true }).waitFor();
   await rows.first().waitFor();
   assert(await rows.count() === 4, 'one row per leg across Binance, OKX, Hyperliquid and Lighter RH');

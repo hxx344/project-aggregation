@@ -1,10 +1,10 @@
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowUpRight, ChevronDown, CircleAlert, LoaderCircle, RefreshCw, ShieldCheck, Wallet } from 'lucide-react';
 import { api, ApiError } from './api';
+import { amount, beijingTime } from './trading-format';
 import type { AssetPosition, PositionAccount, PositionScope, PositionScopeStatus, PositionSource, TradingPositionsResponse } from './trading-positions-types';
 
 const staleAfterMs = 90_000;
-const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const statusNames: Record<PositionScopeStatus, string> = { unconfigured: '未配置', loading: '首次读取中', live: '已同步', stale: '旧值', error: '读取失败', unsupported: '暂不支持' };
 const sourceNames = { ready: '来源已连接', unconfigured: '未配置连接', unavailable: '来源不可用', stale: '来源旧值' };
 type Filters = { source: string; exchange: string; account: string };
@@ -14,17 +14,9 @@ function readFilters(): Filters {
   return { source: params.get(filterParams.source) || '', exchange: params.get(filterParams.exchange) || '', account: params.get(filterParams.account) || '' };
 }
 const accountKey = (sourceId: string, exchangeId: string, account: PositionAccount) => JSON.stringify([sourceId, exchangeId, account.id]);
-const formatDate = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? dateFormat.format(new Date(value)) : '尚未读取';
+const formatDate = (value: string | null) => beijingTime(value);
 const oldTime = (value: string | null, now: number) => !value || !Number.isFinite(Date.parse(value)) || now - Date.parse(value) > staleAfterMs;
 
-// Do not convert exchange decimal strings to floating point numbers.
-function amount(value: string | null, signed = false) {
-  if (value === null || !/^-?\d+(?:\.\d+)?$/.test(value)) return '—';
-  const negative = value.startsWith('-'), nonzero = /[1-9]/.test(value);
-  const [integer, fraction] = value.replace(/^-/, '').split('.');
-  const decimals = fraction?.replace(/0+$/, '');
-  return `${negative && nonzero ? '−' : signed && nonzero ? '+' : ''}${integer.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}${decimals ? `.${decimals}` : ''}`;
-}
 function Money({ value, currency, signed = false }: { value: string | null; currency: string | null; signed?: boolean }) {
   return <>{amount(value, signed)}{value !== null ? <small className="positions-unit">{currency || '币种未提供'}</small> : null}</>;
 }
@@ -158,8 +150,7 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
   const sourceStale = (source: PositionSource) => stale || source.status !== 'ready' || oldTime(source.checkedAt, now);
   const issues = sources.some(source => sourceStale(source) || source.data?.exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status !== 'live' || oldTime(scope.fetchedAt, now)))));
   return <div className="positions-page">
-    <header className="positions-heading"><div><h1>交易所仓位</h1><p>查看 Asset 中各交易所账户的持仓。</p></div><button className="button secondary" onClick={() => void load(true)} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></header>
-    <div className="positions-readonly"><ShieldCheck size={15} /><span>只读查看 · 账户在 Asset 管理</span></div>
+    <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>Asset 中全部交易所账户的持仓 · 只读查看，账户在 Asset 管理</span></p><button className="button secondary" onClick={() => void load(true)} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
     {offline ? <div className="positions-notice" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的旧值；连接恢复后自动更新。</div> : null}
     {error ? <div className="positions-notice" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据，已标记为旧值。' : ''}</span></div> : null}
     {data ? <>

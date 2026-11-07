@@ -4,11 +4,6 @@
 .trading-page .button{min-height:32px}
 .trading-page button:focus-visible,.trading-page summary:focus-visible,.trading-page input:focus-visible,.trading-page select:focus-visible,.trading-page [tabindex]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 
-.trading-heading{display:flex;justify-content:space-between;gap:16px;align-items:center;margin-bottom:14px}
-.trading-title-line{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.trading-title-line h1{font-size:1.25rem;font-weight:650;letter-spacing:-.025em;color:var(--text-primary)}
-.trading-heading p{margin-top:4px;color:var(--text-tertiary);font-size:.75rem}
-.trading-heading>.button{flex-shrink:0}
 
 .trading-readonly{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;color:var(--emerald);background:var(--emerald-soft);font-size:12px;border-radius:var(--radius-sm)}
 
@@ -134,12 +129,6 @@
 .trading-pagination>div{display:flex;gap:8px}
 .trading-pagination .button{font-size:12px;padding:7px 12px}
 
-.trading-connections>summary{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;cursor:pointer;list-style:none;gap:10px;color:var(--text-primary)}
-.trading-connections>summary::-webkit-details-marker{display:none}
-.trading-connections>summary>span{display:flex;align-items:center;gap:10px;min-width:0}
-.trading-connections>summary strong{font-size:.875rem;font-weight:550}
-.trading-connections>summary small{font-size:12px;color:var(--text-tertiary)}
-.trading-connections[open]>summary>svg{transform:rotate(180deg)}
 .trading-connections-body{border-top:1px solid var(--surface-4);padding:14px 16px 16px}
 
 .trading-connection-note{font-size:12px;color:var(--text-tertiary);line-height:1.8;margin-bottom:20px!important}
@@ -219,7 +208,7 @@
 .trading-pnl-inspect b{font-weight:500;color:var(--text-primary);overflow-wrap:anywhere}
 .trading-pnl-chart>.trading-footnote{padding:12px 0 0}
 
-.trading-pair-selector{display:flex;flex-wrap:wrap;gap:6px;margin:-4px 0 14px}
+.trading-pair-selector{display:flex;flex-wrap:wrap;gap:6px}
 .trading-pair-selector button{min-height:32px;padding:5px 12px;border:1px solid var(--surface-5);border-radius:var(--radius-md);background:var(--surface-3);color:var(--text-secondary);cursor:pointer;font-size:13px;transition:background-color .2s ease,border-color .2s ease,color .2s ease,box-shadow .2s ease,transform .2s ease}
 .trading-pair-selector button:hover:not(:disabled){border-color:var(--accent);background:var(--surface-4)}
 .trading-pair-selector button[aria-pressed=true]{border-color:var(--accent);background:var(--accent-subtle);color:var(--accent);font-weight:600}
@@ -256,7 +245,6 @@
 .trading-anthropic-history ul{margin:6px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:4px;color:var(--text-tertiary)}
 
 @media(max-width:1150px) and (min-width:761px){
-  .trading-title-line h1{font-size:1.1875rem}
   .trading-position-table th,.trading-position-table td{padding-inline:10px}
   .trading-account-forms{gap:20px}
   .trading-account-form+.trading-account-form{padding-left:20px}
@@ -270,11 +258,6 @@
 @media(max-width:760px){
   .trading-import-sources{padding:12px}
   .trading-account-import input,.trading-account-import select{font-size:16px}
-  .trading-heading{align-items:flex-start;margin-bottom:12px;gap:12px}
-  .trading-title-line{gap:8px}
-  .trading-title-line h1{font-size:1.125rem}
-  .trading-heading p{font-size:12px}
-  .trading-heading>.button{font-size:12px;padding:8px 10px;white-space:nowrap}
   .trading-panel{margin-bottom:18px}
   .trading-panel-heading{padding:12px 14px 10px;gap:12px}
   .trading-panel-heading h2{font-size:.9375rem}
@@ -323,10 +306,6 @@
   .trading-pagination{padding:14px 16px;flex-wrap:wrap}
   .trading-pagination>span{font-size:11px}
   .trading-pagination>div{margin-left:auto}
-  .trading-connections>summary{padding:18px 16px}
-  .trading-connections>summary>span{gap:8px}
-  .trading-connections>summary strong{font-size:14px}
-  .trading-connections>summary small{font-size:11px}
   .trading-connections-body{padding:16px}
   .trading-account-form input{font-size:16px}
   .trading-notice{align-items:flex-start;font-size:12px;padding:12px;flex-wrap:wrap}
@@ -351,10 +330,6 @@
 }
 
 @media(max-width:430px){
-  .trading-heading{flex-wrap:wrap}
-  .trading-heading>.button{margin-left:auto}
-  .trading-title-line h1{font-size:1.125rem}
-  .trading-heading>div{flex:1 1 240px}
   .trading-account-status{padding-inline:12px}
   .trading-account-status .trading-muted{flex-basis:100%;font-size:10px}
   .trading-funding-coverage>div>span:not(.trading-status){flex-basis:100%;margin-top:1px}
