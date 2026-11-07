@@ -118,6 +118,39 @@ async function fixture(t, { realLighter = false } = {}) {
 }
 const message = item => item.message ?? item;
 
+test('Anthropic market legs refresh the fast book after a slow sibling before sending either leg', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  const body = anthropic({ legs: anthropic().legs.map(leg => ({ ...leg, orderType: 'market' })) });
+  f.start(await f.preview(body));
+  f.handlers['rh-lighter:market'] = async symbol => {
+    f.advance(11_000);
+    return { symbol, at: new Date(f.time).toISOString(), ...structuredClone(RULES['rh-lighter:ANTHROPIC']) };
+  };
+  const before = f.calls.filter(call => call.method === 'market' && call.exchange === 'binance').length;
+  await f.service.tick();
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates().length, 2);
+  assert.ok(f.creates().every(call => call.args[1].orderType === 'market'));
+  assert.equal(f.calls.filter(call => call.method === 'market' && call.exchange === 'binance').length - before, 2);
+});
+
+test('Anthropic market legs wait without sending on stale books and send once after fresh recovery', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  const body = anthropic({ legs: anthropic().legs.map(leg => ({ ...leg, orderType: 'market' })) });
+  f.start(await f.preview(body));
+  f.overrides['binance:ANTHROPICUSDT'] = { at: new Date(f.time - 11_000).toISOString() };
+  await f.service.tick();
+  assert.equal(f.creates().length, 0); assert.equal(f.job.status, 'queued');
+  assert.match(f.job.reason, /Binance ANTHROPICUSDT.*盘口已过期.*11\.0 秒/);
+  f.advance(1000); await f.service.tick();
+  assert.equal(f.creates().length, 0);
+  delete f.overrides['binance:ANTHROPICUSDT'];
+  await f.service.tick();
+  assert.equal(f.job.status, 'running'); assert.equal(f.job.reason, null); assert.equal(f.creates().length, 2);
+  for (const record of f.records.values()) Object.assign(record, { terminal: true, childrenSettled: true, status: 'terminal', filledQuantity: record.quantity });
+  await f.service.tick();
+  assert.equal(f.job.status, 'completed'); assert.equal(f.creates().length, 2);
+});
+
 test('a Lighter RH connection accepts exactly address, account index, API key index and API key, and shows only public labels', async t => {
   const f = await fixture(t);
   const refused = [
