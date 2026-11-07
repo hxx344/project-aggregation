@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, WaitError, StaleMarketError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
+import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_VENUE_SYMBOLS } from './trading-markets.mjs';
 import { orderPrice, stepDecimals } from './trading-hyperliquid-execution.mjs';
 import { orderPrice as rhLighterOrderPrice, RH_LIGHTER_TX_EXPIRES_MS } from './trading-rh-lighter-execution.mjs';
@@ -115,6 +115,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const readFailures = new Map();
   const marketFailures = new Map();
   const rateReadFailures = new Map();
+  const externalWaits = new Map();
   let protectionReady = !accountWriter;
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
   function lostLease() {
@@ -679,10 +680,21 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     } }); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(502, safeError(error)); }
     check();
     const reading = readReductionRisk(config, collected.snapshots, now());
-    if (!reading.met) return { jobId: null, live: reading };
+    if (!reading.met) {
+      // Surface what would block the trigger while there is still time to act.
+      const blocked = [];
+      for (const leg of config.legs) {
+        try { ensureNoExternalOrders(collected.snapshots.get(leg.exchange), leg.symbol); }
+        catch { blocked.push(`${leg.exchange} ${leg.symbol}`); }
+      }
+      return { jobId: null, live: { ...reading, warning: blocked.length ? `${blocked.join('、')} 存在其它活动委托或无法核对委托；达到阈值时将等待其撤销后才能减仓` : null } };
+    }
     const quantities = reductionQuantities(config, reading, collected.markets, now());
     const intent = normalizeIntent(reductionIntent(config, quantities));
-    const plan = { ...buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()), id: randomUUID(), resumeJobId: null, connections: [...collected.connections.values()] };
+    let built;
+    try { built = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()); }
+    catch (error) { if (error instanceof ExternalOrdersError) error.reading = reading; throw error; }
+    const plan = { ...built, id: randomUUID(), resumeJobId: null, connections: [...collected.connections.values()] };
     checkReductionDuration(plan.batchCount, plan.batchIntervalMs, plan.timeoutMs);
     writable();
     const jobId = transaction(() => {
@@ -1255,6 +1267,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (job.reason === previous.reason) job.reason = null;
     event(job, 'Lighter RH 限速后的必要读取与校验已恢复，继续执行'); saveJob(job);
   }
+  function externalOrdersRecovered(id) {
+    const reason = externalWaits.get(id);
+    if (reason === undefined) return;
+    externalWaits.delete(id);
+    const job = jobFor(id);
+    if (job.reason === reason) job.reason = null;
+    event(job, '外部委托已撤销，继续下一批'); saveJob(job);
+  }
   function marketsRecovered(id) {
     if (!marketFailures.delete(id)) return;
     const job = jobFor(id); job.reason = null;
@@ -1405,7 +1425,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
           if (WALLET_VENUES.has(leg.exchange)) checkHyperliquidPrice(leg, market);
         },
       });
-      rateReadsRecovered(id); marketsRecovered(id); job = jobFor(id);
+      rateReadsRecovered(id); marketsRecovered(id); externalOrdersRecovered(id); job = jobFor(id);
       if (job.riskReduction && !all.length && !readReductionRisk(job.riskReduction.config, snapshots, now()).met) {
         job.status = 'stopped'; job.reason = '首批发送前强平距离已恢复，本轮双边均未发送';
         event(job, job.reason);
@@ -1429,6 +1449,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
           if (deferRateRead(id, error)) return;
           message = `Lighter RH 持续限速，自动恢复已达到重试上限（${message}）`;
         }
+        // A risk reduction must not be abandoned because the owner placed a
+        // TP/SL or limit order between batches: hold the next batch (nothing
+        // is sent or cancelled) until it is gone or the task deadline passes.
+        if (error instanceof ExternalOrdersError && latest.riskReduction && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
+          const reason = `${message.replace(/，请先处理后再预览$/, '')}；撤销后继续下一批，期间不发送新批次`;
+          if (latest.reason !== reason) { latest.reason = reason; event(latest, reason); saveJob(latest); }
+          externalWaits.set(id, reason); return;
+        }
         if (error instanceof StaleMarketError && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
           const streak = marketFailures.get(id) ?? { since: now(), count: 0 };
           if (streak.count < READ_RETRY_ATTEMPTS || now() - streak.since < READ_RETRY_MS) {
@@ -1443,7 +1471,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       } catch { /* A new lease owner will reconcile durable intents. */ }
     } finally {
       busyJobs.delete(id);
-      if (!['queued', 'running'].includes(jobFor(id).status)) { readFailures.delete(id); marketFailures.delete(id); rateReadFailures.delete(id); }
+      if (!['queued', 'running'].includes(jobFor(id).status)) { readFailures.delete(id); marketFailures.delete(id); rateReadFailures.delete(id); externalWaits.delete(id); }
       if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); attentionChecks.delete(id); }
     }
   }

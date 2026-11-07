@@ -1,4 +1,4 @@
-import { ExecutionError, WaitError, StaleMarketError, exactKeys } from './trading-execution-plan.mjs';
+import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, exactKeys } from './trading-execution-plan.mjs';
 import { normalizeReductionConfig } from './trading-reduction-plan.mjs';
 import { immediate } from './control/schema.mjs';
 
@@ -121,10 +121,20 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
         if (closed || !execution.leading()) return;
         value = record();
         if (value.revision !== revision || !value.config?.enabled || value.state.jobId) return;
-        live = null;
+        // A trigger held by the owner's orders keeps its risk reading visible.
+        live = error instanceof ExternalOrdersError && error.reading ? error.reading : null;
         const message = error instanceof ExecutionError ? error.message : '自动减仓读取或记录失败，本轮没有新建任务';
+        const previous = value.state.reason;
         value.state.reason = message;
         if (error instanceof WaitError) { value.state.retryAt = iso(now() + 30_000); }
+        else if (error instanceof ExternalOrdersError) {
+          // The owner's own TP/SL or limit order must not silently disarm the
+          // protection at the moment it is needed. Keep the rule armed and
+          // retry; the reason stays visible until the orders are gone.
+          value.state.reason = `${message.replace(/，请先处理后再预览$/, '')}，撤销后自动减仓才会执行；规则保持启用`;
+          value.state.retryAt = iso(now() + 30_000);
+          if (value.state.reason !== previous) event(value, value.state.reason);
+        }
         else {
           value.state.failures += 1;
           // A changed account is never retried on a new binding. Read failures get

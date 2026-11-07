@@ -941,3 +941,19 @@ test('a REST repair started before a same-order write cannot return stale state 
   release();
   await assert.rejects(pending, error => isError('upstream')(error) && /早于最近写入/.test(error.message));
 });
+
+test('a stream reporting invalid data (e.g. a manual order row) falls back to exact REST for create, inspect and book (L103)', async () => {
+  const invalid = async () => { throw new ExecutionExchangeError('invalid_data', { detail: 'fixture malformed frame' }); };
+  const h = harness({ stream: { book: invalid, order: invalid, forget() {}, close() {} } });
+  const chase = spec();
+  h.orders.set(indexOf(chase), orderRow(chase));
+  // The pre-dispatch subscription failure is not a reason to refuse the send.
+  assert.deepEqual(await h.client.create(credentials, chase), { id: String(indexOf(chase)), kind: 'order' });
+  assert.equal(h.of(SEND).length, 1);
+  h.advance(10_000);
+  h.orders.set(indexOf(chase), orderRow(chase, { status: 'filled', filled_base_amount: chase.quantity, remaining_base_amount: '0', filled_quote_amount: '176.05' }));
+  assert.equal((await h.client.inspect(credentials, chase)).terminal, true);
+  const book = await h.client.market('ANTHROPIC', { withRule: false });
+  assert.equal(book.bid, '352.1'); assert.equal(book.ask, '352.3');
+  assert.ok(h.of('/api/v1/orderBookOrders').length >= 1);
+});

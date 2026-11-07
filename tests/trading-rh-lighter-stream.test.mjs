@@ -140,6 +140,8 @@ test('order identity validates envelope, market, owner and numeric/string client
     f => f.orderFrame([f.row({ client_order_id: '8' })]),
     f => f.orderFrame([f.row({ order_id: '100' })]),
     f => f.orderFrame([f.row({ client_order_index: 1.2 })]),
+    f => f.orderFrame([f.row({ client_order_index: undefined, client_order_id: undefined })]),
+    f => f.orderFrame([f.row({ client_order_index: 0, client_order_id: '0', owner_account_index: 13 })]),
     f => f.orderFrame([f.row()], -1),
     f => f.orderFrame([f.row(), f.row()]),
     f => f.orderFrame([], 1, { orders: { 37: [f.row()] } }),
@@ -147,6 +149,17 @@ test('order identity validates envelope, market, owner and numeric/string client
   for (const frame of invalid) {
     const f = fixture(); t.after(() => f.stream.close());
     const pending = assert.rejects(f.readOrder(), invalidData); f.sockets[0].connected(); f.sockets[0].frame(frame(f)); await pending;
+  }
+});
+
+test('manual rows with client index 0 are skipped instead of vetoing the snapshot', async t => {
+  for (const foreign of [{ client_order_index: 0, client_order_id: '0' }, { client_order_index: 0, client_order_id: undefined }]) {
+    const f = fixture(); t.after(() => f.stream.close());
+    const pending = f.readOrder(); f.sockets[0].connected();
+    f.sockets[0].frame(f.orderFrame([f.row({ ...foreign, order_index: 500, order_id: '500', status: 'unexpected' }), f.row()]));
+    const row = await pending;
+    assert.equal(row.client_order_index, 7); assert.equal(row.order_index, 99);
+    assert.equal(f.sockets[0].closed, false);
   }
 });
 

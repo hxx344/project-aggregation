@@ -115,6 +115,7 @@ export default function TradingAnthropicReduction({ shares, onExpired }: { share
       {data.state.reason ? <p className="trading-warning" role="alert">{data.state.reason}</p> : null}
       {data.maintenance ? <p className="trading-warning">当前处于维护状态，不能启用新触发。</p> : null}
       {executing ? <p className="trading-muted">当前减仓任务尚未结束；请先在「价差下单」核对执行，之后再修改规则。</p> : null}
+      {data.live?.warning ? <p className="trading-warning" role="alert">{data.live.warning}</p> : null}
       {data.live ? <div className="trading-anthropic-reduction-live"><p>最近风险检查：{beijingTime(data.live.checkedAt)}（北京时间） · {data.live.met ? '已达到触发阈值' : '未达到触发阈值'}</p><ul>{data.live.legs.map(leg => <li key={`${leg.exchange}:${leg.symbol}:${leg.side}`}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 持仓 {amount(leg.quantity)} 原生单位 · 距强平 {leg.distancePercent === null ? '未提供' : `${leg.distancePercent}%`}</li>)}</ul></div> : <p className="trading-muted">尚无自动减仓风险检查结果。两腿都需要有效、新鲜的强平价；缺少任一腿的数据时，不会自动发送委托。</p>}
       {data.job ? <div className="trading-anthropic-reduction-progress" aria-label="自动减仓执行进度"><strong>执行进度 · 第 {Math.min(data.job.batchIndex + 1, data.job.batchCount)} / {data.job.batchCount} 批</strong><ul>{data.job.legs.map(leg => <li key={leg.id}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 已成交 {amount(leg.filledQuantity)} / 目标 {amount(leg.quantity)} · 剩余 {amount(leg.remainingQuantity)} 原生单位</li>)}</ul><p>执行编号：{data.job.id}</p></div> : null}
       <form onSubmit={event => void write('save', event)} aria-label="ANT 自动减仓设置">

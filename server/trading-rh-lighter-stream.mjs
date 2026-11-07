@@ -251,6 +251,11 @@ export function createRhLighterStream({ ErrorClass = Error, WebSocketImpl = glob
     if (!Array.isArray(rows) || rows.length > MAX_ORDERS) throw invalid('订单快照过大');
     const seen = new Set(), updates = [];
     for (const row of rows) {
+      // The snapshot carries every order of the account in this market. A
+      // manual or venue-generated order has client index 0; it can never be
+      // one the engine addresses, so it must not veto the rest. Any other
+      // malformed index still fails the snapshot as a format change.
+      if (object(row) && row.client_order_index === 0 && row.market_index === sub.marketId && row.owner_account_index === sub.accountIndex) continue;
       if (!object(row) || row.market_index !== sub.marketId || row.owner_account_index !== sub.accountIndex
         || !integer(row.client_order_index, 1, 2 ** 48 - 1) || !integer(row.order_index, 1)
         || !integer(row.order_version) || !integer(row.nonce) || (!WORKING.has(row.status) && !TERMINAL.has(row.status))

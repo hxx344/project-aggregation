@@ -348,3 +348,53 @@ test('a late risk read from a former lease owner cannot persist a failure or mod
   assert.deepEqual(f.db.prepare('SELECT * FROM execution_anthropic_reduction').get(), before);
   assert.equal(f.jobs.length, 0); assert.deepEqual(f.locks(), []); assert.equal(f.creates.length, 0);
 });
+
+test('an owner TP/SL or limit order on a leg warns before the trigger and defers, not disarms, the rule when risk is reached', async t => {
+  const f = await fixture(t);
+  f.accounts.okx.openOrders = [{ symbol: SYMBOL, id: 'manual-tp-1' }];
+  // Below the trigger: the read succeeds and surfaces the future blocker.
+  f.enable({ thresholdPercent: '1' }); await f.reduction.tick();
+  assert.equal(f.state.live.met, false); assert.match(f.state.live.warning, /okx ANTHROPICUSDT/);
+  assert.equal(f.state.state.reason, null); assert.equal(f.state.state.failures, 0);
+  // At the trigger: no task, no send, the rule stays armed and retries.
+  f.reduction.disable({ revision: f.state.revision }); f.enable(); await f.reduction.tick();
+  assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0); assert.deepEqual(f.locks(), []);
+  assert.equal(f.state.config.enabled, true); assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.state.failures, 0);
+  assert.equal(f.state.state.retryAt, stamp(TIME + 30_000)); assert.match(f.state.state.reason, /活动委托.*规则保持启用/);
+  assert.equal(f.state.live.met, true, 'the held trigger keeps its liquidation reading visible');
+  const events = f.state.state.events.length;
+  await f.wait(30_000);
+  for (const account of Object.values(f.accounts)) for (const position of account.positions) position.risk.at = stamp(TIME + 30_000);
+  await f.reduction.tick();
+  assert.equal(f.state.config.enabled, true); assert.equal(f.state.state.events.length, events, 'a repeated identical blocker is not logged again');
+  // Once the owner cancels the order the next retry reduces.
+  f.accounts.okx.openOrders = [];
+  await f.wait(30_000);
+  for (const account of Object.values(f.accounts)) for (const position of account.positions) position.risk.at = stamp(TIME + 60_000);
+  await f.reduction.tick();
+  assert.equal(f.jobs.length, 1); assert.equal(f.state.state.phase, 'reducing');
+});
+
+test('an owner order placed between batches holds the next batch without cancelling or disarming, then resumes', async t => {
+  const f = await fixture(t); f.enable(); await f.reduction.tick();
+  await f.execution.tick(); await f.finishBatch(); f.advance(1000);
+  const sent = f.creates.length, stops = f.calls.filter(row => row.method === 'stop').length;
+  f.accounts.okx.openOrders = [{ symbol: SYMBOL, id: 'manual-sl-1' }];
+  await f.execution.tick(); await f.execution.tick(); await f.reduction.tick();
+  assert.equal(f.creates.length, sent); assert.equal(f.calls.filter(row => row.method === 'stop').length, stops);
+  assert.equal(f.jobs[0].status, 'running'); assert.match(f.jobs[0].reason, /活动委托.*撤销后继续下一批/);
+  assert.equal(f.state.state.phase, 'reducing'); assert.equal(f.state.config.enabled, true);
+  f.accounts.okx.openOrders = [];
+  await f.execution.tick(); assert.equal(f.creates.length, sent + 2);
+  assert.doesNotMatch(f.jobs[0].reason ?? '', /撤销后继续下一批/, 'the stale hold reason is cleared once batches resume');
+});
+
+test('an owner order still present at the task deadline pauses the reduction for review', async t => {
+  const f = await fixture(t); f.enable(); await f.reduction.tick();
+  await f.execution.tick(); await f.finishBatch(); f.advance(1000);
+  f.accounts.okx.openOrders = [{ symbol: SYMBOL, id: 'manual-sl-1' }];
+  await f.execution.tick(); assert.equal(f.jobs[0].status, 'running');
+  await f.wait(60_000); await f.reduction.tick();
+  assert.notEqual(f.jobs[0].status, 'running'); assert.match(f.jobs[0].reason, /执行时间已到/);
+  assert.equal(f.state.state.phase, 'review'); assert.equal(f.creates.length, 2, 'no batch is sent while the owner order remains');
+});

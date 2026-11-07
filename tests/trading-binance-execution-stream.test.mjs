@@ -304,3 +304,84 @@ for (const operation of ['create', 'amend']) {
     });
   }
 }
+
+test('a malformed or clock-skewed push frame disables the stream for that read but exact REST still answers (L103)', async t => {
+  const f = fixture(t); await f.boot();
+  assert.equal((await f.inspect()).filledQuantity, '0');
+  f.elapse(5001); // past the adapter's own five-second REST evidence cache
+  assert.equal((await f.inspect()).filledQuantity, '0');
+  const restBefore = f.orderReads().length;
+  // A malformed frame (unexpected status) fails the whole connection; the
+  // stream's cooldown then rethrows that invalid_data to every read.
+  f.privateSocket().frame(f.orderFrame({ X: 'NEW_INSURANCE' }));
+  f.state.handler = call => call.url.pathname.endsWith('/order') && call.init.method === 'GET'
+    ? f.row({ executedQty: '2', avgPrice: '80', status: 'FILLED' }) : undefined;
+  const filled = await f.inspect();
+  assert.equal(filled.terminal, true); assert.equal(filled.filledQuantity, '2');
+  assert.equal(f.orderReads().length, restBefore + 1);
+  // The public book stream behaves the same: a future-time frame falls back to REST.
+  await f.market();
+  f.publicSocket().frame(f.bookFrame({ T: f.now() + 5000, E: f.now() + 5000 }));
+  const book = await f.market();
+  assert.equal(book.bid, '80');
+  assert.ok(f.calls.some(call => call.url.pathname.endsWith('/ticker/bookTicker')));
+});
+
+test('a REST order read during a stream outage is not served as current after the stream reconnects', async t => {
+  const f = fixture(t); await f.boot();
+  f.state.privateAvailable = false; f.privateSocket().close();
+  const restBefore = f.orderReads().length;
+  assert.equal((await f.inspect()).terminal, false);
+  assert.equal(f.orderReads().length, restBefore + 1);
+  // The order fills while disconnected; the reconnected socket never replays it.
+  f.state.privateAvailable = true;
+  f.state.handler = call => call.url.pathname.endsWith('/order') && call.init.method === 'GET'
+    ? f.row({ executedQty: '2', avgPrice: '80', status: 'FILLED' }) : undefined;
+  f.elapse(16_000);
+  await f.client.account(credentials, { ...f.options, symbols: [spec.symbol] });
+  f.elapse(5001);
+  const after = await f.inspect();
+  assert.equal(after.terminal, true); assert.equal(after.filledQuantity, '2');
+});
+
+for (const path of ['inspect', 'amend']) {
+  test(`a ${path} REST row whose request spanned a disconnect and reconnect is not seeded into the new stream`, async t => {
+    const f = fixture(t); await f.boot();
+    let reconnected = false;
+    const filled = () => f.row({ executedQty: '2', avgPrice: '80', status: 'FILLED' });
+    f.state.handler = async call => {
+      if (!call.url.pathname.endsWith('/order')) return;
+      const method = call.init.method;
+      if (!reconnected && (path === 'inspect' ? method === 'GET' : method === 'PUT')) {
+        reconnected = true;
+        // The socket drops and a new one connects while this request is in flight.
+        f.privateSocket().close(); f.elapse(1001);
+        await f.stream.ready(credentials, f.options);
+        return f.row(path === 'amend' ? { price: '80.05' } : {});
+      }
+      if (method === 'GET') return filled(); // the gap's fill: no stream event follows
+    };
+    if (path === 'inspect') assert.equal((await f.inspect()).terminal, false);
+    else assert.equal((await f.client.amend(credentials, { ...exact, limitPrice: '80.05' }, f.options)).price, '80.05');
+    f.elapse(5001);
+    const after = await f.inspect();
+    assert.equal(after.terminal, true, 'the old-generation row must not answer as current'); assert.equal(after.filledQuantity, '2');
+  });
+}
+
+test('a stop REST row whose request spanned a disconnect and reconnect is checked by REST, not served from the new stream', async t => {
+  const f = fixture(t); await f.boot();
+  f.state.handler = async call => {
+    if (!call.url.pathname.endsWith('/order')) return;
+    if (call.init.method === 'DELETE') {
+      f.privateSocket().close(); f.elapse(1001);
+      await f.stream.ready(credentials, f.options);
+      return f.row({ executedQty: '1', avgPrice: '80', status: 'CANCELED' });
+    }
+    if (call.init.method === 'GET') return f.row({ executedQty: '1', avgPrice: '80', status: 'CANCELED' });
+  };
+  await f.client.stop(credentials, exact, f.options);
+  const reads = f.orderReads().length;
+  const after = await f.inspect();
+  assert.equal(after.terminal, true); assert.equal(f.orderReads().length, reads + 1, 'the old-generation stop row must be confirmed by REST');
+});

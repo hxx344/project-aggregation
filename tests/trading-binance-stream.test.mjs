@@ -347,9 +347,35 @@ test('delayed private frames invalidate their generation as recoverable upstream
     f.sockets[0].frame(f.orderFrame({ z: '4', ap: '100', X: 'FILLED' }));
     assert.equal(await f.stream.order(credentials, spec), null);
   }
-  for (const envelope of [{ E: undefined }, { T: 'invalid' }, { E: EPOCH + 1001 }, { T: EPOCH + 1001 }]) {
+  for (const envelope of [{ E: undefined }, { T: 'invalid' }]) {
     const f = fixture(); t.after(() => f.stream.close()); const errors = [];
     f.stream.subscribePositions(credentials, { onError: cause => errors.push(cause) }); await f.bootPrivate();
     f.sockets[0].frame(f.orderFrame({}, envelope)); assert.equal(errors[0].code, 'invalid_data');
   }
+  // A future time reflects the local server-time estimate, not malformed data.
+  for (const envelope of [{ E: EPOCH + 1001 }, { T: EPOCH + 1001 }]) {
+    const f = fixture(); t.after(() => f.stream.close()); const errors = [];
+    f.stream.subscribePositions(credentials, { onError: cause => errors.push(cause) }); await f.bootPrivate();
+    f.sockets[0].frame(f.orderFrame({}, envelope)); assert.equal(errors[0].code, 'upstream');
+  }
+});
+
+test('REST rows read while disconnected or across a reconnect are not seeded as current stream evidence', async t => {
+  const f = fixture(); t.after(() => f.stream.close());
+  const first = await f.bootPrivate();
+  assert.equal(f.stream.orderGeneration(credentials), first.generation);
+  // Disconnect: the gap's events will never be replayed by the next socket.
+  f.sockets[0].close();
+  assert.equal(f.stream.orderGeneration(credentials), null);
+  assert.equal(f.stream.seedOrder(credentials, f.row()), false);
+  assert.equal(f.stream.seedOrder(credentials, f.row(), { generation: first.generation }), false);
+  await f.advance(1000); f.sockets.at(-1).open();
+  const second = await f.stream.ready(credentials);
+  assert.ok(second.generation > first.generation);
+  // The order filled during the gap; no event arrives. A NEW row read before the
+  // reconnect must not be returned as the current status.
+  assert.equal(f.stream.seedOrder(credentials, f.row(), { generation: first.generation }), false);
+  assert.equal(await f.stream.order(credentials, spec), null);
+  assert.equal(f.stream.seedOrder(credentials, f.row(), { generation: second.generation }), true);
+  assert.equal((await f.stream.order(credentials, spec)).status, 'NEW');
 });
