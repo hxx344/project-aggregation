@@ -34,25 +34,6 @@ function rankableGroups(snapshot: PerpetualSnapshot, live: Set<string>, mode: Pe
   return groups.values();
 }
 
-/** Pairs that were rankable and aligned when `before` was shown and only the leg time skew removes from `after`. */
-function skewDroppedPairs(before: PerpetualSnapshot, beforeAt: number, after: PerpetualSnapshot, afterAt: number): SkewedPair[] {
-  if (before.status === 'unavailable' || after.status === 'unavailable') return [];
-  const previous = new Map(before.quotes.map(quote => [quoteKey(quote), quote]));
-  const liveBefore = liveVenues(before), liveAfter = liveVenues(after), dropped: SkewedPair[] = [];
-  for (const mode of PRICE_MODES) {
-    for (const group of rankableGroups(after, liveAfter, mode, afterAt)) for (let left = 0; left < group.length; left++) for (let right = left + 1; right < group.length; right++) {
-      const first = group[left], second = group[right];
-      if (first.exchange === second.exchange || aligned(first, second, mode)) continue;
-      const shownFirst = previous.get(quoteKey(first)), shownSecond = previous.get(quoteKey(second));
-      if (shownFirst && shownSecond && shownFirst.base === first.base && shownSecond.base === second.base && aligned(shownFirst, shownSecond, mode)
-        && rankable(shownFirst, liveBefore, mode, beforeAt, before.staleAfterMs) && rankable(shownSecond, liveBefore, mode, beforeAt, before.staleAfterMs)) {
-        dropped.push({ mode, base: first.base, first: quoteKey(first), second: quoteKey(second) });
-      }
-    }
-  }
-  return dropped;
-}
-
 /** Keep the latest accumulated frame without delaying first paint or explicit refreshes. */
 export function createPerpetualDisplay({ onData, now = () => performance.now(), sourceNow, schedule = (callback, delay) => setTimeout(callback, delay), cancel = timer => clearTimeout(timer as ReturnType<typeof setTimeout>) }: {
   onData: (snapshot: PerpetualSnapshot) => void;
@@ -68,10 +49,8 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   let displayed = new Map<string, PerpetualQuote>();
   // Actual publications own recovery history; the HEAD baseline above owns only its cadence.
   let recoveredAt = -Infinity, recoveryUsed = false;
-  // Pairs any publication has shown rankable and aligned. A seen pair that a later publication shows
-  // rankable but skewed waits for recovery, however it lost the row: a drop that coincided with an
-  // offline venue or a stale leg must not hide it from recovery forever (#220).
-  const seen = new Set<string>();
+  // Every published rankable but skewed pair waits for recovery, including cold-start/newly listed
+  // pairs that have never been shown aligned. An offline/stale interruption must not erase its turn.
   // A waiting pair stays queued, and keeps its priority, while it is briefly unrankable; it is only
   // ready while rankable and aligned, and leaves the queue once a publication shows it.
   // lastReadyAt and gap (the longest wait between two such realignments, 0 until observed) count
@@ -109,8 +88,8 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
           const first = group[left], second = group[right];
           if (first.exchange === second.exchange) continue;
           const pair = { mode, base: first.base, first: quoteKey(first), second: quoteKey(second) }, key = pairKey(pair);
-          if (aligned(first, second, mode)) { seen.add(key); skewed.delete(key); }
-          else if (seen.has(key) && !skewed.has(key)) skewed.set(key, { ...pair, since, lastReadyAt: -Infinity, gap: 0 });
+          if (aligned(first, second, mode)) skewed.delete(key);
+          else if (!skewed.has(key)) skewed.set(key, { ...pair, since, lastReadyAt: -Infinity, gap: 0 });
         }
       }
     }
@@ -127,7 +106,7 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
   };
   const reset = () => {
     clear(); clearRecovery(); latest = null; published = null; publishedAt = null; displayed = new Map();
-    seen.clear(); skewed.clear(); recoveredAt = -Infinity; recoveryUsed = false;
+    skewed.clear(); recoveredAt = -Infinity; recoveryUsed = false;
   };
   /** Sampling must not expire a displayed quote whose newer observation is already held back. */
   const expiryWait = (next: PerpetualSnapshot) => {
@@ -162,7 +141,9 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
       || due(quotePriceTime(quote, 'mark'), next.staleAfterMs) || due(quote.fundingAt, PERPETUAL_FUNDING_MAX_AGE_MS));
   };
   /**
-   * Recover skew without rotating which pairs are excluded or advancing another quote's expiry.
+   * Recover skew by fairly rotating eligible whole frames without advancing any quote's expiry.
+   * An aligned pair may temporarily replace a skewed baseline pair; show() queues the displaced
+   * pair with the actual publication time, so it can recover in turn (#218).
    * This is an additional whole-frame publication; the baseline timer and expiry protection remain
    * intact. At most one recovery is allowed between baseline publications and in any rolling 20s.
    * The longest-waiting candidate goes first: an older candidate that missed its last realignment
@@ -195,7 +176,6 @@ export function createPerpetualDisplay({ onData, now = () => performance.now(), 
       if (normalizedFunding8h(shown, at) !== null && (!quote || normalizedFunding8h(quote, at) === null
         || quote.fundingAt! < shown.fundingAt!)) return Infinity;
     }
-    if (skewDroppedPairs(published, at, next, at).length) return Infinity;
     noteSafeRealignment(ready);
     if (recoveryUsed) return Infinity;
     const checkedAt = now();

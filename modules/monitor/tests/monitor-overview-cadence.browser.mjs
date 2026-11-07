@@ -1,4 +1,4 @@
-// Start the production Next server on 3189, then use the existing Playwright CLI session:
+// Start the production SSR fixture on 3189, then use the existing Playwright CLI session:
 // playwright-cli run-code --filename tests/monitor-overview-cadence.browser.mjs
 // The fixture is local; API responses and the browser clock never depend on live markets.
 // eslint-disable-next-line @typescript-eslint/no-unused-expressions -- Playwright CLI evaluates this function.
@@ -48,7 +48,7 @@ async page => {
         const source = frozenOil ?? sourceAt(), fetchedAt = iso(source);
         const leg = (coin, markPx) => ({ coin, markPx, fundingRate: 0, fundingIntervalHours: 4, nextFundingAt: iso(source + 3_600_000) });
         return route.fulfill({ json: { source: 'Binance', currency: 'USDT', status: 'live', fetchedAt,
-          brent: leg('BZUSDT', 102 + generation(source)), wti: leg('CLUSDT', 100), collection: { maxAgeMs: 75_000 } } });
+          brent: leg('BZUSDT', 102 + generation(source)), wti: leg('CLUSDT', 80), collection: { maxAgeMs: 75_000 } } });
       }
       if (path === '/api/monitors/oil/candles/15m') return route.fulfill(failHistory ? unavailable : {
         json: { ...candles, status: 'live', metadata: { ...candles.metadata, fetchedAt: iso(now) } } });
@@ -73,7 +73,7 @@ async page => {
     const status = card => card.locator('.hub-card-status > span').textContent();
     const waitReading = (card, value) => until(async () => await reading(card) === value, `Expected card reading ${value}`);
     const waitStatus = (card, value) => until(async () => await status(card) === value, `Expected card status ${value}`);
-    const oilValue = () => `+${(2 + generation(frozenOil ?? sourceAt())).toFixed(3)}%`;
+    const oilValue = () => `+${(22 + generation(frozenOil ?? sourceAt())).toFixed(3)}`;
     const tick = async () => {
       const previous = count('oil/quote');
       await advance(10_000);
@@ -92,18 +92,22 @@ async page => {
       check(sameCounts(expected), `${reason} must refresh each overview feed exactly once`);
     };
 
-    // The server renders the seeded snapshot quote; a failed first read keeps it and marks the feed interrupted.
+    // The SSR fixture has no persisted quote. A failed first read must expose the empty/error state.
     const oilPanel = page.locator('[data-monitor="oil"]');
-    await waitStatus(oil, '更新中断 · 保留数据');
-    await oilPanel.locator('.data-status').filter({ hasText: '实时更新中断' }).waitFor();
+    await waitStatus(oil, '行情暂不可用');
+    await waitReading(oil, '—');
+    await oilPanel.locator('.data-status').filter({ hasText: '实时报价暂不可用' }).waitFor();
     check(count('oil/quote') === 1, 'A failed first visit must issue only one quote request');
     failOil = false; failHistory = false;
     await oilPanel.getByRole('button', { name: '刷新行情' }).click();
 
     // A 30-second collector last ran at source t=0; page polling starts at t=29s.
-    await waitReading(oil, '+2.000%');
+    await waitReading(oil, '+22.000');
     await waitReading(perpetual, '101');
-    await oilPanel.locator('.primary-metric .metric-value').filter({ hasText: '+2.000%' }).waitFor();
+    await until(async () => await oilPanel.locator('.primary-metric .metric-value').textContent() === '+22.000', 'The detail must show the absolute 22 USDT/barrel spread');
+    check(/USDT\s*\/\s*桶/.test(await oil.innerText()), 'The overview must identify the absolute spread unit');
+    check(/USDT\s*\/\s*桶/.test(await oilPanel.locator('.primary-metric').innerText()), 'The detail must identify the absolute spread unit');
+    check(!(await oil.innerText()).includes('+27.500%'), 'The overview primary reading must not use the percentage premium');
     check(count('oil/quote') === 2, 'One explicit oil retry must recover without creating another feed');
     scenarios.push('An uncached oil quote/history failure exposes the connection error; the detail retry recovers the quote');
     await tick(); await tick();
