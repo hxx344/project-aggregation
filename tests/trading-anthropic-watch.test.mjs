@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createAnthropicWatch, liquidationDistance, parseHyperliquidState, validateAlertConfig } from '../server/trading-anthropic-watch.mjs';
+import { createAnthropicWatch, liquidationDistance, parseHyperliquidState, parseRhLighterAccounts, validateAlertConfig } from '../server/trading-anthropic-watch.mjs';
 
 const ADDRESS = '0x' + 'a'.repeat(40);
 const quiet = { warn() {} };
@@ -12,9 +12,14 @@ const hlPosition = (coin, szi, liquidationPx, positionValue = '1000') => ({ type
 function harness({ cex = [], configured = true } = {}) {
   const dataDir = mkdtempSync(path.join(tmpdir(), 'anthropic-watch-'));
   let time = Date.parse('2026-11-06T00:00:00Z');
-  const books = { io: [], xyz: [] }, posts = [], requests = [], ownPosts = [];
-  let postFailure = null, hlFailure = null, gate = null, address = ADDRESS;
+  const books = { io: [], xyz: [] }, posts = [], requests = [], ownPosts = [], rhRequests = [];
+  let postFailure = null, hlFailure = null, rhFailure = null, gate = null, address = ADDRESS, rhAddress = null;
   const fetcher = async (url, init) => {
+    if (String(url).startsWith('https://api.rh.lighter.xyz/')) {
+      rhRequests.push(String(url));
+      if (rhFailure) return rhFailure();
+      return new Response(JSON.stringify({ code: 200, total: h.rhAccounts.length, accounts: h.rhAccounts }), { status: 200 });
+    }
     const body = JSON.parse(init.body);
     if (String(url).startsWith('https://open.feishu.cn/') && h.ownFail) return h.ownFail();
     if (String(url).startsWith('https://open.feishu.cn/')) { ownPosts.push({ url, text: body.card.elements[0].text.content, signed: !!body.sign }); return new Response(JSON.stringify({ code: 0 }), { status: 200 }); }
@@ -28,11 +33,12 @@ function harness({ cex = [], configured = true } = {}) {
   };
   const source = { value: cex };
   const create = () => {
-    const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: () => address, feishu, encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed), log: quiet, fetcher, now: () => time, intervalMs: 0 });
+    const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: exchange => exchange === 'hyperliquid' ? address : exchange === 'rh-lighter' ? rhAddress : null, feishu, encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed), log: quiet, fetcher, now: () => time, intervalMs: 0 });
     watch.initialize(); return watch;
   };
   const h = { digest: configured, books, posts, ownPosts, requests, source, dataDir, advance: ms => { time += ms; }, now: () => time, fail: error => { postFailure = error; },
     hlFail: make => { hlFailure = make; }, hold: promise => { gate = promise; }, setAddress: value => { address = value; },
+    rhAccounts: [], rhRequests, rhFail: make => { rhFailure = make; }, setRhAddress: value => { rhAddress = value; },
     restart: async () => { await h.watch.close(); h.watch = create(); },
     cleanup: () => rmSync(dataDir, { recursive: true, force: true }) };
   h.watch = create();
@@ -245,7 +251,7 @@ test('an alerted leg without a liquidation price clears, and a changed account d
     h.books.io = [hlPosition('io:ANTH', '-10', null)];
     await h.watch.poll();
     assert.equal(h.posts.length, 2); assert.match(h.posts[1], /不再提供强平价.*解除预警/);
-    assert.equal(h.watch.state().sources.at(-1).positions[0].alerting, false);
+    assert.equal(h.watch.state().sources.find(source => source.exchange === 'hyperliquid').positions[0].alerting, false);
     h.books.io = [hlPosition('io:ANTH', '-10', '110')];
     await h.watch.poll();
     assert.equal(h.posts.length, 3);
@@ -253,7 +259,7 @@ test('an alerted leg without a liquidation price clears, and a changed account d
     await h.watch.poll();
     h.advance(10 * 60_000); await h.watch.poll();
     assert.equal(h.posts.length, 3, "the previous account's leg is not reported as gone or interrupted");
-    assert.deepEqual(h.watch.state().sources.at(-1).positions, []);
+    assert.deepEqual(h.watch.state().sources.find(source => source.exchange === 'hyperliquid').positions, []);
   } finally { h.cleanup(); }
 });
 
@@ -382,5 +388,61 @@ test('an own robot that breaks after startup refuses definitely without the dige
     h.watch.save({ enabled: false, thresholdPercent: 20, repeatMinutes: 30 });
     assert.throws(() => h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 }), { status: 409, message: /无法读取/ });
     assert.equal(h.posts.length, 0);
+  } finally { await h.watch.close(); h.cleanup(); }
+});
+
+const rhPosition = (symbol, sign, position, liquidation, extra = {}) => ({ market_id: symbol === 'ANTHROPIC' ? 38 : 0, symbol, initial_margin_fraction: '33.33', sign, position,
+  avg_entry_price: '100.0', position_value: '1000.000000', unrealized_pnl: '-1.5', liquidation_price: liquidation, margin_mode: 0, allocated_margin: '0.000000', ...extra });
+
+test('Lighter RH accounts keep only the Anthropic market of each account under the address', () => {
+  const rows = parseRhLighterAccounts({ accounts: [
+    { index: 7, positions: [rhPosition('ANTHROPIC', -1, '10.00000', '120.123456789012345678901'), rhPosition('ETH', 1, '1', '0')] },
+    { index: 9, positions: [rhPosition('ANTHROPIC', 1, '10', '0', { margin_mode: 1, allocated_margin: '250.5', initial_margin_fraction: '20.00' })] },
+    { index: 11, positions: [rhPosition('ANTHROPIC', 1, '0.00000', '0')] },
+  ] });
+  assert.deepEqual(rows.map(row => [row.id, row.side, row.quantity, row.markPrice, row.liquidationPrice, row.leverage, row.marginMode, row.marginUsed]), [
+    ['rh-lighter:ANTHROPIC:7:short', 'short', '10', '100', '120.123456789012345678', '3', 'cross', null],
+    ['rh-lighter:ANTHROPIC:9:long', 'long', '10', '100', null, '5', 'isolated', '250.5'],
+  ]);
+  assert.throws(() => parseRhLighterAccounts({ accounts: [{ index: 7, positions: [rhPosition('ANTHROPIC', 1, '1', '0'), rhPosition('ANTHROPIC', 1, '2', '0')] }] }));
+  assert.throws(() => parseRhLighterAccounts({ accounts: [{ index: 7, positions: [rhPosition('ANTHROPIC', 0, '1', '0')] }] }));
+  assert.throws(() => parseRhLighterAccounts({ accounts: 'x' }));
+});
+
+test('Lighter RH legs are read for the connected L1 address, alert, and keep the last rows on failures', { timeout: 10_000 }, async () => {
+  const h = harness();
+  try {
+    const RH = '0x' + 'c'.repeat(40);
+    const read = () => h.watch.state().sources.find(source => source.exchange === 'rh-lighter');
+    await h.watch.poll();
+    assert.deepEqual([read().state, read().connected, h.rhRequests.length], ['unconfigured', false, 0], 'no connection, no request');
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    h.setRhAddress(RH);
+    h.rhAccounts = [{ index: 7, positions: [rhPosition('ANTHROPIC', -1, '10', '110')] }];
+    await h.watch.poll();
+    assert.equal(new URL(h.rhRequests[0]).searchParams.get('value'), RH);
+    assert.equal(new URL(h.rhRequests[0]).searchParams.get('by'), 'l1_address');
+    assert.equal(read().state, 'live');
+    assert.equal(read().positions[0].alerting, true);
+    assert.equal(h.posts.length, 1); assert.match(h.posts[0], /Lighter RH ANTHROPIC 账户 7 做空：距强平 10\.00%/);
+
+    const cases = [
+      [() => new Response('{}', { status: 429 }), /Lighter RH 请求过于频繁/],
+      [() => new Response(JSON.stringify({ code: 23000, message: 'too many requests' }), { status: 400 }), /Lighter RH 请求过于频繁/],
+      [() => new Response(JSON.stringify({ code: 20001, message: 'invalid param' }), { status: 400 }), /Lighter RH 返回 HTTP 400/],
+      [() => new Response('{}', { status: 502 }), /Lighter RH 返回 HTTP 502/],
+      [() => new Response(JSON.stringify({ accounts: [{ index: 7, positions: 'x' }] }), { status: 200 }), /Lighter RH 仓位数据无法识别/],
+      [() => { throw new DOMException('timed out', 'TimeoutError'); }, /Lighter RH 读取超时/],
+    ];
+    for (const [make, message] of cases) {
+      h.rhFail(make); await h.watch.poll();
+      assert.equal(read().state, 'stale', String(message)); assert.match(read().error, message);
+      assert.deepEqual(read().positions.map(row => row.liquidationPrice), ['110'], 'the last rows stay');
+    }
+    h.rhFail(() => new Response(JSON.stringify({ code: 21100, message: 'account not found' }), { status: 400 }));
+    await h.watch.poll();
+    assert.deepEqual([read().state, read().positions], ['live', []], 'an address without accounts has no positions');
+    assert.match(h.posts.at(-1), /Lighter RH ANTHROPIC 账户 7 做空：仓位已不在账户中/);
+    assert.ok(h.watch.state().sources.find(source => source.exchange === 'hyperliquid'), 'Hyperliquid is still listed');
   } finally { await h.watch.close(); h.cleanup(); }
 });

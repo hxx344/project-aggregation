@@ -8,6 +8,7 @@ export const connectionSchema=z.discriminatedUnion('exchange',[
   z.object({exchange:z.literal('binance'),apiKey:z.string().trim().min(5).max(256),apiSecret:z.string().trim().min(5).max(256)}).strict(),
   z.object({exchange:z.literal('bybit'),apiKey:z.string().min(5).max(256),apiSecret:z.string().min(5).max(256),region:z.enum(['global','nl','tr','kz','ge','ae','eu']).default('global')}).strict(),
   z.object({exchange:z.literal('hyperliquid'),walletAddress:z.string().trim().regex(/^0x[0-9a-fA-F]{40}$/)}).strict(),
+  z.object({exchange:z.literal('rh-lighter'),walletAddress:z.string().trim().regex(/^0x[0-9a-fA-F]{40}$/)}).strict(),
   z.object({exchange:z.literal('aster'),walletAddress:z.string().trim().regex(/^0x[0-9a-fA-F]{40}$/),privateKey:z.string().trim().regex(/^(0x)?[0-9a-fA-F]{64}$/),includeSpot:z.boolean().default(false)}).strict(),
 ]);
 export type Credentials=z.infer<typeof connectionSchema>;

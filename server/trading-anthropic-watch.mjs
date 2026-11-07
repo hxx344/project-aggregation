@@ -9,12 +9,21 @@ import { EXECUTION_VENUE_SYMBOLS, TRADING_NAMES } from './trading-markets.mjs';
 // Anthropic arbitrage positions and their liquidation watch. Read only: the
 // Binance/OKX legs come from the read-only accounts (trading.anthropic()), the
 // Hyperliquid legs from the public info endpoint for the master address of the
-// live connection. Alerts go through their own Feishu robot when one is saved,
-// otherwise through the Feishu digest's robot.
+// live connection, the Lighter RH legs from the public account endpoint for the
+// L1 address of the live connection (every account under that address).
+// Alerts go through their own Feishu robot when one is saved, otherwise through
+// the Feishu digest's robot.
 // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals
+// https://apidocs.lighter.xyz/reference/account-1
 const HL_INFO = 'https://api.hyperliquid.xyz/info';
 const HL_SYMBOLS = EXECUTION_VENUE_SYMBOLS.hyperliquid;
 const HL_DEXES = [...new Set(HL_SYMBOLS.map(symbol => symbol.split(':')[0]))];
+const RH_ACCOUNT = 'https://api.rh.lighter.xyz/api/v1/account';
+const RH_SYMBOLS = EXECUTION_VENUE_SYMBOLS['rh-lighter'];
+// Lighter answers an address without any account with HTTP 400 and this code; it has no positions.
+const RH_NOT_FOUND = 21100;
+const RH_RATE_LIMITED = 23000;
+const MAX_ACCOUNTS = 256;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_ROWS = 2000;
 const FILE_LIMIT = 256 * 1024;
@@ -27,7 +36,8 @@ const STALE_ALERT_MS = 180_000;
 const HYSTERESIS = 2;
 const FAILURE_RETRY_MS = 60_000;
 export const ANTHROPIC_ALERT_DEFAULTS = Object.freeze({ enabled: false, thresholdPercent: 20, repeatMinutes: 30 });
-const SOURCES = Object.freeze(['binance', 'okx', 'hyperliquid']);
+const SOURCES = Object.freeze(['binance', 'okx', 'hyperliquid', 'rh-lighter']);
+const WALLETS = Object.freeze(['hyperliquid', 'rh-lighter']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const iso = time => new Date(time).toISOString();
 const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
@@ -80,11 +90,43 @@ export function parseHyperliquidState(state, dex) {
   return rows;
 }
 
+/** Positions of the Anthropic markets in every account the Lighter RH `account?by=l1_address` answer lists. */
+export function parseRhLighterAccounts(body) {
+  if (!object(body) || !Array.isArray(body.accounts) || body.accounts.length > MAX_ACCOUNTS) throw new Error('invalid_state');
+  const rows = [], seen = new Set();
+  for (const account of body.accounts) {
+    if (!object(account) || !Number.isSafeInteger(account.index) || account.index < 0 || !Array.isArray(account.positions) || account.positions.length > MAX_ROWS) throw new Error('invalid_state');
+    for (const p of account.positions) {
+      if (!object(p) || typeof p.symbol !== 'string') throw new Error('invalid_state');
+      if (!RH_SYMBOLS.includes(p.symbol)) continue;
+      const key = `${account.index}:${p.symbol}`;
+      if (seen.has(key)) throw new Error('duplicate_position');
+      seen.add(key);
+      const quantity = decimal(p.position, { nonnegative: true });
+      if (quantity === '0') continue;
+      if (p.sign !== 1 && p.sign !== -1) throw new Error('invalid_state');
+      if (![0, 1].includes(p.margin_mode)) throw new Error('invalid_state');
+      const side = p.sign === 1 ? 'long' : 'short';
+      const notional = decimal(p.position_value, { nonnegative: true });
+      const fraction = Number(decimal(p.initial_margin_fraction, { nonnegative: true }));
+      const leverage = fraction > 0 ? Math.round(100 / fraction) : null;
+      // The liquidation price is computed, not a tick-sized value: digits past 18 decimals are dropped, never rounded up.
+      const liquidation = decimal(typeof p.liquidation_price === 'string' ? p.liquidation_price.replace(/^(\d+\.\d{18})\d+$/, '$1') : p.liquidation_price, { nonnegative: true });
+      const isolated = p.margin_mode === 1;
+      rows.push({ id: `rh-lighter:${p.symbol}:${account.index}:${side}`, exchange: 'rh-lighter', symbol: p.symbol, account: account.index, side, quantity, quantityUnit: null,
+        entryPrice: decimal(p.avg_entry_price, { nonnegative: true }), markPrice: significant(Number(notional) / Number(quantity)), notional,
+        unrealizedPnl: decimal(p.unrealized_pnl), leverage: Number.isSafeInteger(leverage) && leverage >= 1 ? String(leverage) : null, marginMode: isolated ? 'isolated' : 'cross',
+        marginUsed: isolated ? decimal(p.allocated_margin, { nonnegative: true }) : null, liquidationPrice: liquidation === '0' ? null : liquidation });
+    }
+  }
+  return rows;
+}
+
 // Reads at most MAX_BODY_BYTES of the body as it streams; the fetch signal also aborts the read.
-async function readLimited(response) {
+async function readLimited(response, name) {
   const length = response.headers?.get?.('content-length');
-  if (length && Number(length) > MAX_BODY_BYTES) throw new Error('Hyperliquid 响应过大');
-  if (!response.body?.getReader) throw new Error('Hyperliquid 仓位数据无法识别');
+  if (length && Number(length) > MAX_BODY_BYTES) throw new Error(`${name} 响应过大`);
+  if (!response.body?.getReader) throw new Error(`${name} 仓位数据无法识别`);
   const reader = response.body.getReader(), chunks = [];
   let size = 0, done = false;
   try {
@@ -92,7 +134,7 @@ async function readLimited(response) {
       const chunk = await reader.read();
       if (chunk.done) { done = true; break; }
       size += chunk.value.byteLength;
-      if (size > MAX_BODY_BYTES) throw new Error('Hyperliquid 响应过大');
+      if (size > MAX_BODY_BYTES) throw new Error(`${name} 响应过大`);
       chunks.push(Buffer.from(chunk.value));
     }
     return Buffer.concat(chunks, size).toString('utf8');
@@ -111,7 +153,7 @@ function readBounded(file) {
 
 const fmt = value => value === null ? '—' : String(value);
 const sideName = side => side === 'long' ? '做多' : '做空';
-const legName = row => `${TRADING_NAMES[row.exchange]} ${row.symbol} ${sideName(row.side)}`;
+const legName = row => `${TRADING_NAMES[row.exchange]} ${row.symbol}${row.account === undefined ? '' : ` 账户 ${row.account}`} ${sideName(row.side)}`;
 function eventLine(event, threshold) {
   if (event.type === 'alert' || event.type === 'repeat') {
     const row = event.row;
@@ -162,7 +204,8 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
   let config = { ...ANTHROPIC_ALERT_DEFAULTS }, loadError = null, stateError = null;
   // active: leg id → { sentAt, label }; stale: source → sentAt. Both are claimed on disk before a send.
   let alerts = { active: {}, stale: {} }, history = [], failedAt = 0, lastError = null;
-  let hl = { address: null, rows: [], fetchedAt: null, lastAttemptAt: null, error: null };
+  const emptyWallet = address => ({ address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null });
+  const wallets = Object.fromEntries(WALLETS.map(exchange => [exchange, emptyWallet(null)]));
   let timer = null, first = null, closed = false, polling = null, sending = null, testing = false;
   // notLiveSince: source → first time this process saw it without a fresh read; startedAt bounds it.
   let startedAt = now();
@@ -175,36 +218,55 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
   }
 
   async function readDex(address, dex, signal) {
+    const name = TRADING_NAMES.hyperliquid;
     const response = await fetcher(HL_INFO, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'clearinghouseState', user: address, dex }),
       redirect: 'error', cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
-    if (response.status === 429) throw new Error('Hyperliquid 请求过于频繁，稍后自动重试');
-    if (!response.ok) throw new Error(`Hyperliquid 返回 HTTP ${response.status}`);
-    const text = await readLimited(response);
-    try { return parseHyperliquidState(JSON.parse(text), dex); } catch { throw new Error('Hyperliquid 仓位数据无法识别'); }
+    if (response.status === 429) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
+    if (!response.ok) throw new Error(`${name} 返回 HTTP ${response.status}`);
+    const text = await readLimited(response, name);
+    try { return parseHyperliquidState(JSON.parse(text), dex); } catch { throw new Error(`${name} 仓位数据无法识别`); }
   }
-  async function readHyperliquid() {
+  async function readRhLighter(address, signal) {
+    const name = TRADING_NAMES['rh-lighter'];
+    const url = `${RH_ACCOUNT}?${new URLSearchParams({ by: 'l1_address', value: address })}`;
+    const response = await fetcher(url, { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
+    if (response.status === 429) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
+    if (!response.ok && response.status !== 400) throw new Error(`${name} 返回 HTTP ${response.status}`);
+    const text = await readLimited(response, name);
+    let body;
+    try { body = JSON.parse(text); } catch { throw new Error(`${name} 仓位数据无法识别`); }
+    if (response.status === 400) {
+      if (object(body) && body.code === RH_NOT_FOUND) return [];
+      if (object(body) && body.code === RH_RATE_LIMITED) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
+      throw new Error(`${name} 返回 HTTP 400`);
+    }
+    try { return parseRhLighterAccounts(body); } catch { throw new Error(`${name} 仓位数据无法识别`); }
+  }
+  const READERS = { hyperliquid: async (address, signal) => (await Promise.all(HL_DEXES.map(dex => readDex(address, dex, signal)))).flat(), 'rh-lighter': readRhLighter };
+  async function readWallet(exchange) {
+    const name = TRADING_NAMES[exchange];
     let address = null;
-    try { address = readAddress(); } catch { address = null; }
+    try { address = readAddress(exchange); } catch { address = null; }
     if (typeof address !== 'string' || !/^0x[0-9a-f]{40}$/.test(address)) address = null;
-    if (address !== hl.address) {
+    if (address !== wallets[exchange].address) {
       // Another account's legs never vanish from this one: a changed or removed connection drops their alerts.
-      if (hl.address) {
-        const active = Object.fromEntries(Object.entries(alerts.active).filter(([id]) => !id.startsWith('hyperliquid:')));
-        const { hyperliquid: staleSince, ...stale } = alerts.stale;
+      if (wallets[exchange].address) {
+        const active = Object.fromEntries(Object.entries(alerts.active).filter(([id]) => !id.startsWith(`${exchange}:`)));
+        const { [exchange]: staleSince, ...stale } = alerts.stale;
         // Memory drops them even if the disk write fails, since the old address is not read again.
         if (Object.keys(active).length !== Object.keys(alerts.active).length || staleSince !== undefined) { alerts = { active, stale }; persist(); }
       }
-      delete notLiveSince.hyperliquid;
-      hl = { address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null };
+      delete notLiveSince[exchange];
+      wallets[exchange] = emptyWallet(address);
     }
     if (!address) return;
-    hl.lastAttemptAt = iso(now());
+    wallets[exchange].lastAttemptAt = iso(now());
     try {
-      const rows = (await Promise.all(HL_DEXES.map(dex => readDex(address, dex, controller.signal)))).flat();
-      if (hl.address === address) hl = { ...hl, rows, fetchedAt: iso(now()), error: null };
+      const rows = await READERS[exchange](address, controller.signal);
+      if (wallets[exchange].address === address) wallets[exchange] = { ...wallets[exchange], rows, fetchedAt: iso(now()), error: null };
     } catch (error) {
-      if (closed || hl.address !== address) return;
-      hl.error = error?.name === 'TimeoutError' ? 'Hyperliquid 读取超时，保留上次仓位' : error instanceof Error && /^Hyperliquid/.test(error.message) ? error.message : 'Hyperliquid 读取失败，保留上次仓位';
+      if (closed || wallets[exchange].address !== address) return;
+      wallets[exchange].error = error?.name === 'TimeoutError' ? `${name} 读取超时，保留上次仓位` : error instanceof Error && error.message.startsWith(`${name} `) ? error.message : `${name} 读取失败，保留上次仓位`;
     }
   }
 
@@ -212,10 +274,11 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
     const current = now();
     let cex = [];
     try { cex = readCex(); } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 只读仓位读取失败'); }
-    const hlState = !hl.address ? 'unconfigured' : !hl.fetchedAt ? hl.error ? 'error' : 'loading' : hl.error || current - timeOf(hl.fetchedAt) > LIVE_MS ? 'stale' : 'live';
+    const walletState = w => !w.address ? 'unconfigured' : !w.fetchedAt ? w.error ? 'error' : 'loading' : w.error || current - timeOf(w.fetchedAt) > LIVE_MS ? 'stale' : 'live';
     const list = [...cex.map(item => ({ exchange: item.exchange, connected: item.connected, state: item.state, fetchedAt: item.fetchedAt, error: item.error, refreshing: !!item.refreshing,
       positions: item.positions.map(row => ({ ...row, quantityUnit: row.quantityUnit ?? null, marginMode: row.marginMode ?? null, marginUsed: null })) })),
-    { exchange: 'hyperliquid', connected: !!hl.address, address: hl.address, state: hlState, fetchedAt: hl.fetchedAt, error: hl.error, refreshing: !!polling, positions: hl.rows }];
+    ...WALLETS.map(exchange => { const w = wallets[exchange];
+      return { exchange, connected: !!w.address, address: w.address, state: walletState(w), fetchedAt: w.fetchedAt, error: w.error, refreshing: !!polling, positions: w.rows }; })];
     return SOURCES.map(exchange => list.find(item => item.exchange === exchange)).filter(Boolean);
   }
 
@@ -277,7 +340,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
   async function poll() {
     if (closed || polling) return polling;
     polling = (async () => {
-      await readHyperliquid();
+      await Promise.all(WALLETS.map(readWallet));
       if (closed || sending || !config.enabled || loadError) return;
       const channel = robot();
       if (!channel.configured || failedAt && now() - failedAt < FAILURE_RETRY_MS) return;

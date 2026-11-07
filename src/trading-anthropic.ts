@@ -7,7 +7,8 @@ import type { Book, BookRead } from './trading-spread';
  * Binance quotes valuation per 1B reference shares, so one unit is S shares
  * (S = outstanding, billions); OKX was rebased to per 10B, one contract is
  * S / 10 shares; Entropy io:ANTH settles valuation per 1B fully diluted
- * shares, one unit is F shares; trade.xyz xyz:ANT is one Class A share.
+ * shares, one unit is F shares, and so does Lighter RH ANTHROPIC; trade.xyz
+ * xyz:ANT is one Class A share.
  * Per-share price = quote ÷ shares per unit. These are assumptions about a
  * future listing; values here are floats for display only.
  */
@@ -17,6 +18,7 @@ export const ANTHROPIC_CONTRACTS: AnthropicContract[] = [
   { exchange: 'hyperliquid', symbol: 'xyz:ANT', venue: 'trade.xyz', label: 'Hyperliquid xyz:ANT（trade.xyz）', basis: null, divisor: 1 },
   { exchange: 'binance', symbol: 'ANTHROPICUSDT', venue: 'Binance', label: 'Binance ANTHROPICUSDT', basis: 'outstanding', divisor: 1 },
   { exchange: 'okx', symbol: 'ANTHROPICUSDT', venue: 'OKX', label: 'OKX ANTHROPIC-USDT-SWAP', basis: 'outstanding', divisor: 10 },
+  { exchange: 'rh-lighter', symbol: 'ANTHROPIC', venue: 'Lighter RH', label: 'Lighter RH ANTHROPIC（Robinhood Chain）', basis: 'diluted', divisor: 1 },
 ];
 export const DEFAULT_SHARES: AnthropicShares = { outstanding: '12.7', diluted: '16.7' };
 export const contractKey = (contract: Pick<AnthropicContract, 'exchange' | 'symbol'>) => `${contract.exchange}:${contract.symbol}`;

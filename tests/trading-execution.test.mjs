@@ -1390,20 +1390,21 @@ test('display quotes read every venue, report a failed leg alone and share reads
   f.handlers['okx:market'] = async symbol => { if (symbol === 'SKHYUSDT') throw new ExecutionExchangeError('not_tradable'); return { symbol, bid: '71', ask: '71.02', at: new Date(f.time).toISOString(), rule: {} }; };
   const before = f.calls.length;
   const value = await f.service.quotes();
-  assert.equal(value.books.length, 16, 'each venue reads only the contracts it lists');
-  assert.deepEqual([...new Set(value.books.map(book => book.exchange))], ['binance', 'bybit', 'okx', 'hyperliquid']);
+  assert.equal(value.books.length, 17, 'each venue reads only the contracts it lists');
+  assert.deepEqual([...new Set(value.books.map(book => book.exchange))], ['binance', 'bybit', 'okx', 'hyperliquid', 'rh-lighter']);
   assert.deepEqual(value.books.filter(book => book.exchange === 'hyperliquid').map(book => book.symbol), ['io:ANTH', 'xyz:ANT']);
+  assert.deepEqual(value.books.filter(book => book.exchange === 'rh-lighter').map(book => book.symbol), ['ANTHROPIC']);
   assert.ok(!value.books.some(book => book.exchange === 'bybit' && book.symbol === 'ANTHROPICUSDT'));
   assert.deepEqual(value.books.find(book => book.exchange === 'binance' && book.symbol === 'CLUSDT'), { exchange: 'binance', symbol: 'CLUSDT', bid: '70', ask: '70.01', at: new Date(f.time).toISOString() });
   assert.deepEqual(value.books.find(book => book.exchange === 'okx' && book.symbol === 'SKHYUSDT'), { exchange: 'okx', symbol: 'SKHYUSDT', error: '合约当前不支持所需的限价交易' });
   assert.ok(value.books.every(book => !('rule' in book)));
   assert.ok(f.calls.slice(before).every(call => call.method === 'market' && call.args[1].withRule === false && call.args[1].signal instanceof AbortSignal));
-  assert.equal(f.calls.length - before, 16);
+  assert.equal(f.calls.length - before, 17);
   await f.service.quotes();
-  assert.equal(f.calls.length - before, 16, 'a read within the cache window is shared');
+  assert.equal(f.calls.length - before, 17, 'a read within the cache window is shared');
   f.advance(2000);
   await f.service.quotes();
-  assert.equal(f.calls.length - before, 32);
+  assert.equal(f.calls.length - before, 34);
 });
 
 test('a slow display read stays shared past the cache window until it settles', async t => {
@@ -1419,13 +1420,13 @@ test('a slow display read stays shared past the cache window until it settles', 
   assert.equal(second, first, 'an in-flight read is reused rather than restarted');
   release();
   await first;
-  assert.equal(f.calls.length - before, 16);
+  assert.equal(f.calls.length - before, 17);
   f.advance(1000);
   await f.service.quotes();
-  assert.equal(f.calls.length - before, 16, 'the window counts from when the read settled');
+  assert.equal(f.calls.length - before, 17, 'the window counts from when the read settled');
   f.advance(1000);
   await f.service.quotes();
-  assert.equal(f.calls.length - before, 32);
+  assert.equal(f.calls.length - before, 34);
 });
 
 test('a display leg that runs past its timeout is reported as a timeout', async t => {
@@ -1448,10 +1449,10 @@ test('a display read stuck past twice the leg timeout is replaced, and its late 
   await new Promise(resolve => setImmediate(resolve));
   gates.forEach(release => release());
   assert.notEqual(replacement, stuck);
-  assert.equal(f.calls.length - before, 32);
+  assert.equal(f.calls.length - before, 34);
   await Promise.all([stuck, replacement]);
   assert.equal(await f.service.quotes(), await replacement, 'the late first read does not displace the replacement');
-  assert.equal(f.calls.length - before, 32);
+  assert.equal(f.calls.length - before, 34);
 });
 
 test('order type and optional chase limit are validated per leg; legacy legs stay chase orders', () => {

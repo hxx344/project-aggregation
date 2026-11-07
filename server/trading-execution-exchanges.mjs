@@ -2,6 +2,7 @@ import { createHmac, createHash } from 'node:crypto';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
 import { createHyperliquidExecutionClient } from './trading-hyperliquid-execution.mjs';
+import { createRhLighterExecutionClient } from './trading-rh-lighter-execution.mjs';
 import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs';
 
 /**
@@ -306,6 +307,7 @@ function upstreamFailure(exchange, status, data, mutation) {
 export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000 } = {}) {
   if (exchange === 'okx') return createOkxExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
   if (exchange === 'hyperliquid') return createHyperliquidExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
+  if (exchange === 'rh-lighter') return createRhLighterExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
   if (!['binance', 'bybit'].includes(exchange) || typeof fetchImpl !== 'function' || typeof now !== 'function'
       || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) fail('configuration');
   const SYMBOLS = EXECUTION_VENUE_SYMBOLS[exchange];

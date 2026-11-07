@@ -24,12 +24,12 @@ function fixture() {
   return { database, save, unseal };
 }
 
-test('Asset catalog includes all five exchanges before setup and never exposes credentials', async t => {
+test('Asset catalog includes every positions exchange before setup and never exposes credentials', async t => {
   const f = fixture(); t.after(() => f.database.close());
   await f.save('owner', 'gate', { exchange: 'gate', apiKey: 'gate-asset-key', apiSecret: 'gate-asset-secret' });
   const service = createPositionsService({ read: async () => assert.fail('unconfigured must not read') });
   const report = await service.read(f.database, 'owner', async () => assert.fail('asset-only Gate and unconfigured accounts must not decrypt'));
-  assert.deepEqual(report.exchanges.map(item => item.id), ['binance', 'bybit', 'okx', 'aster', 'variational']);
+  assert.deepEqual(report.exchanges.map(item => item.id), ['binance', 'bybit', 'okx', 'aster', 'variational', 'rh-lighter']);
   for (const exchange of report.exchanges) for (const account of exchange.accounts) {
     assert.equal(account.configured, false); assert.equal(account.revision, null);
     for (const item of account.scopes) { assert.equal(item.status, 'unconfigured'); assert.equal(item.fetchedAt, null); assert.deepEqual(item.positions, []); }
@@ -164,16 +164,17 @@ test('Binance hides and stops polling the account mode that fails while the othe
   }
 });
 
-test('exchange scopes refresh every 5 s and Variational every 30 s', async t => {
+test('exchange scopes refresh every 5 s, Variational and Lighter RH every 30 s', async t => {
   const f = fixture(); t.after(() => f.database.close()); let clock = at; const reads: string[] = [];
   await f.save('owner', 'variational', { exchange: 'variational', vrToken: 'synthetic-token' });
+  await f.save('owner', 'rh-lighter', { exchange: 'rh-lighter', walletAddress: '0x' + '1'.repeat(40) });
   await f.save('owner', 'okx', { exchange: 'okx', apiKey: 'synthetic-key', apiSecret: 'synthetic-secret', passphrase: 'synthetic' });
   const service = createPositionsService({ now: () => clock, read: async (c, id) => { reads.push(c.exchange + ':' + id); return []; } });
   const cycle = async (ms: number) => { clock += ms; reads.length = 0; await service.read(f.database, 'owner', f.unseal); await service.idle(); return [...new Set(reads.map(item => item.split(':')[0]))].sort(); };
-  assert.deepEqual(await cycle(0), ['okx', 'variational']);
+  assert.deepEqual(await cycle(0), ['okx', 'rh-lighter', 'variational']);
   assert.deepEqual(await cycle(4_999), []);
   assert.deepEqual(await cycle(1), ['okx']);
-  assert.deepEqual(await cycle(25_000), ['okx', 'variational']);
+  assert.deepEqual(await cycle(25_000), ['okx', 'rh-lighter', 'variational']);
 });
 
 test('cycle summaries load in the background, stay cached by side and quantity, and retry after failures', async t => {

@@ -27,7 +27,7 @@ HEARTBEAT_MS = 5_000
 SAFETY_MS = 10_000
 # Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance.
 ASTER_WRITE_EXPIRY_MS = 120_000
-AUTHORITIES = frozenset(("binance", "bybit", "okx", "gate-crossex", "aster", "hyperliquid"))
+AUTHORITIES = frozenset(("binance", "bybit", "okx", "gate-crossex", "aster", "hyperliquid", "rh-lighter"))
 ENVIRONMENTS = frozenset(("mainnet", "testnet", "demo"))
 SECRET_KEY = re.compile(r"^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$", re.I)
 RECOVERY_IDS = ("authorityId", "recoveryId", "checkpointId", "handoffId", "sourceAuthorityId")
@@ -64,7 +64,7 @@ def _scope(value):
 
 def _uid(value, authority):
     # Wallet-addressed venues: the master account address, compared case-insensitively.
-    if authority in ("aster", "hyperliquid"):
+    if authority in ("aster", "hyperliquid", "rh-lighter"):
         if not isinstance(value, str) or not re.fullmatch(r"0x[0-9a-fA-F]{40}", value):
             _fail("INVALID_IDENTITY")
         return value.lower()

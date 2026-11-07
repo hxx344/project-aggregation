@@ -52,7 +52,7 @@ test('snapshot completeness still includes FX failures, asset errors and source 
 
 test('unconnected exchange rows keep their valuation without making a snapshot partial; configured failures still do', () => {
   const old = '2026-09-21T00:00:00+08:00';
-  for (const mode of ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid'] as const) {
+  for (const mode of ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'] as const) {
     const placeholder = { ...asset(100, mode), updatedAt: old, status: '待连接 · 表格值' };
     const disconnected = { ...placeholder, status: '已断开 · 保留旧值', error: 'Previous sync failed' };
     const rows = [placeholder, { ...asset(5), id: 'row-2' }];
@@ -70,8 +70,8 @@ test('unconnected exchange rows keep their valuation without making a snapshot p
 test('configured exchanges follow saved connections, including any configured Aster account', () => {
   const connection = (configured: boolean) => ({ configured, lastSync: null, error: null, scope: '' });
   assert.deepEqual(configuredExchanges({
-    bybit: connection(false), aster: connection(true), binance: connection(false), okx: connection(true), gate: connection(false), variational: connection(false), hyperliquid: connection(true),
-  }), ['aster', 'okx', 'hyperliquid']);
+    bybit: connection(false), aster: connection(true), binance: connection(false), okx: connection(true), gate: connection(false), variational: connection(false), hyperliquid: connection(true), 'rh-lighter': connection(true),
+  }), ['aster', 'okx', 'hyperliquid', 'rh-lighter']);
 });
 
 test('non-finite values are missing rather than poisoning a known subtotal', () => {

@@ -1,6 +1,6 @@
 import { oilSpread } from '../modules/oil/spread.mjs';
 import { monitors } from '../lib/monitors.ts';
-import { anthropicPremium } from '../modules/anthropic/market.mjs';
+import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS, anthropicPremium } from '../modules/anthropic/market.mjs';
 const timestamp = value => { const at = typeof value === 'number' ? value : Date.parse(value); return Number.isFinite(at) && at > 0 ? at : null; };
 const finite = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
 const healthMessage = value => String(value).slice(0, 500);
@@ -31,12 +31,12 @@ export async function readHubSummary(services, now = Date.now(), monitorId = 'oi
   if (monitorId === 'anthropic') {
     const stale = quote && (!at || at > now + 1000 || now - at > staleAfterSeconds * 1000 || quote.status === 'snapshot' || quote.collection?.stale);
     const binance = finite(quote?.binance?.markPx), premium = leg => anthropicPremium(binance, finite(quote?.[leg]?.markPx), leg);
-    const missing = Object.entries(quote?.errors ?? {}).map(([leg, error]) => `${leg === 'binance' ? 'Binance' : leg === 'xyz' ? 'xyz:ANT' : 'io:ANTH'} ${error}`).join('；');
+    const missing = Object.entries(quote?.errors ?? {}).map(([leg, error]) => `${ANTHROPIC_LEGS[leg]?.name ?? leg} ${error}`).join('；');
     const state = !quote ? 'offline' : stale ? 'stale' : missing || quote.collection?.error ? 'partial' : 'online';
     const detail = quote?.collection?.error || (!quote ? '后台尚未取得报价' : stale ? '报价已过期，保留原采集时间' : missing);
     return { updatedAt: at ? new Date(at).toISOString() : null,
       health: { state, message: healthMessage(entry.title + (detail ? '：' + detail : '监控已连接；标记价格按股数假设换算为每股价格')), staleAfterSeconds },
-      metrics: [metric('premium_xyz', 'Binance 相对 xyz:ANT 溢价', premium('xyz'), '%'), metric('premium_io', 'Binance 相对 io:ANTH 溢价', premium('io'), '%'), modules] };
+      metrics: [...ANTHROPIC_COMPARISON_LEGS.map(leg => metric(`premium_${leg}`, `Binance 相对 ${ANTHROPIC_LEGS[leg].name} 溢价`, premium(leg), '%')), modules] };
   }
   const stale = quote && (!at || at > now + 1000 || now - at > staleAfterSeconds * 1000 || quote.status === 'snapshot' || quote.collection?.stale);
   const oilSpreadValue = monitorId === 'oil' ? oilSpread(finite(quote?.brent?.markPx), finite(quote?.wti?.markPx)) : null;

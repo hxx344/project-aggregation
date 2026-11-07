@@ -56,7 +56,7 @@ const respond = errorResponder([HttpError, UpdateError, RuntimeError]);
 // Native execution is not gated by any one embedded trading module's maintenance sync.
 const native = { scope: 'native' };
 // Account, preview and start writes are admitted by the update coordinator before they reach the data plane.
-const admitted = (pathname, method) => /^\/api\/trading\/execution\/accounts\/(?:binance|bybit|okx|hyperliquid)$/.test(pathname) ? ['PUT', 'DELETE'].includes(method)
+const admitted = (pathname, method) => /^\/api\/trading\/execution\/accounts\/(?:binance|bybit|okx|hyperliquid|rh-lighter)$/.test(pathname) ? ['PUT', 'DELETE'].includes(method)
   : ['/api/trading/execution/preview', '/api/trading/execution/jobs'].includes(pathname) && method === 'POST';
 
 // The control plane's HTTP entry (design doc 3.1): sessions, the update

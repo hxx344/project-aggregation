@@ -69,9 +69,19 @@ test('Hyperliquid account values are a recognised live source', () => {
   assert.equal(read({...asset('hyperliquid'),error:'Hyperliquid 读取失败'}).health.state,'partial');
 });
 
+test('Lighter RH account values are a recognised live source', () => {
+  const read = (row: ReturnType<typeof asset> & {error?: string}) => buildHubSummary({...input(),assets:[row]},now).data;
+  const current = read(asset('rh-lighter',fresh,42.25));
+  assert.equal(current.health.state,'online');
+  assert.equal(current.metrics[0].value,42.25);
+  assert.doesNotMatch(current.health.message,/未识别/);
+  assert.equal(read(asset('rh-lighter','2020-01-01T00:00:00Z')).health.state,'stale');
+  assert.equal(read({...asset('rh-lighter'),error:'Lighter RH 读取失败'}).health.state,'partial');
+});
+
 test('disconnected single-account exchanges retain valuations without a live freshness requirement', () => {
   const old = '2020-01-01T00:00:00.000Z';
-  for (const mode of ['bybit', 'binance', 'okx', 'gate', 'variational', 'hyperliquid']) {
+  for (const mode of ['bybit', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter']) {
     const source = { ...input(), connectedExchanges: [], assets: [{ ...asset(mode, old, 123.45), error: 'Previous sync failed' }] };
     const original = structuredClone(source);
     const summary = buildHubSummary(source, now).data;

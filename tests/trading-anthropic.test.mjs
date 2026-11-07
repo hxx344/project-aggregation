@@ -17,7 +17,7 @@ const quotes = { generatedAt: AT, maxAgeMs: 10_000, books: [
 
 test('each contract unit stands for the shares its venue quotes', () => {
   const units = Object.fromEntries(ANTHROPIC_CONTRACTS.map(contract => [`${contract.exchange}:${contract.symbol}`, sharesPerUnit(contract, DEFAULT_SHARES)]));
-  assert.deepEqual(units, { 'hyperliquid:io:ANTH': 16.7, 'hyperliquid:xyz:ANT': 1, 'binance:ANTHROPICUSDT': 12.7, 'okx:ANTHROPICUSDT': 1.27 });
+  assert.deepEqual(units, { 'hyperliquid:io:ANTH': 16.7, 'hyperliquid:xyz:ANT': 1, 'binance:ANTHROPICUSDT': 12.7, 'okx:ANTHROPICUSDT': 1.27, 'rh-lighter:ANTHROPIC': 16.7 });
   assert.equal(sharesPerUnit(findContract('hyperliquid:io:ANTH'), { outstanding: '12.7', diluted: '20' }), 20);
   assert.equal(findContract('bybit:ANTHROPICUSDT'), null);
 });

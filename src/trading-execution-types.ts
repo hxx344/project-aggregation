@@ -1,13 +1,13 @@
 import type { OilSymbol, TradingAccountMode, TradingExchange } from './trading-types';
 
 export type ExecutionMarket = 'oil' | 'hynix' | 'anthropic';
-/** Anthropic pre-IPO contracts: Binance/OKX ANTHROPICUSDT, Hyperliquid HIP-3 io:ANTH (Entropy) and xyz:ANT (trade.xyz). */
-export type AnthropicSymbol = 'ANTHROPICUSDT' | 'io:ANTH' | 'xyz:ANT';
+/** Anthropic pre-IPO contracts: Binance/OKX ANTHROPICUSDT, Hyperliquid HIP-3 io:ANTH (Entropy) and xyz:ANT (trade.xyz), Lighter RH ANTHROPIC. */
+export type AnthropicSymbol = 'ANTHROPICUSDT' | 'io:ANTH' | 'xyz:ANT' | 'ANTHROPIC';
 export type ExecutionSymbol = OilSymbol | 'SKHYUSDT' | 'SKHYNIXUSDT' | AnthropicSymbol;
-/** Live trading venues: the read-only venues plus Hyperliquid (API wallet). */
-export type ExecutionExchange = TradingExchange | 'hyperliquid';
-/** Hyperliquid connects an API (agent) wallet; the other venues keep their account modes. */
-export type ExecutionAccountMode = TradingAccountMode | 'agent';
+/** Live trading venues: the read-only venues plus Hyperliquid (API wallet) and Lighter on Robinhood Chain (API key). */
+export type ExecutionExchange = TradingExchange | 'hyperliquid' | 'rh-lighter';
+/** Hyperliquid connects an API (agent) wallet, Lighter RH an account API key; the other venues keep their account modes. */
+export type ExecutionAccountMode = TradingAccountMode | 'agent' | 'api-key';
 /** Share-count assumptions in billions; editable, they are estimates until the listing documents fix them. */
 export type AnthropicShares = { outstanding: string; diluted: string };
 export type ExecutionLeverage = { type: 'cross' | 'isolated'; value: number };

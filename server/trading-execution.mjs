@@ -4,6 +4,7 @@ import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, WaitError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_VENUE_SYMBOLS } from './trading-markets.mjs';
 import { orderPrice, stepDecimals } from './trading-hyperliquid-execution.mjs';
+import { orderPrice as rhLighterOrderPrice, RH_LIGHTER_TX_EXPIRES_MS } from './trading-rh-lighter-execution.mjs';
 import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL, UNFINISHED_EXECUTION_JOB_SQL } from './control/execution-jobs.mjs';
@@ -18,7 +19,7 @@ const PREVIEW_TTL = 30_000, LEASE_TTL = 60_000;
 // + 30s, so after the call deadline plus this margin an unanswered create can
 // no longer be accepted by any venue.
 const CREATE_ARRIVAL_MARGIN_MS = 60_000, CREATE_OBSERVE_MS = 120_000, ABSENT_CREATE_CHECKS = 2;
-const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5, MISMATCH_RECHECK_MS = 60_000;
+const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5, CANCEL_DEFERRALS = 30, MISMATCH_RECHECK_MS = 60_000;
 // A status read that failed in transport (timeout, connection, 5xx, rate limit)
 // says nothing about the order. Nothing is amended, cancelled or sent while it
 // is unread, so a resting hedge leg is kept for this window before the job
@@ -32,9 +33,13 @@ const VENUE_CLOCK_TOLERANCE_MS = 300_000;
 // The client rounds the window out to whole seconds; stay inside its limit after rounding.
 const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
 // Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
-// Hyperliquid lists no oil contract, so its connection reads its own contracts.
-const connectSymbols = exchange => exchange === 'hyperliquid' ? EXECUTION_VENUE_SYMBOLS.hyperliquid : EXECUTION_MARKETS.oil.symbols;
-const DEFAULT_MODES = Object.freeze({ binance: 'standard', bybit: 'unified', okx: 'cross', hyperliquid: 'agent' });
+// Hyperliquid and Lighter RH list no oil contract, so their connections read their own contracts.
+const connectSymbols = exchange => WALLET_VENUES.has(exchange) ? EXECUTION_VENUE_SYMBOLS[exchange] : EXECUTION_MARKETS.oil.symbols;
+const DEFAULT_MODES = Object.freeze({ binance: 'standard', bybit: 'unified', okx: 'cross', hyperliquid: 'agent', 'rh-lighter': 'api-key' });
+// Venues that rest chase legs as post-only orders and reprice by exact cancel plus re-send.
+const WALLET_VENUES = new Set(['hyperliquid', 'rh-lighter']);
+// Lighter RH Standard accounts allow 60 requests a minute, every cancel and re-send included.
+const RH_LIGHTER_MIN_REPRICE_MS = 5000;
 // Finished jobs are history. Every other status, including a missing or
 // unknown one, is unfinished and always read in full for recovery.
 const JOB_STATUS = "json_extract(json,'$.status')", JOB_CREATED = "json_extract(json,'$.createdAt')";
@@ -59,7 +64,7 @@ const QUOTES_TTL_MS = 2000, QUOTE_TIMEOUT_MS = 6000;
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
 const validRevision = value => Number.isSafeInteger(value) && value >= 0;
 const modeOf = (exchange, mode) => {
-  if (!(exchange === 'binance' ? ['standard', 'portfolio-margin'] : exchange === 'okx' ? ['cross', 'isolated'] : exchange === 'hyperliquid' ? ['agent'] : ['unified']).includes(mode)) throw new ExecutionError(400, '请选择正确的实盘账户模式');
+  if (!(exchange === 'binance' ? ['standard', 'portfolio-margin'] : exchange === 'okx' ? ['cross', 'isolated'] : exchange === 'hyperliquid' ? ['agent'] : exchange === 'rh-lighter' ? ['api-key'] : ['unified']).includes(mode)) throw new ExecutionError(400, '请选择正确的实盘账户模式');
   return mode;
 };
 
@@ -320,7 +325,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (!row.credentials || (revision !== undefined && row.revision !== revision)) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
     const credentials = decrypt(row.credentials);
     if (!credentials || credentials.exchange !== exchange || credentials.purpose !== 'execution') throw new ExecutionError(503, '实盘凭据无法解密，请重新连接');
-    const secrets = exchange === 'hyperliquid' ? { address: credentials.address, agentKey: credentials.agentKey } : { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, ...(exchange === 'okx' ? { passphrase: credentials.passphrase } : {}) };
+    const secrets = exchange === 'hyperliquid' ? { address: credentials.address, agentKey: credentials.agentKey }
+      : exchange === 'rh-lighter' ? { address: credentials.address, accountIndex: credentials.accountIndex, apiKeyIndex: credentials.apiKeyIndex, apiKey: credentials.apiKey }
+      : { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, ...(exchange === 'okx' ? { passphrase: credentials.passphrase } : {}) };
     return { row, credentials: secrets, client: clients.get(exchange), options: { accountMode: row.account_mode, beforeMutation: requireLease } };
   }
   async function call(fn) {
@@ -368,12 +375,17 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (locked(exchange)) throw new ExecutionError(409, '该交易所有未结束任务，先停止并完成委托核对后再更换连接');
   }
   async function connect(exchange, body, session) {
-    const wallet = exchange === 'hyperliquid';
-    exactKeys(body, ['revision', 'accountMode', ...(wallet ? ['address', 'agentKey'] : ['apiKey', 'apiSecret']), ...(exchange === 'okx' ? ['passphrase'] : [])]); checkSession(session); checkAvailable(exchange, body.revision);
+    const wallet = exchange === 'hyperliquid', lighter = exchange === 'rh-lighter';
+    exactKeys(body, ['revision', 'accountMode', ...(wallet ? ['address', 'agentKey'] : lighter ? ['address', 'accountIndex', 'apiKeyIndex', 'apiKey'] : ['apiKey', 'apiSecret']), ...(exchange === 'okx' ? ['passphrase'] : [])]); checkSession(session); checkAvailable(exchange, body.revision);
     const mode = modeOf(exchange, body.accountMode);
     const valid = value => typeof value === 'string' && value.length >= 8 && value.length <= 512 && /^[A-Za-z0-9_-]+$/.test(value);
+    const index = (value, min, max) => { const number = typeof value === 'string' && /^\d{1,15}$/.test(value) ? Number(value) : value; return Number.isSafeInteger(number) && number >= min && number <= max ? number : null; };
     if (wallet) {
       if (typeof body.address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(body.address) || typeof body.agentKey !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(body.agentKey)) throw new ExecutionError(400, '请填写主账户地址（0x 开头 40 位）和 API 钱包私钥（0x 开头 64 位）');
+    } else if (lighter) {
+      const apiKeyIndex = index(body.apiKeyIndex, 4, 254);
+      if (typeof body.address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(body.address) || index(body.accountIndex, 1, Number.MAX_SAFE_INTEGER) === null || apiKeyIndex === null || apiKeyIndex === 157
+        || typeof body.apiKey !== 'string' || !/^(?:0x)?[0-9a-fA-F]{80}$/.test(body.apiKey)) throw new ExecutionError(400, '请填写钱包地址（0x 开头 40 位）、账户索引、API Key 索引（4–254，157 除外）和 API 私钥（80 位十六进制）');
     } else if (!valid(body.apiKey) || !valid(body.apiSecret)) throw new ExecutionError(400, '请填写有效的 HMAC 实盘 API Key 和 Secret');
     if (exchange === 'okx' && (typeof body.passphrase !== 'string' || body.passphrase.length < 8 || body.passphrase.length > 128 || /[\u0000-\u001f\u007f-\u009f]/.test(body.passphrase))) throw new ExecutionError(400, '请填写有效的 OKX Passphrase');
     if (connecting.has(exchange)) throw new ExecutionError(409, '此交易所正在验证实盘连接');
@@ -381,7 +393,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const previous = accountRow(exchange), previousVerified = verifiedAccounts.get(exchange);
     let rebound = false;
     try {
-      const credentials = wallet ? { address: body.address.toLowerCase(), agentKey: body.agentKey } : { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
+      const credentials = wallet ? { address: body.address.toLowerCase(), agentKey: body.agentKey }
+        : lighter ? { address: body.address.toLowerCase(), accountIndex: index(body.accountIndex, 1, Number.MAX_SAFE_INTEGER), apiKeyIndex: index(body.apiKeyIndex, 4, 254), apiKey: body.apiKey.replace(/^0x/, '').toLowerCase() }
+        : { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
       const symbols = connectSymbols(exchange);
       const result = await call(async signal => { const options = { accountMode: mode, signal, requireIdentity: !!accountWriter }; const verified = await client.verify(credentials, options); const account = await client.account(credentials, { ...options, symbols: [...symbols] }); return { verified, account }; });
       checkSession(session); checkAvailable(exchange, body.revision);
@@ -394,8 +408,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         } catch { throw new ExecutionError(409, '原账户仍有未核对操作或账户保护不可用，请先恢复原操作'); }
       }
       stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=?,account_mode=?,identity=?,key_label=?,verified_at=?,snapshot=? WHERE exchange=? AND revision=?').run(
-        // The wallet label is the API wallet's public address tail, never part of the private key.
-        encrypt({ purpose: 'execution', exchange, ...credentials }), mode, result.verified.identity ?? null, wallet ? String(result.verified.agentAddress ?? '').slice(-4) || null : body.apiKey.slice(-4), iso(now()), JSON.stringify(mergeSnapshot(null, result.account, symbols)), exchange, body.revision);
+        // Wallet labels are public (API wallet address tail, Lighter account and key index), never part of a private key.
+        encrypt({ purpose: 'execution', exchange, ...credentials }), mode, result.verified.identity ?? null, wallet ? String(result.verified.agentAddress ?? '').slice(-4) || null : lighter ? `${credentials.accountIndex}#${credentials.apiKeyIndex}` : body.apiKey.slice(-4), iso(now()), JSON.stringify(mergeSnapshot(null, result.account, symbols)), exchange, body.revision);
       return state();
     } catch (error) {
       if (rebound) {
@@ -606,7 +620,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       assertJob(order.jobId);
     }
     Object.assign(current, { remoteId: value.id, filledQuantity, unknown: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
-    saveOrder(current); return true;
+    // Lighter RH accepts a post-only order and cancels it on execution when the book
+    // already crossed it; like a Hyperliquid ALO refusal, nothing rested or filled.
+    const bounced = current.exchange === 'rh-lighter' && value.bounced === true && value.terminal && filledQuantity === '0' && !current.bounced && !current.cancelRequestedAt;
+    if (bounced) current.bounced = true;
+    saveOrder(current);
+    if (bounced) {
+      const job = jobFor(current.jobId), leg = job.plan.legs.find(item => item.id === current.legId);
+      if (leg && job.lastBounceEvent !== leg.id) { job.lastBounceEvent = leg.id; event(job, `${TRADING_NAMES[current.exchange]} ${current.spec.symbol} 只挂单因盘口变化被取消，按最新盘口重新挂单`); saveJob(job); }
+    }
+    return true;
   }
   // Every create left unknown had an uncertain result (timeout, 5xx, unknown
   // code), so a missing client ID is not proof by itself (L039/L062). After the
@@ -616,7 +639,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // plus known fills adopts reality. Bybit market orders carry orderLinkId and
   // follow the same path; Bybit strategies have no client ID and are confirmed
   // by the operator.
-  const createSettledAt = order => Date.parse(order.createdAt) + Math.max(CREATE_OBSERVE_MS, callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS);
+  // A Lighter RH transaction stays executable until its signed expiry (10 min after signing).
+  const createSettledAt = order => Date.parse(order.createdAt) + Math.max(CREATE_OBSERVE_MS, callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS,
+    order.exchange === 'rh-lighter' ? RH_LIGHTER_TX_EXPIRES_MS + callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS : 0);
   async function absentCreate(order) {
     requireLease();
     const current = orderFor(order.localId);
@@ -757,10 +782,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     order.cancelRequestedAt = iso(now()); order.cancelSent = sentBefore + 1; order.state = 'canceling'; saveOrder(order);
     try {
       await call(signal => ctx.client.stop(ctx.credentials, { ...order.spec, id: order.remoteId }, { ...ctx.options, signal, beforeMutation: () => { requireLease(); if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次撤单未发送'); } } } }));
-      finishWrite(operation, 'confirmed', order); saveOrder(order);
+      order.cancelDeferrals = 0; finishWrite(operation, 'confirmed', order); saveOrder(order);
     }
     catch (error) {
       if (error instanceof NotSubmittedError) Object.assign(order, { cancelSent: sentBefore, cancelRequestedAt: requestedBefore });
+      // An adapter refusal before sending (venue cooldown, local rate limit)
+      // keeps the spacing but not the attempt, so a cooldown cannot use up
+      // the cancel budget; its own cap keeps the retries bounded.
+      else if (error instanceof ExecutionExchangeError && error.notSent) {
+        if ((order.cancelDeferrals ?? 0) < CANCEL_DEFERRALS) Object.assign(order, { cancelSent: sentBefore, cancelDeferrals: (order.cancelDeferrals ?? 0) + 1 });
+      } else order.cancelDeferrals = 0;
       finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', order);
       saveOrder(order);
       /* Even a failed or timed-out stop must be reconciled by a fresh query. */
@@ -822,9 +853,10 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   }
   // The adapter repeats this check, but only after a sibling leg may already be sent.
   function checkHyperliquidPrice(leg, market) {
-    const decimals = stepDecimals(leg.rule?.quantityStep);
-    const { problem } = decimals === null ? { problem: '下单步长不是十的整数次幂' }
-      : orderPrice({ side: leg.orderSide, orderType: legOrderType(leg), limitPrice: hyperliquidLimit(leg, market), stopPrice: leg.stopPrice ?? null }, decimals);
+    const order = { side: leg.orderSide, orderType: legOrderType(leg), limitPrice: hyperliquidLimit(leg, market), stopPrice: leg.stopPrice ?? null };
+    const decimals = leg.exchange === 'rh-lighter' ? null : stepDecimals(leg.rule?.quantityStep);
+    const { problem } = leg.exchange === 'rh-lighter' ? rhLighterOrderPrice(order, market.rule.tickSize)
+      : decimals === null ? { problem: '下单步长不是十的整数次幂' } : orderPrice(order, decimals);
     if (problem) throw new ExecutionError(409, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${problem}，本组交易腿均未发送`);
   }
   async function submit(job, leg, quantity, market) {
@@ -842,10 +874,10 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     // Hyperliquid has no venue-side book pegging: chase legs rest at the same-side
     // best price and market legs start from the opposite best (the adapter adds
     // its 1% protection), both from the book that just passed the send checks.
-    const limitPrice = leg.exchange === 'hyperliquid' ? hyperliquidLimit(leg, market) : bound && leg.exchange === 'binance' ? (leg.orderSide === 'buy' ? market.bid : market.ask) : null;
+    const limitPrice = WALLET_VENUES.has(leg.exchange) ? hyperliquidLimit(leg, market) : bound && leg.exchange === 'binance' ? (leg.orderSide === 'buy' ? market.bid : market.ask) : null;
     const spec = { symbol: leg.symbol, side: leg.orderSide, positionSide: positionSide(leg), quantity, reduceOnly: job.plan.action === 'close', clientId: 'h' + createHash('sha256').update(localId).digest('hex').slice(0, 30), orderType, stopPrice: bound ?? leg.stopPrice ?? null,
       ...(limitPrice ? { limitPrice } : {}), ...(leg.exchange === 'okx' ? { contractSize: leg.rule.contractSize, instrumentId: leg.rule.instrumentId } : {}),
-      ...(leg.exchange === 'hyperliquid' ? { assetId: leg.rule.assetId } : {}) };
+      ...(WALLET_VENUES.has(leg.exchange) ? { assetId: leg.rule.assetId } : {}) };
     const order = { localId, jobId: job.id, legId: leg.id, exchange: leg.exchange, accountRevision: leg.accountRevision, phase: job.phase, batch: job.batchIndex,
       kind: leg.exchange === 'bybit' && orderType === 'chase' ? 'strategy' : 'order', remoteId: null, spec, state: 'submitting', unknown: true, settled: false, filledQuantity: '0', price: null, lastCheckedAt: null, createdAt: iso(now()), cancelRequestedAt: null };
     // Persist intent before the network call. On restart an unanswered intent is uncertain.
@@ -994,19 +1026,21 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
           if (stopReached(leg, market)) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 已达到追价界限`);
           // An automatic order rests at its last price rather than chase past the batch limit.
           if (job.auto?.guard && atBound(order, leg, market)) { holdAtBound(id, leg); continue; }
-          const repriceDue = legOrderType(leg) === 'chase' && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= job.plan.repriceIntervalMs
+          const repriceMs = leg.exchange === 'rh-lighter' ? Math.max(job.plan.repriceIntervalMs, RH_LIGHTER_MIN_REPRICE_MS) : job.plan.repriceIntervalMs;
+          const repriceDue = legOrderType(leg) === 'chase' && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= repriceMs
             && (order.price === null || compareDecimals(order.price, leg.orderSide === 'buy' ? market.bid : market.ask) !== 0);
           if (['binance', 'okx'].includes(leg.exchange) && repriceDue) {
             await amendOrder(job, leg, order, market);
             if (jobFor(id).status === 'stopping') break;
-          } else if (leg.exchange === 'hyperliquid' && order.remoteId && !order.unknown && !order.cancelRequestedAt && repriceDue && !resendable(order, market, job.plan.action)) {
+          } else if (WALLET_VENUES.has(leg.exchange) && order.remoteId && !order.unknown && !order.cancelRequestedAt && repriceDue && !resendable(order, market, job.plan.action)) {
             holdRemainder(id, leg);
-          } else if (leg.exchange === 'hyperliquid' && order.remoteId && !order.unknown && (order.cancelRequestedAt ? !cancelRecent(order) : repriceDue && resendable(order, market, job.plan.action))) {
-            // Hyperliquid modify assigns a new order id, so the original is
-            // cancelled by exact id instead; once inspection confirms it ended,
-            // the remainder is re-sent below through the ordinary send checks.
+          } else if (WALLET_VENUES.has(leg.exchange) && order.remoteId && !order.unknown && (order.cancelRequestedAt ? !cancelRecent(order) : repriceDue && resendable(order, market, job.plan.action))) {
+            // Hyperliquid modify assigns a new order id and Lighter RH has no
+            // modify here, so the original is cancelled by exact id instead; once
+            // inspection confirms it ended, the remainder is re-sent below
+            // through the ordinary send checks.
             // A cancel that left the order working is retried with the same spacing and budget as stopping.
-            if (order.cancelRequestedAt && cancelSpent(order)) throw new ExecutionError(409, 'Hyperliquid 追价撤单多次未生效，暂停其余交易腿');
+            if (order.cancelRequestedAt && cancelSpent(order)) throw new ExecutionError(409, `${TRADING_NAMES[leg.exchange]} 追价撤单多次未生效，暂停其余交易腿`);
             await cancelOrder(order);
             if (jobFor(id).status === 'stopping') break;
           }
@@ -1037,7 +1071,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         ensureNoExternalOrders(snapshots.get(leg.exchange), leg.symbol);
         checkChildQuantity(quantity, market, job.plan.action, legOrderType(leg));
         if (stopReached(leg, market)) throw new ExecutionError(409, '最新盘口已达到追价界限');
-        if (leg.exchange === 'hyperliquid') checkHyperliquidPrice(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
+        if (WALLET_VENUES.has(leg.exchange)) checkHyperliquidPrice(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
       }
       if (job.auto?.guard && candidates.length === job.plan.legs.length && !guardMet(id, job, candidates, markets, all, received)) return;
       writable(); job = jobFor(id);

@@ -7,12 +7,14 @@ async (page) => {
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const stamp = () => new Date().toISOString();
   const MASTER = '0x' + 'AB'.repeat(20), AGENT_KEY = '0x' + '11'.repeat(32);
+  const LIGHTER_WALLET = '0x' + 'CD'.repeat(20), LIGHTER_KEY = '22'.repeat(40);
   const requests = [], pageErrors = [], previews = new Map();
   let jobs = [], sequence = 0;
-  const connections = ['binance', 'bybit', 'okx', 'hyperliquid'].map(exchange => ({ exchange, connected: false, revision: 0, accountMode: exchange === 'hyperliquid' ? 'agent' : exchange === 'okx' ? 'cross' : exchange === 'bybit' ? 'unified' : 'standard', identity: null, keyLabel: null, verifiedAt: null, locked: false }));
+  const MODES = { hyperliquid: 'agent', 'rh-lighter': 'api-key', okx: 'cross', bybit: 'unified', binance: 'standard' };
+  const connections = ['binance', 'bybit', 'okx', 'hyperliquid', 'rh-lighter'].map(exchange => ({ exchange, connected: false, revision: 0, accountMode: MODES[exchange], identity: null, keyLabel: null, verifiedAt: null, locked: false }));
   const execution = () => ({ generatedAt: stamp(), connections: structuredClone(connections), positions: [], jobs: structuredClone(jobs) });
-  // Per share at 12.7B / 16.7B: io 8.9 / 9, Binance 10 / 10.1, OKX 10.2 / 10.3, xyz 9.5 / 9.6.
-  const books = { 'hyperliquid:io:ANTH': ['148.63', '150.3'], 'hyperliquid:xyz:ANT': ['9.5', '9.6'], 'binance:ANTHROPICUSDT': ['127', '128.27'], 'okx:ANTHROPICUSDT': ['12.954', '13.081'], 'binance:CLUSDT': ['60.00', '60.02'], 'binance:BZUSDT': ['64.20', '64.22'] };
+  // Per share at 12.7B / 16.7B: io 8.9 / 9, Binance 10 / 10.1, OKX 10.2 / 10.3, xyz 9.5 / 9.6, Lighter RH 9.2 / 9.3.
+  const books = { 'hyperliquid:io:ANTH': ['148.63', '150.3'], 'hyperliquid:xyz:ANT': ['9.5', '9.6'], 'binance:ANTHROPICUSDT': ['127', '128.27'], 'okx:ANTHROPICUSDT': ['12.954', '13.081'], 'rh-lighter:ANTHROPIC': ['153.64', '155.31'], 'binance:CLUSDT': ['60.00', '60.02'], 'binance:BZUSDT': ['64.20', '64.22'] };
   const quotes = () => ({ generatedAt: stamp(), maxAgeMs: 10_000, books: Object.entries(books).map(([key, [bid, ask]]) => { const [exchange, ...symbol] = key.split(':'); return { exchange, symbol: symbol.join(':'), bid, ask, at: stamp() }; }) });
   function makePreview(input) {
     assert(input.market === 'anthropic' && input.legs.length === 2, 'Anthropic preview has two legs');
@@ -20,9 +22,9 @@ async (page) => {
     assert(input.legs.every(leg => leg.quantity === undefined), 'equal shares send no per-leg quantity');
     const result = { ...input, id: `fixture-preview-${++sequence}`, expiresAt: new Date(Date.now() + 60_000).toISOString(), resumeJobId: null,
       connections: connections.filter(connection => input.legs.some(leg => leg.exchange === connection.exchange)),
-      legs: input.legs.map((leg, index) => { const [bid, ask] = books[`${leg.exchange}:${leg.symbol}`]; const hl = leg.exchange === 'hyperliquid';
-        return { ...leg, stopPrice: leg.stopPrice ?? null, id: `leg-${index}`, orderSide: leg.side === 'long' ? 'buy' : 'sell', positionMode: 'one-way', accountRevision: 1, currentQuantity: '0', batchQuantities: [hl ? '10' : '13.149'], quantity: hl ? '10' : '13.149', estimatedNotional: hl ? '1503' : '1669.923', bid, ask, quoteAt: stamp(),
-          rule: hl ? { quoteAsset: 'USDC' } : {}, ...(hl ? { leverage: { type: 'isolated', value: 15 } } : {}) }; }),
+      legs: input.legs.map((leg, index) => { const [bid, ask] = books[`${leg.exchange}:${leg.symbol}`]; const hl = leg.exchange === 'hyperliquid', rh = leg.exchange === 'rh-lighter', wallet = hl || rh;
+        return { ...leg, stopPrice: leg.stopPrice ?? null, id: `leg-${index}`, orderSide: leg.side === 'long' ? 'buy' : 'sell', positionMode: 'one-way', accountRevision: 1, currentQuantity: '0', batchQuantities: [wallet ? '10' : '13.149'], quantity: wallet ? '10' : '13.149', estimatedNotional: wallet ? '1503' : '1669.923', bid, ask, quoteAt: stamp(),
+          rule: hl ? { quoteAsset: 'USDC' } : rh ? { quoteAsset: 'USDG' } : {}, ...(hl ? { leverage: { type: 'isolated', value: 15 } } : rh ? { leverage: { type: 'cross', value: 3 } } : {}) }; }),
       notes: ['模拟预览：不会访问交易所。'] };
     previews.set(result.id, structuredClone(result)); return result;
   }
@@ -44,10 +46,14 @@ async (page) => {
     if (!url.pathname.startsWith('/api/trading/execution')) return send({ error: 'Unexpected fixture API' }, 404);
     if (method !== 'GET') assert(request.headers()['x-csrf-token'] === 'anthropic-fixture-csrf', 'execution writes carry the session CSRF');
     if (url.pathname === '/api/trading/execution' && method === 'GET') return send(execution());
-    const account = url.pathname.match(/\/accounts\/(binance|hyperliquid)$/)?.[1];
+    const account = url.pathname.match(/\/accounts\/(binance|hyperliquid|rh-lighter)$/)?.[1];
     if (account && method === 'PUT') {
       const connection = connections.find(value => value.exchange === account);
-      if (account === 'hyperliquid') {
+      if (account === 'rh-lighter') {
+        assert(Object.keys(body).sort().join(',') === 'accountIndex,accountMode,address,apiKey,apiKeyIndex,revision', 'Lighter connection sends exactly mode, wallet, indexes and API key');
+        assert(body.accountMode === 'api-key' && body.address === LIGHTER_WALLET && body.accountIndex === '22163' && body.apiKeyIndex === '5' && body.apiKey === LIGHTER_KEY, 'Lighter fields are sent trimmed and unchanged');
+        Object.assign(connection, { connected: true, revision: 1, identity: LIGHTER_WALLET.toLowerCase(), keyLabel: '22163#5', verifiedAt: stamp() });
+      } else if (account === 'hyperliquid') {
         assert(Object.keys(body).sort().join(',') === 'accountMode,address,agentKey,revision', 'wallet connection sends exactly mode, address and API wallet key');
         assert(body.accountMode === 'agent' && body.address === MASTER && body.agentKey === AGENT_KEY, 'wallet fields are sent trimmed and unchanged');
         Object.assign(connection, { connected: true, revision: 1, identity: MASTER.toLowerCase(), keyLabel: '9f3e', verifiedAt: stamp() });
@@ -86,7 +92,8 @@ async (page) => {
   assert((await best.locator('th').textContent()) === 'Hyperliquid io:ANTH（Entropy）' && (await best.locator('td').first().textContent()) === 'OKX ANTHROPIC-USDT-SWAP', 'widest pair buys io and sells OKX');
   assert((await best.locator('td').nth(1).textContent()).includes('13.33'), 'gap is (10.2 - 9) / 9');
   assert((await best.locator('td').nth(2).textContent()) === '13.1496 单位空头', 'hedge ratio is F / (S / 10)');
-  assert(await ant.locator(`table:has(caption:text-is("${pairs}")) tbody tr`).count() === 6, 'each contract pair once');
+  assert(await ant.locator(`table:has(caption:text-is("${pairs}")) tbody tr`).count() === 10, 'each contract pair once');
+  assert((await row(perShare, 'Lighter RH ANTHROPIC（Robinhood Chain）').locator('td').nth(2).textContent()) === '9.200 / 9.300', 'Lighter RH quotes per 1B fully diluted shares');
   await ant.getByLabel('完全稀释股 · 十亿股').fill('20');
   await page.waitForFunction(() => document.querySelector('.spread-anthropic tbody tr td:nth-child(4)')?.textContent?.includes('7.515'));
   await ant.getByLabel('流通股 · 十亿股').fill('30');
@@ -110,7 +117,7 @@ async (page) => {
 
   // Connections: Hyperliquid uses the wallet form; the key leaves the field once sent.
   await panel.locator('.execution-connections > summary').click();
-  assert((await panel.locator('.execution-connections > summary').innerText()).includes('0 / 4'), 'four live venues are listed');
+  assert((await panel.locator('.execution-connections > summary').innerText()).includes('0 / 5'), 'five live venues are listed');
   const wallet = panel.getByRole('form', { name: 'Hyperliquid 实盘账户连接' });
   const connectWallet = wallet.getByRole('button', { name: '验证并连接实盘账户' });
   await wallet.getByLabel('Hyperliquid 主账户地址').fill('0x12');
@@ -122,6 +129,19 @@ async (page) => {
   await connectWallet.click();
   await wallet.getByText(MASTER.toLowerCase(), { exact: false }).waitFor();
   assert((await wallet.innerText()).includes('API 钱包地址尾号 9f3e'), 'only the public API wallet tail is shown');
+  const lighter = panel.getByRole('form', { name: 'Lighter RH 实盘账户连接' });
+  const connectLighter = lighter.getByRole('button', { name: '验证并连接实盘账户' });
+  await lighter.getByLabel('Lighter 钱包地址（L1）').fill(LIGHTER_WALLET);
+  await lighter.getByLabel('Lighter 账户索引').fill('22163');
+  await lighter.getByLabel('Lighter API Key 索引').fill('157');
+  await lighter.getByText('API Key 索引须为 4 到 254 的整数（157 除外）。').waitFor();
+  await lighter.getByLabel('Lighter API 私钥').fill(LIGHTER_KEY);
+  assert(await connectLighter.isDisabled(), 'a reserved API key index cannot be sent');
+  await lighter.getByLabel('Lighter API Key 索引').fill(' 5 ');
+  assert(await lighter.getByLabel('Lighter API 私钥').getAttribute('type') === 'password', 'Lighter API key is masked');
+  await connectLighter.click();
+  await lighter.getByText(LIGHTER_WALLET.toLowerCase(), { exact: false }).waitFor();
+  assert((await lighter.innerText()).includes('账户#密钥索引 22163#5'), 'only the account and key indexes are shown');
   const binance = panel.getByRole('form', { name: 'Binance 实盘账户连接' });
   await binance.getByLabel('Binance 实盘 API Key', { exact: true }).fill('fixture_binance_key');
   await binance.getByLabel('Binance 实盘 API Secret', { exact: true }).fill('fixture_binance_secret');
@@ -148,8 +168,22 @@ async (page) => {
   assert(review.includes('主账户 ' + MASTER.toLowerCase()), 'review names the Hyperliquid master account');
   await panel.locator('.execution-review').screenshot({ path: 'output/playwright/trading-anthropic-review.png' });
 
-  // Same venue: io against xyz is a same-exchange pair.
+  // Lighter RH: USDG legs, wallet identity and the account#key label in the review.
   await panel.getByRole('button', { name: '返回修改参数' }).click();
+  await contractA.selectOption('rh-lighter:ANTHROPIC');
+  await panel.getByRole('group', { name: '开仓方向', exact: true }).getByRole('button').nth(0).click();
+  await panel.getByLabel(/^每腿股数/).fill('167');
+  assert(await panel.getByLabel('追价上限 · USDG（选填）').count() === 1, 'Lighter RH chase limit is in USDG');
+  await panel.getByRole('button', { name: '预览开仓组合' }).click();
+  await panel.getByRole('heading', { name: '确认Anthropic跨所两腿开仓' }).waitFor();
+  assert(JSON.stringify(lastPreview().legs.map(leg => [leg.exchange, leg.symbol, leg.side])) === JSON.stringify([['rh-lighter', 'ANTHROPIC', 'long'], ['binance', 'ANTHROPICUSDT', 'short']]), 'Lighter RH leg is sent with its native symbol');
+  const lighterReview = await panel.locator('.execution-review').innerText();
+  assert(lighterReview.includes('Lighter RH') && lighterReview.includes('USDG') && lighterReview.includes('全仓 3x（不修改）'), 'review shows the USDG leg and its live leverage');
+  assert(lighterReview.includes('钱包 ' + LIGHTER_WALLET.toLowerCase()) && lighterReview.includes('账户#密钥索引 22163#5'), 'review names the Lighter wallet and key');
+  await panel.getByRole('button', { name: '返回修改参数' }).click();
+  await contractA.selectOption('hyperliquid:io:ANTH');
+
+  // Same venue: io against xyz is a same-exchange pair.
   await contractB.selectOption('hyperliquid:xyz:ANT');
   await panel.getByRole('group', { name: '开仓方向', exact: true }).getByRole('button').nth(1).click();
   await panel.getByLabel(/^每腿股数/).fill('100');
@@ -168,8 +202,9 @@ async (page) => {
   await ant.screenshot({ path: 'output/playwright/trading-anthropic-mobile-spread.png' });
   await panel.locator('.execution-builder').screenshot({ path: 'output/playwright/trading-anthropic-mobile-builder.png' });
   const rendered = await page.locator('body').innerText();
-  assert(!rendered.includes(AGENT_KEY.slice(2)) && !rendered.includes('fixture_binance_secret'), 'keys never render');
+  assert(!rendered.includes(AGENT_KEY.slice(2)) && !rendered.includes('fixture_binance_secret') && !rendered.includes(LIGHTER_KEY), 'keys never render');
   assert(requests.filter(request => JSON.stringify(request.body ?? {}).includes(AGENT_KEY.slice(2))).every(request => request.path.endsWith('/accounts/hyperliquid')), 'API wallet key only goes to its connection endpoint');
+  assert(requests.filter(request => JSON.stringify(request.body ?? {}).includes(LIGHTER_KEY)).every(request => request.path.endsWith('/accounts/rh-lighter')), 'Lighter API key only goes to its connection endpoint');
   assert(pageErrors.length === 0, `no browser exceptions: ${pageErrors.join('; ')}`);
   return { passed: true, requests: requests.length, previews: requests.filter(request => request.path.endsWith('/preview')).length };
 }

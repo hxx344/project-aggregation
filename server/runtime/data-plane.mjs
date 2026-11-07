@@ -140,7 +140,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
   // Anthropic legs: read-only Binance/OKX accounts plus the live Hyperliquid connection's public positions.
   const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, encrypt, decrypt, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0, readCex: () => trading.anthropic(),
-    readAddress: () => { const row = execution.state().connections.find(item => item.exchange === 'hyperliquid'); return row?.connected && typeof row.identity === 'string' ? row.identity.toLowerCase() : null; } });
+    readAddress: exchange => { const row = execution.state().connections.find(item => item.exchange === exchange); return row?.connected && typeof row.identity === 'string' ? row.identity.toLowerCase() : null; } });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
     close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),
@@ -433,7 +433,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (autoRule && !autoRule[2] && method === 'PUT') return reply(200, executionAuto.update(autoRule[1], await signedBody()));
       if (autoRule && !autoRule[2] && method === 'DELETE') return reply(200, executionAuto.remove(autoRule[1], await signedBody()));
       if (autoRule && autoRule[2] && method === 'POST') return reply(200, executionAuto.act(autoRule[1], autoRule[2], await signedBody()));
-      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx|hyperliquid)$/);
+      const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx|hyperliquid|rh-lighter)$/);
       const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
       if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));
       if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId)));
