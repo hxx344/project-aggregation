@@ -7,14 +7,14 @@ export const FILLS_CACHE_MS = 20_000;
 export const FILLS_PENDING_CACHE_MS = 3_000;
 export const FILLS_STALE_AFTER_MS = 15 * 60_000;
 export const MAX_FILL_ITEMS = 2000;
-export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC'] } as const;
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'XYZANT', 'IOANTH'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillsRequest = { requestId: string; market: FillMarket };
 type ScopeStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';
 export type HubFillItem = {
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
   symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
-  quantity: string; quantityUnit: string; price: string; priceCurrency: 'USDT' | 'USDC';
+  quantity: string; quantityUnit: string; price: string; priceCurrency: string | null;
   fee: string | null; feeCurrency: string | null; realizedPnl: string | null; positionBefore: string | null; positionAfter: string | null; stale: boolean;
 };
 export type FillCoverage = {
@@ -59,8 +59,7 @@ function decimal(value: unknown, positive = false): string | null {
 
 export function fillItems(response: unknown, now: number, market: FillMarket = 'oil') {
   const items: HubFillItem[] = [], coverage: FillCoverage[] = [], seen = new Set<string>();
-  // ANT currently excludes Hyperliquid/RH history, even when connected CEX scopes are complete.
-  let pending = false, incomplete = market === 'anthropic', truncated = false, lookbackStart: string | null = null;
+  let pending = false, incomplete = false, truncated = false, lookbackStart: string | null = null;
   for (const sourceValue of list(object(response).sources)) {
     const source = object(sourceValue), sourceName = text(source.name), projectId = text(source.projectId);
     const sourceStatus = enumeration(source.status, ['ready', 'stale', 'unavailable', 'unconfigured']);
@@ -90,19 +89,26 @@ export function fillItems(response: unknown, now: number, market: FillMarket = '
           truncated ||= scopeTruncated;
           incomplete ||= scopeTruncated || sourceFailed || status === 'stale' || status === 'error' || status === 'live' && old;
           const coverageStatus = status === 'live' && stale ? 'stale' : status;
-          const error = coverageStatus === 'unsupported' ? 'Asset 暂不支持此产品范围的成交读取'
-            : coverageStatus === 'error' ? 'Asset 读取此范围失败，请在 Asset 检查连接与权限'
+          const nativeSource = market === 'anthropic' && ['hyperliquid', 'rh-lighter'].includes(exchangeId);
+          const error = coverageStatus === 'unsupported' ? '数据源暂不支持此产品范围的成交读取'
+            : coverageStatus === 'error' ? nativeSource ? '实盘连接账户的历史读取失败，请检查连接与读取权限' : 'Asset 读取此范围失败，请在 Asset 检查连接与权限'
               : coverageStatus === 'stale' ? '成交数据已过期，等待 Asset 更新' : null;
           coverage.push({ sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, account: accountName, scope: scopeId,
             status: coverageStatus, fetchedAt, coverageStart, coverageEnd, error });
           for (const fillValue of list(scope.fills)) {
             const fill = object(fillValue), base = enumeration(fill.base, FILL_MARKETS[market]);
-            const priceCurrency = enumeration(fill.priceCurrency, ['USDT', 'USDC'] as const), symbol = text(fill.symbol);
+            const nativeAnt = market === 'anthropic' && ['hyperliquid', 'rh-lighter'].includes(exchangeId);
+            const priceCurrency = nativeAnt ? optional(fill.priceCurrency) : enumeration(fill.priceCurrency, ['USDT', 'USDC'] as const), symbol = text(fill.symbol);
+            if (nativeAnt && priceCurrency !== null && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(priceCurrency)) throw new MalformedFills();
             const symbols = exchangeId === 'okx' ? [`${base}-USDT-SWAP`]
               : exchangeId === 'binance' ? [`${base}USDT`]
-                : exchangeId === 'bybit' ? [base + priceCurrency, ...(priceCurrency === 'USDC' ? [base + 'PERP'] : [])] : [];
-            if (!symbols.includes(symbol) || market === 'anthropic' && !['binance', 'okx'].includes(exchangeId)
-              || exchangeId !== 'bybit' && priceCurrency !== 'USDT') throw new MalformedFills();
+                : exchangeId === 'bybit' ? [base + priceCurrency, ...(priceCurrency === 'USDC' ? [base + 'PERP'] : [])]
+                  : nativeAnt && exchangeId === 'rh-lighter' && base === 'ANTHROPIC' ? ['ANTHROPIC']
+                    : nativeAnt && exchangeId === 'hyperliquid' && base === 'XYZANT' ? ['xyz:ANT']
+                      : nativeAnt && exchangeId === 'hyperliquid' && base === 'IOANTH' ? ['io:ANTH'] : [];
+            if (!symbols.includes(symbol) || market === 'anthropic' && !nativeAnt && (!['binance', 'okx'].includes(exchangeId) || base !== 'ANTHROPIC')
+              || !nativeAnt && exchangeId !== 'bybit' && priceCurrency !== 'USDT'
+              || nativeAnt && (fill.positionSide !== 'net' || exchangeId === 'rh-lighter' && priceCurrency !== 'USDG')) throw new MalformedFills();
             const time = timestamp(fill.time);
             if (!time) throw new MalformedFills();
             const key = [projectId, exchangeId, accountId, scopeId, text(fill.id)].map(encodeURIComponent).join('|');
@@ -113,7 +119,7 @@ export function fillItems(response: unknown, now: number, market: FillMarket = '
             incomplete ||= positionBefore === null || positionAfter === null;
             items.push({ key, sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, accountId, account: accountName, scope: scopeId,
               symbol, base, time, side: enumeration(fill.side, ['buy', 'sell'] as const), positionSide: enumeration(fill.positionSide, ['long', 'short', 'net'] as const),
-              quantity: decimal(fill.quantity, true)!, quantityUnit: enumeration(fill.quantityUnit, [exchangeId === 'okx' ? '张' : base]), price: decimal(fill.price, true)!, priceCurrency,
+              quantity: decimal(fill.quantity, true)!, quantityUnit: enumeration(fill.quantityUnit, [exchangeId === 'okx' ? '张' : exchangeId === 'hyperliquid' ? symbol.split(':')[1] : base]), price: decimal(fill.price, true)!, priceCurrency,
               fee: decimal(fill.fee), feeCurrency: optional(fill.feeCurrency), realizedPnl: decimal(fill.realizedPnl), positionBefore, positionAfter, stale });
           }
         }

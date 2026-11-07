@@ -1779,6 +1779,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `execution-accepted-feedback-20261107`；本次用户纠正与验证为一个事件。
 
+### L108：历史成交标记须有真实合约归属，当前持仓不能代替历史配对证据
+
+**适用条件：** 同一标的在多个原生合约之间切换的价差图，以及当前持仓的组合盈亏展示。
+
+**根因：** `b524404` 的 ANT 配置对 RH、xyz、io 共用 Binance/OKX 单腿事件，并随所选图表换纵坐标；成交来源没有包含 RH/HL，文字说明“非双腿成交价差”仍不能阻止用户将图上入场理解为该组合入场。原测试也断言同一 Binance 成交出现在三个图上，复述了错误模型。关联交易按结算币种拆开，未表达用户实际的 Binance–Lighter RH 当前组合。
+
+**以后做法：** 历史事件按真实交易所与原生合约路由，RH、xyz、io 分别隔离；手动成交与工作台成交用相同的真实成交证据。只有单腿证据的 Binance/OKX 记录留明细，不通过当前持仓或相邻时间推断过去的对冲腿。当前组合独立确认唯一反向两腿，多账户或共用一腿时不重复分摊。跨币种估算仅在明确选择口径后提供，并持续标注；本次用户明确允许 ANT 的 USDT/USDG 按 1:1 估算，不推广到其他账本或估值。未知费用/本轮已实现不补零，已知部分与完整总额分开。
+
+**如何验证：** [ANT 标记回归](modules/monitor/tests/anthropic-trades.test.mjs) 必须断言 RH 成交在 xyz/io 图上为零标记、无归属 CEX 仅明细；[组合回归](modules/monitor/tests/related-position-totals.test.mjs) 用用户截图验证未实现 +406.33、已知净盈亏 +394.84，同时保持完整总额未知，覆盖多账户歧义；[真实工作台入口](tests/monitor-anthropic-trades.browser.mjs) 验证切换图表与原币明细，不能只校验标记随曲线移动。
+
+**证据：** project-aggregation `b524404` 的 `anthropicChartConfig` 将同一 `anthropicTradeEvents` 赋给三种对比，`anthropic-trades.test.mjs` 首版对同一 CEX 事件逐项期待 xyz/io/rh 坐标。2026-11-07 用户截图与纠正后核对源码；本次修正补齐原生成交只读来源并按合约分流。没有读取用户真实成交账户，不把夹具当作实盘交易证明。
+
+**事件记录：** `ant-history-pair-attribution-20261107`；P1 逃逸缺陷，用户反馈后修复；已扩充审查清单的身份归属项，留作下次复盘输入，不推进复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

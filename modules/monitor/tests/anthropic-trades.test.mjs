@@ -6,55 +6,61 @@ import { tradeDetailLines } from '../modules/oil/trade-markers.mjs';
 import { fill } from './oil-trades-fixtures.mjs';
 
 const bar = Date.parse('2026-11-06T08:00:00.000Z'), step = 900_000;
-const ant = (overrides = {}) => fill({ key: 'ant-entry', symbol: 'ANTHROPICUSDT', base: 'ANTHROPIC', quantityUnit: 'ANTHROPIC',
+const cex = (overrides = {}) => fill({ key: 'bn', symbol: 'ANTHROPICUSDT', base: 'ANTHROPIC', quantityUnit: 'ANTHROPIC',
   price: '1270', time: new Date(bar + 60_000).toISOString(), ...overrides });
+const native = (leg, overrides = {}) => cex({ key: leg, sourceId: 'native', exchangeId: leg === 'rh' ? 'rh-lighter' : 'hyperliquid',
+  exchange: leg === 'rh' ? 'Lighter RH' : 'Hyperliquid', symbol: leg === 'rh' ? 'ANTHROPIC' : leg === 'xyz' ? 'xyz:ANT' : 'io:ANTH',
+  base: leg === 'rh' ? 'ANTHROPIC' : leg === 'xyz' ? 'XYZANT' : 'IOANTH', quantityUnit: leg === 'rh' ? 'ANTHROPIC' : leg === 'xyz' ? 'ANT' : 'ANTH',
+  priceCurrency: leg === 'rh' ? 'USDG' : null, feeCurrency: leg === 'rh' ? 'USDG' : 'USDC', ...overrides });
 const rows = [{ time: bar - step, binance: 1270, xyz: 80, io: 1670, rh: 835 }, { time: bar, binance: 1270, xyz: 80, io: 1670, rh: 835 }];
+const markers = (fills, leg) => { const config = anthropicChartConfig(leg); return config.tradeMarkers(config.tradeEvents(fills), anthropicPoints(rows, leg)); };
 
-test('ANT classifies actual position changes and keeps unknown and cross-zero fills distinct', () => {
-  const events = anthropicTradeEvents([
-    ant(), ant({ key: 'exit', time: new Date(bar + 120_000).toISOString(), side: 'sell', positionBefore: '2', positionAfter: '0' }),
-    ant({ key: 'unknown', time: new Date(bar + 180_000).toISOString(), positionBefore: null, positionAfter: null }),
-    ant({ key: 'cross', time: new Date(bar + 240_000).toISOString(), side: 'sell', positionBefore: '1', positionAfter: '-1' }),
-    fill({ time: new Date(bar).toISOString() }), ant({ key: 'token', symbol: 'ANTUSDT', base: 'ANT' }),
-    ant({ key: 'bybit', exchangeId: 'bybit' }),
-  ]);
-  assert.deepEqual(events.map(event => event.type), ['entry', 'exit', 'trade', 'rebalance']);
-  assert.equal(events[0].time, bar + 60_000);
-  assert.ok(events.every(event => event.spread === null && event.spreadVenue === null));
-});
-
-test('ANT markers follow the selected closed 15-minute chart and never use native trade price as spread', () => {
-  const events = anthropicTradeEvents([ant()]);
-  for (const [leg, premium, spread] of [['xyz', 25, 20], ['io', 0, 0], ['rh', 100, 50]]) {
-    const config = anthropicChartConfig(leg), points = anthropicPoints(rows, leg);
-    const [marker] = config.tradeMarkers(events, points);
-    assert.equal(config.tradeMarket, 'anthropic');
-    assert.equal(marker.value, premium); assert.equal(marker.usd, spread);
-    assert.equal(marker.basis, '图表溢价率（非成交价差）');
-    assert.equal(marker.event.fills[0].price, '1270', 'native price stays unchanged in details');
-    assert.match(config.trade.note, /非|不代表/);
+test('manual RH entry appears only on RH; the Binance hedge never appears on xyz/io charts', () => {
+  const fills = [cex(), native('rh')];
+  for (const leg of ['xyz', 'io', 'rh']) {
+    const values = markers(fills, leg), plotted = values.filter(marker => marker.value !== null);
+    assert.equal(plotted.length, leg === 'rh' ? 1 : 0, leg);
+    assert.equal(values.find(marker => marker.event.fills[0].exchangeId === 'binance').usd, null);
+    assert.ok(values.some(marker => marker.basis.includes('仅成交明细')), 'unassigned CEX history remains inspectable');
+    if (leg === 'rh') {
+      assert.equal(plotted[0].event.fills[0].key, 'rh'); assert.equal(plotted[0].event.type, 'entry');
+      assert.equal(plotted[0].value, 100); assert.equal(plotted[0].venueLabel, 'Lighter RH');
+    }
   }
 });
 
-test('OKX keeps contracts, account identity, fees and prices separate from Binance', () => {
-  const events = anthropicTradeEvents([ant(), ant({ key: 'okx', exchangeId: 'okx', exchange: 'OKX', accountId: 'okx-main', scope: 'swap',
-    symbol: 'ANTHROPIC-USDT-SWAP', quantityUnit: '张', price: '127', fee: '-0.3', realizedPnl: '4', stale: true })]);
-  const [event] = events;
-  assert.equal(event.venues.length, 2); assert.equal(event.spread, null);
-  assert.equal(event.fees[0].amount, '-0.4'); assert.equal(event.realizedPnl[0].amount, '4');
-  const [marker] = anthropicTradeMarkers(events, anthropicPoints(rows, 'xyz'));
-  assert.equal(marker.value, 25); assert.equal(marker.usd, 20); assert.equal(event.stale, true);
-  const details = tradeDetailLines(marker, value => String(value), anthropicChartConfig('xyz').trade).join('\n');
-  assert.match(details, /2 张 @ 127 USDT/); assert.match(details, /成交价差 未知/); assert.match(details, /手续费合计 -0.4 USDT/);
+test('native symbols route xyz, io and RH independently, including trades made outside this workbench', () => {
+  const fills = [native('rh'), native('io'), native('xyz'), cex({ key: 'okx', exchangeId: 'okx', symbol: 'ANTHROPIC-USDT-SWAP', quantityUnit: '张', price: '127' })];
+  for (const [leg, premium, spread] of [['xyz', 25, 20], ['io', 0, 0], ['rh', 100, 50]]) {
+    const plotted = markers(fills, leg).filter(marker => marker.value !== null);
+    assert.equal(plotted.length, 1); assert.equal(plotted[0].event.fills[0].key, leg);
+    assert.equal(plotted[0].value, premium); assert.equal(plotted[0].usd, spread);
+    assert.equal(plotted[0].event.spread, null, 'a single native fill never claims both legs executed');
+  }
 });
 
-test('missing and open bars stay listed without fabricated marker coordinates; older fills stay outside range', () => {
-  const points = anthropicPoints([rows[0], { ...rows[1], time: bar + step }], 'xyz');
+test('actual native position changes classify exits, cross-zero changes and unknown opening status', () => {
+  const fills = [native('rh'), native('rh', { key: 'exit', time: new Date(bar + 120_000).toISOString(), side: 'sell', positionBefore: '2', positionAfter: '0' }),
+    native('rh', { key: 'unknown', time: new Date(bar + 180_000).toISOString(), positionBefore: null, positionAfter: null }),
+    native('rh', { key: 'cross', time: new Date(bar + 240_000).toISOString(), side: 'sell', positionBefore: '1', positionAfter: '-1' })];
+  assert.deepEqual(anthropicTradeEvents(fills, 'rh').map(event => event.type), ['entry', 'exit', 'trade', 'rebalance']);
+  assert.deepEqual(anthropicTradeEvents(fills, 'xyz'), []);
+});
+
+test('missing/open bars keep native fills listed without invented coordinates, and older fills stay outside range', () => {
+  const points = anthropicPoints([rows[0], { ...rows[1], time: bar + step }], 'rh');
   const times = [bar - 2 * step, bar, bar + step, bar + 2 * step];
-  const events = anthropicTradeEvents(times.map((time, index) => ant({ key: String(index), time: new Date(time).toISOString() })));
-  const markers = anthropicTradeMarkers(events, points);
-  assert.deepEqual(markers.map(marker => marker.event.time), times.slice(1));
-  assert.deepEqual(markers.map(marker => marker.value), [null, 25, null]);
-  assert.deepEqual(markers.map(marker => marker.usd), [null, 20, null]);
-  assert.deepEqual(anthropicTradeMarkers(events, []), []);
+  const events = anthropicTradeEvents(times.map((time, index) => native('rh', { key: String(index), time: new Date(time).toISOString() })), 'rh');
+  const values = anthropicTradeMarkers(events, points, 'rh');
+  assert.deepEqual(values.map(marker => marker.event.time), times.slice(1));
+  assert.deepEqual(values.map(marker => marker.value), [null, 100, null]);
+  assert.deepEqual(values.map(marker => marker.usd), [null, 50, null]);
+});
+
+test('native detail preserves unknown currency, signed fees and true timestamps rather than an order price', () => {
+  const [marker] = markers([native('xyz', { price: '83', fee: '-0.1', realizedPnl: null })], 'xyz');
+  assert.equal(marker.value, 25); assert.equal(marker.event.time, bar + 60_000);
+  const detail = tradeDetailLines(marker, value => String(value), anthropicChartConfig('xyz').trade).join('\n');
+  assert.match(detail, /xyz:ANT 入场/); assert.match(detail, /@ 83 币种未知/);
+  assert.match(detail, /手续费合计 -0.1 USDC/); assert.match(detail, /已实现盈亏合计 未知/);
 });

@@ -1,12 +1,12 @@
 import { createHubRequester, HUB_REQUEST_ID, type RequestTimers } from './hub-requester.ts';
 
 /** Fixed perpetual bases per arbitrage market, matching the host and Asset allowlists. */
-export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC'] } as const;
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'XYZANT', 'IOANTH'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type HubFillItem = {
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
   symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
-  quantity: string; quantityUnit: string; price: string; priceCurrency: 'USDT' | 'USDC';
+  quantity: string; quantityUnit: string; price: string; priceCurrency: string | null;
   fee: string | null; feeCurrency: string | null; realizedPnl: string | null;
   positionBefore: string | null; positionAfter: string | null; stale: boolean;
 };
@@ -35,9 +35,11 @@ const optionalDecimal = (value: unknown) => value === null ? null : decimal(valu
 const iso = (value: unknown) => typeof value === 'string' && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value ? value : undefined;
 const optionalIso = (value: unknown) => value === null ? null : iso(value);
 const currency = (value: unknown) => typeof value === 'string' && /^[A-Z0-9]{1,20}$/.test(value) ? value : undefined;
+const nativeCurrency = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(value) ? value : undefined;
 const bool = (value: unknown) => typeof value === 'boolean' ? value : undefined;
 function parseItem(value: unknown, market: FillMarket): HubFillItem | null {
   const v = record(value); if (!v) return null;
+  const nativeAnt = market === 'anthropic' && ['hyperliquid', 'rh-lighter'].includes(String(v.exchangeId));
   const result = {
     key: text(v.key, 600), sourceId: sourceIdentity(v.sourceId), source: text(v.source), exchangeId: text(v.exchangeId, 40), exchange: text(v.exchange),
     accountId: text(v.accountId), account: text(v.account), scope: text(v.scope, 80), symbol: text(v.symbol, 80),
@@ -45,18 +47,24 @@ function parseItem(value: unknown, market: FillMarket): HubFillItem | null {
     time: iso(v.time), side: v.side === 'buy' || v.side === 'sell' ? v.side : undefined,
     positionSide: ['long', 'short', 'net'].includes(String(v.positionSide)) ? v.positionSide : undefined,
     quantity: decimal(v.quantity, true), quantityUnit: text(v.quantityUnit, 40), price: decimal(v.price, true),
-    priceCurrency: v.priceCurrency === 'USDT' || v.priceCurrency === 'USDC' ? v.priceCurrency : undefined,
-    fee: optionalDecimal(v.fee), feeCurrency: v.feeCurrency === null ? null : currency(v.feeCurrency),
+    priceCurrency: nativeAnt ? v.priceCurrency === null ? null : nativeCurrency(v.priceCurrency) : v.priceCurrency === 'USDT' || v.priceCurrency === 'USDC' ? v.priceCurrency : undefined,
+    fee: optionalDecimal(v.fee), feeCurrency: v.feeCurrency === null ? null : (nativeAnt ? nativeCurrency : currency)(v.feeCurrency),
     realizedPnl: optionalDecimal(v.realizedPnl), positionBefore: optionalDecimal(v.positionBefore), positionAfter: optionalDecimal(v.positionAfter),
     stale: bool(v.stale),
   };
   if (Object.values(result).some(field => field === undefined)) return null;
-  if (!['binance', 'bybit', 'okx'].includes(result.exchangeId!)) return null;
-  if (market === 'anthropic' && !['binance', 'okx'].includes(result.exchangeId!)) return null;
-  if (result.exchangeId !== 'bybit' && result.priceCurrency !== 'USDT') return null;
-  const expected = result.exchangeId === 'okx' ? `${result.base}-${result.priceCurrency}-SWAP` : `${result.base}${result.priceCurrency}`;
-  const usdcPerpetual = result.exchangeId === 'bybit' && result.priceCurrency === 'USDC' && result.symbol === `${result.base}PERP`;
-  if (result.symbol !== expected && !usdcPerpetual || result.quantityUnit !== (result.exchangeId === 'okx' ? '张' : result.base)) return null;
+  if (nativeAnt) {
+    const hl = result.exchangeId === 'hyperliquid', expected = hl ? result.base === 'XYZANT' ? 'xyz:ANT' : result.base === 'IOANTH' ? 'io:ANTH' : null : result.base === 'ANTHROPIC' ? 'ANTHROPIC' : null;
+    if (result.symbol !== expected || result.quantityUnit !== (hl ? expected?.split(':')[1] : 'ANTHROPIC')
+      || !hl && result.priceCurrency !== 'USDG' || result.positionSide !== 'net') return null;
+  } else {
+    if (!['binance', 'bybit', 'okx'].includes(result.exchangeId!)) return null;
+    if (market === 'anthropic' && (!['binance', 'okx'].includes(result.exchangeId!) || result.base !== 'ANTHROPIC')) return null;
+    if (result.exchangeId !== 'bybit' && result.priceCurrency !== 'USDT') return null;
+    const expected = result.exchangeId === 'okx' ? `${result.base}-${result.priceCurrency}-SWAP` : `${result.base}${result.priceCurrency}`;
+    const usdcPerpetual = result.exchangeId === 'bybit' && result.priceCurrency === 'USDC' && result.symbol === `${result.base}PERP`;
+    if (result.symbol !== expected && !usdcPerpetual || result.quantityUnit !== (result.exchangeId === 'okx' ? '张' : result.base)) return null;
+  }
   if ((result.positionBefore === null) !== (result.positionAfter === null)) return null;
   return result as HubFillItem;
 }

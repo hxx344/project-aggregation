@@ -704,6 +704,40 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const jobView = id => publicJob(jobFor(id));
   const jobAccounts = id => (jobFor(id).plan.connections ?? []).map(row => ({ exchange: row.exchange, revision: row.revision, identity: row.identity ?? null }));
   const connectionOf = exchange => { const row = accountRow(exchange); return { revision: row.revision, connected: !!row.credentials }; };
+  // Narrow read-only bridge: credentials stay in the execution service and
+  // history reads do not acquire a writer ticket or modify account snapshots.
+  const historyControllers = new Set();
+  const historyConnections = () => ['hyperliquid', 'rh-lighter'].map(exchange => {
+    const row = accountRow(exchange);
+    return { exchange, revision: row.revision, connected: !closed && !closing && !!row.credentials, identity: row.identity };
+  });
+  async function readAnthropicHistory(exchange, { revision, identity, start, end, signal } = {}) {
+    if (!['hyperliquid', 'rh-lighter'].includes(exchange)) throw new ExecutionError(400, '不支持此交易所的 ANT 原生成交读取');
+    const current = () => {
+      const row = accountRow(exchange);
+      if (closed || closing || signal?.aborted || !row.credentials || !validRevision(revision) || row.revision !== revision || !identity || row.identity !== identity)
+        throw new ExecutionError(409, '实盘连接已改变，已丢弃旧账户成交');
+    };
+    current();
+    const ctx = context(exchange, revision);
+    if (typeof ctx.client?.history !== 'function') throw new ExecutionError(501, '当前交易所尚不支持 ANT 原生成交读取');
+    const controller = new AbortController(); historyControllers.add(controller);
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const timer = setTimeout(() => controller.abort(new DOMException('History deadline', 'TimeoutError')), 45_000); timer.unref?.();
+    let onAbort;
+    const interrupted = new Promise((_resolve, reject) => {
+      onAbort = () => reject(new ExecutionExchangeError(combined.reason?.name === 'TimeoutError' ? 'timeout' : 'aborted'));
+      combined.addEventListener('abort', onAbort, { once: true });
+    });
+    try {
+      combined.throwIfAborted();
+      const result = await Promise.race([ctx.client.history(ctx.credentials, { start, end, signal: combined }), interrupted]);
+      current(); combined.throwIfAborted();
+      return result;
+    } finally {
+      clearTimeout(timer); combined.removeEventListener('abort', onAbort); historyControllers.delete(controller); controller.abort();
+    }
+  }
   function leading() { try { requireLease(); return !closing; } catch { return false; } }
   function validateInspection(order, value, { explicit = false, cancelRecovery = false } = {}) {
     const reducedOriginal = cancelRecovery && order.exchange === 'okx' && order.remoteId && order.spec.reduceOnly && value && compareDecimals(value.quantity, '0') > 0 && compareDecimals(value.quantity, order.spec.quantity) <= 0;
@@ -1377,9 +1411,10 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, leading, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
+      for (const controller of historyControllers) controller.abort();
       let ownsLease = false;
       try { requireLease(); ownsLease = true; } catch { /* The current owner handles recovery. */ }
       const timeout = setTimeout(() => { for (const controller of controllers) controller.abort(); }, 8000); timeout.unref?.();

@@ -96,7 +96,7 @@ function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null;
   if (cx == null || cy == null || !Number.isFinite(cx) || !Number.isFinite(cy)) return <g/>;
   const type = TRADE_TYPES[marker.event.type as TradeType], select = () => onSelect(marker.event.key);
   return <g className="trade-marker" data-trade-type={marker.event.type} data-selected={selected || undefined} transform={`translate(${cx},${cy})`} tabIndex={0} role="button"
-    aria-label={`${type.label} · ${beijing(marker.event.time)} 北京时间 · ${marker.basis} ${markerText(marker)}，查看成交明细`}
+    aria-label={`${marker.venueLabel ? `${marker.venueLabel} ` : ""}${type.label} · ${beijing(marker.event.time)} 北京时间 · ${marker.basis} ${markerText(marker)}，查看成交明细`}
     onClick={select} onMouseEnter={select} onFocus={select} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); select(); } }}>
     <circle r={12} fill="transparent"/>
     <text textAnchor="middle" dy=".35em" aria-hidden="true">{type.symbol}</text>
@@ -111,16 +111,24 @@ function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config,
     ...markers.filter(marker => market === "anthropic" || marker.event.type !== "entry" && marker.event.type !== "exit").map(marker => ({ time: marker.event.time, key: marker.event.key, summary: null, marker })),
   ].sort((a, b) => b.time - a.time || a.key.localeCompare(b.key));
   const summarySpread = (group: (typeof summaries)[number]["groups"][number]) => group.spread === null ? "未知" : `${group.spread.toFixed(3)}${market === "hynix" ? "%" : ` ${group.currency}${config.trade.priceUnit}`}`;
+  const nativeCoverage = market === "anthropic" ? [["hyperliquid", "Hyperliquid"], ["rh-lighter", "Lighter RH"]].map(([id, name]) => {
+    const scopes = trades.coverage.filter(scope => scope.exchangeId === id);
+    const state = !scopes.length ? "历史来源尚未就绪" : scopes.every(scope => scope.status === "unconfigured") ? "未连接实盘读取账户"
+      : scopes.some(scope => scope.status === "error" || scope.status === "stale") ? "读取失败或陈旧，保留可用成交"
+        : scopes.some(scope => scope.status === "loading") ? "历史读取中" : scopes.some(scope => scope.status === "unsupported") ? "当前版本不支持历史读取" : "当前连接账户";
+    return `${name}：${state}`;
+  }).join("；") : null;
   const eventButton = (marker: SpreadTradeMarker) => {
     const type = TRADE_TYPES[marker.event.type as TradeType];
     return <button type="button" key={marker.event.key} className="trade-list-item" data-trade-type={marker.event.type} aria-pressed={selected?.event.key === marker.event.key} onClick={() => onSelect(marker.event.key)}>
-      {`${type.symbol} ${beijing(marker.event.time)} · ${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
+      {`${type.symbol} ${beijing(marker.event.time)} · ${marker.venueLabel ? `${marker.venueLabel} ` : ""}${type.label} · ${marker.event.fills.length} 笔 · ${marker.basis} ${markerText(marker)}`}
     </button>;
   };
   return <section className="trade-panel" aria-labelledby={titleId}>
     <h3 id={titleId}>套利成交</h3>
     <p className="trade-status" role="status">{fillsStatusText(trades, beijing, config.trade.sources)}</p>
     {config.trade.note && <p className="trade-summary-note">{config.trade.note}</p>}
+    {nativeCoverage && <p className="trade-summary-note" role="status">{nativeCoverage}</p>}
     <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === "trade" ? "成交（开平未知）" : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? "颜色只区分类型，不表示盈亏" : `切换到${spreadTabs(config)}可在图上查看标记`}</span></p>
     <div className="trade-summary-list" aria-label="当前区间套利成交">
       {!markers.length && <p>{trades.status === "ok" && !trades.pending && !trades.incomplete ? "当前图表区间暂无套利成交" : "当前图表区间暂无可展示成交"}</p>}

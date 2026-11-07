@@ -437,6 +437,8 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 .related-positions dl { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 4px 0 0; }
 .related-cycle, .related-pair-totals { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--border); }
 .related-cycle-head { display: flex; justify-content: space-between; gap: 8px; color: var(--muted-foreground); font-size: 11px; }
+.related-pair-estimate { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; }
+.related-pair-estimate strong { font-family: var(--font-number); font-size: 21px; font-weight: 650; }
 .related-cycle-note { margin: 6px 0 0; color: var(--muted-foreground); font-size: 11px; }
 .related-spread-pairs li { padding: 8px 10px; margin-bottom: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--background); }
 .related-spread-pairs li > span { color: var(--muted-foreground); }
