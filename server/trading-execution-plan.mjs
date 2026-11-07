@@ -43,6 +43,8 @@ export class ExecutionError extends Error {
 }
 // A refusal before anything is sent that clears once another job or position ends.
 export class WaitError extends ExecutionError {}
+// Only a valid but old book can recover by fetching a newer snapshot.
+export class StaleMarketError extends ExecutionError {}
 export const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 export function exactKeys(value, keys) {
   if (!object(value) || Object.keys(value).some(key => !keys.includes(key))) throw new ExecutionError(400, '交易参数包含不支持的字段');
@@ -124,10 +126,11 @@ export function normalizeIntent(body) {
     timeoutMs: integer(body.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数') };
 }
 
-export function normalizeMarket(value, symbol, now) {
+export function normalizeMarket(value, symbol, now, exchange) {
   if (!object(value) || value.symbol !== symbol || !object(value.rule)) throw new ExecutionError(502, '交易所未返回完整盘口与下单规则');
-  const at = Date.parse(value.at);
-  if (!Number.isFinite(at) || now - at > QUOTE_MAX_AGE || at - now > 1000) throw new ExecutionError(409, '盘口已过期，等待新行情后重试');
+  const at = Date.parse(value.at), source = `${TRADING_NAMES[exchange] ?? ''} ${symbol}`.trim();
+  if (!Number.isFinite(at)) throw new ExecutionError(502, `${source} 盘口时间无效，暂不下单`);
+  if (at - now > 1000) throw new ExecutionError(409, `${source} 盘口时间超前 ${((at - now) / 1000).toFixed(1)} 秒，请检查服务器时钟同步`);
   const bid = positive(value.bid, '买一价'), ask = positive(value.ask, '卖一价');
   if (compareDecimals(bid, ask) >= 0) throw new ExecutionError(502, '交易所盘口交叉，暂不下单');
   const rule = {};
@@ -150,6 +153,7 @@ export function normalizeMarket(value, symbol, now) {
     rule.maxNotional = value.rule.maxNotional === null || value.rule.maxNotional === undefined ? null : decimal(value.rule.maxNotional, { positive: true });
   } catch { throw new ExecutionError(502, '交易所名义金额规则无效'); }
   if (compareDecimals(rule.minQuantity, rule.maxQuantity) > 0 || !isMultiple(bid, rule.tickSize) || !isMultiple(ask, rule.tickSize)) throw new ExecutionError(502, '交易所盘口或合约步长不一致');
+  if (now - at > QUOTE_MAX_AGE) throw new StaleMarketError(409, `${source} 盘口已过期（${((now - at) / 1000).toFixed(1)} 秒，最大 ${QUOTE_MAX_AGE / 1000} 秒），等待新行情后重试`);
   return { symbol, bid, ask, at: new Date(at).toISOString(), rule };
 }
 
@@ -270,7 +274,7 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
   const prepared = intent.legs.map(input => {
     const account = snapshots.get(input.exchange), connection = connections.get(input.exchange);
     if (!connection?.connected) throw new ExecutionError(409, `${input.exchange} 尚未连接实盘账户`);
-    const market = normalizeMarket(markets.get(`${input.exchange}:${input.symbol}`), input.symbol, now);
+    const market = normalizeMarket(markets.get(`${input.exchange}:${input.symbol}`), input.symbol, now, input.exchange);
     const leg = { ...input, id: legId(input), orderType: legOrderType(input), stopPrice: input.stopPrice ?? null, orderSide: orderSide(intent.action, input.side), positionMode: account?.modes?.[input.symbol], accountRevision: connection.revision,
       ...(NUMBERED_VENUES.has(input.exchange) ? { leverage: leverageOf(account, input.exchange, input.symbol) } : {}) };
     if (intent.equalSize) leg.quantity = equalQuantity(intent, leg, market);

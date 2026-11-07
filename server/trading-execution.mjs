@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, WaitError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
+import { ExecutionError, WaitError, StaleMarketError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_VENUE_SYMBOLS } from './trading-markets.mjs';
 import { orderPrice, stepDecimals } from './trading-hyperliquid-execution.mjs';
 import { orderPrice as rhLighterOrderPrice, RH_LIGHTER_TX_EXPIRES_MS } from './trading-rh-lighter-execution.mjs';
@@ -102,6 +102,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const writerTickets = new Map(), verifiedAccounts = new Map(), protectionErrors = new Map(), recoveredWriterJobs = new Set();
   const attentionChecks = new Map();
   const readFailures = new Map();
+  const marketFailures = new Map();
   let protectionReady = !accountWriter;
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
   function lostLease() {
@@ -435,8 +436,28 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
     return state();
   }
+  async function collectMarkets(legs) {
+    const markets = new Map(), received = new Map();
+    const read = async leg => {
+      const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal }));
+      requireLease();
+      const key = `${leg.exchange}:${leg.symbol}`;
+      markets.set(key, value); received.set(key, now());
+    };
+    await Promise.all(legs.map(read));
+    // A slow sibling or cold rule lookup can age a fast book while we await the
+    // group. Refresh only old books once, under the same per-call timeout. Keep
+    // venue timestamps and validate the entire group again after this wait.
+    const stale = legs.filter(leg => {
+      try { normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange); return false; }
+      catch (error) { if (error instanceof StaleMarketError) return true; throw error; }
+    });
+    await Promise.all(stale.map(read));
+    for (const leg of legs) normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
+    requireLease(); return { markets, received };
+  }
   async function collect(legs) {
-    const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), markets = new Map(), connections = new Map(), received = new Map();
+    const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), connections = new Map();
     await Promise.all(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
@@ -452,9 +473,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       snapshots.set(exchange, account); connections.set(exchange, connection(ctx.row));
       stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(mergeSnapshot(ctx.row.snapshot, account, symbols)), exchange, ctx.row.revision);
     }));
-    await Promise.all(legs.map(async leg => {
-      const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })); markets.set(`${leg.exchange}:${leg.symbol}`, value); received.set(`${leg.exchange}:${leg.symbol}`, now());
-    }));
+    const { markets, received } = await collectMarkets(legs);
     requireLease(); return { snapshots, markets, connections, received };
   }
   // Display-only top of book on every venue (same-venue spreads are the main
@@ -826,7 +845,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         const current = jobFor(job.id), original = orderFor(order.localId);
         if (closing || stopRequested(job.id) || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)
             || original.settled || original.remoteId !== order.remoteId || !original.amendPending) throw new NotSubmittedError('任务或原订单已停止，本次追价未发送');
-        try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次追价未发送'); }
+        try { normalizeMarket(market, leg.symbol, now(), leg.exchange); } catch (error) { throw new NotSubmittedError(`${safeError(error)}；本次追价未发送`); }
         if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价界限，本次追价未发送');
         if (current.auto?.guard && atBound(original, leg, market)) throw new NotSubmittedError('已达到本批价差界限，本次追价未发送');
       };
@@ -923,7 +942,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次建单未发送'); } }
         const current = jobFor(job.id);
         if (closing || stopRequested(job.id) || !['queued', 'running'].includes(current.status) || current.phase !== job.phase || current.batchIndex !== job.batchIndex || now() >= Date.parse(current.deadlineAt)) throw new NotSubmittedError('任务已停止或执行时间已到，本次建单未发送');
-        try { normalizeMarket(market, leg.symbol, now()); } catch { throw new NotSubmittedError('盘口已过期，本次建单未发送'); }
+        try { normalizeMarket(market, leg.symbol, now(), leg.exchange); } catch (error) { throw new NotSubmittedError(`${safeError(error)}；本次建单未发送`); }
       };
       const result = await call(signal => ctx.client.create(ctx.credentials, spec, { ...ctx.options, signal, beforeMutation }));
       requireLease();
@@ -1033,6 +1052,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // Transport-level read failures; data, identity and rejection errors still pause at once.
   const transientRead = error => error instanceof ExecutionExchangeError && !closing
     && (['timeout', 'transport', 'upstream', 'aborted'].includes(error.code) || error.code === 'rejected' && RATE_LIMIT_CODES.has(error.providerCode));
+  function marketsRecovered(id) {
+    if (!marketFailures.delete(id)) return;
+    const job = jobFor(id); job.reason = null;
+    event(job, '盘口已恢复新鲜，继续校验并执行'); saveJob(job);
+  }
   async function runJob(id) {
     if (busyJobs.has(id)) return; busyJobs.add(id);
     try {
@@ -1071,6 +1095,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (readFailures.delete(id)) { const latest = jobFor(id); event(latest, '委托状态已恢复读取，继续执行'); saveJob(latest); }
         job = jobFor(id);
         if (job.status === 'stopping') { await stopping(job); return; }
+        const active = [];
         for (const original of working) {
           const order = orderFor(original.localId), leg = job.plan.legs.find(item => item.id === order.legId);
           if (order.settled) {
@@ -1078,9 +1103,18 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
             continue;
           }
           if (order.state === 'paused' || order.state === 'terminal') throw new ExecutionError(409, '交易所策略暂停或子单尚未结束，暂停其余交易腿');
-          const market = normalizeMarket(await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal })), leg.symbol, now());
+          active.push({ order, leg });
+        }
+        // Check every resting leg before any reprice/cancel; a later stale leg
+        // must not leave an earlier sibling already changed in this round.
+        const { markets } = await collectMarkets(active.map(item => item.leg));
+        for (const { leg } of active) {
+          const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
           checkContract(leg, market);
           if (stopReached(leg, market)) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 已达到追价界限`);
+        }
+        for (const { order, leg } of active) {
+          const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
           // An automatic order rests at its last price rather than chase past the batch limit.
           if (job.auto?.guard && atBound(order, leg, market)) { holdAtBound(id, leg); continue; }
           const repriceMs = leg.exchange === 'rh-lighter' ? Math.max(job.plan.repriceIntervalMs, RH_LIGHTER_MIN_REPRICE_MS) : job.plan.repriceIntervalMs;
@@ -1110,6 +1144,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const remaining = job.plan.legs.map(leg => ({ leg, quantity: subtract(leg.batchQuantities[job.batchIndex], totalFilled(all, leg.id, job.phase, job.batchIndex)) }));
       if (remaining.some(item => compareDecimals(item.quantity, '0') < 0)) throw new ExecutionError(409, '本批成交量超出计划，请核对仓位');
       if (remaining.every(item => item.quantity === '0') && all.every(order => order.settled)) {
+        marketsRecovered(id); job = jobFor(id);
         job.batchIndex += 1;
         event(job, `第 ${job.batchIndex} / ${job.plan.batchCount} 批全部成交且委托已结束`);
         if (job.batchIndex >= job.plan.batchCount) { job.status = 'completed'; job.reason = null; transaction(() => { saveJob(job); stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(id); }); return; }
@@ -1117,12 +1152,12 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       }
       if (now() < job.nextBatchAt) return;
       const candidates = remaining.filter(item => compareDecimals(item.quantity, '0') > 0 && !all.some(order => order.legId === item.leg.id && !order.settled));
-      if (!candidates.length) return;
+      if (!candidates.length) { marketsRecovered(id); return; }
       // The group waits for a deferred Lighter RH create and keeps re-sends after a post-only bounce apart.
       if (candidates.some(({ leg }) => now() < resendAt(job, all, leg))) return;
       const { snapshots, markets, received } = await collect(candidates.map(item => item.leg));
       for (const { leg, quantity } of candidates) {
-        const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now());
+        const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
         checkContract(leg, market);
         checkPosition(snapshots.get(leg.exchange), leg, job.plan.action, quantity);
         // Candidates have no unsettled order on this symbol. Any remaining venue
@@ -1132,6 +1167,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (stopReached(leg, market)) throw new ExecutionError(409, '最新盘口已达到追价界限');
         if (WALLET_VENUES.has(leg.exchange)) checkHyperliquidPrice(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
       }
+      marketsRecovered(id); job = jobFor(id);
       if (job.auto?.guard && candidates.length === job.plan.legs.length && !guardMet(id, job, candidates, markets, all, received)) return;
       writable(); job = jobFor(id);
       if (!['queued', 'running'].includes(job.status)) return;
@@ -1144,13 +1180,21 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       try {
         requireLease();
         const latest = jobFor(id), message = safeError(error);
+        if (error instanceof StaleMarketError && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
+          const streak = marketFailures.get(id) ?? { since: now(), count: 0 };
+          if (streak.count < READ_RETRY_ATTEMPTS || now() - streak.since < READ_RETRY_MS) {
+            if (!streak.count) event(latest, `${message}；至少重试 ${READ_RETRY_ATTEMPTS} 次、${READ_RETRY_MS / 1000} 秒，期间不追价、不下新单`);
+            marketFailures.set(id, { ...streak, count: streak.count + 1 });
+            latest.reason = message; saveJob(latest); return;
+          }
+        }
         // A failed attention check stays in attention for the next spaced check; a repeated error is logged once.
         if (latest.status === 'attention') { if (latest.attentionError !== message) { latest.attentionError = message; event(latest, message); saveJob(latest); } }
-        else { pause(id, message); await stopping(jobFor(id)); }
+        else { pause(id, error instanceof StaleMarketError ? `持续未取得新鲜盘口，已暂停（${message}）` : message); await stopping(jobFor(id)); }
       } catch { /* A new lease owner will reconcile durable intents. */ }
     } finally {
       busyJobs.delete(id);
-      if (!['queued', 'running'].includes(jobFor(id).status)) readFailures.delete(id);
+      if (!['queued', 'running'].includes(jobFor(id).status)) { readFailures.delete(id); marketFailures.delete(id); }
       if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); attentionChecks.delete(id); }
     }
   }

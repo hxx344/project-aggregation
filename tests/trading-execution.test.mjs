@@ -455,7 +455,69 @@ test('all legs are revalidated before submit: changed close position, stale quot
     if (fault === 'position') f.accounts.bybit.positions[0].quantity = '0.1';
     if (fault === 'quote') f.markets.bybit = { at: new Date(baseTime - 20_000).toISOString() };
     if (fault === 'order') f.accounts.bybit.openOrders.push({ id: 'external', symbol: 'CLUSDT' });
-    await f.service.tick(); assert.equal(f.creates.length, 0, fault); assert.equal(f.job.status, 'paused', fault);
+    await f.service.tick(); assert.equal(f.creates.length, 0, fault);
+    if (fault === 'quote') {
+      assert.equal(f.job.status, 'queued');
+      for (const elapsed of [1000, 20_000, 1000]) { f.advance(elapsed); await f.service.tick(); }
+      assert.equal(f.creates.length, 0);
+    }
+    assert.equal(f.job.status, 'paused', fault);
+  }
+});
+
+test('stale books keep resting hedges, recover without duplication, and have bounded retries', async t => {
+  for (const scenario of ['recovers', 'persists', 'stop', 'deadline']) {
+    const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+    const hedge = [...f.records.values()].find(record => record.kind === 'order'), filled = [...f.records.values()].find(record => record.kind === 'strategy');
+    f.fill(filled.id); f.advance(1000);
+    f.markets.binance = { bid: '71', ask: '71.01', at: new Date(f.time - 11_000).toISOString() };
+    const writes = () => f.calls.filter(call => ['amend', 'stop', 'create'].includes(call.method));
+    await f.service.tick();
+    assert.equal(f.job.status, 'running'); assert.equal(hedge.terminal, false); assert.equal(writes().length, 2);
+    assert.match(f.job.reason, /Binance CLUSDT.*11\.0 秒/);
+    f.advance(1000); await f.service.tick();
+    assert.equal(writes().length, 2); assert.equal(f.job.events.filter(item => /至少重试.*期间不追价/.test(item.message)).length, 1);
+    if (scenario === 'recovers') {
+      delete f.markets.binance.at; await f.service.tick();
+      assert.equal(f.job.status, 'running'); assert.equal(f.job.reason, null);
+      assert.equal(f.calls.filter(call => call.method === 'amend').length, 1);
+      assert.equal(f.creates.length, 2); assert.equal(hedge.terminal, false);
+      f.fill(hedge.id); await f.service.tick(); assert.equal(f.job.status, 'completed');
+    } else if (scenario === 'persists') {
+      f.advance(30_000); await f.service.tick();
+      assert.equal(f.job.status, 'running'); assert.equal(writes().length, 2);
+      f.advance(1000); await f.service.tick();
+      assert.equal(f.job.status, 'paused'); assert.equal(hedge.terminal, true);
+      assert.equal(f.creates.length, 2); assert.equal(f.calls.filter(call => call.method === 'stop').length, 1);
+    } else {
+      if (scenario === 'stop') f.service.stop(f.job.id, {});
+      else { f.advance(30_000); await f.service.tick(); f.advance(30_000); }
+      await f.service.tick();
+      assert.equal(f.job.status, scenario === 'stop' ? 'stopped' : 'paused');
+      assert.equal(hedge.terminal, true); assert.equal(f.creates.length, 2);
+    }
+  }
+});
+
+test('a stale later resting leg prevents repricing the earlier leg in the same group', async t => {
+  const f = await fixture(t); f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  f.advance(1000); f.markets.binance = { bid: '71', ask: '71.01' };
+  f.markets.bybit = { at: new Date(f.time - 11_000).toISOString() };
+  await f.service.tick();
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates.length, 2);
+  assert.equal(f.calls.filter(call => ['amend', 'stop'].includes(call.method)).length, 0);
+});
+
+test('invalid or future book times and crossed old books fail closed without stale recovery', async t => {
+  for (const [patch, reason] of [
+    [{ at: 'invalid' }, /Bybit CLUSDT 盘口时间无效/],
+    [{ at: new Date(baseTime + 1500).toISOString() }, /Bybit CLUSDT 盘口时间超前 1\.5 秒.*服务器时钟/],
+    [{ at: new Date(baseTime - 11_000).toISOString(), bid: '71', ask: '70' }, /盘口交叉/],
+  ]) {
+    const f = await fixture(t); f.start(await f.preview()); f.markets.bybit = patch;
+    await f.service.tick();
+    assert.equal(f.job.status, 'paused'); assert.equal(f.creates.length, 0); assert.match(f.job.reason, reason);
+    assert.equal(f.job.events.some(item => /至少重试/.test(item.message)), false);
   }
 });
 
