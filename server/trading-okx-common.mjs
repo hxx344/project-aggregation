@@ -51,6 +51,7 @@ export class OkxProtocolError extends Error {
     if (details.notFound) this.notFound = true;
     if (Number.isSafeInteger(details.providerCode)) this.providerCode = details.providerCode;
     if (Number.isInteger(details.httpStatus)) this.httpStatus = details.httpStatus;
+    if (Number.isSafeInteger(details.retryAfterMs) && details.retryAfterMs >= 0) this.retryAfterMs = details.retryAfterMs;
   }
 }
 export function fail(code = 'invalid_data', details) { throw new OkxProtocolError(code, details); }
@@ -170,6 +171,17 @@ function providerFailure(raw, httpStatus, mutation) {
     providerCode, httpStatus, uncertain: mutation && (httpStatus >= 500 || !rejected),
   });
 }
+function retryAfter(response, now) {
+  const value = response.headers?.get('retry-after');
+  if (value === null || value === undefined) return undefined;
+  if (/^\d+$/.test(value)) {
+    const ms = Number(value) * 1000;
+    return Number.isSafeInteger(ms) && Number.isSafeInteger(now + ms) ? ms : 60_000;
+  }
+  const date = value.length <= 128 && /[A-Za-z]/.test(value) ? Date.parse(value) : NaN;
+  // A malformed server instruction is not permission for an immediate retry.
+  return Number.isFinite(date) ? Math.max(0, date - now) : 60_000;
+}
 function delay(ms, signal) {
   checkAbort(signal);
   return new Promise((resolve, reject) => {
@@ -227,9 +239,23 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
         });
         checkAbort(controller.signal);
         if (!response || response.redirected || response.status >= 300 && response.status < 400) fail('upstream', { uncertain: mutation });
-        const data = await readJson(response, controller.signal);
+        let data;
+        try { data = await readJson(response, controller.signal); }
+        catch (error) {
+          // An HTML/empty rate-limit response still has a usable HTTP status.
+          // Do not alter mutation uncertainty or suppress timeout/cancellation.
+          if (!mutation && response.status === 429 && error instanceof OkxProtocolError && error.code === 'invalid_data') {
+            throw new OkxProtocolError('upstream', { httpStatus: 429, retryAfterMs: retryAfter(response, now()) });
+          }
+          throw error;
+        }
         checkAbort(controller.signal);
-        if (!response.ok) throw providerFailure(data?.code, response.status, mutation);
+        const failure = raw => {
+          const error = providerFailure(raw, response.status, mutation);
+          if (!mutation && (response.status === 429 || error.providerCode === 50011)) error.retryAfterMs = retryAfter(response, now());
+          return error;
+        };
+        if (!response.ok) throw failure(data?.code);
         if (!object(data) || typeof data.code !== 'string') fail();
         if (data.code !== '0') {
           // A single-order failure can put its actionable rejection in sCode
@@ -238,7 +264,7 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
             && object(data.data[0]) && typeof data.data[0].sCode === 'string' && data.data[0].sCode !== '0') {
             throw providerFailure(data.data[0].sCode, response.status, true);
           }
-          throw providerFailure(data.code, response.status, mutation);
+          throw failure(data.code);
         }
         const rows = list(data.data, operation === 'positions' ? 100 : 5000);
         if (mutation) {
@@ -266,7 +292,8 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
   async function requestOnce(operation, credentials, parameters = {}, options = {}) {
     try { return await rawRequest(operation, credentials, parameters, options); }
     catch (error) {
-      if (!(error instanceof OkxProtocolError) || error.code !== 'timestamp' || error.uncertain) throw error;
+      if (!(error instanceof OkxProtocolError) || error.code !== 'timestamp' || error.uncertain
+        || error.httpStatus === 429 && ROUTES[operation][1] === 'GET') throw error;
       const before = clock() - offset;
       const time = one(await rawRequest('time', null, {}, options));
       const after = clock() - offset;
@@ -321,5 +348,5 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
     if (compareDecimals(bid, ask) >= 0 || (rules && (!multiple(bid, rules.tickSize) || !multiple(ask, rules.tickSize)))) fail('not_tradable');
     return rules ? { symbol, bid, ask, at: iso(book.ts), rule: rules } : { symbol, bid, ask, at: iso(book.ts) };
   }
-  return Object.freeze({ request, clock, rule, market, credentialsValid });
+  return Object.freeze({ request, clock, rule, market, credentialsValid, wait: waitImpl });
 }

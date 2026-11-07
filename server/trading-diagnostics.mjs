@@ -31,6 +31,8 @@ export function formatTradingDiagnostic(value) {
   if (httpStatus !== undefined) details.push(`HTTP ${httpStatus}`);
   if (providerCode !== undefined) details.push(`${name} ${providerCode}`);
   const suffix = details.length ? `（${details.join('，')}）` : '';
+  // Also correct diagnostics restored from snapshots written by older builds.
+  if (exchange === 'okx' && (httpStatus === 429 || providerCode === 50011)) return `${name} 请求频率受限${suffix}，请稍后重试`;
   switch (code) {
     case 'http': case 'api': return `${label}失败${suffix}，请检查账户模式、API 读取权限、IP 白名单与服务器时间`;
     case 'timeout': return `${label}超时，请稍后重试`;

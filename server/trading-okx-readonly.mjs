@@ -4,6 +4,7 @@ import {
 } from './trading-okx-common.mjs';
 import { compareDecimals } from './trading-decimal.mjs';
 import { TRADING_ANTHROPIC_SYMBOLS, TRADING_HYNIX_SYMBOLS } from './trading-markets.mjs';
+import { createHash } from 'node:crypto';
 
 // Account cash flows come exclusively from authenticated bills, never from
 // public funding-rate history or the current position's cumulative fundingFee.
@@ -11,6 +12,7 @@ import { TRADING_ANTHROPIC_SYMBOLS, TRADING_HYNIX_SYMBOLS } from './trading-mark
 const DAY = 86_400_000;
 const MAX_REQUESTS = 240;
 const MAX_EVENTS = 50_000;
+const CONFIG_RETRY_MS = 2100;
 
 export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
   if (typeof ErrorClass !== 'function') throw new TypeError('TradingExchangeError is required');
@@ -32,9 +34,63 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
   try { protocol = createOkxProtocol(options); } catch (error) { throw convert(error, 'account'); }
   const fetchedAt = () => iso(protocol.clock());
   function modeOf(value) { if (value !== undefined && value !== 'unified') fail('account_mode'); }
+  const permissionFlights = new Map();
+  const localNow = options.now ?? Date.now;
+  // This client's reads may use different keys for the same OKX UID. A server
+  // cooldown covers them all; credential changes must not bypass Retry-After.
+  let configNotBefore = 0, configRateError;
+  async function readPermissions(credentials, signal) {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      checkAbort(signal);
+      const remaining = configNotBefore - localNow();
+      if (remaining > CONFIG_RETRY_MS) throw configRateError;
+      if (remaining > 0) await protocol.wait(remaining, signal);
+      checkAbort(signal);
+      if (configNotBefore > localNow()) throw configRateError;
+      try { return validateConfig(one(await protocol.request('config', credentials, {}, { signal }))); }
+      catch (error) {
+        if (!(error instanceof OkxProtocolError) || !(error.httpStatus === 429 || error.providerCode === 50011)) throw error;
+        configRateError = error;
+        configNotBefore = Math.max(configNotBefore, localNow() + Math.max(CONFIG_RETRY_MS, error.retryAfterMs ?? 0));
+        if (attempt === 1) throw error;
+      }
+    }
+  }
   async function permissions(credentials, signal, budget) {
+    checkAbort(signal);
     if (budget && ++budget.requests > MAX_REQUESTS) fail('page_limit');
-    return validateConfig(one(await protocol.request('config', credentials, {}, { signal })));
+    protocol.credentialsValid(credentials);
+    const captured = { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, passphrase: credentials.passphrase };
+    const key = createHash('sha256').update(JSON.stringify([captured.apiKey, captured.apiSecret, captured.passphrase])).digest('hex');
+    let flight = permissionFlights.get(key);
+    if (!flight) {
+      flight = { controller: new AbortController(), subscribers: 0 };
+      permissionFlights.set(key, flight);
+      const current = flight;
+      // No completed permission result is cached. Every later read must prove
+      // the key is still read-only; only overlapping reads share this request.
+      flight.promise = Promise.resolve().then(() => readPermissions(captured, current.controller.signal)).finally(() => {
+        if (permissionFlights.get(key) === current) permissionFlights.delete(key);
+      });
+    }
+    const current = flight;
+    return new Promise((resolve, reject) => {
+      current.subscribers += 1;
+      let finished = false;
+      const finish = (error, value) => {
+        if (finished) return;
+        finished = true; signal?.removeEventListener('abort', abort);
+        current.subscribers -= 1;
+        if (!current.subscribers && permissionFlights.get(key) === current) {
+          permissionFlights.delete(key); current.controller.abort();
+        }
+        if (error) reject(error); else resolve(value);
+      };
+      const abort = () => finish(new DOMException('读取已取消', 'AbortError'));
+      signal?.addEventListener('abort', abort, { once: true });
+      current.promise.then(value => finish(null, value), error => finish(error));
+      if (signal?.aborted) abort();
+    });
   }
   async function readPositions(credentials, snapshot, signal, symbols = OKX_SYMBOLS) {
     const positions = [], seen = new Set();
