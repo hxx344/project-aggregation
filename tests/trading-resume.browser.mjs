@@ -49,9 +49,9 @@ async (page) => {
   const counts = (items, path) => items.filter(item => item.path === path).length;
   const setOnline = value => page.evaluate(value => { window.__online = value; window.dispatchEvent(new Event(value ? 'online' : 'offline')); }, value);
 
-  for (const section of ['positions', 'oil']) {
+  for (const section of ['positions', 'trade']) {
     await page.goto(`${origin}/?view=trading&tradingSection=${section}`);
-    await page.getByRole('heading', { name: section === 'positions' ? '交易所仓位' : '组合交易', exact: true }).waitFor();
+    await page.getByRole('heading', { name: section === 'positions' ? '交易中心' : '组合交易', exact: true }).waitFor();
     await advance(100);
     const activePaths = section === 'positions' ? [paths[0]] : paths.slice(1);
     let before = (await reads()).length;
@@ -76,7 +76,7 @@ async (page) => {
     changes = (await reads()).slice(before);
     assert(activePaths.every(path => counts(changes, path) === 1), `${section}: network recovery starts once`);
 
-    if (section === 'oil') {
+    if (section === 'trade') {
       // A new pair read started between wake events belongs to this recovery window.
       hold = true; before = (await reads()).length;
       await page.evaluate(() => window.dispatchEvent(new Event('focus'))); await advance(100);

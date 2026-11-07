@@ -36,9 +36,12 @@ async (page) => {
     return send({ error: `Unexpected fixture API: ${method} ${url.pathname}` }, 404);
   });
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
+  const ledgerRead = page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading');
+  await page.goto(`${origin}/?view=trading&tradingSection=auto`);
   const panel = page.locator('section.auto-panel');
   await panel.getByText('尚无自动规则').waitFor();
+  await ledgerRead;
+  assert(await page.locator('.trading-initial').count() === 0, 'ledger placeholder stays out of the auto rules tab');
   assert(await page.locator('.execution-panel').count() === 1, 'execution panel locator stays unique');
 
   await panel.getByRole('button', { name: '新建规则' }).click();

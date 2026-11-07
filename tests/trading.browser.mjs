@@ -75,15 +75,19 @@ async (page) => {
     const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading');
     await page.evaluate(() => window.dispatchEvent(new Event('online'))); await response;
   };
-  const waitForText = text => page.getByText(text, { exact: false }).first().waitFor();
+  // Tabs keep their content mounted; data checks wait for it in the DOM, interactions switch tabs first.
+  const waitForText = text => page.getByText(text, { exact: false }).first().waitFor({ state: 'attached' });
+  const tab = name => page.getByRole('tab', { name, exact: true }).click();
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await waitForText('连接账户，查看四腿的真实仓位');
-  await page.getByText('连接两所并取得完整仓位后开始记录，历史浮盈亏无法回补。', { exact: true }).waitFor();
+  await page.getByText('连接两所并取得完整仓位后开始记录，历史浮盈亏无法回补。', { exact: true }).waitFor({ state: 'attached' });
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'empty fixture retains four defined legs');
   assert((await page.locator('.trading-funding-summary strong').allTextContents()).every(text => text === '—'), 'unconfigured funding must remain missing, never zero');
   await page.getByRole('button', { name: '连接只读账户', exact: true }).click();
-  const binanceForm = page.getByRole('form', { name: 'Binance 账户连接' });
+  assert(new URL(page.url()).searchParams.get('tradingSection') === 'accounts', 'connect button opens the accounts tab');
+  assert(await page.evaluate(() => document.activeElement?.id) === 'trading-connections-title', 'connect button moves focus to the accounts heading');
+  const binanceForm = page.getByRole('form', { name: 'Binance 账户连接', includeHidden: true });
   await binanceForm.getByLabel('API Key', { exact: true }).fill('draft-keep');
   await binanceForm.getByLabel('API Secret', { exact: true }).fill('draft-secret');
 
@@ -97,15 +101,14 @@ async (page) => {
   const pnlPath = await page.locator('[data-series="totalPnl"]').getAttribute('d');
   assert((pnlPath.match(/M/g) || []).length === 2, 'PnL path breaks at missing sample');
   assert((await page.locator('.trading-pnl-latest').innerText()).includes('32.123456789012345678'), 'exact PnL decimals survive rendering');
+  await tab('盈亏资金费');
   const slider = page.getByRole('slider', { name: '选择盈亏采样时刻' });
   await slider.focus(); await page.keyboard.press('ArrowLeft');
   assert((await page.locator('.trading-pnl-inspect').innerText()).includes('31.123456789012345678'), 'keyboard selects exact previous PnL sample');
   assert(await binanceForm.getByLabel('API Key', { exact: true }).inputValue() === 'draft-keep', 'cache refresh must preserve key draft');
   assert((await page.locator('.trading-funding-summary strong').allTextContents()).join('|') === '18.6|6.2|+12.4', 'income, positive expense and signed net use correct units');
-  await page.locator('.trading-connections > summary').click();
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: 'output/playwright/trading-desktop.png', fullPage: true });
-  await page.locator('.trading-connections > summary').click();
   assert(await page.locator('.trading-ledger-scroll tbody tr').count() === 50, 'ledger page bound is fifty');
   await page.getByRole('button', { name: '下一页', exact: true }).click();
   await page.waitForFunction(() => document.querySelectorAll('.trading-ledger-scroll tbody tr').length === 13);
@@ -122,7 +125,7 @@ async (page) => {
   holdReads = true;
   await page.getByRole('button', { name: '总览', exact: true }).click();
   await page.getByRole('button', { name: '交易中心', exact: true }).click();
-  await page.getByRole('button', { name: '套利交易', exact: true }).click();
+  await tab('盈亏资金费');
   await page.waitForFunction(() => document.querySelector('.trading-funding-summary')?.textContent.includes('12.4'));
   assert(await page.locator('.trading-initial').count() === 0, 'returning to trading displays the cached page before a held GET completes');
   await page.getByRole('button', { name: '近30天', exact: true }).click();
@@ -131,7 +134,7 @@ async (page) => {
   await page.getByRole('button', { name: '近7天', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.trading-funding-summary')?.textContent.includes('12.4'));
   releaseReads();
-  await page.getByRole('button', { name: '账户连接', exact: true }).click();
+  await tab('账户连接');
   await binanceForm.getByLabel('API Key', { exact: true }).fill('draft-keep');
   await binanceForm.getByLabel('API Secret', { exact: true }).fill('draft-secret');
   await page.getByRole('button', { name: '刷新观察数据', exact: true }).click();
@@ -144,6 +147,7 @@ async (page) => {
   const bybitCl = page.locator('[data-leg="bybit-CLUSDT"]');
   assert(await bybitCl.count() === 2, 'hedged contract must use two rows');
   assert((await bybitCl.locator('.trading-side').allTextContents()).sort().join('|') === '做多|做空', 'both actual sides shown');
+  await tab('套利仓位');
   await bybitCl.first().locator('summary').click();
   await bybitCl.first().getByText('2026/10/06 08:04:00', { exact: true }).waitFor();
 
@@ -151,6 +155,7 @@ async (page) => {
   await refreshCache(); await waitForText('Bybit 部分账本未能读取');
   assert(await page.locator('[data-series="totalPnl"]').getAttribute('d') === Array(60).fill('').join(' '), 'missing funding never produces a total PnL line');
   assert((await page.locator('[data-series="unrealizedPnl"]').getAttribute('d')).includes('M'), 'floating PnL stays visible while funding is incomplete');
+  await tab('盈亏资金费');
   await page.getByRole('heading', { name: '已获取的资金费', exact: true }).waitFor();
   assert(await page.locator('.trading-status.stale').count() > 0, 'stale data is visibly labelled');
   assert(await page.locator('.trading-status.error').count() > 0, 'single-exchange read error is visible');
@@ -163,6 +168,7 @@ async (page) => {
   await page.locator('.trading-cache-status').getByText('当前显示旧缓存', { exact: false }).waitFor();
   readFailure = false; await refreshCache();
 
+  await tab('账户连接');
   await binanceForm.getByLabel('API Key', { exact: true }).fill('fixture-key');
   await binanceForm.getByLabel('API Secret', { exact: true }).fill('fixture-secret');
   rejectSave = true;
@@ -191,18 +197,20 @@ async (page) => {
   assert(await page.locator('.trading-pnl-plot circle').count() === 2, 'single sample displays visible points');
   pnlMode = 'history';
   await refreshCache(); await waitForText('CLUSDT 与 BZUSDT 均为跨交易所反向持仓。');
-  await page.locator('.trading-connections > summary').click();
+  await tab('套利仓位');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => window.scrollTo(0, 0));
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), '390px viewport has no page-wide horizontal overflow');
   assert(await page.locator('.trading-position-table thead').isHidden(), 'phone uses labelled position cards');
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'phone retains all four legs');
+  await tab('盈亏资金费');
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), '390px PnL tab has no page-wide horizontal overflow');
   assert(await page.locator('.trading-chart svg').getAttribute('height') === '224', 'phone reserves readable chart height');
-  while (await page.locator('.trading-page details[open] > summary').count()) await page.locator('.trading-page details[open] > summary').first().click();
+  while (await page.locator('.trading-tab:not([hidden]) details[open] > summary').count()) await page.locator('.trading-tab:not([hidden]) details[open] > summary').first().click();
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: 'output/playwright/trading-mobile.png', fullPage: true });
   await page.locator('.trading-pnl').screenshot({ path: 'output/playwright/trading-pnl-mobile.png' });
-  await page.getByRole('button', { name: '账户连接', exact: true }).click();
+  await tab('账户连接');
   await binanceForm.getByLabel('API Key', { exact: true }).focus();
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'expanded phone connection form has no horizontal overflow');
 

@@ -1,6 +1,8 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { Gauge, LoaderCircle, Wallet } from 'lucide-react';
+import { ArrowLeftRight, Bot, ChartLine, Layers, Link2, LoaderCircle, Wallet } from 'lucide-react';
 import type { TradingCache } from './trading-cache';
+import { TRADING_SECTIONS, tradingSectionOf } from './trading-sections';
+import type { TradingSection } from './trading-sections';
 import TradingPositions from './TradingPositions';
 import './trading-center.css';
 
@@ -12,23 +14,19 @@ function loadOilPage() {
 }
 function preloadOilPage() { loadOilPage().catch(() => {}); }
 const OilTradingPage = lazy(loadOilPage);
-type TradingSection = 'positions' | 'oil';
-
-function readSection(): TradingSection {
-  const params = new URLSearchParams(location.search);
-  const section = params.get('tradingSection');
-  if (section !== null) return section === 'oil' ? 'oil' : 'positions';
-  // Existing bookmarks predate the trading center and open the oil strategy.
-  return params.has('tradingPair') || params.has('tradingDays') ? 'oil' : 'positions';
-}
+const icons: Record<TradingSection, typeof Wallet> = { positions: Wallet, trade: ArrowLeftRight, legs: Layers, pnl: ChartLine, auto: Bot, accounts: Link2 };
 
 export default function TradingPage({ cache, onExpired, onProject, navigationSearch }: {
   cache: TradingCache; onExpired: () => void; onProject: (id: string) => void; navigationSearch: string;
 }) {
-  const [section, setSection] = useState(readSection);
-  useEffect(() => { setSection(readSection()); }, [navigationSearch]);
+  const [section, setSection] = useState(() => tradingSectionOf(location.search));
+  // The arbitrage tabs mount on first visit and then stay mounted (hidden) for the rest of the visit,
+  // so opening the trading center on 全部仓位 does not start the arbitrage reads.
+  const [arbitrageOpened, setArbitrageOpened] = useState(section !== 'positions');
+  useEffect(() => { setSection(tradingSectionOf(location.search)); }, [navigationSearch]);
+  useEffect(() => { if (section !== 'positions') setArbitrageOpened(true); }, [section]);
   useEffect(() => {
-    const back = () => setSection(readSection());
+    const back = () => setSection(tradingSectionOf(location.search));
     window.addEventListener('popstate', back);
     return () => window.removeEventListener('popstate', back);
   }, []);
@@ -36,7 +34,7 @@ export default function TradingPage({ cache, onExpired, onProject, navigationSea
     if (next === section) return;
     const url = new URL(location.href);
     url.searchParams.set('tradingSection', next);
-    if (next === 'oil') {
+    if (next !== 'positions') {
       url.searchParams.set('tradingDays', String(cache.selection().days));
       url.searchParams.set('tradingPair', cache.selection().pair);
     }
@@ -44,10 +42,14 @@ export default function TradingPage({ cache, onExpired, onProject, navigationSea
     setSection(next);
   }
   return <div className="trading-center">
-    <nav className="trading-sections" aria-label="交易模块">
-      <button type="button" aria-current={section === 'positions' ? 'page' : undefined} onClick={() => select('positions')}><Wallet size={17} />交易所仓位</button>
-      <button type="button" aria-current={section === 'oil' ? 'page' : undefined} onClick={() => select('oil')} onMouseEnter={preloadOilPage} onFocus={preloadOilPage}><Gauge size={17} />套利交易</button>
-    </nav>
-    {section === 'positions' ? <TradingPositions onExpired={onExpired} onProject={onProject} navigationSearch={navigationSearch} /> : <Suspense fallback={<div className="positions-empty" role="status"><LoaderCircle className="spin" size={22} /><p>正在加载套利交易…</p></div>}><OilTradingPage cache={cache} onExpired={onExpired} /></Suspense>}
+    <header className="trading-center-heading"><h1>交易中心</h1><p>全部交易所仓位与原油、海力士、Anthropic 价差套利</p></header>
+    <div className="trading-sections" role="tablist" aria-label="交易中心分区">{TRADING_SECTIONS.map(({ id, label }) => {
+      const Icon = icons[id];
+      return <button key={id} type="button" role="tab" id={`trading-tab-${id}`} aria-selected={section === id} aria-controls="trading-tabpanel" onClick={() => select(id)} {...(id !== 'positions' ? { onMouseEnter: preloadOilPage, onFocus: preloadOilPage } : {})}><Icon size={16} />{label}</button>;
+    })}</div>
+    <div role="tabpanel" id="trading-tabpanel" aria-labelledby={`trading-tab-${section}`}>
+      {section === 'positions' ? <TradingPositions onExpired={onExpired} onProject={onProject} navigationSearch={navigationSearch} /> : null}
+      {arbitrageOpened ? <Suspense fallback={section === 'positions' ? null : <div className="positions-empty" role="status"><LoaderCircle className="spin" size={22} /><p>正在加载套利交易…</p></div>}><OilTradingPage cache={cache} onExpired={onExpired} section={section} onSection={select} /></Suspense> : null}
+    </div>
   </div>;
 }

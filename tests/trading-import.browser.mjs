@@ -71,7 +71,8 @@ async (page) => {
   });
   const metadataCount = () => requests.filter(request => request.path === '/api/trading/import-sources').length;
   const imports = () => requests.filter(request => request.path.endsWith('/import'));
-  const waitForText = text => page.getByText(text, { exact: false }).first().waitFor();
+  const waitForText = text => page.getByText(text, { exact: false }).first().waitFor({ state: 'attached' });
+  const tab = name => page.getByRole('tab', { name, exact: true }).click();
   const refreshSources = async () => {
     const response = page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading/import-sources');
     await page.getByRole('button', { name: '刷新来源', exact: true }).click(); await response;
@@ -82,14 +83,14 @@ async (page) => {
     await page.evaluate(() => window.dispatchEvent(new Event('online'))); await response;
   };
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=oil`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await waitForText('等待两所最新仓位，暂不判断四腿结构');
-  assert(metadataCount() === 0, 'closed connections do not load Asset metadata');
-  await page.getByRole('button', { name: '账户连接', exact: true }).click();
+  assert(metadataCount() === 0, 'other tabs do not load Asset metadata');
+  await tab('账户连接');
   await waitForText('暂无已启用的 Asset 项目');
-  const binance = page.getByRole('form', { name: 'Binance 账户连接' }), bybit = page.getByRole('form', { name: 'Bybit 账户连接' });
-  const binanceSource = binance.getByRole('combobox', { name: 'Asset 来源', exact: true }), bybitSource = bybit.getByRole('combobox', { name: 'Asset 来源', exact: true });
-  const binanceMode = binance.getByRole('combobox', { name: 'Binance 账户模式', exact: true });
+  const binance = page.getByRole('form', { name: 'Binance 账户连接', includeHidden: true }), bybit = page.getByRole('form', { name: 'Bybit 账户连接', includeHidden: true });
+  const binanceSource = binance.getByRole('combobox', { name: 'Asset 来源', exact: true, includeHidden: true }), bybitSource = bybit.getByRole('combobox', { name: 'Asset 来源', exact: true, includeHidden: true });
+  const binanceMode = binance.getByRole('combobox', { name: 'Binance 账户模式', exact: true, includeHidden: true });
   assert(await binanceMode.inputValue() === 'standard', 'existing ordinary connection defaults to standard mode');
   assert(await bybit.getByRole('combobox').count() === 1, 'Bybit keeps its unified-account flow');
   const importBinance = binance.getByRole('button', { name: '从 Asset 导入并替换', exact: true });
@@ -112,6 +113,7 @@ async (page) => {
   assert(imports().length === 0, 'choosing between two sources does not auto-import');
   const beforePolling = metadataCount();
   const rangeResponse = page.waitForResponse(response => new URL(response.url()).pathname === '/api/trading' && new URL(response.url()).searchParams.get('days') === '30');
+  await tab('盈亏资金费');
   await page.getByRole('button', { name: '近30天', exact: true }).click();
   await rangeResponse;
   await page.clock.install(); await page.clock.runFor(15000);
@@ -119,6 +121,8 @@ async (page) => {
   assert(await binanceSource.inputValue() === 'asset-b', 'trading polling retains explicit source selection');
   assert(await binance.getByLabel('API Key', { exact: true }).inputValue() === 'manual-binance-draft', 'metadata and trading refresh preserve manual draft');
 
+  await tab('账户连接');
+  assert(metadataCount() === beforePolling, 'returning to the accounts tab keeps the loaded sources');
   await binanceMode.selectOption('portfolio-margin');
   holdImport = true; readFailure = true;
   await importBinance.click();
@@ -128,13 +132,17 @@ async (page) => {
   assert(await page.getByRole('button', { name: '刷新来源', exact: true }).isDisabled(), 'pending import blocks metadata refresh');
   assert(await binance.getByRole('button', { name: '验证并替换连接', exact: true }).isDisabled(), 'pending import blocks manual mutation');
   const selectedB = imports().at(-1);
-  assert(selectedB?.query === '?days=30&page=0' && JSON.stringify(selectedB.body) === JSON.stringify({ revision: 7, accountMode: 'portfolio-margin', projectId: 'asset-b', projectRevision: 'project-b-v1', sourceRevision: 'b-binance-v1' }), 'selected Asset B payload, portfolio mode and time range are correct');
+  assert(selectedB?.query === '?days=30&page=0&pair=binance,bybit' && JSON.stringify(selectedB.body) === JSON.stringify({ revision: 7, accountMode: 'portfolio-margin', projectId: 'asset-b', projectRevision: 'project-b-v1', sourceRevision: 'b-binance-v1' }), 'selected Asset B payload, portfolio mode and time range are correct');
   const pendingImports = imports().length;
+  await tab('盈亏资金费');
   await page.getByRole('button', { name: '近7天', exact: true }).click();
+  await tab('账户连接');
   assert(await importBinance.isDisabled(), 'changing range retains the pending mutation lock');
+  await tab('盈亏资金费');
   await page.getByRole('button', { name: '近30天', exact: true }).click();
   assert(imports().length === pendingImports, 'range switching never duplicates the import');
   assert(typeof releaseImport === 'function', 'import fixture is held for busy-state checks');
+  await tab('账户连接');
   releaseImport(); holdImport = false;
   await waitForText('已从 Asset 导入并验证只读密钥');
   await waitForText('测试缓存暂不可读');

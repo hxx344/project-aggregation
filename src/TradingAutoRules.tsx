@@ -98,7 +98,7 @@ const RuleCard = memo(function RuleCard({ rule, disabled, onAction, onEdit }: { 
       {rule.enabled && (state.phase === 'idle' || state.phase === 'holding') ? live?.note ? <span className="execution-warning">{live.note}</span>
         : live && live.value !== null ? <span>当前{state.phase === 'idle' ? '开仓' : '平仓'}可成交价差（{live.side === 'sell' ? '卖出' : '买入'}价差）：<strong className={live.met ? 'spread-up' : undefined}>{spreadValue(rule, live.value)}</strong> · 连续满足 {live.hits} / {config.confirmSamples} 次 · 盘口 {date(live.at)}</span>
         : <span className="execution-help">等待读取盘口…</span>
-        : busyPhase ? <span>任务执行中，进度见上方「执行进度」{state.jobId ? `（执行编号 ${state.jobId}）` : ''}</span>
+        : busyPhase ? <span>任务执行中，进度见「价差下单」中的「执行进度」{state.jobId ? `（执行编号 ${state.jobId}）` : ''}</span>
         : <span className="execution-help">{rule.enabled ? '' : '未启用，不会自动下单。'}</span>}
     </div>
     {state.held ? <p className="auto-rule-held">本规则持仓：{state.held.map(leg => `${leg.symbol} ${leg.side === 'long' ? '多' : '空'} ${leg.quantity}${leg.exchange === 'okx' ? ' 张' : ''}`).join('，')}</p> : null}
@@ -180,6 +180,6 @@ export default function TradingAutoRules({ onExpired }: { onExpired: () => void 
     {notice ? <p className="execution-message" role="status">{notice}</p> : null}
     {editor ? <RuleForm key={editor.key} initial={editor.rule ? formOf(editor.rule.config) : emptyForm()} editing={editor.rule} disabled={disabled} onSave={save} onCancel={() => setEditor(null)} /> : null}
     <div className="auto-rules">{state ? state.rules.length ? state.rules.map(rule => <RuleCard key={`${rule.id}:${rule.revision}`} rule={rule} disabled={disabled} onAction={action} onEdit={edit} />) : <p className="execution-help">尚无自动规则。新建规则并启用后，服务器按阈值自动下单。</p> : <p className="execution-help">正在读取自动规则…</p>}</div>
-    <p className="execution-help auto-panel-note">使用上方「组合交易」的实盘账户连接与执行器，下单前同样核对账户、盘口、持仓和现有委托。任务未全部成交（暂停、停止或待核对）时规则自动停用，需人工核对后重置。服务重启会暂停执行中的任务，对应规则同样转为待核对。同一交易所与品种可以有多条规则，每条只平自己开的仓；它们的任务依次执行，同合约有未结束的任务时其他规则等待。单向持仓模式下，反方向的规则要等已有仓位平掉后才开仓。</p>
+    <p className="execution-help auto-panel-note">使用「价差下单」中「组合交易」的实盘账户连接与执行器，下单前同样核对账户、盘口、持仓和现有委托。任务未全部成交（暂停、停止或待核对）时规则自动停用，需人工核对后重置。服务重启会暂停执行中的任务，对应规则同样转为待核对。同一交易所与品种可以有多条规则，每条只平自己开的仓；它们的任务依次执行，同合约有未结束的任务时其他规则等待。单向持仓模式下，反方向的规则要等已有仓位平掉后才开仓。</p>
   </section>;
 }
