@@ -7,6 +7,7 @@ import type { AnthropicShares, ExecutionQuotes } from './trading-execution-types
 import { crossEdge, crossSpread, formatPercent, formatPrice, formatSigned, readBook, SPREAD_MARKETS, venueSpread } from './trading-spread';
 import type { BookRead, Spread, SpreadMarket } from './trading-spread';
 import { bestPairs, DEFAULT_SHARES, sharesProblem, shareBooks } from './trading-anthropic';
+import { TRADING_PAIRS } from './trading-preferences';
 import './trading-execution.css';
 
 const EXCHANGES: Record<TradingExchange, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
@@ -92,7 +93,7 @@ function AnthropicTable({ quotes, shares, onShares }: { quotes: ExecutionQuotes;
   </div>;
 }
 
-function TradingSpread({ pair, shares, onShares }: { pair: TradingPair; shares: AnthropicShares; onShares: (value: AnthropicShares) => void }) {
+function TradingSpread({ pair, onPair, shares, onShares }: { pair: TradingPair; onPair: (value: TradingPair) => void; shares: AnthropicShares; onShares: (value: AnthropicShares) => void }) {
   const exchanges = pairExchanges(pair);
   const [quotes, setQuotes] = useState<ExecutionQuotes | null>(null);
   const [receivedAt, setReceivedAt] = useState(0);
@@ -132,6 +133,7 @@ function TradingSpread({ pair, shares, onShares }: { pair: TradingPair; shares: 
       <div className="spread-markets">{markets.map(market => <VenueTable key={market} market={market} quotes={quotes} />)}</div>
       <details className="spread-section" open><summary>Anthropic 上市前价差 · Hyperliquid（Entropy / trade.xyz）、Binance、OKX</summary><AnthropicTable quotes={quotes} shares={shares} onShares={onShares} /></details>
       <details className="spread-cross"><summary>跨所价差 · {exchanges.map(exchange => EXCHANGES[exchange]).join(' 与 ')}</summary>
+        <label className="spread-pair">对比交易所<select aria-label="对比交易所" value={pair} onChange={event => onPair(event.target.value as TradingPair)}>{TRADING_PAIRS.map(value => <option key={value} value={value}>{pairExchanges(value).map(exchange => EXCHANGES[exchange]).join(' + ')}</option>)}</select></label>
         <div className="spread-markets">{markets.map(market => <CrossTable key={market} market={market} quotes={quotes} pair={exchanges} />)}</div>
       </details>
     </> : null}

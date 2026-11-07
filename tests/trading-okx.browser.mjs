@@ -1,7 +1,8 @@
 // Run with playwright-cli run-code --filename against isolated localhost:4175.
 // All API calls are intercepted before navigation; no real account is accessed.
 async (page) => {
-  const origin = 'http://127.0.0.1:4175';
+  const origin = page.url() === 'about:blank' ? 'http://127.0.0.1:4175' : new URL(page.url()).origin;
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):(?:4175|4178)$/.test(origin)) throw new Error('Use an isolated production preview');
   if (page.url() !== 'about:blank' && new URL(page.url()).origin !== origin) throw new Error('OKX fixture requires isolated localhost:4175');
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const stamp = () => new Date().toISOString();
@@ -50,6 +51,8 @@ async (page) => {
       assert(url.searchParams.get('pair') === 'binance,okx', 'account mutation preserves requested pair');
       readonly.okx = true; revisions.okx++; return send(state(url));
     }
+    if (url.pathname === '/api/trading/execution/quotes') return send({ generatedAt: stamp(), maxAgeMs: 10000, books: [] });
+    if (url.pathname === '/api/trading/execution/auto') return send({ generatedAt: stamp(), maintenance: false, rules: [] });
     if (url.pathname === '/api/trading/execution' && method === 'GET') return send(execution());
     if (url.pathname === '/api/trading/execution/accounts/okx' && method === 'PUT') {
       assert(body.passphrase === 'execution-fixture-pass' && body.accountMode === 'isolated', 'execution Passphrase and explicitly selected margin mode');
@@ -71,14 +74,17 @@ async (page) => {
     return send({ error: `Unexpected fixture: ${method} ${url.pathname}` }, 404);
   });
   await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(origin);
+  await page.evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('workbench:')) localStorage.removeItem(key); });
   await page.goto(`${origin}/?view=trading&tradingPair=okx,binance`);
-  const pairs = page.getByRole('group', { name: '交易所组合' }), panel = page.locator('.execution-panel');
-  await pairs.getByRole('button', { name: 'Binance + OKX' }).waitFor();
-  assert(await pairs.getByRole('button', { name: 'Binance + OKX' }).getAttribute('aria-pressed') === 'true', 'reversed URL resolves canonical pair');
+  const pairs = page.getByRole('combobox', { name: '对比交易所' }), panel = page.locator('.execution-panel');
+  await page.locator('details.spread-cross > summary').click();
+  await pairs.waitFor();
+  assert(await pairs.inputValue() === 'binance,okx', 'reversed URL resolves canonical pair');
   const tab = name => page.getByRole('tab', { name, exact: true }).click();
   assert(new URL(page.url()).searchParams.get('tradingSection') === null && await page.getByRole('tab', { name: '价差下单', exact: true }).getAttribute('aria-selected') === 'true', 'legacy pair link opens the trade tab');
   await tab('套利仓位');
-  await page.locator('.trading-positions').getByRole('button', { name: '账户连接', exact: true }).click();
+  await page.locator('.trading-positions[aria-labelledby="trading-positions-title"]').getByRole('button', { name: '账户连接', exact: true }).click();
   const readForm = page.getByRole('form', { name: 'OKX 账户连接', exact: true, includeHidden: true });
   await readForm.getByLabel('API Key', { exact: true }).fill('readonly-fixture-key');
   await readForm.getByLabel('API Secret', { exact: true }).fill('readonly-fixture-secret');
@@ -106,37 +112,41 @@ async (page) => {
   assert(await executionForm.getByLabel('OKX 实盘 Passphrase').inputValue() === '', 'execution Passphrase is cleared');
   await panel.locator('.execution-connections > summary').click();
   async function build() {
-    await panel.getByRole('combobox', { name: '开仓方向', exact: true }).selectOption('forward');
+    await panel.getByRole('group', { name: '开仓方向', exact: true }).getByRole('button').first().click();
+    await panel.getByRole('button', { name: '逐腿填写', exact: true }).click();
     for (const leg of await panel.locator('.execution-leg-input').all()) {
       await leg.getByLabel(/^数量/).fill('4');
-      await leg.getByLabel(/追价停止/).fill(await leg.getByLabel(/买单追价/).count() ? '90' : '70');
+      const limit = leg.getByLabel(/追价[上下]限/);
+      await limit.fill(await leg.getByLabel(/追价上限/).count() ? '90' : '70');
     }
     await panel.getByRole('button', { name: '预览开仓组合' }).click();
   }
+  await panel.getByRole('button', { name: /^四腿组合/ }).click();
   await build();
-  await panel.getByRole('heading', { name: '确认四腿组合开仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油四腿组合开仓' }).waitFor();
   const review = panel.locator('.execution-review');
   assert((await review.innerText()).includes('0.25') && (await review.innerText()).includes('CL-USDT-SWAP'), 'preview uses server contract rules');
-  assert(await review.getByText('总数量 · 张', { exact: true }).count() === 2, 'OKX legs explicitly use contracts');
+  const okxQuantities = await review.locator('tbody tr').filter({ hasText: /OKX .*SWAP/ }).locator('td[data-label="数量"]').allTextContents();
+  assert(okxQuantities.length === 2 && okxQuantities.every(text => text.includes('张') && text.includes('0.25')), 'OKX legs explicitly use contracts');
   assert(previews.get('preview-1').legs.map(leg => leg.exchange).join(',') === 'binance,binance,okx,okx', 'four leg structure follows selected pair');
   await page.screenshot({ path: 'output/playwright/trading-okx-desktop.png', fullPage: true });
   await review.getByRole('button', { name: '确认并一键开仓' }).click();
   await panel.locator('.execution-job').waitFor();
   holdPair = 'bybit,okx';
   const readStarted = new Promise(resolve => { heldReadReady = resolve; });
-  await pairs.getByRole('button', { name: 'Bybit + OKX' }).click();
-  assert(await page.locator('.trading-positions').count() === 0, 'uncached pair never displays the previous positions');
-  assert(await panel.getByRole('combobox', { name: '开仓方向', exact: true }).inputValue() === '', 'pair change resets direction');
+  await pairs.selectOption('bybit,okx');
+  assert(await page.locator('.trading-positions[aria-labelledby="trading-positions-title"]').count() === 0, 'uncached pair never displays the previous positions');
+  assert(await panel.getByRole('group', { name: '开仓方向', exact: true }).locator('[aria-pressed=true]').count() === 0, 'pair change resets direction');
   assert(await panel.locator('.execution-job').count() === 1, 'job management retains all pairs');
   await readStarted;
   holdPair = null; releaseRead?.();
-  await page.locator('.trading-positions').waitFor();
+  await page.locator('.trading-positions[aria-labelledby="trading-positions-title"]').waitFor({ state: 'attached' });
   holdPreview = true;
   const previewStarted = new Promise(resolve => { heldPreviewReady = resolve; });
   await build();
   await previewStarted;
-  await pairs.getByRole('button', { name: 'Binance + Bybit' }).click();
-  await pairs.getByRole('button', { name: 'Bybit + OKX' }).click();
+  await pairs.selectOption('binance,bybit');
+  await pairs.selectOption('bybit,okx');
   const previewResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/preview'));
   holdPreview = false; releasePreview?.();
   await panel.getByRole('button', { name: '预览开仓组合' }).waitFor();
@@ -144,14 +154,14 @@ async (page) => {
   assert(await panel.locator('.execution-review').count() === 0, 'delayed preview cannot reappear after pair round trip');
   await panel.getByRole('button', { name: /跨所两腿/ }).click();
   await build();
-  await panel.getByRole('heading', { name: '确认跨所两腿开仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油跨所两腿开仓' }).waitFor();
   const crossPreview = [...previews.values()].at(-1);
   assert(crossPreview.legs.map(leg => leg.exchange).join(',') === 'bybit,okx', 'cross exchange structure uses current pair');
   await review.getByRole('button', { name: '返回修改参数' }).click();
   await panel.getByRole('button', { name: /同所两腿/ }).click();
-  await panel.getByRole('combobox', { name: '交易所', exact: true }).selectOption('okx');
+  await panel.getByRole('group', { name: '交易所', exact: true }).getByRole('button', { name: 'OKX', exact: true }).click();
   await build();
-  await panel.getByRole('heading', { name: '确认同所两腿开仓' }).waitFor();
+  await panel.getByRole('heading', { name: '确认原油同所两腿开仓' }).waitFor();
   assert([...previews.values()].at(-1).legs.every(leg => leg.exchange === 'okx'), 'same exchange supports OKX');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.screenshot({ path: 'output/playwright/trading-okx-mobile.png', fullPage: true });

@@ -1665,6 +1665,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `arb-auto-bounds-20261106`；首次合并前审查发现，未逃逸到正式版。
 
+**浏览器偏好枚举补充（2026-11-07）：** 基线 `b524404` 上新增的交易偏好恢复在判断结构是否有效时先做 `String(value)`，实际恢复却使用严格枚举；`['okx']` 被前者接纳、后者回退成 Binance，仍保留旧方向；合法 JSON 对象 `{ "toString": null }` 还会让初始化直接抛错。持久化 JSON 同样是不可信输入，结构校验与恢复须使用相同的严格类型/枚举判断，不先转换字符串。独立固定补丁探针确认后已在首次提交前修复，[偏好测试](tests/trading-preferences.test.mjs) 覆盖数组、对象、非当前品种的坏数据和方向清除；[审查记录](docs/reviews/2026-11-07-ui-preferences.md) 保存证据边界。事件 `trading-preference-enum-coercion-20261107`，未发布实现，未发生实盘交易。
+
 ### L101：后台页面不长期占用 HTTP/1.1 连接，也不在后台跑每秒推送
 
 **适用条件：** 工作台按 `http://hub.localhost:<端口>` 等 HTTP/1.1 地址访问，页面或预载模块 iframe 用 EventSource 等长连接；或已加载的隐藏模块在 `backgroundUpdates:true` 下继续运行推送与定时重绘。

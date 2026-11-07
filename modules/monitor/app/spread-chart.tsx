@@ -1,5 +1,8 @@
 "use client";
 
+import { useViewPreference } from "../lib/use-view-preference";
+import { chartPreference, DEFAULT_CHART_PREFERENCES } from "../lib/view-preferences";
+import type { SetStateAction } from "react";
 import { memo, useId, useMemo, useState } from "react";
 import { Activity, Check, Info } from "lucide-react";
 import { SvgPlot, createHoverStore, type PlotLayer } from "./svg-plot";
@@ -172,8 +175,11 @@ function SpreadChart({ data, loading, range, onRangeChange, trades, config = HYN
   config?: SpreadChartConfig;
 }) {
   const { intervalMs, periods } = config;
-  const [mode,setMode] = useState<Mode>(() => chartModes(config)[0]);
-  const [enabled,setEnabled] = useState<Toggles>({ sma: true, bands: true, zscore: true });
+  const [preferences, setPreferences] = useViewPreference(`monitor:chart:${config.tradeMarket ?? config.kicker}:v1`, DEFAULT_CHART_PREFERENCES, chartPreference);
+  const mode = preferences.mode && chartModes(config).includes(preferences.mode) ? preferences.mode : chartModes(config)[0];
+  const setMode = (next: Mode) => setPreferences(current => ({ ...current, mode: next }));
+  const enabled: Toggles = preferences;
+  const setEnabled = (next: SetStateAction<Toggles>) => setPreferences(current => ({ ...current, ...(typeof next === 'function' ? next(current) : next) }));
   const metric: SpreadMetric = mode === "spread" ? "spread" : "premium";
   // Calculate on ALL history first so selecting one week retains the 20-day warmup.
   const fullHistory = useMemo(() => calculateIndicators(data,metric,periods,intervalMs),[data,metric,periods,intervalMs]);

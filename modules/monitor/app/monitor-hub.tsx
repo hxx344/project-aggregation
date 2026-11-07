@@ -1,6 +1,7 @@
 "use client";
 
 import { useHubBridge, type PositionsMarket } from "../lib/hub-bridge";
+import { readViewPreference, writeViewPreference } from "../lib/view-preferences";
 import { memo, useCallback, useEffect, useState } from "react";
 import { flushSync } from "react-dom";
 import { Activity, ArrowUpRight, Layers3 } from "lucide-react";
@@ -83,14 +84,17 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil" }: {
   const selectMonitor = useCallback((id: string) => {
     if (id === 'perpetual') setPerpetualVisited(true);
     setActive(id);
+    writeViewPreference("monitor:active:v1", id);
     const url = new URL(window.location.href);
     url.searchParams.set("monitor", id);
     window.history.replaceState(null, "", url);
   }, []);
   useEffect(() => {
     const restore = () => {
-      const url = new URL(window.location.href), id = url.searchParams.get("monitor");
-      if (id && monitors.some(monitor => monitor.id === id)) { setActive(id); if (id === 'perpetual') setPerpetualVisited(true); }
+      const url = new URL(window.location.href), parameter = url.searchParams.get("monitor");
+      const saved = readViewPreference("monitor:active:v1");
+      const id = parameter ?? (typeof saved === "string" ? saved : null);
+      if (id && monitors.some(monitor => monitor.id === id)) { setActive(id); writeViewPreference("monitor:active:v1", id); if (id === 'perpetual') setPerpetualVisited(true); }
     };
     restore();
     window.addEventListener("popstate", restore);

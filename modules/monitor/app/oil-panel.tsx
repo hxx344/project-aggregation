@@ -4,6 +4,8 @@ import { Activity as ChartActivity, useEffect, useMemo, useState, type ReactNode
 import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from "lucide-react";
 import { lazyComponent } from "../lib/lazy-component";
 import { useHydrated } from "../lib/use-hydrated";
+import { useViewPreference } from "../lib/use-view-preference";
+import { booleanPreference, rangePreference, basisPreference } from "../lib/view-preferences";
 import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useOilFeed } from "../hooks/use-oil-feed";
@@ -41,13 +43,13 @@ export default function OilPanel({ onSummary, initial = null, active = true, sel
   // Mount the heavy charts only on the first visit, then preserve their controls.
   if (active && !hasOpened) setHasOpened(true);
   const charts = hasOpened || shown;
-  const [range, setRange] = useState<number | null>(7);
+  const [range, setRange] = useViewPreference<number | null>("monitor:oil:range:v1", 7, rangePreference);
   // Read only the selected range plus indicator warmup; "全部" reads the complete history.
   const windowDays = range === null ? null : range + OIL_WARMUP_DAYS;
   const { data, quote, loading, error, errorWindow, quoteError, refresh } = useOilFeed(initial?.oil, active, summaryActive, windowDays);
   const initialTrend = initial?.oil?.trend ?? undefined;
-  const [basis, setBasis] = useState<FundingBasis>("quantity");
-  const [details, setDetails] = useState(false);
+  const [basis, setBasis] = useViewPreference<FundingBasis>("monitor:oil:basis:v1", "quantity", basisPreference);
+  const [details, setDetails] = useViewPreference("monitor:oil:details:v1", false, booleanPreference);
   const trades = useHubFills("oil", tradesActive);
   const readSummary = useMemo(() => createOilSummaryReader(), []);
   const trendPoints = useMemo(() => data?.points.map(point => ({ time: point.time, value: point.spread })), [data?.points]);

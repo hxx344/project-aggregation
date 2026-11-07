@@ -6,6 +6,8 @@ import { pairExchanges } from './trading-cache';
 import type { TradingExchange, TradingPair } from './trading-types';
 import type { AnthropicShares, ExecutionAccountMode, ExecutionAction, ExecutionConnection, ExecutionExchange, ExecutionJob, ExecutionLegInput, ExecutionMarket, ExecutionOrderType, ExecutionPlanInput, ExecutionPreset, ExecutionPreview, ExecutionSide, ExecutionState, ExecutionSymbol } from './trading-execution-types';
 import { ANTHROPIC_CONTRACTS, contractKey, findContract, sharesProblem } from './trading-anthropic';
+import { readTradingPreferences, saveTradingPreferences, TRADING_PAIRS } from './trading-preferences';
+import type { ExecutionPreferences } from './trading-preferences';
 import './trading-execution.css';
 
 const BASE = '/api/trading/execution';
@@ -15,7 +17,6 @@ const PAIR_VENUES: TradingExchange[] = ['binance', 'bybit', 'okx'];
 const MODES: Record<ExecutionAccountMode, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金', unified: '统一交易账户', cross: '全仓', isolated: '逐仓', agent: 'API 钱包', 'api-key': 'API Key' };
 const MARKET_NAMES: Record<ExecutionMarket, string> = { oil: '原油', hynix: '海力士', anthropic: 'Anthropic' };
 type PairMarket = Exclude<ExecutionMarket, 'anthropic'>;
-const DEFAULT_ANTHROPIC: [string, string] = ['hyperliquid:io:ANTH', 'binance:ANTHROPICUSDT'];
 // Oil hedges equal barrels; the SK hynix ADR/ordinary pair hedges equal USDT notional.
 const MARKETS: Record<PairMarket, { name: string; symbols: [ExecutionSymbol, ExecutionSymbol]; labels: [string, string]; sizing: string; unit: string; hint: string }> = {
   oil: { name: '原油', symbols: ['CLUSDT', 'BZUSDT'], labels: ['CL', 'BZ'], sizing: '等桶', unit: '桶', hint: '每腿成交相同桶数，按各所每张合约桶数换算原生数量。' },
@@ -196,17 +197,18 @@ const Preview = memo(function Preview({ preview, expired, disabled, uncertain, o
   </section>;
 });
 
-export default function TradingExecution({ pair, onExpired, shares, onShares }: { pair: TradingPair; onExpired: () => void; shares: AnthropicShares; onShares: (value: AnthropicShares) => void }) {
+export default function TradingExecution({ pair, onPair, onExpired, shares, onShares }: { pair: TradingPair; onPair: (value: TradingPair) => void; onExpired: () => void; shares: AnthropicShares; onShares: (value: AnthropicShares) => void }) {
   const [state, setState] = useState<ExecutionState | null>(null);
   const [busy, setBusy] = useState(false), [reading, setReading] = useState(false);
   const [readError, setReadError] = useState(''), [writeError, setWriteError] = useState(''), [notice, setNotice] = useState('');
   const [offline, setOffline] = useState(!navigator.onLine), [expiredSession, setExpiredSession] = useState(false);
-  const [preset, setPreset] = useState<ExecutionPreset>('same-exchange'), [action, setAction] = useState<ExecutionAction>('open');
-  const [market, setMarket] = useState<ExecutionMarket>('oil'), [sizeMode, setSizeMode] = useState<'equal' | 'per-leg'>('equal'), [equalSize, setEqualSize] = useState('');
-  const [selectedExchange, setSelectedExchange] = useState<TradingExchange>('binance'), [selectedSymbol, setSelectedSymbol] = useState<ExecutionSymbol>('CLUSDT');
-  const [orientation, setOrientation] = useState(''), [anthropicKeys, setAnthropicKeys] = useState<[string, string]>(DEFAULT_ANTHROPIC);
+  const [preferences, setPreferences] = useState(() => readTradingPreferences(pair));
+  const market = preferences.market;
+  const { preset, action, sizeMode, selectedExchange, selectedSymbol, orientation, anthropicKeys, orderTypes, batchCount, batchInterval, repriceInterval, timeout, advanced } = preferences.profiles[market];
+  const updatePreferences = (patch: Partial<ExecutionPreferences>) => setPreferences(current => ({ ...current, profiles: { ...current.profiles, [current.market]: { ...current.profiles[current.market], ...patch, pair } } }));
+  useEffect(() => { saveTradingPreferences(preferences); }, [preferences]);
+  const [equalSize, setEqualSize] = useState('');
   const [values, setValues] = useState<Record<string, { quantity: string; stopPrice: string; orderType: ExecutionOrderType }>>({});
-  const [batchCount, setBatchCount] = useState('1'), [batchInterval, setBatchInterval] = useState('1'), [repriceInterval, setRepriceInterval] = useState('5'), [timeout, setExecutionTimeout] = useState('300');
   const [storedReview, setReview] = useState<{ preview: ExecutionPreview; requestId: string; uncertain: boolean; pair: TradingPair } | null>(null);
   const review = storedReview?.pair === pair ? storedReview : null;
   const [draftPair, setDraftPair] = useState(pair);
@@ -219,7 +221,7 @@ export default function TradingExecution({ pair, onExpired, shares, onShares }: 
   const pairVersion = useRef(0);
   pairRef.current = pair;
   // Reset before children commit, so a new pair never exposes the old direction or preview.
-  if (draftPair !== pair) { pairVersion.current++; setDraftPair(pair); setOrientation(''); setValues({}); setReview(null); setWriteError(''); setNotice(''); }
+  if (draftPair !== pair) { pairVersion.current++; setDraftPair(pair); updatePreferences({ orientation: '' }); setValues({}); setEqualSize(''); setReview(null); setWriteError(''); setNotice(''); }
   const acceptState = useCallback((value: ExecutionState) => { lastSuccess.current = performance.now(); setState(value); setReadError(''); }, []);
   const expire = useCallback(() => { if (!mounted.current) return; readController.current?.abort(); writeController.current?.abort(); setState(null); setReview(null); setExpiredSession(true); expiresHandler.current(); }, []);
   const load = useCallback(async (force = false) => {
@@ -299,7 +301,8 @@ export default function TradingExecution({ pair, onExpired, shares, onShares }: 
     setNotice(suffix.endsWith('/stop') ? '已请求停止，正在核对并撤销余单。已成交仓位保留。' : suffix.endsWith('/reconcile') ? '核对请求已完成，请查看各腿最新状态。' : '实盘连接已更新。');
     return true;
   };
-  function resetStructure() { setOrientation(''); setValues({}); setEqualSize(''); setReview(null); setWriteError(''); }
+  function resetDraft() { setValues({}); setEqualSize(''); setReview(null); setWriteError(''); }
+  function changeStructure(patch: Partial<ExecutionPreferences>) { updatePreferences({ ...patch, orientation: '' }); resetDraft(); }
   async function preview(body: ExecutionPlanInput | { resumeJobId: string }) {
     const requestedPair = pairRef.current;
     const requestedVersion = pairVersion.current;
@@ -312,7 +315,7 @@ export default function TradingExecution({ pair, onExpired, shares, onShares }: 
     const equal = sizeMode === 'equal';
     // An empty chase limit means no limit; market legs never send one.
     const legs = draftLegs.map(leg => {
-      const value = values[legKey(leg)], orderType = value?.orderType ?? 'chase', stopPrice = orderType === 'chase' ? value?.stopPrice.trim() ?? '' : '';
+      const value = values[legKey(leg)], orderType = orderTypes[legKey(leg)] ?? 'chase', stopPrice = orderType === 'chase' ? value?.stopPrice.trim() ?? '' : '';
       return { ...leg, orderType, ...(equal ? {} : { quantity: value?.quantity.trim() || '' }), ...(stopPrice ? { stopPrice } : {}) };
     });
     if (equal && !positive(equalSize.trim()) || !equal && legs.some(leg => !positive(leg.quantity ?? ''))) { setWriteError(equal ? `请填写大于零的每腿${market === 'oil' ? '桶数' : market === 'anthropic' ? '股数' : '名义金额'}。` : '每腿数量须填写大于零的十进制数。'); return; }
@@ -361,31 +364,32 @@ export default function TradingExecution({ pair, onExpired, shares, onShares }: 
       <fieldset disabled={disabled || !!review}>
         <legend className="visually-hidden">选择组合并填写交易参数</legend>
         <div className="execution-row">
-          <Choice label="品种" value={market} options={(Object.keys(MARKET_NAMES) as ExecutionMarket[]).map(value => [value, MARKET_NAMES[value]])} onChange={next => { setMarket(next); if (next !== 'anthropic') setSelectedSymbol(MARKETS[next].symbols[0]); resetStructure(); }} />
-          <Choice label="交易动作" value={action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => { setAction(next); resetStructure(); }} />
-          {anthropic ? null : preset === 'same-exchange' ? <Choice label="交易所" value={selectedExchange} options={PAIR_VENUES.map(value => [value, EXCHANGES[value]])} onChange={next => { setSelectedExchange(next); resetStructure(); }} />
-            : preset === 'cross-exchange' ? <Choice label="合约" value={selectedSymbol} options={marketSymbols.map(symbol => [symbol, symbol])} onChange={next => { setSelectedSymbol(next); resetStructure(); }} /> : null}
+          <Choice label="品种" value={market} options={(Object.keys(MARKET_NAMES) as ExecutionMarket[]).map(value => [value, MARKET_NAMES[value]])} onChange={next => { setPreferences(current => { const profile = current.profiles[next]; return { ...current, market: next, profiles: { ...current.profiles, [next]: { ...profile, ...(next !== 'anthropic' && profile.preset !== 'same-exchange' && profile.pair !== pair ? { orientation: '' as const } : {}), pair } } }; }); resetDraft(); }} />
+          <Choice label="交易动作" value={action} options={[['open', '开仓'], ['close', '平仓']]} onChange={next => changeStructure({ action: next })} />
+          {anthropic ? null : preset === 'same-exchange' ? <Choice label="交易所" value={selectedExchange} options={PAIR_VENUES.map(value => [value, EXCHANGES[value]])} onChange={next => changeStructure({ selectedExchange: next })} />
+            : preset === 'cross-exchange' ? <Choice label="合约" value={selectedSymbol} options={marketSymbols.map(symbol => [symbol, symbol])} onChange={next => changeStructure({ selectedSymbol: next })} /> : null}
+          {!anthropic && preset !== 'same-exchange' ? <label>跨所组合<select aria-label="跨所组合" value={pair} onChange={event => onPair(event.target.value as TradingPair)}>{TRADING_PAIRS.map(value => <option key={value} value={value}>{pairExchanges(value).map(exchange => EXCHANGES[exchange]).join(' + ')}</option>)}</select></label> : null}
         </div>
         {anthropic ? <div className="execution-anthropic" role="group" aria-label="Anthropic 组合合约">
-          {([0, 1] as const).map(index => <label key={index}>{index === 0 ? '合约 A' : '合约 B'}<select value={anthropicKeys[index]} onChange={event => { const next: [string, string] = [...anthropicKeys]; next[index] = event.target.value; setAnthropicKeys(next); resetStructure(); }}>{ANTHROPIC_CONTRACTS.map(contract => { const key = contractKey(contract); return <option key={key} value={key} disabled={key === anthropicKeys[1 - index]}>{contract.label}</option>; })}</select></label>)}
+          {([0, 1] as const).map(index => <label key={index}>{index === 0 ? '合约 A' : '合约 B'}<select value={anthropicKeys[index]} onChange={event => { const next: [string, string] = [...anthropicKeys]; next[index] = event.target.value; changeStructure({ anthropicKeys: next }); }}>{ANTHROPIC_CONTRACTS.map(contract => { const key = contractKey(contract); return <option key={key} value={key} disabled={key === anthropicKeys[1 - index]}>{contract.label}</option>; })}</select></label>)}
           <label>流通股 · 十亿股<input type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={shares.outstanding} onChange={event => onShares({ ...shares, outstanding: event.target.value })} /></label>
           <label>完全稀释股 · 十亿股<input type="text" inputMode="decimal" autoComplete="off" maxLength={24} value={shares.diluted} onChange={event => onShares({ ...shares, diluted: event.target.value })} /></label>
           {sharesError ? <p className="execution-warning" role="alert">{sharesError}</p> : <p className="execution-help">{PRESETS[activePreset]} · 两腿按估算股数配平，股数假设与实时价差表共用，预览时固定。只在两侧最终按相同每股价格结算时收敛，不是保证收益；Hyperliquid 与 Lighter RH 按账户当前杠杆与保证金模式成交，本系统不修改。</p>}
         </div>
-          : <div className="execution-presets" role="group" aria-label="交易预设">{(Object.keys(PRESETS) as ExecutionPreset[]).map(value => <button key={value} type="button" aria-pressed={preset === value} onClick={() => { setPreset(value); resetStructure(); }}>{PRESETS[value]}<small>{value === 'four-leg' ? `${leftName} 与 ${rightName} · ${labelA} 对 ${labelB}` : value === 'same-exchange' ? `单所 · ${labelA} 对 ${labelB}` : `${leftName} 对 ${rightName} · 同一合约`}</small></button>)}</div>}
-        <div className="execution-choice execution-direction"><span aria-hidden="true">{action === 'open' ? '开仓方向' : '待平仓方向'}</span><div className="execution-direction-options" role="group" aria-label={action === 'open' ? '开仓方向' : '待平仓方向'}>{(['forward', 'reverse'] as const).map(value => <button key={value} type="button" aria-pressed={orientation === value} onClick={() => { setOrientation(value); setValues({}); }}>{legsFor(value === 'reverse').map(leg => <span key={legKey(leg)} className={`execution-leg-chip ${leg.side}`}>{EXCHANGES[leg.exchange]} {anthropic ? leg.symbol : leg.symbol === marketSymbols[0] ? labelA : labelB} <b>{leg.side === 'long' ? '多' : '空'}</b></span>)}</button>)}</div></div>
+          : <div className="execution-presets" role="group" aria-label="交易预设">{(Object.keys(PRESETS) as ExecutionPreset[]).map(value => <button key={value} type="button" aria-pressed={preset === value} onClick={() => { changeStructure({ preset: value }); }}>{PRESETS[value]}<small>{value === 'four-leg' ? `${leftName} 与 ${rightName} · ${labelA} 对 ${labelB}` : value === 'same-exchange' ? `单所 · ${labelA} 对 ${labelB}` : `${leftName} 对 ${rightName} · 同一合约`}</small></button>)}</div>}
+        <div className="execution-choice execution-direction"><span aria-hidden="true">{action === 'open' ? '开仓方向' : '待平仓方向'}</span><div className="execution-direction-options" role="group" aria-label={action === 'open' ? '开仓方向' : '待平仓方向'}>{(['forward', 'reverse'] as const).map(value => <button key={value} type="button" aria-pressed={orientation === value} onClick={() => { updatePreferences({ orientation: value }); setValues({}); }}>{legsFor(value === 'reverse').map(leg => <span key={legKey(leg)} className={`execution-leg-chip ${leg.side}`}>{EXCHANGES[leg.exchange]} {anthropic ? leg.symbol : leg.symbol === marketSymbols[0] ? labelA : labelB} <b>{leg.side === 'long' ? '多' : '空'}</b></span>)}</button>)}</div></div>
         <div className="execution-row execution-sizing">
-          <Choice label="数量方式" value={sizeMode} options={[['equal', sizing.sizing], ['per-leg', '逐腿填写']]} onChange={next => { setSizeMode(next); setEqualSize(''); setValues({}); }} />
+          <Choice label="数量方式" value={sizeMode} options={[['equal', sizing.sizing], ['per-leg', '逐腿填写']]} onChange={next => { updatePreferences({ sizeMode: next }); setEqualSize(''); setValues({}); }} />
           {sizeMode === 'equal' ? <label className="execution-amount">{market === 'oil' ? '每腿桶数' : anthropic ? '每腿股数' : '每腿名义金额'}<span className="execution-input-unit"><input type="text" inputMode="decimal" autoComplete="off" value={equalSize} required maxLength={48} pattern="[0-9]+([.][0-9]{1,18})?" placeholder={market === 'hynix' ? '例如 1000' : '例如 100'} onChange={event => setEqualSize(event.target.value)} /><span aria-hidden="true">{sizing.unit}</span></span></label> : null}
           <p className="execution-help">{sizeMode === 'equal' ? `${sizing.hint}实际各腿数量以预览为准。` : 'OKX 按张填写，其他交易所按原生合约单位；开仓时多空两侧须大致平衡。'}</p>
         </div>
         {orientation ? <div className={`execution-leg-inputs${sizeMode === 'per-leg' ? ' per-leg' : ''}`}>{draftLegs.map(leg => {
-          const key = legKey(leg), value = values[key] || { quantity: '', stopPrice: '', orderType: 'chase' as const }, buy = orderSide(action, leg.side) === 'buy';
+          const key = legKey(leg), value = { quantity: values[key]?.quantity ?? '', stopPrice: values[key]?.stopPrice ?? '', orderType: orderTypes[key] ?? 'chase' as const }, buy = orderSide(action, leg.side) === 'buy';
           const position = state?.positions.find(row => row.exchange === leg.exchange && row.symbol === leg.symbol && row.side === leg.side);
-          return <section key={key} className="execution-leg-input" aria-label={`${EXCHANGES[leg.exchange]} ${leg.symbol} 交易参数`}><header><strong>{EXCHANGES[leg.exchange]} {leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(action, leg.side)}</span></header>{sizeMode === 'per-leg' ? <div><label>数量 · {quantityUnit(leg.exchange)}<input type="text" inputMode="decimal" autoComplete="off" value={value.quantity} required maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" onChange={event => setValues(current => ({ ...current, [key]: { ...value, quantity: event.target.value } }))} /></label>{action === 'close' ? <div className="execution-position-hint"><span>{position ? `最近${direction(leg.side)} ${amount(position.quantity)} · ${date(position.fetchedAt)}` : `尚无该方向仓位数据`}</span><button type="button" className="text-button" disabled={!position || !positive(position.quantity)} onClick={() => position && setValues(current => ({ ...current, [key]: { ...value, quantity: position.quantity } }))}>填入当前数量</button></div> : null}</div> : null}<Choice label="下单方式" value={value.orderType} options={ORDER_TYPES} onChange={next => setValues(current => ({ ...current, [key]: { ...value, orderType: next } }))} />{value.orderType === 'market' ? <p className="execution-help execution-market-note">按对手盘吃单成交，不设价格界限，成交价可能偏离盘口。</p> : <label>{buy ? '追价上限' : '追价下限'} · {quoteAsset(leg.exchange)}（选填）<input type="text" inputMode="decimal" autoComplete="off" value={value.stopPrice} maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" placeholder={`留空不设${buy ? '上限' : '下限'}`} onChange={event => setValues(current => ({ ...current, [key]: { ...value, stopPrice: event.target.value } }))} /></label>}</section>;
+          return <section key={key} className="execution-leg-input" aria-label={`${EXCHANGES[leg.exchange]} ${leg.symbol} 交易参数`}><header><strong>{EXCHANGES[leg.exchange]} {leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(action, leg.side)}</span></header>{sizeMode === 'per-leg' ? <div><label>数量 · {quantityUnit(leg.exchange)}<input type="text" inputMode="decimal" autoComplete="off" value={value.quantity} required maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" onChange={event => setValues(current => ({ ...current, [key]: { ...value, quantity: event.target.value } }))} /></label>{action === 'close' ? <div className="execution-position-hint"><span>{position ? `最近${direction(leg.side)} ${amount(position.quantity)} · ${date(position.fetchedAt)}` : `尚无该方向仓位数据`}</span><button type="button" className="text-button" disabled={!position || !positive(position.quantity)} onClick={() => position && setValues(current => ({ ...current, [key]: { ...value, quantity: position.quantity } }))}>填入当前数量</button></div> : null}</div> : null}<Choice label="下单方式" value={value.orderType} options={ORDER_TYPES} onChange={next => updatePreferences({ orderTypes: { ...orderTypes, [key]: next } })} />{value.orderType === 'market' ? <p className="execution-help execution-market-note">按对手盘吃单成交，不设价格界限，成交价可能偏离盘口。</p> : <label>{buy ? '追价上限' : '追价下限'} · {quoteAsset(leg.exchange)}（选填）<input type="text" inputMode="decimal" autoComplete="off" value={value.stopPrice} maxLength={80} pattern="[0-9]+([.][0-9]{1,18})?" placeholder={`留空不设${buy ? '上限' : '下限'}`} onChange={event => setValues(current => ({ ...current, [key]: { ...value, stopPrice: event.target.value } }))} /></label>}</section>;
         })}</div> : <p className="execution-choose-direction">先选择方向，再设置各腿下单方式。</p>}
-        <details className="execution-advanced"><summary><span><strong>执行参数</strong><small>{batchCount || '?'} 批 · 批间 {batchInterval || '?'} 秒 · 追价间隔 {repriceInterval || '?'} 秒 · 最长 {timeout || '?'} 秒</small></span><ChevronDown size={16} /></summary>
-          <div className="execution-settings"><label>拆分批数<input type="number" min="1" max="200" step="1" required value={batchCount} onChange={event => setBatchCount(event.target.value)} /></label><label>批间等待 · 秒<input type="number" min="0" max="600" step="0.001" required value={batchInterval} onChange={event => setBatchInterval(event.target.value)} /></label><label>本地追价间隔（Binance / OKX / Hyperliquid / Lighter RH） · 秒<input type="number" min="1" max="60" step="0.001" required value={repriceInterval} onChange={event => setRepriceInterval(event.target.value)} /></label><label>最长执行 · 秒<input type="number" min="30" max="3600" step="0.001" required value={timeout} onChange={event => setExecutionTimeout(event.target.value)} /></label></div>
+        <details className="execution-advanced" open={advanced} onToggle={event => { const open = event.currentTarget.open; if (open !== advanced) updatePreferences({ advanced: open }); }}><summary><span><strong>执行参数</strong><small>{batchCount || '?'} 批 · 批间 {batchInterval || '?'} 秒 · 追价间隔 {repriceInterval || '?'} 秒 · 最长 {timeout || '?'} 秒</small></span><ChevronDown size={16} /></summary>
+          <div className="execution-settings"><label>拆分批数<input type="number" min="1" max="200" step="1" required value={batchCount} onChange={event => updatePreferences({ batchCount: event.target.value })} /></label><label>批间等待 · 秒<input type="number" min="0" max="600" step="0.001" required value={batchInterval} onChange={event => updatePreferences({ batchInterval: event.target.value })} /></label><label>本地追价间隔（Binance / OKX / Hyperliquid / Lighter RH） · 秒<input type="number" min="1" max="60" step="0.001" required value={repriceInterval} onChange={event => updatePreferences({ repriceInterval: event.target.value })} /></label><label>最长执行 · 秒<input type="number" min="30" max="3600" step="0.001" required value={timeout} onChange={event => updatePreferences({ timeout: event.target.value })} /></label></div>
           <p className="execution-help">每批各腿完成后才进入下一批。达到追价界限、最长时间或出现无法核对的状态时，停止后续批次并处理余单；已成交数量单独保留。</p>
         </details>
         <div className="execution-builder-footer"><p>{missingConnection ? '此组合需要的实盘账户尚未全部连接。' : '预览会重新读取交易账户的盘口、规则与持仓，不会下单。'}</p>{missingConnection && state ? <button className="button secondary" type="button" onClick={() => { const element = connectionsRef.current; if (element) { element.open = true; element.scrollIntoView({ block: 'start', behavior: 'smooth' }); } }}><Link2 size={16} />连接实盘账户</button> : null}<button className="button primary" type="submit" disabled={missingConnection || !orientation || stale || !!sharesError}><ArrowRightLeft size={16} />预览{action === 'open' ? '开仓' : '平仓'}组合</button></div>

@@ -2,7 +2,7 @@
 // All API intercepts are installed before navigating to isolated localhost:4175.
 async (page) => {
   const origin = page.url() === 'about:blank' ? 'http://127.0.0.1:4175' : new URL(page.url()).origin;
-  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):4175$/.test(origin)) throw new Error('Spread fixture requires isolated localhost:4175');
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):(?:4175|4178)$/.test(origin)) throw new Error('Spread fixture requires isolated localhost:4175');
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const pageErrors = [], quoteReads = [];
   let failQuotes = false;
@@ -40,6 +40,8 @@ async (page) => {
   const cell = (caption, row, column) => panel.locator(`table:has(caption:text-is("${caption}")) tbody tr:has(th:text-is("${row}")) td`).nth(column);
   const oil = '原油 · 同所价差 BZ − CL', hynix = '海力士 · 同所价差 ADR − 正股 ÷ 10';
   await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto(origin);
+  await page.evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('workbench:')) localStorage.removeItem(key); });
   await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await panel.getByText('前台每 3 秒更新盘口').waitFor();
 
@@ -63,7 +65,7 @@ async (page) => {
   assert((await cell(crossOil, 'CL', 4).textContent()).includes('Bybit 卖 · Binance 买'), 'edge direction');
   assert((await cell(crossOil, 'CL', 4).textContent()).startsWith('+0.03'), 'edge value sells bid and buys ask');
   assert(await cell(crossOil, '四腿：两所价差之差', 1).textContent() === '+0.256 个百分点', 'four-leg spread gap');
-  await page.getByRole('button', { name: 'Binance + OKX' }).click();
+  await cross.getByRole('combobox', { name: '对比交易所' }).selectOption('binance,okx');
   await panel.locator('caption:text-is("原油 · Binance − OKX（中间价）")').waitFor();
   assert(await panel.locator('caption:text-is("原油 · Binance − Bybit（中间价）")').count() === 0, 'previous pair is gone');
 

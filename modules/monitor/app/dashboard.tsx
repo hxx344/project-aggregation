@@ -4,6 +4,8 @@ import { Activity as ChartActivity, useEffect, useMemo, useState, type ReactNode
 import { lazyComponent } from "../lib/lazy-component";
 import { useHydrated } from "../lib/use-hydrated";
 import { Activity, ArrowDownRight, ArrowUpRight, ChevronDown, Clock3, Info, RefreshCw, MoveRight, BarChart3 } from "lucide-react";
+import { useViewPreference } from "../lib/use-view-preference";
+import { booleanPreference, rangePreference } from "../lib/view-preferences";
 import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useMarketFeed } from "../hooks/use-market-feed";
@@ -43,9 +45,9 @@ export default function Dashboard({ onSummary, active = true, selected = active,
   // Show the most recent read with its real source time; the reader serving the card decides whether it is stale.
   const trend = useMemo(() => createTrend(latestTrend(fullTrend, overviewTrend, initialTrend), hynixTrendOptions, trendRetained), [fullTrend, overviewTrend, initialTrend, trendRetained]);
   useEffect(() => { onSummary?.(hynixSummary(quote, quoteError, trend)); }, [onSummary, quote, quoteError, trend]);
-  const [range,setRange] = useState<number | null>(null);
+  const [range,setRange] = useViewPreference<number | null>("monitor:hynix:range:v1", null, rangePreference);
   const trades = useHubFills("hynix", tradesActive);
-  const [details,setDetails] = useState(false);
+  const [details,setDetails] = useViewPreference("monitor:hynix:details:v1", false, booleanPreference);
   const points = useMemo(() => selectRange(data?.points ?? EMPTY_POINTS,range),[data?.points,range]);
   // Current metrics must never silently substitute an hourly close for a quote.
   const current = quote;

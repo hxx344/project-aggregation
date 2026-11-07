@@ -9,11 +9,11 @@ export const TRADING_SECTIONS: { id: TradingSection; label: string }[] = [
   { id: 'accounts', label: '账户连接' },
 ];
 
-export function tradingSectionOf(search: string): TradingSection {
+export function tradingSectionOf(search: string, fallback: TradingSection = 'positions'): TradingSection {
   const params = new URLSearchParams(search);
   const section = params.get('tradingSection');
   if (TRADING_SECTIONS.some(item => item.id === section)) return section as TradingSection;
   // `oil` was the single arbitrage page; links without a section predate the trading center.
   if (section === 'oil' || section === null && (params.has('tradingPair') || params.has('tradingDays'))) return 'trade';
-  return 'positions';
+  return section === null ? fallback : 'positions';
 }

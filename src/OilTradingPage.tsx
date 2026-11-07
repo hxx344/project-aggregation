@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } 
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
-import { ageTradingData, normalizeTradingPair, pairExchanges, tradingCacheNow } from './trading-cache';
+import { ageTradingData, pairExchanges, tradingCacheNow } from './trading-cache';
 import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
 import TradingPnlChart from './TradingPnlChart';
@@ -13,7 +13,9 @@ import TradingSpread from './TradingSpread';
 import { amount, beijingTime, polarity } from './trading-format';
 import { tradingSectionOf } from './trading-sections';
 import type { TradingSection } from './trading-sections';
-import { DEFAULT_SHARES } from './trading-anthropic';
+import { sharesProblem } from './trading-anthropic';
+import { DAYS_PREFERENCE_KEY, PAIR_PREFERENCE_KEY, SHARES_PREFERENCES_KEY, readShares, readTradingDays, readTradingPair } from './trading-preferences';
+import { writePreference } from './ui-preferences';
 import type { AnthropicShares } from './trading-execution-types';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPair, TradingPosition, TradingReadState, TradingState } from './trading-types';
 type PositionLeg = Pick<TradingLeg, 'id' | 'exchange' | 'state'> & { symbol: string };
@@ -23,8 +25,8 @@ const exchangeNames = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
 const accountModeNames: Record<TradingAccountMode, string> = { standard: '普通 U 本位', 'portfolio-margin': '组合保证金（Portfolio Margin）', unified: '统一交易账户', cross: '全仓', isolated: '逐仓' };
 type ImportRequest = TradingImportSelection & { revision: number; accountMode: TradingAccountMode };
 const stateNames: Record<TradingReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
-const readDays = (): 7 | 30 => new URLSearchParams(location.search).get('tradingDays') === '30' ? 30 : 7;
-const readPair = () => normalizeTradingPair(new URLSearchParams(location.search).get('tradingPair'));
+const readDays = () => readTradingDays(location.search);
+const readPair = () => readTradingPair(location.search);
 const formatDate = (value: string | null) => beijingTime(value, '尚未同步', true);
 
 function ReadStatus({ state }: { state: TradingReadState }) { return <span className={`trading-status ${state}`}><i aria-hidden="true" />{stateNames[state]}</span>; }
@@ -128,7 +130,9 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
   const data = entry ? ageTradingData(entry, now, offline || !!error) : null;
   const oldCache = !!entry && (offline || !!error || entry.failed || !entry.data.cache.builtAt || now - Date.parse(entry.data.cache.builtAt) > 75_000);
   // One set of Anthropic share-count assumptions for the spread view and the live preview.
-  const [shares, setShares] = useState<AnthropicShares>(DEFAULT_SHARES);
+  const [shares, setShares] = useState<AnthropicShares>(readShares);
+  useEffect(() => { if (!sharesProblem(shares)) writePreference(SHARES_PREFERENCES_KEY, shares); }, [shares]);
+  useEffect(() => { writePreference(PAIR_PREFERENCE_KEY, pair); writePreference(DAYS_PREFERENCE_KEY, days); }, [pair, days]);
   const [sources, setSources] = useState<TradingImportSource[] | null>(null);
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [sourcesError, setSourcesError] = useState('');
@@ -302,7 +306,7 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
   const pendingPage = !!data && (days !== data.period.days || page !== currentPage);
   const openConnections = () => { focusConnections.current = true; onSection('accounts'); };
   const dataTab = section === 'legs' || section === 'pnl' || section === 'accounts';
-  const pairTab = section === 'trade' || section === 'legs' || section === 'pnl';
+  const pairTab = section === 'legs' || section === 'pnl';
 
   return <div className="trading-page" hidden={section === 'positions'}>
     {pairTab || dataTab ? <div className="trading-toolbar">
@@ -310,8 +314,8 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
       {dataTab ? <button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button> : null}
     </div> : null}
     <div className="trading-tab" hidden={section !== 'trade'}>
-      <TradingSpread pair={pair} shares={shares} onShares={setShares} />
-      <TradingExecution pair={pair} onExpired={onExpired} shares={shares} onShares={setShares} />
+      <TradingSpread pair={pair} onPair={changePair} shares={shares} onShares={setShares} />
+      <TradingExecution pair={pair} onPair={changePair} onExpired={onExpired} shares={shares} onShares={setShares} />
     </div>
     <div className="trading-tab" hidden={section !== 'auto'}><TradingAutoRules onExpired={onExpired} /></div>
     <div className="trading-tab" hidden={!dataTab}>

@@ -24,6 +24,7 @@ async page => {
   const fills = { generatedAt: stamp, sources: [{ projectId: 'asset', name: 'Asset', status: 'ready', data: { schemaVersion: 1, generatedAt: stamp, lookbackStart, exchanges: ['binance', 'okx'].map(venue => ({ id: venue, name: venue === 'binance' ? 'Binance' : 'OKX', accounts: [{ id: 'main', name: '主账户', scopes: [{ id: venue === 'binance' ? 'um' : 'swap', status: 'live', refreshing: false, fetchedAt: stamp, coverageStart: lookbackStart, coverageEnd: stamp, truncated: false, fills: [fill('entry', end - 2 * day + 60_000, false, venue), fill('exit', end - day + 60_000, true, venue), fill('old', end - 20 * day + 60_000, false, venue)] }] }] })) } }] };
   const errors = [], requests = [], listener = error => errors.push(error.stack ?? error.message);
   let failReads = false;
+  let launchMonitor = 'anthropic';
   const handler = async route => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
     const send = (json, status = 200) => route.fulfill({ status, json });
@@ -36,7 +37,7 @@ async page => {
       return route.fulfill({ response: await route.fetch({ url: monitorBuild + path + url.search }) });
     }
     if (url.origin !== origin) return route.abort('blockedbyclient');
-    if (path === '/api/projects/monitor/launch' && request.method() === 'POST') return send({ url: `${moduleOrigin}/?monitor=anthropic` });
+    if (path === '/api/projects/monitor/launch' && request.method() === 'POST') return send({ url: `${moduleOrigin}/${launchMonitor ? `?monitor=${launchMonitor}` : ''}` });
     if (request.method() !== 'GET') throw new Error(`Unexpected host write: ${path}`);
     if (path === '/api/session') return send({ authenticated: true, csrfToken: 'ant-fixture-only' });
     if (path === '/api/health') return send({ status: 'ok' });
@@ -57,6 +58,8 @@ async page => {
   await page.route('**/*', handler);
   try {
     await page.goto(`${origin}/?view=project&id=monitor`);
+    await page.frameLocator('iframe[title="monitor模块"]').locator('body').evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('monitor:')) localStorage.removeItem(key); });
+    await page.reload();
     const frame = page.frameLocator('iframe[title="monitor模块"]'), panel = frame.getByRole('tabpanel', { name: 'Anthropic 价差', exact: true });
     const entry = panel.locator('.trade-marker[data-trade-type="entry"]'), exit = panel.locator('.trade-marker[data-trade-type="exit"]');
     await entry.first().waitFor(); await exit.first().waitFor();
@@ -100,6 +103,43 @@ async page => {
     await page.screenshot({ path: '.playwright-cli/ant-trades-mobile.png' });
     check(sizes.scroll <= sizes.width + 1, `ANT totals and chart fit the narrow iframe: ${JSON.stringify(sizes)}`);
     await page.setViewportSize({ width: 1440, height: 1050 });
+    // Personal chart choices survive a real host/iframe reload and remain isolated per market.
+    await panel.getByRole('button', { name: 'Lighter RH', exact: true }).click();
+    await chart.getByRole('button', { name: '1 月', exact: true }).click();
+    await chart.getByRole('button', { name: '7 日均线', exact: true }).click();
+    await chart.getByRole('button', { name: '每股价格', exact: true }).click();
+    await panel.getByRole('button', { name: '数据来源与覆盖范围' }).click();
+    await page.reload();
+    await panel.getByRole('button', { name: 'Lighter RH', exact: true }).waitFor();
+    await panel.getByRole('button', { name: 'Lighter RH', exact: true }).evaluate(node => { if (node.getAttribute('aria-pressed') !== 'true') throw Error('ANT leg was not restored'); });
+    check(await chart.getByRole('button', { name: '1 月', exact: true }).getAttribute('aria-pressed') === 'true', 'ANT range restores');
+    check(await chart.getByRole('button', { name: '每股价格', exact: true }).getAttribute('aria-pressed') === 'true', 'ANT chart mode restores');
+    await chart.getByRole('button', { name: '溢价率', exact: true }).click();
+    check(await chart.getByRole('button', { name: '7 日均线', exact: true }).getAttribute('aria-pressed') === 'false', 'ANT indicators restore');
+    await chart.getByRole('button', { name: '每股价格', exact: true }).click();
+    check(await panel.getByRole('button', { name: '数据来源与覆盖范围' }).getAttribute('aria-expanded') === 'true', 'ANT disclosure restores');
+    await frame.getByRole('tab', { name: '原油价差', exact: true }).click();
+    const oilPanel = frame.getByRole('tabpanel', { name: '原油价差', exact: true });
+    const oilChart = oilPanel.getByRole('region', { name: '历史价差图表', exact: true });
+    await oilChart.getByRole('button', { name: '1 周', exact: true }).waitFor();
+    check(await oilChart.getByRole('button', { name: '1 周', exact: true }).getAttribute('aria-pressed') === 'true', 'ANT range does not replace oil default');
+    await oilChart.getByRole('button', { name: '全部', exact: true }).click();
+    await frame.getByRole('tab', { name: 'Anthropic 价差', exact: true }).click();
+    check(await chart.getByRole('button', { name: '1 月', exact: true }).getAttribute('aria-pressed') === 'true', 'oil range does not replace ANT range');
+    launchMonitor = '';
+    await page.reload(); await panel.waitFor();
+    check(await frame.getByRole('tab', { name: 'Anthropic 价差', exact: true }).getAttribute('data-state') === 'active', 'saved monitor restores without a URL selection');
+    launchMonitor = 'oil';
+    await page.reload(); await oilPanel.waitFor();
+    check(await frame.getByRole('tab', { name: '原油价差', exact: true }).getAttribute('data-state') === 'active', 'explicit monitor URL overrides saved selection');
+    check(await oilChart.getByRole('button', { name: '全部', exact: true }).getAttribute('aria-pressed') === 'true', 'oil all-history null restores independently');
+    launchMonitor = 'anthropic';
+    await page.reload(); await panel.waitFor();
+    // Restore the earlier view so the failure-retention assertions still address its exact chart.
+    await panel.getByRole('button', { name: 'xyz:ANT', exact: true }).click();
+    await chart.getByRole('button', { name: '1 周', exact: true }).click();
+    await chart.getByRole('button', { name: '溢价率', exact: true }).click();
+    await entry.first().waitFor(); await exit.first().waitFor();
     failReads = true;
     await page.clock.fastForward(301_000);
     await panel.locator('.trade-status').filter({ hasText: '刷新失败，保留上次成功数据' }).waitFor();
@@ -112,7 +152,7 @@ async page => {
     await page.clock.fastForward(301_000);
     check(requests.filter(market => market === 'anthropic').length === before, 'inactive ANT chart stops fill reads');
     check(errors.length === 0, errors.join('\n'));
-    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'entry/exit keyboard details', 'native prices', 'three comparison legs', 'range and price modes', 'per-currency PnL', 'unknown cycle', 'refresh failure retention', 'foreground-only reads', '390px layout'] };
+    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'entry/exit keyboard details', 'native prices', 'three comparison legs', 'range and price modes', 'per-currency PnL', 'unknown cycle', 'refresh failure retention', 'foreground-only reads', '390px layout', 'reload preferences', 'market isolation', 'monitor URL priority'] };
   } finally {
     page.off('pageerror', listener);
     await page.unroute('**/*', handler);

@@ -3,7 +3,7 @@
 // Never point this fixture at a real Hub session.
 async (page) => {
   const origin = page.url() === 'about:blank' ? 'http://127.0.0.1:4175' : new URL(page.url()).origin;
-  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):4175$/.test(origin)) throw new Error('Anthropic fixture requires isolated localhost:4175');
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):(?:4175|4178)$/.test(origin)) throw new Error('Anthropic fixture requires isolated localhost:4175 or :4178');
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const stamp = () => new Date().toISOString();
   const MASTER = '0x' + 'AB'.repeat(20), AGENT_KEY = '0x' + '11'.repeat(32);
@@ -81,6 +81,8 @@ async (page) => {
   const perShare = 'Anthropic 上市前合约 · 按股数假设折算为每股价格', pairs = '两两组合 · 买入便宜一侧卖一、卖出较贵一侧买一';
   const lastPreview = () => requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
   await page.setViewportSize({ width: 1440, height: 1100 });
+  await page.goto(origin);
+  await page.evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('workbench:')) localStorage.removeItem(key); });
   await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await ant.waitFor();
 

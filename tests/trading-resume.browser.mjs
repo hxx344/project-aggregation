@@ -1,6 +1,7 @@
 // All traffic is intercepted; use the isolated production preview on port 4175.
 async (page) => {
-  const origin = 'http://127.0.0.1:4175';
+  const origin = page.url() === 'about:blank' ? 'http://127.0.0.1:4175' : new URL(page.url()).origin;
+  if (!/^http:\/\/(?:127\.0\.0\.1|localhost):(?:4175|4178)$/.test(origin)) throw new Error('Use an isolated production preview');
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const paths = ['/api/trading/positions', '/api/trading', '/api/trading/execution'];
   const errors = [], writes = [], held = [];
@@ -35,9 +36,11 @@ async (page) => {
     if (paths.includes(path) && hold) await new Promise(resolve => held.push(resolve));
     const now = Date.now(), stamp = new Date(now).toISOString(), start = now - 7 * 86_400_000;
     if (path === '/api/trading/positions') return send({ generatedAt: stamp, sources: [] });
+    if (path === '/api/trading/execution/quotes') return send({ generatedAt: new Date().toISOString(), maxAgeMs: 10000, books: [] });
+    if (path === '/api/trading/execution/auto') return send({ generatedAt: new Date().toISOString(), maintenance: false, rules: [] });
     if (path === '/api/trading/execution') return send({ generatedAt: stamp, connections: [], positions: [], jobs: [] });
     if (path === '/api/trading') return send({ mode: 'read-only', exchanges: (url.searchParams.get('pair') || 'binance,bybit').split(','), strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: stamp, period: { days: 7, start: new Date(start).toISOString(), end: stamp }, cache: { builtAt: stamp, servedAt: stamp, rebuilding: false }, accounts: [], legs: [], structure: { state: 'unknown', message: '尚未连接只读观察账户' }, pnl: { currency: 'USDT', intervalMs: 60_000, cumulativeStart: start, end: now, recordingStartedAt: null, pointCount: 0, points: [], latest: null, status: 'collecting' }, funding: { complete: false, income: null, expense: null, net: null, currency: 'USDT', events: [], pagination: { page: 0, pageSize: 50, total: 0, pages: 0 }, daily: [] } });
-    return send({});
+    return route.fulfill({ status: 503, json: { error: 'Outside recovery fixture' } });
   });
   const advance = async ms => { await page.clock.runFor(ms); await page.waitForTimeout(40); };
   const reads = () => page.evaluate(() => window.__reads);
@@ -50,6 +53,8 @@ async (page) => {
   const setOnline = value => page.evaluate(value => { window.__online = value; window.dispatchEvent(new Event(value ? 'online' : 'offline')); }, value);
 
   for (const section of ['positions', 'trade']) {
+    await page.goto(origin);
+    await page.evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('workbench:')) localStorage.removeItem(key); });
     await page.goto(`${origin}/?view=trading&tradingSection=${section}`);
     await page.getByRole('heading', { name: section === 'positions' ? '交易中心' : '组合交易', exact: true }).waitFor();
     await advance(100);
@@ -80,7 +85,8 @@ async (page) => {
       // A new pair read started between wake events belongs to this recovery window.
       hold = true; before = (await reads()).length;
       await page.evaluate(() => window.dispatchEvent(new Event('focus'))); await advance(100);
-      await page.getByRole('group', { name: '交易所组合' }).getByRole('button', { name: 'Binance + OKX' }).click();
+      await page.locator('details.spread-cross > summary').click();
+      await page.getByRole('combobox', { name: '对比交易所' }).selectOption('binance,okx');
       await advance(100); await page.evaluate(() => window.dispatchEvent(new Event('pageshow'))); await advance(1_100);
       changes = (await reads()).slice(before).filter(read => read.path === paths[1]);
       assert(changes.length === 1 && changes[0].pair === 'binance,okx' && !changes[0].aborted, 'pair switch read survives later wake events');

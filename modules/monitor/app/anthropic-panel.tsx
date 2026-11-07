@@ -4,6 +4,8 @@ import { Activity as ChartActivity, useEffect, useMemo, useState, type ReactNode
 import { Activity, ArrowDownRight, ArrowUpRight, BarChart3, ChevronDown, Clock3, Info, MoveRight, RefreshCw } from "lucide-react";
 import { lazyComponent } from "../lib/lazy-component";
 import { useHydrated } from "../lib/use-hydrated";
+import { useViewPreference } from "../lib/use-view-preference";
+import { booleanPreference, rangePreference, legPreference } from "../lib/view-preferences";
 import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useAnthropicFeed } from "../hooks/use-anthropic-feed";
@@ -32,9 +34,9 @@ export default function AnthropicPanel({ onSummary, active = true, selected = ac
   const [hasOpened, setHasOpened] = useState(active);
   if (active && !hasOpened) setHasOpened(true);
   const charts = hasOpened || shown;
-  const [range, setRange] = useState<number | null>(7);
-  const [leg, setLeg] = useState<AnthropicComparisonLeg>("xyz");
-  const [details, setDetails] = useState(false);
+  const [range, setRange] = useViewPreference<number | null>("monitor:anthropic:range:v1", 7, rangePreference);
+  const [leg, setLeg] = useViewPreference<AnthropicComparisonLeg>("monitor:anthropic:leg:v1", "xyz", legPreference);
+  const [details, setDetails] = useViewPreference("monitor:anthropic:details:v1", false, booleanPreference);
   const windowDays = range === null ? null : range + ANTHROPIC_WARMUP_DAYS;
   const { data, quote, loading, error, errorWindow, quoteError, refresh } = useAnthropicFeed(active, summaryActive, windowDays);
   const trades = useHubFills("anthropic", tradesActive);

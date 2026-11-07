@@ -1,7 +1,9 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { ArrowLeftRight, Bot, ChartLine, Layers, Link2, LoaderCircle, Wallet } from 'lucide-react';
 import type { TradingCache } from './trading-cache';
-import { TRADING_SECTIONS, tradingSectionOf } from './trading-sections';
+import { TRADING_SECTIONS } from './trading-sections';
+import { readTradingSection, saveTradingSection } from './trading-navigation';
+import { readTradingDays, readTradingPair } from './trading-preferences';
 import type { TradingSection } from './trading-sections';
 import TradingPositions from './TradingPositions';
 import './trading-center.css';
@@ -19,14 +21,15 @@ const icons: Record<TradingSection, typeof Wallet> = { positions: Wallet, trade:
 export default function TradingPage({ cache, onExpired, onProject, navigationSearch }: {
   cache: TradingCache; onExpired: () => void; onProject: (id: string) => void; navigationSearch: string;
 }) {
-  const [section, setSection] = useState(() => tradingSectionOf(location.search));
+  const [section, setSection] = useState(() => readTradingSection(location.search));
   // The arbitrage tabs mount on first visit and then stay mounted (hidden) for the rest of the visit,
   // so opening the trading center on 全部仓位 does not start the arbitrage reads.
   const [arbitrageOpened, setArbitrageOpened] = useState(section !== 'positions');
-  useEffect(() => { setSection(tradingSectionOf(location.search)); }, [navigationSearch]);
+  useEffect(() => { setSection(readTradingSection(location.search)); }, [navigationSearch]);
+  useEffect(() => { saveTradingSection(section); }, [section]);
   useEffect(() => { if (section !== 'positions') setArbitrageOpened(true); }, [section]);
   useEffect(() => {
-    const back = () => setSection(tradingSectionOf(location.search));
+    const back = () => setSection(readTradingSection(location.search));
     window.addEventListener('popstate', back);
     return () => window.removeEventListener('popstate', back);
   }, []);
@@ -35,8 +38,8 @@ export default function TradingPage({ cache, onExpired, onProject, navigationSea
     const url = new URL(location.href);
     url.searchParams.set('tradingSection', next);
     if (next !== 'positions') {
-      url.searchParams.set('tradingDays', String(cache.selection().days));
-      url.searchParams.set('tradingPair', cache.selection().pair);
+      url.searchParams.set('tradingDays', String(readTradingDays(location.search)));
+      url.searchParams.set('tradingPair', readTradingPair(location.search));
     }
     history.pushState(null, '', url);
     setSection(next);
