@@ -5,8 +5,8 @@ import { oilSpread } from '../modules/oil/spread.mjs';
 /** Current same-venue spread in the market's unit (oil USDT/桶, Hynix percent), keyed by exchange id (for example `binance`). */
 export type VenueSpreads = Record<string, { value: number | null; stale: boolean }>;
 /** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. */
-/** Anthropic: Binance ANTHROPICUSDT; Asset does not read Hyperliquid positions, and bare ANT/ANTH would also match unrelated tokens. */
-export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC'] };
+/** Anthropic: Binance ANTHROPICUSDT plus Hyperliquid io:ANTH and xyz:ANT, matched with their dex prefix (separators dropped); bare ANT/ANTH would also match unrelated tokens. */
+export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'IOANTH', 'XYZANT'] };
 export type UnpairedReason = 'same-side' | 'multiple' | 'missing-leg';
 /** Why the realized half of a pair total is missing or qualified. */
 export type RealizedStatus = 'complete' | 'partial' | 'loading' | 'unavailable' | 'mixed-currency';

@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createPositionsSource, failedOutcome, matchBase, MAX_POSITION_ITEMS, openTradingRequest, positionItems, positionsReply, positionsRequest, POSITIONS_TIMEOUT_MS } from '../src/hub-positions.ts';
+import { createPositionsSource, failedOutcome, matchBase, MAX_POSITION_ITEMS, openTradingRequest, positionItems, positionsReply, positionsRequest, POSITIONS_TIMEOUT_MS, withExecutionLegs } from '../src/hub-positions.ts';
 import { ASSET_POSITIONS_TIMEOUT_MS } from '../server/asset-positions.mjs';
 import { POSITIONS_TIMEOUT_MS as MODULE_POSITIONS_TIMEOUT_MS } from '../modules/monitor/lib/hub-bridge.ts';
+import { RELATED_SYMBOLS } from '../modules/monitor/lib/related-pairs.ts';
+import { ANTHROPIC_LEGS } from '../modules/monitor/modules/anthropic/market.mjs';
 
 const now = Date.parse('2026-10-22T04:00:00.000Z');
 const at = new Date(now - 5_000).toISOString();
@@ -195,4 +197,54 @@ test('cycle summaries are forwarded field by field and stay absent for older Ass
   const { items } = positionItems(response([position('CLUSDT', { cycle: { ...cycle, secret: 'leak' } }), position('BZUSDT'), position('CL-USDT-SWAP', { side: 'short', cycle: null })]), ['CL', 'BZ'], now);
   assert.deepEqual(items[0].cycle, cycle); assert.equal('cycle' in items[1], false); assert.equal(items[2].cycle, null);
   for (const bad of [{ ...cycle, status: 'done' }, { ...cycle, net: 1 }, 'partial']) assert.throws(() => positionItems(response([position('CLUSDT', { cycle: bad })]), ['CL'], now));
+});
+
+test('Anthropic requests match the Binance and both Hyperliquid legs without bare ANT/ANTH', () => {
+  for (const leg of Object.values(ANTHROPIC_LEGS)) assert.ok(matchBase(leg.symbol, RELATED_SYMBOLS.anthropic), leg.symbol);
+  assert.equal(matchBase('io:ANTH', RELATED_SYMBOLS.anthropic), 'IOANTH');
+  assert.equal(matchBase('xyz:ANT', RELATED_SYMBOLS.anthropic), 'XYZANT');
+  for (const symbol of ['ANTUSDT', 'ANTHUSDT', 'ANT', 'xyz:ANTX', 'io:ANTHX', 'abc:ANT'])
+    assert.equal(matchBase(symbol, RELATED_SYMBOLS.anthropic), null, symbol);
+});
+
+const hlRow = (symbol, overrides = {}) => ({ id: `hyperliquid:${symbol}:short`, exchange: 'hyperliquid', symbol, side: 'short', quantity: '12.5', quantityUnit: null, entryPrice: '1050.1', markPrice: '1040.2',
+  notional: '13002.5', unrealizedPnl: '123.75', leverage: '3', marginMode: 'isolated', marginUsed: '4334', liquidationPrice: '1400', distancePercent: '34.59', alerting: false, ...overrides });
+const watch = ({ connected = true, state = 'live', fetchedAt = at, positions = [hlRow('xyz:ANT'), hlRow('io:ANTH', { side: 'long', quantity: '0.75' })] } = {}) => ({ schema: 1, generatedAt: at, sources: [
+  { exchange: 'binance', connected: true, state: 'live', fetchedAt: at, error: null, refreshing: false, positions: [hlRow('ANTHROPICUSDT', { exchange: 'binance', id: 'binance:ANTHROPICUSDT:long' })] },
+  { exchange: 'hyperliquid', connected, address: '0xabcdefabcdefabcdefabcdefabcdefabcdefabcd', state, fetchedAt, error: 'Hyperliquid 读取失败', refreshing: false, positions: connected ? positions : [] },
+], alerts: { config: {}, channel: { host: 'open.feishu.cn' }, history: [] } });
+
+test('Anthropic replies add the live Hyperliquid legs beside Asset and skip the duplicated read-only accounts', () => {
+  const parsed = positionsRequest(request({ market: 'anthropic', symbols: [...RELATED_SYMBOLS.anthropic] }));
+  const asset = { status: 'ok', data: response([position('ANTHROPICUSDT'), position('CLUSDT')]), at: 0 };
+  const reply = positionsReply(parsed, withExecutionLegs(asset, { status: 'ok', data: watch(), at: 0 }), now);
+  assert.equal(reply.status, 'ok'); assert.equal(reply.incomplete, false); assert.equal(reply.sourcesIncomplete, false);
+  assert.deepEqual(reply.items.map(item => `${item.exchangeId}:${item.symbol}:${item.side}:${item.base}`), ['binance:ANTHROPICUSDT:long:ANTHROPIC', 'hyperliquid:xyz:ANT:short:XYZANT', 'hyperliquid:io:ANTH:long:IOANTH']);
+  assert.deepEqual(reply.items[1], { key: 'hyperliquid:xyz:ANT:short:1', source: '套利交易实盘', exchange: 'Hyperliquid', exchangeId: 'hyperliquid', symbol: 'xyz:ANT', base: 'XYZANT', side: 'short',
+    quantity: '12.5', quantityUnit: 'ANT', entryPrice: '1050.1', markPrice: '1040.2', unrealizedPnl: '123.75', pnlCurrency: null, updatedAt: at, stale: false });
+  assert.equal(reply.items[2].quantityUnit, 'ANTH');
+  for (const secret of ['0xabcdef', 'feishu', '4334', '34.59']) assert.ok(!JSON.stringify(reply).includes(secret), secret);
+  const parsedOil = positionsRequest(request());
+  assert.deepEqual(positionsReply(parsedOil, withExecutionLegs(asset, { status: 'ok', data: watch(), at: 0 }), now).items.map(item => item.symbol), ['CLUSDT'], 'other markets never pick up the legs');
+});
+
+test('Hyperliquid leg failures mark only their own source and keep Asset positions', () => {
+  const parsed = positionsRequest(request({ market: 'anthropic', symbols: [...RELATED_SYMBOLS.anthropic] }));
+  const asset = { status: 'ok', data: response([position('ANTHROPICUSDT')]), at: 0 };
+  const reply = legs => positionsReply(parsed, withExecutionLegs(asset, legs), now);
+  for (const legs of [{ status: 'unavailable', at: 0, reason: 'timeout' }, { status: 'unauthorized', at: 0 }, { status: 'ok', data: null, at: 0 },
+    { status: 'ok', data: watch({ positions: [hlRow('xyz:ANT', { quantity: 12.5 })] }), at: 0 }, { status: 'ok', data: watch({ positions: [hlRow('xyz:ANT', { side: 'flat' })] }), at: 0 }, { status: 'ok', data: watch({ state: 'odd' }), at: 0 }]) {
+    const result = reply(legs);
+    assert.equal(result.status, 'ok', JSON.stringify(legs)); assert.equal(result.sourcesIncomplete, true, JSON.stringify(legs));
+    assert.deepEqual(result.items.map(item => item.symbol), ['ANTHROPICUSDT']);
+  }
+  const disconnected = reply({ status: 'ok', data: watch({ connected: false }), at: 0 });
+  assert.equal(disconnected.incomplete, false, 'an unconnected execution account is not a failed source'); assert.equal(disconnected.items.length, 1);
+  assert.equal(reply({ status: 'ok', data: { sources: [] }, at: 0 }).incomplete, false);
+  assert.equal(reply({ status: 'ok', data: watch({ state: 'error', fetchedAt: null, positions: [] }), at: 0 }).sourcesIncomplete, true, 'a first read that failed cannot confirm the legs');
+  assert.equal(reply({ status: 'ok', data: watch({ state: 'loading', fetchedAt: null, positions: [] }), at: 0 }).sourcesIncomplete, true);
+  assert.deepEqual(reply({ status: 'ok', data: watch({ state: 'stale' }), at: 0 }).items.map(item => item.stale), [false, true, true]);
+  assert.deepEqual(reply({ status: 'ok', data: watch({ fetchedAt: new Date(now - 91_000).toISOString() }), at: 0 }).items.map(item => item.stale), [false, true, true]);
+  for (const failed of [{ status: 'unavailable', at: 0, reason: 'http', httpStatus: 503 }, { status: 'unauthorized', at: 0 }])
+    assert.deepEqual(withExecutionLegs(failed, { status: 'ok', data: watch(), at: 0 }), failed, 'an Asset read failure is reported as before');
 });

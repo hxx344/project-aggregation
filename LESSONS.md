@@ -1174,6 +1174,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `hynix-related-leg-symbol-20261022`；实际发生日期 2026-10-22（Asia/Shanghai）；不推进全历史复盘检查点。
 
+**来源覆盖补充（2026-11-07）：** Anthropic 价差的关联交易只列出 Binance 腿。除了请求列表只有 `ANTHROPIC`，更根本的是 Hyperliquid 腿根本不在持仓桥读取的 Asset 仓位里：Asset 只接入 Hyperliquid 账户总值，仓位由套利交易的实盘连接读取（`/api/trading/anthropic`）。新增市场时，先确认每条腿的仓位实际由哪个来源提供，并让持仓桥读到它；同时列出带 HIP-3 前缀的原生名（`IOANTH`、`XYZANT`）。[工作台持仓测试](tests/hub-positions.test.mjs) 覆盖两条 Hyperliquid 腿的并入、只读账户腿不重复，以及该来源失败时只标记自身不可用；[持仓桥浏览器用例](tests/hub-positions.browser.mjs) 从宿主页面入口验证。事件 `anthropic-related-hyperliquid-legs-20261107`；不推进复盘检查点。
+
 ### L072：更新后的维护锁释放不能依赖浏览器读取状态
 
 **适用条件：** 工作台更新期间持久化交易维护锁，更新器重启工作台时任务仍在运行，内置交易模块以维护状态启动，锁只在 [更新协调器](server/updates.mjs) 的 `status()`/`check()` 观察到任务结束后释放。

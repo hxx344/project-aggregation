@@ -22,13 +22,17 @@ async (page) => {
       scope('scope-secret-9', 'live', [position('CLUSDT'), position('BZUSDT', { side: 'short', entryPrice: null, unrealizedPnl: null }), position('CLOUDUSDT'), position('XAUUSDT')]),
       scope('scope-secret-stale', 'stale', [position('CL-USDT-SWAP')])] }] }] } },
     { projectId: 'asset-secret-missing', name: 'Asset 备用账本', status: 'unavailable', error: '来源暂不可用', checkedAt: stamp(), data: null }] });
+  const legsState = () => ({ schema: 1, generatedAt: stamp(), sources: [
+    { exchange: 'binance', connected: true, state: 'live', fetchedAt: stamp(), error: null, refreshing: false, positions: [{ id: 'binance:ANTHROPICUSDT:short', exchange: 'binance', symbol: 'ANTHROPICUSDT', side: 'short', quantity: '3', quantityUnit: null, entryPrice: '900', markPrice: '910', unrealizedPnl: '-30' }] },
+    { exchange: 'hyperliquid', connected: true, address: '0xfeedfeedfeedfeedfeedfeedfeedfeedfeedfeed', state: 'live', fetchedAt: stamp(), error: null, refreshing: false, positions: [
+      { id: 'hyperliquid:xyz:ANT:long', exchange: 'hyperliquid', symbol: 'xyz:ANT', side: 'long', quantity: '40', quantityUnit: null, entryPrice: '71.2', markPrice: '72.5', unrealizedPnl: '52', liquidationPrice: '40', distancePercent: '44.83' }] }] });
   const errors = [], external = [], unexpected = [], requests = [], held = [];
   const launches = new Map();
   let expire = false, holdRead = false, neverRespond = false;
   page.on('pageerror', error => errors.push(error.message));
   const moduleHtml = id => `<!doctype html><meta charset="utf-8"><body><p>${id} fixture</p><script>
     const origin = ${JSON.stringify(origin)};
-    window.fixture = { hostReady: [], replies: [] };
+    window.fixture = { hostReady: [], replies: [], activity: 0 };
     fixture.send = value => parent.postMessage({ channel: 'project-hub', version: 1, ...value }, origin);
     // Like the real bridges, answer each host ready so the load-time revalidation reconnects.
     function sendReady() { fixture.send({ type: 'ready', role: 'module', capabilities: ['activity', 'navigate', 'changed', 'positions', 'open-trading'] }); }
@@ -36,6 +40,7 @@ async (page) => {
       if (event.origin !== origin || event.source !== parent || event.data?.channel !== 'project-hub' || event.data.version !== 1) return;
       if (event.data.type === 'ready') { fixture.hostReady.push(event.data.capabilities); sendReady(); }
       if (event.data.type === 'positions') fixture.replies.push(event.data);
+      if (event.data.type === 'activity') fixture.activity++;
     });
     sendReady();
   </script></body>`;
@@ -59,11 +64,13 @@ async (page) => {
       if (expire) return send({ error: '登录已过期' }, 401);
       return send(positionsState());
     }
+    if (path === '/api/trading/anthropic') return send(legsState());
     if (path.startsWith('/api/')) { unexpected.push(`${request.method()} ${path}`); return send({ error: `Unexpected API ${path}` }, 404); }
     return route.continue();
   };
   const release = () => { for (const resume of held.splice(0)) resume(); };
   const reads = () => requests.filter(request => request.path === '/api/trading/positions').length;
+  const legReads = () => requests.filter(request => request.path === '/api/trading/anthropic').length;
   const eventually = async (check, message, tries = 150) => { for (let i = 0; i < tries; i++) { if (await check()) return; await page.waitForTimeout(40); } throw new Error(message); };
   const frameFor = id => page.frames().find(frame => frame.url().startsWith(`${origin}/_bridge-fixture/${id}/`));
   const connect = async id => {
@@ -113,6 +120,26 @@ async (page) => {
     await ask(monitor, request('perp-1', { market: 'perpetual', symbols: ['XAU', 'CL', 'BZ'] }));
     const perp = await reply(monitor, 'perp-1');
     assert(perp.status === 'ok' && perp.items.some(item => item.symbol === 'XAUUSDT' && item.base === 'XAU') && reads() === 1, 'cached response serves another market');
+    assert(legReads() === 0, 'only Anthropic requests read the execution legs');
+
+    // Asset is cached by the oil read, the legs are cold: a hidden page refuses only the legs and must resend activity.
+    await page.getByRole('button', { name: '总览', exact: true }).click();
+    await page.waitForTimeout(300);
+    const activityBefore = await monitor.evaluate(() => fixture.activity);
+    await ask(monitor, request('anthropic-hidden', { market: 'anthropic', symbols: ['ANTHROPIC', 'IOANTH', 'XYZANT'] }));
+    const hiddenLegs = await reply(monitor, 'anthropic-hidden');
+    assert(hiddenLegs.status === 'ok' && hiddenLegs.sourcesIncomplete === true && legReads() === 0 && reads() === 1, `hidden anthropic reply ${JSON.stringify(hiddenLegs)}`);
+    await eventually(async () => await monitor.evaluate(() => fixture.activity) > activityBefore, 'a refused leg read did not resend activity');
+    await page.locator('.project-nav').filter({ hasText: 'monitor' }).click();
+    monitor = await connect('monitor');
+    await page.waitForTimeout(300);
+
+    await ask(monitor, request('anthropic-1', { market: 'anthropic', symbols: ['ANTHROPIC', 'IOANTH', 'XYZANT'] }));
+    const anthropic = await reply(monitor, 'anthropic-1');
+    const leg = anthropic.items.find(item => item.exchangeId === 'hyperliquid');
+    assert(anthropic.status === 'ok' && legReads() === 1 && reads() === 1 && leg && leg.symbol === 'xyz:ANT' && leg.base === 'XYZANT' && leg.side === 'long' && leg.quantity === '40' && leg.quantityUnit === 'ANT' && leg.source === '套利交易实盘' && leg.stale === false, `anthropic reply ${JSON.stringify(anthropic)}`);
+    assert(!anthropic.items.some(item => item.symbol === 'ANTHROPICUSDT'), 'read-only account legs of the trading page are not added beside Asset');
+    assert(!JSON.stringify(anthropic).includes('0xfeed') && !JSON.stringify(anthropic).includes('44.83'), 'the execution address and alert fields stay in the host');
 
     for (const value of [request('bad-market', { market: 'gold' }), request('bad-retired', { market: 'cl-xau' }), request('bad-empty', { symbols: [] }), request('bad-lower', { symbols: ['cl'] }),
       request('bad-many', { symbols: Array.from({ length: 21 }, (_, i) => `B${i}`) }), request('bad id'), { type: 'positions-request', requestId: 'bad-missing', market: 'oil' }])
@@ -187,7 +214,7 @@ async (page) => {
 
     assert(!unexpected.length && !external.length && !errors.length, JSON.stringify({ unexpected, external, errors }));
     assert(requests.every(request => request.method === 'GET' || (request.method === 'POST' && /\/api\/projects\/(monitor|asset)\/launch$/.test(request.path))), 'only launch POSTs are sent');
-    return { passed: true, positionReads: reads(), scenarios: ['monitor capabilities', 'single in-flight read', 'redacted items', 'cache across markets', 'invalid and forged messages ignored', 'inactive cache and open-trading ignored', 'non-monitor ignored', '401 unauthorized without logout', 'inactive cold unavailable', '15s timeout without retry', 'open-trading to positions'] };
+    return { passed: true, positionReads: reads(), scenarios: ['monitor capabilities', 'single in-flight read', 'redacted items', 'cache across markets', 'hidden cold legs resend activity', 'anthropic execution legs', 'invalid and forged messages ignored', 'inactive cache and open-trading ignored', 'non-monitor ignored', '401 unauthorized without logout', 'inactive cold unavailable', '15s timeout without retry', 'open-trading to positions'] };
   } finally {
     neverRespond = false; holdRead = false; release();
     await page.goto('about:blank').catch(() => {});

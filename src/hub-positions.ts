@@ -116,6 +116,39 @@ export function positionItems(response: unknown, bases: readonly string[], now: 
   return { items, incomplete: sourcesIncomplete || truncated, sourcesIncomplete, truncated, matchedCount, itemLimit: MAX_POSITION_ITEMS };
 }
 
+/** Markets whose Hyperliquid legs come from the live execution connection (`/api/trading/anthropic`); Asset does not read Hyperliquid positions. */
+export const EXECUTION_LEG_MARKETS: readonly PositionMarket[] = ['anthropic'];
+const EXECUTION_SOURCE = '套利交易实盘';
+const LEG_STATES = new Set(['unconfigured', 'loading', 'live', 'stale', 'error']);
+const DECIMAL = /^-?\d+(?:\.\d+)?$/;
+const decimalText = (value: unknown) => { if (typeof value !== 'string' || !DECIMAL.test(value)) throw new MalformedPositions(); return value; };
+const optionalDecimal = (value: unknown) => value === null ? null : decimalText(value);
+// Only the fields positionItems reads; the Hyperliquid size is in coin units and the settlement coin is not reported.
+function legPosition(value: unknown) {
+  const row = object(value), symbol = text(row.symbol), side = text(row.side);
+  if (side !== 'long' && side !== 'short') throw new MalformedPositions();
+  return { symbol, instrumentId: symbol, side, quantity: decimalText(row.quantity), quantityUnit: symbol.slice(symbol.indexOf(':') + 1) || symbol,
+    entryPrice: optionalDecimal(row.entryPrice), markPrice: optionalDecimal(row.markPrice), unrealizedPnl: optionalDecimal(row.unrealizedPnl), pnlCurrency: null };
+}
+function executionSource(legs: PositionsOutcome) {
+  const unavailable = { projectId: 'trading-execution', name: EXECUTION_SOURCE, status: 'unavailable', error: null, checkedAt: null, data: null };
+  if (legs.status !== 'ok') return unavailable;
+  try {
+    const source = list(object(legs.data).sources).map(object).find(item => item.exchange === 'hyperliquid');
+    if (!source || source.connected !== true) return null;
+    const state = text(source.state), fetchedAt = optional(source.fetchedAt);
+    if (!LEG_STATES.has(state)) throw new MalformedPositions();
+    const positions = list(source.positions).map(legPosition);
+    return { projectId: 'trading-execution', name: EXECUTION_SOURCE, status: 'ready', error: null, checkedAt: fetchedAt, data: { exchanges: [{ id: 'hyperliquid', name: 'Hyperliquid', accounts: [
+      { scopes: [{ id: 'perp', status: state, fetchedAt, positions }] }] }] } };
+  } catch { return unavailable; }
+}
+/** Adds the execution connection's legs as one more source; a failed leg read marks only that source unavailable. */
+export function withExecutionLegs(positions: PositionsOutcome, legs: PositionsOutcome): PositionsOutcome {
+  if (positions.status !== 'ok' || !record(positions.data) || !Array.isArray(positions.data.sources)) return positions;
+  const source = executionSource(legs);
+  return source ? { ...positions, data: { ...positions.data, sources: [...positions.data.sources, source] } } : positions;
+}
 export function positionsReply(request: PositionsRequest, outcome: PositionsOutcome, now: number): PositionsReply {
   const failed = (status: 'unavailable' | 'unauthorized', cause: { reason?: UnavailableReason; httpStatus?: number } = {}): PositionsReply => ({ type: 'positions', requestId: request.requestId, market: request.market, status, generatedAt: null, incomplete: false, items: [], ...cause });
   if (outcome.status === 'unauthorized') return failed('unauthorized');
