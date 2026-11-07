@@ -89,14 +89,14 @@
 - **版本 1 布局**：第 3 节全部对象，按三层比较；允许已知遗留表 `trading_views`。
 - **受支持历史布局**：第 4 节列出的版本 0 差异。
 - **上一可回滚版本**：安装器保留集合（第 6 节）。目前这个集合里没有任何版本读取 `user_version`。
-- **唯一入口**：新增 `server/control/hub-schema.mjs`，显式写出版本 1 的期望结构（不靠运行创建函数反推），提供 `inspectHubSchema(db)`，返回 `{ userVersion, state: 'v1' | 'v0-known' | 'unknown' | 'newer', diff }`；后续的 `migrateHub(db)` 按版本顺序执行。
+- **唯一入口**：`server/control/hub-schema.mjs`（E1b-1 已实现）。它按对象固定版本 1 每个表和索引存储定义的摘要（不靠运行创建函数反推；`tests/hub-schema.test.mjs` 断言当前创建函数在空库上的产物与之完全一致，任何创建语句变化都会使测试失败，直到给出新版本和迁移）。`inspectHubSchema(db)` 只读，返回 `{ userVersion, state, missing, legacy, mismatched, unexpected, retired }`，`state` 为 `v1`、`v0-complete`（可标记）、`v0-legacy`（创建函数可补齐）、`newer` 或 `unknown`。后续的 `migrateHub(db)` 按版本顺序执行。
 
 建议批次：
 
 | 批次 | 内容 | 级别 | 验收 |
 | --- | --- | --- | --- |
-| E1b-1 | `inspectHubSchema` 与测试夹具：新建库、第 4 节各历史布局、同名不同定义的索引、未知列、`user_version` 过新 | R1 | 每种布局的判定结果确定；不写库 |
-| E1b-2 | runtime 在数据面全部创建函数完成后，在 `immediate()` 内重新判定，`v0-known` 且结构已完整时写 `user_version=1`；`unknown` 只记诊断、不改版本。候选 API 遇到 `newer` 拒绝晋升 | R3（数据库结构） | 历史库升级、并发启动、标记后回滚到 `previous_release` 读写正常 |
+| E1b-1（已完成） | `inspectHubSchema` 与测试：新建库、第 4 节各历史布局、同名不同定义的索引与生成列、多出的列/表/视图、`user_version` 为 1/过新/负数/与结构不符、只读连接 | R1 | 每种布局的判定结果确定；不写库；尚无调用方 |
+| E1b-2 | runtime 在数据面全部创建函数完成后，在 `immediate()` 内重新判定，`v0-complete` 时写 `user_version=1`；`unknown` 只记诊断、不改版本。候选 API 遇到 `newer` 拒绝晋升 | R3（数据库结构） | 历史库升级、并发启动、标记后回滚到 `previous_release` 读写正常 |
 | E1c | `migrateHub` 有序迁移：结构变更、回填与版本推进在同一事务；首个迁移处理第 5 节的索引定义（等兼容处理进入回滚集合后） | R3 | 演进计划 E1 退出条件：迁移中断与重跑、迁移后注入启动/健康失败并回滚 |
 
 ## 8 复现方法
