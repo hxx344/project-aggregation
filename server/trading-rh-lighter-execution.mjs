@@ -145,7 +145,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   // nonce or order read back, nor start a signer worker for the forgotten key.
   let cooldownUntil = 0, shared = null, mutations = Promise.resolve(), generation = 0, orderRevision = 0;
   const recoveryReads = new Map(), orderRevisions = new Map();
-  const recoverableStream = error => error instanceof ErrorClass && !error.rateLimited && ['upstream', 'transport', 'timeout'].includes(error.code);
+  // A stream fault, malformed frames included, only disables the push path for
+  // this read: the bounded exact REST lookup validates its own result (L103).
+  const recoverableStream = error => error instanceof ErrorClass && !error.rateLimited && ['upstream', 'transport', 'timeout', 'invalid_data'].includes(error.code);
 
   async function recoveryRead(key, operation, signal, fresh = false) {
     checkAbort(signal);

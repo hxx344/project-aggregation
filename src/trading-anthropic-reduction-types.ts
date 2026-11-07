@@ -12,6 +12,6 @@ export type AnthropicReductionState = {
     reason: string | null; events: { time: string; message: string }[]; triggeredAt: string | null;
     failures?: number; retryAt?: string | null;
   };
-  live: null | { checkedAt: string; legs: (AnthropicReductionLeg & { quantity: string; distancePercent: string | null })[]; met: boolean };
+  live: null | { checkedAt: string; legs: (AnthropicReductionLeg & { quantity: string; distancePercent: string | null })[]; met: boolean; warning?: string | null };
   job: ExecutionJob | null; connections: ExecutionConnection[]; maintenance: boolean;
 };

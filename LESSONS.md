@@ -1733,6 +1733,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 独立审查另确认只读可见性缺口：余额事件的空 `P` 不代表清仓，但非空 `B` 及其他合约仓位变化仍会影响 cross/PM 强平风险，不能因合约不在关注列表就忽略风险失效信号。只转发余额变化布尔，在过滤仓位前清旧风险并递增在途 REST 的风险序列；数量和基线时间保留，下一次完整 REST 可恢复。四项普通/PM 回归先红后绿。ANT 自动减仓本身另读实盘 `execution.account` 风险，不将只读监控显示缺陷夸大为交易授权漏洞。
 
+**推送故障与自动规则补充（2026-11-07）：** 合入后审查发现三处同类缺口。Binance 执行适配器把推送流的 `invalid_data` 直接报错，引擎随即暂停撤单；流里事件时间只容忍比校时估计超前 1 秒，样本过期后偏移又退回 0，时钟偏差主机在重新校时窗口即可触发。Lighter 订单快照含账户在该市场的全部订单，一行 `client_order_index` 为 0 的手动单就否决整份快照，且 `invalid_data` 不回退 REST，建单在发送前失败而同批 Binance 腿已发出。另外 Binance 断线或冷却期间读到的 REST 订单被写入流缓存，重连后新连接不补发断线期事件，旧 NEW 状态最长 30 秒仍作为当前状态返回。以后推送只是加速路径：任何非取消类的推送故障（含格式错误）只关闭本次推送读取并走有界 REST 精确补读，由 REST 结果自身的校验决定成败；推送时间超前归为 `upstream`；快照中本市场本账户 `client_order_index` 为 0 的手动单跳过，不能否决其它行，其它非法编号仍按格式错误处理；REST 结果（建单、改价、查询、撤单各路径）只能写入请求发出前已连接且代次未变的流缓存。自动减仓遇到用户自己的止盈止损或限价单（`ExternalOrdersError`）时保持启用并 30 秒重试、原因与事件可见，未达阈值时也提前给出预警，不能在触发时刻静默停用；任务进行中出现外部委托时，截止前只暂停发新批次、不撤本任务余单，截止后才按原路径暂停。验证见 `tests/trading-binance-execution-stream.test.mjs`、`tests/trading-binance-stream.test.mjs`、`tests/trading-rh-lighter-execution.test.mjs`、`tests/trading-rh-lighter-stream.test.mjs`、`tests/trading-anthropic-reduction.test.mjs` 本次新增用例，均做过去掉修复的变异验证。离线复现，未在真实账户触发。事件 `trading-stream-fault-review-20261107`；合入后审查发现，不推进复盘检查点。
+
 ### L104：`submit()` 的失败分支提前返回前必须重新保存委托
 
 **适用条件：** 在 `server/trading-execution.mjs` 的 `submit()` catch 块里新增任何提前 `return` 的分支（延后重发、bounce 重挂、已接受待可见等）。

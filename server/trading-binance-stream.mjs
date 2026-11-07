@@ -265,7 +265,9 @@ export function createBinanceStreams({ fetchImpl = globalThis.fetch, WebSocketIm
     if (message.e !== 'bookTicker' || message.s !== session.symbol || !timestamp(message.T) || !timestamp(message.E)) throw invalid();
     const sequence = id(message.u); if (!sequence) throw invalid();
     const source = message.T, at = exchangeNow();
-    if (!Number.isFinite(at) || source > at + 1000 || message.E > at + 1000) throw invalid();
+    if (!Number.isFinite(at)) throw invalid();
+    // A future source time is a clock-estimate problem, not malformed data.
+    if (source > at + 1000 || message.E > at + 1000) throw error('upstream', '盘口时间超前于校准时间');
     if (at - source >= bookAge || at - message.E >= bookAge) throw error('upstream', '盘口时间已过期');
     const row = { symbol: session.symbol, bidPrice: decimal(message.b, { positive: true }), askPrice: decimal(message.a, { positive: true }),
       bidQty: decimal(message.B, { positive: true }), askQty: decimal(message.A, { positive: true }), time: source, receivedAt: now() };
@@ -305,8 +307,8 @@ export function createBinanceStreams({ fetchImpl = globalThis.fetch, WebSocketIm
     if (!['ACCOUNT_UPDATE', 'ORDER_TRADE_UPDATE'].includes(message.e)) return;
     if (session.mode === 'portfolio-margin' && message.fs !== 'UM') return;
     const exchangeAt = exchangeNow();
-    if (!timestamp(message.E) || !timestamp(message.T) || !Number.isFinite(exchangeAt)
-      || message.E > exchangeAt + 1000 || message.T > exchangeAt + 1000) throw invalid();
+    if (!timestamp(message.E) || !timestamp(message.T) || !Number.isFinite(exchangeAt)) throw invalid();
+    if (message.E > exchangeAt + 1000 || message.T > exchangeAt + 1000) throw error('upstream', '私有事件时间超前于校准时间');
     if (exchangeAt - message.E >= ORDER_AGE_MS) throw error('upstream', '私有事件已过期，等待重新核对');
     if (message.e === 'ORDER_TRADE_UPDATE') {
       const row = message.o;
@@ -416,11 +418,19 @@ export function createBinanceStreams({ fetchImpl = globalThis.fetch, WebSocketIm
       || entry.source === 'ws' && (exchangeNow() < entry.eventTime - 1000 || exchangeNow() - entry.eventTime >= ORDER_AGE_MS)) return null;
     return { ...entry.row };
   }
+  // The connected generation observed before a REST read. A row read across a
+  // disconnect cannot be seeded: the new socket never replays the gap's events.
+  function orderGeneration(credentials, options = {}) {
+    const session = privateSession(credentials, options); check(session);
+    return session.connected ? session.generation : null;
+  }
   function seedOrder(credentials, row, options = {}) {
     const session = privateSession(credentials, options); check(session);
     const normalized = normalizeOrder(row);
     if (!Number.isFinite(exchangeNow()) || normalized.updateTime > exchangeNow() + 1000) throw invalid();
+    if (!session.connected || options.generation !== undefined && options.generation !== session.generation) return false;
     remember(session, normalized, exchangeNow(), 'rest');
+    return true;
   }
   function invalidateOrder(credentials, spec, options = {}) {
     const session = privateSession(credentials, options), wanted = specOf(spec); check(session);
@@ -458,5 +468,5 @@ export function createBinanceStreams({ fetchImpl = globalThis.fetch, WebSocketIm
     } else for (const session of [...sessions.values()]) detach(session, aborted(), true);
   }
   function close() { if (closed) return; closed = true; forget(); }
-  return { book, ready, order, seedOrder, invalidateOrder, subscribePositions, forget, close };
+  return { book, ready, order, orderGeneration, seedOrder, invalidateOrder, subscribePositions, forget, close };
 }

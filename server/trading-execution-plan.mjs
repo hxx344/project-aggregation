@@ -45,6 +45,9 @@ export class ExecutionError extends Error {
 export class WaitError extends ExecutionError {}
 // Only a valid but old book can recover by fetching a newer snapshot.
 export class StaleMarketError extends ExecutionError {}
+// Another live order on the contract. Clears once the owner cancels it, so an
+// automatic rule waits instead of treating it as a permanent refusal.
+export class ExternalOrdersError extends ExecutionError {}
 export const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 export function exactKeys(value, keys) {
   if (!object(value) || Object.keys(value).some(key => !keys.includes(key))) throw new ExecutionError(400, '交易参数包含不支持的字段');
@@ -211,7 +214,7 @@ export function checkPosition(account, leg, action, quantity) {
 }
 export function ensureNoExternalOrders(account, symbol, ownedIds = new Set()) {
   if (!Array.isArray(account.openOrders) || !Array.isArray(account.strategies)) throw new ExecutionError(502, '无法核对账户现有委托，暂不下单');
-  if (account.openOrders.some(order => order.symbol === symbol && !ownedIds.has(order.id)) || account.strategies.some(strategy => strategy.symbol === symbol && strategy.status !== 'terminal' && !ownedIds.has(strategy.id))) throw new ExecutionError(409, `${symbol} 存在本任务之外的活动委托，请先处理后再预览`);
+  if (account.openOrders.some(order => order.symbol === symbol && !ownedIds.has(order.id)) || account.strategies.some(strategy => strategy.symbol === symbol && strategy.status !== 'terminal' && !ownedIds.has(strategy.id))) throw new ExternalOrdersError(409, `${symbol} 存在本任务之外的活动委托，请先处理后再预览`);
 }
 
 /**
