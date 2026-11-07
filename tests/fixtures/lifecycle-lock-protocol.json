@@ -1,0 +1,6 @@
+{
+  "$comment": "Line protocol between server/recovery/lifecycle-lock.mjs (wrapper) and server/recovery/lifecycle_lock.py (helper). The helper prints {ready, schemaVersion} or {code}; the wrapper accepts only helperCodes from it and maps anything else to RUNTIME_LOCK_PROTOCOL. tests/lifecycle-lock-protocol.test.mjs checks both files against this list; the lock behavior itself is covered by tests/lifecycle-lock.test.mjs and tests/test_lifecycle_lock.py.",
+  "schemaVersion": 1,
+  "helperCodes": ["INVALID_RUNTIME_LOCK_OPTIONS", "RUNTIME_LOCK_BUSY", "RUNTIME_LOCK_LOST", "RUNTIME_LOCK_UNAVAILABLE", "UNSAFE_RUNTIME_LOCK_PATH"],
+  "wrapperOnlyCodes": ["RUNTIME_LOCK_PROTOCOL", "RUNTIME_LOCK_TIMEOUT"]
+}
