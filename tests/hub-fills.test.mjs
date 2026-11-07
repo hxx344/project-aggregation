@@ -19,12 +19,12 @@ test('fills requests only accept the fixed markets without symbol or URL overrid
     { ...request, symbols: ['BTC'] }, { ...request, url: 'https://example.com' }]) assert.equal(fillsRequest(invalid), null);
 });
 
-test('ANT host and Monitor contracts preserve real fills, reject wrong markets and report partial venue coverage', () => {
+test('ANT host and Monitor contracts preserve real fills and reject wrong markets', () => {
   const raw = response(); raw.sources[0].data = anthropicPayload();
   const antRequest = fillsRequest({ ...request, market: 'anthropic' });
   const mapped = () => fillsReply(antRequest, { status: 'ok', data: raw, at: 0 }, NOW);
   const ant = mapped();
-  assert.equal(ant.status, 'ok'); assert.equal(ant.incomplete, true);
+  assert.equal(ant.status, 'ok'); assert.equal(ant.incomplete, false);
   assert.equal(ant.items[0].base, 'ANTHROPIC'); assert.equal(ant.items[0].price, '80.000000000000000001');
   assert.equal(ant.items[0].realizedPnl, '2.123456789012345678'); assert.ok(parseFillsReply(ant, 'anthropic'));
   assert.equal(parseFillsReply(ant, 'oil'), null); assert.equal(parseFillsReply(ant, 'hynix'), null);
@@ -34,6 +34,37 @@ test('ANT host and Monitor contracts preserve real fills, reject wrong markets a
   raw.sources[0].data.exchanges[0].id = 'okx';
   Object.assign(scope(raw.sources[0].data).fills[0], { symbol: 'ANTHROPIC-USDT-SWAP', quantityUnit: '张', positionBefore: null, positionAfter: null });
   const unknown = mapped(); assert.equal(unknown.items[0].positionBefore, null); assert.ok(parseFillsReply(unknown, 'anthropic'));
+});
+
+test('ANT native fills cross the real host/Monitor contract with exact venue identities and unknown currencies', () => {
+  const raw = response(); raw.sources[0].data = anthropicPayload();
+  const data = anthropicPayload(), rh = data.exchanges[0];
+  rh.id = 'rh-lighter'; rh.name = 'Lighter RH'; rh.accounts[0].id = '22163';
+  Object.assign(scope(data).fills[0], { id: 'native-rh', symbol: 'ANTHROPIC', quantityUnit: 'ANTHROPIC', priceCurrency: 'USDG', fee: null, feeCurrency: null });
+  const hl = structuredClone(rh); hl.id = 'hyperliquid'; hl.name = 'Hyperliquid'; hl.accounts[0].id = 'main';
+  Object.assign(hl.accounts[0].scopes[0].fills[0], { id: 'native-xyz', symbol: 'xyz:ANT', base: 'XYZANT', quantityUnit: 'ANT', priceCurrency: null, fee: '-0.1', feeCurrency: 'USDC', realizedPnl: null });
+  const io = structuredClone(hl.accounts[0].scopes[0].fills[0]); Object.assign(io, { id: 'native-io', symbol: 'io:ANTH', base: 'IOANTH', quantityUnit: 'ANTH' });
+  io.feeCurrency = 'USDe';
+  hl.accounts[0].scopes[0].fills.push(io); hl.accounts[0].scopes[0].truncated = true;
+  data.exchanges.push(hl);
+  raw.sources.push({ projectId: 'anthropic-history', name: 'ANT原生成交', status: 'ready', data });
+  const request = { requestId: 'native-test', market: 'anthropic' };
+  const mapped = () => fillsReply(request, { status: 'ok', data: raw, at: 0 }, NOW);
+  const result = mapped(); assert.equal(result.status, 'ok'); assert.equal(result.items.length, 4); assert.equal(result.incomplete, true);
+  assert.deepEqual(new Set(result.items.map(row => row.symbol)), new Set(['ANTHROPICUSDT', 'ANTHROPIC', 'xyz:ANT', 'io:ANTH']));
+  const module = parseFillsReply(result, 'anthropic'); assert.ok(module);
+  assert.equal(module.items.find(row => row.symbol === 'xyz:ANT').priceCurrency, null);
+  assert.equal(module.items.find(row => row.symbol === 'ANTHROPIC').priceCurrency, 'USDG');
+  assert.equal(module.items.find(row => row.symbol === 'xyz:ANT').fee, '-0.1');
+  assert.equal(module.items.find(row => row.symbol === 'io:ANTH').feeCurrency, 'USDe');
+  for (const patch of [{ exchangeId: 'binance' }, { base: 'ANTHROPIC' }, { symbol: 'xyz:ANTH' }, { quantityUnit: '张' }, { positionSide: 'long' }]) {
+    const changed = structuredClone(result); Object.assign(changed.items.find(row => row.symbol === 'xyz:ANT'), patch);
+    assert.equal(parseFillsReply(changed, 'anthropic'), null, JSON.stringify(patch));
+  }
+  scope(data).fills[0].priceCurrency = 'USDT'; assert.equal(mapped().status, 'unavailable', 'RH cannot claim the CEX settlement currency');
+  scope(data).fills[0].priceCurrency = 'USDG';
+  raw.sources[0].data.exchanges[0].accounts[0].scopes[0].fills[0].base = 'XYZANT';
+  assert.equal(mapped().status, 'unavailable', 'a CEX fill cannot claim a HIP-3 base');
 });
 
 test('mapping preserves every venue/account/scope identity and exact decimals, without copying provider fields', () => {

@@ -12,6 +12,7 @@ import { createTradingExecution } from '../trading-execution.mjs';
 import { createTradingAuto } from '../trading-auto.mjs';
 import { createAnthropicWatch } from '../trading-anthropic-watch.mjs';
 import { createAnthropicReduction } from '../trading-anthropic-reduction.mjs';
+import { createAnthropicHistory } from '../trading-anthropic-history.mjs';
 import { ExecutionError } from '../trading-execution-plan.mjs';
 import { normalizeTradingPair } from '../trading-markets.mjs';
 import { UpdateError } from '../updates.mjs';
@@ -75,6 +76,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // already belongs to a managed or recovered authority.
   const sharedAccountWriter = accountWriter || (embeddedModules || existsSync(writerDatabase) || existsSync(`${writerDatabase}.required`) ? createAccountWriter({ databasePath: writerDatabase, runtimeId: randomUUID(), moduleId: 'hub' }) : null);
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
+  const anthropicHistory = createAnthropicHistory({ execution, now: executionNow });
   const executionEntries = createExecutionEntries({ db, log, readMaintenance: () => control.getSetting('updates-maintenance') === '1', refuse: () => { throw new UpdateError(409, EXECUTION_MAINTENANCE); } });
   // Automatic rules create jobs through the same maintenance entry as a manual start.
   const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
@@ -412,6 +414,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       const market = url.search ? url.searchParams.get('market') : 'oil';
       if (url.search && ([...url.searchParams.keys()].join() !== 'market' || !Object.hasOwn(FILL_MARKETS, market))) throw new HttpError(400, '成交接口只接受 market 参数');
       const data = await assetFillsByMarket[market].state();
+      if (market === 'anthropic') {
+        const native = anthropicHistory.state();
+        data.sources.push(native.source);
+        data.pending = !!data.pending || native.pending;
+      }
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
       return reply(200, data);
     }
@@ -419,7 +426,10 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // them (withExecutionEntry); here each one also holds an execution entry
     // against the durable maintenance flag. Stop and reconcile stay open.
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
-      if (pathname === '/api/trading/execution' && method === 'GET') return reply(200, execution.state());
+      if (pathname === '/api/trading/execution' && method === 'GET') {
+        if (url.search && [...url.searchParams.keys()].join() !== 'jobId') throw new HttpError(400, '执行状态只接受一个 jobId 参数');
+        return reply(200, execution.state(url.searchParams.get('jobId')));
+      }
       if (pathname === '/api/trading/execution/quotes' && method === 'GET') {
         if (url.search) throw new HttpError(400, '行情接口不接受查询参数');
         const data = await execution.quotes();
@@ -511,7 +521,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // All collectors, WS feeds and research share this process's single thread.
   const eventLoop = createEventLoopLag(); eventLoop.start();
 
-  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); executionAuto.stop(); anthropicReduction.stop(); }
+  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); executionAuto.stop(); anthropicReduction.stop(); anthropicHistory.stop(); }
   return {
     trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle,
     get baseline() { return baseline; },
@@ -532,6 +542,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

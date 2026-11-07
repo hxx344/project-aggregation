@@ -14,7 +14,7 @@ import { createRhLighterStream } from './trading-rh-lighter-stream.mjs';
 // https://docs.lighter.xyz/developers/reference/rate-limits
 const HOST = 'https://api.rh.lighter.xyz';
 const READ_PATHS = new Set(['/api/v1/orderBooks', '/api/v1/orderBookDetails', '/api/v1/orderBookOrders', '/api/v1/account',
-  '/api/v1/accountsByL1Address', '/api/v1/accountActiveOrders', '/api/v1/accountOrders', '/api/v1/nextNonce']);
+  '/api/v1/accountsByL1Address', '/api/v1/accountActiveOrders', '/api/v1/accountOrders', '/api/v1/nextNonce', '/api/v1/trades']);
 const SEND_PATH = '/api/v1/sendTx';
 export const RH_LIGHTER_SYMBOLS = EXECUTION_VENUE_SYMBOLS['rh-lighter'];
 // lighter-go signs every transaction with ExpiredAt = signing time + 10 min - 1 s
@@ -475,6 +475,58 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     return { identity: k.address, modes: Object.fromEntries(selected.map(symbol => [symbol, 'one-way'])), positions, openOrders, strategies: [], leverage };
   }
 
+  // Actual trades include manual orders too. Read at most four 500-row pages,
+  // sharing the existing 40/min budget; no immediate retries or order reads.
+  // https://github.com/elliottech/lighter-python/blob/main/docs/OrderApi.md#trades
+  async function history(credentials, { start, end, signal } = {}) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1e11 || end < start || end > now() + 60_000 || end - start > 85 * 86_400_000) fail('input');
+    const k = keys(credentials), token = await tokenFor(k, signal);
+    checkAbort(signal); if (k.era !== generation) fail('aborted');
+    const marketId = await marketIdOf('ANTHROPIC', signal);
+    const fills = new Map(), cursors = new Set();
+    let cursor = '', complete = false, previousTime = Infinity;
+    const optionalAmount = value => value === null || value === undefined ? null : amount(value);
+    for (let page = 0; page < 4; page += 1) {
+      checkAbort(signal); if (k.era !== generation) fail('aborted');
+      const data = await request('/api/v1/trades', { token, signal, query: { account_index: String(k.accountIndex), market_id: String(marketId),
+        sort_by: 'timestamp', sort_dir: 'desc', limit: '500', aggregate: 'false', ...(cursor ? { cursor } : {}) } });
+      if (!Array.isArray(data.trades) || data.trades.length > 500 || data.next_cursor !== undefined && data.next_cursor !== null && (typeof data.next_cursor !== 'string' || data.next_cursor.length > 2048)) fail();
+      let beforeStart = false;
+      for (const row of data.trades) {
+        if (!object(row) || row.market_id !== marketId || !Number.isSafeInteger(row.timestamp) || row.timestamp < 1e11 || row.timestamp > now() + 60_000
+          || typeof row.is_maker_ask !== 'boolean' || !Number.isSafeInteger(row.ask_account_id) || !Number.isSafeInteger(row.bid_account_id)) fail();
+        const ask = row.ask_account_id === k.accountIndex, bid = row.bid_account_id === k.accountIndex;
+        if (ask === bid) fail();
+        const rawId = row.trade_id_str ?? (Number.isSafeInteger(row.trade_id) ? String(row.trade_id) : null);
+        if (typeof rawId !== 'string' || !/^\d{1,40}$/.test(rawId)) fail();
+        const id = `${marketId}:${rawId}`;
+        // Cursor pages may repeat a boundary trade; a different payload for the
+        // same id is not evidence for a second fill or a complete history.
+        if (row.timestamp > previousTime && !fills.has(id)) fail('pagination');
+        previousTime = Math.min(previousTime, row.timestamp);
+        if (row.timestamp < start) { beforeStart = true; continue; }
+        if (row.timestamp > end) continue;
+        const quantity = amount(row.size, { positive: true });
+        const positionBefore = optionalAmount(ask === row.is_maker_ask ? row.maker_position_size_before : row.taker_position_size_before);
+        const fill = { id, symbol: 'ANTHROPIC', base: 'ANTHROPIC', time: new Date(row.timestamp).toISOString(), side: ask ? 'sell' : 'buy', positionSide: 'net',
+          quantity, quantityUnit: 'ANTHROPIC', price: amount(row.price, { positive: true }), priceCurrency: 'USDG',
+          // The API reports integer fees but does not document their unit. Do
+          // not interpret them as USDG or replace an absent PnL with zero.
+          fee: null, feeCurrency: null, realizedPnl: optionalAmount(ask ? row.ask_account_pnl : row.bid_account_pnl), positionBefore,
+          positionAfter: positionBefore === null ? null : fromUnits(units(positionBefore) + (ask ? -1n : 1n) * units(quantity)) };
+        if (fills.has(id) && JSON.stringify(fills.get(id)) !== JSON.stringify(fill)) fail();
+        fills.set(id, fill);
+      }
+      if (beforeStart || !data.next_cursor) { complete = true; break; }
+      if (!data.trades.length || cursors.has(data.next_cursor)) break;
+      cursors.add(data.next_cursor); cursor = data.next_cursor;
+    }
+    checkAbort(signal); if (k.era !== generation) fail('aborted');
+    const rows = [...fills.values()].sort((a, b) => b.time.localeCompare(a.time) || a.id.localeCompare(b.id));
+    return { accountId: String(k.accountIndex), fills: rows, coverageStart: complete ? new Date(start).toISOString() : rows.at(-1)?.time ?? null,
+      coverageEnd: new Date(end).toISOString(), truncated: !complete };
+  }
+
   function specOf(value, { requireId = false, requirePrice = false } = {}) {
     if (!object(value) || !RH_LIGHTER_SYMBOLS.includes(value.symbol) || !['buy', 'sell'].includes(value.side) || value.positionSide !== 'BOTH'
       || typeof value.reduceOnly !== 'boolean' || typeof value.clientId !== 'string' || !/^[A-Za-z0-9_.:/-]{1,32}$/.test(value.clientId)
@@ -714,6 +766,6 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   }
 
   const unsupported = async () => fail('input');
-  return { exchange: 'rh-lighter', verify, account, market, create, amend, inspect, stop, endedStrategies: unsupported, forget,
+  return { exchange: 'rh-lighter', verify, account, history, market, create, amend, inspect, stop, endedStrategies: unsupported, forget,
     close() { forget(); live.close(); } };
 }

@@ -69,7 +69,7 @@ async (page) => {
       assert(Object.keys(body).sort().join(',') === 'confirmLive,previewId,requestId' && body.confirmLive, 'confirmation uses immutable server preview');
       const preview = previews.get(body.previewId); assert(preview, 'known preview');
       jobs.push({ ...preview, id: 'fixture-okx-job', status: 'running', createdAt: stamp(), updatedAt: stamp(), deadlineAt: preview.expiresAt, batchIndex: 0, reason: null, canResume: false, events: [], legs: preview.legs.map(leg => ({ ...leg, filledQuantity: '0', remainingQuantity: leg.quantity, currentOrder: null })) });
-      return send(execution());
+      return send({ ...execution(), acceptedJob: jobs.at(-1) });
     }
     return send({ error: `Unexpected fixture: ${method} ${url.pathname}` }, 404);
   });

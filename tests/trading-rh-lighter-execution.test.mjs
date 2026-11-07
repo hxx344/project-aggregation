@@ -25,6 +25,9 @@ const indexOf = value => clientOrderIndexOf(value.clientId);
 const orderRow = (value, overrides = {}) => ({ market_index: 7, client_order_index: indexOf(value), order_index: 281474976710700, is_ask: value.side === 'sell', reduce_only: value.reduceOnly, type: 'limit',
   time_in_force: value.orderType === 'market' ? 'immediate-or-cancel' : 'post-only', status: 'open', timestamp: T0 / 1000,
   initial_base_amount: value.quantity, filled_base_amount: '0', remaining_base_amount: value.quantity, filled_quote_amount: '0', price: value.limitPrice, ...overrides });
+const tradeRow = (overrides = {}) => ({ market_id: 7, trade_id_str: '9007199254740999999', timestamp: T0 - 1000, transaction_time: (T0 - 1000) * 1000,
+  ask_account_id: 12, bid_account_id: 12345, is_maker_ask: false, size: '0.25', price: '354.15', maker_position_size_before: '-0.5',
+  taker_position_size_before: '2', maker_fee: 12345, bid_account_pnl: '1.8', ...overrides });
 
 function streamingHarness(options = {}) {
   const sockets = [];
@@ -108,6 +111,64 @@ function harness({ routes = {}, sends = [], signer: patch = {}, timeoutMs, strea
     signed: method => signs.filter(entry => entry.method === method),
   };
 }
+
+test('native history reads manual RH fills with true timestamp, signed positions and unknown fee units', async () => {
+  const h = harness({ routes: { '/api/v1/trades': query => {
+    assert.equal(query.get('account_index'), '12345'); assert.equal(query.get('market_id'), '7');
+    assert.equal(query.get('aggregate'), 'false'); assert.equal(query.get('sort_by'), 'timestamp');
+    return ok({ trades: [tradeRow(), tradeRow({ trade_id_str: '2', timestamp: T0 - 2000, ask_account_id: 12345, bid_account_id: 12,
+      is_maker_ask: false, taker_position_size_before: '2', ask_account_pnl: undefined })] });
+  } } });
+  const result = await h.client.history(credentials, { start: T0 - DAY, end: T0 });
+  assert.equal(result.accountId, '12345'); assert.equal(result.truncated, false);
+  assert.deepEqual(result.fills[0], { id: '7:9007199254740999999', symbol: 'ANTHROPIC', base: 'ANTHROPIC', time: new Date(T0 - 1000).toISOString(),
+    side: 'buy', positionSide: 'net', quantity: '0.25', quantityUnit: 'ANTHROPIC', price: '354.15', priceCurrency: 'USDG', fee: null, feeCurrency: null,
+    realizedPnl: '1.8', positionBefore: '-0.5', positionAfter: '-0.25' });
+  assert.equal(result.fills[1].positionAfter, '1.75'); assert.equal(result.fills[1].realizedPnl, null);
+  assert.ok(h.calls.every(call => call.init.method === 'GET')); assert.deepEqual(h.signs.map(row => row.method), ['authToken']);
+  assert.deepEqual(h.paths(), ['/api/v1/orderBooks', '/api/v1/trades']);
+});
+
+test('native RH history deduplicates cursor boundaries and bounds repeated or full pagination', async () => {
+  let page = 0;
+  const h = harness({ routes: { '/api/v1/trades': () => ok({ trades: [tradeRow()], next_cursor: ++page === 1 ? 'a' : 'a' }) } });
+  const repeated = await h.client.history(credentials, { start: T0 - DAY, end: T0 });
+  assert.equal(page, 2); assert.equal(repeated.fills.length, 1); assert.equal(repeated.truncated, true);
+  assert.equal(repeated.coverageStart, repeated.fills[0].time);
+  let fullPage = 0;
+  const full = harness({ routes: { '/api/v1/trades': () => {
+    const offset = fullPage++ * 500;
+    return ok({ trades: Array.from({ length: 500 }, (_, i) => tradeRow({ trade_id_str: String(offset + i), timestamp: T0 - offset - i })), next_cursor: `page-${fullPage}` });
+  } } });
+  const result = await full.client.history(credentials, { start: T0 - DAY, end: T0 });
+  assert.equal(fullPage, 4); assert.equal(result.fills.length, 2000); assert.equal(result.truncated, true);
+});
+
+test('native RH history rejects foreign, malformed or changed duplicate rows and honors cooldown', async () => {
+  for (const patch of [{ market_id: 8 }, { ask_account_id: 12, bid_account_id: 13 }, { timestamp: T0 / 1000 }, { trade_id_str: 'bad' }, { maker_position_size_before: 'bad' }]) {
+    const h = harness({ routes: { '/api/v1/trades': () => ok({ trades: [tradeRow(patch)] }) } });
+    await assert.rejects(h.client.history(credentials, { start: T0 - DAY, end: T0 }), isError('invalid_data'));
+  }
+  const conflict = harness({ routes: { '/api/v1/trades': () => ok({ trades: [tradeRow(), tradeRow({ size: '0.5' })] }) } });
+  await assert.rejects(conflict.client.history(credentials, { start: T0 - DAY, end: T0 }), isError('invalid_data'));
+  const h = harness({ routes: { '/api/v1/trades': () => json({}, 429) } });
+  await assert.rejects(h.client.history(credentials, { start: T0 - DAY, end: T0 }), error => error.rateLimited && error.retryAt === T0 + 60_000);
+  const count = h.calls.length;
+  await assert.rejects(h.client.history(credentials, { start: T0 - DAY, end: T0 }), error => error.rateLimited);
+  assert.equal(h.calls.length, count);
+  const invalid = harness();
+  await assert.rejects(invalid.client.history(credentials, { start: T0 - 86 * DAY, end: T0 }), isError('input'));
+  assert.equal(invalid.calls.length, 0);
+});
+
+test('native RH history rejects a late trade response after the key is forgotten', async () => {
+  let release, entered;
+  const waiting = new Promise(resolve => { entered = resolve; });
+  const h = harness({ routes: { '/api/v1/trades': async () => { entered(); return new Promise(resolve => { release = resolve; }); } } });
+  const pending = h.client.history(credentials, { start: T0 - DAY, end: T0 });
+  await waiting; h.client.forget(); release(ok({ trades: [tradeRow()] }));
+  await assert.rejects(pending, isError('aborted'));
+});
 
 test('exports name the one Anthropic contract, the signed transaction lifetime and a stable client order index', () => {
   assert.deepEqual([...RH_LIGHTER_SYMBOLS], ['ANTHROPIC']);

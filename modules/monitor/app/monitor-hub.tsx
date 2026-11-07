@@ -21,6 +21,7 @@ import AlertSettings, { type AlertViewState } from "./alert-settings";
 import { MonitorAlertSide } from "./monitor-detail-side";
 import RelatedPositions, { type VenueSpreads } from "./related-positions";
 import { RELATED_SYMBOLS } from "../lib/related-pairs";
+import type { AnthropicPairQuotes } from "../lib/related-position-totals";
 import { monitorAlertAdapters } from "../lib/monitor-alerts";
 import ExchangeComparison from "./exchange-comparison";
 import { useMonitorControls } from '../lib/use-monitor-controls';
@@ -71,6 +72,7 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil" }: {
   const [oil, setOil] = useState(initialSummary.oil);
   const [hynix, setHynix] = useState(initialSummary.hynix);
   const [anthropic, setAnthropic] = useState(() => anthropicSummary());
+  const [anthropicQuotes, setAnthropicQuotes] = useState<AnthropicPairQuotes>();
   const [alertStates, setAlertStates] = useState<Record<string, AlertViewState>>({});
   const reportAlertView = useCallback((id: string, state: AlertViewState) => setAlertStates(previous => previous[id]?.view === state.view && previous[id]?.loadError === state.loadError ? previous : { ...previous, [id]: state }), []);
   const [alertOpenRequests, setAlertOpenRequests] = useState<Record<string, number>>({});
@@ -147,11 +149,11 @@ export default function MonitorHub({ initial = null, initialMonitor = "oil" }: {
       <NotificationSettings active={hub.readActive}/>
       <div className="monitor-detail" data-detail-monitor={active} data-layout={active === "perpetual" || !detailEnabled ? "wide" : "split"}>
         <div className="monitor-detail-main">
-          {monitors.map(monitor => { const id = monitor.id as keyof typeof panels; const panelProps = { initial, onSummary: summaryHandlers[id], active: hub.readActive && active === id, selected: active === id, summaryActive: hub.readActive }; return <TabsContent key={monitor.id} value={monitor.id} forceMount className="hub-content">{!enabled(monitor.id) ? <p className="notice" role="status">{monitor.title}监控已关闭，行情采集、自动告警{monitor.id === 'perpetual' ? '和持仓跟踪' : ''}已暂停。配置和历史数据已保留，可通过上方开关重新开启。</p> : monitor.id === "perpetual" ? (perpetualVisited && <PerpetualPanel hubConnected={hub.connected} active={hub.readActive && active === "perpetual"} interactionActive={hub.active && active === "perpetual"} navSlot={active === "perpetual" ? navSlot : null}/>) : id === "oil" ? <OilDetail {...panelProps} tradesActive={hub.active && active === "oil"}>{comparison("oil")}</OilDetail> : id === "hynix" ? <HynixDetail {...panelProps} tradesActive={hub.active && active === "hynix"}>{comparison("hynix")}</HynixDetail> : id === "anthropic" ? <AnthropicDetail {...panelProps} tradesActive={hub.active && active === "anthropic"}/> : <p role="alert">该监控模块尚未提供面板。</p>}</TabsContent>; })}
+          {monitors.map(monitor => { const id = monitor.id as keyof typeof panels; const panelProps = { initial, onSummary: summaryHandlers[id], active: hub.readActive && active === id, selected: active === id, summaryActive: hub.readActive }; return <TabsContent key={monitor.id} value={monitor.id} forceMount className="hub-content">{!enabled(monitor.id) ? <p className="notice" role="status">{monitor.title}监控已关闭，行情采集、自动告警{monitor.id === 'perpetual' ? '和持仓跟踪' : ''}已暂停。配置和历史数据已保留，可通过上方开关重新开启。</p> : monitor.id === "perpetual" ? (perpetualVisited && <PerpetualPanel hubConnected={hub.connected} active={hub.readActive && active === "perpetual"} interactionActive={hub.active && active === "perpetual"} navSlot={active === "perpetual" ? navSlot : null}/>) : id === "oil" ? <OilDetail {...panelProps} tradesActive={hub.active && active === "oil"}>{comparison("oil")}</OilDetail> : id === "hynix" ? <HynixDetail {...panelProps} tradesActive={hub.active && active === "hynix"}>{comparison("hynix")}</HynixDetail> : id === "anthropic" ? <AnthropicDetail {...panelProps} onPairQuotes={setAnthropicQuotes} tradesActive={hub.active && active === "anthropic"}/> : <p role="alert">该监控模块尚未提供面板。</p>}</TabsContent>; })}
           <div className="hub-alert-settings">{monitors.filter(monitor => enabled(monitor.id) && monitor.capabilities.includes("alerts")).map(monitor => <div key={monitor.id} hidden={active !== monitor.id}>{monitorAlertAdapters[monitor.id] ? <AlertSettings active={hub.readActive && active === monitor.id} monitorId={monitor.id} title={monitor.title} adapter={monitorAlertAdapters[monitor.id]} onView={reportAlertView} openRequest={alertOpenRequests[monitor.id] ?? 0}/> : <p role="alert">该监控模块尚未接入统一告警设置。</p>}</div>)}</div>
         </div>
         {active !== "perpetual" && detailEnabled ? <aside className="monitor-detail-side">
-          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.active} spreads={active === "oil" ? oilSpreads : active === "hynix" ? hynixSpreads : undefined}/>
+          <RelatedPositions market={active as PositionsMarket} symbols={RELATED_SYMBOLS[active] ?? []} active={hub.active} spreads={active === "oil" ? oilSpreads : active === "hynix" ? hynixSpreads : undefined} anthropicQuotes={anthropicQuotes}/>
           {hasAlerts ? <MonitorAlertSide state={alertStates[alertId]} onOpenRules={openAlertRules}/> : null}
         </aside> : null}
       </div>

@@ -256,11 +256,42 @@ test('preview/read endpoints do not order; session-bound and one-use preview is 
   const f = await fixture(t), preview = await f.preview(), requestId = randomUUID();
   f.service.state(); assert.equal(f.creates.length, 0);
   assert.throws(() => f.start(preview, requestId, 'other-session'), /过期|提交/);
-  f.start(preview, requestId); const id = f.job.id;
-  f.start(preview, requestId); assert.equal(f.job.id, id);
+  const accepted = f.start(preview, requestId); const id = f.job.id;
+  assert.deepEqual(accepted.acceptedJob, f.job);
+  assert.equal(f.start(preview, requestId).acceptedJob.id, id); assert.equal(f.job.id, id);
+  assert.throws(() => f.start(preview, requestId, 'other-session'), /标识已被使用/);
   assert.equal(f.service.state().jobs.length, 1); assert.equal(f.creates.length, 0);
   assert.throws(() => f.start(preview), /过期|提交/);
   assert.throws(() => f.service.disconnect('binance', { revision: 1 }), /未结束任务/);
+});
+
+test('submission receipt identifies its original job after newer jobs push it outside recent history', async t => {
+  const f = await fixture(t), preview = await f.preview(), requestId = randomUUID();
+  const accepted = f.start(preview, requestId).acceptedJob;
+  const stored = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(accepted.id).json);
+  stored.status = 'stopped';
+  f.db.prepare('UPDATE execution_jobs SET json=? WHERE id=?').run(JSON.stringify(stored), stored.id);
+  const insert = f.db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)');
+  for (let i = 1; i <= 31; i++) {
+    const job = { ...stored, id: randomUUID(), createdAt: new Date(f.time + i).toISOString() };
+    insert.run(job.id, JSON.stringify(job));
+  }
+  f.advance(31_000); // Past preview expiry, within the unchanged execution lease.
+  const before = f.db.prepare('SELECT count(*) AS count FROM execution_jobs').get().count, calls = f.calls.length;
+  const repeated = f.start(preview, requestId);
+  assert.equal(repeated.jobs.some(job => job.id === accepted.id), false);
+  assert.equal(repeated.acceptedJob.id, accepted.id);
+  assert.equal(repeated.acceptedJob.status, 'stopped');
+  assert.deepEqual(repeated.acceptedJob.legs, accepted.legs);
+  const observed = f.service.state(accepted.id);
+  assert.equal(observed.jobs.length, 31);
+  assert.deepEqual(observed.jobs.find(job => job.id === accepted.id), repeated.acceptedJob);
+  assert.deepEqual(observed.jobs.slice(0, 30), repeated.jobs);
+  assert.equal(f.service.state(repeated.jobs[0].id).jobs.length, 30, 'tracked history is not duplicated');
+  assert.throws(() => f.service.state(randomUUID()), { status: 404 });
+  assert.throws(() => f.service.state(''), { status: 400 });
+  assert.equal(f.calls.length, calls);
+  assert.equal(f.db.prepare('SELECT count(*) AS count FROM execution_jobs').get().count, before);
 });
 
 test('four-leg preset validates opposite directions and auto-splits to a shared exchange quantity cap', async t => {
@@ -611,7 +642,10 @@ test('stopping with a partial fill resumes only the remaining amount, excluding 
   delete f.markets.bybit;
   const preview = await f.preview({ resumeJobId: f.job.id });
   assert.equal(preview.legs.length, 1); assert.equal(preview.legs[0].quantity, '1.6');
-  f.start(preview); await f.service.tick();
+  const originalId = f.job.id, requestId = randomUUID();
+  assert.equal(f.start(preview, requestId).acceptedJob.id, originalId);
+  assert.equal(f.start(preview, requestId).acceptedJob.id, originalId);
+  await f.service.tick();
   assert.equal(f.creates.length, 3); assert.equal(f.creates.at(-1).exchange, 'bybit'); assert.equal(f.creates.at(-1).args[1].quantity, '1.6');
   f.fill([...f.records.values()].at(-1).id); await f.service.tick(); assert.equal(f.job.status, 'completed');
   assert.deepEqual(f.job.legs.map(leg => leg.filledQuantity), ['2', '2']);

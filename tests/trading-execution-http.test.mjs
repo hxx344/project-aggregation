@@ -332,6 +332,14 @@ test('HTTP confirmation is session-bound and one-use; duplicate requests enqueue
   const submitted = await Promise.all([1, 2].map(() => f.request(`${PREFIX}/jobs`, { method: 'POST', body, session: sessionA })));
   assert.ok(submitted.every(response => response.status === 202 && response.data.jobs.length === 1));
   const jobId = submitted[0].data.jobs[0].id;
+  assert.ok(submitted.every(response => response.data.acceptedJob.id === jobId));
+  const trackedRoute = `${PREFIX}?jobId=${jobId}`;
+  assert.equal((await f.request(trackedRoute, { auth: false })).status, 401);
+  const tracked = await f.request(trackedRoute);
+  assert.equal(tracked.status, 200);
+  assert.equal(tracked.data.jobs.filter(job => job.id === jobId).length, 1);
+  for (const query of ['jobId=', 'jobId=invalid', `jobId=${jobId}&jobId=${jobId}`, `jobId=${jobId}&extra=1`]) assert.equal((await f.request(`${PREFIX}?${query}`)).status, 400);
+  assert.equal((await f.request(`${PREFIX}?jobId=${randomUUID()}`)).status, 404);
   assert.equal(submitted[1].data.jobs[0].id, jobId); assert.equal(f.rows('SELECT * FROM execution_jobs').length, 1);
   assert.equal(f.rows('SELECT * FROM execution_requests').length, 1);
   assert.equal((await f.request(`${PREFIX}/jobs`, { method: 'POST', body: { ...body, requestId: randomUUID() }, session: sessionA })).status, 409);

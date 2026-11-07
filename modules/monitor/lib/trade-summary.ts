@@ -5,7 +5,7 @@ import type { TradeEvent } from "./hynix-trades.ts";
 
 type Total = ReturnType<typeof decimal>;
 type Leg = { key: string; symbol: string; base: string; side: string; positionSide: string; quantityUnit: string; quantity: Total; notional: Total };
-type Group = { key: string; source: string; exchange: string; account: string; scope: string; currency: string; direction: string; stale: boolean; legs: Map<string, Leg> };
+type Group = { key: string; source: string; exchange: string; account: string; scope: string; currency: string | null; direction: string; stale: boolean; legs: Map<string, Leg> };
 
 const positionKey = (fill: HubFillItem) => JSON.stringify([tradeVenueKey(fill), fill.scope, fill.symbol, fill.base, fill.positionSide, fill.quantityUnit, fill.priceCurrency]);
 

@@ -14,6 +14,8 @@ export type SpreadTradeMarker = {
   usd: number | null;
   /** `percent` for a premium market (Hynix), `absolute` for a quote-currency spread (oil). */
   unit: "percent" | "absolute";
+  /** Explicit native venue/contract for single-leg markers. */
+  venueLabel?: string;
 };
 export type HynixTradeMarker = SpreadTradeMarker;
 

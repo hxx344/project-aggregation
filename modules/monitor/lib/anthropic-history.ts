@@ -60,10 +60,10 @@ export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartCo
     tabs: { premium: "溢价率", spread: "每股价差", price: "每股价格" }, units: { premium: `% · Binance 相对 ${name}`, spread: "USD / 股", price: "USD / 股" },
     premiumName: "Binance 溢价率", spreadName: "每股价差", legs: ["Binance", name], zeroLabel: "0 = 同价", domainStep: 1, digits: 2, price: usd,
     tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(1))}` },
-    tradeEvents: anthropicTradeEvents, tradeMarkers: anthropicTradeMarkers, tradeMarket: "anthropic",
+    tradeEvents: items => anthropicTradeEvents(items, leg), tradeMarkers: (events, points) => anthropicTradeMarkers(events, points, leg), tradeMarket: "anthropic",
     trade: { priceUnit: "", chartLabel: "图表同 15 分钟溢价率", chartNote: "已收盘 K 线，非双腿成交价差", metricName: "溢价率",
-      sources: "仅支持 Binance、OKX；Hyperliquid、Lighter RH 成交暂未接入",
-      note: "标记时间来自真实成交，纵坐标采用所选合约对的同一根 15 分钟 K 线；缺失或未收盘时仅列出成交。原生数量和成交价格不做每股换算，不代表双腿同时入场或出场。" },
+      sources: "CEX 来源为资产账本；Hyperliquid、Lighter RH 来源为当前实盘连接账户，手动成交同样读取",
+      note: `图上仅标记 ${name} 的真实成交；其他比较合约不混入。Binance、OKX 单腿无法确认配对归属，仅保留明细。纵坐标取同一根已收盘 15 分钟 K 线，不代表双腿成交价差；缺失或未收盘时仅列出成交。` },
     emptyText: { loading: "正在载入 15 分钟 K 线", hint: `Binance ANTHROPICUSDT / ${label} 同一时段已收盘 K 线` },
   };
 }

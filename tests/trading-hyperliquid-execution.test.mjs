@@ -49,6 +49,33 @@ const signer = call => {
   return recoverAddress(digest, signature).toLowerCase();
 };
 
+test('native history reads master fills for both ANT contracts and never double counts builder fee', async () => {
+  const rows = ['xyz:ANT', 'io:ANTH', 'BTC'].map((coin, i) => ({ coin, tid: 20 + i, hash: '0x' + 'ab'.repeat(32), time: T0 - 1000 * (i + 1),
+    side: i ? 'B' : 'A', sz: '0.5', px: '100', startPosition: i ? '-1' : '2', closedPnl: i ? undefined : '3', fee: '0.1', feeToken: 'USDC', builderFee: '0.05' }));
+  const h = harness({ info: { userFills: payload => { assert.equal(payload.user, MASTER); assert.equal(payload.aggregateByTime, false); return [...rows, rows[0]]; } } });
+  const result = await h.client.history(credentials, { start: T0 - 86_400_000, end: T0 });
+  assert.equal(result.fills.length, 2); assert.equal(result.truncated, true);
+  assert.deepEqual(result.fills.map(row => [row.symbol, row.base, row.quantityUnit, row.positionBefore, row.positionAfter, row.fee, row.priceCurrency, row.realizedPnl]),
+    [['xyz:ANT', 'XYZANT', 'ANT', '2', '1.5', '-0.1', null, '3'], ['io:ANTH', 'IOANTH', 'ANTH', '-1', '-0.5', '-0.1', null, null]]);
+  assert.equal(h.exchanges.length, 0); assert.deepEqual(h.calls.map(call => call.payload.type), ['userFills']);
+});
+
+test('native Hyperliquid history bounds rows and coverage and rejects malformed candidate fills', async () => {
+  const row = { coin: 'xyz:ANT', tid: 1, hash: '0x' + 'cd'.repeat(32), time: T0 - 2000, side: 'B', sz: '1', px: '100', startPosition: '0' };
+  for (const patch of [{ tid: 2 ** 54 }, { hash: 'bad' }, { time: T0 + 60_001 }, { sz: '0' }, { side: 'buy' }, { feeToken: 'bad\ntoken' }]) {
+    const h = harness({ info: { userFills: [{ ...row, ...patch }] } });
+    await assert.rejects(h.client.history(credentials, { start: T0 - 86_400_000, end: T0 }), isError('invalid_data'));
+  }
+  const full = harness({ info: { userFills: Array.from({ length: 2000 }, (_, i) => ({ ...row, tid: i, time: T0 - 2000 + i })) } });
+  const result = await full.client.history(credentials, { start: T0 - 86_400_000, end: T0 });
+  assert.equal(result.fills.length, 2000); assert.equal(result.fills[0].time, new Date(T0 - 1).toISOString());
+  assert.equal(result.coverageEnd, new Date(T0).toISOString()); assert.equal(result.truncated, true);
+  const excess = harness({ info: { userFills: Array.from({ length: 2001 }, () => row) } });
+  await assert.rejects(excess.client.history(credentials, { start: T0 - 86_400_000, end: T0 }), isError('response_limit'));
+  const empty = await harness({ info: { userFills: [row] } }).client.history(credentials, { start: T0 - 1000, end: T0 });
+  assert.equal(empty.coverageStart, null); assert.equal(empty.truncated, true);
+});
+
 test('price grid follows five significant figures and 6 - szDecimals decimals; IOC protection rounds outward', () => {
   assert.equal(priceTick('1616.4', 3), '0.1');
   assert.equal(priceTick('99.206', 2), '0.001');

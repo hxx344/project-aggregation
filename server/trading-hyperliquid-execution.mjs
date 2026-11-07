@@ -432,6 +432,40 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
     return fail('pagination');
   }
 
+  // Read the real master account, including orders placed outside this app.
+  // Read the latest 2,000 fills across all coins so a busy account's recent
+  // entries cannot be hidden behind an old first page. This bounded endpoint
+  // never claims complete 85-day coverage.
+  async function history(credentials, { start, end, signal } = {}) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1e11 || end < start || end > now() + 60_000 || end - start > 85 * 86_400_000) fail('input');
+    const { master } = keys(credentials);
+    const rows = await info({ type: 'userFills', user: master, aggregateByTime: false }, signal);
+    if (!Array.isArray(rows) || rows.length > MAX_ROWS) fail('response_limit');
+    const fills = new Map();
+    let first = null;
+    const optionalAmount = value => value === null || value === undefined ? null : amount(value);
+    for (const row of rows) {
+      if (!object(row) || typeof row.coin !== 'string' || !Number.isSafeInteger(row.time) || row.time < 1e11 || row.time > now() + 60_000) fail();
+      if (row.time < start || row.time > end) continue;
+      first = Math.min(first ?? row.time, row.time);
+      if (!HYPERLIQUID_SYMBOLS.includes(row.coin)) continue;
+      if (!Object.hasOwn(ORDER_SIDES, row.side) || !Number.isSafeInteger(row.tid) || row.tid < 0 || typeof row.hash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(row.hash)) fail();
+      const side = ORDER_SIDES[row.side], quantity = amount(row.sz, { positive: true }), positionBefore = optionalAmount(row.startPosition);
+      const feeCurrency = row.feeToken === null || row.feeToken === undefined ? null : typeof row.feeToken === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(row.feeToken.trim()) ? row.feeToken.trim() : fail();
+      const id = `${row.coin}:${row.tid}:${row.hash}`, fee = optionalAmount(row.fee);
+      const fill = { id, symbol: row.coin, base: row.coin === 'xyz:ANT' ? 'XYZANT' : 'IOANTH', time: new Date(row.time).toISOString(), side, positionSide: 'net',
+        quantity, quantityUnit: row.coin === 'xyz:ANT' ? 'ANT' : 'ANTH', price: amount(row.px, { positive: true }),
+        // feeToken does not prove the price/PnL quote token of a HIP-3 market.
+        priceCurrency: null, fee: fee === null ? null : fromUnits(-units(fee)), feeCurrency, realizedPnl: optionalAmount(row.closedPnl), positionBefore,
+        positionAfter: positionBefore === null ? null : fromUnits(units(positionBefore) + (side === 'buy' ? 1n : -1n) * units(quantity)) };
+      if (fills.has(id) && JSON.stringify(fills.get(id)) !== JSON.stringify(fill)) fail();
+      fills.set(id, fill); // fee already includes builderFee: never add it again.
+    }
+    checkAbort(signal);
+    return { accountId: 'main', fills: [...fills.values()].sort((a, b) => b.time.localeCompare(a.time) || a.id.localeCompare(b.id)),
+      coverageStart: first === null ? null : new Date(first).toISOString(), coverageEnd: new Date(end).toISOString(), truncated: true };
+  }
+
   async function inspect(credentials, value, { signal } = {}) {
     const spec = specOf(value);
     const { master } = keys(credentials);
@@ -476,5 +510,5 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
   }
 
   const unsupported = async () => fail('input');
-  return { exchange: 'hyperliquid', verify, account, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported };
+  return { exchange: 'hyperliquid', verify, account, history, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported };
 }

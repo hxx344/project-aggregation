@@ -1,8 +1,8 @@
-// Root production preview on 4178; Monitor ssr-browser-server.mjs on 3189.
+// Root production preview on 4182; Monitor ssr-browser-server.mjs on 3192.
 // Run with playwright-cli run-code --filename. Every API is isolated; no account services are contacted.
 async page => {
-  const origin = 'http://hub.localhost:4178', moduleOrigin = 'http://p-0123456789abcdef01234567.hub.localhost:4178';
-  const monitorBuild = 'http://127.0.0.1:3189', day = 86_400_000, step = 900_000;
+  const origin = 'http://hub.localhost:4182', moduleOrigin = 'http://p-0123456789abcdef01234567.hub.localhost:4182';
+  const monitorBuild = 'http://127.0.0.1:3192', day = 86_400_000, step = 900_000;
   const now = Date.now(), end = Math.floor(now / step) * step - step, stamp = new Date(now).toISOString();
   const iso = time => new Date(time).toISOString(), check = (value, message) => { if (!value) throw new Error(message); };
   const project = { id: 'monitor', name: 'monitor', description: '', category: 'other', adapter: 'monitor', enabled: true, embedded: true, accessMode: 'proxy', apiUrl: 'http://127.0.0.1:9000', url: '', mode: 'embed', hasCredentials: true, revision: 'ant-trades-fixture', staleAfterSeconds: 120, order: 0 };
@@ -10,18 +10,22 @@ async page => {
   const samples = Array.from({ length: 40 * 96 }, (_, index) => ({ time: end - (40 * 96 - 1 - index) * step, binance: 1270, xyz: 80, io: 1670, rh: 835 }));
   const candles = { status: 'live', metadata: { source: 'Binance + Hyperliquid + rh-Lighter', symbols: ['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH', 'ANTHROPIC'], interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute candle closes', fetchedAt: stamp, firstObservation: iso(samples[0].time), lastObservation: iso(end), rows: samples.length, errors: {} }, data: samples };
   const quote = { fetchedAt: stamp, errors: {}, binance: { markPx: 1270, fundingRate: 0, nextFundingTime: null }, xyz: { markPx: 80, fundingRate: 0, oraclePx: 80 }, io: { markPx: 1670, fundingRate: 0, oraclePx: 1670 }, rh: { markPx: 835, fundingRate: null, indexPx: 835 } };
-  const cycle = (overrides = {}) => ({ status: 'complete', since: iso(end - 3 * day), closedQuantity: '1', closePrice: '1200', realizedPnl: '10', fees: '-2', funding: '1', net: '9', currency: 'USDT', note: null, updatedAt: stamp, ...overrides });
+  const cycle = (overrides = {}) => ({ status: 'complete', since: iso(end - 3 * day), closedQuantity: '0', closePrice: null, realizedPnl: '0', fees: '-14.77', funding: '3.28', net: '-11.49', currency: 'USDT', note: null, updatedAt: stamp, ...overrides });
   const position = (symbol, unrealizedPnl, pnlCurrency, extra = {}) => ({ symbol, instrumentId: symbol, side: 'long', quantity: '2', quantityUnit: 'ANTHROPIC', entryPrice: '1200', markPrice: '1210', unrealizedPnl, pnlCurrency, ...extra });
   const exchange = (id, name, positions) => ({ id, name, accounts: [{ id: 'main', name: '主账户', scopes: [{ id: 'perp', status: 'live', fetchedAt: stamp, positions }] }] });
   const positions = { generatedAt: stamp, sources: [{ projectId: 'asset', name: 'Asset', status: 'ready', data: { exchanges: [
-    exchange('binance', 'Binance', [position('ANTHROPICUSDT', '30', 'USDT', { cycle: cycle() })]),
-    exchange('okx', 'OKX', [position('ANTHROPIC-USDT-SWAP', '-10', 'USDT', { side: 'short', quantityUnit: '张', cycle: cycle({ realizedPnl: '-3', fees: '-1', funding: '2', net: '-2' }) })]),
-    exchange('rh-lighter', 'Lighter RH', [position('ANTHROPIC', '5', 'USDG')]),
+    exchange('binance', 'Binance', [position('ANTHROPICUSDT', '-1298.80', 'USDT', { side: 'short', quantity: '33.84', entryPrice: '1349.8098', cycle: cycle() })]),
+    exchange('rh-lighter', 'Lighter RH', [position('ANTHROPIC', '1705.13', 'USDG', { quantity: '24.73130', entryPrice: '1530.9' })]),
   ] } }] };
-  const legs = { sources: [{ exchange: 'hyperliquid', connected: true, state: 'live', fetchedAt: stamp, positions: [position('xyz:ANT', '7', null, { side: 'short', entryPrice: '80', markPrice: '79' })] }] };
+  const legs = { sources: [{ exchange: 'hyperliquid', connected: true, state: 'live', fetchedAt: stamp, positions: [] }] };
   const lookbackStart = iso(now - 85 * day);
   const fill = (id, time, close, venue = 'binance') => ({ id, symbol: venue === 'okx' ? 'ANTHROPIC-USDT-SWAP' : 'ANTHROPICUSDT', base: 'ANTHROPIC', time: iso(time), side: close ? 'sell' : 'buy', positionSide: 'net', quantity: '2', quantityUnit: venue === 'okx' ? '张' : 'ANTHROPIC', price: venue === 'okx' ? '127' : '1270', priceCurrency: 'USDT', fee: '-0.1', feeCurrency: 'USDT', realizedPnl: close ? '4' : '0', positionBefore: close ? '2' : '0', positionAfter: close ? '0' : '2' });
   const fills = { generatedAt: stamp, sources: [{ projectId: 'asset', name: 'Asset', status: 'ready', data: { schemaVersion: 1, generatedAt: stamp, lookbackStart, exchanges: ['binance', 'okx'].map(venue => ({ id: venue, name: venue === 'binance' ? 'Binance' : 'OKX', accounts: [{ id: 'main', name: '主账户', scopes: [{ id: venue === 'binance' ? 'um' : 'swap', status: 'live', refreshing: false, fetchedAt: stamp, coverageStart: lookbackStart, coverageEnd: stamp, truncated: false, fills: [fill('entry', end - 2 * day + 60_000, false, venue), fill('exit', end - day + 60_000, true, venue), fill('old', end - 20 * day + 60_000, false, venue)] }] }] })) } }] };
+  const native = structuredClone(fills.sources[0]); native.projectId = 'anthropic-history'; native.name = 'ANT原生成交';
+  native.data.exchanges = [{ id: 'rh-lighter', name: 'Lighter RH', accounts: [{ id: '22163', name: '当前实盘连接账户', scopes: [{ id: 'perpetual', status: 'live', refreshing: false, fetchedAt: stamp, coverageStart: lookbackStart, coverageEnd: stamp, truncated: false,
+    fills: [fill('rh-entry', end - 2 * day + 60_000, false), fill('rh-exit', end - day + 60_000, true), fill('rh-old', end - 20 * day + 60_000, false)].map(row => ({ ...row, symbol: 'ANTHROPIC', price: '1530.9', priceCurrency: 'USDG', fee: null, feeCurrency: null, realizedPnl: null })) }] }] },
+    { id: 'hyperliquid', name: 'Hyperliquid', accounts: [{ id: 'main', name: '当前实盘连接主账户', scopes: [{ id: 'perpetual', status: 'live', refreshing: false, fetchedAt: stamp, coverageStart: lookbackStart, coverageEnd: stamp, truncated: true, fills: [] }] }] }];
+  fills.sources.push(native);
   const errors = [], requests = [], listener = error => errors.push(error.stack ?? error.message);
   let failReads = false;
   let launchMonitor = 'anthropic';
@@ -61,29 +65,33 @@ async page => {
     await page.frameLocator('iframe[title="monitor模块"]').locator('body').evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('monitor:')) localStorage.removeItem(key); });
     await page.reload();
     const frame = page.frameLocator('iframe[title="monitor模块"]'), panel = frame.getByRole('tabpanel', { name: 'Anthropic 价差', exact: true });
+    await panel.getByRole('button', { name: 'Lighter RH', exact: true }).click();
     const entry = panel.locator('.trade-marker[data-trade-type="entry"]'), exit = panel.locator('.trade-marker[data-trade-type="exit"]');
     await entry.first().waitFor(); await exit.first().waitFor();
     check(await entry.count() === 1 && await exit.count() === 1, 'one entry and exit event in the one-week chart');
-    check((await entry.getAttribute('aria-label')).includes('25.000%'), 'xyz markers use chart premium');
+    check((await entry.getAttribute('aria-label')).includes('Lighter RH 入场') && (await entry.getAttribute('aria-label')).includes('100.000%'), 'RH entry names its native venue and uses only RH chart premium');
     await entry.focus(); await page.keyboard.press('Enter');
     const details = panel.getByLabel('套利成交明细');
     await details.waitFor();
-    check((await details.innerText()).includes('2 张 @ 127 USDT'), 'OKX keeps its native contract price');
-    check((await details.innerText()).includes('手续费合计 -0.2 USDT'), 'fill details retain fees');
-    check((await panel.locator('.trade-status').innerText()).includes('Hyperliquid、Lighter RH 成交暂未接入'), 'history coverage is explicit');
-    const side = frame.locator('[data-related-positions="anthropic"]'), usdt = side.locator('[data-position-totals="USDT"]');
-    await usdt.waitFor();
-    check((await usdt.innerText()).includes('+27.00 USDT'), 'total includes unrealized 20 and realized net 7');
-    check((await usdt.innerText()).includes('−3.00 USDT'), 'signed fees are added');
-    check((await side.locator('[data-position-totals="USDG"]').innerText()).includes('+5.00 USDG'), 'USDG stays separate');
-    check((await side.locator('[data-position-totals="unknown"]').innerText()).includes('结算币种未知'), 'Hyperliquid has no invented currency or zero cycle');
-    check(await side.locator('.related-positions-list li').count() === 4, 'all legs remain visible');
-    for (const [name, expected] of [['io:ANTH', '0.000%'], ['Lighter RH', '100.000%'], ['xyz:ANT', '25.000%']]) {
+    check((await details.innerText()).includes('2 ANTHROPIC @ 1530.9 USDG'), 'RH keeps its native trade price');
+    check((await details.innerText()).includes('手续费合计 未知'), 'missing RH fee is never zero');
+    check((await panel.locator('.trade-status').innerText()).includes('当前实盘连接账户'), 'history account scope is explicit');
+    const side = frame.locator('[data-related-positions="anthropic"]'), pair = side.locator('[data-ant-pair="rh"]');
+    await pair.waitFor();
+    check((await pair.innerText()).includes('Binance ↔ Lighter RH'), 'current actual pair is identified');
+    check((await pair.locator('.related-pair-estimate').innerText()).includes('+394.84 USD'), 'reported known net combines both actual legs');
+    check((await pair.innerText()).includes('+406.33 USD'), 'unrealized combines USDT and USDG under explicit assumption');
+    check((await pair.innerText()).includes('1:1 估算') && (await pair.innerText()).includes('Lighter RH：已实现、手续费、资金费'), 'estimate assumption and missing components stay visible');
+    check(await side.locator('.related-positions-list li').count() === 2, 'both original currency legs remain visible');
+    for (const name of ['io:ANTH', 'xyz:ANT']) {
       await panel.getByRole('button', { name, exact: true }).click();
-      await entry.first().waitFor();
-      check((await entry.getAttribute('aria-label')).includes(expected), `${name} uses its own chart coordinates`);
-      check((await usdt.innerText()).includes('+27.00 USDT'), 'chart selection does not change related totals');
+      await panel.locator('.trade-panel').waitFor();
+      check(await panel.locator('.trade-marker').count() === 0, `${name} has no RH or ambiguous Binance marker`);
+      check((await panel.locator('.trade-list-item').first().innerText()).includes('未关联组合的 CEX'), 'unassigned CEX trade remains in the list only');
+      check(!(await panel.locator('.trade-list-item').allInnerTexts()).some(text => text.includes('Lighter RH 入场')), 'RH history never leaks into another comparison');
+      check((await pair.innerText()).includes('+394.84 USD'), 'current pair remains RH, not retroactively reassigned by chart selection');
     }
+    await panel.getByRole('button', { name: 'Lighter RH', exact: true }).click(); await entry.first().waitFor();
     const chart = panel.getByRole('region', { name: '历史价差图表', exact: true });
     await chart.getByRole('button', { name: '1 月', exact: true }).click();
     await entry.nth(1).waitFor();
@@ -91,7 +99,7 @@ async page => {
     await entry.nth(1).waitFor({ state: 'hidden' });
     await chart.getByRole('button', { name: '每股价格', exact: true }).click();
     check(await panel.locator('.trade-marker').count() === 0, 'price mode uses the fill list without incompatible axis markers');
-    check(await panel.locator('.trade-list-item').count() === 2, 'actual fills stay accessible in price mode');
+    check(await panel.locator('.trade-list-item').count() === 4, 'native and unassigned CEX fills stay accessible in price mode');
     await chart.getByRole('button', { name: '溢价率', exact: true }).click();
     await entry.first().waitFor();
     await entry.scrollIntoViewIfNeeded();
@@ -136,7 +144,7 @@ async page => {
     launchMonitor = 'anthropic';
     await page.reload(); await panel.waitFor();
     // Restore the earlier view so the failure-retention assertions still address its exact chart.
-    await panel.getByRole('button', { name: 'xyz:ANT', exact: true }).click();
+    await panel.getByRole('button', { name: 'Lighter RH', exact: true }).click();
     await chart.getByRole('button', { name: '1 周', exact: true }).click();
     await chart.getByRole('button', { name: '溢价率', exact: true }).click();
     await entry.first().waitFor(); await exit.first().waitFor();
@@ -144,15 +152,15 @@ async page => {
     await page.clock.fastForward(301_000);
     await panel.locator('.trade-status').filter({ hasText: '刷新失败，保留上次成功数据' }).waitFor();
     await side.getByText(/保留 .* 的持仓数据/).waitFor();
-    check((await usdt.innerText()).includes('+27.00 USDT'), 'failed refresh retains the previous nonzero total');
-    check((await usdt.innerText()).includes('保留旧数据'), 'retained total is visibly marked');
+    check((await pair.innerText()).includes('+394.84 USD'), 'failed refresh retains the previous nonzero estimate');
+    check((await pair.innerText()).includes('保留旧数据'), 'retained estimate is visibly marked');
     check(await entry.count() === 1 && await exit.count() === 1, 'failed fill refresh retains markers');
     await frame.getByRole('tab', { name: '原油价差', exact: true }).click();
     const before = requests.filter(market => market === 'anthropic').length;
     await page.clock.fastForward(301_000);
     check(requests.filter(market => market === 'anthropic').length === before, 'inactive ANT chart stops fill reads');
     check(errors.length === 0, errors.join('\n'));
-    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'entry/exit keyboard details', 'native prices', 'three comparison legs', 'range and price modes', 'per-currency PnL', 'unknown cycle', 'refresh failure retention', 'foreground-only reads', '390px layout', 'reload preferences', 'market isolation', 'monitor URL priority'] };
+    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'RH entry/exit keyboard details', 'native prices', 'no RH or ambiguous CEX markers on xyz/io', 'actual pair and screenshot PnL', 'explicit 1:1 estimate and missing cycle', 'range and price modes', 'refresh failure retention', 'foreground-only reads', '390px layout', 'reload preferences', 'market isolation', 'monitor URL priority'] };
   } finally {
     page.off('pageerror', listener);
     await page.unroute('**/*', handler);

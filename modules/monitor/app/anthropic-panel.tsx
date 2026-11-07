@@ -10,6 +10,7 @@ import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useAnthropicFeed } from "../hooks/use-anthropic-feed";
 import { useHubFills } from "../lib/hub-fills";
+import type { AnthropicPairQuotes } from "../lib/related-position-totals";
 import { createAnthropicSummaryReader, type SummaryProps, type SummaryStatus } from "../lib/monitor-summary";
 import { getQuoteStaleAfterMs } from "../lib/market-freshness";
 import { anthropicChartConfig, anthropicPoints, coversAnthropicRange, ANTHROPIC_WARMUP_DAYS, type AnthropicComparisonLeg, type AnthropicQuote } from "../lib/anthropic-history";
@@ -29,7 +30,7 @@ const stamp = (t: number | string) => `${date(t, true)} ${new Date(t).toISOStrin
 const legName = (key: string) => ANTHROPIC_LEGS[key as keyof typeof ANTHROPIC_LEGS]?.name ?? key;
 const comparisonPremiums = (quote: AnthropicQuote | null) => Object.fromEntries(ANTHROPIC_COMPARISON_LEGS.map(key => [key, anthropicPremium(quote?.binance?.markPx, quote?.[key]?.markPx, key)])) as Record<AnthropicComparisonLeg, number | null>;
 
-export default function AnthropicPanel({ onSummary, active = true, selected = active, summaryActive = active, tradesActive = false, children }: SummaryProps & { active?: boolean; selected?: boolean; summaryActive?: boolean; tradesActive?: boolean; children?: ReactNode }) {
+export default function AnthropicPanel({ onSummary, onPairQuotes, active = true, selected = active, summaryActive = active, tradesActive = false, children }: SummaryProps & { onPairQuotes?: (quotes: AnthropicPairQuotes) => void; active?: boolean; selected?: boolean; summaryActive?: boolean; tradesActive?: boolean; children?: ReactNode }) {
   const shown = useHydrated() ? active : selected;
   const [hasOpened, setHasOpened] = useState(active);
   if (active && !hasOpened) setHasOpened(true);
@@ -48,6 +49,8 @@ export default function AnthropicPanel({ onSummary, active = true, selected = ac
   const binance = quote?.binance ?? null, other = quote?.[leg] ?? null;
   const premiums = useMemo(() => comparisonPremiums(quote), [quote]);
   const premium = premiums[leg];
+  useEffect(() => { onPairQuotes?.({ premiums, fetchedAt: quote?.fetchedAt ?? null,
+    staleAfterMs: getQuoteStaleAfterMs(quote, 35_000), stale: status !== "live" }); }, [onPairQuotes, premiums, quote, status]);
   useEffect(() => {
     onSummary?.(readSummary({
       status, premiums, trendLeg: legName(leg),

@@ -29,13 +29,13 @@ export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chart
     byFill.get(effect.key).push(effect);
   }
   return [
-    `${type.symbol} ${type.label} · ${formatTime(event.time)} 北京时间`,
+    `${type.symbol} ${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${formatTime(event.time)} 北京时间`,
     `${event.fills.length} 笔成交 · 至 ${formatTime(event.end)}${event.stale ? ' · 保留旧数据' : ''}`,
     `${basis} ${spreadText(value, unit)}${event.spreadVenue ? ` · ${labels.get(event.spreadVenue.key)}` : ''}`,
     `${chartLabel} ${spreadText(chartSpread, unit)}（${chartNote}）`,
     ...event.venues.flatMap(venue => [
       `${labels.get(venue.key)} · ${venue.direction}`,
-      ...venue.legs.map(leg => `${leg.base} ${leg.sides.map(side => side === 'buy' ? '买' : '卖').join('/')} ${leg.quantity} ${leg.quantityUnit} @ ${leg.price} ${leg.currency}${priceUnit} · ${leg.scopes.join(' / ')}`),
+      ...venue.legs.map(leg => `${leg.base} ${leg.sides.map(side => side === 'buy' ? '买' : '卖').join('/')} ${leg.quantity} ${leg.quantityUnit} @ ${leg.price} ${leg.currency ?? '币种未知'}${priceUnit} · ${leg.scopes.join(' / ')}`),
       `成交价差 ${spreadText(unit === 'absolute' ? absoluteSpread(venue) : venue.spread, unit)}${venue.currency ? `（${venue.currency}${unit === 'absolute' ? priceUnit : ''}）` : ''}`,
       `手续费 ${cashText(venue.fees)} · 已实现盈亏 ${cashText(venue.realizedPnl)}`,
     ]),
