@@ -1,0 +1,269 @@
+{
+  "$comment": "Account writer protocol shared by server/execution/account-writer.mjs and server/execution/account_writer.py. tests/account-writer-protocol.test.mjs reads the codes both sides raise and replays every scenario on both. Hashes and account keys are values existing ledgers already store: changing one needs a new protocol version, not a vector update. A failing step prints the value the implementation returned. Every error code is either expected by a vector step or listed in notVectored with the reason.",
+  "protocol": {
+    "registrySchema": "1",
+    "recoverySchemaVersion": 1,
+    "accountKeyDomain": "account-writer:v1"
+  },
+  "constants": {
+    "TTL_MS": 60000,
+    "HEARTBEAT_MS": 5000,
+    "SAFETY_MS": 10000,
+    "ASTER_WRITE_EXPIRY_MS": 120000,
+    "RECOVERY_SCHEMA_VERSION": 1
+  },
+  "authorities": ["binance", "bybit", "okx", "gate-crossex", "aster", "hyperliquid", "rh-lighter"],
+  "environments": ["mainnet", "testnet", "demo"],
+  "errorCodes": ["ACCOUNT_ISOLATED", "ACCOUNT_PINNED", "ACCOUNT_UNRESOLVED", "ALREADY_REJECTED", "ALREADY_SUBMITTED", "AUTHORITY_RETIRED", "BINDING_CHANGED", "BINDING_REQUIRED", "BINDING_UNRESOLVED", "CLOCK_ROLLBACK", "DUPLICATE_ACCOUNT", "INVALID_ACCOUNT_SET", "INVALID_BUDGET", "INVALID_CLOCK", "INVALID_GROUP_ID", "INVALID_IDENTIFIER", "INVALID_IDENTITY", "INVALID_INTENT_TARGET", "INVALID_ISOLATION", "INVALID_MARGIN_TRANSFER", "INVALID_OPERATION_ID", "INVALID_OPTIONS", "INVALID_OUTCOME", "INVALID_PAYLOAD", "INVALID_RECOVERY_STATE", "INVALID_REVISION", "INVALID_SCOPE", "INVALID_TICKET", "LEASE_EXPIRED", "OPERATION_CONFLICT", "OPERATION_FINAL", "OPERATION_NOT_FOUND", "OPERATION_UNRESOLVED", "OWNERSHIP_LOST", "OWNER_ALIVE", "OWNER_ID_REUSED", "RECOVERY_REQUIRED", "REGISTRY_BUSY", "REGISTRY_MISSING", "REGISTRY_REPLACED", "REGISTRY_UNAVAILABLE", "UNSAFE_DATABASE_PATH", "UNSAFE_PAYLOAD", "UNSUPPORTED_RECOVERY_SCHEMA", "UNSUPPORTED_SCHEMA", "UNVERIFIED_BINDING", "WRITER_CLOSED", "WRITER_RETIRED"],
+  "notVectored": {
+    "ACCOUNT_PINNED": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "ACCOUNT_UNRESOLVED": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "AUTHORITY_RETIRED": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "CLOCK_ROLLBACK": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "INVALID_CLOCK": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "INVALID_OPTIONS": "构造参数错误，两侧构造函数签名不同（Node 传对象，Python 传位置参数），不属于共享调用协议",
+    "INVALID_RECOVERY_STATE": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "LEASE_EXPIRED": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "OWNERSHIP_LOST": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "OWNER_ALIVE": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "OWNER_ID_REUSED": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "RECOVERY_REQUIRED": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "REGISTRY_BUSY": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "REGISTRY_MISSING": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "REGISTRY_REPLACED": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "REGISTRY_UNAVAILABLE": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "UNSAFE_DATABASE_PATH": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "UNSUPPORTED_RECOVERY_SCHEMA": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "UNSUPPORTED_SCHEMA": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖",
+    "UNVERIFIED_BINDING": "需要多个 writer 进程、存活探测或注入时钟，由 tests/account-writer.test.mjs 的 Node/Python 互操作场景覆盖",
+    "WRITER_CLOSED": "Python 测试 peer 在 close 后退出，无法继续调用；两侧关闭后调用的行为由各自单元测试覆盖",
+    "WRITER_RETIRED": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖"
+  },
+  "shapes": {
+    "bind": {
+      "fields": {
+        "accountKey": "string",
+        "connectionId": "string",
+        "generation": "integer",
+        "verified": "boolean"
+      }
+    },
+    "lease": {
+      "fields": {
+        "bindings": "array",
+        "claims": "array",
+        "moduleId": "string",
+        "ownerId": "string",
+        "runtimeId": "string"
+      },
+      "items": {
+        "claims": "claim",
+        "bindings": "binding"
+      }
+    },
+    "claim": {
+      "fields": {
+        "accountKey": "string",
+        "fence": "integer"
+      }
+    },
+    "binding": {
+      "fields": {
+        "accountKey": "string",
+        "connectionId": "string",
+        "generation": "integer"
+      }
+    },
+    "operation": {
+      "fields": {
+        "bindings": "array",
+        "bodyHash": "string",
+        "claims": "array",
+        "moduleId": "string",
+        "operationId": "string",
+        "ownerId": "string",
+        "runtimeId": "string",
+        "state": "string"
+      },
+      "items": {
+        "claims": "claim",
+        "bindings": "binding"
+      }
+    },
+    "outcome": {
+      "fields": {
+        "operationId": "string",
+        "state": "string"
+      }
+    },
+    "isolation": {
+      "fields": {
+        "isolated": "integer",
+        "reason": "string"
+      }
+    },
+    "unresolved": {
+      "each": "unresolvedEntry"
+    },
+    "unresolvedEntry": {
+      "fields": {
+        "bodyHash": "string",
+        "createdAt": "integer",
+        "operationId": "string",
+        "state": "string",
+        "updatedAt": "integer"
+      }
+    },
+    "snapshot": {
+      "fields": {
+        "accounts": "array",
+        "bindings": "array",
+        "isolations": "array",
+        "operations": "array",
+        "recovery": "object",
+        "writerRetired": "boolean"
+      },
+      "items": {
+        "accounts": "snapshotAccount",
+        "bindings": "snapshotBinding",
+        "isolations": "snapshotIsolation",
+        "recovery": "snapshotRecovery"
+      }
+    },
+    "snapshotAccount": {
+      "fields": {
+        "authority": "string",
+        "environment": "string",
+        "moduleId": "string",
+        "state": "string"
+      }
+    },
+    "snapshotBinding": {
+      "fields": {
+        "authority": "string",
+        "count": "integer",
+        "environment": "string",
+        "moduleId": "string",
+        "verified": "boolean"
+      }
+    },
+    "snapshotIsolation": {
+      "fields": {
+        "authority": "string",
+        "environment": "string",
+        "moduleId": "string",
+        "reason": "string"
+      }
+    },
+    "snapshotRecovery": {
+      "fields": {
+        "authorityId": "string",
+        "schemaVersion": "integer",
+        "state": "string"
+      }
+    }
+  },
+  "scenarios": [
+    {
+      "name": "account keys: decimal UIDs drop leading zeros, wallet addresses ignore case, the parent account and key revision are not part of the key",
+      "moduleId": "hub",
+      "steps": [
+        {"call":"accountKey","args":[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}],"expect":{"value":"0bbb66fdbc4ac7a04ef10f501ea170cc065072d3557c8f2c59df20841895e73e"}},
+        {"call":"accountKey","args":[{"authority":"binance","environment":"mainnet","accountId":918273645}],"expect":{"value":"0bbb66fdbc4ac7a04ef10f501ea170cc065072d3557c8f2c59df20841895e73e"}},
+        {"call":"accountKey","args":[{"authority":"okx","environment":"demo","accountId":42,"parentAccountId":"7"}],"expect":{"value":"9b223f123327261002860d8eb2b4cbba032890a3d20afa0e5eb5b2baff821c18"}},
+        {"call":"accountKey","args":[{"authority":"hyperliquid","environment":"testnet","accountId":"0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"}],"expect":{"value":"c954dd53db2812c6bd51ea97c453bf81f45f2943f7fe4bb0ebf39a364fd200d8"}},
+        {"call":"accountKey","args":[{"authority":"rh-lighter","environment":"mainnet","accountId":"0xabababababababababababababababababababab"}],"expect":{"value":"5ddef210d1d75c78ab1d64ca80a723377ac0e229cdf0bea148e7bc49dbe3de12"}},
+        {"call":"accountKey","args":[{"authority":"aster","environment":"mainnet","accountId":"0xAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAbAb"}],"expect":{"value":"0d4ac79bed695a16c9db8f78b56b2d59aa3601390bca5a869eabfb30d4a6daf1"}},
+        {"call":"accountKey","args":[{"authority":"gate-crossex","environment":"mainnet","accountId":"1"}],"expect":{"value":"0b27b7db6a32e5572a53fc2f6b8aa95744dc3a29b013cf6f5c239b784d684782"}},
+        {"call":"accountKey","args":[{"authority":"bybit","environment":"testnet","accountId":"1"}],"expect":{"value":"ce98225359fe73a5e14160a594624148767ca9d07a9731657d4adc85f35e5428"}},
+        {"call":"accountKey","args":[{"authority":"binance","environment":"mainnet","accountId":"0"}],"expect":{"code":"INVALID_IDENTITY"}},
+        {"call":"accountKey","args":[{"authority":"binance","environment":"mainnet","accountId":"1.0"}],"expect":{"code":"INVALID_IDENTITY"}},
+        {"call":"accountKey","args":[{"authority":"kraken","environment":"mainnet","accountId":"1"}],"expect":{"code":"INVALID_SCOPE"}},
+        {"call":"accountKey","args":[{"authority":"binance","environment":"staging","accountId":"000918273645"}],"expect":{"code":"INVALID_SCOPE"}},
+        {"call":"accountKey","args":[{"authority":"binance","environment":"mainnet","accountId":"000918273645","apiKey":"x"}],"expect":{"code":"INVALID_IDENTITY"}},
+        {"call":"accountKey","args":[{"authority":"aster","environment":"mainnet","accountId":"123"}],"expect":{"code":"INVALID_IDENTITY"}}
+      ]
+    },
+    {
+      "name": "semantic body hash: IEEE-754 numbers, code point key order, nesting, and payloads refused before hashing",
+      "moduleId": "hub",
+      "steps": [
+        {"call":"bind","args":["connection-0",{"authority":"binance","environment":"mainnet","accountId":"000918273645"},1],"pick":["generation","verified"],"shape":"bind","expect":{"value":{"generation":1,"verified":true}}},
+        {"call":"claim","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}]],"save":"lease","pick":[],"shape":"lease","expect":{"value":{}}},
+        {"call":"importUnknown","args":["$lease","hash-0",{"symbol":"BTCUSDT","quantity":"0.010","price":101.5,"reduceOnly":false,"tag":null}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"5d0df74216f63da98160ee9276ba1c0ab582da9dd24ba8bb5297df70b19c3762","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-1",{"numbers":[0,-0.0,0.1,1e-7,9007199254740991,-9007199254740991,123.456,1]}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"1fdcf214fc0b02f38a3cce8e59cff6c2582f4126305deba3ceb4436f06551616","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-2",{"b":1,"a":2,"é":3,"z":4,"😀":5,"￿":6}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"11d1c1e582629533b19e130a82408c2a7ad65d338bdbdd56d1faa90537791d5d","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-3",{"nested":[[1,[2,[3]]],{"x":{"y":"中文"}}],"empty":[]}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"248e9dc8cde29aab2a460b744e57399d797156a78761d5eec422aff1076ddfb1","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-4",{}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"03d0fae7adcee14b6915adeaf76d7012d8db870235dba4a0efe117d604b67b90","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-5",{"groupId":"group-1","leg":"first"}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"002a87bd3eca6d2f869b735fed4fe7830900fe9616e06bea3a2f39b0544aa246","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-6",{"apiKey":"x"}],"pick":["bodyHash","state"],"expect":{"code":"UNSAFE_PAYLOAD"}},
+        {"call":"importUnknown","args":["$lease","hash-7",{"nested":{"secret":"x"}}],"pick":["bodyHash","state"],"expect":{"code":"UNSAFE_PAYLOAD"}},
+        {"call":"importUnknown","args":["$lease","hash-8",{"n":1e+300}],"pick":["bodyHash","state"],"expect":{"code":"INVALID_PAYLOAD"}},
+        {"call":"importUnknown","args":["$lease","hash-9",{"n":9007199254740992}],"pick":["bodyHash","state"],"expect":{"code":"INVALID_PAYLOAD"}},
+        {"call":"importUnknown","args":["$lease","hash-10",{"s":"\ud800"}],"pick":["bodyHash","state"],"expect":{"code":"INVALID_PAYLOAD"}}
+      ]
+    },
+    {
+      "name": "tickets and operations: bind, claim, ownership checks, prepare, finish, replay, resolve, isolation, release and snapshot",
+      "moduleId": "hub",
+      "steps": [
+        {"call":"claim","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}]],"expect":{"code":"BINDING_REQUIRED"}},
+        {"call":"bind","args":["",{"authority":"binance","environment":"mainnet","accountId":"000918273645"},1],"expect":{"code":"INVALID_IDENTIFIER"}},
+        {"call":"bind","args":["connection-0",{"authority":"binance","environment":"mainnet","accountId":"000918273645"},1.5],"expect":{"code":"INVALID_REVISION"}},
+        {"call":"bind","args":["connection-0",{"authority":"binance","environment":"mainnet","accountId":"000918273645"},1],"pick":["generation","accountKey","verified"],"shape":"bind","expect":{"value":{"generation":1,"accountKey":"0bbb66fdbc4ac7a04ef10f501ea170cc065072d3557c8f2c59df20841895e73e","verified":true}}},
+        {"call":"claim","args":[[]],"expect":{"code":"INVALID_ACCOUNT_SET"}},
+        {"call":"claim","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"},{"authority":"binance","environment":"mainnet","accountId":"918273645"}]],"expect":{"code":"DUPLICATE_ACCOUNT"}},
+        {"call":"claim","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}]],"save":"lease","pick":[],"shape":"lease","expect":{"value":{}}},
+        {"call":"assertOwned","args":[{}],"expect":{"code":"INVALID_TICKET"}},
+        {"call":"assertOwned","args":["$lease",-1],"expect":{"code":"INVALID_BUDGET"}},
+        {"call":"assertOwned","args":["$lease"],"expect":{"value":true}},
+        {"call":"prepare","args":["$lease","op-1",{"side":"BUY"}],"save":"operation","pick":["operationId","bodyHash","state"],"shape":"operation","expect":{"value":{"operationId":"op-1","bodyHash":"5384af005dcac70229459901ed272af65d3085c729680e14e2d15689bf7a3ad0","state":"sending"}}},
+        {"call":"finish","args":["$operation","bogus"],"expect":{"code":"INVALID_OUTCOME"}},
+        {"call":"finish","args":["$operation","confirmed"],"shape":"outcome","expect":{"value":{"operationId":"op-1","state":"confirmed"}}},
+        {"call":"finish","args":["$operation","confirmed"],"expect":{"value":{"operationId":"op-1","state":"confirmed"}}},
+        {"call":"finish","args":["$operation","rejected"],"expect":{"code":"OPERATION_FINAL"}},
+        {"call":"prepare","args":["$lease","op-1",{"side":"BUY"}],"expect":{"code":"ALREADY_SUBMITTED"}},
+        {"call":"importUnknown","args":["$lease","op-1",{"side":"SELL"}],"expect":{"code":"OPERATION_CONFLICT"}},
+        {"call":"importUnknown","args":["$lease","op-1",{"side":"BUY"}],"pick":["operationId","bodyHash","state"],"shape":"operation","expect":{"value":{"operationId":"op-1","bodyHash":"5384af005dcac70229459901ed272af65d3085c729680e14e2d15689bf7a3ad0","state":"confirmed"}}},
+        {"call":"prepare","args":["$lease","",{}],"expect":{"code":"INVALID_OPERATION_ID"}},
+        {"call":"prepare","args":["$lease","op-2",{"groupId":""}],"expect":{"code":"INVALID_GROUP_ID"}},
+        {"call":"prepare","args":["$lease","op-3",{"side":"SELL"}],"save":"rejected","pick":["state"],"expect":{"value":{"state":"sending"}}},
+        {"call":"finish","args":["$rejected","rejected"],"expect":{"value":{"operationId":"op-3","state":"rejected"}}},
+        {"call":"prepare","args":["$lease","op-3",{"side":"SELL"}],"expect":{"code":"ALREADY_REJECTED"}},
+        {"call":"importUnknown","args":["$lease","op-4",{"side":"BUY","leg":2}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"daff0f2bcb2a01b2934cf984154506a565d007f87cb8651415a55e5bccc14bad","state":"unknown"}}},
+        {"call":"unresolved","args":["$lease"],"pick":[],"shape":"unresolved","expect":{"value":{}}},
+        {"call":"prepare","args":["$lease","op-4",{"side":"BUY","leg":2}],"expect":{"code":"OPERATION_UNRESOLVED"}},
+        {"call":"releaseBinding","args":["connection-0"],"expect":{"code":"BINDING_UNRESOLVED"}},
+        {"call":"resolve","args":["op-4","$lease","confirmed"],"shape":"outcome","expect":{"value":{"operationId":"op-4","state":"confirmed"}}},
+        {"call":"resolve","args":["missing","$lease"],"expect":{"code":"OPERATION_NOT_FOUND"}},
+        {"call":"freeze","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}],"bogus"],"expect":{"code":"INVALID_ISOLATION"}},
+        {"call":"freeze","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}],"manual-isolation"],"shape":"isolation","expect":{"value":{"isolated":1,"reason":"manual-isolation"}}},
+        {"call":"claim","args":[[{"authority":"binance","environment":"mainnet","accountId":"000918273645"}]],"expect":{"code":"ACCOUNT_ISOLATED"}},
+        {"call":"snapshot","args":[],"pick":["accounts","bindings","isolations"],"shape":"snapshot","expect":{"value":{"accounts":[{"authority":"binance","environment":"mainnet","moduleId":"hub","state":"owned"}],"bindings":[{"authority":"binance","environment":"mainnet","moduleId":"hub","verified":true,"count":1}],"isolations":[{"authority":"binance","environment":"mainnet","reason":"manual-isolation","moduleId":"hub"}]}}},
+        {"call":"releaseBinding","args":["connection-0"],"expect":{"value":true}},
+        {"call":"releaseBinding","args":["connection-0"],"expect":{"value":false}},
+        {"call":"bind","args":["connection-0",{"authority":"binance","environment":"mainnet","accountId":"000918273645"},2],"pick":["generation","verified"],"expect":{"value":{"generation":3,"verified":true}}},
+        {"call":"assertOwned","args":["$lease"],"expect":{"code":"ACCOUNT_ISOLATED"}},
+        {"call":"bind","args":["connection-1",null,1,{"authority":"okx","environment":"mainnet"}],"pick":["generation","accountKey","verified"],"expect":{"value":{"generation":1,"accountKey":null,"verified":false}}},
+        {"call":"claim","args":[[{"authority":"okx","environment":"mainnet","accountId":"5"}]],"expect":{"code":"BINDING_REQUIRED"}}
+      ]
+    },
+    {
+      "name": "Aster intents: original order, leverage request and margin transfer hash the same on both sides",
+      "moduleId": "aster",
+      "steps": [
+        {"call":"bind","args":["connection-0",{"authority":"aster","environment":"mainnet","accountId":"0x1111111111111111111111111111111111111111"},1],"pick":["verified"],"expect":{"value":{"verified":true}}},
+        {"call":"bind","args":["connection-1",{"authority":"aster","environment":"mainnet","accountId":"0x2222222222222222222222222222222222222222"},1],"pick":["verified"],"expect":{"value":{"verified":true}}},
+        {"call":"bind","args":["connection-2",{"authority":"aster","environment":"mainnet","accountId":"0x3333333333333333333333333333333333333333"},1],"pick":["verified"],"expect":{"value":{"verified":true}}},
+        {"call":"claim","args":[[{"authority":"aster","environment":"mainnet","accountId":"0x1111111111111111111111111111111111111111"},{"authority":"aster","environment":"mainnet","accountId":"0x2222222222222222222222222222222222222222"},{"authority":"aster","environment":"mainnet","accountId":"0x3333333333333333333333333333333333333333"}]],"save":"lease","pick":[],"shape":"lease","expect":{"value":{}}},
+        {"call":"importUnknown","args":["$lease","hash-0",{"order":{"symbol":"BTCUSDT","positionSide":"LONG","side":"BUY","type":"MARKET","quantity":"0.01000","newClientOrderId":"original-L","newOrderRespType":"RESULT"}}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"391b24e661286f7b469b936790951333c2827bc18b755c4ca9a6cc73fd56490b","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","hash-1",{"method":"POST","path":"/fapi/v3/leverage","params":{"symbol":"BTCUSDT","leverage":"20"}}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"dc9dce5144ffe5e97d2fae67e4936f6e6e0d18c0225474929940e6530f6be787","state":"unknown"}}},
+        {"call":"importUnknown","args":["$lease","bad-target",{"intentAction":"cancel","intentTarget":{"accountKey":"not-a-key","symbol":"BTCUSDT","clientOrderId":"x"}}],"expect":{"code":"INVALID_INTENT_TARGET"}},
+        {"call":"importUnknown","args":["$lease","bad-margin",{"marginTransfer":{"version":1,"method":"POST","path":"/fapi/v3/subAccountTransfer","params":{"fromAccountAddress":"0x1111111111111111111111111111111111111111","toAccountAddress":"0x2222222222222222222222222222222222222222","asset":"USD1","amount":"0","kindType":"FUTURE_FUTURE"},"source":{"authority":"aster","environment":"mainnet","accountId":"0x1111111111111111111111111111111111111111"},"destination":{"authority":"aster","environment":"mainnet","accountId":"0x2222222222222222222222222222222222222222"},"master":{"authority":"aster","environment":"mainnet","accountId":"0x3333333333333333333333333333333333333333"}}}],"expect":{"code":"INVALID_MARGIN_TRANSFER"}},
+        {"call":"importUnknown","args":["$lease","hash-2",{"marginTransfer":{"version":1,"method":"POST","path":"/fapi/v3/subAccountTransfer","params":{"fromAccountAddress":"0x1111111111111111111111111111111111111111","toAccountAddress":"0x2222222222222222222222222222222222222222","asset":"USD1","amount":"12.3456789","kindType":"FUTURE_FUTURE"},"source":{"authority":"aster","environment":"mainnet","accountId":"0x1111111111111111111111111111111111111111"},"destination":{"authority":"aster","environment":"mainnet","accountId":"0x2222222222222222222222222222222222222222"},"master":{"authority":"aster","environment":"mainnet","accountId":"0x3333333333333333333333333333333333333333"}}}],"pick":["bodyHash","state"],"expect":{"value":{"bodyHash":"7a9de84efffa07447b4fcf3cc58e89b42ed6023d171a69391d4b2a9a187cee85","state":"unknown"}}},
+        {"call":"bind","args":["connection-0",{"authority":"aster","environment":"mainnet","accountId":"0x1111111111111111111111111111111111111111"},2],"pick":["generation","verified"],"expect":{"value":{"generation":2,"verified":true}}},
+        {"call":"assertOwned","args":["$lease"],"expect":{"code":"BINDING_CHANGED"}}
+      ]
+    }
+  ]
+}
