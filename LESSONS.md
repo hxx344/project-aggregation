@@ -1709,6 +1709,10 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 验证：`tests/trading-execution-rh-lighter.test.mjs` 的 `Anthropic market legs` 两项在修复前均复现暂停，修复后覆盖慢腿 11 秒导致快腿过期后的补读、持续旧盘口零发送与恢复后只发送一次；`tests/trading-execution.test.mjs` 覆盖挂单保留、持续失败预算、第二腿过期时第一腿不改价、停止/截止优先及无效/未来/交叉盘口拒绝。事件 `trading-stale-book-no-retry-20261107`；用户现场具体过期腿、读取耗时和服务器时钟差未取得日志，不能将离线慢腿复现当作现场根因证明。审查与交付证据见 [本次记录](docs/reviews/2026-11-07-ant-quote-recovery.md)。
 
+**Lighter 只读限流补充（2026-11-07）：** 用户截图再次出现 Binance 已全成、Lighter 部分成交后以“已达到本地限速”暂停。基线 `0ed4b6d` 的账户/盘口采集直接暂停，订单状态读取只有 20 秒通用窗口，未遵守适配器 `retryAt`。只对 Lighter 明确只读限流按恢复时间等待，首次失败起固定 180 秒、最多三次恢复；等待期间不读、不追价、不下新单，停止与任务截止优先，恢复重新核验所需证据。预算不能被同轮成功的状态读取清除；已接受建单的确定性“查无”仍保留原签名观察窗口。独立审查进一步确认：不能只检查 rejected Promise，还须先校验已成功返回的兄弟盘口、账户和订单终态，硬错误优先于限流等待；否则已越过价格界限或提前终止会被延后。该优先级缺口在交付前修复。
+
+验证见 [Lighter 执行回归](tests/trading-execution-rh-lighter.test.mjs) 的 `Lighter RH rate-limited` 用例，覆盖真实适配器模拟传输的本地配额耗尽和 HTTP 429、部分成交余量、等待零调用、恢复上限、停止/截止、未知单不重发和已成功返回的硬错误优先。修复前七组新用例均失败；独立三组优先级探针用于增量复核。[审查记录](docs/reviews/2026-11-07-rh-lighter-read-cooldown.md) 区分离线缺陷与尚未取得的服务器版本/失败端点证据。事件 `rh-lighter-read-rate-cooldown-20261107`；不推进复盘检查点。
+
 ### L104：`submit()` 的失败分支提前返回前必须重新保存委托
 
 **适用条件：** 在 `server/trading-execution.mjs` 的 `submit()` catch 块里新增任何提前 `return` 的分支（延后重发、bounce 重挂、已接受待可见等）。

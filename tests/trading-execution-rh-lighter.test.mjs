@@ -58,7 +58,7 @@ function venue(clock) {
     return answers[pathname]();
   };
   const client = createRhLighterExecutionClient({ ErrorClass: ExecutionExchangeError, fetchImpl, now: clock, signer, sleep: async () => {} });
-  return { client, requests };
+  return { client, requests, answers };
 }
 
 async function fixture(t, { realLighter = false } = {}) {
@@ -117,6 +117,224 @@ async function fixture(t, { realLighter = false } = {}) {
     get job() { return instance.state().jobs[0]; } };
 }
 const message = item => item.message ?? item;
+
+const limitedRead = (f, offset = 60_000) => Object.assign(new ExecutionExchangeError('upstream', { detail: '请求过于频繁，已达到本地限速' }), { rateLimited: true, retryAt: f.time + offset });
+async function advanceTicks(f, duration) {
+  const end = f.time + duration;
+  while (f.time < end) { f.advance(Math.min(10_000, end - f.time)); await f.service.tick(); }
+}
+
+test('Lighter RH rate-limited market reads keep the partly filled hedge and wait for the admission time', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.start(await f.preview()); await f.service.tick();
+  const sibling = [...f.records.values()].find(row => row.symbol === 'ANTHROPICUSDT');
+  Object.assign(sibling, { filledQuantity: sibling.quantity, terminal: true, childrenSettled: true, status: 'terminal' });
+  f.lighterOrder().filledQuantity = '0.4';
+  f.handlers['rh-lighter:market'] = async () => { throw limitedRead(f); };
+  await f.service.tick();
+  assert.equal(f.job.status, 'running');
+  assert.match(f.job.reason, /Lighter RH ANTHROPIC.*限速.*自动/);
+  const before = f.calls.length;
+  await advanceTicks(f, 59_999);
+  assert.equal(f.calls.length, before, 'cooldown ticks do not poll or mutate');
+  assert.equal(f.stops('rh-lighter').length, 0, 'the partly filled hedge stays on the book');
+  delete f.handlers['rh-lighter:market'];
+  await advanceTicks(f, 1);
+  assert.equal(f.job.status, 'running'); assert.equal(f.job.reason, null);
+  assert.equal(f.creates('binance').length, 1); assert.equal(f.creates('rh-lighter').length, 1);
+  assert.equal(lighterLeg(f).filledQuantity, '0.4');
+});
+
+test('Lighter RH rate-limited pre-send reads cover verify, account and market and revalidate after cooling', async t => {
+  for (const method of ['verify', 'account', 'market']) {
+    const f = await fixture(t); await f.connectLighter();
+    f.start(await f.preview());
+    f.handlers[`rh-lighter:${method}`] = async () => { throw limitedRead(f); };
+    await f.service.tick();
+    assert.equal(f.job.status, 'queued', method); assert.equal(f.creates().length, 0);
+    const before = f.calls.length;
+    await advanceTicks(f, 59_999); assert.equal(f.calls.length, before);
+    delete f.handlers[`rh-lighter:${method}`];
+    await advanceTicks(f, 1);
+    assert.equal(f.job.status, 'running'); assert.equal(f.creates().length, 2);
+    assert.equal(f.job.reason, null);
+  }
+  const changed = await fixture(t); await changed.connectLighter();
+  changed.start(await changed.preview());
+  changed.handlers['rh-lighter:account'] = async () => { throw limitedRead(changed); };
+  await changed.service.tick();
+  delete changed.handlers['rh-lighter:account'];
+  changed.accounts['rh-lighter'].openOrders = [{ symbol: 'ANTHROPIC', id: 'external-order' }];
+  await advanceTicks(changed, 60_000);
+  assert.equal(changed.job.status, 'paused'); assert.equal(changed.creates().length, 0, 'new external orders block recovery');
+});
+
+test('Lighter RH rate-limited status reads wait beyond the generic 20 s window without duplicate sends', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.start(await f.preview()); await f.service.tick();
+  f.handlers['rh-lighter:inspect'] = async () => { throw limitedRead(f); };
+  await f.service.tick();
+  const before = f.calls.length;
+  await advanceTicks(f, 59_999);
+  assert.equal(f.job.status, 'running'); assert.equal(f.calls.length, before);
+  delete f.handlers['rh-lighter:inspect'];
+  for (const row of f.records.values()) Object.assign(row, { filledQuantity: row.quantity, status: 'terminal', terminal: true, childrenSettled: true });
+  await advanceTicks(f, 1);
+  assert.equal(f.job.status, 'completed'); assert.equal(f.creates().length, 2); assert.equal(f.stops('rh-lighter').length, 0);
+});
+
+test('Lighter RH rate-limited cancel reconciliation preserves the partial fill and sends only the confirmed remainder', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.start(await f.preview()); await f.service.tick();
+  const original = f.lighterOrder(); original.filledQuantity = '0.4';
+  const sibling = [...f.records.values()].find(row => row.symbol === 'ANTHROPICUSDT');
+  Object.assign(sibling, { filledQuantity: sibling.quantity, status: 'terminal', terminal: true, childrenSettled: true });
+  f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.3' };
+  f.handlers['rh-lighter:stop'] = async (_credentials, _spec, options) => {
+    options.beforeMutation();
+    Object.assign(original, { status: 'terminal', terminal: true, childrenSettled: true });
+    f.handlers['rh-lighter:inspect'] = async () => { throw limitedRead(f); };
+    return { id: original.id };
+  };
+  await advanceTicks(f, 5000);
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates('rh-lighter').length, 1);
+  const before = f.calls.length;
+  await advanceTicks(f, 59_999); assert.equal(f.calls.length, before);
+  delete f.handlers['rh-lighter:inspect']; delete f.handlers['rh-lighter:stop'];
+  await advanceTicks(f, 1);
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates('rh-lighter').length, 2);
+  assert.equal(f.creates('rh-lighter')[1].args[1].quantity, '9.6');
+  assert.equal(f.creates('binance').length, 1); assert.equal(f.stops('rh-lighter').length, 1);
+});
+
+test('Lighter RH rate-limited reads have fixed time and attempt bounds despite successful status reads', async t => {
+  for (const [offset, bound] of [[10_000, 30_000], [60_000, 180_000], [600_000, 180_000]]) {
+    const f = await fixture(t); await f.connectLighter();
+    f.start(await f.preview()); await f.service.tick();
+    let reads = 0;
+    f.handlers['rh-lighter:market'] = async () => { reads += 1; throw limitedRead(f, offset); };
+    await f.service.tick();
+    await advanceTicks(f, bound - 1); assert.equal(f.job.status, 'running');
+    await advanceTicks(f, 1); assert.equal(f.job.status, 'paused');
+    assert.equal(reads, offset === 10_000 ? 4 : offset === 60_000 ? 3 : 1);
+    assert.match(f.job.reason, /限速.*(?:上限|超时|持续)/);
+  }
+});
+
+test('Lighter RH rate-limited waits yield to user stop, deadline and hard sibling failures', async t => {
+  for (const action of ['stop', 'deadline']) {
+    const f = await fixture(t); await f.connectLighter();
+    f.start(await f.preview(anthropic({ timeoutMs: 30_000 }))); await f.service.tick();
+    f.handlers['rh-lighter:market'] = async () => { throw limitedRead(f); };
+    await f.service.tick(); assert.equal(f.job.status, 'running');
+    if (action === 'stop') f.service.stop(f.job.id, {});
+    await advanceTicks(f, action === 'stop' ? 1000 : 30_000);
+    assert.equal(f.job.status, action === 'stop' ? 'stopped' : 'paused');
+    assert.equal(f.stops('rh-lighter').length, 1); assert.equal(f.creates().length, 2);
+  }
+  const f = await fixture(t); await f.connectLighter();
+  f.start(await f.preview()); await f.service.tick();
+  f.handlers['rh-lighter:inspect'] = async () => { throw limitedRead(f); };
+  f.handlers['binance:inspect'] = async () => { throw new ExecutionExchangeError('invalid_data'); };
+  await f.service.tick();
+  assert.notEqual(f.job.status, 'running', 'a bad sibling response is not hidden by a rate limit');
+});
+
+test('Lighter RH rate-limited real adapter quota exhaustion holds a queued job and recovers after the rolling window', async t => {
+  const f = await fixture(t, { realLighter: true }); await f.connectLighter();
+  const preview = await f.preview();
+  while (f.real.requests.length < 40) {
+    try { await f.real.client.account(f.lighterBody(), { symbols: ['ANTHROPIC'] }); }
+    catch (error) { assert.equal(error.rateLimited, true); break; }
+  }
+  assert.equal(f.real.requests.length, 40);
+  f.start(preview); await f.service.tick();
+  assert.equal(f.job.status, 'queued'); assert.match(f.job.reason, /已达到本地限速/);
+  const before = f.real.requests.length;
+  await advanceTicks(f, 59_999); assert.equal(f.real.requests.length, before);
+  await advanceTicks(f, 1);
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates('rh-lighter').length, 1); assert.equal(f.creates('binance').length, 1);
+});
+
+test('Lighter RH rate-limited real adapter 429 cooldown is observed without sending or polling early', async t => {
+  const f = await fixture(t, { realLighter: true }); await f.connectLighter();
+  f.start(await f.preview());
+  const original = f.real.answers['/api/v1/account'];
+  f.real.answers['/api/v1/account'] = () => new Response('{}', { status: 429 });
+  await f.service.tick();
+  assert.equal(f.job.status, 'queued'); assert.equal(f.creates().length, 0);
+  const count = f.real.requests.length;
+  await advanceTicks(f, 59_999); assert.equal(f.real.requests.length, count);
+  f.real.answers['/api/v1/account'] = original;
+  await advanceTicks(f, 1);
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates().length, 2);
+});
+
+test('Lighter RH rate-limited read classification does not hide sibling errors or uncertain/unclassified results', async t => {
+  for (const method of ['account', 'market']) {
+    const f = await fixture(t); await f.connectLighter(); f.start(await f.preview());
+    f.handlers[`rh-lighter:${method}`] = async () => { throw limitedRead(f); };
+    f.handlers[`binance:${method}`] = async () => { await new Promise(resolve => setImmediate(resolve)); throw new ExecutionExchangeError('invalid_data'); };
+    await f.service.tick();
+    assert.equal(f.job.status, 'paused', method); assert.equal(f.creates().length, 0);
+    assert.doesNotMatch(f.job.reason, /等待限速恢复/);
+  }
+  for (const change of [{ uncertain: true }, { rateLimited: false }, { retryAt: NaN }]) {
+    const f = await fixture(t); await f.connectLighter(); f.start(await f.preview());
+    f.handlers['rh-lighter:account'] = async () => { throw Object.assign(limitedRead(f), change); };
+    await f.service.tick(); assert.equal(f.job.status, 'paused'); assert.equal(f.creates().length, 0);
+  }
+});
+
+test('Lighter RH rate-limited reads clear only after a whole successful round and do not shorten accepted-create observation', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.handlers['rh-lighter:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw acceptedUnseen(); };
+  f.start(await f.preview()); await f.service.tick();
+  f.handlers['rh-lighter:inspect'] = async () => { throw limitedRead(f); };
+  await f.service.tick();
+  await advanceTicks(f, 59_999);
+  delete f.handlers['rh-lighter:inspect'];
+  await advanceTicks(f, 1);
+  await advanceTicks(f, 130_000);
+  assert.equal(f.job.status, 'running', 'confirmed not-found remains inside the accepted transaction lifetime');
+  assert.equal(f.creates('rh-lighter').length, 1, 'an accepted create is never duplicated');
+  assert.equal(f.job.reason, null);
+
+  const g = await fixture(t); await g.connectLighter(); g.start(await g.preview()); await g.service.tick();
+  g.handlers['rh-lighter:market'] = async () => { throw limitedRead(g, 10_000); };
+  await g.service.tick(); await advanceTicks(g, 20_000);
+  delete g.handlers['rh-lighter:market']; await advanceTicks(g, 10_000);
+  assert.equal(g.job.reason, null);
+  g.handlers['rh-lighter:market'] = async () => { throw limitedRead(g, 10_000); };
+  await g.service.tick(); assert.equal(g.job.status, 'running', 'a successful complete round resets the previous attempt budget');
+});
+
+test('Lighter RH rate-limited reads never hide hard facts in fulfilled sibling responses', async t => {
+  for (const mode of ['future-book', 'stop-price', 'early-terminal', 'external-order']) {
+    const f = await fixture(t); await f.connectLighter();
+    const body = anthropic(); body.legs[1].stopPrice = '100';
+    f.start(await f.preview(body));
+    if (mode !== 'external-order') await f.service.tick();
+    if (mode === 'early-terminal') {
+      const sibling = [...f.records.values()].find(row => row.symbol === 'ANTHROPICUSDT');
+      Object.assign(sibling, { status: 'terminal', terminal: true, childrenSettled: true, filledQuantity: '0.1' });
+      f.handlers['rh-lighter:inspect'] = async () => { throw limitedRead(f); };
+    } else if (mode === 'external-order') {
+      f.accounts.binance.openOrders = [{ symbol: 'ANTHROPICUSDT', id: 'external' }];
+      f.handlers['rh-lighter:account'] = async () => { throw limitedRead(f); };
+    } else {
+      f.handlers['rh-lighter:market'] = async () => { throw limitedRead(f); };
+      f.overrides['binance:ANTHROPICUSDT'] = mode === 'future-book' ? { at: new Date(f.time + 120_000).toISOString() } : { bid: '98', ask: '99' };
+    }
+    await f.service.tick();
+    assert.notEqual(f.job.status, 'running', mode);
+    assert.notEqual(f.job.status, 'queued', mode);
+    assert.doesNotMatch(f.job.reason, /等待限速恢复/, mode);
+    const diagnostic = mode === 'future-book' ? /盘口时间超前/ : mode === 'stop-price' ? /追价界限/ : mode === 'early-terminal' ? /提前终止/ : /本任务之外/;
+    assert.ok(f.job.events.some(event => diagnostic.test(message(event))), mode);
+    assert.equal(f.creates().length, mode === 'external-order' ? 0 : 2);
+  }
+});
 
 test('Anthropic market legs refresh the fast book after a slow sibling before sending either leg', async t => {
   const f = await fixture(t); await f.connectLighter();

@@ -26,6 +26,10 @@ const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5
 // pauses and cancels it (which would leave the filled sibling unhedged). Both
 // bounds apply, so a read that hangs until the call deadline still gets retries.
 const READ_RETRY_MS = 20_000, READ_RETRY_ATTEMPTS = 3;
+// An explicit Lighter read cooldown can exceed the generic transport window.
+// Wait without polling, then re-enter all normal checks. Three recovery tries
+// and a fixed three-minute window bound the entire streak, not each endpoint.
+const RATE_READ_RETRY_MS = 10_000, RATE_READ_WINDOW_MS = 180_000, RATE_READ_RETRIES = 3;
 // Binance -1003, Bybit 10006 and OKX 50011 are request-rate refusals.
 const RATE_LIMIT_CODES = new Set([-1003, 10006, 50011]);
 // Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
@@ -67,6 +71,12 @@ const UNSETTLED_ORDER = "(CASE WHEN json_valid(json) THEN json_extract(json,'$.s
 const ORDER_INDEX_SQL = `
   CREATE INDEX IF NOT EXISTS execution_orders_unsettled ON execution_orders(job_id) WHERE ${UNSETTLED_ORDER};`;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
+class RateLimitedReadError extends ExecutionError {
+  constructor(exchange, symbol, error) {
+    super(502, `${TRADING_NAMES[exchange]} ${symbol}：${safeError(error)}`);
+    this.retryAt = error.retryAt;
+  }
+}
 const QUOTES_TTL_MS = 2000, QUOTE_TIMEOUT_MS = 6000;
 const safeError = error => error instanceof ExecutionError || error instanceof ExecutionExchangeError ? error.message.slice(0, 220) : '交易所响应无法确认，请核对任务与交易所委托';
 const validRevision = value => Number.isSafeInteger(value) && value >= 0;
@@ -103,6 +113,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const attentionChecks = new Map();
   const readFailures = new Map();
   const marketFailures = new Map();
+  const rateReadFailures = new Map();
   let protectionReady = !accountWriter;
   let closed = false, closing = false, leader = false, heldLease = false, retired = false, ticking = null;
   function lostLease() {
@@ -436,15 +447,43 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
     return state();
   }
-  async function collectMarkets(legs) {
+  async function readCall(exchange, symbol, operation) {
+    try { return await call(operation); }
+    catch (error) {
+      // Only a known read can acquire this classification. A create/cancel
+      // response, including an uncertain send, never becomes a retryable read.
+      if (exchange === 'rh-lighter' && error instanceof ExecutionExchangeError && error.rateLimited === true && !error.uncertain && Number.isSafeInteger(error.retryAt)) {
+        throw new RateLimitedReadError(exchange, symbol, error);
+      }
+      throw error;
+    }
+  }
+  async function readGroup(reads) {
+    const results = await Promise.allSettled(reads), errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+    if (!errors.length) return;
+    // Finish sibling reads and surface a hard failure even if the rate-limited
+    // read rejected first. No in-flight snapshot is carried into the next tick.
+    const hard = errors.find(error => !(error instanceof RateLimitedReadError));
+    throw hard ?? errors.reduce((latest, error) => error.retryAt > latest.retryAt ? error : latest);
+  }
+  async function collectMarkets(legs, validate = () => {}) {
     const markets = new Map(), received = new Map();
+    const checked = (leg, value, allowStale = false) => {
+      let market;
+      try { market = normalizeMarket(value, leg.symbol, now(), leg.exchange); }
+      catch (error) { if (allowStale && error instanceof StaleMarketError) return; throw error; }
+      validate(leg, market);
+    };
     const read = async leg => {
-      const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal }));
+      const value = await readCall(leg.exchange, leg.symbol, signal => clients.get(leg.exchange).market(leg.symbol, { signal }));
       requireLease();
       const key = `${leg.exchange}:${leg.symbol}`;
       markets.set(key, value); received.set(key, now());
+      // Hard failures in a returned sibling book outrank another leg's rate
+      // limit. Old books alone still get the bounded refresh below.
+      checked(leg, value, true);
     };
-    await Promise.all(legs.map(read));
+    await readGroup(legs.map(read));
     // A slow sibling or cold rule lookup can age a fast book while we await the
     // group. Refresh only old books once, under the same per-call timeout. Keep
     // venue timestamps and validate the entire group again after this wait.
@@ -452,20 +491,21 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       try { normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange); return false; }
       catch (error) { if (error instanceof StaleMarketError) return true; throw error; }
     });
-    await Promise.all(stale.map(read));
-    for (const leg of legs) normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
+    await readGroup(stale.map(read));
+    for (const leg of legs) checked(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
     requireLease(); return { markets, received };
   }
-  async function collect(legs) {
+  async function collect(legs, { validateAccount = () => {}, validateMarket } = {}) {
     const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), connections = new Map();
-    await Promise.all(exchanges.map(async exchange => {
+    await readGroup(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
       const symbols = [...new Set(legs.filter(leg => leg.exchange === exchange).map(leg => leg.symbol))];
-      const account = await call(async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity) throw new ExecutionError(409, '交易账户身份不一致'); return snapshot; });
+      const account = await readCall(exchange, symbols.join(' / '), async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity) throw new ExecutionError(409, '交易账户身份不一致'); return snapshot; });
       requireLease();
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
+      for (const leg of legs.filter(item => item.exchange === exchange)) validateAccount(leg, account);
       if (accountWriter) {
         if (!ctx.row.identity && account.identity) stmt.prepare('UPDATE execution_accounts SET identity=? WHERE exchange=? AND revision=?').run(account.identity, exchange, ctx.row.revision);
         bindAccount(exchange, ctx.row.revision, account.identity);
@@ -473,7 +513,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       snapshots.set(exchange, account); connections.set(exchange, connection(ctx.row));
       stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(mergeSnapshot(ctx.row.snapshot, account, symbols)), exchange, ctx.row.revision);
     }));
-    const { markets, received } = await collectMarkets(legs);
+    const { markets, received } = await collectMarkets(legs, validateMarket);
     requireLease(); return { snapshots, markets, connections, received };
   }
   // Display-only top of book on every venue (same-venue spreads are the main
@@ -633,7 +673,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (order.kind === 'strategy' && !order.remoteId && !explicitId) return false;
     const ctx = context(order.exchange, order.accountRevision);
     let value;
-    try { value = await call(signal => ctx.client.inspect(ctx.credentials, { ...order.spec, id: explicitId ?? order.remoteId }, { ...ctx.options, signal, cancelRecovery })); }
+    try { value = await readCall(order.exchange, order.spec.symbol, signal => ctx.client.inspect(ctx.credentials, { ...order.spec, id: explicitId ?? order.remoteId }, { ...ctx.options, signal, cancelRecovery })); }
     catch (error) { if (error?.notFound && await absentCreate(order)) return true; throw error; }
     requireLease();
     const current = orderFor(order.localId), filledQuantity = validateInspection(current, value, { explicit: !!explicitId, cancelRecovery });
@@ -699,7 +739,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   async function freshPosition(order) {
     const job = jobFor(order.jobId), leg = job.plan.legs.find(item => item.id === order.legId);
     const ctx = context(order.exchange, order.accountRevision);
-    const account = await call(signal => ctx.client.account(ctx.credentials, { ...ctx.options, signal, symbols: [order.spec.symbol] }));
+    const account = await readCall(order.exchange, order.spec.symbol, signal => ctx.client.account(ctx.credentials, { ...ctx.options, signal, symbols: [order.spec.symbol] }));
     requireLease();
     if (!leg?.currentQuantity || !Array.isArray(account?.openOrders) || !Array.isArray(account?.strategies)) return { account, matches: false };
     const busy = account.openOrders.some(item => item.symbol === order.spec.symbol) || account.strategies.some(item => item.symbol === order.spec.symbol && item.status !== 'terminal');
@@ -1050,8 +1090,26 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     heldRemainders.add(key); event(latest, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 剩余数量低于交易所最小下单量，委托保留原价、不再追价`); saveJob(latest);
   }
   // Transport-level read failures; data, identity and rejection errors still pause at once.
-  const transientRead = error => error instanceof ExecutionExchangeError && !closing
-    && (['timeout', 'transport', 'upstream', 'aborted'].includes(error.code) || error.code === 'rejected' && RATE_LIMIT_CODES.has(error.providerCode));
+  const transientRead = error => !closing && (error instanceof RateLimitedReadError || error instanceof ExecutionExchangeError
+    && (['timeout', 'transport', 'upstream', 'aborted'].includes(error.code) || error.code === 'rejected' && RATE_LIMIT_CODES.has(error.providerCode)));
+  function deferRateRead(id, error) {
+    const time = now(), previous = rateReadFailures.get(id), since = previous?.since ?? time;
+    const count = previous?.count ?? 0;
+    if (count >= RATE_READ_RETRIES || time - since >= RATE_READ_WINDOW_MS) return false;
+    const reason = `${safeError(error)}；等待限速恢复后自动核对，期间不追价、不下新单`;
+    const job = jobFor(id);
+    if (!previous) event(job, `${reason}（最多重试 ${RATE_READ_RETRIES} 次、${RATE_READ_WINDOW_MS / 1000} 秒）`);
+    rateReadFailures.set(id, { since, count: count + 1, retryAt: Math.max(time + RATE_READ_RETRY_MS, error.retryAt), reason });
+    job.reason = reason; saveJob(job); return true;
+  }
+  function rateReadsRecovered(id) {
+    const previous = rateReadFailures.get(id);
+    if (!previous) return;
+    rateReadFailures.delete(id);
+    const job = jobFor(id);
+    if (job.reason === previous.reason) job.reason = null;
+    event(job, 'Lighter RH 限速后的必要读取与校验已恢复，继续执行'); saveJob(job);
+  }
   function marketsRecovered(id) {
     if (!marketFailures.delete(id)) return;
     const job = jobFor(id); job.reason = null;
@@ -1067,16 +1125,39 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (!['queued', 'running'].includes(job.status)) return;
       protectJob(job);
       if (now() >= Date.parse(job.deadlineAt)) { pause(id, '执行时间已到，停止追价并撤销余单'); await stopping(jobFor(id)); return; }
+      const rateWait = rateReadFailures.get(id);
+      if (rateWait && now() - rateWait.since >= RATE_READ_WINDOW_MS) throw new ExecutionError(502, 'Lighter RH 持续限速，自动恢复已达到时间上限，暂停并核对余单');
+      if (rateWait && now() < rateWait.retryAt) return;
       const allBefore = orders(id), working = allBefore.filter(unsettled);
       if (working.length) {
         const readings = await Promise.allSettled(working.map(order => inspectOrder(order)));
+        const active = [];
+        for (const [index, original] of working.entries()) {
+          if (readings[index].status !== 'fulfilled' || readings[index].value !== true) continue;
+          const order = orderFor(original.localId), leg = job.plan.legs.find(item => item.id === order.legId);
+          if (order.settled) {
+            if (compareDecimals(order.filledQuantity, order.spec.quantity) < 0 && !order.cancelRequestedAt && !order.bounced) throw new ExecutionError(409, legOrderType(order.spec) === 'market' ? `${TRADING_NAMES[order.exchange]} ${order.spec.symbol} 市价单未全部成交（流动性不足或交易所价格保护），暂停其余交易腿` : '委托提前终止且未全部成交，暂停其余交易腿');
+            continue;
+          }
+          if (order.state === 'paused' || order.state === 'terminal') throw new ExecutionError(409, '交易所策略暂停或子单尚未结束，暂停其余交易腿');
+          active.push({ order, leg });
+        }
         const unread = working.map((order, index) => ({ order, result: readings[index] })).filter(({ result }) => result.status === 'rejected' || result.value === false);
         // An accepted Lighter RH create that is not visible yet holds the task (no
         // reprice, cancel or new send) until its signed expiry plus the
         // not-created check has passed; only then does a miss pause the task.
         const pending = unread.filter(({ order, result }) => pendingVisible(orderFor(order.localId)) && result.status === 'rejected' && (result.reason?.notFound || transientRead(result.reason)));
         const failed = unread.filter(item => !pending.includes(item));
+        const limited = unread.filter(({ result }) => result.status === 'rejected' && result.reason instanceof RateLimitedReadError);
+        // A malformed/foreign sibling response still wins over a cooldown.
+        if (limited.length && failed.every(({ result }) => result.status === 'rejected' && transientRead(result.reason))) {
+          throw limited.reduce((latest, item) => item.result.reason.retryAt > latest.retryAt ? item.result.reason : latest, limited[0].result.reason);
+        }
         if (!failed.length && pending.length) {
+          // A definitive not-found is a successful read while an accepted
+          // transaction is still becoming visible. Keep its original signed
+          // observation window; a past rate limit must not shorten that window.
+          if (pending.every(({ result }) => result.reason?.notFound)) rateReadsRecovered(id);
           // Every other read succeeded: an earlier transient streak must not carry over the hold.
           if (readFailures.delete(id)) { const latest = jobFor(id); event(latest, '委托状态已恢复读取，继续执行'); saveJob(latest); }
           return;
@@ -1095,24 +1176,12 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (readFailures.delete(id)) { const latest = jobFor(id); event(latest, '委托状态已恢复读取，继续执行'); saveJob(latest); }
         job = jobFor(id);
         if (job.status === 'stopping') { await stopping(job); return; }
-        const active = [];
-        for (const original of working) {
-          const order = orderFor(original.localId), leg = job.plan.legs.find(item => item.id === order.legId);
-          if (order.settled) {
-            if (compareDecimals(order.filledQuantity, order.spec.quantity) < 0 && !order.cancelRequestedAt && !order.bounced) throw new ExecutionError(409, legOrderType(order.spec) === 'market' ? `${TRADING_NAMES[order.exchange]} ${order.spec.symbol} 市价单未全部成交（流动性不足或交易所价格保护），暂停其余交易腿` : '委托提前终止且未全部成交，暂停其余交易腿');
-            continue;
-          }
-          if (order.state === 'paused' || order.state === 'terminal') throw new ExecutionError(409, '交易所策略暂停或子单尚未结束，暂停其余交易腿');
-          active.push({ order, leg });
-        }
         // Check every resting leg before any reprice/cancel; a later stale leg
         // must not leave an earlier sibling already changed in this round.
-        const { markets } = await collectMarkets(active.map(item => item.leg));
-        for (const { leg } of active) {
-          const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
+        const { markets } = await collectMarkets(active.map(item => item.leg), (leg, market) => {
           checkContract(leg, market);
           if (stopReached(leg, market)) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 已达到追价界限`);
-        }
+        });
         for (const { order, leg } of active) {
           const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
           // An automatic order rests at its last price rather than chase past the batch limit.
@@ -1144,6 +1213,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const remaining = job.plan.legs.map(leg => ({ leg, quantity: subtract(leg.batchQuantities[job.batchIndex], totalFilled(all, leg.id, job.phase, job.batchIndex)) }));
       if (remaining.some(item => compareDecimals(item.quantity, '0') < 0)) throw new ExecutionError(409, '本批成交量超出计划，请核对仓位');
       if (remaining.every(item => item.quantity === '0') && all.every(order => order.settled)) {
+        rateReadsRecovered(id);
         marketsRecovered(id); job = jobFor(id);
         job.batchIndex += 1;
         event(job, `第 ${job.batchIndex} / ${job.plan.batchCount} 批全部成交且委托已结束`);
@@ -1152,22 +1222,25 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       }
       if (now() < job.nextBatchAt) return;
       const candidates = remaining.filter(item => compareDecimals(item.quantity, '0') > 0 && !all.some(order => order.legId === item.leg.id && !order.settled));
-      if (!candidates.length) { marketsRecovered(id); return; }
+      if (!candidates.length) { rateReadsRecovered(id); marketsRecovered(id); return; }
       // The group waits for a deferred Lighter RH create and keeps re-sends after a post-only bounce apart.
       if (candidates.some(({ leg }) => now() < resendAt(job, all, leg))) return;
-      const { snapshots, markets, received } = await collect(candidates.map(item => item.leg));
-      for (const { leg, quantity } of candidates) {
-        const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
-        checkContract(leg, market);
-        checkPosition(snapshots.get(leg.exchange), leg, job.plan.action, quantity);
-        // Candidates have no unsettled order on this symbol. Any remaining venue
-        // order (including eventually consistent own orders) blocks a new submit.
-        ensureNoExternalOrders(snapshots.get(leg.exchange), leg.symbol);
-        checkChildQuantity(quantity, market, job.plan.action, legOrderType(leg));
-        if (stopReached(leg, market)) throw new ExecutionError(409, '最新盘口已达到追价界限');
-        if (WALLET_VENUES.has(leg.exchange)) checkHyperliquidPrice(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
-      }
-      marketsRecovered(id); job = jobFor(id);
+      const quantityFor = leg => candidates.find(item => item.leg.id === leg.id).quantity;
+      const { markets, received } = await collect(candidates.map(item => item.leg), {
+        validateAccount(leg, account) {
+          checkPosition(account, leg, job.plan.action, quantityFor(leg));
+          // Candidates have no unsettled own order. Even an eventually
+          // consistent remaining venue order blocks another submit.
+          ensureNoExternalOrders(account, leg.symbol);
+        },
+        validateMarket(leg, market) {
+          checkContract(leg, market);
+          checkChildQuantity(quantityFor(leg), market, job.plan.action, legOrderType(leg));
+          if (stopReached(leg, market)) throw new ExecutionError(409, '最新盘口已达到追价界限');
+          if (WALLET_VENUES.has(leg.exchange)) checkHyperliquidPrice(leg, market);
+        },
+      });
+      rateReadsRecovered(id); marketsRecovered(id); job = jobFor(id);
       if (job.auto?.guard && candidates.length === job.plan.legs.length && !guardMet(id, job, candidates, markets, all, received)) return;
       writable(); job = jobFor(id);
       if (!['queued', 'running'].includes(job.status)) return;
@@ -1179,7 +1252,12 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     } catch (error) {
       try {
         requireLease();
-        const latest = jobFor(id), message = safeError(error);
+        const latest = jobFor(id);
+        let message = safeError(error);
+        if (error instanceof RateLimitedReadError && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
+          if (deferRateRead(id, error)) return;
+          message = `Lighter RH 持续限速，自动恢复已达到重试上限（${message}）`;
+        }
         if (error instanceof StaleMarketError && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
           const streak = marketFailures.get(id) ?? { since: now(), count: 0 };
           if (streak.count < READ_RETRY_ATTEMPTS || now() - streak.since < READ_RETRY_MS) {
@@ -1194,7 +1272,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       } catch { /* A new lease owner will reconcile durable intents. */ }
     } finally {
       busyJobs.delete(id);
-      if (!['queued', 'running'].includes(jobFor(id).status)) { readFailures.delete(id); marketFailures.delete(id); }
+      if (!['queued', 'running'].includes(jobFor(id).status)) { readFailures.delete(id); marketFailures.delete(id); rateReadFailures.delete(id); }
       if (FINAL.has(jobFor(id).status)) { writerTickets.delete(id); recoveredWriterJobs.delete(id); attentionChecks.delete(id); }
     }
   }
