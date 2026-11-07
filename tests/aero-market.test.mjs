@@ -207,17 +207,19 @@ test('each scan records hourly samples for gauge pools, served per window and on
   await reopened.close();
 });
 
-test('replay runs the recommended cells over hourly samples and skips short, unknown or disabled pools', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'aero-market-')); t.after(() => rmSync(dir, { recursive: true, force: true }));
+test('replay runs hourly samples with coverage and input identity, and skips unknown or disabled pools', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'aero-market-'));
   onlyBase(dir);
   const fake = fakeChain(), clock = timers();
   const market = createAeroMarket({ dataDir: dir, log: silent, now: () => fake.chain.t * 1000, reads: fake.reads, createRpc: fake.createRpc, setTimer: clock.setTimer, clearTimer: clock.clearTimer });
-  t.after(() => market.close());
+  t.after(async () => { await market.close(); rmSync(dir, { recursive: true, force: true }); });
   await market.initialize();
   await clock.fire(); await settle(market);
   const body = (pools, extra = {}) => ({ window: '7d', deposit: 1000, delayMin: 5, pools, ...extra });
   const pools = [['base', POOL_WETH, 10], ['base', POOL_AERO, 0], ['base', `0x${'9'.repeat(40)}`, 3]];
-  assert.deepEqual((await market.replay(body(pools))).pools, {}, 'one hourly sample is not enough');
+  const short = await market.replay(body(pools));
+  assert.equal(short.pools[`base:${POOL_WETH}`].status, 'insufficient_history');
+  assert.equal(short.pools[`base:${POOL_WETH}`].net, null, 'one hourly sample is not enough');
   for (let h = 0; h < 7; h++) {
     fake.chain.t += 3600;
     while (clock.pending()[0]?.ms === 30_000) { await clock.fire(); await settle(market); }
@@ -225,8 +227,11 @@ test('replay runs the recommended cells over hourly samples and skips short, unk
   }
   const result = await market.replay(body(pools));
   assert.equal(result.available, true);
+  assert.equal(result.version, market.state().samples.version); assert.equal(result.enabledChains, 'base');
   assert.deepEqual(Object.keys(result.pools).sort(), [`base:${POOL_AERO}`, `base:${POOL_WETH}`].sort(), 'unknown pools are skipped');
   const weth = result.pools[`base:${POOL_WETH}`];
+  assert.equal(weth.cells, 10); assert.equal(weth.status, 'complete'); assert.equal(weth.gapHours, 0);
+  assert.equal(weth.to - weth.from, weth.hours * 3_600_000);
   assert.ok(weth.hours >= 6 && weth.emission > 0, JSON.stringify(weth));
   // 响应按 5 位有效数字取整，恒等式按最大分量的精度核对。
   assert.ok(Math.abs(weth.net - (weth.emission - weth.impermanent - weth.cost)) <= 1e-4 * Math.max(Math.abs(weth.emission), Math.abs(weth.impermanent), weth.cost, 1e-9), JSON.stringify(weth));
@@ -234,6 +239,15 @@ test('replay runs the recommended cells over hourly samples and skips short, unk
     body([['mars', POOL_WETH, 1]]), body(Array.from({ length: 251 }, () => ['base', POOL_WETH, 1])), { ...body(pools), extra: 1 }]) {
     await assert.rejects(market.replay(bad), (e) => e.status === 400);
   }
+  const tiny = (await market.replay(body([['base', POOL_WETH, 1]], { deposit: 1e-9 }))).pools[`base:${POOL_WETH}`];
+  assert.equal(tiny.status, 'cost_exhausted'); assert.equal(tiny.apr, null);
+  assert.ok(tiny.cost >= 0 && tiny.emission >= 0 && Number.isFinite(tiny.net));
+  fake.chain.t += 8 * 3600;
+  while (clock.pending()[0]?.ms === 30_000) { await clock.fire(); await settle(market); }
+  await clock.fire(); await settle(market);
+  const gapped = (await market.replay(body(pools))).pools[`base:${POOL_WETH}`];
+  assert.equal(gapped.status, 'insufficient_history'); assert.equal(gapped.hours, 0); assert.equal(gapped.net, null);
+  assert.equal(gapped.naturalHours, 15); assert.equal(gapped.validHours, 7); assert.equal(gapped.gapHours, 8);
   const config = market.state().config;
   await market.save({ ...config, chains: { ...config.chains, base: { ...config.chains.base, enabled: false } } });
   assert.deepEqual((await market.replay(body(pools))).pools, {}, 'disabled chains are not replayed');

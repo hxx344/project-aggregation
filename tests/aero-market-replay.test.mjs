@@ -50,7 +50,7 @@ test('leaving the range rebalances once at the hour, pays the cost and keeps net
 test('full range never rebalances and lags holding by the v2 loss', () => {
   // 价格 ×4：全范围仓位价值 / 持有价值 = 2√4 / (1 + 4) = 0.8。
   const up = Math.round(Math.log(4) / Math.log(1.0001));
-  const r = run(series([TICK, TICK + up], { emission: 0 }), { cells: 0 });
+  const r = run(series([TICK, ...flat(6, TICK + up)], { emission: 0 }), { cells: 0 });
   assert.equal(r.rebalances, 0); assert.equal(r.intraHour, 0);
   const hold = 10_000 / 2 * 4 + 10_000 / 2;
   close(r.impermanent, hold * 0.2, 1e-3);
@@ -70,9 +70,56 @@ test('missing emission hours are reported and the start waits for a price', () =
   const r = run(s);
   close(r.hours, 7); close(r.missingHours, 2);
   assert.equal(r.from, HOUR);
-  assert.equal(run(series([TICK])), null, 'one sample is not a path');
+  assert.equal(run(series([TICK])).status, 'insufficient_history', 'one sample is not a path');
   assert.equal(run(series(flat(3)), { deposit: 0 }), null);
   assert.ok(MIN_REPLAY_HOURS >= 1);
   const huge = run(series(flat(9)), { cells: 2 * 887272 });
   assert.ok(huge && Number.isFinite(huge.net) && huge.rebalances === 0, 'cells beyond the usable range are clamped to full range');
+});
+
+test('only adjacent valid hourly intervals count, and a gap starts a new position in the latest segment', () => {
+  const sparse = series(flat(2)); sparse.slots = [0, 8 * HOUR];
+  const a = run(sparse);
+  assert.equal(a.status, 'insufficient_history'); assert.equal(a.net, null);
+  assert.equal(a.naturalHours, 8); assert.equal(a.validHours, 0); assert.equal(a.gapHours, 8); assert.equal(a.hours, 0);
+  const interrupted = series([...flat(7), ...flat(7, TICK + 900)]);
+  interrupted.slots = [...Array.from({ length: 7 }, (_, i) => i * HOUR), ...Array.from({ length: 7 }, (_, i) => (10 + i) * HOUR)];
+  const b = run(interrupted), latest = run(series(flat(7, TICK + 900)));
+  assert.equal(b.status, 'complete'); assert.equal(b.from, 10 * HOUR); assert.equal(b.to, 16 * HOUR);
+  assert.equal(b.naturalHours, 16); assert.equal(b.validHours, 12); assert.equal(b.gapHours, 4); assert.equal(b.hours, 6);
+  close(b.net, latest.net); close(b.cost, latest.cost); assert.equal(b.rebalances, 0, 'no guessed exit across the missing path');
+  interrupted.slots.pop(); for (const field of ['ticks', 'staked', 'usd0', 'usd1', 'emission', 'vol']) interrupted[field].pop();
+  assert.equal(run(interrupted).status, 'insufficient_history', 'an older long segment cannot hide the latest short segment');
+  assert.equal(run(series(flat(6))).net, null, 'six points only cover five intervals');
+  assert.equal(run(series(flat(7))).hours, MIN_REPLAY_HOURS, 'seven points cover six intervals');
+  const noPrice = series(flat(9)); noPrice.usd1[4] = NaN;
+  assert.equal(run(noPrice).status, 'insufficient_history'); assert.equal(run(noPrice).gapHours, 2);
+  const offHour = series(flat(9)); offHour.slots[4] += 1;
+  assert.equal(run(offHour).status, 'insufficient_history');
+});
+
+test('rebalance costs below, at and above equity never create negative liquidity or later emissions', () => {
+  for (const intra of [false, true]) {
+    const s = series(intra ? flat(9) : [TICK + 5, ...flat(8, TICK + 400)], { vol: intra ? 0.2 : 1e-6 });
+    for (const fraction of [0.5, 1, 2]) {
+      const r = run(s, { cells: intra ? 1 : 20, costFraction: fraction, delaySec: 0 });
+      assert.ok(r.cost >= 0 && r.emission >= 0);
+      close(r.net, r.emission - r.impermanent - r.cost);
+      if (fraction < 1) {
+        assert.equal(r.status, 'complete'); assert.equal(r.hours, 8); assert.notEqual(r.apr, null);
+      } else {
+        assert.equal(r.status, 'cost_exhausted'); assert.equal(r.hours, 1); assert.equal(r.to, HOUR); assert.equal(r.apr, null);
+        close(r.emission, intra ? 36 : 18);
+        assert.equal(r.rebalances, intra ? 0 : 1); assert.equal(r.intraHour, intra ? 1 : 0);
+        const atLimit = run(s, { cells: intra ? 1 : 20, costFraction: 1, delaySec: 0 });
+        close(r.cost, atLimit.cost); close(r.net, atLimit.net, 1e-12);
+        if (intra) close(r.net + 10_000, r.emission, 1e-12);
+      }
+    }
+  }
+  const tiny = run(series(flat(9), { vol: 0.2 }), { cells: 1, deposit: 1e-9, costFraction: 0.2 / 1e-9, delaySec: 0 });
+  assert.equal(tiny.status, 'cost_exhausted'); close(tiny.cost, 1e-9, 1e-15);
+  assert.equal(tiny.hours, 1); assert.ok(Number.isFinite(tiny.net));
+  const dust = run(series(flat(9), { vol: 0.2 }), { cells: 1, deposit: Number.MIN_VALUE, costFraction: Infinity, delaySec: 0 });
+  assert.equal(dust.status, 'cost_exhausted'); assert.equal(dust.hours, 1); assert.ok(dust.cost >= 0 && Number.isFinite(dust.net));
 });

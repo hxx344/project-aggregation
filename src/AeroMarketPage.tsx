@@ -77,7 +77,9 @@ const cellsOf = (pool: MarketPool, range: [number, number]) => {
   const full = fullRange(pool.tickSpacing);
   return range[0] <= full[0] && range[1] >= full[1] ? 0 : Math.round((range[1] - range[0]) / pool.tickSpacing);
 };
-const perDay = (r: MarketReplay) => (r.net / r.hours) * 24;
+const perDay = (r: MarketReplay) => r.net === null ? null : (r.net / r.hours) * 24;
+const replayAmount = (r: MarketReplay | null) => !r || r.net === null ? '—'
+  : r.status === 'cost_exhausted' ? `${signedUsd(r.net)}（已终止）` : `${signedUsd(perDay(r))}/天`;
 const exitsOf = (r: MarketReplay) => r.rebalances + r.intraHour;
 const Q96 = 2 ** 96;
 // 调仓停摆与最短在区间的输入上限：停摆超过 1 天时模型会偏向几乎一直空仓的窄区间。
@@ -176,7 +178,7 @@ function averageOf(pool: MarketPool, entry: MarketSamples['pools'][string] | und
 function PoolFacts({ metrics, width, average, replay }: { metrics: Metrics; width: number; average: string; replay: string }) {
   const { pool } = metrics, r = metrics.replay;
   return <dl className="am-detail-facts">
-    <div><dt>历史回放（推荐宽度）</dt><dd className={r ? r.net > 0 ? 'up' : r.net < 0 ? 'down' : '' : ''}>{r ? `${signedUsd(r.net)} · ${signedUsd(perDay(r))}/天 · 年化 ${pct(r.apr, 0)}` : '—'}<small>{replay}</small></dd></div>
+    <div><dt>历史回放（推荐宽度）</dt><dd className={(r?.net ?? 0) > 0 ? 'up' : (r?.net ?? 0) < 0 ? 'down' : ''}>{r?.net !== null && r ? `${signedUsd(r.net)} · ${replayAmount(r)}${r.apr !== null ? ` · 年化 ${pct(r.apr, 0)}` : ''}` : '—'}<small>{replay}</small></dd></div>
     <div><dt>池子</dt><dd><code>{pool.address}</code></dd></div>
     <div><dt>Gauge</dt><dd>{pool.gauge ? <code>{pool.gauge}</code> : '无（不产生排放）'}</dd></div>
     <div><dt>净年化（列表 {widthLabel(width)}）</dt><dd>{pct(metrics.net?.net, 0)}<small>{metrics.net ? `排放 ${pct(metrics.net.emission, 0)} − 无常损失 ${pct(metrics.net.impermanent, 0)} − 停摆 ${pct(metrics.net.downtime, 0)} − 调仓 ${pct(metrics.net.rebalance, 0)}` : '缺少波动率或排放'}{metrics.best ? `；推荐 ${rangeLabel(pool, metrics.best.range)} 为 ${pct(metrics.best.result.net, 0)}` : ''}</small></dd></div>
@@ -241,8 +243,8 @@ export default function AeroMarketPage({ market, safe = null, onExpired, onConfi
   const samplesGeneration = useRef(0);
   const samplesRef = useRef(samples);
   samplesRef.current = samples;
-  // 回放结果连同它对应的请求参数：参数与当前不符时视为计算中，不把别的投入金额下的盈亏当成当前的显示。
-  const [replay, setReplay] = useState<{ window: MarketWindow; deposit: number; delayMin: number; data: MarketReplays | null; error: string } | null>(null);
+  // 结果、错误与排序都绑定完整输入身份，包含样本版本、启用链和推荐格数。
+  const [replay, setReplay] = useState<{ signature: string; data: MarketReplays | null; error: string } | null>(null);
   const replayGeneration = useRef(0);
   const [minScoreText, setMinScoreText] = useState('');
   const [minAvgScoreText, setMinAvgScoreText] = useState('');
@@ -316,8 +318,8 @@ export default function AeroMarketPage({ market, safe = null, onExpired, onConfi
     return best && (p.emissionPerSec ?? 0) > 0 ? [[p.chain, p.address, cellsOf(p, best.range)]] : [];
   }), [snapshot, recommended]);
   const replaySignature = avgWindow === 'off' || samplesVersion === null || !(deposit > 0) ? null : JSON.stringify([avgWindow, deposit, delayMin, samplesVersion, enabledChains, replayPools]);
-  const replayInput = useRef({ window: avgWindow, deposit, delayMin, pools: replayPools });
-  replayInput.current = { window: avgWindow, deposit, delayMin, pools: replayPools };
+  const replayInput = useRef({ window: avgWindow, deposit, delayMin, pools: replayPools, samplesVersion, enabledChains });
+  replayInput.current = { window: avgWindow, deposit, delayMin, pools: replayPools, samplesVersion, enabledChains };
   useEffect(() => {
     if (replaySignature === null || !freshSnapshot) return;
     const page = lifetime.current?.signal;
@@ -326,21 +328,28 @@ export default function AeroMarketPage({ market, safe = null, onExpired, onConfi
     const signal = AbortSignal.any([page, run.signal]);
     const version = ++replayGeneration.current;
     const current = () => !signal.aborted && version === replayGeneration.current;
-    const { window: win, deposit: dep, delayMin: delay, pools } = replayInput.current;
+    const { window: win, deposit: dep, delayMin: delay, pools, samplesVersion: sampleVersion, enabledChains: chains } = replayInput.current;
     if (win === 'off') return;
     const timer = setTimeout(() => void (async () => {
-      const done = (data: MarketReplays | null, error = '') => setReplay((r) => ({ window: win, deposit: dep, delayMin: delay, data: data ?? (r?.window === win && r.deposit === dep && r.delayMin === delay ? r.data : null), error }));
+      const done = (data: MarketReplays | null, error = '') => setReplay((r) => ({ signature: replaySignature, data: data ?? (r?.signature === replaySignature ? r.data : null), error }));
       try {
         const batches = Array.from({ length: Math.ceil(pools.length / REPLAY_BATCH) }, (_, i) => pools.slice(i * REPLAY_BATCH, (i + 1) * REPLAY_BATCH));
         const parts = await Promise.all(batches.map((batch) => api<MarketReplays>(`${ROOT}/replay`, { method: 'POST', body: JSON.stringify({ window: win, deposit: dep, delayMin: delay, pools: batch }), signal, timeoutMs: 20_000 })));
         if (!current()) return;
+        const consistent = parts.every((part, i) => {
+          const requested = new Map(batches[i].map(([chain, address, cells]) => [`${chain}:${address}`, cells]));
+          return part.window === win && part.version === sampleVersion && part.enabledChains === chains && part.from === parts[0]?.from
+            && Object.entries(part.pools).every(([id, result]) => requested.has(id) && requested.get(id) === result.cells);
+        });
+        if (!consistent) throw new Error('回放样本或推荐宽度已变化，等待最新快照后重算');
         const unavailable = parts.find((part) => !part.available);
-        done({ window: win, available: !unavailable, error: unavailable?.error ?? null, version: parts[0]?.version ?? 0, from: parts[0]?.from, pools: Object.assign({}, ...parts.map((part) => part.pools)) });
+        done({ window: win, available: !unavailable, error: unavailable?.error ?? null, version: sampleVersion ?? 0, enabledChains: chains, from: parts[0]?.from, pools: Object.assign({}, ...parts.map((part) => part.pools)) });
       } catch (reason) { if (current()) fail(reason, (text) => done(null, text)); }
     })(), REPLAY_DEBOUNCE_MS);
     return () => { clearTimeout(timer); run.abort(); };
   }, [replaySignature, freshSnapshot, fail, lifetime]);
-  const replayData = avgWindow !== 'off' && replay?.window === avgWindow && replay.deposit === deposit && replay.delayMin === delayMin ? replay.data : null;
+  const currentReplay = replaySignature !== null && replay?.signature === replaySignature ? replay : null;
+  const replayData = currentReplay?.data ?? null;
   const all = useMemo(() => (snapshot?.pools ?? []).map((p) => {
     const best = recommended.get(key(p)) ?? null, m = metricsFor(p, aeroUsd, width, deposit, best, plan);
     const withReplay = replayData?.available && best ? { ...m, replay: replayData.pools[key(p)] ?? null } : m;
@@ -351,15 +360,18 @@ export default function AeroMarketPage({ market, safe = null, onExpired, onConfi
     if (avgWindow === 'off') return '未计算（在筛选栏选择历史窗口）';
     if (snapshot?.samples === undefined) return '服务端未提供样本，更新后可用';
     if (!(deposit > 0)) return '请填写投入金额';
-    const failed = replay?.window === avgWindow && replay.deposit === deposit && replay.delayMin === delayMin ? replay.error : '';
+    const failed = currentReplay?.error;
     if (failed) return `回放失败：${failed}`;
     if (!replayData) return '正在回放…';
     if (!replayData.available) return `样本库不可用${replayData.error ? `：${replayData.error}` : ''}`;
     if (!m?.best) return '没有推荐区间（缺少波动率、排放或 AERO 价），无法回放';
-    if (!m.replay) return `${WINDOWS[avgWindow]}该池的小时样本不足 6 小时，继续累计`;
+    if (!m.replay) return `${WINDOWS[avgWindow]}该池还没有可用的回放样本`;
     const r = m.replay;
+    const coverage = `自然跨度 ${r.naturalHours.toFixed(0)} 小时，有效区间 ${r.validHours.toFixed(0)} 小时，缺口 ${r.gapHours.toFixed(0)} 小时；最新连续段 ${when(r.from)} 至 ${when(r.to)}，已回放 ${r.hours.toFixed(0)} 小时`;
+    if (r.status === 'insufficient_history') return `${coverage}；连续有效区间不足 6 小时，暂不计算收益`;
     return `投入 ${usd(deposit)} 按推荐宽度（${rangeLabel(m.pool, m.best.range)}）在${WINDOWS[avgWindow]}的真实小时路径上自动调仓：排放 ${signedUsd(r.emission)} − 无常损失 ${usd(r.impermanent)} − 调仓成本 ${usd(r.cost)} = ${signedUsd(r.net)}（相对一直持有初始两币）；`
-      + `整点出区间 ${r.rebalances} 次、小时内碰边约 ${r.intraHour.toFixed(1)} 次，在区间 ${pct(r.inRange, 0)}，覆盖 ${r.hours.toFixed(0)} 小时${r.missingHours > 0 ? `（其中 ${r.missingHours.toFixed(0)} 小时缺排放读数，按 0 计）` : ''}`;
+      + `整点出区间 ${r.rebalances} 次、小时内碰边约 ${r.intraHour.toFixed(1)} 次，在区间 ${pct(r.inRange, 0)}；${coverage}${r.missingHours > 0 ? `（其中 ${r.missingHours.toFixed(0)} 小时缺排放读数，按 0 计）` : ''}`
+      + (r.status === 'cost_exhausted' ? '；调仓成本耗尽仓位，回放已终止，后续不计排放、不折算年化' : '');
   };
   // 平均值的状态说明：样本库不可用、读取中、还在累计或覆盖不足时都要讲清楚，不能让空列看起来像是池子没收益。
   const averageNote = (m: Metrics | null) => {
@@ -552,7 +564,7 @@ export default function AeroMarketPage({ market, safe = null, onExpired, onConfi
           return <tr key={k} onClick={() => openPool(m.pool)}>
               <th scope="row"><span className="am-pool-cell"><button type="button" className={`am-star${starred ? ' on' : ''}`} aria-pressed={starred} aria-label={`${starred ? '取消收藏' : '收藏'} ${pairName(m.pool)}`} title={favoriteDisabled ? '正在连接服务器，稍后可收藏' : starred ? '取消收藏' : '收藏'} disabled={favoriteDisabled} onClick={(e) => { e.stopPropagation(); toggleFavorite(m.pool); }}><Star size={15} /></button>
                 <button type="button" className="am-pool" title="查看池子详情"><strong>{pairName(m.pool)}{(() => { const status = m.pool.chain === 'base' ? poolStatus(safe, m.pool) : null; return status ? <span className={`as-tag ${status}`}>{status === 'listed' ? '已加池' : '待加池'}</span> : null; })()}</strong><small>{chainNames.get(m.pool.chain)} · CL{m.pool.tickSpacing} · {m.pool.fee === null ? '—' : `${(m.pool.fee / 1e4).toFixed(2)}%`} · {short(m.pool.address)}</small></button></span></th>
-              <td className={`num strong ${m.replay ? m.replay.net > 0 ? 'up' : m.replay.net < 0 ? 'down' : '' : ''}`} title={replayNote(m)}>{m.replay ? `${signedUsd(perDay(m.replay))}/天` : '—'}<small>{m.replay ? `年化 ${pct(m.replay.apr, 0)} · 调仓 ${exitsOf(m.replay).toFixed(0)} 次 · ${m.replay.hours.toFixed(0)} 小时` : ''}</small></td>
+              <td className={`num strong ${(m.replay?.net ?? 0) > 0 ? 'up' : (m.replay?.net ?? 0) < 0 ? 'down' : ''}`} title={replayNote(m)}>{replayAmount(m.replay)}<small>{m.replay?.net !== null && m.replay ? `${m.replay.apr !== null ? `年化 ${pct(m.replay.apr, 0)} · ` : ''}调仓 ${exitsOf(m.replay).toFixed(0)} 次 · ${m.replay.hours.toFixed(0)} 小时` : ''}</small></td>
               <td className="num">{m.score === null ? '—' : m.score.toFixed(1)}</td>
               <td className="num" title={averageNote(m)}>{m.avg?.score == null ? '—' : m.avg.score.toFixed(1)}</td>
               <td className={`num ${(m.best?.result.net ?? 0) > 0 ? 'up' : (m.best?.result.net ?? 0) < 0 ? 'down' : ''}`}>{pct(m.best?.result.net, 0)}<small>{m.best ? `${rangeLabel(m.pool, m.best.range)} · ${days(m.best.result.days)}` : ''}</small></td>

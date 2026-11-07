@@ -6,6 +6,7 @@ const LOG_TICK = Math.log(1.0001);
 const MIN_TICK = -887272, MAX_TICK = 887272;
 const Q96 = 2 ** 96;
 const DAY = 86400;
+const HOUR = 3600;
 // 与 src/aero-market-math.ts 的 VOL_FLOOR、REBALANCE_GAS_USD 相同。
 export const VOL_FLOOR = 0.001;
 const REBALANCE_GAS_USD = { ethereum: 10 };
@@ -60,9 +61,24 @@ export function replayPool(series, { tickSpacing, decimals0, decimals1, cells, c
   const { slots, ticks, staked, usd0, usd1, emission, vol } = series;
   const usdPerToken1 = (i) => known(usd1[i]) && usd1[i] > 0 ? usd1[i] / 10 ** decimals1
     : known(usd0[i]) && usd0[i] > 0 ? usd0[i] / 10 ** decimals0 / priceOf(ticks[i]) : null;
-  let start = 0;
-  while (start < slots.length && !(usdPerToken1(start) > 0)) start++;
-  if (slots.length - start < 2 || !(deposit > 0) || !(costFraction >= 0)) return null;
+  // 极小的合法投入可能使 gas/本金溢出为 Infinity，仍按成本耗尽处理，不把它伪装成缺少样本。
+  if (!slots.length || !known(deposit) || !(deposit > 0) || !(costFraction >= 0)) return null;
+  // 缺口两侧的持仓路径未知，不能跨过去继续旧仓位。只重放最新连续有效整点段，
+  // 同时保留整个窗口的自然跨度与有效区间数；缺排放与缺价格/整点是不同的问题。
+  const valid = (i) => Number.isInteger(slots[i]) && slots[i] % HOUR === 0 && known(ticks[i])
+    && ticks[i] >= MIN_TICK && ticks[i] <= MAX_TICK && usdPerToken1(i) > 0 && known(staked[i]) && staked[i] >= 0;
+  let start = 0, validSec = 0;
+  for (let i = 1; i < slots.length; i++) {
+    if (valid(i - 1) && valid(i) && slots[i] - slots[i - 1] === HOUR) validSec += HOUR;
+    else start = i;
+  }
+  const last = slots.length - 1;
+  const naturalHours = Math.max(0, slots[last] - slots[0]) / HOUR;
+  const hours = valid(last) ? (slots[last] - slots[start]) / HOUR : 0;
+  const coverage = { naturalHours, validHours: validSec / HOUR, gapHours: Math.max(0, naturalHours - validSec / HOUR),
+    from: slots[start], to: slots[last], hours };
+  if (hours < MIN_REPLAY_HOURS) return { ...coverage, status: 'insufficient_history', net: null, emission: null, impermanent: null, cost: null,
+    rebalances: 0, intraHour: 0, inRange: 0, missingHours: 0, apr: null };
   const full = cells === 0;
   // 格数超过可用范围时按全范围的边界截断。
   const [minTick, maxTick] = fullRange(tickSpacing);
@@ -70,13 +86,15 @@ export function replayPool(series, { tickSpacing, decimals0, decimals1, cells, c
   let [lower, upper] = rangeAt(ticks[start]);
   let price = usdPerToken1(start);
   let l = deposit / price / valueOf(1, lower, upper, ticks[start]);
+  if (!(l > 0) || !Number.isFinite(l)) return null;
   const [hold0, hold1] = amountsOf(l, lower, upper, ticks[start]);
   let earned = 0, costUsd = 0, rebalances = 0, intraHour = 0, liveSec = 0, totalSec = 0, missingSec = 0, downLeft = 0;
+  let endIndex = start, status = 'complete';
   for (let i = start + 1; i < slots.length; i++) {
     const dt = slots[i] - slots[i - 1], from = ticks[i - 1], to = ticks[i];
-    if (!(dt > 0)) continue;
     totalSec += dt;
-    price = usdPerToken1(i) ?? price;
+    endIndex = i;
+    price = usdPerToken1(i);
     const out = to < lower || to >= upper;
     let cross = 0;
     if (!out && !full) {
@@ -92,27 +110,31 @@ export function replayPool(series, { tickSpacing, decimals0, decimals1, cells, c
     else earned += rate * (l / (others + l)) * Math.max(live - lost, 0);
     if (cross > 0) {
       const value = valueOf(l, lower, upper, to);
-      costUsd += cross * costFraction * value * price;
-      l *= 1 - cross * costFraction;
+      const paidFraction = Math.min(cross * costFraction, 1);
+      costUsd += paidFraction * value * price;
+      l *= 1 - paidFraction;
       intraHour += cross;
+      if (paidFraction === 1) { status = 'cost_exhausted'; break; }
     }
     if (out) {
       const value = valueOf(l, lower, upper, to);
-      costUsd += value * costFraction * price;
+      const paidFraction = Math.min(costFraction, 1);
+      costUsd += value * paidFraction * price;
       [lower, upper] = rangeAt(to);
-      l = (value * (1 - costFraction)) / valueOf(1, lower, upper, to);
+      l = (value * (1 - paidFraction)) / valueOf(1, lower, upper, to);
       rebalances++;
+      if (paidFraction === 1) { status = 'cost_exhausted'; break; }
       downLeft = delaySec;
     }
   }
   if (!(totalSec > 0) || !Number.isFinite(l)) return null;
-  const end = ticks[slots.length - 1];
+  const end = ticks[endIndex];
   const behind = (valueOf(l, lower, upper, end) - (hold0 * priceOf(end) + hold1)) * price;
   const net = behind + earned;
   if (!Number.isFinite(net)) return null;
   return {
-    hours: totalSec / 3600, from: slots[start], to: slots[slots.length - 1], net, emission: earned, impermanent: -behind - costUsd, cost: costUsd,
+    ...coverage, status, hours: totalSec / HOUR, to: slots[endIndex], net, emission: earned, impermanent: -behind - costUsd, cost: costUsd,
     rebalances, intraHour, inRange: liveSec / totalSec, missingHours: missingSec / 3600,
-    apr: (net / deposit) * ((365 * DAY) / totalSec),
+    apr: status === 'complete' ? (net / deposit) * ((365 * DAY) / totalSec) : null,
   };
 }

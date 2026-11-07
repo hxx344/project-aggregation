@@ -12,7 +12,7 @@ import { emissionRate, liquiditySegments, priceChange, realizedVol, solvePrices,
 import * as chainReads from './aero-market-rpc.mjs';
 import { rpcDiagnostic } from './aero-market-rpc.mjs';
 import { openMarketSamples, SAMPLE_WINDOWS } from './aero-market-samples.mjs';
-import { MIN_REPLAY_HOURS, rebalanceCostFraction, replayPool } from './aero-market-replay.mjs';
+import { rebalanceCostFraction, replayPool } from './aero-market-replay.mjs';
 
 const HOUR = 3600;
 const HISTORY_SEC = 7 * 86400;
@@ -641,14 +641,17 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
       return { ...result, tag, pools: Object.fromEntries(Object.entries(result.pools).filter(([k]) => on.has(k.slice(0, k.indexOf(':'))))) };
     },
     // 历史回放：按窗口取每个池子的逐小时序列，用页面给的格数与当前读数估算的单次调仓成本重放自动调仓策略。
-    // 停用的链、不在跟踪中的池子、样本不足 MIN_REPLAY_HOURS 的池子不返回。
+    // 停用的链和不在跟踪中的池子不返回；连续样本不足的池子只返回覆盖诊断。
     async replay(value) {
       const request = strictReplayRequest(value);
-      const empty = (error) => ({ window: request.window, available: false, error, version: samples?.status().version ?? 0, pools: {} });
+      const enabled = () => AERO_CHAINS.filter((c) => config.enabled && config.chains[c.id].enabled).map((c) => c.id).sort().join(',');
+      const empty = (error) => ({ window: request.window, available: false, error, version: samples?.status().version ?? 0, enabledChains: enabled(), pools: {} });
       if (!samples) return empty(null);
       let store;
       try { store = await samples.series(); } catch (reason) { return empty(String(reason?.message || reason).slice(0, 240)); }
       if (!store) return empty(samples.status().error);
+      // series() 可能等待读盘；等待完成后锁定版本，下面同步计算，不混合不同批次的样本。
+      const version = samples.status().version, enabledChains = enabled();
       const nowSec = Math.floor(now() / 1000), from = Math.floor(nowSec / HOUR) * HOUR - SAMPLE_WINDOWS[request.window] + HOUR;
       const pools = {}, rowsOf = new Map();
       for (const { chain, address, cells } of request.pools) {
@@ -661,12 +664,13 @@ export function createAeroMarket({ dataDir, enabledByDefault = true, log = conso
         const view = Object.fromEntries(Object.entries(s).map(([f, list]) => [f, list.slice(i)]));
         const result = replayPool(view, { tickSpacing: row.tickSpacing, decimals0: row.token0.decimals, decimals1: row.token1.decimals, cells,
           costFraction: rebalanceCostFraction(row, request.deposit), deposit: request.deposit, delaySec: request.delayMin * 60 });
-        if (!result || result.hours < MIN_REPLAY_HOURS) continue;
-        const r = (v, d = 5) => Number(v.toPrecision(d));
-        pools[key] = { hours: r(result.hours, 4), net: r(result.net), emission: r(result.emission), impermanent: r(result.impermanent), cost: r(result.cost),
+        if (!result) continue;
+        const r = (v, d = 5) => v === null ? null : Number(v.toPrecision(d));
+        pools[key] = { ...result, cells, from: result.from * 1000, to: result.to * 1000,
+          hours: r(result.hours, 4), net: r(result.net), emission: r(result.emission), impermanent: r(result.impermanent), cost: r(result.cost),
           rebalances: result.rebalances, intraHour: r(result.intraHour, 3), inRange: r(result.inRange, 3), missingHours: r(result.missingHours, 3), apr: r(result.apr) };
       }
-      return { window: request.window, available: true, error: null, version: samples.status().version, from: from * 1000, pools };
+      return { window: request.window, available: true, error: null, version, enabledChains, from: from * 1000, pools };
     },
     async initialize() {
       if (initialized) return;
