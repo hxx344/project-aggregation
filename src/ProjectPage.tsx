@@ -7,7 +7,7 @@ import ModuleRecovery from './ModuleRecovery';
 import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
-import { createPositionsSource, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest } from './hub-positions';
+import { createPositionsSource, EXECUTION_LEG_MARKETS, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest, withExecutionLegs } from './hub-positions';
 import { FILLS_CAPABILITIES, FILLS_CACHE_MS, FILLS_TIMEOUT_MS, fillsCacheMs, fillsReply, fillsRequest, type FillMarket } from './hub-fills';
 
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
@@ -39,6 +39,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
   // Advances whenever the iframe document may have changed, so late replies never reach a newer document.
   const documentGeneration = useRef(0);
   const positions = useRef<ReturnType<typeof createPositionsSource> | null>(null);
+  const executionLegs = useRef<ReturnType<typeof createPositionsSource> | null>(null);
   const fills = useRef<Partial<Record<FillMarket, ReturnType<typeof createPositionsSource>>>>({});
   const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading });
   latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading };
@@ -82,11 +83,13 @@ export default function ProjectPage({ project, snapshot, now, active, background
         // Background reads are only for the visible page; hidden pages get the cache or 'unavailable'.
         // A 401 here is a background helper failure: answer the module, never expire the hub session.
         positions.current ??= createPositionsSource(signal => api('/api/trading/positions', { signal, timeoutMs: POSITIONS_TIMEOUT_MS }));
-        void positions.current.read(latest.current.active && document.visibilityState === 'visible').then(outcome => {
+        const legs = EXECUTION_LEG_MARKETS.includes(request.market) ? executionLegs.current ??= createPositionsSource(signal => api('/api/trading/anthropic', { signal, timeoutMs: POSITIONS_TIMEOUT_MS })) : null;
+        const allowNetwork = latest.current.active && document.visibilityState === 'visible';
+        void Promise.all([positions.current.read(allowNetwork), legs?.read(allowNetwork)]).then(([outcome, legOutcome]) => {
           if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('positions')) return;
-          post(positionsReply(request, outcome, Date.now()));
+          post(positionsReply(request, legOutcome ? withExecutionLegs(outcome, legOutcome) : outcome, Date.now()));
           // A foreground request this page refused means the module missed an activity change; resend it.
-          if (outcome.status === 'unavailable' && outcome.reason === 'background') synchronize();
+          if ([outcome, legOutcome].some(value => value?.status === 'unavailable' && value.reason === 'background')) synchronize();
         });
       } else if (positionsBridge && connected.current && data.type === 'fills-request' && moduleCapabilities.current.includes('fills')) {
         const request = fillsRequest(data); if (!request) return;
@@ -106,7 +109,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
     return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
   useEffect(synchronize, [active, backgroundUpdates, query, source]);
-  useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; for (const source of Object.values(fills.current)) source.dispose(); fills.current = {}; }, []);
+  useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; executionLegs.current?.dispose(); executionLegs.current = null; for (const source of Object.values(fills.current)) source.dispose(); fills.current = {}; }, []);
 
   useEffect(() => {
     const pending = pendingTabs.current;
