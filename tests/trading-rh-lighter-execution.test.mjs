@@ -253,6 +253,64 @@ test('the auth token is refreshed ten minutes before its deadline and public rea
   assert.ok(idle.of('/api/v1/orderBooks').every(call => call.init.headers.Authorization === undefined), 'an expired token is not sent');
 });
 
+test('a token the venue refuses is signed again on the next request, and disconnecting forgets every token and identity', async () => {
+  let refuse = true;
+  const h = harness({ routes: { '/api/v1/accountOrders': () => refuse ? json({ code: 20013, message: 'invalid auth' }, 401) : ok({ orders: [] }) } });
+  await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'd1' })), isError('permissions', { providerCode: 20013 }));
+  assert.equal(h.signed('authToken').length, 1);
+  refuse = false;
+  await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'd2' })), isError('not_found'));
+  assert.equal(h.signed('authToken').length, 2, 'the refused token is not reused');
+  await h.client.verify(credentials); await h.client.verify(credentials);
+  const lookups = h.of('/api/v1/accountsByL1Address').length;
+  assert.equal(lookups, 1, 'a verified identity is cached');
+  h.client.forget();
+  h.advance(600_000);
+  const after = h.calls.length;
+  await h.client.market('ANTHROPIC');
+  const reads = h.calls.slice(after);
+  assert.ok(reads.length && reads.every(call => call.init.headers.Authorization === undefined), 'market reads go back to unauthenticated');
+  await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'd3' })), isError('not_found'));
+  assert.equal(h.signed('authToken').length, 3, 'a new connection signs a new token');
+  await h.client.verify(credentials);
+  assert.equal(h.of('/api/v1/accountsByL1Address').length, lookups + 1, 'identity is read again');
+});
+
+test('a call still in flight when the key is forgotten neither signs nor caches anything for it', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = harness({ routes: { '/api/v1/accountsByL1Address': async () => { await gate; return ok({ l1_address: ADDRESS, sub_accounts: [{ index: 12345, l1_address: ADDRESS }] }); } } });
+  const pending = h.client.verify(credentials);
+  await new Promise(resolve => setImmediate(resolve));
+  h.client.forget();
+  release();
+  await assert.rejects(pending, isError('aborted'));
+  assert.equal(h.signed('authToken').length, 0, 'no signature for a forgotten key');
+  const after = h.calls.length;
+  await h.client.market('ANTHROPIC');
+  assert.ok(h.calls.slice(after).every(call => call.init.headers.Authorization === undefined), 'no token was cached');
+});
+
+test('a create waiting for its nonce when the key is forgotten is refused as not sent, unsigned and unsent', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = harness({ routes: { '/api/v1/nextNonce': async () => { await gate; return ok({ account_index: 12345, api_key_index: 5, nonce: 41 }); } } });
+  await h.client.market('ANTHROPIC');
+  const pending = h.client.create(credentials, spec());
+  for (let index = 0; index < 20 && !h.of('/api/v1/nextNonce').length; index += 1) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.of('/api/v1/nextNonce').length, 1, 'the create is held at the nonce read');
+  h.client.forget();
+  release();
+  await assert.rejects(pending, error => isError('aborted', { notSent: true })(error) && !error.uncertain);
+  assert.deepEqual([h.signed('createOrder').length, h.of(SEND).length], [0, 0]);
+});
+
+test('an order timestamp in milliseconds is refused, since the venue reports seconds', async () => {
+  const value = spec({ id: String(indexOf(spec())) });
+  const h = harness({ routes: { '/api/v1/accountOrders': ok({ orders: [orderRow(spec(), { timestamp: T0 })] }) } });
+  await assert.rejects(h.client.inspect(credentials, value), isError('invalid_data'));
+});
+
 test('account reports positions, open orders and the account leverage of the selected contract', async () => {
   const h = harness({ routes: {
     '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
@@ -372,7 +430,7 @@ test('create waits for the predicted execution time, bounded, before looking for
 
 test('an accepted create that never becomes visible, or reads back wrong, stays uncertain', async () => {
   const missing = harness();
-  await assert.rejects(missing.client.create(credentials, spec()), isError('not_found', { uncertain: true }));
+  await assert.rejects(missing.client.create(credentials, spec()), isError('not_found', { uncertain: true, accepted: true }));
   assert.deepEqual(missing.sleeps, [300, 1000]);
   assert.equal(missing.of('/api/v1/accountOrders').length, 2);
   assert.equal(missing.of(SEND).length, 1, 'never re-sent');
@@ -383,10 +441,10 @@ test('an accepted create that never becomes visible, or reads back wrong, stays 
 
   for (const row of [orderRow(spec(), { is_ask: true }), orderRow(spec(), { time_in_force: 'good-till-time' }), orderRow(spec(), { status: 'weird' })]) {
     const wrong = harness({ routes: { '/api/v1/accountOrders': ok({ orders: [row] }) } });
-    await assert.rejects(wrong.client.create(credentials, spec()), isError('invalid_data', { uncertain: true }));
+    await assert.rejects(wrong.client.create(credentials, spec()), isError('invalid_data', { uncertain: true, accepted: true }));
   }
   const unreadable = harness({ routes: { '/api/v1/accountOrders': () => json({ error: 'busy' }, 500) } });
-  await assert.rejects(unreadable.client.create(credentials, spec()), isError('upstream', { uncertain: true }));
+  await assert.rejects(unreadable.client.create(credentials, spec()), isError('upstream', { uncertain: true, accepted: true }));
   const duplicate = harness({ routes: { '/api/v1/accountOrders': ok({ orders: [orderRow(spec()), orderRow(spec())] }) } });
   await assert.rejects(duplicate.client.create(credentials, spec()), isError('invalid_data', { uncertain: true }));
 });
@@ -501,7 +559,7 @@ test('a 429, 405 or code 23000 starts a 60 s cooldown during which nothing is re
   for (const routes of [{ '/api/v1/orderBooks': () => json({}, 429) }, { '/api/v1/orderBooks': () => json({}, 405) }, { '/api/v1/orderBooks': { code: 23000 } }, { '/api/v1/orderBooks': () => json({ code: 23000 }, 400) }]) {
     let refusing = true;
     const h = harness({ routes: { '/api/v1/orderBooks': (...args) => refusing ? (typeof routes['/api/v1/orderBooks'] === 'function' ? routes['/api/v1/orderBooks'](...args) : json(routes['/api/v1/orderBooks'])) : ok({ order_books: [{ symbol: 'ANTHROPIC', market_id: 7, market_type: 'perp' }] }) } });
-    await assert.rejects(h.client.market('ANTHROPIC'), isError('upstream'));
+    await assert.rejects(h.client.market('ANTHROPIC'), isError('upstream', { rateLimited: true, retryAt: T0 + 60_000 }));
     refusing = false;
     h.advance(59_999);
     await assert.rejects(h.client.market('ANTHROPIC'), error => isError('upstream')(error) && /冷却/.test(error.message));
@@ -512,7 +570,7 @@ test('a 429, 405 or code 23000 starts a 60 s cooldown during which nothing is re
   }
 
   const limited = harness({ sends: [() => json({ code: 23000, message: 'too many requests' }, 400)] });
-  await assert.rejects(limited.client.create(credentials, spec()), error => isError('rejected', { uncertain: false, providerCode: 23000 })(error) && error.notSent === undefined, 'a venue refusal reached the venue');
+  await assert.rejects(limited.client.create(credentials, spec()), error => isError('rejected', { uncertain: false, providerCode: 23000, rateLimited: true, retryAt: T0 + 60_000 })(error) && error.notSent === undefined, 'a venue refusal reached the venue');
   const before = limited.calls.length;
   await assert.rejects(limited.client.create(credentials, spec({ clientId: 'c2' })), error => error instanceof ExecutionExchangeError && error.uncertain === false);
   assert.equal(limited.calls.length, before, 'a refused send is not followed by another request inside the cooldown');
@@ -557,27 +615,27 @@ test('a bounced post-only order drops the cached book so the re-send reads a new
   assert.equal(h.of('/api/v1/orderBookOrders').length, 2);
 });
 
-test('the local limit admits 50 requests per rolling minute and fails a request that would wait longer than 8 s', async () => {
+test('the local limit admits 40 requests per rolling minute and fails a request that would wait longer than 8 s', async () => {
   const h = harness({ routes: { '/api/v1/accountOrders': ok({ orders: [] }) } });
-  for (let index = 0; index < 50; index += 1) await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'r' + index })), isError('not_found'));
-  assert.equal(h.calls.length, 50);
-  await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'r50' })), error => isError('upstream', { uncertain: false })(error) && /本地限速/.test(error.message));
+  for (let index = 0; index < 40; index += 1) await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'r' + index })), isError('not_found'));
+  assert.equal(h.calls.length, 40);
+  await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'r40' })), error => isError('upstream', { uncertain: false, rateLimited: true, retryAt: T0 + 60_000 })(error) && /本地限速/.test(error.message));
   h.advance(51_999);
   await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'r51' })), error => isError('upstream')(error) && /本地限速/.test(error.message));
-  assert.equal(h.calls.length, 50, 'refused before sending');
+  assert.equal(h.calls.length, 40, 'refused before sending');
   assert.deepEqual(h.sleeps, [], 'a long wait is not queued');
   h.advance(1);
   await assert.rejects(h.client.inspect(credentials, spec({ clientId: 'r52' })), isError('not_found'));
   assert.deepEqual(h.sleeps, [8000], 'a wait of up to 8 s is slept, then sent');
-  assert.equal(h.calls.length, 51);
-  assert.equal(h.calls[50].at, T0 + 60_000);
+  assert.equal(h.calls.length, 41);
+  assert.equal(h.calls[40].at, T0 + 60_000);
 
   const m = harness();
   m.orders.set(indexOf(spec()), orderRow(spec()));
   await m.client.create(credentials, spec());
   const used = m.calls.length;
-  for (let index = used; index < 50; index += 1) await assert.rejects(m.client.inspect(credentials, spec({ clientId: 'm' + index })), isError('not_found'));
-  await assert.rejects(m.client.create(credentials, spec({ clientId: 'm-next' })), error => isError('rejected', { uncertain: false })(error) && /本地限速/.test(error.message));
+  for (let index = used; index < 40; index += 1) await assert.rejects(m.client.inspect(credentials, spec({ clientId: 'm' + index })), isError('not_found'));
+  await assert.rejects(m.client.create(credentials, spec({ clientId: 'm-next' })), error => isError('rejected', { uncertain: false, rateLimited: true })(error) && /本地限速/.test(error.message));
   assert.equal(m.of(SEND).length, 1);
 });
 

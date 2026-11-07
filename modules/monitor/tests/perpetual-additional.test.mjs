@@ -39,7 +39,7 @@ test('additional discovery uses separate production venues and isolates nonstand
   await assert.rejects(discoverAdditionalMarkets('rh-lighter', { fetchImpl: response({ code: 500 }) }), /目录/);
 });
 
-test('rh-Lighter directory fees preserve zero, convert percent units and reject missing values', async () => {
+test('Lighter RH directory fees preserve zero, convert percent units and reject missing values', async () => {
   const now = 1789999999000;
   const values = ['0.0000', '0.0350', 0.005, undefined, null, '', ' ', 'invalid', -0.01, Infinity, 11, false];
   let requests = 0;
@@ -111,7 +111,7 @@ test('subscriptions use BBO streams, bounded batches, heartbeat and correct mark
   assert.deepEqual(createAdditionalSubscriptions('entropy', rh), []);
 });
 
-test('rh-Lighter BBO timestamps, zero-sized removal and funding percentage stay distinct', async () => {
+test('Lighter RH BBO timestamps, zero-sized removal and funding percentage stay distinct', async () => {
   const markets = await discoverAdditionalMarkets('rh-lighter', { fetchImpl: response(rhData) });
   const context = {};
   const bbo = { channel: 'ticker:0', type: 'subscribed/ticker', ticker: { s: 'ETH', b: { price: '2634.64', size: '14.2' }, a: { price: '2635.12', size: '1.4' }, last_updated_at: 1789825429882830 } };

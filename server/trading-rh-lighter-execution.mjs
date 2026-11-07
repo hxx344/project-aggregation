@@ -19,10 +19,14 @@ export const RH_LIGHTER_SYMBOLS = EXECUTION_VENUE_SYMBOLS['rh-lighter'];
 // lighter-go signs every transaction with ExpiredAt = signing time + 10 min - 1 s
 // (client.DefaultExpireTime); an unanswered create can execute until then.
 export const RH_LIGHTER_TX_EXPIRES_MS = 600_000;
-// Standard accounts get 60 requests per rolling minute per L1 address and IP,
-// sendTx included, with a 60 s firewall cooldown once exceeded. This client keeps
-// below that and leaves room for the operator's own app.
-const REQUESTS_PER_MINUTE = 50;
+// Standard accounts get 60 requests per rolling minute, sendTx included, with a
+// 60 s firewall cooldown once exceeded. Unauthenticated reads count per IP and
+// L1 address; authenticated reads and sendTx count per L1 address only (checked
+// against the rate-limit page on 2026-11-07). The monitor, asset and position
+// alert reads are unauthenticated, so they spend the IP bucket; this client's
+// authenticated traffic shares the L1 bucket with the operator's own app and
+// every sub-account of the same owner, and keeps a third of it free.
+const REQUESTS_PER_MINUTE = 40;
 const RATE_WINDOW_MS = 60_000;
 const MAX_RATE_WAIT_MS = 8000;
 const COOLDOWN_MS = 60_000;
@@ -117,6 +121,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new TypeError('timeout is invalid');
   const fail = (code = 'invalid_data', details) => { throw new ErrorClass(code, details); };
   const checkAbort = signal => { if (signal?.aborted) fail('aborted'); };
+  // A request the rate limit refused (locally, in cooldown or by the venue
+  // firewall) carries when the next one can be admitted.
+  const limited = (mutation, detail, retryAt, providerCode) => { throw Object.assign(new ErrorClass(mutation ? 'rejected' : 'upstream', { detail, providerCode }), { rateLimited: true, retryAt }); };
   const amount = (value, options = {}) => {
     try { if (typeof value !== 'string') fail(); return decimal(value, options); } catch { return fail(); }
   };
@@ -125,7 +132,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   const signerOf = () => (sign ??= createRhLighterSigner());
   const marketIds = new Map(), rules = new Map(), books = new Map(), orderReads = new Map(), identities = new Map(), tokens = new Map(), nonces = new Map();
   const sent = [];
-  let cooldownUntil = 0, shared = null, mutations = Promise.resolve();
+  // generation is bumped by forget(): a call still in flight then cannot put a token, identity,
+  // nonce or order read back, nor start a signer worker for the forgotten key.
+  let cooldownUntil = 0, shared = null, mutations = Promise.resolve(), generation = 0;
 
   function keys(credentials) {
     if (!object(credentials) || typeof credentials.address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(credentials.address)
@@ -134,7 +143,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
       || typeof credentials.apiKey !== 'string' || !/^(?:0x)?[0-9a-fA-F]{80}$/.test(credentials.apiKey)) fail('credentials');
     const privateKey = credentials.apiKey.replace(/^0x/, '').toLowerCase();
     return { address: credentials.address.toLowerCase(), accountIndex: credentials.accountIndex, apiKeyIndex: credentials.apiKeyIndex, privateKey,
-      slot: `${credentials.accountIndex}:${credentials.apiKeyIndex}`, fingerprint: createHash('sha256').update(`${credentials.accountIndex}:${credentials.apiKeyIndex}:${privateKey}`).digest('hex') };
+      era: generation, slot: `${credentials.accountIndex}:${credentials.apiKeyIndex}`, fingerprint: createHash('sha256').update(`${credentials.accountIndex}:${credentials.apiKeyIndex}:${privateKey}`).digest('hex') };
   }
 
   async function readJson(response, signal) {
@@ -165,11 +174,11 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   async function admit(signal, mutation) {
     while (true) {
       const time = now();
-      if (time < cooldownUntil) fail(mutation ? 'rejected' : 'upstream', { detail: '请求过于频繁，Lighter RH 冷却中' });
+      if (time < cooldownUntil) limited(mutation, '请求过于频繁，Lighter RH 冷却中', cooldownUntil);
       while (sent.length && sent[0] <= time - RATE_WINDOW_MS) sent.shift();
       if (sent.length < REQUESTS_PER_MINUTE) { sent.push(time); return; }
       const wait = sent[0] + RATE_WINDOW_MS - time;
-      if (wait > MAX_RATE_WAIT_MS) fail(mutation ? 'rejected' : 'upstream', { detail: '请求过于频繁，已达到本地限速' });
+      if (wait > MAX_RATE_WAIT_MS) limited(mutation, '请求过于频繁，已达到本地限速', sent[0] + RATE_WINDOW_MS);
       await sleep(wait, signal);
       checkAbort(signal);
     }
@@ -204,7 +213,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
         if (!response || response.redirected || response.status >= 300 && response.status < 400) fail('upstream', { uncertain: mutation });
         if (response.status === 429 || response.status === 405) {
           cooldownUntil = now() + COOLDOWN_MS;
-          fail(mutation ? 'rejected' : 'upstream', { detail: '请求过于频繁' });
+          limited(mutation, '请求过于频繁', cooldownUntil);
         }
         if (GATEWAY_REFUSALS.has(response.status)) fail(mutation ? 'rejected' : 'upstream');
         // An expired or foreign auth token is answered 401 with code 20013.
@@ -212,8 +221,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
           let data = null;
           try { data = await readJson(response, controller.signal); } catch (error) { if (!mutation) throw error; }
           const code = object(data) && Number.isSafeInteger(data.code) ? data.code : null;
-          if (code === 23000) cooldownUntil = now() + COOLDOWN_MS;
+          if (code === 23000) { cooldownUntil = now() + COOLDOWN_MS; limited(mutation, REJECTIONS[23000], cooldownUntil, code); }
           if (mutation && UNCERTAIN_CODES.has(code)) fail('upstream', { providerCode: code, uncertain: true });
+          if (AUTH_CODES.has(code)) dropToken(token);
           if (AUTH_CODES.has(code)) fail('permissions', { providerCode: code, detail: 'API 私钥与账户或 API Key 索引不匹配，或已被更换' });
           fail(mutation ? 'rejected' : 'upstream', { providerCode: code ?? undefined, detail: code === null ? undefined : REJECTIONS[code] ?? `代码 ${code}` });
         }
@@ -221,7 +231,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
         const data = await readJson(response, controller.signal);
         if (!object(data)) fail('invalid_data', { uncertain: mutation });
         if (data.code !== 200 && data.code !== undefined) {
-          if (data.code === 23000) cooldownUntil = now() + COOLDOWN_MS;
+          // A send answered 200 with code 23000 keeps the uncertain path below; a read is a plain rate limit.
+          if (data.code === 23000) { cooldownUntil = now() + COOLDOWN_MS; if (!mutation) limited(false, REJECTIONS[23000], cooldownUntil, 23000); }
+          if (AUTH_CODES.has(data.code)) dropToken(token);
           if (AUTH_CODES.has(data.code) && !mutation) fail('permissions', { providerCode: data.code, detail: 'API 私钥与账户或 API Key 索引不匹配，或已被更换' });
           fail('upstream', { providerCode: Number.isSafeInteger(data.code) ? data.code : undefined, uncertain: mutation });
         }
@@ -243,23 +255,30 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     }
   }
 
-  async function signed(method, params) {
+  async function signed(k, method, params) {
+    // A key forgotten while this call waited is not handed to a new signer worker.
+    if (k.era !== generation) fail('aborted');
     let result;
     try { result = await signerOf()[method](params); } catch { fail('credentials', { detail: 'Lighter RH 签名失败，请核对 API 私钥与索引' }); }
     if (!object(result)) fail('credentials');
     return result;
   }
 
+  // A token the venue refused is signed again on the next request instead of being reused for 20 minutes.
+  function dropToken(token) {
+    if (!token) return;
+    for (const [key, entry] of tokens) if (entry.token === token) tokens.delete(key);
+    if (shared?.token === token) shared = null;
+  }
   async function tokenFor(k, signal) {
     const cached = tokens.get(k.fingerprint);
     if (cached && cached.until > now()) { shared = cached; return cached.token; }
     const deadline = Math.floor(now() / 1000) + AUTH_LIFETIME_S;
-    const { authToken } = await signed('authToken', { privateKey: k.privateKey, apiKeyIndex: k.apiKeyIndex, accountIndex: k.accountIndex, deadline });
+    const { authToken } = await signed(k, 'authToken', { privateKey: k.privateKey, apiKeyIndex: k.apiKeyIndex, accountIndex: k.accountIndex, deadline });
     checkAbort(signal);
     if (typeof authToken !== 'string' || !authToken.startsWith(`${deadline}:${k.accountIndex}:${k.apiKeyIndex}:`) || authToken.length > 1024) fail('credentials');
     const entry = { token: authToken, until: deadline * 1000 - AUTH_REFRESH_MS };
-    tokens.set(k.fingerprint, entry);
-    shared = entry;
+    if (k.era === generation) { tokens.set(k.fingerprint, entry); shared = entry; }
     return authToken;
   }
   // Market reads carry the last account token: authenticated requests count
@@ -350,7 +369,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     const token = await tokenFor(k, signal);
     const data = await request('/api/v1/accountActiveOrders', { query: { account_index: String(k.accountIndex) }, token, signal });
     if (!Array.isArray(data.orders)) fail();
-    identities.set(k.fingerprint, { address: k.address, until: now() + IDENTITY_TTL });
+    if (k.era === generation) identities.set(k.fingerprint, { address: k.address, until: now() + IDENTITY_TTL });
     return { identity: k.address, keyLabel: label };
   }
 
@@ -391,8 +410,8 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
           positions.push({ symbol, side: entry.sign === 1 ? 'long' : 'short', quantity: size });
         }
         if (![0, 1].includes(entry.margin_mode)) fail();
-        const fraction = Number(amount(entry.initial_margin_fraction, { positive: true }));
-        const value = Math.round(100 / fraction);
+        // initial_margin_fraction is a percentage; like defaultLeverage, the usable leverage rounds down.
+        const value = Number(100n * SCALE / units(amount(entry.initial_margin_fraction, { positive: true })));
         if (!Number.isSafeInteger(value) || value < 1 || value > 100) fail();
         leverage[symbol] = { type: entry.margin_mode === 1 ? 'isolated' : 'cross', value };
       } else leverage[symbol] = { type: 'cross', value: rule.defaultLeverage };
@@ -437,7 +456,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   // nonce read, signing) is marked notSent: nothing reached the venue.
   function transact(k, method, params, { signal, beforeMutation }) {
     let guarded = false;
-    const guard = () => { beforeMutation?.(); guarded = true; };
+    const guard = () => { if (k.era !== generation) fail('aborted'); beforeMutation?.(); guarded = true; };
     const run = async () => {
       checkAbort(signal);
       let nonce = nonces.get(k.slot);
@@ -445,7 +464,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
         const data = await request('/api/v1/nextNonce', { query: { account_index: String(k.accountIndex), api_key_index: String(k.apiKeyIndex) }, token: await tokenFor(k, signal), signal });
         nonce = integerOf(data.nonce);
       }
-      const tx = await signed(method, { ...params, privateKey: k.privateKey, apiKeyIndex: k.apiKeyIndex, accountIndex: k.accountIndex, nonce });
+      const tx = await signed(k, method, { ...params, privateKey: k.privateKey, apiKeyIndex: k.apiKeyIndex, accountIndex: k.accountIndex, nonce });
       if (!Number.isSafeInteger(tx.txType) || typeof tx.txInfo !== 'string' || tx.txInfo.length > 8192 || typeof tx.txHash !== 'string' || !/^[0-9a-f]{64,128}$/.test(tx.txHash)) fail('credentials');
       orderReads.clear();
       let data;
@@ -454,7 +473,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
       } catch (error) { nonces.delete(k.slot); throw error; }
       finally { orderReads.clear(); }
       if (typeof data.tx_hash !== 'string' || data.tx_hash.toLowerCase() !== tx.txHash) { nonces.delete(k.slot); fail('invalid_data', { uncertain: true }); }
-      nonces.set(k.slot, nonce + 1);
+      if (k.era === generation) nonces.set(k.slot, nonce + 1);
       const predicted = Number.isSafeInteger(data.predicted_execution_time_ms) ? data.predicted_execution_time_ms : null;
       return { txHash: tx.txHash, predicted };
     };
@@ -473,7 +492,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     if (!fresh && cached && now() - cached.at < ORDER_TTL) return cached.rows;
     const data = await request('/api/v1/accountOrders', { query: { account_index: String(k.accountIndex), client_order_indexes: indexes.join(',') }, token: await tokenFor(k, signal), signal });
     if (!Array.isArray(data.orders) || data.orders.length > 20) fail();
-    orderReads.set(key, { rows: data.orders, at: now() });
+    if (k.era === generation) orderReads.set(key, { rows: data.orders, at: now() });
     return data.orders;
   }
 
@@ -486,7 +505,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   function inspection(row, spec) {
     const tif = spec.orderType === 'market' ? 'immediate-or-cancel' : 'post-only';
     if (row.market_index !== spec.assetId || row.is_ask !== (spec.side === 'sell') || row.reduce_only !== spec.reduceOnly || row.type !== 'limit'
-      || row.time_in_force !== tif || typeof row.status !== 'string' || !Number.isSafeInteger(row.timestamp) || row.timestamp <= 0) fail();
+      || row.time_in_force !== tif || typeof row.status !== 'string' || !Number.isSafeInteger(row.timestamp) || row.timestamp <= 0
+      // Unix seconds per the Order schema; a millisecond value would read as a date far in the future.
+      || row.timestamp >= 1e11) fail();
     if (!WORKING.has(row.status) && !TERMINAL.has(row.status)) fail();
     const quantity = amount(row.initial_base_amount, { positive: true }), filledQuantity = amount(row.filled_base_amount, { nonnegative: true });
     const remaining = amount(row.remaining_base_amount, { nonnegative: true });
@@ -521,22 +542,26 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
       orderExpiry: market ? 0 : now() + CHASE_EXPIRY_MS,
     }, { signal, beforeMutation });
     // Acceptance only queues the transaction. The id is claimed once the order
-    // is visible; otherwise the create stays uncertain and the engine
-    // reconciles it by client index after the signed expiry has passed.
+    // is visible; otherwise the create stays uncertain and marked `accepted`:
+    // the engine keeps looking it up by client index until the signed expiry
+    // has passed instead of pausing the task.
     const first = Math.min(VISIBLE_WAIT_MS, Math.max(0, (sentAt.predicted ?? now()) - now())) + 300;
-    for (const delay of [first, VISIBLE_RETRY_MS]) {
-      await sleep(delay, signal);
-      // The transaction was accepted: an interrupted check never means "not sent".
-      if (signal?.aborted) fail('aborted', { uncertain: true });
-      let row;
-      try { row = matchOf(await ordersByIndex(k, [spec.clientOrderIndex], signal, true), spec); }
-      catch (error) { if (error instanceof ErrorClass) error.uncertain = true; throw error; }
-      if (row) {
-        try { inspection(row, spec); } catch { fail('invalid_data', { uncertain: true }); }
-        return { id: String(spec.clientOrderIndex), kind: 'order' };
+    try {
+      for (const delay of [first, VISIBLE_RETRY_MS]) {
+        await sleep(delay, signal);
+        // The transaction was accepted: an interrupted check never means "not sent".
+        if (signal?.aborted) fail('aborted', { uncertain: true });
+        const row = matchOf(await ordersByIndex(k, [spec.clientOrderIndex], signal, true), spec);
+        if (row) {
+          try { inspection(row, spec); } catch { fail('invalid_data', { uncertain: true }); }
+          return { id: String(spec.clientOrderIndex), kind: 'order' };
+        }
       }
+      return fail('not_found', { uncertain: true, detail: '委托已提交但尚未在交易所查到' });
+    } catch (error) {
+      if (!(error instanceof ErrorClass)) throw Object.assign(new ErrorClass('invalid_data', { uncertain: true }), { accepted: true });
+      throw Object.assign(error, { uncertain: true, accepted: true });
     }
-    return fail('not_found', { uncertain: true, detail: '委托已提交但尚未在交易所查到' });
   }
 
   async function inspect(credentials, value, { signal } = {}) {
@@ -559,6 +584,14 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     return { id: spec.id };
   }
 
+  // A disconnected key leaves no token, identity, nonce or signer state behind:
+  // market reads go back to unauthenticated and the signer thread holding the
+  // key is stopped (the next connection starts a fresh one).
+  function forget() {
+    generation += 1; tokens.clear(); identities.clear(); nonces.clear(); orderReads.clear(); shared = null;
+    if (sign && sign !== signer) { const current = sign; sign = null; void Promise.resolve(current.close()).catch(() => {}); }
+  }
+
   const unsupported = async () => fail('input');
-  return { exchange: 'rh-lighter', verify, account, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported };
+  return { exchange: 'rh-lighter', verify, account, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported, forget };
 }

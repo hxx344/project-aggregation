@@ -6,7 +6,7 @@ import { oilSpread } from '../modules/oil/spread.mjs';
 export type VenueSpreads = Record<string, { value: number | null; stale: boolean }>;
 /** Hyperliquid names the ordinary-share leg SKHX; the CEX contracts use SKHYNIX. */
 /**
- * Anthropic: Binance ANTHROPICUSDT and rh-Lighter ANTHROPIC (exchange id `rh-lighter`) share the bare ANTHROPIC base;
+ * Anthropic: Binance ANTHROPICUSDT and Lighter RH ANTHROPIC (exchange id `rh-lighter`) share the bare ANTHROPIC base;
  * Hyperliquid io:ANTH and xyz:ANT are matched with their dex prefix (separators dropped), since bare ANT/ANTH would also match unrelated tokens.
  */
 export const RELATED_SYMBOLS: Record<string, readonly string[]> = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHX', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'IOANTH', 'XYZANT'] };
