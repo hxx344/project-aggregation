@@ -44,7 +44,7 @@ function validateMarket(market) {
   if (market.exchange === 'kraken' && (!/^PF_[A-Z0-9]+USD$/.test(market.symbol) || market.quoteCurrency !== 'USD' || market.contractKind !== 'linear' || market.multiplier !== 1)) throw unsupported('Kraken 指标仅支持已核实的 PF 线性每币合约');
   if (Object.hasOwn(LIGHTER_HOSTS, market.exchange) && (!Number.isInteger(market.marketId) || market.marketId < 0 || market.marketId > 32767)) throw Error('Lighter 指标缺少有效市场编号');
   if (market.exchange === 'lighter' && market.quoteCurrency !== 'USDC') throw Error('Lighter 计价币不匹配');
-  if (market.exchange === 'rh-lighter' && market.quoteCurrency !== 'USDG') throw Error('rh-Lighter 计价币不匹配');
+  if (market.exchange === 'rh-lighter' && market.quoteCurrency !== 'USDG') throw Error('Lighter RH 计价币不匹配');
   if (['binance', 'aster', 'bybit', 'okx', 'bitget'].includes(market.exchange) && !['USDT', 'USDC', 'USD1'].includes(market.quoteCurrency)) throw unsupported('该计价币指标口径尚未核实');
   if (market.exchange === 'bitget' && market.productType !== `${market.quoteCurrency}-FUTURES`) throw Error('Bitget 指标产品类型不匹配');
 }

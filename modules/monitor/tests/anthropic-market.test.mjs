@@ -16,11 +16,11 @@ import { anthropicHistory } from '../lib/anthropic-history.ts';
 
 const BAR = ANTHROPIC_CANDLE_MS, DAY = 86_400_000;
 const NOW = Date.UTC(2026, 10, 6, 12, 7);
-const ok = (body, status = 200) => ({ ok: status < 400, status, json: async () => body });
-const fail = status => ({ ok: false, status, json: async () => ({}) });
+const ok = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const fail = status => new Response('{}', { status });
 const hlContext = (name, markPx, isDelisted = false) => [{ universe: [{ name: 'other' }, { name, isDelisted }] }, [{ markPx: '1' }, { markPx: String(markPx), funding: '0.00001', oraclePx: String(markPx) }]];
 
-/** Routes Binance GETs, rh-Lighter GETs and Hyperliquid POSTs; `binance`/`hl`/`rh` return a response or throw. */
+/** Routes Binance GETs, Lighter RH GETs and Hyperliquid POSTs; `binance`/`hl`/`rh` return a response or throw. */
 function fetcher({ binance, hl, rh = () => fail(500) }) {
   const calls = [];
   const fn = async (url, init = {}) => {
@@ -34,7 +34,7 @@ function fetcher({ binance, hl, rh = () => fail(500) }) {
 }
 
 /**
- * A public rh-Lighter deployment: the catalog lists the ANTHROPIC perpetual among other markets, an
+ * A public Lighter RH deployment: the catalog lists the ANTHROPIC perpetual among other markets, an
  * unknown market id answers HTTP 400, and candles return the latest `count_back` bars opening before
  * `end_timestamp` (at most 500), as measured against api.rh.lighter.xyz.
  */
@@ -230,7 +230,7 @@ test('the candles API windows Anthropic history with its own coverage, which the
   assert.equal(calls.length, before, 'an invalid window never reads the dataset');
 });
 
-test('rh-Lighter reads the ANTHROPIC perpetual by symbol, then one market per round, priced per fully diluted share', async () => {
+test('Lighter RH reads the ANTHROPIC perpetual by symbol, then one market per round, priced per fully diluted share', async () => {
   const rh = createRhLighterState(), venue = fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270', lastFundingRate: '0.0001', nextFundingTime: NOW }), hl: () => fail(500), rh: rhVenue({ id: 51, mark: '1670' }) });
   const first = await fetchAnthropicQuote({ now: NOW, fetcher: venue, rh });
   assert.deepEqual(first.rh, { markPx: 1670, fundingRate: null, indexPx: 1502.5 });
@@ -238,13 +238,13 @@ test('rh-Lighter reads the ANTHROPIC perpetual by symbol, then one market per ro
   const second = await fetchAnthropicQuote({ now: NOW + 10_000, fetcher: venue, rh });
   assert.equal(second.rh.markPx, 1670);
   assert.deepEqual(rhCalls(venue.calls).map(call => call.params), [{}, { market_id: '51' }], 'later rounds read only the discovered market');
-  // 1270 / 12.7 = 100 per share on Binance, 1670 / 16.7 = 100 per share on rh-Lighter.
+  // 1270 / 12.7 = 100 per share on Binance, 1670 / 16.7 = 100 per share on Lighter RH.
   assert.ok(Math.abs(anthropicPremium(first.binance.markPx, first.rh.markPx, 'rh')) < 1e-9);
   assert.ok(Math.abs(anthropicPremium(1270, 1503, 'rh') - (100 / (1503 / 16.7) - 1) * 100) < 1e-9);
   assert.deepEqual(anthropicChartRows([{ time: 0, binance: 1270, xyz: null, io: null, rh: 1503 }], 'rh').map(row => row.equivalent), [1503 / 16.7]);
 });
 
-test('a missing, delisted or reassigned rh-Lighter market fails only that leg and is looked up again', async () => {
+test('a missing, delisted or reassigned Lighter RH market fails only that leg and is looked up again', async () => {
   const healthy = { binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' }), hl: body => ok(hlContext(body.dex === 'xyz' ? 'xyz:ANT' : 'io:ANTH', 95)) };
   const missing = await fetchAnthropicQuote({ now: NOW, rh: createRhLighterState(), fetcher: fetcher({ ...healthy, rh: rhVenue({ symbol: 'OPENAI' }) }) });
   assert.equal(missing.rh, null); assert.equal(missing.errors.rh, '合约缺失');
@@ -265,7 +265,7 @@ test('a missing, delisted or reassigned rh-Lighter market fails only that leg an
   assert.equal(rh.market, null);
 });
 
-test('rh-Lighter 429 or 405 pauses its quote and candle requests for 60 s without touching other venues', async () => {
+test('Lighter RH 429 or 405 pauses its quote and candle requests for 60 s without touching other venues', async () => {
   for (const status of [429, 405]) {
     const rh = createRhLighterState(), gate = createBinanceGate();
     const limited = fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' }), hl: () => fail(500), rh: () => fail(status) });
@@ -276,13 +276,42 @@ test('rh-Lighter 429 or 405 pauses its quote and candle requests for 60 s withou
     assert.equal(cooled.binance.markPx, 1270);
     const candles = await fetchAnthropicCandles(null, { now: NOW + 59_000, fetcher: fetcher({ binance: () => ok([kline(lastClosed, 1270)]), hl: () => fail(500), rh: limited }), rh, gate, clock: () => NOW + 59_000 });
     assert.equal(candles.metadata.errors.rh, `接口限流冷却中（HTTP ${status}）`);
-    assert.equal(rhCalls(limited.calls).length, 1, 'no rh-Lighter request inside the cooldown');
+    assert.equal(rhCalls(limited.calls).length, 1, 'no Lighter RH request inside the cooldown');
     await fetchAnthropicQuote({ now: NOW + 60_000, fetcher: limited, rh, gate, clock: () => NOW + 60_000 });
     assert.equal(rhCalls(limited.calls).length, 2, 'the cooldown ends after 60 s');
   }
 });
 
-test('rh-Lighter candles page forward from the listing, at most four pages a round, and resume from the last close', async () => {
+test('Lighter RH code 23000, as HTTP 400 or inside a 200 body, cools down like a firewall 429', async () => {
+  for (const status of [400, 200]) {
+    const rh = createRhLighterState(), gate = createBinanceGate();
+    const limited = fetcher({ binance: () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' }), hl: () => fail(500), rh: () => ok({ code: 23000, message: 'Too Many Requests' }, status) });
+    const first = await fetchAnthropicQuote({ now: NOW, fetcher: limited, rh, gate, clock: () => NOW });
+    assert.equal(first.errors.rh, '接口限流冷却中（代码 23000）');
+    const cooled = await fetchAnthropicQuote({ now: NOW + 59_000, fetcher: limited, rh, gate, clock: () => NOW + 59_000 });
+    assert.equal(cooled.errors.rh, '接口限流冷却中（代码 23000）');
+    assert.equal(rhCalls(limited.calls).length, 1, 'no Lighter RH request inside the cooldown');
+  }
+});
+
+test('a Lighter RH response over 2 MiB is refused, whether announced by Content-Length or only seen while streaming', async () => {
+  const binance = () => ok({ symbol: 'ANTHROPICUSDT', markPrice: '1270' });
+  const padded = size => async url => { const body = await rhVenue()(url).json(); return ok({ ...body, pad: 'x'.repeat(size) }); };
+  const read = rh => fetchAnthropicQuote({ now: NOW, fetcher: fetcher({ binance, hl: () => fail(500), rh }), rh: createRhLighterState(), gate: createBinanceGate(), clock: () => NOW });
+  const small = await read(padded(1024 * 1024));
+  assert.equal(small.errors.rh, undefined, 'a valid 1 MiB catalog is read');
+  const streamed = await read(padded(2 * 1024 * 1024));
+  assert.equal(streamed.errors.rh, '响应无效或网络失败', 'the same catalog past 2 MiB is refused');
+  assert.equal(streamed.binance.markPx, 1270);
+  let pulls = 0, cancelled = false;
+  const announced = () => new Response(new ReadableStream({ pull(controller) { pulls += 1; controller.enqueue(new TextEncoder().encode('{')); }, cancel() { cancelled = true; } }), { status: 200, headers: { 'content-length': String(3 * 1024 * 1024) } });
+  const refused = await read(announced);
+  assert.equal(refused.errors.rh, '响应无效或网络失败');
+  assert.ok(cancelled, 'the announced oversized body is cancelled');
+  assert.ok(pulls <= 1, `the body is not read (${pulls} pulls)`);
+});
+
+test('Lighter RH candles page forward from the listing, at most four pages a round, and resume from the last close', async () => {
   const rh = createRhLighterState(), listedAt = NOW - 30 * DAY + 7 * 60_000, closedEnd = Math.floor(NOW / BAR) * BAR;
   const venue = fetcher({ binance: () => fail(500), hl: () => fail(500), rh: rhVenue({ listedAt, close: t => 1000 + (t / BAR) % 7 }) });
   const first = await fetchAnthropicCandles(null, { now: NOW, fetcher: venue, rh });
@@ -309,10 +338,10 @@ test('rh-Lighter candles page forward from the listing, at most four pages a rou
   const bad = fetcher({ binance: () => ok([kline(lastClosed, 1270)]), hl: () => fail(500), rh: url => url.pathname === '/api/v1/candles' ? ok({ code: 200, r: '15m', c: [{ t: lastClosed + 60_000, c: 1 }] }) : rhVenue()(url) });
   const rejected = await fetchAnthropicCandles(null, { now: NOW, fetcher: bad, rh: createRhLighterState() });
   assert.equal(rejected.metadata.errors.rh, '响应无效或网络失败');
-  assert.equal(rejected.data.at(-1).binance, 1270, 'an invalid rh-Lighter page fails only that leg');
+  assert.equal(rejected.data.at(-1).binance, 1270, 'an invalid Lighter RH page fails only that leg');
 });
 
-test('history saved before the rh-Lighter leg validates, gains an empty leg and backfills it', async t => {
+test('history saved before the Lighter RH leg validates, gains an empty leg and backfills it', async t => {
   const rows = [0, 1, 2].map(index => ({ time: lastClosed - (2 - index) * BAR, binance: 1270, xyz: 100, io: 1670 }));
   const fetchedAt = new Date(NOW).toISOString();
   const legacy = { status: 'live', metadata: { source: 'Binance + Hyperliquid', symbols: ['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH'], interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute trade candle closes', fetchedAt, firstObservation: new Date(rows[0].time).toISOString(), lastObservation: new Date(rows[2].time).toISOString(), rows: 3, errors: { io: '请求超时' } }, data: rows };
@@ -343,13 +372,13 @@ test('history saved before the rh-Lighter leg validates, gains an empty leg and 
   assert.equal(validateAnthropicCandles(store.read('anthropic', ANTHROPIC_CANDLE_ACTION)).metadata.symbols.length, 4);
 });
 
-test('a quote saved before the rh-Lighter leg reads that leg as missing, and the hub reports its premium', async () => {
+test('a quote saved before the Lighter RH leg reads that leg as missing, and the hub reports its premium', async () => {
   const saved = validateAnthropicQuote({ fetchedAt: new Date(NOW).toISOString(), binance: { markPx: 1270 }, xyz: { markPx: 100 }, io: null, errors: { io: '请求超时' } });
   assert.equal(saved.rh, null); assert.equal(saved.errors.rh, '暂无报价');
   const quote = { fetchedAt: new Date(NOW).toISOString(), status: 'live', binance: { markPx: 1270 }, xyz: { markPx: 100 }, io: { markPx: 1670 }, rh: null, errors: { rh: '合约缺失' } };
   const summary = await readHubSummary(new Map([['anthropic', { handle: async () => quote }]]), NOW + 1000, 'anthropic');
   assert.equal(summary.health.state, 'partial');
-  assert.match(summary.health.message, /rh-Lighter 合约缺失/);
+  assert.match(summary.health.message, /Lighter RH 合约缺失/);
   assert.deepEqual(summary.metrics.map(metric => metric.key), ['premium_xyz', 'premium_io', 'premium_rh', 'modules']);
   const priced = await readHubSummary(new Map([['anthropic', { handle: async () => ({ ...quote, rh: { markPx: 1837 }, errors: {} }) }]]), NOW + 1000, 'anthropic');
   assert.ok(Math.abs(priced.metrics[2].value - (100 / 110 - 1) * 100) < 1e-9);

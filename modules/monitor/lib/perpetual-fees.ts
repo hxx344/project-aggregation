@@ -5,7 +5,7 @@ export const takerFeeVenues = [
   { id: 'binance', name: 'Binance' }, { id: 'bybit', name: 'Bybit' },
   { id: 'okx', name: 'OKX' }, { id: 'bitget', name: 'Bitget' }, { id: 'gate', name: 'Gate' },
   { id: 'hyperliquid', name: 'Hyperliquid' }, { id: 'lighter', name: 'Lighter' },
-  { id: 'aster', name: 'Aster' }, { id: 'rh-lighter', name: 'rh-Lighter' }, { id: 'entropy', name: 'Entropy' },
+  { id: 'aster', name: 'Aster' }, { id: 'rh-lighter', name: 'Lighter RH' }, { id: 'entropy', name: 'Entropy' },
 ] as const;
 export type TakerFeeVenue = typeof takerFeeVenues[number]['id'];
 export type TakerFeeOverrides = Partial<Record<TakerFeeVenue, number>>;

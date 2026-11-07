@@ -12,9 +12,9 @@ type Reply = (url: URL) => Response | Promise<Response>;
 
 const short = { market_id: 120, symbol: 'ANTHROPIC', sign: -1, position: '0.44104', avg_entry_price: '1516.1', position_value: '-668.6', unrealized_pnl: '0.06', initial_margin_fraction: '20.00', liquidation_price: '3000.5', margin_mode: 0 };
 const long = { market_id: 1, symbol: 'BTC', sign: 1, position: '0.01', avg_entry_price: '100000', position_value: '1000', unrealized_pnl: '-2.5', initial_margin_fraction: '5', liquidation_price: '0', margin_mode: 1 };
-const closed = { market_id: 2, symbol: 'ETH', sign: 1, position: '0.000', position_value: '0' };
+const closed = { market_id: 2, symbol: 'ETH', sign: 1, position: '0.000', avg_entry_price: '0.00', position_value: '-0.000000', unrealized_pnl: '0.000000', initial_margin_fraction: '20.00', liquidation_price: '0', margin_mode: 0 };
 function account(index: number, extra: Record<string, unknown> = {}) {
-  return { index, account_index: index, l1_address: ADDRESS, total_asset_value: '100.25', ...extra };
+  return { index, account_index: index, l1_address: ADDRESS, total_asset_value: '100.25', assets: [], positions: [], ...extra };
 }
 const page = (accounts: unknown[], extra: Record<string, unknown> = {}) => Response.json({ code: 200, total: accounts.length, accounts, ...extra });
 
@@ -40,8 +40,8 @@ test('the balance sums total_asset_value over every account and lists spot balan
   const f = fixture(() => page([
     account(7, { name: 'main', total_asset_value: '1000.5', assets: [{ symbol: 'USDG', asset_id: 3, balance: '20', locked_balance: '0' }, { asset_id: 9, balance: '0', locked_balance: '1.5' }], shares: [{ public_pool_index: 1, shares_amount: 5 }] }),
     account(8, { total_asset_value: '-0.5', bo_positions: [{ market_id: 3 }] }),
-    // Zero fields are omitted by the API, including the account value.
-    { index: 9, l1_address: ADDRESS },
+    // Zero values arrive explicitly; shares and bo_positions may be absent.
+    { index: 9, l1_address: ADDRESS, total_asset_value: '0.000000', assets: [], positions: [] },
   ]));
   const result = await syncRhLighter({ walletAddress: ADDRESS }, f.fetcher);
   assert.equal(result.total, 1000);
@@ -56,6 +56,14 @@ test('the balance sums total_asset_value over every account and lists spot balan
     [NOTE_COIN, '持有二元期权仓位，未单独列出', 0, 0, 0],
   ]);
   assert.equal(f.urls.length, 1);
+});
+
+test('a missing amount, margin mode or position list is refused instead of read as zero', async () => {
+  const { position: _position, ...noQuantity } = long, { margin_mode: _mode, ...noMode } = long, { avg_entry_price: _entry, ...noEntry } = long;
+  const { total_asset_value: _value, ...noValue } = account(1), { positions: _rows, ...noPositions } = account(1);
+  for (const body of [[account(1, { positions: [noQuantity] })], [account(1, { positions: [noMode] })], [account(1, { positions: [noEntry] })], [noValue], [noPositions]]) {
+    await assert.rejects(readRhLighterPositions({ walletAddress: ADDRESS }, fixture(() => page(body)).fetcher), new RegExp(RH_LIGHTER_ERRORS.invalid));
+  }
 });
 
 test('positions skip closed markets, map sign, margin mode, leverage and missing liquidation price', async () => {

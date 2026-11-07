@@ -53,9 +53,9 @@ function address(value: unknown): string {
   if (typeof value !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(value.trim())) fail(RH_LIGHTER_ERRORS.address);
   return (value as string).trim().toLowerCase();
 }
-// The API omits fields whose value is zero or empty, so an absent amount means zero; any other malformed value is refused.
+// Zero values are sent explicitly ("0.000000", margin_mode 0; checked against public account reads on 2026-11-07),
+// as the trading adapter and the position alert also require, so a missing amount is refused rather than read as zero.
 function decimalText(value: unknown): string {
-  if (value === undefined) return '0';
   if (typeof value !== 'string' || value.length > 64 || !DECIMAL.test(value)) fail(RH_LIGHTER_ERRORS.invalid);
   return value as string;
 }
@@ -66,8 +66,9 @@ function amount(value: unknown): number {
 }
 const isZero = (value: string) => !/[1-9]/.test(value);
 const symbolOf = (value: unknown) => typeof value === 'string' && SYMBOL.test(value) ? value : fail(RH_LIGHTER_ERRORS.invalid);
-function rows(value: unknown): unknown[] {
-  if (value === undefined) return [];
+// `shares` and `bo_positions` only add notes; positions and assets must be present.
+function rows(value: unknown, optional = false): unknown[] {
+  if (optional && value === undefined) return [];
   if (!Array.isArray(value) || value.length > MAX_ROWS) fail(RH_LIGHTER_ERRORS.invalid);
   return value as unknown[];
 }
@@ -79,7 +80,7 @@ function parsePosition(row: unknown, account: number, at: string): Position | nu
   if (quantity.startsWith('-') || !integer(row.market_id)) fail(RH_LIGHTER_ERRORS.invalid);
   const side = row.sign === 1 ? 'long' as const : row.sign === -1 ? 'short' as const : fail(RH_LIGHTER_ERRORS.invalid);
   const symbol = symbolOf(row.symbol);
-  const marginMode = row.margin_mode === undefined || row.margin_mode === 0 ? 'cross' : row.margin_mode === 1 ? 'isolated' : fail(RH_LIGHTER_ERRORS.invalid);
+  const marginMode = row.margin_mode === 0 ? 'cross' : row.margin_mode === 1 ? 'isolated' : fail(RH_LIGHTER_ERRORS.invalid);
   // initial_margin_fraction is a percentage, so the configured leverage is its reciprocal.
   const fraction = amount(row.initial_margin_fraction);
   if (fraction < 0) fail(RH_LIGHTER_ERRORS.invalid);
@@ -87,7 +88,7 @@ function parsePosition(row: unknown, account: number, at: string): Position | nu
   return {
     id: positionId('rh-lighter', String(account), String(row.market_id), side), symbol, instrumentId: symbol, side, positionSide: 'net',
     quantity, quantityUnit: symbol, contractSize: '1',
-    entryPrice: row.avg_entry_price === undefined ? null : decimalText(row.avg_entry_price), markPrice: null,
+    entryPrice: decimalText(row.avg_entry_price), markPrice: null,
     notional: decimalText(row.position_value).replace(/^-/, ''), unrealizedPnl: decimalText(row.unrealized_pnl),
     leverage: fraction > 0 ? String(Number((100 / fraction).toFixed(4))) : null,
     // Lighter reports 0 when the position has no liquidation price.
@@ -109,7 +110,7 @@ function parseAccount(item: unknown, user: string, at: string): Account {
   const positions = rows(item.positions).map(row => parsePosition(row, index as number, at)).filter(row => row !== null);
   const name = typeof item.name === 'string' && /^[\p{L}\p{N} _.-]{1,32}$/u.test(item.name.trim()) ? item.name.trim() : null;
   return { index: index as number, name, value: amount(item.total_asset_value), assets, positions,
-    pooled: rows(item.shares).length > 0, binary: rows(item.bo_positions).length > 0 };
+    pooled: rows(item.shares, true).length > 0, binary: rows(item.bo_positions, true).length > 0 };
 }
 
 async function boundedJson(response: Response): Promise<unknown> {

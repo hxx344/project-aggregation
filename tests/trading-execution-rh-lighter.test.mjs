@@ -242,6 +242,9 @@ test('a post-only order the venue cancelled on arrival is re-sent in full from t
   f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.4' };
   f.advance(1000); await f.service.tick();
   assert.equal(f.job.status, 'running');
+  assert.equal(f.creates('rh-lighter').length, 1, 'a bounced order is not re-sent within 5 s of the last send');
+  f.advance(4000); await f.service.tick();
+  assert.equal(f.job.status, 'running');
   assert.equal(f.job.events.filter(item => /只挂单因盘口变化被取消/.test(message(item))).length, 1);
   const sent = f.creates('rh-lighter');
   assert.equal(sent.length, 2);
@@ -250,6 +253,8 @@ test('a post-only order the venue cancelled on arrival is re-sent in full from t
   assert.equal(f.creates('binance').length, 1, 'the sibling leg is not re-sent');
   Object.assign(f.lighterOrder(), { status: 'terminal', terminal: true, childrenSettled: true, bounced: true });
   f.advance(1000); await f.service.tick();
+  assert.equal(f.creates('rh-lighter').length, 2);
+  f.advance(4000); await f.service.tick();
   assert.equal(f.creates('rh-lighter').length, 3);
   assert.equal(f.job.events.filter(item => /只挂单因盘口变化被取消/.test(message(item))).length, 1, 'repeated bounces of one leg are reported once');
 
@@ -362,4 +367,126 @@ test('through the real adapter, an accepted create that never shows up is looked
   assert.ok(lookups.length >= 4 && lookups.every(request => request.query.get('client_order_indexes') === String(index)), `looked up by client order index (${lookups.length})`);
   assert.notEqual(leg().currentOrder?.unknown, true, 'repeated misses after the expiry settle the create');
   assert.equal(sends().length, 1, 'the unanswered order is never replayed');
+});
+
+const acceptedUnseen = () => Object.assign(new ExecutionExchangeError('not_found', { uncertain: true, notFound: true, detail: '委托已提交但尚未在交易所查到' }), { accepted: true });
+const lighterLeg = f => f.job.legs.find(item => item.exchange === 'rh-lighter');
+
+test('an accepted Lighter RH create that is not visible yet holds the task without pausing or cancelling the hedge, then continues once it shows up', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.handlers['rh-lighter:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw acceptedUnseen(); };
+  f.start(await f.preview()); await f.service.tick();
+  assert.equal(f.job.status, 'running');
+  assert.equal(f.job.events.filter(item => /委托已被交易所接受但尚未查到/.test(message(item))).length, 1);
+  const created = f.creates('rh-lighter')[0], hedges = f.creates('binance').length;
+  assert.equal(hedges, 1);
+  f.overrides['binance:ANTHROPICUSDT'] = { bid: '1260', ask: '1260.5' };
+  for (let step = 0; step < 6; step += 1) { f.advance(10_000); await f.service.tick(); }
+  assert.equal(f.job.status, 'running', 'a miss inside the signed lifetime does not pause');
+  assert.equal(f.creates('rh-lighter').length, 1, 'never re-sent');
+  assert.deepEqual([f.stops('binance').length, f.stops('rh-lighter').length, f.creates('binance').length, f.calls.filter(call => call.method === 'amend').length], [0, 0, hedges, 0], 'nothing is repriced, cancelled or sent meanwhile');
+  delete f.overrides['binance:ANTHROPICUSDT'];
+  const spec = created.args[1];
+  f.records.set('late', { ...spec, id: 'late', kind: 'order', status: 'working', terminal: false, childrenSettled: false, filledQuantity: '0', price: spec.limitPrice ?? '352.1', averagePrice: null, createdAt: new Date(created.at).toISOString() });
+  f.advance(10_000); await f.service.tick();
+  assert.equal(f.job.status, 'running', f.job.reason);
+  assert.equal(lighterLeg(f).currentOrder.unknown, false, 'found by its client index and claimed');
+});
+
+test('an accepted Lighter RH create still unseen after its signed lifetime and the recheck pauses the task', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.handlers['rh-lighter:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw acceptedUnseen(); };
+  f.start(await f.preview()); await f.service.tick();
+  f.accounts['rh-lighter'].openOrders = [{ symbol: 'ANTHROPIC', id: 'foreign' }];
+  const createdAt = f.time, holdUntil = createdAt + TEN_MINUTES + CALL_TIMEOUT + ARRIVAL_MARGIN + 60_000;
+  while (f.time + 10_000 < holdUntil) { f.advance(10_000); await f.service.tick(); }
+  assert.equal(f.job.status, 'running', f.job.reason ?? 'held until the signed lifetime and the recheck have passed');
+  for (let step = 0; step < 3; step += 1) { f.advance(10_000); await f.service.tick(); }
+  assert.notEqual(f.job.status, 'running');
+  assert.ok(f.job.events.some(item => /提交结果不明/.test(message(item))), 'paused because the accepted create is still unaccounted for');
+  assert.equal(f.creates('rh-lighter').length, 1);
+});
+
+test('a Lighter RH create refused before it left (rate limit, cooldown) is re-planned after a spacing, capped at 30 in a row', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  const cooled = () => Object.assign(new ExecutionExchangeError('rejected', { detail: '请求过于频繁，Lighter RH 冷却中' }), { notSent: true, rateLimited: true, retryAt: f.time + 30_000 });
+  f.handlers['rh-lighter:create'] = async () => { throw cooled(); };
+  const fallback = f.handlers['rh-lighter:create'];
+  f.start(await f.preview()); await f.service.tick();
+  const deferred = () => f.job.events.filter(item => /本次建单未送达交易所/.test(message(item))).length;
+  assert.equal(f.job.status, 'running');
+  assert.equal(deferred(), 1);
+  assert.match(message(f.job.events.find(item => /本次建单未送达交易所/.test(message(item)))), /30 秒后/);
+  f.advance(20_000); await f.service.tick();
+  assert.equal(f.creates('rh-lighter').length, 1, 'not re-sent before the cooldown ends');
+  f.advance(10_000); await f.service.tick();
+  assert.equal(f.creates('rh-lighter').length, 2, 're-sent from the latest book once the cooldown ends');
+  assert.equal(deferred(), 1, 'consecutive deferrals are reported once');
+  delete f.handlers['rh-lighter:create'];
+  f.advance(30_000); await f.service.tick();
+  assert.equal(f.creates('rh-lighter').length, 3);
+  assert.equal(lighterLeg(f).currentOrder.unknown, false);
+  Object.assign(f.lighterOrder(), { status: 'terminal', terminal: true, childrenSettled: true, bounced: true });
+  f.handlers['rh-lighter:create'] = fallback;
+  f.advance(5000); await f.service.tick();
+  assert.equal(f.creates('rh-lighter').length, 4);
+  assert.equal(deferred(), 2, 'a real send resets the streak');
+  assert.equal(f.job.status, 'running');
+
+  const g = await fixture(t); await g.connectLighter();
+  g.handlers['rh-lighter:create'] = async () => { throw Object.assign(new ExecutionExchangeError('transport', {}), { notSent: true }); };
+  g.start(await g.preview()); await g.service.tick();
+  for (let step = 0; step < 40 && g.job.status === 'running'; step += 1) { g.advance(10_000); await g.service.tick(); }
+  assert.equal(g.creates('rh-lighter').length, 31, 'thirty deferrals, then the next refusal pauses');
+  assert.notEqual(g.job.status, 'running');
+  assert.match(g.job.reason ?? '', /下单结果/);
+
+  const u = await fixture(t); await u.connectLighter();
+  u.handlers['rh-lighter:create'] = async () => { throw Object.assign(new ExecutionExchangeError('rejected', { providerCode: 21700 }), {}); };
+  u.start(await u.preview()); await u.service.tick();
+  assert.notEqual(u.job.status, 'running', 'a refusal that reached the venue still pauses');
+});
+
+test('disconnecting Lighter RH makes the adapter forget its tokens, identities and signer', async t => {
+  const f = await fixture(t, { realLighter: true }); await f.connectLighter();
+  f.service.disconnect('rh-lighter', { revision: 1 });
+  assert.equal(f.calls.filter(call => call.exchange === 'rh-lighter' && call.method === 'forget').length, 1);
+});
+
+test('while an accepted Lighter RH create is pending, a stop still cancels and an earlier transient read streak is cleared', async t => {
+  const f = await fixture(t); await f.connectLighter();
+  f.handlers['rh-lighter:create'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw acceptedUnseen(); };
+  f.start(await f.preview()); await f.service.tick();
+  f.handlers['binance:inspect'] = async () => { throw new ExecutionExchangeError('timeout', {}); };
+  for (let step = 0; step < 3; step += 1) { f.advance(1000); await f.service.tick(); }
+  assert.equal(f.job.status, 'running', 'three quick transient misses stay inside the read window');
+  delete f.handlers['binance:inspect'];
+  f.advance(10_000); await f.service.tick();
+  assert.ok(f.job.events.some(item => /委托状态已恢复读取/.test(message(item))), 'a clean pass while holding ends the streak');
+  f.advance(30_000);
+  f.handlers['binance:inspect'] = async () => { throw new ExecutionExchangeError('timeout', {}); };
+  await f.service.tick();
+  assert.equal(f.job.status, 'running', 'a later single transient miss starts a new streak instead of pausing');
+  delete f.handlers['binance:inspect'];
+
+  f.service.stop(f.job.id, {});
+  f.advance(1000); await f.service.tick();
+  assert.notEqual(f.job.status, 'running', 'a stop request is handled before the pending hold');
+  assert.equal(f.stops('binance').length, 1, 'the hedge order is cancelled on request');
+});
+
+test('a Lighter RH deferral hint in the past waits the 10 s floor and a far one is capped at 120 s', async t => {
+  for (const [offset, seconds] of [[-5000, 10], [600_000, 120]]) {
+    const f = await fixture(t); await f.connectLighter();
+    f.handlers['rh-lighter:create'] = async () => { throw Object.assign(new ExecutionExchangeError('rejected', { detail: '请求过于频繁' }), { notSent: true, rateLimited: true, retryAt: f.time + offset }); };
+    f.start(await f.preview()); await f.service.tick();
+    const note = f.job.events.map(message).find(text => /本次建单未送达交易所/.test(text));
+    assert.match(note, new RegExp(`${seconds} 秒后`));
+    const start = f.time;
+    while (f.time + 10_000 < start + seconds * 1000 - 1000) { f.advance(10_000); await f.service.tick(); }
+    f.advance(start + seconds * 1000 - 1000 - f.time); await f.service.tick();
+    assert.equal(f.creates('rh-lighter').length, 1, `not re-sent before ${seconds} s`);
+    f.advance(1000); await f.service.tick();
+    assert.equal(f.creates('rh-lighter').length, 2, `re-sent at ${seconds} s`);
+  }
 });
