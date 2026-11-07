@@ -41,9 +41,9 @@ const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
 // Hyperliquid and Lighter RH list no oil contract, so their connections read their own contracts.
 const connectSymbols = exchange => WALLET_VENUES.has(exchange) ? EXECUTION_VENUE_SYMBOLS[exchange] : EXECUTION_MARKETS.oil.symbols;
 const DEFAULT_MODES = Object.freeze({ binance: 'standard', bybit: 'unified', okx: 'cross', hyperliquid: 'agent', 'rh-lighter': 'api-key' });
-// Venues that rest chase legs as post-only orders and reprice by exact cancel plus re-send.
+// Wallet venues rest chase legs at an explicit post-only price.
 const WALLET_VENUES = new Set(['hyperliquid', 'rh-lighter']);
-// Lighter RH Standard accounts allow 60 requests a minute, every cancel and re-send included.
+// Preserve the minimum spacing even though Lighter RH reprices the original order.
 const RH_LIGHTER_MIN_REPRICE_MS = 5000;
 // A Lighter RH create refused before it left this process (local rate limit,
 // venue cooldown, a failed pre-send read) or by the venue firewall did not
@@ -228,7 +228,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (operation.action === 'create') Object.assign(order, { state: 'rejected', settled: true, unknown: false });
       // A recovered cancel keeps its sequence, send count and send time; the
       // next cancel takes a new sequence and still honours the spacing.
-      else { order.unknown = false; order.amendPending = false; }
+      else if (!(order.exchange === 'rh-lighter' && order.amendPending && operation.action === 'cancel')) { order.unknown = false; order.amendPending = false; }
     } else if (operation.state === 'confirmed' || order.settled) accountWriter.resolve(operation.operationId, ticket);
     saveOrder(order);
   }
@@ -709,6 +709,17 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (explicit && (value.positionSide === null || !value.createdAt || !Number.isFinite(Date.parse(value.createdAt)) || Date.parse(value.createdAt) < Date.parse(order.createdAt) - 5000 || Date.parse(value.createdAt) > Date.parse(order.createdAt) + callTimeoutMs + 5000)) throw new ExecutionError(409, '策略方向或创建时间不匹配，禁止认领其他策略');
     return filled;
   }
+  function lighterAmendVisible(order, value) {
+    if (order.exchange !== 'rh-lighter' || !order.amendPending) return true;
+    // A settled original is safe to reconcile even if the modify never ran.
+    if (value.terminal && value.childrenSettled) return true;
+    const version = value.orderVersion ?? 0;
+    if (!validRevision(version) || !Number.isSafeInteger(order.amendVersion) || order.amendVersion <= 0 || !order.amendTarget?.limitPrice) throw new ExecutionError(409, 'Lighter RH 改单版本或目标缺失，保留原委托待核对');
+    if (version > order.amendVersion) throw new ExecutionError(409, 'Lighter RH 原委托已被其他操作修改，禁止认领改单结果');
+    if (version < order.amendVersion) return false;
+    if (!value.price || compareDecimals(value.price, order.amendTarget.limitPrice) !== 0) throw new ExecutionError(409, 'Lighter RH 改单价格与目标不一致，禁止认领改单结果');
+    return true;
+  }
   async function inspectOrder(order, explicitId, cancelRecovery = false) {
     requireLease();
     if (order.kind === 'strategy' && !order.remoteId && !explicitId) return false;
@@ -718,16 +729,34 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     catch (error) { if (error?.notFound && await absentCreate(order)) return true; throw error; }
     requireLease();
     const current = orderFor(order.localId), filledQuantity = validateInspection(current, value, { explicit: !!explicitId, cancelRecovery });
+    const pendingAmend = current.exchange === 'rh-lighter' && current.amendPending;
+    const amendVisible = lighterAmendVisible(current, value);
+    if (!amendVisible) {
+      // A readable old version proves only its cumulative fills. It cannot
+      // acknowledge the modify, release its shared writer intent or be absent-create evidence.
+      Object.assign(current, { filledQuantity, price: value.price ?? null, lastCheckedAt: iso(now()), unknown: true });
+      saveOrder(current); return false;
+    }
+    if (pendingAmend) {
+      if (value.orderVersion === current.amendVersion) current.spec = { ...current.spec, ...current.amendTarget };
+      current.amendPending = false;
+      if (current.writerOperation?.action === 'amend') { current.writerOperation.state = 'confirmed'; current.writerDispatch = 'confirmed'; }
+      // Record matching evidence before releasing the shared unknown intent.
+      Object.assign(current, { filledQuantity, unknown: false, state: value.status, settled: value.terminal && value.childrenSettled });
+      saveOrder(current);
+    }
     if (accountWriter) {
       const ticket = protectJob(jobFor(order.jobId));
       const known = new Set([`hub:create:${order.localId}`, `hub:legacy-amend:${order.localId}`, `hub:legacy-cancel:${order.localId}`]);
       for (const operation of accountWriter.unresolved(ticket)) {
         const belongs = known.has(operation.operationId) || operation.operationId.startsWith(`hub:amend:${order.localId}:`) || operation.operationId.startsWith(`hub:cancel:${order.localId}:`);
-        if (belongs && (operation.operationId === `hub:create:${order.localId}` || value.terminal && value.childrenSettled)) accountWriter.resolve(operation.operationId, ticket);
+        if (belongs && (operation.operationId === `hub:create:${order.localId}` || value.terminal && value.childrenSettled || pendingAmend && (operation.operationId === `hub:amend:${order.localId}:${current.amendCount}` || operation.operationId === `hub:legacy-amend:${order.localId}`))) accountWriter.resolve(operation.operationId, ticket);
       }
       assertJob(order.jobId);
     }
     Object.assign(current, { remoteId: value.id, filledQuantity, unknown: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
+    if (current.exchange === 'rh-lighter' && validRevision(value.orderVersion ?? 0)) current.orderVersion = value.orderVersion ?? 0;
+    if (current.settled || pendingAmend) clearAmendDeferral(current);
     // Lighter RH accepts a post-only order and cancels it on execution when the book
     // already crossed it; like a Hyperliquid ALO refusal, nothing rested or filled.
     const bounced = current.exchange === 'rh-lighter' && value.bounced === true && value.terminal && filledQuantity === '0' && !current.bounced && !current.cancelRequestedAt;
@@ -752,6 +781,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     order.exchange === 'rh-lighter' ? RH_LIGHTER_TX_EXPIRES_MS + callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS : 0);
   const pendingVisible = order => order.exchange === 'rh-lighter' && !!order.acceptedAt && !order.remoteId && order.unknown && !order.settled
     && now() < createSettledAt(order) + MISMATCH_RECHECK_MS;
+  const pendingAmendVisible = order => order.exchange === 'rh-lighter' && order.amendPending && order.unknown && !order.settled
+    && Number.isFinite(Date.parse(order.amendSentAt)) && now() < Date.parse(order.amendSentAt) + RH_LIGHTER_TX_EXPIRES_MS + callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS;
   async function absentCreate(order) {
     requireLease();
     const current = orderFor(order.localId);
@@ -910,16 +941,25 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   }
   async function amendOrder(job, leg, order, market) {
     writable();
-    if (!['binance', 'okx'].includes(order.exchange) || legOrderType(order.spec) !== 'chase' || !order.remoteId || order.settled || order.unknown || order.amendPending) throw new ExecutionError(409, '原订单尚未确认，禁止追价');
+    if (!['binance', 'okx', 'rh-lighter'].includes(order.exchange) || legOrderType(order.spec) !== 'chase' || !order.remoteId || order.settled || order.unknown || order.amendPending || order.cancelRequestedAt) throw new ExecutionError(409, '原订单尚未确认，禁止追价');
     if ((order.amendCount ?? 0) >= 9000) throw new ExecutionError(409, '原订单已达到追价次数上限，请停止后重新预览');
-    const ctx = context(order.exchange, order.accountRevision);
+    const ctx = context(order.exchange, order.accountRevision), lighter = order.exchange === 'rh-lighter';
+    const passive = leg.orderSide === 'buy' ? market.bid : market.ask;
+    // A manual resume drops the automatic guard and uses the plan's own limit.
+    const target = lighter ? { limitPrice: passive, stopPrice: jobFor(job.id).auto?.guard ? order.spec.stopPrice : leg.stopPrice ?? null }
+      : order.spec.limitPrice ? (jobFor(job.id).auto?.guard ? { limitPrice: passive } : { limitPrice: null, stopPrice: leg.stopPrice ?? null }) : {};
+    if (lighter) {
+      const amendVersion = Math.max(now(), (order.orderVersion ?? 0) + 1, (order.amendVersion ?? 0) + 1);
+      if (!Number.isSafeInteger(amendVersion) || amendVersion <= 0) throw new ExecutionError(409, 'Lighter RH 改单版本超出安全范围，停止追价');
+      Object.assign(order, { amendVersion, amendTarget: target, amendSentAt: iso(now()) });
+    }
     // Amend the original total, never its remainder. Existing fills continue to
     // belong to the same order; this intent must survive a lost acknowledgement.
     Object.assign(order, { state: 'amending', amendPending: true, unknown: true, lastAmendAt: iso(now()), amendCount: (order.amendCount ?? 0) + 1 });
     saveOrder(order);
     let operation;
     try {
-      operation = prepareWrite(order, 'amend', { quantity: order.spec.quantity, price: leg.orderSide === 'buy' ? market.bid : market.ask });
+      operation = prepareWrite(order, 'amend', { quantity: order.spec.quantity, price: passive, ...(lighter ? { amendVersion: order.amendVersion } : {}) });
       const beforeMutation = () => {
         requireLease();
         if (operation) { try { accountWriter.assertOwned(operation, callTimeoutMs); } catch { throw new NotSubmittedError('账户写入许可已变化，本次追价未发送'); } }
@@ -930,28 +970,54 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (stopReached(leg, market)) throw new NotSubmittedError('已达到追价界限，本次追价未发送');
         if (current.auto?.guard && atBound(original, leg, market)) throw new NotSubmittedError('已达到本批价差界限，本次追价未发送');
       };
-      // A manual resume drops the automatic guard and continues with the plan's own limit.
-      const target = order.spec.limitPrice ? (jobFor(job.id).auto?.guard ? { limitPrice: leg.orderSide === 'buy' ? market.bid : market.ask } : { limitPrice: null, stopPrice: leg.stopPrice ?? null }) : {};
-      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, ...target, id: order.remoteId }, { ...ctx.options, signal, beforeMutation, amendSequence: order.amendCount }));
+      const value = await call(signal => ctx.client.amend(ctx.credentials, { ...order.spec, ...target, id: order.remoteId }, { ...ctx.options, signal, beforeMutation, amendSequence: order.amendCount, ...(lighter ? { amendVersion: order.amendVersion } : {}) }));
       requireLease();
       const current = orderFor(order.localId), filledQuantity = validateInspection(current, value);
+      if (!lighterAmendVisible(current, value)) throw new ExecutionExchangeError('upstream', { uncertain: true, detail: 'Lighter RH 改单目标版本尚未可见' });
       Object.assign(current, { spec: { ...current.spec, ...target }, filledQuantity, unknown: false, amendPending: false, state: value.status, price: value.price ?? null, lastCheckedAt: iso(now()), settled: value.terminal && value.childrenSettled });
+      if (lighter) { current.orderVersion = value.orderVersion ?? 0; clearAmendDeferral(current); }
       finishWrite(operation, 'confirmed', current);
       saveOrder(current);
-      if (current.settled && compareDecimals(current.filledQuantity, current.spec.quantity) < 0) throw new ExecutionError(409, '原生追价后订单提前终止且未全部成交，暂停其余交易腿');
+      if (current.settled && compareDecimals(current.filledQuantity, current.spec.quantity) < 0) pause(job.id, '原生追价后订单提前终止且未全部成交，暂停其余交易腿');
     } catch (error) {
       requireLease();
       // A rejected amendment says nothing about whether the original order is
       // still live. Keep it unsettled until inspection and stop finish normally.
       const current = orderFor(order.localId);
-      finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', current);
+      const rejected = error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain;
+      finishWrite(operation, rejected ? 'rejected' : 'unknown', current);
       if (current.amendPending) {
-        current.amendPending = false;
-        current.unknown = !(error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain);
+        current.amendPending = lighter && !rejected;
+        current.unknown = !rejected;
         current.state = current.unknown ? 'unknown' : 'working'; saveOrder(current);
+      }
+      if (lighter && error instanceof ExecutionExchangeError) {
+        if (error.uncertain) {
+          clearAmendDeferral(current); saveOrder(current);
+          const latest = jobFor(job.id);
+          event(latest, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 改单结果尚未确认，继续核对原委托版本，期间不追价、不下新单`); saveJob(latest); return;
+        }
+        if (error.notSent && (error.rateLimited || DEFERRABLE_CODES.has(error.code)) && deferAmend(current, error)) return;
       }
       pause(job.id, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 原生追价结果：${safeError(error)}`);
     }
+  }
+  function deferAmend(order, error) {
+    const time = now(), previous = order.amendDeferral, since = previous?.since ?? time, count = previous?.count ?? 0;
+    if (count >= RATE_READ_RETRIES || time - since >= RATE_READ_WINDOW_MS) return false;
+    const reason = `${TRADING_NAMES[order.exchange]} ${order.spec.symbol} 改单明确未发送（${safeError(error)}），保留原委托，等待恢复后自动核对`;
+    order.amendDeferral = { since, count: count + 1, retryAt: Math.max(time + SEND_DEFER_MS, Number.isSafeInteger(error.retryAt) ? error.retryAt : 0), reason };
+    saveOrder(order);
+    const job = jobFor(order.jobId); job.reason = reason;
+    if (!previous) event(job, `${reason}（最多重试 ${RATE_READ_RETRIES} 次、${RATE_READ_WINDOW_MS / 1000} 秒）`);
+    saveJob(job); return true;
+  }
+  function clearAmendDeferral(order) {
+    if (!order.amendDeferral) return;
+    const job = jobFor(order.jobId);
+    if (job.reason === order.amendDeferral.reason) job.reason = null;
+    event(job, 'Lighter RH 改单等待已结束，已核对原委托状态'); saveJob(job);
+    order.amendDeferral = null;
   }
   // A remainder the venue would refuse (below its minimum) keeps resting at its price instead of being cancelled.
   function resendable(order, market, action) {
@@ -1169,6 +1235,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const rateWait = rateReadFailures.get(id);
       if (rateWait && now() - rateWait.since >= RATE_READ_WINDOW_MS) throw new ExecutionError(502, 'Lighter RH 持续限速，自动恢复已达到时间上限，暂停并核对余单');
       if (rateWait && now() < rateWait.retryAt) return;
+      const amendWaits = orders(id).filter(unsettled).map(order => order.amendDeferral).filter(Boolean);
+      if (amendWaits.some(wait => now() - wait.since >= RATE_READ_WINDOW_MS)) throw new ExecutionError(502, 'Lighter RH 改单持续未能发送，自动恢复已达到时间上限，暂停并核对余单');
+      if (amendWaits.some(wait => now() < wait.retryAt)) return;
       const allBefore = orders(id), working = allBefore.filter(unsettled);
       if (working.length) {
         const readings = await Promise.allSettled(working.map(order => inspectOrder(order)));
@@ -1187,7 +1256,11 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         // An accepted Lighter RH create that is not visible yet holds the task (no
         // reprice, cancel or new send) until its signed expiry plus the
         // not-created check has passed; only then does a miss pause the task.
-        const pending = unread.filter(({ order, result }) => pendingVisible(orderFor(order.localId)) && result.status === 'rejected' && (result.reason?.notFound || transientRead(result.reason)));
+        const pending = unread.filter(({ order, result }) => {
+          const current = orderFor(order.localId);
+          return pendingVisible(current) && result.status === 'rejected' && (result.reason?.notFound || transientRead(result.reason))
+            || pendingAmendVisible(current) && (result.status === 'fulfilled' && result.value === false || result.status === 'rejected' && (result.reason?.notFound || transientRead(result.reason)));
+        });
         const failed = unread.filter(item => !pending.includes(item));
         const limited = unread.filter(({ result }) => result.status === 'rejected' && result.reason instanceof RateLimitedReadError);
         // A malformed/foreign sibling response still wins over a cooldown.
@@ -1198,7 +1271,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
           // A definitive not-found is a successful read while an accepted
           // transaction is still becoming visible. Keep its original signed
           // observation window; a past rate limit must not shorten that window.
-          if (pending.every(({ result }) => result.reason?.notFound)) rateReadsRecovered(id);
+          if (pending.every(({ result }) => result.status === 'fulfilled' || result.reason?.notFound)) rateReadsRecovered(id);
           // Every other read succeeded: an earlier transient streak must not carry over the hold.
           if (readFailures.delete(id)) { const latest = jobFor(id); event(latest, '委托状态已恢复读取，继续执行'); saveJob(latest); }
           return;
@@ -1226,20 +1299,25 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         for (const { order, leg } of active) {
           const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);
           // An automatic order rests at its last price rather than chase past the batch limit.
-          if (job.auto?.guard && atBound(order, leg, market)) { holdAtBound(id, leg); continue; }
+          if (job.auto?.guard && atBound(order, leg, market)) {
+            if (order.amendDeferral) { clearAmendDeferral(order); saveOrder(order); }
+            holdAtBound(id, leg); continue;
+          }
           const repriceMs = leg.exchange === 'rh-lighter' ? Math.max(job.plan.repriceIntervalMs, RH_LIGHTER_MIN_REPRICE_MS) : job.plan.repriceIntervalMs;
           const repriceDue = legOrderType(leg) === 'chase' && now() - Date.parse(order.lastAmendAt ?? order.createdAt) >= repriceMs
             && (order.price === null || compareDecimals(order.price, leg.orderSide === 'buy' ? market.bid : market.ask) !== 0);
-          if (['binance', 'okx'].includes(leg.exchange) && repriceDue) {
+          if (order.amendDeferral && order.price !== null && compareDecimals(order.price, leg.orderSide === 'buy' ? market.bid : market.ask) === 0) { clearAmendDeferral(order); saveOrder(order); }
+          if (['binance', 'okx', 'rh-lighter'].includes(leg.exchange) && !order.cancelRequestedAt && repriceDue) {
             await amendOrder(job, leg, order, market);
             if (jobFor(id).status === 'stopping') break;
-          } else if (WALLET_VENUES.has(leg.exchange) && order.remoteId && !order.unknown && !order.cancelRequestedAt && repriceDue && !resendable(order, market, job.plan.action)) {
+            const latest = orderFor(order.localId);
+            if (latest.amendPending || latest.amendDeferral) return;
+          } else if (leg.exchange === 'hyperliquid' && order.remoteId && !order.unknown && !order.cancelRequestedAt && repriceDue && !resendable(order, market, job.plan.action)) {
             holdRemainder(id, leg);
-          } else if (WALLET_VENUES.has(leg.exchange) && order.remoteId && !order.unknown && (order.cancelRequestedAt ? !cancelRecent(order) : repriceDue && resendable(order, market, job.plan.action))) {
-            // Hyperliquid modify assigns a new order id and Lighter RH has no
-            // modify here, so the original is cancelled by exact id instead; once
-            // inspection confirms it ended, the remainder is re-sent below
-            // through the ordinary send checks.
+          } else if (WALLET_VENUES.has(leg.exchange) && order.remoteId && !order.unknown && (order.cancelRequestedAt ? !cancelRecent(order) : leg.exchange === 'hyperliquid' && repriceDue && resendable(order, market, job.plan.action))) {
+            // Hyperliquid modify assigns a new order id, so cancel the exact
+            // original before sending its confirmed remainder. Also finish any
+            // Lighter cancel already persisted by an earlier service version.
             // A cancel that left the order working is retried with the same spacing and budget as stopping.
             if (order.cancelRequestedAt && cancelSpent(order)) throw new ExecutionError(409, `${TRADING_NAMES[leg.exchange]} 追价撤单多次未生效，暂停其余交易腿`);
             await cancelOrder(order);
@@ -1383,6 +1461,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (ownsLease) for (const job of unfinishedJobs()) if (ACTIVE.has(job.status)) { try { pause(job.id, '服务关闭：暂停后续交易并撤销余单'); } catch (error) { if (!accountWriter) throw error; } }
         await Promise.allSettled([...(ticking ? [ticking] : []), ...pending]);
         if (ownsLease) await Promise.allSettled(unfinishedJobs().filter(job => job.status === 'stopping').map(job => runJob(job.id)));
-      } finally { clearTimeout(timeout); closed = true; writerTickets.clear(); recoveredWriterJobs.clear(); stmt.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner); }
+      } finally {
+        clearTimeout(timeout); closed = true; writerTickets.clear(); recoveredWriterJobs.clear(); stmt.prepare('DELETE FROM execution_lease WHERE id=1 AND owner=?').run(owner);
+        await Promise.allSettled([...clients.values()].map(client => Promise.resolve().then(() => client.close?.())));
+      }
     } };
 }

@@ -1723,6 +1723,10 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **自动规则读取分类补充（2026-11-07）：** ANT 自动减仓规则初版把所有 HTTP 语义 `status===409` 都视为永久拒绝，包含 `StaleMarketError`；一轮盘口补读后仍旧便停用规则，行情恢复也不再监测。调度器按错误类型区分短暂旧盘口与账户变更等硬拒绝，旧盘口沿用三次持久失败预算；明确限流 `retryAt` 不得被本地最长等待截短。[自动减仓集成测试](tests/trading-anthropic-reduction.test.mjs) 经真实 `collectMarkets` 复现 11 秒旧盘口两次读取后错误停用，修复后冷却再读可触发；另以执行器注入的较长期限验证跨重启不提前请求，当前 RH 适配器只有更短期限，后者是防扩展回归。事件 `ant-reduction-stale-rule-disable-20261107`，独立审查在发布前发现；同轮修复不增加既有事件次数。
 
+**Lighter WS 与原生改单补充（2026-11-07）：** 用户继续反馈 ANT 追价频繁限流，并指出可以原生改单。基线 `00fe4f1` 的 Lighter 盘口与查单各按 4 秒 REST 缓存运行，追价则撤单、核验、账户预检、再建单；只读限流恢复没有减少这些请求。正常路径改用完整 BBO 与鉴权订单推送，原生改单维持原客户编号和总量，并以持久化版本和目标价格确认；发送结果未知不重放，旧版本只能更新已确认成交。官方证明器明确 BaseAmount 是新总量，不能传剩余量或用 0 猜测保量。私有频道 envelope nonce 缺乏严格递增契约，不按它过滤成交推送；公共 ticker/pong 不能使私有缓存无限有效，无新私有证据时有界重新订阅并等新快照，缺席原单再按客户编号精确 REST 核对。新发送变为未知后清除旧的未发送退避，避免旧 180 秒预算缩短新签名的观察窗口；不再需要追价时结束退避。
+
+验证见 [流回归](tests/trading-rh-lighter-stream.test.mjs)、[适配器回归](tests/trading-rh-lighter-execution.test.mjs)、[引擎回归](tests/trading-execution-rh-lighter.test.mjs) 与 [本次记录](docs/reviews/2026-11-07-lighter-ws-reprice.md)。受控连续一分钟的健康推送没有 REST 盘口/查单；总量 10、已成 3、改单途中再成 2 后仍为总量 10、累计 5、剩余 5。两项退避边界在修复前的新回归均失败。独立审查另复现并关闭两个 P1：私有证据须在读取前/等待后检查绝对截止，不能只靠定时器；订单行 nonce 是队列字段，不能用统一递增门槛否决更高改单版本，买单队列计数可能下降。增量独立探针确认过期立即撤权、同一轮仅重订阅一次，以及更高版本/较低 nonce 后 inspect 不回退且零 REST。真实公开 RH ticker 已只读核对；未使用真实私有账户下单。事件 `rh-lighter-ws-native-amend-20261107`，关联同日限流改进，不推进复盘检查点。
+
 ### L104：`submit()` 的失败分支提前返回前必须重新保存委托
 
 **适用条件：** 在 `server/trading-execution.mjs` 的 `submit()` catch 块里新增任何提前 `return` 的分支（延后重发、bounce 重挂、已接受待可见等）。

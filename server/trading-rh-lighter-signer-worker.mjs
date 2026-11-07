@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import vm from 'node:vm';
 
 // Runs the official lighter-go WASM signer in its own thread so its globals
-// (CreateClient, Sign*) never reach the main process. Only the three
+// (CreateClient, Sign*) never reach the main process. Only the four
 // functions below are reachable: no transfer, withdrawal, leverage or key
 // change can be signed through this worker. Provenance: vendor/lighter-signer/README.md.
 const DIR = new URL('./vendor/lighter-signer/', import.meta.url);
@@ -27,7 +27,7 @@ function load() {
   return WebAssembly.instantiate(bytes, go.importObject).then(({ instance }) => {
     // main() registers the functions, then blocks on select{} for the worker's lifetime.
     void go.run(instance);
-    for (const name of ['CreateClient', 'SignCreateOrder', 'SignCancelOrder', 'CreateAuthToken']) if (typeof globalThis[name] !== 'function') throw new Error('signer function missing');
+    for (const name of ['CreateClient', 'SignCreateOrder', 'SignModifyOrder', 'SignCancelOrder', 'CreateAuthToken']) if (typeof globalThis[name] !== 'function') throw new Error('signer function missing');
   });
 }
 
@@ -55,6 +55,11 @@ const METHODS = {
   cancelOrder(p) {
     client(p);
     return checked(globalThis.SignCancelOrder(p.marketIndex, p.index, 0, p.nonce, p.apiKeyIndex, p.accountIndex));
+  },
+  modifyOrder(p) {
+    client(p);
+    return checked(globalThis.SignModifyOrder(p.marketIndex, p.index, p.baseAmount, p.price, 0,
+      0, 0, 0, 0, 0, 0, p.nonce, p.orderVersion, p.apiKeyIndex, p.accountIndex));
   },
   authToken(p) {
     client(p);

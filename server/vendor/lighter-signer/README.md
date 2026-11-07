@@ -1,6 +1,6 @@
 # Lighter 官方签名器（WASM）
 
-`server/trading-rh-lighter-signer-worker.mjs` 在独立线程中加载本目录的官方签名器，为 Lighter RH（Robinhood Chain，chain id 466324）签名下单、撤单与鉴权令牌。worker 只暴露 `CreateClient`、`SignCreateOrder`、`SignCancelOrder`、`CreateAuthToken`，不签转账、提现、杠杆或换密钥交易。
+`server/trading-rh-lighter-signer-worker.mjs` 在独立线程中加载本目录的官方签名器，为 Lighter RH（Robinhood Chain，chain id 466324）签名下单、改单、撤单与鉴权令牌。worker 只暴露 `CreateClient`、`SignCreateOrder`、`SignModifyOrder`、`SignCancelOrder`、`CreateAuthToken`，不签转账、提现、杠杆或换密钥交易。
 
 ## 来源
 
@@ -23,4 +23,4 @@ worker 加载时先校验解压后的 `wasm_exec.js` 与 WASM 的 SHA-256，任�
 GOFLAGS= GOWASM= GOEXPERIMENT= CGO_ENABLED=0 GOOS=js GOARCH=wasm go build -mod=readonly -trimpath -buildvcs=false -o ./build/lighter-signer.wasm ./wasm/
 ```
 
-再用 Brotli（Node `zlib.brotliCompressSync` 即可）压缩为 `lighter-signer.wasm.br`，并更新 worker 中的 `SIGNER_WASM_SHA256` 与上表。升级签名器时同时核对 `SignCreateOrder` / `SignCancelOrder` 参数顺序与 `wasm_exec.js` 是否与 Go 版本匹配。
+再用 Brotli（Node `zlib.brotliCompressSync` 即可）压缩为 `lighter-signer.wasm.br`，并更新 worker 中的 `SIGNER_WASM_SHA256` 与上表。升级签名器时同时核对 `SignCreateOrder` / `SignModifyOrder` / `SignCancelOrder` 参数顺序与 `wasm_exec.js` 是否与 Go 版本匹配。改单的 `orderVersion` 在线上 JSON 中编码为 `L2TxAttributes["8"]`，真实离线 WASM 测试核对该字段。

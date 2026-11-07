@@ -1,11 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID, createHash } from 'node:crypto';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
 import { checkContract } from '../server/trading-execution-plan.mjs';
 import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 import { createRhLighterExecutionClient } from '../server/trading-rh-lighter-execution.mjs';
+import { unavailableLighterStream } from './fixtures/lighter-stream.mjs';
 
 const baseTime = Date.UTC(2026, 10, 7, 8);
 // Fixture-only values: the clients are fakes and never reach a venue.
@@ -57,16 +62,18 @@ function venue(clock) {
     if (!answers[pathname]) throw new Error('unexpected request ' + url);
     return answers[pathname]();
   };
-  const client = createRhLighterExecutionClient({ ErrorClass: ExecutionExchangeError, fetchImpl, now: clock, signer, sleep: async () => {} });
+  const client = createRhLighterExecutionClient({ ErrorClass: ExecutionExchangeError, fetchImpl, now: clock, signer, stream: unavailableLighterStream(ExecutionExchangeError), sleep: async () => {} });
   return { client, requests, answers };
 }
 
-async function fixture(t, { realLighter = false } = {}) {
+async function fixture(t, { realLighter = false, guarded = false } = {}) {
   const db = new DatabaseSync(':memory:');
-  let time = baseTime, serial = 0;
+  let time = baseTime, serial = 0, instance;
+  const directory = guarded ? mkdtempSync(join(tmpdir(), 'lighter-writer-')) : null;
+  const writer = guarded ? createAccountWriter({ databasePath: join(directory, 'execution-control.sqlite'), moduleId: 'hub', runtimeId: randomUUID(), now: () => time }) : null;
   const records = new Map(), calls = [], handlers = {}, overrides = {};
   const accounts = {
-    binance: { identity: null, modes: { ANTHROPICUSDT: 'one-way' }, positions: [], openOrders: [], strategies: [] },
+    binance: { identity: guarded ? '1' : null, modes: { ANTHROPICUSDT: 'one-way' }, positions: [], openOrders: [], strategies: [] },
     bybit: { identity: 'fixture-uid', modes: {}, positions: [], openOrders: [], strategies: [] },
     okx: { identity: 'fixture-uid', modes: {}, positions: [], openOrders: [], strategies: [] },
     hyperliquid: { identity: OWNER, modes: { 'io:ANTH': 'one-way', 'xyz:ANT': 'one-way' }, positions: [], openOrders: [], strategies: [], leverage: { 'io:ANTH': { type: 'isolated', value: 15 }, 'xyz:ANT': { type: 'cross', value: 10 } } },
@@ -91,6 +98,13 @@ async function fixture(t, { realLighter = false } = {}) {
     }
     const record = spec.id ? records.get(spec.id) : [...records.values()].find(item => item.clientId === spec.clientId);
     if (!record) throw new ExecutionExchangeError('not_found', { notFound: true });
+    if (method === 'amend') {
+      args[2].beforeMutation();
+      assert.equal(spec.quantity, record.quantity, 'a native amendment keeps the original total');
+      record.price = spec.limitPrice ?? (overrides[`${exchange}:${spec.symbol}`] ?? RULES[`${exchange}:${spec.symbol}`])[spec.side === 'buy' ? 'bid' : 'ask'];
+      if (exchange === 'rh-lighter') record.orderVersion = args[2].amendVersion;
+      return structuredClone(record);
+    }
     if (method === 'inspect') { const { clientId: _clientId, assetId: _assetId, limitPrice: _limitPrice, orderType: _orderType, stopPrice: _stopPrice, ...value } = structuredClone(record); return value; }
     if (method === 'stop') { args[2].beforeMutation(); Object.assign(record, { status: 'terminal', terminal: true, childrenSettled: true }); return { id: record.id }; }
     throw new ExecutionExchangeError('input');
@@ -100,12 +114,13 @@ async function fixture(t, { realLighter = false } = {}) {
     if (exchange !== 'rh-lighter' || !real) return factory(exchange);
     return Object.fromEntries(Object.entries(real.client).map(([method, value]) => [method, typeof value === 'function' ? (...args) => { calls.push({ exchange, method, args, at: time }); return value(...args); } : value]));
   };
-  const instance = createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => { stored.push(value); return JSON.stringify(value); }, decrypt: JSON.parse, clientFactory: wrapped });
-  t.after(async () => { await instance.close(); db.close(); });
+  const create = () => createTradingExecution({ db, stmt: null, now: () => time, intervalMs: 0, encrypt: value => { stored.push(value); return JSON.stringify(value); }, decrypt: JSON.parse, clientFactory: wrapped, accountWriter: writer });
+  instance = create();
+  t.after(async () => { await instance.close(); writer?.close(); db.close(); if (directory) rmSync(directory, { recursive: true, force: true }); });
   await instance.initializeProtection();
   await instance.connect('binance', { revision: 0, accountMode: 'standard', apiKey: 'fixture_key', apiSecret: 'fixture_secret' });
   const lighterBody = (body = {}) => ({ revision: 0, accountMode: 'api-key', address: ADDRESS, accountIndex: 12345, apiKeyIndex: 5, apiKey: '0x' + API_KEY, ...body });
-  return { db, records, calls, accounts, handlers, overrides, stored, real, service: instance, get time() { return time; }, advance(value) { time += value; },
+  return { db, writer, records, calls, accounts, handlers, overrides, stored, real, create, get service() { return instance; }, set service(value) { instance = value; }, get time() { return time; }, advance(value) { time += value; },
     lighterBody,
     preview: (body = anthropic()) => instance.preview(body, 'session-a'),
     start: preview => instance.start({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, 'session-a'),
@@ -113,10 +128,17 @@ async function fixture(t, { realLighter = false } = {}) {
     connectHyperliquid: () => instance.connect('hyperliquid', { revision: 0, accountMode: 'agent', address: ADDRESS, agentKey: '0x' + '11'.repeat(32) }),
     creates: exchange => calls.filter(call => call.method === 'create' && (!exchange || call.exchange === exchange)),
     stops: exchange => calls.filter(call => call.method === 'stop' && call.exchange === exchange),
+    amends: exchange => calls.filter(call => call.method === 'amend' && call.exchange === exchange),
     lighterOrder: () => [...records.values()].filter(record => record.symbol === 'ANTHROPIC').at(-1),
     get job() { return instance.state().jobs[0]; } };
 }
 const message = item => item.message ?? item;
+const durableLighter = f => f.db.prepare('SELECT json FROM execution_orders').all().map(row => JSON.parse(row.json)).find(order => order.exchange === 'rh-lighter');
+const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+async function beginReprice(f, options = {}) {
+  await f.connectLighter(); f.start(await f.preview(anthropic(options))); await f.service.tick();
+  f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.3' }; f.advance(5000);
+}
 
 const limitedRead = (f, offset = 60_000) => Object.assign(new ExecutionExchangeError('upstream', { detail: '请求过于频繁，已达到本地限速' }), { rateLimited: true, retryAt: f.time + offset });
 async function advanceTicks(f, duration) {
@@ -183,28 +205,29 @@ test('Lighter RH rate-limited status reads wait beyond the generic 20 s window w
   assert.equal(f.job.status, 'completed'); assert.equal(f.creates().length, 2); assert.equal(f.stops('rh-lighter').length, 0);
 });
 
-test('Lighter RH rate-limited cancel reconciliation preserves the partial fill and sends only the confirmed remainder', async t => {
+test('Lighter RH rate-limited amendment keeps the original partial fill and retries only an explicitly unsent modify', async t => {
   const f = await fixture(t); await f.connectLighter();
   f.start(await f.preview()); await f.service.tick();
   const original = f.lighterOrder(); original.filledQuantity = '0.4';
   const sibling = [...f.records.values()].find(row => row.symbol === 'ANTHROPICUSDT');
   Object.assign(sibling, { filledQuantity: sibling.quantity, status: 'terminal', terminal: true, childrenSettled: true });
   f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.3' };
-  f.handlers['rh-lighter:stop'] = async (_credentials, _spec, options) => {
-    options.beforeMutation();
-    Object.assign(original, { status: 'terminal', terminal: true, childrenSettled: true });
-    f.handlers['rh-lighter:inspect'] = async () => { throw limitedRead(f); };
-    return { id: original.id };
+  f.handlers['rh-lighter:amend'] = async () => {
+    throw Object.assign(limitedRead(f), { notSent: true });
   };
   await advanceTicks(f, 5000);
   assert.equal(f.job.status, 'running'); assert.equal(f.creates('rh-lighter').length, 1);
   const before = f.calls.length;
   await advanceTicks(f, 59_999); assert.equal(f.calls.length, before);
-  delete f.handlers['rh-lighter:inspect']; delete f.handlers['rh-lighter:stop'];
+  delete f.handlers['rh-lighter:amend'];
   await advanceTicks(f, 1);
-  assert.equal(f.job.status, 'running'); assert.equal(f.creates('rh-lighter').length, 2);
-  assert.equal(f.creates('rh-lighter')[1].args[1].quantity, '9.6');
-  assert.equal(f.creates('binance').length, 1); assert.equal(f.stops('rh-lighter').length, 1);
+  assert.equal(f.job.status, 'running'); assert.equal(f.creates('rh-lighter').length, 1);
+  assert.equal(f.amends('rh-lighter').length, 2);
+  assert.equal(f.amends('rh-lighter')[1].args[1].quantity, '10');
+  assert.equal(f.amends('rh-lighter')[1].args[1].id, original.id);
+  assert.equal(lighterLeg(f).filledQuantity, '0.4');
+  assert.equal(f.creates('binance').length, 1); assert.equal(f.stops('rh-lighter').length, 0);
+  assert.equal(f.job.reason, null);
 });
 
 test('Lighter RH rate-limited reads have fixed time and attempt bounds despite successful status reads', async t => {
@@ -454,7 +477,7 @@ test('the contract check compares Lighter RH market id, quantity step and tick s
   assert.match(f.job.reason ?? '', /Lighter RH 合约价格精度已改变/);
 });
 
-test('Lighter RH chase legs rest at the same-side best price and are repriced by exact cancel and re-send no faster than every 5 s', async t => {
+test('Lighter RH native amendments keep the original id and total quantity and run no faster than every 5 s', async t => {
   const f = await fixture(t); await f.connectLighter();
   f.start(await f.preview()); await f.service.tick();
   const [first] = f.creates('rh-lighter');
@@ -464,26 +487,207 @@ test('Lighter RH chase legs rest at the same-side best price and are repriced by
   original.filledQuantity = '0.4';
   f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.3' };
   for (const step of [1000, 1000, 1000, 1000]) { f.advance(step); await f.service.tick(); }
-  assert.equal(f.stops('rh-lighter').length, 0, 'a 1 s reprice interval is stretched to 5 s on Lighter RH');
+  assert.equal(f.amends('rh-lighter').length, 0, 'a 1 s reprice interval is stretched to 5 s on Lighter RH');
   f.advance(999); await f.service.tick();
-  assert.equal(f.stops('rh-lighter').length, 0);
+  assert.equal(f.amends('rh-lighter').length, 0);
   f.advance(1); await f.service.tick();
-  assert.equal(f.stops('rh-lighter').length, 1);
-  assert.equal(f.stops('rh-lighter')[0].args[1].id, original.id);
-  assert.equal(f.calls.filter(call => call.method === 'amend' && call.exchange === 'rh-lighter').length, 0, 'Lighter RH orders are never amended');
-  const resent = f.creates('rh-lighter');
-  assert.equal(resent.length, 2);
-  assert.deepEqual({ quantity: resent[1].args[1].quantity, limitPrice: resent[1].args[1].limitPrice }, { quantity: '9.6', limitPrice: '352.2' });
-  assert.notEqual(resent[1].args[1].clientId, first.args[1].clientId);
+  assert.equal(f.stops('rh-lighter').length, 0);
+  assert.equal(f.amends('rh-lighter').length, 1);
+  const amended = f.amends('rh-lighter')[0];
+  assert.equal(amended.args[1].id, original.id);
+  assert.deepEqual({ quantity: amended.args[1].quantity, limitPrice: amended.args[1].limitPrice }, { quantity: '10', limitPrice: '352.2' });
+  assert.equal(amended.args[1].clientId, first.args[1].clientId);
+  assert.equal(f.creates('rh-lighter').length, 1);
+  assert.equal(lighterLeg(f).filledQuantity, '0.4');
+  assert.equal(durableLighter(f).amendVersion, f.time);
+  assert.equal(durableLighter(f).orderVersion, f.time);
+  assert.equal(durableLighter(f).amendPending, false);
   assert.equal(f.job.status, 'running');
 
   const slow = await fixture(t); await slow.connectLighter();
   slow.start(await slow.preview(anthropic({ repriceIntervalMs: 10_000 }))); await slow.service.tick();
   slow.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.3' };
   for (let index = 0; index < 9; index += 1) { slow.advance(1000); await slow.service.tick(); }
-  assert.equal(slow.stops('rh-lighter').length, 0, 'a longer configured interval is kept');
+  assert.equal(slow.amends('rh-lighter').length, 0, 'a longer configured interval is kept');
   slow.advance(1000); await slow.service.tick();
-  assert.equal(slow.stops('rh-lighter').length, 1);
+  assert.equal(slow.amends('rh-lighter').length, 1);
+});
+
+test('Lighter RH native amendments preserve fills received during sending and use a strictly newer version', async t => {
+  const f = await fixture(t); await beginReprice(f);
+  const original = f.lighterOrder(); original.filledQuantity = '0.4'; original.orderVersion = f.time + 100_000;
+  f.handlers['rh-lighter:amend'] = async (_credentials, spec, options) => {
+    options.beforeMutation();
+    assert.equal(spec.quantity, '10'); assert.equal(spec.id, original.id);
+    assert.equal(options.amendVersion, original.orderVersion + 1);
+    Object.assign(original, { filledQuantity: '0.6', price: spec.limitPrice, orderVersion: options.amendVersion });
+    return structuredClone(original);
+  };
+  await f.service.tick();
+  assert.equal(lighterLeg(f).filledQuantity, '0.6');
+  assert.equal(f.creates('rh-lighter').length, 1); assert.equal(f.stops('rh-lighter').length, 0);
+  assert.equal(durableLighter(f).spec.quantity, '10'); assert.equal(durableLighter(f).orderVersion, f.time + 100_001);
+});
+
+test('Lighter RH unknown amendments retain their shared intent through old versions and reconcile a late matching version once', async t => {
+  for (const accepted of [false, true]) {
+    const f = await fixture(t, { guarded: true }); await beginReprice(f);
+    const original = f.lighterOrder();
+    f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => {
+      options.beforeMutation(); original.filledQuantity = '0.4';
+      throw Object.assign(new ExecutionExchangeError('timeout', { uncertain: true }), { accepted });
+    };
+    await f.service.tick();
+    const pending = durableLighter(f), operationId = pending.writerOperation.operationId;
+    assert.equal(pending.amendPending, true); assert.equal(pending.unknown, true);
+    assert.equal(pending.amendTarget.limitPrice, '352.2'); assert.equal(pending.amendSentAt, new Date(f.time).toISOString());
+    assert.equal(f.writer.pendingOperationIds().includes(operationId), true);
+    await advanceTicks(f, 30_000);
+    assert.equal(f.job.status, 'running'); assert.equal(durableLighter(f).amendPending, true); assert.equal(durableLighter(f).unknown, true);
+    assert.equal(lighterLeg(f).filledQuantity, '0.4'); assert.equal(f.amends('rh-lighter').length, 1);
+    assert.equal(f.stops('rh-lighter').length, 0); assert.equal(f.creates('rh-lighter').length, 1);
+    assert.equal(f.writer.pendingOperationIds().includes(operationId), true);
+    Object.assign(original, { orderVersion: pending.amendVersion, price: pending.amendTarget.limitPrice, filledQuantity: '0.7' });
+    await f.service.tick();
+    assert.equal(durableLighter(f).amendPending, false); assert.equal(durableLighter(f).unknown, false);
+    assert.equal(lighterLeg(f).filledQuantity, '0.7'); assert.equal(f.amends('rh-lighter').length, 1);
+    assert.equal(f.writer.pendingOperationIds().includes(operationId), false);
+    assert.equal(durableLighter(f).writerOperation.state, 'confirmed');
+  }
+});
+
+test('Lighter RH unknown amendments yield to stop and deadline while cancelling the same original id', async t => {
+  for (const action of ['stop', 'deadline']) {
+    const f = await fixture(t, { guarded: true }); await beginReprice(f, { timeoutMs: 30_000 });
+    const original = f.lighterOrder();
+    f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('transport', { uncertain: true }); };
+    await f.service.tick();
+    if (action === 'stop') f.service.stop(f.job.id, {}); else f.advance(30_000);
+    await f.service.tick();
+    assert.equal(f.job.status, action === 'stop' ? 'stopped' : 'paused', action);
+    assert.equal(f.stops('rh-lighter').length, 1); assert.equal(f.stops('rh-lighter')[0].args[1].id, original.id);
+    assert.equal(f.amends('rh-lighter').length, 1); assert.equal(f.creates('rh-lighter').length, 1);
+    assert.equal(durableLighter(f).amendPending, false);
+    assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  }
+});
+
+test('Lighter RH prepared amendments recheck stop, deadline and stale books before sending', async t => {
+  for (const action of ['stop', 'deadline', 'stale']) {
+    const f = await fixture(t), arrived = deferred(), release = deferred(); let sends = 0;
+    await beginReprice(f, { timeoutMs: 30_000 });
+    f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => {
+      arrived.resolve(); await release.promise; options.beforeMutation(); sends += 1;
+      throw new Error('The send guard must reject');
+    };
+    const running = f.service.tick(); await arrived.promise;
+    if (action === 'stop') f.service.stop(f.job.id, {}); else f.advance(action === 'deadline' ? 30_000 : 10_001);
+    release.resolve(); await running;
+    assert.equal(sends, 0, action); assert.equal(f.job.status, action === 'stop' ? 'stopped' : 'paused', action);
+    assert.equal(f.creates('rh-lighter').length, 1);
+  }
+});
+
+test('Lighter RH unknown amendments have a fixed observation bound and never enter absent-create recovery', async t => {
+  const f = await fixture(t); await beginReprice(f);
+  f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  await f.service.tick();
+  const sentAt = f.time;
+  await advanceTicks(f, TEN_MINUTES + CALL_TIMEOUT + ARRIVAL_MARGIN - 1);
+  assert.equal(f.job.status, 'running'); assert.equal(f.amends('rh-lighter').length, 1);
+  assert.equal(durableLighter(f).absentChecks, undefined);
+  assert.equal(Date.parse(durableLighter(f).amendSentAt), sentAt);
+  f.advance(1); await f.service.tick();
+  assert.equal(f.job.status, 'paused'); assert.equal(f.stops('rh-lighter').length, 1);
+  assert.equal(f.creates('rh-lighter').length, 1);
+});
+
+test('Lighter RH mismatched amendment versions, prices and total quantities cannot acknowledge an unknown modify', async t => {
+  for (const changed of ['version', 'price', 'quantity']) {
+    const f = await fixture(t); await beginReprice(f);
+    f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+    await f.service.tick();
+    const pending = durableLighter(f), original = f.lighterOrder();
+    Object.assign(original, { orderVersion: pending.amendVersion + (changed === 'version' ? 1 : 0), price: changed === 'price' ? '352.25' : pending.amendTarget.limitPrice });
+    if (changed === 'quantity') original.quantity = '9';
+    await f.service.tick();
+    assert.notEqual(f.job.status, 'running', changed);
+    assert.equal(f.amends('rh-lighter').length, 1); assert.equal(f.creates('rh-lighter').length, 1);
+    assert.ok(f.stops('rh-lighter').length > 0);
+  }
+});
+
+test('Lighter RH explicitly unsent amendments obey durable attempt and time bounds, with stop taking precedence', async t => {
+  for (const action of ['attempts', 'window', 'stop', 'deadline']) {
+    const f = await fixture(t); await beginReprice(f, action === 'deadline' ? { timeoutMs: 30_000 } : {});
+    f.handlers['rh-lighter:amend'] = async () => { throw Object.assign(limitedRead(f, action === 'window' ? 600_000 : 10_000), { notSent: true }); };
+    await f.service.tick();
+    assert.equal(durableLighter(f).amendPending, false); assert.equal(durableLighter(f).unknown, false);
+    const before = f.calls.length;
+    if (action === 'stop') f.service.stop(f.job.id, {});
+    else if (action === 'deadline') f.advance(30_000);
+    else {
+      await advanceTicks(f, 9999); assert.equal(f.calls.length, before);
+      await advanceTicks(f, 1); await advanceTicks(f, action === 'window' ? 170_000 : 20_000);
+    }
+    await f.service.tick();
+    assert.equal(f.job.status, action === 'stop' ? 'stopped' : 'paused', action);
+    assert.equal(f.amends('rh-lighter').length, action === 'attempts' ? 4 : 1, action);
+    assert.equal(f.creates('rh-lighter').length, 1);
+  }
+});
+
+test('Lighter RH restart retains unknown amend evidence and shared intent until an original-order terminal is confirmed', async t => {
+  const f = await fixture(t, { guarded: true }); await beginReprice(f);
+  f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  await f.service.tick();
+  const pending = durableLighter(f), old = f.service;
+  f.handlers['rh-lighter:stop'] = async () => { throw Object.assign(limitedRead(f), { notSent: true }); };
+  f.db.prepare('UPDATE execution_lease SET expires=0').run(); f.service = f.create(); await f.service.initializeProtection();
+  assert.equal(durableLighter(f).amendVersion, pending.amendVersion); assert.equal(durableLighter(f).amendPending, true);
+  await f.service.tick();
+  assert.equal(durableLighter(f).amendPending, true); assert.equal(durableLighter(f).unknown, true);
+  assert.equal(f.writer.pendingOperationIds().includes(pending.writerOperation.operationId), true);
+  assert.equal(f.amends('rh-lighter').length, 1); assert.equal(f.creates('rh-lighter').length, 1);
+  delete f.handlers['rh-lighter:stop']; f.advance(15_000); await f.service.tick();
+  assert.equal(f.job.status, 'paused'); assert.equal(durableLighter(f).amendPending, false);
+  assert.equal(f.writer.snapshot().operations.some(row => ['sending', 'unknown'].includes(row.state)), false);
+  await old.close();
+});
+
+test('Lighter RH an uncertain modify after an unsent deferral keeps its own observation window', async t => {
+  const f = await fixture(t); await beginReprice(f);
+  f.handlers['rh-lighter:amend'] = async () => { throw Object.assign(limitedRead(f, 10_000), { notSent: true }); };
+  await f.service.tick();
+  const first = durableLighter(f); assert.equal(first.amendDeferral.count, 1);
+  f.handlers['rh-lighter:amend'] = async (_credentials, _spec, options) => { options.beforeMutation(); throw new ExecutionExchangeError('timeout', { uncertain: true }); };
+  await advanceTicks(f, 10_000);
+  const pending = durableLighter(f);
+  assert.equal(pending.amendDeferral, null); assert.equal(pending.amendPending, true); assert.equal(pending.unknown, true);
+  assert.ok(pending.amendVersion > first.amendVersion);
+  await advanceTicks(f, 180_000);
+  assert.equal(f.job.status, 'running'); assert.equal(f.stops('rh-lighter').length, 0); assert.equal(f.amends('rh-lighter').length, 2);
+  Object.assign(f.lighterOrder(), { orderVersion: pending.amendVersion, price: pending.amendTarget.limitPrice });
+  await f.service.tick();
+  assert.equal(durableLighter(f).amendPending, false); assert.equal(f.job.reason, null);
+});
+
+test('Lighter RH an automatic order reaching its price bound ends an unsent deferral without cancelling', async t => {
+  const f = await fixture(t); await beginReprice(f);
+  const row = f.db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(f.job.id), job = JSON.parse(row.json);
+  job.auto = { guard: {}, boundsBatch: job.batchIndex }; f.db.prepare('UPDATE execution_jobs SET json=? WHERE id=?').run(JSON.stringify(job), job.id);
+  const order = durableLighter(f); order.spec.stopPrice = '352.3';
+  f.db.prepare('UPDATE execution_orders SET json=? WHERE id=?').run(JSON.stringify(order), order.localId);
+  f.handlers['rh-lighter:amend'] = async () => { throw Object.assign(limitedRead(f, 10_000), { notSent: true }); };
+  await f.service.tick(); assert.equal(durableLighter(f).amendDeferral.count, 1);
+  f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.3', ask: '352.4' };
+  await advanceTicks(f, 10_000);
+  assert.equal(durableLighter(f).amendDeferral, null); assert.equal(f.job.reason, null);
+  await advanceTicks(f, 180_000);
+  assert.equal(f.job.status, 'running'); assert.equal(f.amends('rh-lighter').length, 1); assert.equal(f.stops('rh-lighter').length, 0);
+  assert.equal(f.creates('rh-lighter').length, 1); assert.equal(f.lighterOrder().price, '352.1');
+  assert.ok(f.job.events.some(item => /委托保留原价/.test(item.message)));
+  assert.equal(f.job.events.some(item => /改单已恢复并确认/.test(item.message)), false);
 });
 
 test('a post-only order the venue cancelled on arrival is re-sent in full from the next book; other early ends still pause', async t => {

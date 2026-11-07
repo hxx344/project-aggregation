@@ -47,6 +47,7 @@ export function createRhLighterSigner({ timeoutMs = DEFAULT_TIMEOUT_MS, WorkerCl
   }
   return {
     createOrder: params => call('createOrder', params),
+    modifyOrder: params => call('modifyOrder', params),
     cancelOrder: params => call('cancelOrder', params),
     authToken: params => call('authToken', params),
     close() { const current = worker; worker = null; settleAll('signer closed'); return current ? current.terminate() : Promise.resolve(); },

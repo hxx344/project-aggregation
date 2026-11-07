@@ -5,6 +5,7 @@ import { Worker } from 'node:worker_threads';
 import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 import { createRhLighterSigner } from '../server/trading-rh-lighter-signer.mjs';
 import { createRhLighterExecutionClient, clientOrderIndexOf } from '../server/trading-rh-lighter-execution.mjs';
+import { unavailableLighterStream } from './fixtures/lighter-stream.mjs';
 
 // Random test-only keys: never registered on any Lighter account. Signing is offline.
 const KEY_A = 'a1'.repeat(40), KEY_B = 'b2'.repeat(40);
@@ -18,7 +19,7 @@ async function held(promise) {
   try { return await promise; } finally { clearInterval(keep); }
 }
 
-test('the real signer builds create, cancel and auth token payloads from exactly the given fields, offline', async t => {
+test('the real signer builds create, modify, cancel and auth token payloads from exactly the given fields, offline', async t => {
   const signer = createRhLighterSigner();
   t.after(() => signer.close());
   const orderExpiry = Date.now() + 28 * 86_400_000;
@@ -48,6 +49,14 @@ test('the real signer builds create, cancel and auth token payloads from exactly
   assert.deepEqual({ AccountIndex: cancelled.AccountIndex, ApiKeyIndex: cancelled.ApiKeyIndex, MarketIndex: cancelled.MarketIndex, Index: cancelled.Index, Nonce: cancelled.Nonce },
     { AccountIndex: 12345, ApiKeyIndex: 5, MarketIndex: 7, Index: 99, Nonce: 43 });
 
+  const modified = await held(signer.modifyOrder({ ...ACCOUNT, marketIndex: 7, index: 99, baseAmount: 50, price: 35211, nonce: 44, orderVersion: 123456, privateKey: KEY_A }));
+  assert.equal(modified.txType, 17);
+  const amendment = JSON.parse(modified.txInfo);
+  assert.deepEqual({ AccountIndex: amendment.AccountIndex, ApiKeyIndex: amendment.ApiKeyIndex, MarketIndex: amendment.MarketIndex, Index: amendment.Index,
+    BaseAmount: amendment.BaseAmount, Price: amendment.Price, TriggerPrice: amendment.TriggerPrice, Nonce: amendment.Nonce, OrderVersion: amendment.L2TxAttributes?.['8'] },
+  { AccountIndex: 12345, ApiKeyIndex: 5, MarketIndex: 7, Index: 99, BaseAmount: 50, Price: 35211, TriggerPrice: 0, Nonce: 44, OrderVersion: 123456 });
+  assert.ok(!modified.txInfo.includes(KEY_A));
+
   const deadline = Math.floor(Date.now() / 1000) + 1800;
   const { authToken, txType } = await held(signer.authToken({ ...ACCOUNT, deadline, privateKey: KEY_A }));
   assert.equal(txType, undefined);
@@ -66,7 +75,7 @@ test('changing the private key of the same account and key index rebuilds the si
   await assert.rejects(held(signer.authToken({ ...ACCOUNT, deadline: 1, privateKey: 'zz' })), /signer rejected the request/);
 });
 
-test('the worker signs only the three listed transactions; every other method is refused', async t => {
+test('the worker signs only the four listed operations; every other method is refused', async t => {
   const worker = new Worker(WORKER_URL);
   t.after(() => worker.terminate());
   const replies = new Map();
@@ -80,7 +89,7 @@ test('the worker signs only the three listed transactions; every other method is
   assert.equal(accepted.error, undefined);
   assert.equal(accepted.result.txType, 14);
   const signer = createRhLighterSigner();
-  assert.deepEqual(Object.keys(signer).sort(), ['authToken', 'cancelOrder', 'close', 'createOrder']);
+  assert.deepEqual(Object.keys(signer).sort(), ['authToken', 'cancelOrder', 'close', 'createOrder', 'modifyOrder']);
   await signer.close();
 });
 
@@ -138,11 +147,11 @@ test('worker errors, exits and close reject pending calls without guessing a res
   assert.equal(FakeWorker.created[0].terminated, 1, 'closing twice terminates once');
 });
 
-test('the adapter and the real signer agree on every order, cancel and token parameter', async t => {
+test('the adapter and the real signer agree on every order, modify, cancel and token parameter', async t => {
   const real = createRhLighterSigner();
   t.after(() => real.close());
   let lastHash = null;
-  const signer = Object.fromEntries(['createOrder', 'cancelOrder', 'authToken'].map(method => [method, async params => {
+  const signer = Object.fromEntries(['createOrder', 'modifyOrder', 'cancelOrder', 'authToken'].map(method => [method, async params => {
     const result = await held(real[method](params));
     if (result.txHash) lastHash = result.txHash;
     return result;
@@ -158,11 +167,19 @@ test('the adapter and the real signer agree on every order, cancel and token par
     if (pathname === '/api/v1/accountsByL1Address') return ok({ sub_accounts: [{ index: 12345, l1_address: address }] });
     if (pathname === '/api/v1/accountActiveOrders') { sent.push({ token: init.headers.Authorization }); return ok({ orders: [] }); }
     if (pathname === '/api/v1/nextNonce') return ok({ nonce: 7 });
-    if (pathname === '/api/v1/sendTx') { const form = new URLSearchParams(init.body); sent.push({ type: form.get('tx_type'), info: JSON.parse(form.get('tx_info')) }); return ok({ tx_hash: lastHash }); }
+    if (pathname === '/api/v1/sendTx') {
+      const form = new URLSearchParams(init.body), info = JSON.parse(form.get('tx_info'));
+      sent.push({ type: form.get('tx_type'), info });
+      if (form.get('tx_type') === '17') {
+        const original = visible.find(row => row.client_order_index === info.Index);
+        Object.assign(original, { price: '352.2', order_version: info.L2TxAttributes['8'] });
+      }
+      return ok({ tx_hash: lastHash });
+    }
     if (pathname === '/api/v1/accountOrders') return ok({ orders: visible.filter(row => String(row.client_order_index) === searchParams.get('client_order_indexes')) });
     throw new Error('unexpected request ' + url);
   };
-  const client = createRhLighterExecutionClient({ ErrorClass: ExecutionExchangeError, fetchImpl, signer, sleep: async () => {} });
+  const client = createRhLighterExecutionClient({ ErrorClass: ExecutionExchangeError, fetchImpl, signer, stream: unavailableLighterStream(ExecutionExchangeError), sleep: async () => {} });
   assert.deepEqual(await client.verify(credentials), { identity: address, keyLabel: '12345#5' });
   assert.match(sent[0].token, /^\d+:12345:5:[0-9a-f]+$/);
 
@@ -186,7 +203,14 @@ test('the adapter and the real signer agree on every order, cancel and token par
   assert.deepEqual({ Price: market.Price, IsAsk: market.IsAsk, TimeInForce: market.TimeInForce, ReduceOnly: market.ReduceOnly, OrderExpiry: market.OrderExpiry, Nonce: market.Nonce },
     { Price: 34857, IsAsk: 1, TimeInForce: 0, ReduceOnly: 1, OrderExpiry: 0, Nonce: 8 });
 
+  const amended = await client.amend(credentials, { ...chase, id: String(clientOrderIndexOf('hchase')), limitPrice: '352.2' }, { amendVersion: 5 });
+  assert.equal(amended.orderVersion, 5);
+  assert.equal(sent.at(-1).type, '17');
+  const changed = sent.at(-1).info;
+  assert.deepEqual({ Index: changed.Index, BaseAmount: changed.BaseAmount, Price: changed.Price, Nonce: changed.Nonce, Version: changed.L2TxAttributes['8'] },
+    { Index: clientOrderIndexOf('hchase'), BaseAmount: 50, Price: 35220, Nonce: 9, Version: 5 });
+
   await client.stop(credentials, { ...chase, id: String(clientOrderIndexOf('hchase')) });
   assert.equal(sent.at(-1).type, '15');
-  assert.deepEqual({ MarketIndex: sent.at(-1).info.MarketIndex, Index: sent.at(-1).info.Index, Nonce: sent.at(-1).info.Nonce }, { MarketIndex: 7, Index: clientOrderIndexOf('hchase'), Nonce: 9 });
+  assert.deepEqual({ MarketIndex: sent.at(-1).info.MarketIndex, Index: sent.at(-1).info.Index, Nonce: sent.at(-1).info.Nonce }, { MarketIndex: 7, Index: clientOrderIndexOf('hchase'), Nonce: 10 });
 });

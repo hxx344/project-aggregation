@@ -2,12 +2,13 @@ import { createHash } from 'node:crypto';
 import { compareDecimals, decimal } from './trading-decimal.mjs';
 import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs';
 import { createRhLighterSigner } from './trading-rh-lighter-signer.mjs';
+import { createRhLighterStream } from './trading-rh-lighter-stream.mjs';
 
 // Lighter on Robinhood Chain (USDG perps) through one API key of one account.
-// The signer worker can only build CreateOrder, CancelOrder and auth tokens:
+// The signer worker can only build CreateOrder, ModifyOrder, CancelOrder and auth tokens:
 // no transfer, withdrawal, leverage, margin or key change exists here.
-// Chase legs are post-only limit orders; repricing cancels by client order
-// index and the engine re-sends the remainder once the cancel is terminal.
+// Chase legs are post-only limit orders amended by client order index, with
+// their original total quantity and a durable, strictly increasing version.
 // Market legs are IOC limit orders priced 1% through the opposite book.
 // https://docs.lighter.xyz/developers/robinhood-chain/overview
 // https://docs.lighter.xyz/developers/reference/rate-limits
@@ -30,11 +31,10 @@ const REQUESTS_PER_MINUTE = 40;
 const RATE_WINDOW_MS = 60_000;
 const MAX_RATE_WAIT_MS = 8000;
 const COOLDOWN_MS = 60_000;
-// The engine ticks every second and the display quotes poll every 2 s. These
-// keep one working order near 30 reads per minute and the display near 10.
-const BOOK_TTL = 4000;
-const DISPLAY_BOOK_TTL = 6000;
-const ORDER_TTL = 4000;
+// Healthy books and orders come from WS. Exact REST reads only repair a missing
+// order or an interrupted stream, at most once per key per 10 s (except the two
+// bounded checks immediately after a write). They keep the original read time.
+const RECOVERY_READ_MS = 10_000;
 const MARKET_ID_TTL = 600_000;
 const RULE_TTL = 60_000;
 const IDENTITY_TTL = 60_000;
@@ -114,7 +114,7 @@ export function orderPrice(spec, tickSize) {
   return { price, problem: null };
 }
 
-export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalThis.fetch, now = Date.now, timeoutMs = 10_000, signer = null,
+export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalThis.fetch, now = Date.now, timeoutMs = 10_000, signer = null, stream = null, WebSocketImpl = globalThis.WebSocket,
   sleep = (ms, signal) => new Promise(resolve => { const timer = setTimeout(done, ms); function done() { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); } signal?.addEventListener('abort', done, { once: true }); }) } = {}) {
   if (typeof ErrorClass !== 'function') throw new TypeError('ExecutionExchangeError is required');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetch is required');
@@ -136,13 +136,50 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     try { return decimal(fromUnits(units(amount(value, { positive: true })) * SCALE / units(quantity)), { positive: true }); } catch { return null; }
   };
   const integerOf = (value, min = 0, max = Number.MAX_SAFE_INTEGER) => { if (!Number.isSafeInteger(value) || value < min || value > max) fail(); return value; };
+  const live = stream ?? createRhLighterStream({ ErrorClass, WebSocketImpl, now });
   let sign = signer;
   const signerOf = () => (sign ??= createRhLighterSigner());
-  const marketIds = new Map(), rules = new Map(), books = new Map(), orderReads = new Map(), identities = new Map(), tokens = new Map(), nonces = new Map();
+  const marketIds = new Map(), rules = new Map(), identities = new Map(), tokens = new Map(), nonces = new Map();
   const sent = [];
   // generation is bumped by forget(): a call still in flight then cannot put a token, identity,
   // nonce or order read back, nor start a signer worker for the forgotten key.
-  let cooldownUntil = 0, shared = null, mutations = Promise.resolve(), generation = 0;
+  let cooldownUntil = 0, shared = null, mutations = Promise.resolve(), generation = 0, orderRevision = 0;
+  const recoveryReads = new Map(), orderRevisions = new Map();
+  const recoverableStream = error => error instanceof ErrorClass && !error.rateLimited && ['upstream', 'transport', 'timeout'].includes(error.code);
+
+  async function recoveryRead(key, operation, signal, fresh = false) {
+    checkAbort(signal);
+    const time = now();
+    let entry = recoveryReads.get(key);
+    if (!entry || !entry.pending && (fresh || time < entry.at || time >= entry.until)) {
+      for (const [id, value] of recoveryReads) if (!value.pending && time >= value.until) recoveryReads.delete(id);
+      if (recoveryReads.size >= MAX_ROWS && !recoveryReads.has(key)) fail('response_limit');
+      entry = { at: time, pending: true, until: Infinity, promise: null };
+      // The transport has its own timeout. A display caller aborting must not
+      // cancel the same recovery read the executor is awaiting.
+      entry.promise = operation();
+      recoveryReads.set(key, entry);
+      const done = () => { entry.pending = false; entry.until = now() + RECOVERY_READ_MS; };
+      entry.promise.then(done, done);
+    }
+    if (!signal) return entry.promise;
+    return new Promise((resolve, reject) => {
+      const abort = () => { signal.removeEventListener('abort', abort); reject(new ErrorClass('aborted')); };
+      signal.addEventListener('abort', abort, { once: true });
+      entry.promise.then(value => { signal.removeEventListener('abort', abort); if (signal.aborted) reject(new ErrorClass('aborted')); else resolve(value); },
+        error => { signal.removeEventListener('abort', abort); reject(error); });
+      if (signal.aborted) abort();
+    });
+  }
+  const orderKey = (k, index) => `${k.fingerprint}:${index}`;
+  function invalidateOrder(k, index) {
+    const key = orderKey(k, index), time = now();
+    // Five minutes exceed the maximum HTTP timeout plus rate-admission wait.
+    // Prune old identities without invalidating unrelated in-flight orders.
+    for (const [id, entry] of orderRevisions) if (time - entry.at > 300_000) orderRevisions.delete(id);
+    orderRevisions.set(key, { revision: ++orderRevision, at: time });
+    recoveryReads.delete(`order:${key}`);
+  }
 
   function keys(credentials) {
     if (!object(credentials) || typeof credentials.address !== 'string' || !/^0x[0-9a-fA-F]{40}$/.test(credentials.address)
@@ -346,16 +383,19 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   async function market(symbol, { signal, withRule = true } = {}) {
     if (!RH_LIGHTER_SYMBOLS.includes(symbol)) fail('input');
     const rule = await ruleOf(symbol, signal);
-    let book = books.get(rule.assetId);
-    if (!book || now() - book.received >= (withRule ? BOOK_TTL : DISPLAY_BOOK_TTL)) {
-      const data = await request('/api/v1/orderBookOrders', { query: { market_id: String(rule.assetId), limit: '5' }, token: publicToken(), signal });
-      const bid = bestOf(data.bids, 'bid'), ask = bestOf(data.asks, 'ask');
-      if (compareDecimals(bid, ask) >= 0) fail();
-      // The venue sends no book timestamp: the receive time is the honest age.
-      book = { bid, ask, received: now() };
-      books.set(rule.assetId, book);
+    let book;
+    try { book = await live.book(rule.assetId, symbol, { signal }); }
+    catch (error) {
+      checkAbort(signal);
+      if (!recoverableStream(error)) throw error;
+      book = await recoveryRead(`book:${rule.assetId}`, async () => {
+        const data = await request('/api/v1/orderBookOrders', { query: { market_id: String(rule.assetId), limit: '5' }, token: publicToken() });
+        const bid = bestOf(data.bids, 'bid'), ask = bestOf(data.asks, 'ask');
+        if (compareDecimals(bid, ask) >= 0) fail();
+        return { bid, ask, at: new Date(now()).toISOString() };
+      }, signal);
     }
-    const result = { symbol, bid: book.bid, ask: book.ask, at: new Date(book.received).toISOString() };
+    const result = { symbol, bid: book.bid, ask: book.ask, at: typeof book.at === 'number' ? new Date(book.at).toISOString() : book.at };
     if (!withRule) return result;
     const { defaultLeverage, ...limits } = rule;
     return { ...result, rule: limits };
@@ -476,12 +516,13 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
       }
       const tx = await signed(k, method, { ...params, privateKey: k.privateKey, apiKeyIndex: k.apiKeyIndex, accountIndex: k.accountIndex, nonce });
       if (!Number.isSafeInteger(tx.txType) || typeof tx.txInfo !== 'string' || tx.txInfo.length > 8192 || typeof tx.txHash !== 'string' || !/^[0-9a-f]{64,128}$/.test(tx.txHash)) fail('credentials');
-      orderReads.clear();
+      const orderIndex = params.clientOrderIndex ?? params.index;
+      invalidateOrder(k, orderIndex);
       let data;
       try {
         data = await request(SEND_PATH, { form: { tx_type: String(tx.txType), tx_info: tx.txInfo, price_protection: 'true' }, signal, beforeMutation: guard });
       } catch (error) { nonces.delete(k.slot); throw error; }
-      finally { orderReads.clear(); }
+      finally { invalidateOrder(k, orderIndex); }
       if (typeof data.tx_hash !== 'string' || data.tx_hash.toLowerCase() !== tx.txHash) { nonces.delete(k.slot); fail('invalid_data', { uncertain: true }); }
       if (k.era === generation) nonces.set(k.slot, nonce + 1);
       const predicted = Number.isSafeInteger(data.predicted_execution_time_ms) ? data.predicted_execution_time_ms : null;
@@ -496,14 +537,34 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     try { return await checkedRule(spec, signal); } catch (error) { markUnsent(error); throw error; }
   }
 
-  async function ordersByIndex(k, indexes, signal, fresh = false) {
-    const key = `${k.accountIndex}:${indexes.join(',')}`;
-    const cached = orderReads.get(key);
-    if (!fresh && cached && now() - cached.at < ORDER_TTL) return cached.rows;
-    const data = await request('/api/v1/accountOrders', { query: { account_index: String(k.accountIndex), client_order_indexes: indexes.join(',') }, token: await tokenFor(k, signal), signal });
-    if (!Array.isArray(data.orders) || data.orders.length > 20) fail();
-    if (k.era === generation) orderReads.set(key, { rows: data.orders, at: now() });
-    return data.orders;
+  async function streamOrder(k, spec, signal, { waitMs = 0, minVersion = 0 } = {}) {
+    const token = await tokenFor(k, signal);
+    if (k.era !== generation) fail('aborted');
+    try {
+      return await live.order(spec.assetId, k.accountIndex, spec.clientOrderIndex, { token, tokenExpiresAt: tokens.get(k.fingerprint)?.until,
+        identity: k.fingerprint, signal, waitMs, minVersion });
+    } catch (error) { if (AUTH_CODES.has(error.providerCode)) dropToken(token); throw error; }
+  }
+  async function ordersByIndex(k, spec, signal, { fresh = false, waitMs = 0, minVersion = 0 } = {}) {
+    try {
+      const row = await streamOrder(k, spec, signal, { waitMs, minVersion });
+      if (k.era !== generation) fail('aborted');
+      if (row) return [row];
+    } catch (error) {
+      checkAbort(signal);
+      if (!recoverableStream(error)) throw error;
+    }
+    // A stream snapshot can omit filled or cancelled history. Only an exact
+    // REST lookup can establish absence; a missing WS row never does so.
+    const key = orderKey(k, spec.clientOrderIndex), revision = orderRevisions.get(key)?.revision;
+    return recoveryRead(`order:${key}`, async () => {
+      const data = await request('/api/v1/accountOrders', { query: { account_index: String(k.accountIndex), client_order_indexes: String(spec.clientOrderIndex) }, token: await tokenFor(k) });
+      if (k.era !== generation) fail('aborted');
+      if (revision !== orderRevisions.get(key)?.revision) fail('upstream', { detail: '委托补核早于最近写入，等待新的订单状态' });
+      if (!Array.isArray(data.orders) || data.orders.length > 20) fail();
+      for (const row of data.orders) if (object(row) && row.owner_account_index !== undefined && row.owner_account_index !== k.accountIndex) fail();
+      return data.orders;
+    }, signal, fresh);
   }
 
   function matchOf(rows, spec) {
@@ -526,11 +587,13 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     if (row.status === 'filled' && compareDecimals(filledQuantity, quantity) !== 0) fail();
     let averagePrice = null;
     if (filledQuantity !== '0') averagePrice = fromUnits(units(amount(row.filled_quote_amount, { positive: true })) * SCALE / units(filledQuantity));
+    const orderVersion = row.order_version === undefined ? 0 : integerOf(row.order_version);
     return {
       id: String(spec.clientOrderIndex), kind: 'order', status: terminal ? 'terminal' : 'working', quantity, filledQuantity,
       price: amount(row.price, { positive: true }), averagePrice, terminal, childrenSettled: terminal,
       symbol: spec.symbol, side: spec.side, reduceOnly: row.reduce_only, positionSide: 'BOTH',
       createdAt: new Date(row.timestamp * 1000).toISOString(),
+      orderVersion,
       // A post-only order the book crossed after the read: nothing rested or filled.
       ...(spec.orderType === 'chase' && row.status === 'canceled-post-only' && filledQuantity === '0' ? { bounced: true } : {}),
     };
@@ -546,6 +609,10 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     const { price, problem } = orderPrice(spec, rule.tickSize);
     if (problem) fail('input', { detail: problem });
     const market = spec.orderType === 'market';
+    // Subscribe before dispatch so immediate fills are observed. Temporary WS
+    // failure is covered by the bounded exact post-send REST reconciliation.
+    try { await streamOrder(k, spec, signal); }
+    catch (error) { if (!recoverableStream(error)) { markUnsent(error); throw error; } }
     const sentAt = await transact(k, 'createOrder', {
       marketIndex: rule.assetId, clientOrderIndex: spec.clientOrderIndex, baseAmount: Number(baseAmount), price: Number(units(price) / units(rule.tickSize)),
       isAsk: spec.side === 'sell' ? 1 : 0, orderType: 0, timeInForce: market ? 0 : 2, reduceOnly: spec.reduceOnly ? 1 : 0,
@@ -561,7 +628,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
         await sleep(delay, signal);
         // The transaction was accepted: an interrupted check never means "not sent".
         if (signal?.aborted) fail('aborted', { uncertain: true });
-        const row = matchOf(await ordersByIndex(k, [spec.clientOrderIndex], signal, true), spec);
+        const row = matchOf(await ordersByIndex(k, spec, signal, { fresh: true, waitMs: VISIBLE_RETRY_MS }), spec);
         if (row) {
           try { inspection(row, spec); } catch { fail('invalid_data', { uncertain: true }); }
           return { id: String(spec.clientOrderIndex), kind: 'order' };
@@ -577,12 +644,55 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   async function inspect(credentials, value, { signal } = {}) {
     const spec = specOf(value);
     const k = keys(credentials);
-    const row = matchOf(await ordersByIndex(k, [spec.clientOrderIndex], signal), spec);
+    const row = matchOf(await ordersByIndex(k, spec, signal), spec);
     if (!row) fail('not_found', { notFound: true });
     const result = inspection(row, spec);
     // The cached book is the one the post-only order crossed; the re-send must read a new one.
-    if (result.bounced) books.delete(spec.assetId);
+    if (result.bounced) recoveryReads.delete(`book:${spec.assetId}`);
     return result;
+  }
+
+  async function amend(credentials, value, { signal, beforeMutation, amendVersion } = {}) {
+    const spec = specOf(value, { requireId: true, requirePrice: true });
+    if (spec.orderType !== 'chase' || !Number.isSafeInteger(amendVersion) || amendVersion < 1) fail('input');
+    const k = keys(credentials);
+    let rule, previous;
+    try {
+      rule = await checkedRule(spec, signal);
+      const row = matchOf(await ordersByIndex(k, spec, signal), spec);
+      if (!row) fail('not_found', { notFound: true });
+      previous = inspection(row, spec);
+      if (compareDecimals(previous.quantity, spec.quantity) !== 0) fail('invalid_data');
+      if (previous.terminal) return previous;
+      if (previous.orderVersion >= amendVersion) fail('input', { detail: '改单版本未超过原订单版本' });
+    } catch (error) { markUnsent(error); throw error; }
+    const baseAmount = units(spec.quantity) / units(rule.quantityStep);
+    if (units(spec.quantity) % units(rule.quantityStep) !== 0n || baseAmount < 1n || baseAmount > MAX_BASE_AMOUNT) fail('input');
+    const { price, problem } = orderPrice(spec, rule.tickSize);
+    if (problem) fail('input', { detail: problem });
+    // The official prover subtracts execution-time fills from this total. Using
+    // locally observed remaining size would shrink the order during a fill race.
+    const sentAt = await transact(k, 'modifyOrder', { marketIndex: rule.assetId, index: spec.clientOrderIndex,
+      baseAmount: Number(baseAmount), price: Number(units(price) / units(rule.tickSize)), orderVersion: amendVersion }, { signal, beforeMutation });
+    const first = Math.min(VISIBLE_WAIT_MS, Math.max(0, (sentAt.predicted ?? now()) - now())) + 300;
+    try {
+      for (const delay of [first, VISIBLE_RETRY_MS]) {
+        await sleep(delay, signal);
+        checkAbort(signal);
+        const row = matchOf(await ordersByIndex(k, spec, signal, { fresh: true, waitMs: VISIBLE_RETRY_MS, minVersion: amendVersion }), spec);
+        if (!row) continue;
+        const result = inspection(row, spec);
+        if (compareDecimals(result.quantity, spec.quantity) !== 0 || compareDecimals(result.filledQuantity, previous.filledQuantity) < 0) fail('invalid_data');
+        if (result.terminal) return result;
+        if (result.orderVersion < amendVersion) continue;
+        if (result.orderVersion !== amendVersion || compareDecimals(result.price, price) !== 0) fail('invalid_data', { detail: '订单改价回报与本次版本或价格不一致' });
+        return result;
+      }
+      fail('upstream', { detail: '改单已提交，等待对应版本的订单推送确认' });
+    } catch (error) {
+      if (!(error instanceof ErrorClass)) throw Object.assign(new ErrorClass('invalid_data', { uncertain: true }), { accepted: true });
+      throw Object.assign(error, { uncertain: true, accepted: true });
+    }
   }
 
   async function stop(credentials, value, { signal, beforeMutation } = {}) {
@@ -598,10 +708,12 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   // market reads go back to unauthenticated and the signer thread holding the
   // key is stopped (the next connection starts a fresh one).
   function forget() {
-    generation += 1; tokens.clear(); identities.clear(); nonces.clear(); orderReads.clear(); shared = null;
+    generation += 1; tokens.clear(); identities.clear(); nonces.clear(); recoveryReads.clear(); orderRevisions.clear(); shared = null;
+    live.forget();
     if (sign && sign !== signer) { const current = sign; sign = null; void Promise.resolve(current.close()).catch(() => {}); }
   }
 
   const unsupported = async () => fail('input');
-  return { exchange: 'rh-lighter', verify, account, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported, forget };
+  return { exchange: 'rh-lighter', verify, account, market, create, amend, inspect, stop, endedStrategies: unsupported, forget,
+    close() { forget(); live.close(); } };
 }

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { ExecutionExchangeError, createExecutionExchangeClient } from '../server/trading-execution-exchanges.mjs';
 import { createRhLighterExecutionClient, clientOrderIndexOf, protectivePrice, orderPrice, RH_LIGHTER_SYMBOLS, RH_LIGHTER_TX_EXPIRES_MS } from '../server/trading-rh-lighter-execution.mjs';
+import { unavailableLighterStream } from './fixtures/lighter-stream.mjs';
 
 // Fixture values only: no real wallet, account or API key.
 const ADDRESS = '0x' + 'Ab'.repeat(20);
@@ -25,7 +26,31 @@ const orderRow = (value, overrides = {}) => ({ market_index: 7, client_order_ind
   time_in_force: value.orderType === 'market' ? 'immediate-or-cancel' : 'post-only', status: 'open', timestamp: T0 / 1000,
   initial_base_amount: value.quantity, filled_base_amount: '0', remaining_base_amount: value.quantity, filled_quote_amount: '0', price: value.limitPrice, ...overrides });
 
-function harness({ routes = {}, sends = [], signer: patch = {}, timeoutMs } = {}) {
+function streamingHarness(options = {}) {
+  const sockets = [];
+  let h, bookNonce = 0, orderNonce = 0;
+  const rows = () => [...h.orders.values()].map(row => ({ owner_account_index: credentials.accountIndex, nonce: 1, order_version: 0, ...row }));
+  class Socket {
+    constructor(url) { this.url = url; this.listeners = new Map(); this.sent = []; sockets.push(this); queueMicrotask(() => this.frame({ type: 'connected' })); }
+    addEventListener(name, listener) { const list = this.listeners.get(name) ?? []; list.push(listener); this.listeners.set(name, list); }
+    emit(name, event) { for (const listener of this.listeners.get(name) ?? []) listener(event); }
+    frame(value) { if (!this.closed) this.emit('message', { data: JSON.stringify(value) }); }
+    send(raw) {
+      const message = JSON.parse(raw); this.sent.push(message);
+      if (message.type === 'subscribe' && message.channel === 'ticker/7') queueMicrotask(() => pushBook('352.1', '352.3', 'subscribed/ticker'));
+      if (message.type === 'subscribe' && message.channel === 'account_orders/7/12345') queueMicrotask(() => pushOrders('subscribed/account_orders'));
+      if (message.type === 'ping') queueMicrotask(() => this.frame({ type: 'pong' }));
+    }
+    close() { if (this.closed) return; this.closed = true; this.emit('close', {}); }
+  }
+  const pushBook = (bid = '352.1', ask = '352.3', type = 'update/ticker') => sockets.at(-1)?.frame({ type, channel: 'ticker:7', nonce: ++bookNonce,
+    timestamp: h.time, ticker: { s: 'ANTHROPIC', b: { price: bid, size: '3' }, a: { price: ask, size: '3' }, last_updated_at: h.time * 1000 } });
+  const pushOrders = (type = 'update/account_orders') => sockets.at(-1)?.frame({ type, channel: 'account_orders:7', account: credentials.accountIndex, nonce: ++orderNonce, orders: { 7: rows() } });
+  h = harness({ ...options, WebSocketImpl: Socket });
+  return Object.assign(h, { sockets, pushBook, pushOrders });
+}
+
+function harness({ routes = {}, sends = [], signer: patch = {}, timeoutMs, stream, WebSocketImpl } = {}) {
   let time = T0, lastHash = null;
   const calls = [], signs = [], sleeps = [], orders = new Map();
   const nonce = { value: 41 };
@@ -38,9 +63,10 @@ function harness({ routes = {}, sends = [], signer: patch = {}, timeoutMs } = {}
   const base = {
     async createOrder(params) { return tx(14, params); },
     async cancelOrder(params) { return tx(15, params); },
+    async modifyOrder(params) { return tx(17, params); },
     async authToken(params) { return { authToken: `${params.deadline}:${params.accountIndex}:${params.apiKeyIndex}:${'ab'.repeat(40)}` }; },
   };
-  const signer = Object.fromEntries(['createOrder', 'cancelOrder', 'authToken'].map(method => [method, async params => {
+  const signer = Object.fromEntries(['createOrder', 'modifyOrder', 'cancelOrder', 'authToken'].map(method => [method, async params => {
     signs.push({ method, params, at: time });
     return (patch[method] ?? base[method])(params);
   }]));
@@ -70,6 +96,7 @@ function harness({ routes = {}, sends = [], signer: patch = {}, timeoutMs } = {}
     return answer instanceof Response ? answer : json(answer);
   };
   const client = createRhLighterExecutionClient({ ErrorClass: ExecutionExchangeError, fetchImpl, now: () => time, signer,
+    ...(WebSocketImpl ? { WebSocketImpl } : { stream: stream ?? unavailableLighterStream(ExecutionExchangeError) }),
     sleep: async ms => { sleeps.push(ms); time += ms; }, ...(timeoutMs ? { timeoutMs } : {}) });
   return {
     client, calls, signs, sleeps, orders, nonce,
@@ -209,21 +236,21 @@ test('market maps live order book details to tick, step and limits, and refuses 
   assert.equal(renumbered.of('/api/v1/orderBooks').length, 2, 'a renumbered contract drops the cached market id');
 });
 
-test('book, rule and market id caches expire on their own clocks', async () => {
+test('REST recovery books, rules and market IDs expire independently without renewing old quote time', async () => {
   const h = harness();
   const count = path => h.of(path).length;
   await h.client.market('ANTHROPIC');
-  h.advance(3999); await h.client.market('ANTHROPIC');
+  h.advance(9999); await h.client.market('ANTHROPIC');
   assert.equal(count('/api/v1/orderBookOrders'), 1);
   h.advance(1); const fresh = await h.client.market('ANTHROPIC');
-  assert.equal(count('/api/v1/orderBookOrders'), 2, 'an order book is reused for under 4 s');
-  assert.equal(fresh.at, new Date(T0 + 4000).toISOString(), 'the quote age is the receive time');
-  h.advance(5999); await h.client.market('ANTHROPIC', { withRule: false });
-  assert.equal(count('/api/v1/orderBookOrders'), 2, 'display reads accept a book under 6 s old');
+  assert.equal(count('/api/v1/orderBookOrders'), 2, 'REST repairs happen at most once per 10 s');
+  assert.equal(fresh.at, new Date(T0 + 10_000).toISOString(), 'the quote age is the receive time');
+  h.advance(9999); await h.client.market('ANTHROPIC', { withRule: false });
+  assert.equal(count('/api/v1/orderBookOrders'), 2, 'display and execution share the same recovery read');
   h.advance(1); await h.client.market('ANTHROPIC', { withRule: false });
   assert.equal(count('/api/v1/orderBookOrders'), 3);
   assert.equal(count('/api/v1/orderBookDetails'), 1);
-  h.advance(60_000 - 10_000); await h.client.market('ANTHROPIC');
+  h.advance(60_000 - 20_000); await h.client.market('ANTHROPIC');
   assert.equal(count('/api/v1/orderBookDetails'), 2, 'contract rules are re-read after one minute');
   assert.equal(count('/api/v1/orderBooks'), 1);
   h.advance(600_000 - 60_000); await h.client.market('ANTHROPIC');
@@ -672,7 +699,7 @@ test('the local limit admits 40 requests per rolling minute and fails a request 
 test('inspect maps venue order states, flags a bounced post-only order and averages fills from quote over base', async () => {
   const look = async (row, value = spec({ id: String(indexOf(spec())) })) => harness({ routes: { '/api/v1/accountOrders': ok({ orders: [row] }) } }).client.inspect(credentials, value);
   assert.deepEqual(await look(orderRow(spec())), { id: String(indexOf(spec())), kind: 'order', status: 'working', quantity: '0.5', filledQuantity: '0', price: '352.1', averagePrice: null,
-    terminal: false, childrenSettled: false, symbol: 'ANTHROPIC', side: 'buy', reduceOnly: false, positionSide: 'BOTH', createdAt: new Date(T0).toISOString() });
+    terminal: false, childrenSettled: false, symbol: 'ANTHROPIC', side: 'buy', reduceOnly: false, positionSide: 'BOTH', createdAt: new Date(T0).toISOString(), orderVersion: 0 });
   for (const status of ['pending', 'in-progress']) assert.equal((await look(orderRow(spec(), { status }))).terminal, false, status);
   const filled = await look(orderRow(spec(), { status: 'filled', filled_base_amount: '0.5', remaining_base_amount: '0', filled_quote_amount: '176.1' }));
   assert.deepEqual({ status: filled.status, terminal: filled.terminal, settled: filled.childrenSettled, filled: filled.filledQuantity, average: filled.averagePrice, bounced: filled.bounced },
@@ -705,12 +732,12 @@ test('inspect maps venue order states, flags a bounced post-only order and avera
   assert.equal((await unanswered.client.inspect(credentials, spec({ id: null }))).id, String(indexOf(spec())), 'an unanswered create is found by client index alone');
 });
 
-test('order reads are shared for 4 s and dropped by every send', async () => {
+test('REST order recovery reads are shared for 10 s and dropped by every send', async () => {
   const h = harness();
   const value = spec({ id: String(indexOf(spec())) });
   h.orders.set(indexOf(spec()), orderRow(spec()));
   await h.client.inspect(credentials, value);
-  h.advance(3999);
+  h.advance(9999);
   await h.client.inspect(credentials, value);
   assert.equal(h.of('/api/v1/accountOrders').length, 1);
   h.advance(1);
@@ -743,4 +770,113 @@ test('stop signs a cancel by client order index after the final guard and return
   await assert.rejects(gone.client.stop(credentials, value), error => isError('rejected', { uncertain: false })(error) && /已成交、已撤销或不存在/.test(error.message));
   const lost = harness({ sends: [() => json({}, 500)] });
   await assert.rejects(lost.client.stop(credentials, value), isError('upstream', { uncertain: true }));
+});
+
+test('healthy WS books and order updates run for a minute without REST polling', async t => {
+  const h = streamingHarness(); t.after(() => h.client.close());
+  const value = spec(); h.orders.set(indexOf(value), orderRow(value));
+  await h.client.market('ANTHROPIC');
+  await h.client.inspect(credentials, value);
+  for (let tick = 1; tick <= 60; tick += 1) {
+    h.advance(1000); h.pushBook(tick % 2 ? '352.11' : '352.1');
+    if (tick === 30) {
+      h.orders.set(indexOf(value), orderRow(value, { filled_base_amount: '0.2', remaining_base_amount: '0.3', filled_quote_amount: '70.42' }));
+      h.pushOrders();
+    }
+    const [book, order] = await Promise.all([h.client.market('ANTHROPIC'), h.client.inspect(credentials, value)]);
+    assert.equal(book.at, new Date(h.time).toISOString());
+    assert.equal(order.filledQuantity, tick < 30 ? '0' : '0.2');
+  }
+  assert.equal(h.of('/api/v1/orderBookOrders').length, 0);
+  assert.equal(h.of('/api/v1/accountOrders').length, 0);
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.sockets[0].sent.filter(message => message.type === 'subscribe').length, 3, 'the quiet private channel refreshes its WS snapshot once without REST');
+});
+
+test('WS native modify preserves original total during fills and confirms the exact version without cancel or recreate', async t => {
+  let h;
+  const value = spec({ quantity: '10', id: String(indexOf(spec())) });
+  h = streamingHarness({ sends: [form => {
+    assert.equal(form.get('tx_type'), '17');
+    const tx = JSON.parse(form.get('tx_info'));
+    assert.equal(tx.baseAmount, 1000, 'the venue subtracts execution-time fills from the original total');
+    h.orders.set(indexOf(value), orderRow(value, { price: '352.2', initial_base_amount: '10', filled_base_amount: '5', remaining_base_amount: '5', filled_quote_amount: '1760.6', order_version: tx.orderVersion, nonce: 99 }));
+    h.pushOrders();
+    return ok({ tx_hash: h.lastHash });
+  }] });
+  t.after(() => h.client.close());
+  h.orders.set(indexOf(value), orderRow(value, { filled_base_amount: '3', remaining_base_amount: '7', filled_quote_amount: '1056.3', order_version: 4, nonce: 100 }));
+  let guarded = 0;
+  const modified = await h.client.amend(credentials, { ...value, limitPrice: '352.2' }, { amendVersion: 5, beforeMutation() { guarded += 1; } });
+  assert.equal(guarded, 1);
+  assert.deepEqual({ id: modified.id, quantity: modified.quantity, filled: modified.filledQuantity, price: modified.price, version: modified.orderVersion },
+    { id: value.id, quantity: '10', filled: '5', price: '352.2', version: 5 });
+  assert.deepEqual(h.signed('modifyOrder').map(item => item.params.index), [indexOf(value)]);
+  assert.equal(h.signed('createOrder').length + h.signed('cancelOrder').length, 0);
+  assert.equal(h.of(SEND).length, 1);
+  assert.equal(h.of('/api/v1/accountOrders').length, 0, 'pushes confirm the amendment');
+  const inspected = await h.client.inspect(credentials, value);
+  assert.deepEqual([inspected.orderVersion, inspected.filledQuantity, inspected.price], [5, '5', '352.2'], 'inspect cannot return a pre-modify WS row after confirmation');
+});
+
+test('accepted modify cannot be confirmed by an older version, wrong target or another order quantity', async () => {
+  const value = spec({ id: String(indexOf(spec())), limitPrice: '352.2' });
+  for (const [after, code] of [
+    [{ order_version: 0, price: '352.1' }, 'upstream'],
+    [{ order_version: 5, price: '352.1' }, 'invalid_data'],
+    [{ order_version: 6, price: '352.2' }, 'invalid_data'],
+    [{ order_version: 5, price: '352.2', initial_base_amount: '0.6' }, 'invalid_data'],
+  ]) {
+    const h = harness({ sends: [() => { h.orders.set(indexOf(value), orderRow(value, after)); return ok({ tx_hash: h.lastHash }); }] });
+    h.orders.set(indexOf(value), orderRow(spec()));
+    await assert.rejects(h.client.amend(credentials, value, { amendVersion: 5 }), isError(code, { uncertain: true, accepted: true }));
+    assert.equal(h.of(SEND).length, 1);
+  }
+});
+
+test('modify refuses changed identity, total, bounds and stale version before dispatch and leaves ambiguous sends unknown', async () => {
+  const value = spec({ id: String(indexOf(spec())), limitPrice: '352.2' });
+  for (const [row, target, version] of [
+    [orderRow(spec(), { is_ask: true }), value, 5],
+    [orderRow(spec(), { initial_base_amount: '0.6' }), value, 5],
+    [orderRow(spec(), { order_version: 5 }), value, 5],
+    [orderRow(spec()), { ...value, stopPrice: '352.2' }, 5],
+    [orderRow(spec()), { ...value, limitPrice: '352.205' }, 5],
+    [orderRow(spec()), value, 0],
+  ]) {
+    const h = harness(); h.orders.set(indexOf(value), row);
+    await assert.rejects(h.client.amend(credentials, target, { amendVersion: version }));
+    assert.equal(h.of(SEND).length, 0);
+  }
+  const lost = harness({ sends: [() => { throw new Error('fixture transport lost'); }] });
+  lost.orders.set(indexOf(value), orderRow(spec()));
+  await assert.rejects(lost.client.amend(credentials, value, { amendVersion: 5 }), isError('transport', { uncertain: true }));
+  assert.equal(lost.of(SEND).length, 1);
+  const guarded = harness(); guarded.orders.set(indexOf(value), orderRow(spec()));
+  await assert.rejects(guarded.client.amend(credentials, value, { amendVersion: 5, beforeMutation() { throw new ExecutionExchangeError('aborted'); } }), isError('aborted', { notSent: true, uncertain: false }));
+  assert.equal(guarded.of(SEND).length, 0);
+});
+
+test('a missing WS order is repaired by exact REST lookup, never inferred terminal, with a bounded recovery cadence', async t => {
+  const h = streamingHarness(); t.after(() => h.client.close());
+  const value = spec();
+  await assert.rejects(h.client.inspect(credentials, value), isError('not_found', { notFound: true }));
+  h.orders.set(indexOf(value), orderRow(value, { status: 'filled', filled_base_amount: value.quantity, remaining_base_amount: '0', filled_quote_amount: '176.05' }));
+  await assert.rejects(h.client.inspect(credentials, value), isError('not_found'), 'missing cached REST evidence is not overwritten with invented completion');
+  h.advance(10_000);
+  assert.equal((await h.client.inspect(credentials, value)).terminal, true);
+  assert.equal(h.of('/api/v1/accountOrders').length, 2);
+  assert.ok(h.of('/api/v1/accountOrders').every(call => call.query.get('client_order_indexes') === String(indexOf(value))));
+});
+
+test('a REST repair started before a same-order write cannot return stale state after acceptance', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = harness({ routes: { '/api/v1/accountOrders': async () => { await gate; return ok({ orders: [orderRow(spec())] }); } } });
+  const value = spec({ id: String(indexOf(spec())) });
+  const pending = h.client.inspect(credentials, value);
+  while (!h.of('/api/v1/accountOrders').length) await new Promise(resolve => setImmediate(resolve));
+  await h.client.stop(credentials, value);
+  release();
+  await assert.rejects(pending, error => isError('upstream')(error) && /早于最近写入/.test(error.message));
 });
