@@ -31,7 +31,7 @@ function harness({ exchange = [], info = {}, timeoutMs } = {}) {
       return typeof next === 'function' ? next(payload, init) : json(next);
     }
     const handler = info[payload.type];
-    if (handler) return json(typeof handler === 'function' ? handler(payload) : handler);
+    if (handler) return json(typeof handler === 'function' ? await handler(payload) : handler);
     if (payload.type === 'perpDexs') return json(DEXES);
     if (payload.type === 'meta') return json(META[payload.dex]);
     if (payload.type === 'l2Book') return json({ coin: payload.coin, time, levels: payload.coin === 'io:ANTH' ? [[{ px: '1616.4', sz: '2', n: 1 }], [{ px: '1617', sz: '1', n: 1 }]] : [[{ px: '99.206', sz: '2', n: 1 }], [{ px: '99.316', sz: '1', n: 1 }]] });
@@ -93,7 +93,7 @@ test('account reads positions, open orders and live leverage of the master addre
     activeAssetData: payload => ({ coin: payload.coin, leverage: { type: payload.coin === 'io:ANTH' ? 'isolated' : 'cross', value: 3 } }),
   } });
   const value = await client.account(credentials, { symbols: ['io:ANTH', 'xyz:ANT'] });
-  assert.deepEqual(value.positions, [{ symbol: 'io:ANTH', side: 'short', quantity: '1.25' }]);
+  assert.deepEqual(value.positions, [{ symbol: 'io:ANTH', side: 'short', quantity: '1.25', risk: { markPrice: null, liquidationPrice: null, at: new Date(T0).toISOString() } }]);
   assert.deepEqual(value.openOrders, [{ id: '7', symbol: 'io:ANTH', side: 'buy', positionSide: 'BOTH', quantity: '2', filledQuantity: '1.5', reduceOnly: false }]);
   assert.deepEqual(value.leverage, { 'io:ANTH': { type: 'isolated', value: 3 }, 'xyz:ANT': { type: 'cross', value: 3 } });
   assert.deepEqual(value.modes, { 'io:ANTH': 'one-way', 'xyz:ANT': 'one-way' });
@@ -101,6 +101,49 @@ test('account reads positions, open orders and live leverage of the master addre
   await assert.rejects(client.account(credentials, { symbols: ['CLUSDT'] }), isError('input'));
   const missing = harness({ info: { clearinghouseState: { assetPositions: [] }, frontendOpenOrders: [], activeAssetData: { coin: 'io:ANTH' } } });
   await assert.rejects(missing.client.account(credentials, { symbols: ['io:ANTH'] }), isError('invalid_data'));
+});
+
+test('account risk derives exact marks for both HIP-3 legs and keeps each state receipt time through slow order reads', async () => {
+  let releaseState, releaseOrders;
+  const stateGate = new Promise(resolve => { releaseState = resolve; });
+  const orderGate = new Promise(resolve => { releaseOrders = resolve; });
+  const h = harness({ info: {
+    clearinghouseState: async payload => {
+      if (payload.dex === 'xyz') await stateGate;
+      return { assetPositions: [{ type: 'oneWay', position: payload.dex === 'io'
+        ? { coin: 'io:ANTH', szi: '-1.25', positionValue: '2000.125', liquidationPx: '1800.1000' }
+        : { coin: 'xyz:ANT', szi: '3', positionValue: '1', liquidationPx: '0.2' } }] };
+    },
+    frontendOpenOrders: async () => { await orderGate; return []; },
+    activeAssetData: payload => ({ coin: payload.coin, leverage: { type: 'isolated', value: 3 } }),
+  } });
+  const pending = h.client.account(credentials, { symbols: ['io:ANTH', 'xyz:ANT'] });
+  await new Promise(setImmediate);
+  h.advance(7000); releaseState();
+  await new Promise(setImmediate);
+  h.advance(7000); releaseOrders();
+  const value = await pending;
+  assert.deepEqual(value.positions.map(row => row.risk), [
+    { markPrice: '1600.1', liquidationPrice: '1800.1', at: new Date(T0).toISOString() },
+    { markPrice: '0.333333333333333333', liquidationPrice: '0.2', at: new Date(T0 + 7000).toISOString() },
+  ]);
+  assert.equal(h.exchanges.length, 0);
+  assert.ok(h.calls.every(call => call.payload.user === MASTER));
+});
+
+test('account risk returns null for missing or malformed prices without losing a valid manual position', async () => {
+  for (const invalid of [undefined, null, '', '0', '-1', 42, [], {}, 'NaN', 'Infinity', '1e2', ' 2', '1.1234567890123456789']) {
+    for (const field of ['positionValue', 'liquidationPx']) {
+      const h = harness({ info: {
+        clearinghouseState: { assetPositions: [{ type: 'oneWay', position: { coin: 'io:ANTH', szi: '-2', positionValue: '200', liquidationPx: '120', [field]: invalid } }] },
+        frontendOpenOrders: [], activeAssetData: { coin: 'io:ANTH', leverage: { type: 'cross', value: 3 } },
+      } });
+      const { positions } = await h.client.account(credentials, { symbols: ['io:ANTH'] });
+      assert.deepEqual(positions, [{ symbol: 'io:ANTH', side: 'short', quantity: '2',
+        risk: { markPrice: field === 'positionValue' ? null : '100', liquidationPrice: field === 'liquidationPx' ? null : '120', at: new Date(T0).toISOString() } }]);
+      assert.equal(h.exchanges.length, 0);
+    }
+  }
 });
 
 test('create signs one ALO order with the API wallet, a deterministic cloid and a 30 s expiry, after the final guard', async () => {

@@ -127,6 +127,14 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   const amount = (value, options = {}) => {
     try { if (typeof value !== 'string') fail(); return decimal(value, options); } catch { return fail(); }
   };
+  const liquidationPrice = value => {
+    // Computed liquidation prices can exceed 18 decimals. Match the existing
+    // observer's bounded precision; malformed, absent and zero prices stay null.
+    try { return amount(typeof value === 'string' && value.length <= 100 ? value.replace(/^(\d+\.\d{18})\d+$/, '$1') : value, { positive: true }); } catch { return null; }
+  };
+  const markPrice = (value, quantity) => {
+    try { return decimal(fromUnits(units(amount(value, { positive: true })) * SCALE / units(quantity)), { positive: true }); } catch { return null; }
+  };
   const integerOf = (value, min = 0, max = Number.MAX_SAFE_INTEGER) => { if (!Number.isSafeInteger(value) || value < min || value > max) fail(); return value; };
   let sign = signer;
   const signerOf = () => (sign ??= createRhLighterSigner());
@@ -375,11 +383,12 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
 
   async function accountRow(k, signal) {
     const data = await request('/api/v1/account', { query: { by: 'index', value: String(k.accountIndex) }, token: await tokenFor(k, signal), signal });
+    const receivedAt = new Date(now()).toISOString();
     if (!Array.isArray(data.accounts) || data.accounts.length !== 1 || !object(data.accounts[0])) fail();
     const row = data.accounts[0];
     if (row.index !== k.accountIndex || typeof row.l1_address !== 'string' || row.l1_address.toLowerCase() !== k.address) fail('permissions', { detail: '账户索引不属于该钱包地址' });
     if (!Array.isArray(row.positions) || row.positions.length > MAX_ROWS) fail();
-    return row;
+    return { row, receivedAt };
   }
 
   function openOrderOf(row, symbol) {
@@ -395,7 +404,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     const selected = executionSymbols(symbols, RH_LIGHTER_SYMBOLS);
     if (!selected?.length) fail('input');
     const selectedRules = await Promise.all(selected.map(symbol => ruleOf(symbol, signal)));
-    const row = await accountRow(k, signal);
+    const { row, receivedAt } = await accountRow(k, signal);
     const token = await tokenFor(k, signal);
     const positions = [], openOrders = [], leverage = {};
     for (const [index, symbol] of selected.entries()) {
@@ -407,7 +416,8 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
         const size = amount(entry.position, { nonnegative: true });
         if (size !== '0') {
           if (entry.sign !== 1 && entry.sign !== -1) fail();
-          positions.push({ symbol, side: entry.sign === 1 ? 'long' : 'short', quantity: size });
+          positions.push({ symbol, side: entry.sign === 1 ? 'long' : 'short', quantity: size,
+            risk: { markPrice: markPrice(entry.position_value, size), liquidationPrice: liquidationPrice(entry.liquidation_price), at: receivedAt } });
         }
         if (![0, 1].includes(entry.margin_mode)) fail();
         // initial_margin_fraction is a percentage; like defaultLeverage, the usable leverage rounds down.

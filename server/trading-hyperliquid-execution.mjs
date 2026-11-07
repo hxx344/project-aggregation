@@ -134,6 +134,10 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
   const amount = (value, options = {}) => {
     try { if (typeof value !== 'string') fail(); return decimal(value, options); } catch { return fail(); }
   };
+  const riskPrice = value => { try { return amount(value, { positive: true }); } catch { return null; } };
+  const markPrice = (value, quantity) => {
+    try { return decimal(fromUnits(units(amount(value, { positive: true })) * SCALE / units(quantity)), { positive: true }); } catch { return null; }
+  };
   const milliseconds = value => { if (!Number.isSafeInteger(value) || value <= 0 || value > 8_640_000_000_000_000) fail(); return value; };
   const metaCache = new Map();
   const identityCache = new Map();
@@ -301,7 +305,7 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
     return { ...result, rule: { ...limits, tickSize: priceTick(bid, szDecimals) }, onlyIsolated, maxLeverage };
   }
 
-  function positionsOf(state, selected, coins) {
+  function positionsOf(state, selected, coins, receivedAt) {
     if (!object(state) || !Array.isArray(state.assetPositions) || state.assetPositions.length > MAX_ROWS) fail();
     const positions = [];
     for (const entry of state.assetPositions) {
@@ -314,7 +318,9 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
       const size = amount(entry.position.szi);
       if (size === '0') continue;
       const short = size.startsWith('-');
-      positions.push({ symbol: coin, side: short ? 'short' : 'long', quantity: short ? size.slice(1) : size });
+      const quantity = short ? size.slice(1) : size;
+      positions.push({ symbol: coin, side: short ? 'short' : 'long', quantity,
+        risk: { markPrice: markPrice(entry.position.positionValue, quantity), liquidationPrice: riskPrice(entry.position.liquidationPx), at: receivedAt } });
     }
     return positions;
   }
@@ -335,11 +341,14 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
     if (!selected?.length) fail('input');
     const dexes = [...new Set(selected.map(dexOf))];
     const [reads, active] = await Promise.all([
-      Promise.all(dexes.map(dex => Promise.all([info({ type: 'clearinghouseState', user: master, dex }, signal), info({ type: 'frontendOpenOrders', user: master, dex }, signal)]))),
+      Promise.all(dexes.map(dex => Promise.all([
+        info({ type: 'clearinghouseState', user: master, dex }, signal).then(state => ({ state, receivedAt: new Date(milliseconds(now())).toISOString() })),
+        info({ type: 'frontendOpenOrders', user: master, dex }, signal),
+      ]))),
       Promise.all(selected.map(coin => info({ type: 'activeAssetData', user: master, coin }, signal))),
     ]);
     const coins = new Set(), positions = [], openOrders = [];
-    for (const [state, orders] of reads) { positions.push(...positionsOf(state, selected, coins)); openOrders.push(...openOrdersOf(orders, selected)); }
+    for (const [{ state, receivedAt }, orders] of reads) { positions.push(...positionsOf(state, selected, coins, receivedAt)); openOrders.push(...openOrdersOf(orders, selected)); }
     const leverage = {};
     selected.forEach((coin, index) => {
       const row = active[index];

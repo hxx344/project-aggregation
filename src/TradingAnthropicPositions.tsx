@@ -5,6 +5,7 @@ import { api, ApiError } from './api';
 import type { AnthropicShares } from './trading-execution-types';
 import { contractKey, findContract, sharesPerUnit } from './trading-anthropic';
 import { amount, beijingTime, polarity } from './trading-format';
+import TradingAnthropicReduction from './TradingAnthropicReduction';
 
 type Source = 'binance' | 'okx' | 'hyperliquid' | 'rh-lighter';
 type ReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
@@ -132,6 +133,9 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         ? `多头 ≈ ${shareText(longShares)} 股 · 空头 ≈ ${shareText(shortShares)} 股 · 差 ${shareText(Math.abs(longShares - shortShares))} 股（按「价差下单」中的股数假设 ${shares.outstanding}B / ${shares.diluted}B 估算）`
         : '股数假设无效，暂不估算多空股数'}</strong></div> : null}
 
+    </>}
+    <TradingAnthropicReduction shares={shares} onExpired={onExpired} />
+    {data ? <>
       <div className="trading-anthropic-alerts">
         <h3><BellRing size={16} />强平预警 · 飞书</h3>
         {data.alerts.channel.error ? <p className="trading-warning" role="alert"><CircleAlert size={14} />{data.alerts.channel.error}</p>
@@ -168,6 +172,6 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         </li>)}</ul></details> : null}
       </div>
       <p className="trading-footnote">强平价与标记价来自交易所账户接口；Hyperliquid 与 Lighter RH 标记价按仓位价值 ÷ 数量折算。估算股数沿用页面的股数假设，只用于核对多空是否大致相等。</p>
-    </>}
+    </> : null}
   </section>;
 }

@@ -171,6 +171,39 @@ for (const mode of ['standard', 'portfolio-margin']) {
   });
 }
 
+test('Binance Anthropic risk uses signed position responses and keeps receipt time through slow order reads', async () => {
+  for (const accountMode of ['standard', 'portfolio-margin']) {
+    let time = NOW;
+    const { client, calls } = harness('binance', call => {
+      if (call.url.pathname.endsWith('/apiRestrictions')) return binancePermission(accountMode === 'portfolio-margin');
+      if (call.url.pathname.endsWith('/positionRisk')) return [{ symbol: call.parameters.symbol, positionSide: 'BOTH', marginAsset: 'USDT', positionAmt: '-2.50', markPrice: '1600.100', liquidationPrice: '1800.25' }];
+      if (call.url.pathname.endsWith('/openOrders')) time += 12_000;
+    }, { now: () => time });
+    const { positions } = await client.account(credentials, { accountMode, symbols: ['ANTHROPICUSDT'] });
+    assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '2.5',
+      risk: { markPrice: '1600.1', liquidationPrice: '1800.25', at: new Date(NOW).toISOString() } }]);
+    assert.equal(time, NOW + 12_000);
+    assert.ok(calls.every(call => call.init.method === 'GET'));
+    for (const call of calls) authenticatedSignature('binance', call);
+    assert.equal(calls.find(call => call.url.pathname.endsWith('/positionRisk')).url.pathname, accountMode === 'standard' ? '/fapi/v3/positionRisk' : '/papi/v1/um/positionRisk');
+    const legacy = await client.account(credentials, { accountMode, symbols: ['CLUSDT'] });
+    assert.deepEqual(legacy.positions, [{ symbol: 'CLUSDT', side: 'short', quantity: '2.5' }]);
+  }
+});
+
+test('Binance missing or invalid Anthropic risk prices stay null without rejecting a valid manual position', async () => {
+  for (const invalid of [undefined, null, '', '0', '-1', 42, [], {}, 'NaN', 'Infinity', '1e2', ' 2', '1.1234567890123456789']) {
+    for (const field of ['markPrice', 'liquidationPrice']) {
+      const { client, calls } = harness('binance', call => call.url.pathname.endsWith('/positionRisk')
+        ? [{ symbol: 'ANTHROPICUSDT', positionSide: 'BOTH', marginAsset: 'USDT', positionAmt: '2', markPrice: '100', liquidationPrice: '80', [field]: invalid }] : undefined);
+      const { positions } = await client.account(credentials, { symbols: ['ANTHROPICUSDT'] });
+      assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'long', quantity: '2',
+        risk: { markPrice: field === 'markPrice' ? null : '100', liquidationPrice: field === 'liquidationPrice' ? null : '80', at: new Date(NOW).toISOString() } }]);
+      assert.ok(calls.every(call => call.init.method === 'GET'));
+    }
+  }
+});
+
 test('Binance explicit limit prices are sent as post-only prices and must lie strictly inside the limit', async () => {
   const { client, calls } = harness('binance', call => call.init.method === 'PUT' ? binanceOrder({ price: '89.5' }) : undefined);
   await client.create(credentials, { ...spec, limitPrice: '89.9' }, { accountMode: 'standard' });

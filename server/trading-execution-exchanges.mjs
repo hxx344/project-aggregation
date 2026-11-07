@@ -12,6 +12,8 @@ import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs
  * createExecutionExchangeClient(exchange, { fetchImpl, now, timeoutMs }) exposes:
  *   verify(credentials, options) -> { identity: string | null }
  *   account(credentials, options) -> { identity, modes, positions, openOrders, strategies }
+ *     Anthropic positions also expose risk: { markPrice, liquidationPrice, at };
+ *     prices are positive decimal strings or null, at is the local receipt time.
  *   market(symbol, { signal, withRule = true }) -> { symbol, bid, ask, at, rule }
  *     (withRule: false reads the book only, for display; rule is then absent)
  *   create(credentials, spec, options) -> { id, kind: 'order' | 'strategy' }
@@ -570,6 +572,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (exchange === 'binance') {
         modes[symbol] = snapshot.positionMode;
         const rows = array(await request('positions', credentials, { symbol }, options), 20), seen = new Set();
+        const receivedAt = new Date(clock()).toISOString();
         for (const row of rows) {
           requireObject(row);
           if (row.symbol !== symbol || options.accountMode === 'standard' && row.marginAsset !== 'USDT'
@@ -579,7 +582,13 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
           seen.add(positionSide);
           const signed = amount(row.positionAmt);
           if (positionSide === 'LONG' && compareDecimals(signed, '0') < 0 || positionSide === 'SHORT' && compareDecimals(signed, '0') > 0) fail();
-          if (signed !== '0') positions.push({ symbol, side: compareDecimals(signed, '0') > 0 ? 'long' : 'short', quantity: signed.startsWith('-') ? negateDecimal(signed) : signed });
+          if (signed !== '0') {
+            // Optional risk fields must not turn an otherwise usable account
+            // snapshot into a manual-trading failure, nor invent zero prices.
+            const riskPrice = value => { try { return amount(value, { positive: true }); } catch { return null; } };
+            positions.push({ symbol, side: compareDecimals(signed, '0') > 0 ? 'long' : 'short', quantity: signed.startsWith('-') ? negateDecimal(signed) : signed,
+              ...(symbol === 'ANTHROPICUSDT' ? { risk: { markPrice: riskPrice(row.markPrice), liquidationPrice: riskPrice(row.liquidationPrice), at: receivedAt } } : {}) });
+          }
         }
         for (const row of array(await request('openOrders', credentials, { symbol }, options))) {
           const order = parseBinanceOrder(row);

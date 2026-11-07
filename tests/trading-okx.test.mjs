@@ -179,6 +179,39 @@ test('OKX hedge observations and execution account sizes use positive contracts 
   }
 });
 
+test('OKX Anthropic risk keeps local position receipt time despite signing clock correction and slow order reads', async () => {
+  let configs = 0;
+  const h = harness({ handler: (call, _calls, state) => {
+    if (call.url.pathname.endsWith('/config') && ++configs === 1) return response({ code: '50102' });
+    if (call.url.pathname.endsWith('/positions')) return [position(call.parameters.instId, { pos: '-30', markPx: '183.500', liqPx: '260.100' })];
+    if (call.url.pathname.endsWith('/orders-pending')) state.now += 12_000;
+  } });
+  const { positions } = await h.client.account(credentials, { symbols: ['ANTHROPICUSDT'] });
+  assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '30',
+    risk: { markPrice: '183.5', liquidationPrice: '260.1', at: new Date(NOW).toISOString() } }]);
+  assert.equal(h.state.now, NOW + 12_000);
+  assert.equal(h.calls.filter(call => call.url.pathname.endsWith('/time')).length, 1);
+  const positionCall = h.calls.find(call => call.url.pathname.endsWith('/positions'));
+  assert.equal(positionCall.parameters.instId, 'ANTHROPIC-USDT-SWAP');
+  assert.equal(positionCall.init.headers['OK-ACCESS-TIMESTAMP'], new Date(NOW + 2000).toISOString());
+  for (const call of h.calls.filter(call => !call.url.pathname.endsWith('/time'))) signed(call);
+  assert.equal(mutations(h.calls).length, 0);
+  assert.deepEqual((await h.client.account(credentials, { symbols: ['CLUSDT'] })).positions, [{ symbol: 'CLUSDT', side: 'short', quantity: '30' }]);
+});
+
+test('OKX missing or malformed Anthropic prices stay null while valid manual positions remain usable', async () => {
+  for (const invalid of [undefined, null, '', '0', '-1', 42, [], {}, 'NaN', 'Infinity', '1e2', ' 2', '1.1234567890123456789']) {
+    for (const field of ['markPx', 'liqPx']) {
+      const h = harness({ handler: call => call.url.pathname.endsWith('/positions')
+        ? [position(call.parameters.instId, { markPx: '100', liqPx: '80', [field]: invalid })] : undefined });
+      const { positions } = await h.client.account(credentials, { symbols: ['ANTHROPICUSDT'] });
+      assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'long', quantity: '20',
+        risk: { markPrice: field === 'markPx' ? null : '100', liquidationPrice: field === 'liqPx' ? null : '80', at: new Date(NOW).toISOString() } }]);
+      assert.equal(mutations(h.calls).length, 0);
+    }
+  }
+});
+
 test('OKX account refuses another margin mode position or ordinary order without changing account settings', async () => {
   for (const accountMode of ['cross', 'isolated']) {
     const other = accountMode === 'cross' ? 'isolated' : 'cross';

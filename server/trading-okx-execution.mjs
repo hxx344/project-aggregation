@@ -34,6 +34,8 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
   }
   let protocol;
   try { protocol = createOkxProtocol(options); } catch (error) { throw convert(error); }
+  const now = options.now ?? Date.now;
+  const riskPrice = value => { try { return amount(value, { positive: true }); } catch { return null; } };
   const wrapped = fn => async (...args) => { try { return await fn(...args); } catch (error) { throw convert(error); } };
   function modeOf(value) { const mode = value ?? 'cross'; if (!['cross', 'isolated'].includes(mode)) fail('account_mode'); return mode; }
   function specOf(value, requireId = false) {
@@ -155,7 +157,11 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     const positions = [], openOrders = [], modes = {}, seen = new Set();
     for (const symbol of selected) {
       modes[symbol] = config.positionMode;
-      for (const row of list(await protocol.request('positions', credentials, { instType: 'SWAP', instId: instrumentId(symbol) }, { signal }), 20)) {
+      const rows = list(await protocol.request('positions', credentials, { instType: 'SWAP', instId: instrumentId(symbol) }, { signal }), 20);
+      // Use local receipt time, without the signing clock's server offset and
+      // before ordinary/algo order reads can delay this account result.
+      const receivedAt = new Date(now()).toISOString();
+      for (const row of rows) {
         const size = positionSize(row, symbol, config.positionMode);
         if (!size) continue;
         if (row.mgnMode !== mode) {
@@ -164,7 +170,8 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
         }
         const key = `${symbol}:${row.posSide}`;
         if (seen.has(key)) fail(); seen.add(key);
-        positions.push({ symbol, ...size });
+        positions.push({ symbol, ...size, ...(symbol === 'ANTHROPICUSDT'
+          ? { risk: { markPrice: riskPrice(row.markPx), liquidationPrice: riskPrice(row.liqPx), at: receivedAt } } : {}) });
       }
       const orders = await ordinaryOrders(credentials, symbol, mode, signal);
       for (const order of orders) if ((order.positionSide === 'BOTH') !== (config.positionMode === 'one-way')) fail('account_mode');

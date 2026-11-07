@@ -10,6 +10,7 @@ import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL, UNFINISHED_EXECUTION_JOB_SQL } from './control/execution-jobs.mjs';
 import { immediate } from './control/schema.mjs';
 import { evaluateRule, boundsFor, SPREADS } from './trading-auto.mjs';
+import { normalizeReductionConfig, readReductionRisk, reductionQuantities, reductionIntent, checkReductionDuration } from './trading-reduction-plan.mjs';
 
 const iso = time => new Date(time).toISOString();
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
@@ -495,13 +496,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     for (const leg of legs) checked(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
     requireLease(); return { markets, received };
   }
-  async function collect(legs, { validateAccount = () => {}, validateMarket } = {}) {
+  async function collect(legs, { validateAccount = () => {}, validateMarket, requireIdentity = false } = {}) {
     const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), connections = new Map();
     await readGroup(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
       const symbols = [...new Set(legs.filter(leg => leg.exchange === exchange).map(leg => leg.symbol))];
-      const account = await readCall(exchange, symbols.join(' / '), async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity) throw new ExecutionError(409, '交易账户身份不一致'); return snapshot; });
+      const account = await readCall(exchange, symbols.join(' / '), async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter || requireIdentity, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity || requireIdentity && (!verified.identity || !snapshot.identity)) throw new ExecutionError(409, '交易账户身份不一致或无法核验'); return snapshot; });
       requireLease();
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
@@ -655,6 +656,46 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       } catch (error) { writerTickets.delete(job.id); recoveredWriterJobs.delete(job.id); throw error; }
       return job.id;
     });
+  }
+  // Risk reductions have no spread guard. The same fresh, authenticated
+  // snapshot supplies both the liquidation trigger and the native quantities.
+  async function startRiskReduction(body, { ruleId, accounts, check, commit }) {
+    writable();
+    const config = normalizeReductionConfig(body);
+    if (!config.enabled || ruleId !== 'anthropic-reduction' || typeof check !== 'function' || typeof commit !== 'function') throw new ExecutionError(500, '自动减仓参数无效');
+    const legs = config.legs.map(leg => {
+      const binding = accounts?.[leg.exchange];
+      if (!validRevision(binding?.revision) || typeof binding.identity !== 'string' || !binding.identity) throw new ExecutionError(409, '自动减仓缺少已核验的实盘账户绑定');
+      return { ...leg, accountRevision: binding.revision };
+    });
+    if (lockOwner(legs)) throw new WaitError(409, '所选合约已有未结束任务，等待其结束后重新核验');
+    let collected;
+    try { collected = await collect(legs, { requireIdentity: true, validateAccount(leg, account) {
+      if (account.identity !== accounts[leg.exchange].identity) throw new ExecutionError(409, '自动减仓账户身份已变化');
+    } }); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(502, safeError(error)); }
+    check();
+    const reading = readReductionRisk(config, collected.snapshots, now());
+    if (!reading.met) return { jobId: null, live: reading };
+    const quantities = reductionQuantities(config, reading, collected.markets, now());
+    const intent = normalizeIntent(reductionIntent(config, quantities));
+    const plan = { ...buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()), id: randomUUID(), resumeJobId: null, connections: [...collected.connections.values()] };
+    checkReductionDuration(plan.batchCount, plan.batchIntervalMs, plan.timeoutMs);
+    writable();
+    const jobId = transaction(() => {
+      check();
+      for (const leg of plan.legs) context(leg.exchange, leg.accountRevision);
+      if (lockOwner(legs)) throw new WaitError(409, '所选合约已有未结束任务');
+      const job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [],
+        riskReduction: { ruleId, config, accounts, trigger: reading }, status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) };
+      commit(job.id, reading);
+      try {
+        protectJob(job); recoveredWriterJobs.add(job.id);
+        event(job, `ANT 强平距离触发双边市价减仓：总比例 ${config.reducePercent}%，实际 ${plan.batchCount} 批`); saveJob(job);
+        for (const leg of plan.legs) stmt.prepare('INSERT INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
+      } catch (error) { writerTickets.delete(job.id); recoveredWriterJobs.delete(job.id); throw error; }
+      return job.id;
+    });
+    return { jobId, live: reading };
   }
   const jobView = id => publicJob(jobFor(id));
   const jobAccounts = id => (jobFor(id).plan.connections ?? []).map(row => ({ exchange: row.exchange, revision: row.revision, identity: row.identity ?? null }));
@@ -1226,9 +1267,17 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       // The group waits for a deferred Lighter RH create and keeps re-sends after a post-only bounce apart.
       if (candidates.some(({ leg }) => now() < resendAt(job, all, leg))) return;
       const quantityFor = leg => candidates.find(item => item.leg.id === leg.id).quantity;
-      const { markets, received } = await collect(candidates.map(item => item.leg), {
+      const { markets, received, snapshots } = await collect(candidates.map(item => item.leg), {
+        requireIdentity: !!job.riskReduction,
         validateAccount(leg, account) {
-          checkPosition(account, leg, job.plan.action, quantityFor(leg));
+          const current = checkPosition(account, leg, job.plan.action, quantityFor(leg));
+          if (job.riskReduction) {
+            if (account.identity !== job.riskReduction.accounts[leg.exchange]?.identity) throw new ExecutionError(409, '自动减仓账户身份已变化');
+            // Every batch must observe the prior fills. A stale pre-fill
+            // position or an external position change cannot fund a new batch.
+            const expected = subtract(leg.currentQuantity, totalFilled(all, leg.id, job.phase));
+            if (compareDecimals(current, expected) !== 0) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 持仓未反映已成交减仓或被外部更改，请核对后再继续`);
+          }
           // Candidates have no unsettled own order. Even an eventually
           // consistent remaining venue order blocks another submit.
           ensureNoExternalOrders(account, leg.symbol);
@@ -1241,6 +1290,12 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         },
       });
       rateReadsRecovered(id); marketsRecovered(id); job = jobFor(id);
+      if (job.riskReduction && !all.length && !readReductionRisk(job.riskReduction.config, snapshots, now()).met) {
+        job.status = 'stopped'; job.reason = '首批发送前强平距离已恢复，本轮双边均未发送';
+        event(job, job.reason);
+        transaction(() => { saveJob(job); stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(id); });
+        return;
+      }
       if (job.auto?.guard && candidates.length === job.plan.legs.length && !guardMet(id, job, candidates, markets, all, received)) return;
       writable(); job = jobFor(id);
       if (!['queued', 'running'].includes(job.status)) return;
@@ -1318,7 +1373,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, startAutomatic, lockOwner, jobView, jobAccounts, connectionOf, leading, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, leading, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       let ownsLease = false;

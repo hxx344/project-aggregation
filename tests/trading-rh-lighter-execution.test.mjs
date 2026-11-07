@@ -324,7 +324,7 @@ test('account reports positions, open orders and the account leverage of the sel
   } });
   assert.deepEqual(await h.client.account(credentials, { symbols: ['ANTHROPIC'] }), {
     identity: OWNER, modes: { ANTHROPIC: 'one-way' }, strategies: [],
-    positions: [{ symbol: 'ANTHROPIC', side: 'short', quantity: '1.5' }],
+    positions: [{ symbol: 'ANTHROPIC', side: 'short', quantity: '1.5', risk: { markPrice: null, liquidationPrice: null, at: new Date(T0).toISOString() } }],
     openOrders: [
       { id: '77', symbol: 'ANTHROPIC', side: 'buy', positionSide: 'BOTH', quantity: '2', filledQuantity: '0.5', reduceOnly: true },
       { id: '281474976710700', symbol: 'ANTHROPIC', side: 'sell', positionSide: 'BOTH', quantity: '1', filledQuantity: '0', reduceOnly: false },
@@ -361,6 +361,36 @@ test('account reports positions, open orders and the account leverage of the sel
   ];
   for (const [routes, code] of cases) await assert.rejects(harness({ routes }).client.account(credentials), isError(code), JSON.stringify(routes));
   await assert.rejects(harness().client.account(credentials, { symbols: ['CLUSDT'] }), isError('input'));
+});
+
+test('account risk uses the configured account index and exact notional over size before slow order reads', async () => {
+  const h = harness({ routes: {
+    '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
+      { market_id: 7, position: '1.5', sign: -1, margin_mode: 1, initial_margin_fraction: '20', position_value: '600.15', liquidation_price: '450.1234567890123456789012345' },
+    ] }] }),
+    '/api/v1/accountActiveOrders': () => { h.advance(12_000); return ok({ orders: [] }); },
+  } });
+  const { positions } = await h.client.account(credentials);
+  assert.deepEqual(positions, [{ symbol: 'ANTHROPIC', side: 'short', quantity: '1.5',
+    risk: { markPrice: '400.1', liquidationPrice: '450.123456789012345678', at: new Date(T0).toISOString() } }]);
+  assert.equal(h.time, T0 + 12_000);
+  assert.deepEqual(Object.fromEntries(h.of('/api/v1/account')[0].query), { by: 'index', value: '12345' });
+  assert.ok(h.of('/api/v1/account')[0].init.headers.Authorization);
+  assert.equal(h.of(SEND).length, 0);
+});
+
+test('account risk rejects malformed and unavailable prices without rejecting a valid manual position', async () => {
+  for (const invalid of [undefined, null, '', '0', '-1', 42, [], {}, 'NaN', 'Infinity', '1e2', ' 2', '1.123456789012345678x', '1'.repeat(101)]) {
+    for (const field of ['position_value', 'liquidation_price']) {
+      const h = harness({ routes: { '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
+        { market_id: 7, position: '3', sign: 1, margin_mode: 0, initial_margin_fraction: '20', position_value: '1', liquidation_price: '0.2', [field]: invalid },
+      ] }] }) } });
+      const { positions } = await h.client.account(credentials);
+      assert.deepEqual(positions, [{ symbol: 'ANTHROPIC', side: 'long', quantity: '3',
+        risk: { markPrice: field === 'position_value' ? null : '0.333333333333333333', liquidationPrice: field === 'liquidation_price' ? null : '0.2', at: new Date(T0).toISOString() } }]);
+      assert.equal(h.of(SEND).length, 0);
+    }
+  }
 });
 
 test('order prices: chase prices must sit on the tick grid inside the chase limit; IOC protection is 1% through the book, rounded outward', () => {
