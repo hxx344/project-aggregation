@@ -1697,6 +1697,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 验证：`tests/trading-execution-rh-lighter.test.mjs` 的 `Anthropic market legs` 两项在修复前均复现暂停，修复后覆盖慢腿 11 秒导致快腿过期后的补读、持续旧盘口零发送与恢复后只发送一次；`tests/trading-execution.test.mjs` 覆盖挂单保留、持续失败预算、第二腿过期时第一腿不改价、停止/截止优先及无效/未来/交叉盘口拒绝。事件 `trading-stale-book-no-retry-20261107`；用户现场具体过期腿、读取耗时和服务器时钟差未取得日志，不能将离线慢腿复现当作现场根因证明。审查与交付证据见 [本次记录](docs/reviews/2026-11-07-ant-quote-recovery.md)。
 
+### L104：`submit()` 的失败分支提前返回前必须重新保存委托
+
+**适用条件：** 在 `server/trading-execution.mjs` 的 `submit()` catch 块里新增任何提前 `return` 的分支（延后重发、bounce 重挂、已接受待可见等）。
+
+**根因：** catch 块先调用 `finishWrite()`，它在写保护开启时就把委托落库，然后才把内存里的委托改成 `rejected`/`settled` 或 `unknown`。首版 Lighter RH「未送达延后重发」分支在 `deferSend()` 后直接返回，库里留下 `submitting`、未结算、结果未知的记录；下一轮读回后被当作不确定建单，要等签名有效期（约 12 分钟）才结算，期间该腿不能重发。没有写保护时（`operation` 为空）甚至一次都不落库。
+
+**以后做法：** catch 块中任何在末尾 `saveOrder(order); pause(...)` 之前返回的分支，都先 `saveOrder(order)`（或像 bounce 分支那样在分支内保存）；不依赖 `finishWrite()` 已经保存。
+
+**如何验证：** 运行 `node --test --test-name-pattern="refused before it left" tests/trading-execution-rh-lighter.test.mjs`；临时去掉延后分支的 `saveOrder(order)` 时该测试应失败（第二次重发不会发生）。
+
+**证据：** 2026-11-07 project-aggregation Lighter RH 后续修复，开发中由新增引擎测试发现，未进入发布版本。
+
+**事件记录：** `rh-lighter-defer-unsaved-20261107`；作者自测发现。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

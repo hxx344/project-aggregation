@@ -40,6 +40,13 @@ const DEFAULT_MODES = Object.freeze({ binance: 'standard', bybit: 'unified', okx
 const WALLET_VENUES = new Set(['hyperliquid', 'rh-lighter']);
 // Lighter RH Standard accounts allow 60 requests a minute, every cancel and re-send included.
 const RH_LIGHTER_MIN_REPRICE_MS = 5000;
+// A Lighter RH create refused before it left this process (local rate limit,
+// venue cooldown, a failed pre-send read) or by the venue firewall did not
+// reach the order book. It settles as rejected and the leg is re-planned on a
+// later tick, at least this far apart and not before the cooldown ends, at most
+// this many times in a row (L084): only a send that reached the venue resets it.
+const SEND_DEFER_MS = 10_000, MAX_SEND_DEFER_MS = 120_000, CREATE_DEFERRALS = 30;
+const DEFERRABLE_CODES = new Set(['timeout', 'transport', 'upstream', 'aborted']);
 // Finished jobs are history. Every other status, including a missing or
 // unknown one, is unfinished and always read in full for recovery.
 const JOB_STATUS = "json_extract(json,'$.status')", JOB_CREATED = "json_extract(json,'$.createdAt')";
@@ -425,6 +432,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     exactKeys(body, ['revision']); checkSession(session); checkAvailable(exchange, body.revision);
     accountWriter?.releaseBinding(`hub:${exchange}`);
     verifiedAccounts.delete(exchange); protectionErrors.delete(exchange);
+    clients.get(exchange)?.forget?.();
     stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
     return state();
   }
@@ -551,7 +559,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         // A person confirmed the remaining quantity: the rule's threshold no longer holds it back.
         if (job.auto?.guard) job.auto = { ...job.auto, guard: null };
       } else job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [] };
-      Object.assign(job, { status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) });
+      Object.assign(job, { status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs), sendDeferrals: {} });
       protectJob(job, !!plan.resumeJobId);
       recoveredWriterJobs.add(job.id);
       stmt.prepare('DELETE FROM execution_stop_requests WHERE job_id=?').run(job.id);
@@ -661,6 +669,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // A Lighter RH transaction stays executable until its signed expiry (10 min after signing).
   const createSettledAt = order => Date.parse(order.createdAt) + Math.max(CREATE_OBSERVE_MS, callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS,
     order.exchange === 'rh-lighter' ? RH_LIGHTER_TX_EXPIRES_MS + callTimeoutMs + CREATE_ARRIVAL_MARGIN_MS : 0);
+  const pendingVisible = order => order.exchange === 'rh-lighter' && !!order.acceptedAt && !order.remoteId && order.unknown && !order.settled
+    && now() < createSettledAt(order) + MISMATCH_RECHECK_MS;
   async function absentCreate(order) {
     requireLease();
     const current = orderFor(order.localId);
@@ -878,6 +888,29 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       : decimals === null ? { problem: '下单步长不是十的整数次幂' } : orderPrice(order, decimals);
     if (problem) throw new ExecutionError(409, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${problem}，本组交易腿均未发送`);
   }
+  function resendAt(job, all, leg) {
+    if (leg.exchange !== 'rh-lighter') return 0;
+    const last = all.filter(order => order.legId === leg.id).reduce((latest, order) => !latest || order.createdAt > latest.createdAt ? order : latest, null);
+    return Math.max(job.sendDeferrals?.[leg.id]?.retryAt ?? 0, last?.bounced ? Date.parse(last.createdAt) + RH_LIGHTER_MIN_REPRICE_MS : 0);
+  }
+  function clearSendDeferral(jobId, legId) {
+    const job = jobFor(jobId);
+    if (!job.sendDeferrals?.[legId]) return;
+    const { [legId]: _cleared, ...rest } = job.sendDeferrals;
+    job.sendDeferrals = rest; saveJob(job);
+  }
+  // True when a Lighter RH create that did not reach the order book is left for a later tick.
+  function deferSend(jobId, leg, error) {
+    if (error.uncertain || !(error.rateLimited || error.notSent && DEFERRABLE_CODES.has(error.code))) return false;
+    const job = jobFor(jobId), count = job.sendDeferrals?.[leg.id]?.count ?? 0;
+    if (count >= CREATE_DEFERRALS) return false;
+    const time = now(), hinted = Number.isSafeInteger(error.retryAt) ? Math.min(error.retryAt, time + MAX_SEND_DEFER_MS) : 0;
+    const retryAt = Math.max(time + SEND_DEFER_MS, hinted);
+    job.sendDeferrals = { ...job.sendDeferrals, [leg.id]: { count: count + 1, retryAt } };
+    if (!count) event(job, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 本次建单未送达交易所（${safeError(error)}），${Math.ceil((retryAt - time) / 1000)} 秒后按最新盘口重新下单；连续 ${CREATE_DEFERRALS} 次未送达则暂停`);
+    saveJob(job);
+    return true;
+  }
   async function submit(job, leg, quantity, market) {
     writable();
     if (!['queued', 'running'].includes(jobFor(job.id).status)) return;
@@ -917,12 +950,26 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       Object.assign(order, { remoteId: result.id, unknown: false, state: 'working' });
       finishWrite(operation, 'confirmed', order);
       saveOrder(order);
+      clearSendDeferral(job.id, leg.id);
     } catch (error) {
       // A stale process must not overwrite reconciliation performed by a new owner.
       requireLease();
       finishWrite(operation, error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain ? 'rejected' : 'unknown', order);
       if (error instanceof NotSubmittedError || error instanceof ExecutionExchangeError && !error.uncertain) Object.assign(order, { state: 'rejected', settled: true, unknown: false });
       else Object.assign(order, { state: 'unknown', unknown: true });
+      if (order.exchange === 'rh-lighter' && error instanceof ExecutionExchangeError) {
+        // Accepted by sendTx but not yet visible: the order is looked up by its
+        // client index on later ticks (pendingVisible) instead of pausing the
+        // task and cancelling a hedge leg that may already have filled.
+        if (error.uncertain && error.accepted) {
+          order.acceptedAt = iso(now()); saveOrder(order); clearSendDeferral(job.id, leg.id);
+          const latest = jobFor(job.id);
+          event(latest, `${TRADING_NAMES[leg.exchange]} ${leg.symbol} 委托已被交易所接受但尚未查到，按客户订单号继续核对，期间不追价、不撤单、不下新单`); saveJob(latest);
+          return;
+        }
+        if (deferSend(job.id, leg, error)) { saveOrder(order); return; }
+      }
+      if (!(error instanceof NotSubmittedError)) clearSendDeferral(job.id, leg.id);
       // A post-only bounce rests and fills nothing; the next pass re-reads the
       // book and re-sends through the full send checks instead of pausing.
       if (error instanceof ExecutionExchangeError && error.repriceable && !error.uncertain && order.exchange === 'hyperliquid') {
@@ -1023,7 +1070,17 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const allBefore = orders(id), working = allBefore.filter(unsettled);
       if (working.length) {
         const readings = await Promise.allSettled(working.map(order => inspectOrder(order)));
-        const failed = working.map((order, index) => ({ order, result: readings[index] })).filter(({ result }) => result.status === 'rejected' || result.value === false);
+        const unread = working.map((order, index) => ({ order, result: readings[index] })).filter(({ result }) => result.status === 'rejected' || result.value === false);
+        // An accepted Lighter RH create that is not visible yet holds the task (no
+        // reprice, cancel or new send) until its signed expiry plus the
+        // not-created check has passed; only then does a miss pause the task.
+        const pending = unread.filter(({ order, result }) => pendingVisible(orderFor(order.localId)) && result.status === 'rejected' && (result.reason?.notFound || transientRead(result.reason)));
+        const failed = unread.filter(item => !pending.includes(item));
+        if (!failed.length && pending.length) {
+          // Every other read succeeded: an earlier transient streak must not carry over the hold.
+          if (readFailures.delete(id)) { const latest = jobFor(id); event(latest, '委托状态已恢复读取，继续执行'); saveJob(latest); }
+          return;
+        }
         if (failed.length) {
           const detail = failed.map(({ order, result }) => `${TRADING_NAMES[order.exchange]} ${order.spec.symbol}：${result.status === 'rejected' ? safeError(result.reason) : '提交结果尚未查到'}`).join('；');
           const streak = readFailures.get(id) ?? { since: now(), count: 0 };
@@ -1096,6 +1153,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (now() < job.nextBatchAt) return;
       const candidates = remaining.filter(item => compareDecimals(item.quantity, '0') > 0 && !all.some(order => order.legId === item.leg.id && !order.settled));
       if (!candidates.length) { marketsRecovered(id); return; }
+      // The group waits for a deferred Lighter RH create and keeps re-sends after a post-only bounce apart.
+      if (candidates.some(({ leg }) => now() < resendAt(job, all, leg))) return;
       const { snapshots, markets, received } = await collect(candidates.map(item => item.leg));
       for (const { leg, quantity } of candidates) {
         const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now(), leg.exchange);

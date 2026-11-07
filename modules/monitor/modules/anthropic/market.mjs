@@ -2,12 +2,12 @@ import { requestBinance } from '../oil/binance.mjs';
 import { requestInfo } from '../oil/hyperliquid.mjs';
 
 /**
- * Anthropic pre-IPO perpetuals on Binance, Hyperliquid and rh-Lighter quote different units, so every
+ * Anthropic pre-IPO perpetuals on Binance, Hyperliquid and Lighter RH quote different units, so every
  * comparison is per share. Shares per native unit mirror the trading page defaults
  * (src/trading-anthropic.ts DEFAULT_SHARES, server/trading-execution-plan.mjs SHARE_BASIS):
  * Binance quotes valuation per 1B outstanding shares (12.7B outstanding -> 12.7 shares per unit),
  * Entropy io:ANTH per 1B fully diluted shares (16.7B -> 16.7 shares), trade.xyz xyz:ANT is one share.
- * rh-Lighter (Lighter on Robinhood Chain, an independent order book collateralised in USDG) quotes
+ * Lighter RH (Lighter on Robinhood Chain, an independent order book collateralised in USDG) quotes
  * Pre-IPO markets as valuation per 1B assumed shares and settles after an IPO at
  * share price x fully diluted shares / 1B, so one unit is 16.7 shares like io:ANTH.
  * https://docs.lighter.xyz/trading/real-world-assets-rwas/pre-ipo-markets
@@ -18,7 +18,7 @@ export const ANTHROPIC_LEGS = Object.freeze({
   binance: Object.freeze({ exchange: 'binance', symbol: 'ANTHROPICUSDT', name: 'Binance', venue: 'Binance', label: 'Binance ANTHROPICUSDT', sharesPerUnit: ANTHROPIC_SHARES.outstanding, basis: '流通股 127 亿' }),
   xyz: Object.freeze({ exchange: 'hyperliquid', symbol: 'xyz:ANT', dex: 'xyz', name: 'xyz:ANT', venue: 'Hyperliquid', label: 'Hyperliquid xyz:ANT', sharesPerUnit: 1, basis: '1 股' }),
   io: Object.freeze({ exchange: 'hyperliquid', symbol: 'io:ANTH', dex: 'io', name: 'io:ANTH', venue: 'Hyperliquid', label: 'Hyperliquid io:ANTH', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 167 亿股' }),
-  rh: Object.freeze({ exchange: 'rh-lighter', symbol: 'ANTHROPIC', name: 'rh-Lighter', venue: 'rh-Lighter', label: 'rh-Lighter ANTHROPIC', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 167 亿股' }),
+  rh: Object.freeze({ exchange: 'rh-lighter', symbol: 'ANTHROPIC', name: 'Lighter RH', venue: 'Lighter RH', label: 'Lighter RH ANTHROPIC', sharesPerUnit: ANTHROPIC_SHARES.diluted, basis: '完全稀释 167 亿股' }),
 });
 /**
  * @typedef {'xyz' | 'io' | 'rh'} AnthropicComparisonLeg
@@ -41,8 +41,9 @@ export const ANTHROPIC_COMPARISON_LEGS = Object.freeze([...HYPERLIQUID_LEGS, 'rh
 export const ANTHROPIC_LEG_KEYS = Object.freeze(['binance', ...ANTHROPIC_COMPARISON_LEGS]);
 const LEG_KEYS = ANTHROPIC_LEG_KEYS;
 const SYMBOLS = LEG_KEYS.map(key => ANTHROPIC_LEGS[key].symbol);
+// Stored in saved candle snapshots and checked when they load, so it keeps the venue's earlier spelling.
 export const ANTHROPIC_SOURCE = 'Binance + Hyperliquid + rh-Lighter';
-/** Candle snapshots saved before the rh-Lighter leg existed; they validate with that leg empty. */
+/** Candle snapshots saved before the Lighter RH leg existed; they validate with that leg empty. */
 const LEGACY_CANDLE_SOURCE = Object.freeze({ source: 'Binance + Hyperliquid', symbols: JSON.stringify(['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH']) });
 export const ANTHROPIC_QUOTE_REFRESH_MS = 10_000;
 export const ANTHROPIC_CANDLE_ACTION = 'candles/15m';
@@ -54,12 +55,14 @@ export const ANTHROPIC_INITIAL_DAYS = 50;
 export const ANTHROPIC_RETENTION_DAYS = 400;
 const DAY_MS = 86_400_000, OVERLAP_BARS = 96, BINANCE_PAGE = 1500, BINANCE_MAX_PAGES = 40;
 /**
- * rh-Lighter returns at most 500 candles per request. Pages per candle round are capped because the
+ * Lighter RH returns at most 500 candles per request. Pages per candle round are capped because the
  * Standard tier allows 60 REST requests per minute per IP, shared with the perpetual scanner; a
  * backfill longer than one round continues from the last saved close on the next round.
  * https://docs.lighter.xyz/developers/reference/rate-limits.md
  */
-const RH_PAGE = 500, RH_MAX_PAGES = 4, RH_COOLDOWN_MS = 60_000;
+const RH_PAGE = 500, RH_MAX_PAGES = 4, RH_COOLDOWN_MS = 60_000, RH_RATE_LIMITED = 23000;
+// The full catalog is about 100 KB and a 500-bar page about 60 KB; anything far larger is refused unread.
+const RH_MAX_BODY_BYTES = 2 * 1024 * 1024;
 const RH_API = 'https://api.rh.lighter.xyz';
 
 const record = value => { if (!value || typeof value !== 'object' || Array.isArray(value)) throw Error('Invalid Anthropic object'); return value; };
@@ -75,12 +78,12 @@ const rate = value => {
 const stamp = value => { if (typeof value !== 'string' || !Number.isFinite(Date.parse(value))) throw Error('Invalid Anthropic timestamp'); return value; };
 
 class VenueCooldown extends Error {
-  constructor(venue, status) { super(`${venue} HTTP ${status} cooldown`); this.status = status; }
+  constructor(venue, status) { super(`${venue} ${status === RH_RATE_LIMITED ? 'code' : 'HTTP'} ${status} cooldown`); this.status = status; }
 }
 
 /** Short Chinese reason for a failed leg read; never echoes upstream bodies. */
 export function legError(error) {
-  if (error instanceof VenueCooldown) return `接口限流冷却中（HTTP ${error.status}）`;
+  if (error instanceof VenueCooldown) return `接口限流冷却中（${error.status === RH_RATE_LIMITED ? '代码' : 'HTTP'} ${error.status}）`;
   const message = String(error?.message ?? '');
   const http = /HTTP (\d{3})/.exec(message);
   if (http) return http[1] === '451' ? '服务器所在地区被拒绝访问（HTTP 451）' : `接口返回 HTTP ${http[1]}`;
@@ -174,7 +177,7 @@ async function readHyperliquidQuote(key, options) {
 }
 
 /**
- * rh-Lighter request state shared by the quote and candle jobs: a 60 s cooldown after HTTP 429 or 405,
+ * Lighter RH request state shared by the quote and candle jobs: a 60 s cooldown after HTTP 429 or 405,
  * and the market found in the public catalog. The market id is never hard-coded: it is looked up by
  * symbol and type, kept until a single-market read stops matching, and then looked up again.
  * @typedef {{ id: number, listedAt: number | null }} RhLighterMarket
@@ -186,17 +189,44 @@ const sharedRhState = createRhLighterState();
 
 /** Same REST format as Lighter mainnet on a separate deployment with its own market ids: https://apidocs.rh.lighter.xyz */
 async function rhRequest(path, params, { rh = sharedRhState, clock = Date.now, fetcher = fetch, timeout = 10_000 }) {
-  if (clock() < rh.until) throw new VenueCooldown('rh-Lighter', rh.status);
+  if (clock() < rh.until) throw new VenueCooldown('Lighter RH', rh.status);
   const url = new URL(path, RH_API);
   url.search = new URLSearchParams(Object.entries(params).map(([key, value]) => [key, String(value)])).toString();
   const response = await fetcher(url.href, { cache: 'no-store', credentials: 'omit', redirect: 'error', signal: AbortSignal.timeout(timeout) });
+  const cool = status => { rh.until = Math.max(rh.until, clock() + RH_COOLDOWN_MS); rh.status = status; };
   if (!response.ok) {
-    if (response.status === 429 || response.status === 405) { rh.until = Math.max(rh.until, clock() + RH_COOLDOWN_MS); rh.status = response.status; }
-    throw Object.assign(Error(`rh-Lighter HTTP ${response.status}`), { status: response.status });
+    if (response.status === 429 || response.status === 405) { void response.body?.cancel().catch(() => {}); cool(response.status); }
+    // The API servers answer an exhausted limit with HTTP 400 and code 23000 instead of a firewall 429.
+    else if (response.status === 400) { const body = await rhJson(response).catch(() => null); if (body?.code === RH_RATE_LIMITED) { cool(RH_RATE_LIMITED); throw new VenueCooldown('Lighter RH', RH_RATE_LIMITED); } }
+    else void response.body?.cancel().catch(() => {});
+    throw Object.assign(Error(`Lighter RH HTTP ${response.status}`), { status: response.status });
   }
-  const body = record(await response.json());
-  if (body.code !== 200) throw Error('Invalid rh-Lighter response code');
+  const body = record(await rhJson(response));
+  if (body.code === RH_RATE_LIMITED) { cool(RH_RATE_LIMITED); throw new VenueCooldown('Lighter RH', RH_RATE_LIMITED); }
+  if (body.code !== 200) throw Error('Invalid Lighter RH response code');
   return body;
+}
+
+/** JSON body read as it streams, refused once it passes RH_MAX_BODY_BYTES. */
+async function rhJson(response) {
+  const length = response.headers.get('content-length');
+  if (!response.body) throw Error('Invalid Lighter RH response');
+  if (length && (!/^\d+$/.test(length) || Number(length) > RH_MAX_BODY_BYTES)) { void response.body.cancel().catch(() => {}); throw Error('Lighter RH response too large'); }
+  const reader = response.body.getReader(), chunks = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > RH_MAX_BODY_BYTES) { void reader.cancel().catch(() => {}); throw Error('Lighter RH response too large'); }
+      chunks.push(value);
+    }
+  } finally { reader.releaseLock(); }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  try { return JSON.parse(new TextDecoder().decode(bytes)); } catch { throw Error('Invalid Lighter RH response'); }
 }
 
 const rhListedAt = item => {
@@ -205,7 +235,7 @@ const rhListedAt = item => {
 };
 /** A catalog row is usable only when it is the active ANTHROPIC perpetual. */
 function rhActive(item, rh) {
-  if (item.status !== 'active') { rh.market = null; throw Error('rh-Lighter market delisted'); }
+  if (item.status !== 'active') { rh.market = null; throw Error('Lighter RH market delisted'); }
   return item;
 }
 
@@ -216,12 +246,12 @@ async function discoverRhMarket(options) {
     try {
       // https://docs.lighter.xyz/api/orders/orderbookdetails.md
       const body = await rhRequest('/api/v1/orderBookDetails', {}, options);
-      if (!Array.isArray(body.order_book_details)) throw Error('Invalid rh-Lighter catalog');
+      if (!Array.isArray(body.order_book_details)) throw Error('Invalid Lighter RH catalog');
       const matches = body.order_book_details.filter(item => item?.symbol === ANTHROPIC_LEGS.rh.symbol && item.market_type === 'perp');
-      if (matches.length > 1) throw Error('rh-Lighter market ambiguous');
-      if (!matches.length) throw Error('rh-Lighter market missing');
+      if (matches.length > 1) throw Error('Lighter RH market ambiguous');
+      if (!matches.length) throw Error('Lighter RH market missing');
       const item = record(matches[0]);
-      if (!Number.isSafeInteger(item.market_id) || item.market_id < 0) throw Error('Invalid rh-Lighter market id');
+      if (!Number.isSafeInteger(item.market_id) || item.market_id < 0) throw Error('Invalid Lighter RH market id');
       rhActive(item, rh);
       rh.market = { id: item.market_id, listedAt: rhListedAt(item) };
       return item;
@@ -241,12 +271,12 @@ async function readRhQuote(options) {
     try { body = await rhRequest('/api/v1/orderBookDetails', { market_id: id }, options); }
     catch (error) {
       // An unknown market index answers HTTP 400; look the symbol up again next round.
-      if (error?.status === 400) { rh.market = null; throw Error('rh-Lighter market missing'); }
+      if (error?.status === 400) { rh.market = null; throw Error('Lighter RH market missing'); }
       throw error;
     }
     const rows = body.order_book_details;
     item = Array.isArray(rows) && rows.length === 1 ? record(rows[0]) : null;
-    if (!item || item.market_id !== id || item.symbol !== ANTHROPIC_LEGS.rh.symbol || item.market_type !== 'perp') { rh.market = null; throw Error('rh-Lighter market missing'); }
+    if (!item || item.market_id !== id || item.symbol !== ANTHROPIC_LEGS.rh.symbol || item.market_type !== 'perp') { rh.market = null; throw Error('Lighter RH market missing'); }
     rhActive(item, rh);
     rh.market = { id, listedAt: rhListedAt(item) };
   }
@@ -299,7 +329,7 @@ export function createAnthropicCandles(rows, fetchedAt, status = 'live', errors 
 }
 
 /**
- * Snapshots saved before the rh-Lighter leg existed are accepted and returned in the current shape with that leg empty.
+ * Snapshots saved before the Lighter RH leg existed are accepted and returned in the current shape with that leg empty.
  * @param {unknown} input @returns {AnthropicCandles}
  */
 export function validateAnthropicCandles(input) {
@@ -373,10 +403,10 @@ async function rhCandles(startTime, endTime, options) {
   for (let page = 0; page < RH_MAX_PAGES && cursor < closedEnd; page++) {
     const end = Math.min(cursor + RH_PAGE * ANTHROPIC_CANDLE_MS, closedEnd), count = (end - cursor) / ANTHROPIC_CANDLE_MS;
     const body = await rhRequest('/api/v1/candles', { market_id: market.id, resolution: '15m', start_timestamp: cursor, end_timestamp: end, count_back: count }, options);
-    if (body.r !== '15m' || !Array.isArray(body.c) || body.c.length > RH_PAGE) throw Error('Invalid rh-Lighter candles');
+    if (body.r !== '15m' || !Array.isArray(body.c) || body.c.length > RH_PAGE) throw Error('Invalid Lighter RH candles');
     let last = -1;
     for (const row of body.c) {
-      if (!row || !Number.isSafeInteger(row.t) || row.t <= last || row.t % ANTHROPIC_CANDLE_MS || row.t >= end) throw Error('Invalid rh-Lighter candle');
+      if (!row || !Number.isSafeInteger(row.t) || row.t <= last || row.t % ANTHROPIC_CANDLE_MS || row.t >= end) throw Error('Invalid Lighter RH candle');
       last = row.t;
       if (row.t >= cursor) result.set(row.t, positive(row.c));
     }

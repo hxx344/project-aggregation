@@ -23,6 +23,10 @@ const RH_SYMBOLS = EXECUTION_VENUE_SYMBOLS['rh-lighter'];
 // Lighter answers an address without any account with HTTP 400 and this code; it has no positions.
 const RH_NOT_FOUND = 21100;
 const RH_RATE_LIMITED = 23000;
+// HTTP 429/405 or code 23000 is the venue firewall's static 60 s block of this IP; no read is sent until it ends.
+// These reads are unauthenticated and spend the IP bucket shared with the monitor and asset module, not the
+// L1-address bucket of the trading connection, so the trading client keeps its own cooldown.
+const RH_COOLDOWN_MS = 60_000;
 const MAX_ACCOUNTS = 256;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_ROWS = 2000;
@@ -109,7 +113,8 @@ export function parseRhLighterAccounts(body) {
       const side = p.sign === 1 ? 'long' : 'short';
       const notional = decimal(p.position_value, { nonnegative: true });
       const fraction = Number(decimal(p.initial_margin_fraction, { nonnegative: true }));
-      const leverage = fraction > 0 ? Math.round(100 / fraction) : null;
+      // The usable leverage rounds down, as in the trading adapter.
+      const leverage = fraction > 0 ? Math.floor(100 / fraction + 1e-9) : null;
       // The liquidation price is computed, not a tick-sized value: digits past 18 decimals are dropped, never rounded up.
       const liquidation = decimal(typeof p.liquidation_price === 'string' ? p.liquidation_price.replace(/^(\d+\.\d{18})\d+$/, '$1') : p.liquidation_price, { nonnegative: true });
       const isolated = p.margin_mode === 1;
@@ -210,6 +215,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
   // notLiveSince: source → first time this process saw it without a fresh read; startedAt bounds it.
   let startedAt = now();
   const notLiveSince = {};
+  let rhCooldownUntil = 0;
   const controller = new AbortController();
 
   function persist(next = alerts) {
@@ -227,19 +233,21 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
     try { return parseHyperliquidState(JSON.parse(text), dex); } catch { throw new Error(`${name} 仓位数据无法识别`); }
   }
   async function readRhLighter(address, signal) {
-    const name = TRADING_NAMES['rh-lighter'];
+    const name = TRADING_NAMES['rh-lighter'], limited = () => { rhCooldownUntil = now() + RH_COOLDOWN_MS; return new Error(`${name} 请求过于频繁，稍后自动重试`); };
+    if (now() < rhCooldownUntil) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
     const url = `${RH_ACCOUNT}?${new URLSearchParams({ by: 'l1_address', value: address })}`;
     const response = await fetcher(url, { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
-    if (response.status === 429) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
+    if (response.status === 429 || response.status === 405) { void response.body?.cancel().catch(() => {}); throw limited(); }
     if (!response.ok && response.status !== 400) throw new Error(`${name} 返回 HTTP ${response.status}`);
     const text = await readLimited(response, name);
     let body;
     try { body = JSON.parse(text); } catch { throw new Error(`${name} 仓位数据无法识别`); }
     if (response.status === 400) {
       if (object(body) && body.code === RH_NOT_FOUND) return [];
-      if (object(body) && body.code === RH_RATE_LIMITED) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
+      if (object(body) && body.code === RH_RATE_LIMITED) throw limited();
       throw new Error(`${name} 返回 HTTP 400`);
     }
+    if (object(body) && body.code === RH_RATE_LIMITED) throw limited();
     try { return parseRhLighterAccounts(body); } catch { throw new Error(`${name} 仓位数据无法识别`); }
   }
   const READERS = { hyperliquid: async (address, signal) => (await Promise.all(HL_DEXES.map(dex => readDex(address, dex, signal)))).flat(), 'rh-lighter': readRhLighter };

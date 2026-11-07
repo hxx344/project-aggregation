@@ -429,18 +429,26 @@ test('Lighter RH legs are read for the connected L1 address, alert, and keep the
     const cases = [
       [() => new Response('{}', { status: 429 }), /Lighter RH 请求过于频繁/],
       [() => new Response(JSON.stringify({ code: 23000, message: 'too many requests' }), { status: 400 }), /Lighter RH 请求过于频繁/],
+      [() => new Response(JSON.stringify({ code: 23000, message: 'too many requests' }), { status: 200 }), /Lighter RH 请求过于频繁/],
       [() => new Response(JSON.stringify({ code: 20001, message: 'invalid param' }), { status: 400 }), /Lighter RH 返回 HTTP 400/],
       [() => new Response('{}', { status: 502 }), /Lighter RH 返回 HTTP 502/],
       [() => new Response(JSON.stringify({ accounts: [{ index: 7, positions: 'x' }] }), { status: 200 }), /Lighter RH 仓位数据无法识别/],
       [() => { throw new DOMException('timed out', 'TimeoutError'); }, /Lighter RH 读取超时/],
     ];
     for (const [make, message] of cases) {
-      h.rhFail(make); await h.watch.poll();
+      h.advance(60_000); h.rhFail(make); await h.watch.poll();
       assert.equal(read().state, 'stale', String(message)); assert.match(read().error, message);
       assert.deepEqual(read().positions.map(row => row.liquidationPrice), ['110'], 'the last rows stay');
     }
+    h.advance(60_000); h.rhFail(() => new Response('{}', { status: 405 })); await h.watch.poll();
+    const sent = h.rhRequests.length;
+    h.advance(59_000); await h.watch.poll();
+    assert.equal(h.rhRequests.length, sent, 'no Lighter RH read inside the 60 s cooldown');
+    assert.match(read().error, /Lighter RH 请求过于频繁/);
+    h.advance(1000);
     h.rhFail(() => new Response(JSON.stringify({ code: 21100, message: 'account not found' }), { status: 400 }));
     await h.watch.poll();
+    assert.equal(h.rhRequests.length, sent + 1, 'the cooldown ends after 60 s');
     assert.deepEqual([read().state, read().positions], ['live', []], 'an address without accounts has no positions');
     assert.match(h.posts.at(-1), /Lighter RH ANTHROPIC 账户 7 做空：仓位已不在账户中/);
     assert.ok(h.watch.state().sources.find(source => source.exchange === 'hyperliquid'), 'Hyperliquid is still listed');

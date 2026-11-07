@@ -2,7 +2,7 @@
 // Entropy is the `io` HIP-3 namespace, not Hyperliquid's native perpetual venue.
 import { AUXILIARY_BOOK_POLL_MS, RH_LIGHTER_BOOK_CONFIRM_MS } from './collection-policy.mjs';
 export const ADDITIONAL_EXCHANGES = [
-  { id: 'rh-lighter', name: 'rh-Lighter', type: 'dex', website: 'https://robinhoodchain.lighter.xyz', docsUrl: 'https://apidocs.rh.lighter.xyz/docs/websocket', description: 'Robinhood Chain 独立盘口 · USDG · WS 买卖一档' },
+  { id: 'rh-lighter', name: 'Lighter RH', type: 'dex', website: 'https://robinhoodchain.lighter.xyz', docsUrl: 'https://apidocs.rh.lighter.xyz/docs/websocket', description: 'Robinhood Chain 独立盘口 · USDG · WS 买卖一档' },
   { id: 'entropy', name: 'Entropy', type: 'dex', website: 'https://entropy.io', docsUrl: 'https://docs.entropy.io', description: 'Hyperliquid HIP-3 io · USDC · WS 买卖一档；非标准合约独立展示' },
 ];
 
@@ -35,7 +35,7 @@ async function request(url, options, fetchImpl, signal) {
 export async function discoverAdditionalMarkets(exchangeId, { fetchImpl = fetch, signal, now = Date.now() } = {}) {
   if (exchangeId === 'rh-lighter') {
     const data = await request(`${RH_API}/api/v1/orderBookDetails`, {}, fetchImpl, signal);
-    if (data.code !== 200 || !Array.isArray(data.order_book_details)) throw new Error('rh-Lighter 合约目录格式异常');
+    if (data.code !== 200 || !Array.isArray(data.order_book_details)) throw new Error('Lighter RH 合约目录格式异常');
     return data.order_book_details.filter(item => item.market_type === 'perp' && item.status === 'active' && Number.isInteger(item.market_id) && typeof item.symbol === 'string' && item.symbol.length > 0).map(item => {
       const share = RH_EQUITIES.has(item.symbol), crypto = RH_CRYPTO.has(item.symbol), preipo = RH_PREIPO.has(item.symbol);
       const base = share ? `EQUITY:${item.symbol}` : crypto ? item.symbol : `RH-LIGHTER:${item.symbol}:${preipo ? 'PREIPO' : 'CONTRACT'}`;
@@ -44,7 +44,7 @@ export async function discoverAdditionalMarkets(exchangeId, { fetchImpl = fetch,
       // https://apidocs.rh.lighter.xyz/reference/orderbooks
       const feePercent = finite(item.taker_fee);
       const takerFeeRate = feePercent !== null && feePercent >= 0 && feePercent <= 10 ? feePercent / 100 : null;
-      return { id: `rh-lighter:${item.symbol}`, exchange: 'rh-lighter', symbol: item.symbol, base, displayBase: item.symbol, quoteCurrency: 'USDG', collateralCurrency: 'USDG', multiplier: 1, fundingIntervalHours: 1, marketId: item.market_id, contractUnit: share ? '每股' : crypto ? '每枚' : preipo ? '平台独立 Pre-IPO 规格' : 'rh-Lighter 独立合约规格', comparable: share || crypto, takerFeeRate, takerFeeAt: takerFeeRate === null ? null : now, takerFeeSource: takerFeeRate === null ? null : 'rh-lighter-standard' };
+      return { id: `rh-lighter:${item.symbol}`, exchange: 'rh-lighter', symbol: item.symbol, base, displayBase: item.symbol, quoteCurrency: 'USDG', collateralCurrency: 'USDG', multiplier: 1, fundingIntervalHours: 1, marketId: item.market_id, contractUnit: share ? '每股' : crypto ? '每枚' : preipo ? '平台独立 Pre-IPO 规格' : 'Lighter RH 独立合约规格', comparable: share || crypto, takerFeeRate, takerFeeAt: takerFeeRate === null ? null : now, takerFeeSource: takerFeeRate === null ? null : 'rh-lighter-standard' };
     });
   }
   if (exchangeId === 'entropy') {
