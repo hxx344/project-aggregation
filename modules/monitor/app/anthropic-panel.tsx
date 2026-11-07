@@ -7,6 +7,7 @@ import { useHydrated } from "../lib/use-hydrated";
 import { ranges } from "../lib/chart-ranges";
 import { dailyPoints, selectRange } from "../lib/market";
 import { useAnthropicFeed } from "../hooks/use-anthropic-feed";
+import { useHubFills } from "../lib/hub-fills";
 import { createAnthropicSummaryReader, type SummaryProps, type SummaryStatus } from "../lib/monitor-summary";
 import { getQuoteStaleAfterMs } from "../lib/market-freshness";
 import { anthropicChartConfig, anthropicPoints, coversAnthropicRange, ANTHROPIC_WARMUP_DAYS, type AnthropicComparisonLeg, type AnthropicQuote } from "../lib/anthropic-history";
@@ -26,7 +27,7 @@ const stamp = (t: number | string) => `${date(t, true)} ${new Date(t).toISOStrin
 const legName = (key: string) => ANTHROPIC_LEGS[key as keyof typeof ANTHROPIC_LEGS]?.name ?? key;
 const comparisonPremiums = (quote: AnthropicQuote | null) => Object.fromEntries(ANTHROPIC_COMPARISON_LEGS.map(key => [key, anthropicPremium(quote?.binance?.markPx, quote?.[key]?.markPx, key)])) as Record<AnthropicComparisonLeg, number | null>;
 
-export default function AnthropicPanel({ onSummary, active = true, selected = active, summaryActive = active, children }: SummaryProps & { active?: boolean; selected?: boolean; summaryActive?: boolean; children?: ReactNode }) {
+export default function AnthropicPanel({ onSummary, active = true, selected = active, summaryActive = active, tradesActive = false, children }: SummaryProps & { active?: boolean; selected?: boolean; summaryActive?: boolean; tradesActive?: boolean; children?: ReactNode }) {
   const shown = useHydrated() ? active : selected;
   const [hasOpened, setHasOpened] = useState(active);
   if (active && !hasOpened) setHasOpened(true);
@@ -36,6 +37,7 @@ export default function AnthropicPanel({ onSummary, active = true, selected = ac
   const [details, setDetails] = useState(false);
   const windowDays = range === null ? null : range + ANTHROPIC_WARMUP_DAYS;
   const { data, quote, loading, error, errorWindow, quoteError, refresh } = useAnthropicFeed(active, summaryActive, windowDays);
+  const trades = useHubFills("anthropic", tradesActive);
   const config = useMemo(() => anthropicChartConfig(leg), [leg]);
   const readSummary = useMemo(() => createAnthropicSummaryReader(), []);
   const allPoints = useMemo(() => data ? anthropicPoints(data.rows, leg) : EMPTY_POINTS, [data, leg]);
@@ -84,7 +86,7 @@ export default function AnthropicPanel({ onSummary, active = true, selected = ac
         <article className="metric"><div className="metric-label"><span className="legend-dot ordinary"/>{contract.venue}<span className="ticker">{symbol}</span></div><div className="metric-value">{usd(other ? perShare(leg, other.markPx) : null)}</div><div className="metric-foot">标记价 {native(other?.markPx)}{rhLeg ? " USDG" : ""}{contract.sharesPerUnit === 1 ? "" : ` ÷ ${contract.sharesPerUnit}`} <span>· {rhLeg ? "资金费暂未接入" : `资金费 ${fundingText(other?.fundingRate)} / 小时`}</span></div></article>
         <article className="metric"><div className="metric-label">区间平均溢价<span className="ticker">{ranges.find(r => r.days === range)?.label}</span></div><div className="metric-value">{signed(stats?.mean)}</div><div className="metric-foot">{stats ? `${signed(stats.min)} 至 ${signed(stats.max)}` : "等待行情数据"}</div></article>
       </section>
-      {charts && <ChartActivity mode={shown ? "visible" : "hidden"}><SpreadChart key={leg} data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} config={config}/></ChartActivity>}
+      {charts && <ChartActivity mode={shown ? "visible" : "hidden"}><SpreadChart key={leg} data={chartPoints} loading={historyPending} range={range} onRangeChange={setRange} trades={trades} config={config}/></ChartActivity>}
       <p className="chart-footnote"><Info size={13} aria-hidden="true"/>缺失时段曲线断开，不补 0 · 采样 15 分钟 · 每股价格依赖股数假设</p></div>
       {children}
       <div className="bottom-grid"><section className="table-panel"><div className="section-heading"><h2>近期观察</h2><span>每日最后共同 15 分钟 K 线 · 起点 UTC</span></div><div className="table-scroll"><table><thead><tr><th>日期</th><th>Binance / 股</th><th>{contract.name} / 股</th><th>溢价</th></tr></thead><tbody>{recent.map(p => <tr key={p.time}><td>{date(p.time, true)}<small>{new Date(p.time).toISOString().slice(11, 16)}</small></td><td>{usd(p.adr)}</td><td>{usd(p.equivalent)}</td><td><span className={`premium-pill ${p.premium >= 0 ? "positive" : "negative"}`}>{p.premium >= 0 ? <ArrowUpRight size={13}/> : <ArrowDownRight size={13}/>}{signed(p.premium)}</span></td></tr>)}{!recent.length && <tr><td colSpan={4} className="empty-table">{historyPending ? "正在加载记录…" : "暂无记录"}</td></tr>}</tbody></table></div></section>

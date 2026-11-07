@@ -51,8 +51,8 @@ export type SpreadChartConfig = {
   tradeEvents: (items: HubFillsView["items"]) => TradeEvent[];
   tradeMarkers: (events: TradeEvent[], points: Point[]) => SpreadTradeMarker[];
   /** Null for markets without fill markers; the trade panel is then never shown. */
-  tradeMarket: "oil" | "hynix" | null;
-  trade: { priceUnit: string; chartLabel: string; chartNote: string; metricName: string };
+  tradeMarket: "oil" | "hynix" | "anthropic" | null;
+  trade: { priceUnit: string; chartLabel: string; chartNote: string; metricName: string; sources?: string; note?: string };
   emptyText: { loading: string; hint: string };
 };
 const hynixMoney = (v: number) => `$${v.toFixed(2)}`;
@@ -100,12 +100,12 @@ function TradeMark({ cx, cy, marker, selected, onSelect }: { cx?: number | null;
   </g>;
 }
 
-function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config, market }: { trades: HubFillsView; markers: SpreadTradeMarker[]; selected: SpreadTradeMarker | null; onSelect: (key: string) => void; chartMarkers: boolean; config: SpreadChartConfig; market: "oil" | "hynix" }) {
+function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config, market }: { trades: HubFillsView; markers: SpreadTradeMarker[]; selected: SpreadTradeMarker | null; onSelect: (key: string) => void; chartMarkers: boolean; config: SpreadChartConfig; market: NonNullable<SpreadChartConfig["tradeMarket"]> }) {
   const titleId = useId();
-  const summaries = useMemo(() => summarizeTradeEvents(markers.map(marker => marker.event), market), [markers, market]);
+  const summaries = useMemo(() => market === "anthropic" ? [] : summarizeTradeEvents(markers.map(marker => marker.event), market), [markers, market]);
   const rows = [
     ...summaries.map(summary => ({ time: summary.start, key: summary.key, summary, marker: null })),
-    ...markers.filter(marker => marker.event.type !== "entry" && marker.event.type !== "exit").map(marker => ({ time: marker.event.time, key: marker.event.key, summary: null, marker })),
+    ...markers.filter(marker => market === "anthropic" || marker.event.type !== "entry" && marker.event.type !== "exit").map(marker => ({ time: marker.event.time, key: marker.event.key, summary: null, marker })),
   ].sort((a, b) => b.time - a.time || a.key.localeCompare(b.key));
   const summarySpread = (group: (typeof summaries)[number]["groups"][number]) => group.spread === null ? "未知" : `${group.spread.toFixed(3)}${market === "hynix" ? "%" : ` ${group.currency}${config.trade.priceUnit}`}`;
   const eventButton = (marker: SpreadTradeMarker) => {
@@ -116,7 +116,8 @@ function TradePanel({ trades, markers, selected, onSelect, chartMarkers, config,
   };
   return <section className="trade-panel" aria-labelledby={titleId}>
     <h3 id={titleId}>套利成交</h3>
-    <p className="trade-status" role="status">{fillsStatusText(trades, beijing)}</p>
+    <p className="trade-status" role="status">{fillsStatusText(trades, beijing, config.trade.sources)}</p>
+    {config.trade.note && <p className="trade-summary-note">{config.trade.note}</p>}
     <p className="trade-legend">{(Object.keys(TRADE_TYPES) as TradeType[]).map(key => <span key={key} data-trade-type={key}>{TRADE_TYPES[key].symbol} {key === "trade" ? "成交（开平未知）" : TRADE_TYPES[key].label}</span>)}<span className="trade-legend-note">{chartMarkers ? "颜色只区分类型，不表示盈亏" : `切换到${spreadTabs(config)}可在图上查看标记`}</span></p>
     <div className="trade-summary-list" aria-label="当前区间套利成交">
       {!markers.length && <p>{trades.status === "ok" && !trades.pending && !trades.incomplete ? "当前图表区间暂无套利成交" : "当前图表区间暂无可展示成交"}</p>}

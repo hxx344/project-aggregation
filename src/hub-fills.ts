@@ -7,7 +7,7 @@ export const FILLS_CACHE_MS = 20_000;
 export const FILLS_PENDING_CACHE_MS = 3_000;
 export const FILLS_STALE_AFTER_MS = 15 * 60_000;
 export const MAX_FILL_ITEMS = 2000;
-export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] } as const;
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillsRequest = { requestId: string; market: FillMarket };
 type ScopeStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';
@@ -59,7 +59,8 @@ function decimal(value: unknown, positive = false): string | null {
 
 export function fillItems(response: unknown, now: number, market: FillMarket = 'oil') {
   const items: HubFillItem[] = [], coverage: FillCoverage[] = [], seen = new Set<string>();
-  let pending = false, incomplete = false, truncated = false, lookbackStart: string | null = null;
+  // ANT currently excludes Hyperliquid/RH history, even when connected CEX scopes are complete.
+  let pending = false, incomplete = market === 'anthropic', truncated = false, lookbackStart: string | null = null;
   for (const sourceValue of list(object(response).sources)) {
     const source = object(sourceValue), sourceName = text(source.name), projectId = text(source.projectId);
     const sourceStatus = enumeration(source.status, ['ready', 'stale', 'unavailable', 'unconfigured']);
@@ -100,7 +101,8 @@ export function fillItems(response: unknown, now: number, market: FillMarket = '
             const symbols = exchangeId === 'okx' ? [`${base}-USDT-SWAP`]
               : exchangeId === 'binance' ? [`${base}USDT`]
                 : exchangeId === 'bybit' ? [base + priceCurrency, ...(priceCurrency === 'USDC' ? [base + 'PERP'] : [])] : [];
-            if (!symbols.includes(symbol) || exchangeId !== 'bybit' && priceCurrency !== 'USDT') throw new MalformedFills();
+            if (!symbols.includes(symbol) || market === 'anthropic' && !['binance', 'okx'].includes(exchangeId)
+              || exchangeId !== 'bybit' && priceCurrency !== 'USDT') throw new MalformedFills();
             const time = timestamp(fill.time);
             if (!time) throw new MalformedFills();
             const key = [projectId, exchangeId, accountId, scopeId, text(fill.id)].map(encodeURIComponent).join('|');

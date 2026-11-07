@@ -1,7 +1,7 @@
 import type { PositionsStatus } from './positions-types.ts';
 
 /** Fixed perpetual bases per arbitrage market; each market is read, cached and replayed separately. */
-export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] } as const;
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillBase = (typeof FILL_MARKETS)[FillMarket][number];
 export type Fill = {

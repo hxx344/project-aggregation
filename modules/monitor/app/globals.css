@@ -487,6 +487,8 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
   .hub-nav-slot .perp-workspace-nav { overflow-x: auto; }
   .monitor-detail { margin-inline: 16px; }
   .monitor-detail-side { grid-template-columns: 1fr; }
+  .monitor-detail [data-monitor="anthropic"] .detail-toolbar { flex-wrap: wrap; }
+  .monitor-detail [data-monitor="anthropic"] .refresh-area { flex: 1 1 100%; flex-wrap: wrap; }
 }
 .hub-embedded .hub-nav-row, .hub-embedded .monitor-detail { margin-inline: 16px; }
 

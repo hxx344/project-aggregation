@@ -1,7 +1,7 @@
 import { createHubRequester, HUB_REQUEST_ID, type RequestTimers } from './hub-requester.ts';
 
 /** Fixed perpetual bases per arbitrage market, matching the host and Asset allowlists. */
-export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] } as const;
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type HubFillItem = {
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
@@ -52,6 +52,7 @@ function parseItem(value: unknown, market: FillMarket): HubFillItem | null {
   };
   if (Object.values(result).some(field => field === undefined)) return null;
   if (!['binance', 'bybit', 'okx'].includes(result.exchangeId!)) return null;
+  if (market === 'anthropic' && !['binance', 'okx'].includes(result.exchangeId!)) return null;
   if (result.exchangeId !== 'bybit' && result.priceCurrency !== 'USDT') return null;
   const expected = result.exchangeId === 'okx' ? `${result.base}-${result.priceCurrency}-SWAP` : `${result.base}${result.priceCurrency}`;
   const usdcPerpetual = result.exchangeId === 'bybit' && result.priceCurrency === 'USDC' && result.symbol === `${result.base}PERP`;

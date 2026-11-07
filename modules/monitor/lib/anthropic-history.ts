@@ -2,6 +2,7 @@ import type { Point } from "./market.ts";
 import type { SpreadChartConfig } from "../app/spread-chart";
 import { ANTHROPIC_CANDLE_MS, ANTHROPIC_LEGS, ANTHROPIC_LEG_KEYS, anthropicChartRows, validateAnthropicCandles, validateAnthropicQuote } from "../modules/anthropic/market.mjs";
 import type { QuoteFreshness } from "./market-freshness.ts";
+import { anthropicTradeEvents, anthropicTradeMarkers } from "./anthropic-trades.ts";
 
 /** Contracts compared against Binance. */
 export type AnthropicComparisonLeg = "xyz" | "io" | "rh";
@@ -50,7 +51,6 @@ export const anthropicPoints = (rows: AnthropicRow[], leg: AnthropicComparisonLe
 
 const BARS_PER_DAY = 86_400_000 / ANTHROPIC_CANDLE_MS;
 const usd = (v: number) => `$${v.toFixed(2)}`;
-const noTrades = () => [];
 /** Per-share premium chart of Binance against the selected comparison contract. */
 export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartConfig {
   const { name, label } = ANTHROPIC_LEGS[leg];
@@ -60,8 +60,10 @@ export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartCo
     tabs: { premium: "溢价率", spread: "每股价差", price: "每股价格" }, units: { premium: `% · Binance 相对 ${name}`, spread: "USD / 股", price: "USD / 股" },
     premiumName: "Binance 溢价率", spreadName: "每股价差", legs: ["Binance", name], zeroLabel: "0 = 同价", domainStep: 1, digits: 2, price: usd,
     tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(1))}` },
-    tradeEvents: noTrades, tradeMarkers: noTrades, tradeMarket: null,
-    trade: { priceUnit: "", chartLabel: "", chartNote: "", metricName: "溢价率" },
+    tradeEvents: anthropicTradeEvents, tradeMarkers: anthropicTradeMarkers, tradeMarket: "anthropic",
+    trade: { priceUnit: "", chartLabel: "图表同 15 分钟溢价率", chartNote: "已收盘 K 线，非双腿成交价差", metricName: "溢价率",
+      sources: "仅支持 Binance、OKX；Hyperliquid、Lighter RH 成交暂未接入",
+      note: "标记时间来自真实成交，纵坐标采用所选合约对的同一根 15 分钟 K 线；缺失或未收盘时仅列出成交。原生数量和成交价格不做每股换算，不代表双腿同时入场或出场。" },
     emptyText: { loading: "正在载入 15 分钟 K 线", hint: `Binance ANTHROPICUSDT / ${label} 同一时段已收盘 K 线` },
   };
 }

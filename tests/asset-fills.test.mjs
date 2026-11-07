@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createAssetFills, normalizeAssetFills, ageAssetFills, ASSET_FILLS_RESPONSE_LIMIT, ASSET_FILLS_CACHE_MS, ASSET_FILLS_PENDING_CACHE_MS, ASSET_FILLS_STALE_MS, ASSET_FILLS_BACKGROUND_IDLE_MS } from '../server/asset-fills.mjs';
-import { NOW, STAMP, payload, hynixPayload, fill, scope, deferred } from './fills-fixtures.mjs';
+import { NOW, STAMP, payload, hynixPayload, anthropicPayload, fill, scope, deferred } from './fills-fixtures.mjs';
 
 test('fills allowlist preserves precision and coverage without upstream secrets', () => {
   const raw = payload();
@@ -139,6 +139,30 @@ test('background warming runs only for a market a page read recently', async t =
   // Background reads must not renew the window themselves.
   f.tick(1); await wait(); const idle = f.calls();
   await wait(); assert.equal(f.calls(), idle, 'warming stops once the market sits idle');
+});
+
+test('ANT preserves native decimals, rejects unsupported venues and isolates failures from other markets', async t => {
+  const data = anthropicPayload();
+  assert.deepEqual(scope(normalizeAssetFills(data, NOW, 'anthropic')).fills, scope(data).fills);
+  for (const market of ['oil', 'hynix']) assert.throws(() => normalizeAssetFills(data, NOW, market), /invalid_fills/);
+  for (const exchange of ['bybit', 'hyperliquid', 'rh']) {
+    const unsupported = anthropicPayload(); unsupported.exchanges[0].id = exchange;
+    assert.throws(() => normalizeAssetFills(unsupported, NOW, 'anthropic'), /invalid_fills/);
+  }
+  const okx = anthropicPayload(); okx.exchanges[0].id = 'okx';
+  Object.assign(scope(okx).fills[0], { symbol: 'ANTHROPIC-USDT-SWAP', quantityUnit: '张', positionBefore: null, positionAfter: null });
+  assert.equal(scope(normalizeAssetFills(okx, NOW, 'anthropic')).fills[0].positionBefore, null);
+  let fail = false; const routes = [];
+  const ant = createAssetFills({ market: 'anthropic', listTargets: () => [target()], now: () => NOW, cacheMs: 0, request: async (_base, route) => {
+    routes.push(route); if (fail) throw Object.assign(new Error('secret'), { statusCode: 400 }); return { data };
+  } });
+  t.after(() => ant.close());
+  assert.equal((await ant.state()).sources[0].status, 'ready');
+  fail = true; const stale = (await ant.state()).sources[0];
+  assert.match(stale.error, /尚不支持 ANT 成交/); assert.equal(stale.status, 'stale');
+  assert.deepEqual(scope(stale.data).fills, scope(data).fills); assert.equal(scope(stale.data).fetchedAt, STAMP);
+  assert.ok(routes.every(route => route === '/api/hub/fills?market=anthropic'));
+  const oil = fixture(t); assert.equal((await oil.reader.state()).sources[0].status, 'ready');
 });
 
 test('malformed refresh retains the earlier snapshot; revision changes discard it and late completions', async t => {

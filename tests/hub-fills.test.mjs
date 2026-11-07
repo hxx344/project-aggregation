@@ -4,18 +4,36 @@ import { fillsRequest, fillsReply, fillItems, fillsCacheMs, FILLS_TIMEOUT_MS, FI
 import { createPositionsSource } from '../src/hub-positions.ts';
 import { ASSET_FILLS_TIMEOUT_MS } from '../server/asset-fills.mjs';
 import { FILLS_TIMEOUT_MS as MODULE_FILLS_TIMEOUT_MS, parseFillsReply } from '../modules/monitor/lib/hub-fills-contract.ts';
-import { NOW, STAMP, LOOKBACK, response, scope, fill, hynixPayload } from './fills-fixtures.mjs';
+import { NOW, STAMP, LOOKBACK, response, scope, fill, hynixPayload, anthropicPayload } from './fills-fixtures.mjs';
 
 const request = { type: 'fills-request', requestId: 'fills-1', market: 'oil' };
 const reply = data => fillsReply(fillsRequest(request), { status: 'ok', data, at: 0 }, NOW);
 
-test('fills requests only accept the fixed oil and hynix markets without symbol or URL overrides', () => {
+test('fills requests only accept the fixed markets without symbol or URL overrides', () => {
   assert.deepEqual(fillsRequest(request), { requestId: 'fills-1', market: 'oil' });
   assert.deepEqual(fillsRequest({ ...request, market: 'hynix' }), { requestId: 'fills-1', market: 'hynix' });
+  assert.deepEqual(fillsRequest({ ...request, market: 'anthropic' }), { requestId: 'fills-1', market: 'anthropic' });
   assert.ok(fillsRequest({ ...request, channel: 'project-hub', version: 1 }));
   for (const invalid of [null, [], {}, { ...request, type: 'fills' }, { ...request, market: 'cl-xau' }, { ...request, market: undefined }, { ...request, market: '__proto__' }, { ...request, market: 'toString' },
     { ...request, requestId: '' }, { ...request, requestId: 'a'.repeat(65) }, { ...request, requestId: 'a_b' }, { ...request, requestId: 1 },
     { ...request, symbols: ['BTC'] }, { ...request, url: 'https://example.com' }]) assert.equal(fillsRequest(invalid), null);
+});
+
+test('ANT host and Monitor contracts preserve real fills, reject wrong markets and report partial venue coverage', () => {
+  const raw = response(); raw.sources[0].data = anthropicPayload();
+  const antRequest = fillsRequest({ ...request, market: 'anthropic' });
+  const mapped = () => fillsReply(antRequest, { status: 'ok', data: raw, at: 0 }, NOW);
+  const ant = mapped();
+  assert.equal(ant.status, 'ok'); assert.equal(ant.incomplete, true);
+  assert.equal(ant.items[0].base, 'ANTHROPIC'); assert.equal(ant.items[0].price, '80.000000000000000001');
+  assert.equal(ant.items[0].realizedPnl, '2.123456789012345678'); assert.ok(parseFillsReply(ant, 'anthropic'));
+  assert.equal(parseFillsReply(ant, 'oil'), null); assert.equal(parseFillsReply(ant, 'hynix'), null);
+  assert.equal(reply(raw).status, 'unavailable');
+  assert.equal(parseFillsReply({ ...ant, items: [{ ...ant.items[0], exchangeId: 'bybit' }] }, 'anthropic'), null);
+  raw.sources[0].data.exchanges[0].id = 'bybit'; assert.equal(mapped().status, 'unavailable');
+  raw.sources[0].data.exchanges[0].id = 'okx';
+  Object.assign(scope(raw.sources[0].data).fills[0], { symbol: 'ANTHROPIC-USDT-SWAP', quantityUnit: '张', positionBefore: null, positionAfter: null });
+  const unknown = mapped(); assert.equal(unknown.items[0].positionBefore, null); assert.ok(parseFillsReply(unknown, 'anthropic'));
 });
 
 test('mapping preserves every venue/account/scope identity and exact decimals, without copying provider fields', () => {

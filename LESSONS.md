@@ -349,6 +349,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `monitor-scanner-shell-width-20261014`；一次已核实布局缺陷，多个视口及子标签页不重复计数。
 
+**ANT 工具栏补充（2026-11-07）：** 基线 `4efbca4` 的 ANT 工具栏在共享 `.refresh-area` 横排中放入三个合约切换按钮、刷新按钮和刷新说明，390px iframe 实测 `scrollWidth=459`。新增市场控件时须按 iframe 实际宽度检查工具栏，不能只确认图表本身缩放。当前仅对 ANT 的窄屏工具栏与刷新区启用换行，不改公共容器宽度；[工作台验收](tests/monitor-anthropic-trades.browser.mjs) 复现并覆盖修复后的 390px 无横向溢出。事件 `ant-monitor-toolbar-overflow-20261107`；本次浏览器验收发现，未核实用户服务器是否遇到。
+
 ### L022：页面时钟不套用原始时间戳的整数约束
 
 **适用条件：** 页面用服务器时间加 `performance.now()` 增量计算持仓时长或数据过期。

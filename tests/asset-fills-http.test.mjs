@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { createApp } from '../server/app.mjs';
-import { payload, scope, NOW, hynixPayload } from './fills-fixtures.mjs';
+import { payload, scope, NOW, hynixPayload, anthropicPayload } from './fills-fixtures.mjs';
 
 const password = 'hub-fills-test-only';
 const assetPassword = 'asset-fills-test-only';
@@ -16,7 +16,7 @@ const deferred = () => { let resolve; const promise = new Promise(done => { reso
 async function fixture(t) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-fills-http-'));
   const calls = [], gates = [];
-  let loginCount = 0, reply = async (_req, res) => send(res, 200, body());
+  let loginCount = 0, reply = async (req, res) => send(res, 200, req.url.endsWith('market=anthropic') ? anthropicPayload() : body());
   const asset = http.createServer(async (req, res) => {
     calls.push({ method: req.method, url: req.url });
     assert.equal(req.headers.origin, assetOrigin);
@@ -26,7 +26,7 @@ async function fixture(t) {
       return send(res, 200, { ok: true }, { 'Set-Cookie': `asset_session=fixture-${++loginCount}; HttpOnly; Path=/` });
     }
     if (req.headers.cookie !== `asset_session=fixture-${loginCount}`) return send(res, 401, { error: 'secret-upstream-error' });
-    assert.equal(req.method, 'GET'); assert.match(req.url, /^\/api\/hub\/fills(\?market=hynix)?$/);
+    assert.equal(req.method, 'GET'); assert.match(req.url, /^\/api\/hub\/fills(\?market=(hynix|anthropic))?$/);
     if (req.url.endsWith('market=hynix')) return send(res, 200, hynixPayload());
     await reply(req, res);
   });
@@ -79,7 +79,28 @@ test('fills route requires Hub authentication and only reads the configured Asse
   assert.equal(result.data.sources[0].status, 'ready');
   assert.deepEqual(result.data.sources[0].data.exchanges[0].accounts[0].scopes[0].fills.map(item => [item.symbol, item.base]), [['SKHYUSDT', 'SKHY']]);
   assert.equal(f.calls.at(-1).url, '/api/hub/fills?market=hynix', 'each market reads its own Asset query');
+  result = await f.request('/api/trading/fills?market=anthropic');
+  assert.equal(result.data.sources[0].status, 'ready');
+  assert.deepEqual(scope(result.data.sources[0].data).fills.map(item => [item.symbol, item.base]), [['ANTHROPICUSDT', 'ANTHROPIC']]);
+  assert.equal(f.calls.at(-1).url, '/api/hub/fills?market=anthropic');
   assert.equal((await f.request('/api/trading/fills', { method: 'POST', data: {} })).response.status, 405);
+});
+
+test('ANT HTTP failures retain only ANT history and never fall back to oil data', async t => {
+  const f = await fixture(t); await f.connect();
+  const first = (await f.request('/api/trading/fills?market=anthropic')).data.sources[0];
+  f.reply(async (req, res) => req.url.endsWith('market=anthropic')
+    ? send(res, 503, { error: 'upstream-secret' }) : send(res, 200, body()));
+  const stale = (await f.request('/api/trading/fills?market=anthropic')).data.sources[0];
+  assert.equal(stale.status, 'stale'); assert.equal(scope(stale.data).status, 'stale');
+  assert.deepEqual(scope(stale.data).fills, scope(first.data).fills);
+  assert.equal(scope(stale.data).fetchedAt, scope(first.data).fetchedAt);
+  const oil = (await f.request('/api/trading/fills')).data.sources[0];
+  assert.equal(oil.status, 'ready'); assert.equal(scope(oil.data).fills[0].base, 'CL');
+  f.reply(async (_req, res) => send(res, 200, body()));
+  const mismatched = (await f.request('/api/trading/fills?market=anthropic')).data.sources[0];
+  assert.equal(mismatched.status, 'stale'); assert.match(mismatched.error, /格式无效/);
+  assert.equal(scope(mismatched.data).fills[0].base, 'ANTHROPIC');
 });
 
 test('old Asset versions get an upgrade message and session expiration is retried safely', async t => {

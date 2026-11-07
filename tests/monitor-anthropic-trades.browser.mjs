@@ -1,0 +1,122 @@
+// Root production preview on 4178; Monitor ssr-browser-server.mjs on 3189.
+// Run with playwright-cli run-code --filename. Every API is isolated; no account services are contacted.
+async page => {
+  const origin = 'http://hub.localhost:4178', moduleOrigin = 'http://p-0123456789abcdef01234567.hub.localhost:4178';
+  const monitorBuild = 'http://127.0.0.1:3189', day = 86_400_000, step = 900_000;
+  const now = Date.now(), end = Math.floor(now / step) * step - step, stamp = new Date(now).toISOString();
+  const iso = time => new Date(time).toISOString(), check = (value, message) => { if (!value) throw new Error(message); };
+  const project = { id: 'monitor', name: 'monitor', description: '', category: 'other', adapter: 'monitor', enabled: true, embedded: true, accessMode: 'proxy', apiUrl: 'http://127.0.0.1:9000', url: '', mode: 'embed', hasCredentials: true, revision: 'ant-trades-fixture', staleAfterSeconds: 120, order: 0 };
+  const overview = { generatedAt: stamp, projects: [{ project, state: 'online', freshness: 'static', message: '', checkedAt: null, updatedAt: null, latencyMs: 1, diagnostics: [], metrics: [] }] };
+  const samples = Array.from({ length: 40 * 96 }, (_, index) => ({ time: end - (40 * 96 - 1 - index) * step, binance: 1270, xyz: 80, io: 1670, rh: 835 }));
+  const candles = { status: 'live', metadata: { source: 'Binance + Hyperliquid + rh-Lighter', symbols: ['ANTHROPICUSDT', 'xyz:ANT', 'io:ANTH', 'ANTHROPIC'], interval: '15m', timezone: 'UTC', priceBasis: 'Completed 15-minute candle closes', fetchedAt: stamp, firstObservation: iso(samples[0].time), lastObservation: iso(end), rows: samples.length, errors: {} }, data: samples };
+  const quote = { fetchedAt: stamp, errors: {}, binance: { markPx: 1270, fundingRate: 0, nextFundingTime: null }, xyz: { markPx: 80, fundingRate: 0, oraclePx: 80 }, io: { markPx: 1670, fundingRate: 0, oraclePx: 1670 }, rh: { markPx: 835, fundingRate: null, indexPx: 835 } };
+  const cycle = (overrides = {}) => ({ status: 'complete', since: iso(end - 3 * day), closedQuantity: '1', closePrice: '1200', realizedPnl: '10', fees: '-2', funding: '1', net: '9', currency: 'USDT', note: null, updatedAt: stamp, ...overrides });
+  const position = (symbol, unrealizedPnl, pnlCurrency, extra = {}) => ({ symbol, instrumentId: symbol, side: 'long', quantity: '2', quantityUnit: 'ANTHROPIC', entryPrice: '1200', markPrice: '1210', unrealizedPnl, pnlCurrency, ...extra });
+  const exchange = (id, name, positions) => ({ id, name, accounts: [{ id: 'main', name: '主账户', scopes: [{ id: 'perp', status: 'live', fetchedAt: stamp, positions }] }] });
+  const positions = { generatedAt: stamp, sources: [{ projectId: 'asset', name: 'Asset', status: 'ready', data: { exchanges: [
+    exchange('binance', 'Binance', [position('ANTHROPICUSDT', '30', 'USDT', { cycle: cycle() })]),
+    exchange('okx', 'OKX', [position('ANTHROPIC-USDT-SWAP', '-10', 'USDT', { side: 'short', quantityUnit: '张', cycle: cycle({ realizedPnl: '-3', fees: '-1', funding: '2', net: '-2' }) })]),
+    exchange('rh-lighter', 'Lighter RH', [position('ANTHROPIC', '5', 'USDG')]),
+  ] } }] };
+  const legs = { sources: [{ exchange: 'hyperliquid', connected: true, state: 'live', fetchedAt: stamp, positions: [position('xyz:ANT', '7', null, { side: 'short', entryPrice: '80', markPrice: '79' })] }] };
+  const lookbackStart = iso(now - 85 * day);
+  const fill = (id, time, close, venue = 'binance') => ({ id, symbol: venue === 'okx' ? 'ANTHROPIC-USDT-SWAP' : 'ANTHROPICUSDT', base: 'ANTHROPIC', time: iso(time), side: close ? 'sell' : 'buy', positionSide: 'net', quantity: '2', quantityUnit: venue === 'okx' ? '张' : 'ANTHROPIC', price: venue === 'okx' ? '127' : '1270', priceCurrency: 'USDT', fee: '-0.1', feeCurrency: 'USDT', realizedPnl: close ? '4' : '0', positionBefore: close ? '2' : '0', positionAfter: close ? '0' : '2' });
+  const fills = { generatedAt: stamp, sources: [{ projectId: 'asset', name: 'Asset', status: 'ready', data: { schemaVersion: 1, generatedAt: stamp, lookbackStart, exchanges: ['binance', 'okx'].map(venue => ({ id: venue, name: venue === 'binance' ? 'Binance' : 'OKX', accounts: [{ id: 'main', name: '主账户', scopes: [{ id: venue === 'binance' ? 'um' : 'swap', status: 'live', refreshing: false, fetchedAt: stamp, coverageStart: lookbackStart, coverageEnd: stamp, truncated: false, fills: [fill('entry', end - 2 * day + 60_000, false, venue), fill('exit', end - day + 60_000, true, venue), fill('old', end - 20 * day + 60_000, false, venue)] }] }] })) } }] };
+  const errors = [], requests = [], listener = error => errors.push(error.stack ?? error.message);
+  let failReads = false;
+  const handler = async route => {
+    const request = route.request(), url = new URL(request.url()), path = url.pathname;
+    const send = (json, status = 200) => route.fulfill({ status, json });
+    if (url.origin === moduleOrigin) {
+      if (request.method() !== 'GET') throw new Error(`Unexpected module write: ${path}`);
+      if (path === '/api/monitors') return send({ schemaVersion: 1, monitors: ['oil', 'hynix', 'anthropic', 'perpetual'].map(id => ({ id, runtime: { available: true, monitorId: id, enabled: true, running: true, revision: 0 } })) });
+      if (path === '/api/monitors/anthropic/candles/15m') return send(candles);
+      if (path === '/api/monitors/anthropic/quote') return send(quote);
+      if (path.startsWith('/api/')) return send({ error: 'Controlled unavailable fixture' }, 503);
+      return route.fulfill({ response: await route.fetch({ url: monitorBuild + path + url.search }) });
+    }
+    if (url.origin !== origin) return route.abort('blockedbyclient');
+    if (path === '/api/projects/monitor/launch' && request.method() === 'POST') return send({ url: `${moduleOrigin}/?monitor=anthropic` });
+    if (request.method() !== 'GET') throw new Error(`Unexpected host write: ${path}`);
+    if (path === '/api/session') return send({ authenticated: true, csrfToken: 'ant-fixture-only' });
+    if (path === '/api/health') return send({ status: 'ok' });
+    if (path === '/api/overview/events' || path === '/api/system/updates/events') return route.abort();
+    if (path === '/api/overview') return send(overview);
+    if (path === '/api/system/updates') return send({ enabled: false, checking: false, checkedAt: null, checkError: null, planId: null, expiresAt: null, modules: [], job: null });
+    if (path === '/api/trading/fills') { requests.push(url.searchParams.get('market') ?? 'oil'); return failReads ? send({ error: 'Fixture unavailable' }, 503) : send(url.searchParams.get('market') === 'anthropic' ? fills : { generatedAt: stamp, sources: [] }); }
+    if (path === '/api/trading/positions') return failReads ? send({ error: 'Fixture unavailable' }, 503) : send(positions);
+    if (path === '/api/trading/anthropic') return send(legs);
+    if (path.startsWith('/api/')) return send({ error: 'Controlled unavailable fixture' }, 503);
+    return route.continue();
+  };
+  await page.goto('about:blank');
+  await page.unrouteAll({ behavior: 'wait' });
+  await page.setViewportSize({ width: 1440, height: 1050 });
+  await page.clock.install({ time: new Date(now) });
+  page.on('pageerror', listener);
+  await page.route('**/*', handler);
+  try {
+    await page.goto(`${origin}/?view=project&id=monitor`);
+    const frame = page.frameLocator('iframe[title="monitor模块"]'), panel = frame.getByRole('tabpanel', { name: 'Anthropic 价差', exact: true });
+    const entry = panel.locator('.trade-marker[data-trade-type="entry"]'), exit = panel.locator('.trade-marker[data-trade-type="exit"]');
+    await entry.first().waitFor(); await exit.first().waitFor();
+    check(await entry.count() === 1 && await exit.count() === 1, 'one entry and exit event in the one-week chart');
+    check((await entry.getAttribute('aria-label')).includes('25.000%'), 'xyz markers use chart premium');
+    await entry.focus(); await page.keyboard.press('Enter');
+    const details = panel.getByLabel('套利成交明细');
+    await details.waitFor();
+    check((await details.innerText()).includes('2 张 @ 127 USDT'), 'OKX keeps its native contract price');
+    check((await details.innerText()).includes('手续费合计 -0.2 USDT'), 'fill details retain fees');
+    check((await panel.locator('.trade-status').innerText()).includes('Hyperliquid、Lighter RH 成交暂未接入'), 'history coverage is explicit');
+    const side = frame.locator('[data-related-positions="anthropic"]'), usdt = side.locator('[data-position-totals="USDT"]');
+    await usdt.waitFor();
+    check((await usdt.innerText()).includes('+27.00 USDT'), 'total includes unrealized 20 and realized net 7');
+    check((await usdt.innerText()).includes('−3.00 USDT'), 'signed fees are added');
+    check((await side.locator('[data-position-totals="USDG"]').innerText()).includes('+5.00 USDG'), 'USDG stays separate');
+    check((await side.locator('[data-position-totals="unknown"]').innerText()).includes('结算币种未知'), 'Hyperliquid has no invented currency or zero cycle');
+    check(await side.locator('.related-positions-list li').count() === 4, 'all legs remain visible');
+    for (const [name, expected] of [['io:ANTH', '0.000%'], ['Lighter RH', '100.000%'], ['xyz:ANT', '25.000%']]) {
+      await panel.getByRole('button', { name, exact: true }).click();
+      await entry.first().waitFor();
+      check((await entry.getAttribute('aria-label')).includes(expected), `${name} uses its own chart coordinates`);
+      check((await usdt.innerText()).includes('+27.00 USDT'), 'chart selection does not change related totals');
+    }
+    const chart = panel.getByRole('region', { name: '历史价差图表', exact: true });
+    await chart.getByRole('button', { name: '1 月', exact: true }).click();
+    await entry.nth(1).waitFor();
+    await chart.getByRole('button', { name: '1 周', exact: true }).click();
+    await entry.nth(1).waitFor({ state: 'hidden' });
+    await chart.getByRole('button', { name: '每股价格', exact: true }).click();
+    check(await panel.locator('.trade-marker').count() === 0, 'price mode uses the fill list without incompatible axis markers');
+    check(await panel.locator('.trade-list-item').count() === 2, 'actual fills stay accessible in price mode');
+    await chart.getByRole('button', { name: '溢价率', exact: true }).click();
+    await entry.first().waitFor();
+    await entry.scrollIntoViewIfNeeded();
+    await page.screenshot({ path: '.playwright-cli/ant-trades-desktop.png' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await side.scrollIntoViewIfNeeded();
+    const sizes = await side.evaluate(node => { const document = node.ownerDocument, width = document.documentElement.clientWidth; return { width, scroll: document.documentElement.scrollWidth,
+      overflow: [...document.querySelectorAll('main *')].filter(element => element.getBoundingClientRect().right > width + 1).slice(0, 8).map(element => element.className) }; });
+    await page.screenshot({ path: '.playwright-cli/ant-trades-mobile.png' });
+    check(sizes.scroll <= sizes.width + 1, `ANT totals and chart fit the narrow iframe: ${JSON.stringify(sizes)}`);
+    await page.setViewportSize({ width: 1440, height: 1050 });
+    failReads = true;
+    await page.clock.fastForward(301_000);
+    await panel.locator('.trade-status').filter({ hasText: '刷新失败，保留上次成功数据' }).waitFor();
+    await side.getByText(/保留 .* 的持仓数据/).waitFor();
+    check((await usdt.innerText()).includes('+27.00 USDT'), 'failed refresh retains the previous nonzero total');
+    check((await usdt.innerText()).includes('保留旧数据'), 'retained total is visibly marked');
+    check(await entry.count() === 1 && await exit.count() === 1, 'failed fill refresh retains markers');
+    await frame.getByRole('tab', { name: '原油价差', exact: true }).click();
+    const before = requests.filter(market => market === 'anthropic').length;
+    await page.clock.fastForward(301_000);
+    check(requests.filter(market => market === 'anthropic').length === before, 'inactive ANT chart stops fill reads');
+    check(errors.length === 0, errors.join('\n'));
+    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'entry/exit keyboard details', 'native prices', 'three comparison legs', 'range and price modes', 'per-currency PnL', 'unknown cycle', 'refresh failure retention', 'foreground-only reads', '390px layout'] };
+  } finally {
+    page.off('pageerror', listener);
+    await page.unroute('**/*', handler);
+    await page.clock.resume();
+    await page.setViewportSize({ width: 1440, height: 1050 });
+  }
+}

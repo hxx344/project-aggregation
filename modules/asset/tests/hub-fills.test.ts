@@ -434,7 +434,7 @@ test('history requests have a shared spacing reservation and refuse a page beyon
 });
 
 test('fills route authenticates first, rejects all extra/duplicate query params, and sanitizes service failures', async () => {
-  for (const [query, market] of [['', 'oil'], ['?schemaVersion=1', 'oil'], ['?market=oil', 'oil'], ['?schemaVersion=1&market=hynix', 'hynix']]) {
+  for (const [query, market] of [['', 'oil'], ['?schemaVersion=1', 'oil'], ['?market=oil', 'oil'], ['?schemaVersion=1&market=hynix', 'hynix'], ['?market=anthropic', 'anthropic']]) {
     assert.equal(fillsQueryMarket('http://localhost/api/hub/fills' + query), market);
   }
   for (const query of ['?schemaVersion=2', '?symbol=BTCUSDT', '?schemaVersion=1&symbol=CL', '?schemaVersion=1&schemaVersion=1', '?schemaVersion=',
@@ -459,8 +459,9 @@ test('fills route authenticates first, rejects all extra/duplicate query params,
     const request = (query = '') => new Request('http://localhost/api/hub/fills' + query);
     assert.equal((await route.GET(request('?symbol=BTC'))).status, 400); assert.equal(reads, 0); assert.equal(initialized, 0);
     assert.equal((await route.GET(request('?schemaVersion=1'))).status, 200); assert.equal(reads, 1);
-    assert.equal((await route.GET(request('?market=hynix'))).status, 200); assert.deepEqual(markets, ['oil', 'hynix']);
-    assert.equal((await route.GET(request('?market=gold'))).status, 400); assert.equal(reads, 2);
+    assert.equal((await route.GET(request('?market=hynix'))).status, 200);
+    assert.equal((await route.GET(request('?market=anthropic'))).status, 200); assert.deepEqual(markets, ['oil', 'hynix', 'anthropic']);
+    assert.equal((await route.GET(request('?market=gold'))).status, 400); assert.equal(reads, 3);
     auth = false; assert.equal((await route.GET(request('?bad=1'))).status, 401);
     auth = true; fail = true; const response = await route.GET(request()); assert.equal(response.status, 503);
     assert.equal((await response.text()).includes('PRIVATE'), false);
@@ -761,20 +762,81 @@ test('each market keeps its own entries and stored rows, and an unknown stored m
   const rows = async () => (await f.database.prepare('SELECT scope FROM fill_cache WHERE owner = ? ORDER BY scope').bind('owner').all<{ scope: string }>()).results.map(row => row.scope);
   let clock = at; const markets: string[] = [];
   const options = { now: () => clock, read: async () => [held('1')], fills: async (_c: Credentials, _s: string, request: { market: string }) => {
-    markets.push(request.market); return [fill(request.market + '-1', at - 2 * minute, 'buy', '1')];
+    markets.push(request.market); return [fill(request.market + '-1', at - 2 * minute, 'buy', '1',
+      request.market === 'anthropic' ? { base: 'ANTHROPIC', symbol: 'ANTHROPIC-USDT-SWAP' } : {})];
   } };
   const first = createFillsService(options);
   await first.read(f.database, 'owner', f.unseal); await first.idle();
   await first.read(f.database, 'owner', f.unseal, 'hynix'); await first.idle();
+  await first.read(f.database, 'owner', f.unseal, 'anthropic'); await first.idle();
   clock += minute;
   assert.deepEqual(scope(await first.read(f.database, 'owner', f.unseal)).fills.map(item => item.id), ['oil-1'], 'reading hynix keeps the oil entry');
   await first.idle(); first.close();
-  assert.deepEqual(markets, ['oil', 'hynix']);
-  assert.deepEqual(await rows(), ['SWAP', 'hynix:SWAP']);
+  assert.deepEqual(markets, ['oil', 'hynix', 'anthropic']);
+  assert.deepEqual(await rows(), ['SWAP', 'anthropic:SWAP', 'hynix:SWAP']);
   await f.database.prepare('INSERT INTO fill_cache(owner,account,scope,revision,data,updated_at) SELECT owner,account,?,revision,data,updated_at FROM fill_cache WHERE scope = ?').bind('gold:SWAP', 'SWAP').run();
   const second = createFillsService({ ...options, fills: async () => assert.fail('stored fills are within their refresh time') });
   t.after(() => second.close());
   assert.deepEqual(scope(await second.read(f.database, 'owner', f.unseal, 'hynix')).fills.map(item => item.id), ['hynix-1']);
+  assert.deepEqual(scope(await second.read(f.database, 'owner', f.unseal, 'anthropic')).fills.map(item => [item.id, item.base]), [['anthropic-1', 'ANTHROPIC']]);
   assert.deepEqual(scope(await second.read(f.database, 'owner', f.unseal)).fills.map(item => item.id), ['oil-1']);
-  assert.deepEqual(await rows(), ['SWAP', 'hynix:SWAP']);
+  assert.deepEqual(await rows(), ['SWAP', 'anthropic:SWAP', 'hynix:SWAP']);
+});
+
+test('ANT reads only verified Binance/OKX instruments and never queries Bybit', async () => {
+  const request = { market: 'anthropic' as const, start: at - minute - 1, end: at };
+  for (const product of ['um', 'pm-um']) {
+    const sample = mock(() => [{ symbol: 'ANTHROPICUSDT', id: 42, time: at - minute - 1, side: 'BUY', positionSide: 'BOTH',
+      qty: '1.000000000000000001', price: '80.000000000000000001', realizedPnl: '2.123456789012345678', commission: '0.000000000000000001', commissionAsset: 'USDT' }]);
+    const fills = await readFills(binance, product, request, { fetcher: sample.fetcher, spacing: false });
+    assert.equal(sample.calls.length, 1); assert.equal(sample.calls[0].searchParams.get('symbol'), 'ANTHROPICUSDT');
+    assert.equal(sample.calls[0].pathname, product === 'um' ? '/fapi/v1/userTrades' : '/papi/v1/um/userTrades');
+    assert.deepEqual([fills[0].base, fills[0].quantity, fills[0].price, fills[0].fee, fills[0].realizedPnl],
+      ['ANTHROPIC', '1.000000000000000001', '80.000000000000000001', '-0.000000000000000001', '2.123456789012345678']);
+  }
+  const okxRows = mock(() => ({ code: '0', data: [{ billId: '1001', instId: 'ANTHROPIC-USDT-SWAP', ts: String(at - minute - 1),
+    side: 'sell', posSide: 'short', fillSz: '2.000000000000000001', fillPx: '80.2', fee: '-0.123', feeCcy: 'USDT', fillPnl: '1.2' }] }));
+  const fills = await readFills(okx, 'SWAP', request, { fetcher: okxRows.fetcher, spacing: false });
+  assert.equal(okxRows.calls.length, 1); assert.equal(okxRows.calls[0].searchParams.get('instId'), 'ANTHROPIC-USDT-SWAP');
+  assert.deepEqual([fills[0].base, fills[0].quantityUnit, fills[0].quantity], ['ANTHROPIC', '张', '2.000000000000000001']);
+  const forbidden = mock(() => assert.fail('unsupported ANT scopes must not send an HTTP request'));
+  for (const product of ['linear-usdt', 'linear-usdc']) await assert.rejects(readFills(bybit, product, request, { fetcher: forbidden.fetcher, spacing: false }));
+  assert.deepEqual(forbidden.calls, []);
+  const wrong = mock(() => ({ code: '0', data: [{ billId: 'wrong', instId: 'CL-USDT-SWAP', ts: String(at - minute - 1) }] }));
+  await assert.rejects(readFills(okx, 'SWAP', request, { fetcher: wrong.fetcher, spacing: false }));
+});
+
+test('ANT service isolates stored history, marks Bybit unsupported and retains failed reads without inventing positions', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(okx); await f.save(bybit);
+  let clock = at, failed = false; const reads: string[] = [];
+  const ant = fill('ant-1', at - 2 * minute, 'buy', '1', { symbol: 'ANTHROPIC-USDT-SWAP', base: 'ANTHROPIC' });
+  const service = createFillsService({ now: () => clock, read: async c => {
+    assert.equal(c.exchange, 'okx');
+    throw new Error('snapshot unavailable');
+  }, fills: async (c, _scope, request) => {
+    reads.push(c.exchange + ':' + request.market); assert.equal(c.exchange, 'okx');
+    if (failed) throw new Error('PRIVATE'); return [request.market === 'anthropic' ? ant : fill('oil-1', at - 2 * minute, 'buy', '1')];
+  } });
+  t.after(() => service.close());
+  await service.read(f.database, 'owner', f.unseal, 'anthropic'); await service.idle();
+  let result = await service.read(f.database, 'owner', f.unseal, 'anthropic');
+  assert.equal(scope(result).fills[0].base, 'ANTHROPIC'); assert.equal(scope(result).fills[0].positionBefore, null);
+  assert.equal(scope(result).fills[0].positionAfter, null); assert.equal(scope(result).fetchedAt, null); assert.equal(scope(result).status, 'error');
+  for (const product of ['linear-usdt', 'linear-usdc']) {
+    const unsupported = scope(result, 'bybit', product);
+    assert.equal(unsupported.status, 'unsupported'); assert.equal(unsupported.refreshing, false); assert.deepEqual(unsupported.fills, []);
+    assert.match(unsupported.error!, /仅支持 Binance 与 OKX/);
+  }
+  assert.deepEqual(reads, ['okx:anthropic']);
+  const stored = await f.database.prepare('SELECT scope FROM fill_cache WHERE owner = ?').bind('owner').all<{ scope: string }>();
+  assert.deepEqual(stored.results.map(row => row.scope), ['anthropic:SWAP']);
+  failed = true; clock += minute; await service.read(f.database, 'owner', f.unseal, 'anthropic'); await service.idle();
+  result = await service.read(f.database, 'owner', f.unseal, 'anthropic');
+  assert.equal(scope(result).fills[0].id, 'ant-1'); assert.equal(scope(result).fills[0].positionBefore, null);
+  assert.equal(JSON.stringify(result).includes('PRIVATE'), false);
+  service.close();
+  const restored = createFillsService({ now: () => at, fills: async () => assert.fail('stored ANT data remains within the retry window') });
+  t.after(() => restored.close());
+  const cached = await restored.read(f.database, 'owner', f.unseal, 'anthropic');
+  assert.equal(scope(cached).fills[0].base, 'ANTHROPIC'); assert.equal(scope(cached).refreshing, false);
 });

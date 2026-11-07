@@ -9,6 +9,9 @@ import type { HistoryOptions } from './positions-history.ts';
 
 /** end anchors historical windows locally; the newest window omits the local upper bound. */
 export type FillsRequest = { market: FillMarket; start: number; end: number };
+// ANT history is available only for the verified Binance/OKX perpetual contracts.
+export const fillsSupported = (exchange: string, scope: string, market: FillMarket) =>
+  cycleSupported(exchange, scope) && (market !== 'anthropic' || exchange === 'binance' || exchange === 'okx');
 const optional = (value: unknown, parse = decimal) => value === undefined || value === null || value === '' ? null : parse(value);
 const fee = (value: unknown, parse = decimal) => { const result = optional(value, parse); return result === null ? null : negate(result); };
 function inRange(value: unknown, start: number, end: number | null) {
@@ -23,7 +26,7 @@ function fillWindows<T>(request: FillsRequest, latestWindow: number, read: (star
 /** A market's fixed instruments are read even when all current positions have closed.
  * Pagination, request budgets, decimal parsing and endpoint spacing are shared with cycle statistics. */
 export async function readFills(credentials: Credentials, scope: string, request: FillsRequest, options: HistoryOptions = {}): Promise<ReadFill[]> {
-  if (!cycleSupported(credentials.exchange, scope) || !['binance', 'bybit', 'okx'].includes(credentials.exchange)) throw new Error(POSITIONS_INVALID);
+  if (!fillsSupported(credentials.exchange, scope, request.market)) throw new Error(POSITIONS_INVALID);
   if (credentials.exchange !== 'binance' && credentials.exchange !== 'bybit' && credentials.exchange !== 'okx') throw new Error(POSITIONS_INVALID);
   const ctx = historyContext(credentials.exchange, credentials, options), fills: ReadFill[] = [];
   let order = 0;

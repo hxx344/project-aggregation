@@ -7,7 +7,7 @@ export const ASSET_FILLS_PENDING_CACHE_MS = 3_000;
 export const ASSET_FILLS_BACKGROUND_MS = 60_000;
 // Only a market a page read within this window keeps being warmed; the Asset fill cache covers later reopens.
 export const ASSET_FILLS_BACKGROUND_IDLE_MS = 6 * 60 * 60_000;
-export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'] };
+export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC'] };
 export const ASSET_FILLS_STALE_MS = 15 * 60_000;
 // 5,000 fills with six 128-character decimal fields and bounded labels can
 // exceed 2 MiB. Allow ~2 KiB per fill plus scope metadata, still with a hard cap.
@@ -79,7 +79,8 @@ export function normalizeAssetFills(data, now = Date.now(), market = 'oil') {
             const symbols = exchange.id === 'okx' ? [`${row.base}-USDT-SWAP`]
               : exchange.id === 'binance' ? [`${row.base}USDT`]
                 : exchange.id === 'bybit' ? [row.base + row.priceCurrency, ...(row.priceCurrency === 'USDC' ? [row.base + 'PERP'] : [])] : [];
-            if (!symbols.includes(symbol) || exchange.id !== 'bybit' && row.priceCurrency !== 'USDT'
+            if (!symbols.includes(symbol) || market === 'anthropic' && !['binance', 'okx'].includes(exchange.id)
+              || exchange.id !== 'bybit' && row.priceCurrency !== 'USDT'
               || row.quantityUnit !== (exchange.id === 'okx' ? '张' : row.base)) throw malformed();
             const fill = { id: row.id, symbol, base: row.base, time: timestamp(row.time, now, false), side: row.side, positionSide: row.positionSide,
               quantity: decimal(row.quantity, true), quantityUnit: row.quantityUnit, price: decimal(row.price, true), priceCurrency: row.priceCurrency,
@@ -116,7 +117,7 @@ export const fillsPending = data => data.exchanges.some(exchange => exchange.acc
 function sourceError(error, market) {
   if ([404, 405].includes(error?.statusCode)) return '此 Asset 尚不支持只读成交，请先更新 Asset';
   // Assets released before market queries reject the unknown parameter.
-  if (market !== 'oil' && error?.statusCode === 400) return '此 Asset 尚不支持海力士成交，请先更新 Asset';
+  if (market !== 'oil' && error?.statusCode === 400) return `此 Asset 尚不支持${market === 'anthropic' ? ' ANT ' : '海力士'}成交，请先更新 Asset`;
   if ([401, 403].includes(error?.statusCode)) return 'Asset 登录失败，请检查项目中保存的登录密码';
   if (error?.statusCode === 429) return 'Asset 暂时限流，请稍后重试';
   if (error?.code === 'insecure_transport') return 'Asset 连接需要 HTTPS 或本机回环地址';

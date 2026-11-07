@@ -5,10 +5,9 @@ import type { ScopeDefinition } from './positions-catalog.ts';
 import type { Position } from './positions-types.ts';
 import { defaultRead, sourceAccounts, revisionOf } from './hub-positions.ts';
 import type { Database, SourceAccount, Unseal, ConnectionRow } from './hub-positions.ts';
-import { cycleSupported } from './positions-cycle-readers.ts';
 import { CYCLE_LOOKBACK_MS } from './positions-cycle.ts';
 import { MAX_REQUESTS } from './positions-history.ts';
-import { readFills } from './hub-fills-readers.ts';
+import { fillsSupported, readFills } from './hub-fills-readers.ts';
 import type { FillsRequest } from './hub-fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills } from './hub-fills-replay.ts';
 import { FILL_MARKETS } from './hub-fills-types.ts';
@@ -18,7 +17,8 @@ const TTL = 5 * 60_000, RETRY = 60_000, IDLE = 15 * 60_000, DEADLINE = 45_000, O
 const SKEW_RETRY = 30_000, MAX_AUTO_RETRIES = 10;
 const FAILED = '成交读取失败，请检查连接、读取权限及服务器时间；已保留上次数据';
 const CONFLICT = '成交记录存在冲突，暂时无法更新';
-const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范围暂不支持原油成交读取', hynix: '此交易所或产品范围暂不支持海力士成交读取' };
+const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范围暂不支持原油成交读取', hynix: '此交易所或产品范围暂不支持海力士成交读取',
+  anthropic: 'ANT 成交目前仅支持 Binance 与 OKX 永续合约' };
 type ReadPositions = (credentials: Credentials, scope: string, signal: AbortSignal, fetcher: typeof fetch) => Promise<Position[]>;
 type ReadFills = (credentials: Credentials, scope: string, request: FillsRequest, options: { signal: AbortSignal; fetcher: typeof fetch }) => Promise<ReadFill[]>;
 type Entry = {
@@ -102,7 +102,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
     for (const row of rows.results) {
       const account = accounts.find(item => item.key === row.account), slot = parseSlot(row.scope);
       const definition = POSITIONS_CATALOG.find(item => item.id === account?.exchange)?.scopes.find(item => item.id === slot?.scope);
-      if (!slot || !account?.row || revisionOf(account.row.encrypted) !== row.revision || !definition || !cycleSupported(account.exchange, slot.scope)) {
+      if (!slot || !account?.row || revisionOf(account.row.encrypted) !== row.revision || !definition || !fillsSupported(account.exchange, slot.scope, slot.market)) {
         await forget(database, owner, row.account, row.scope, row.revision); continue;
       }
       // A hidden Binance mode never gets an entry; skip it rather than parse its row on every poll.
@@ -247,7 +247,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           const definitions = [...exchange.scopes].sort((a, b) => Number(b.id === 'pm-um') - Number(a.id === 'pm-um'));
           const scopes = definitions.flatMap(definition => {
             const key = cacheKey(owner, account.key, market, definition.id); keep.add(key);
-            const supported = cycleSupported(exchange.id, definition.id);
+            const supported = fillsSupported(exchange.id, definition.id, market);
             if (!revision) return [empty(definition, false, supported, market)];
             if (inactive(owner, account, market, definition.id, revision)) return [];
             if (!supported) return [empty(definition, true, false, market)];

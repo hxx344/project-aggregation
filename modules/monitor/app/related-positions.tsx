@@ -5,6 +5,7 @@ import { ArrowUpRight, ChevronDown, Link2 } from "lucide-react";
 import { hubOpenTrading, POSITIONS_TIMEOUT_MS, useHubHost, useHubPositions, type HubPositionItem, type HubPositionsView, type PositionsMarket } from "../lib/hub-bridge";
 import { pairedMarket, relatedSpreadPairs, type RealizedStatus, type SpreadPair, type UnpairedReason, type VenueSpreads } from "../lib/related-pairs";
 import type { SpreadMarket } from "../lib/exchange-quotes";
+import { relatedPositionTotals } from "../lib/related-position-totals";
 
 export type { VenueSpreads };
 const unpairedText = (market: PositionsMarket): Record<UnpairedReason, string> => ({ "same-side": market === "hynix" ? "ADR 与正股同向" : "CL 与 BZ 同向", multiple: "同一交易所有多笔同币种持仓", "missing-leg": "缺少另一条腿" });
@@ -96,6 +97,30 @@ function PositionRows({ items }: { items: HubPositionItem[] }) {
   </li>)}</ul>;
 }
 
+function AnthropicTotals({ items, incomplete, retained }: { items: HubPositionItem[]; incomplete: boolean; retained: boolean }) {
+  const totals = relatedPositionTotals(items, incomplete);
+  return <div className="related-position-totals" aria-label="ANT 关联持仓盈亏合计">
+    {totals.map(group => <div className="related-pair-totals" data-position-totals={group.currency ?? "unknown"} key={group.currency ?? "unknown"}>
+      <div className="related-cycle-head"><span>{incomplete ? "已显示持仓小计" : "关联持仓合计"} · {group.currency ?? "币种未知"}</span><span>{group.count} 笔{group.unrealizedStale || retained ? " · 保留旧数据" : ""}</span></div>
+      <dl>
+        <MoneyCell label="未实现盈亏" value={group.unrealized} currency={group.currency}/>
+        <MoneyCell label="已实现盈亏" value={group.realized} currency={group.currency}/>
+        <MoneyCell label="手续费" value={group.fees} currency={group.currency}/>
+        <MoneyCell label="资金费" value={group.funding} currency={group.currency}/>
+        <MoneyCell label="已实现净额" value={group.net} currency={group.currency} title="各持仓本轮已实现盈亏 + 手续费 + 资金费"/>
+        <MoneyCell label="总盈亏" value={group.total} currency={group.currency} title="未实现盈亏 + 已实现净额；列表与本轮统计均完整时显示"/>
+      </dl>
+      {group.currency === null ? <p className="related-cycle-note">结算币种未知，保留逐腿金额，暂不合计。</p>
+        : group.realizedStatus !== "complete" ? <p className="related-cycle-note">{group.realizedStatus === "loading" ? "本轮已实现部分统计中…"
+          : group.realizedStatus === "partial" ? "已实现数据不完整，以上为已知部分，总盈亏暂不可用。"
+            : group.realizedStatus === "mixed-currency" ? "本轮结算币种缺失或与未实现盈亏不同，暂不合计已实现部分。"
+              : "部分持仓缺少本轮平仓统计，已实现合计与总盈亏暂不可用。"}</p> : null}
+      {incomplete ? <p className="related-cycle-note">持仓列表不完整，以上仅为已显示持仓的小计，总盈亏暂不可用。</p> : null}
+    </div>)}
+    <p className="detail-side-foot">按结算币种分别合计全部关联持仓，不随图表区间或对比合约切换。已实现部分仅含当前持仓本轮（自仓位从零开仓起）的统计；总盈亏 = 未实现盈亏 + 已实现净额。缺失值不按 0 计算，USDT、USDC、USDG 不直接相加。</p>
+  </div>;
+}
+
 // Names the failing layer so a screenshot tells where the read stopped.
 function unavailableMessage({ timedOut, reason, httpStatus }: Pick<HubPositionsView, "timedOut" | "reason" | "httpStatus">) {
   if (timedOut) return `持仓不可用：${POSITIONS_TIMEOUT_MS / 1000} 秒内未收到工作台回复，稍后自动重试`;
@@ -138,6 +163,7 @@ export default function RelatedPositions({ market, symbols, active, spreads, var
     {range ? <p className="detail-side-error">{range}</p> : null}
     {pairMarket && incomplete && shown.length ? <p className="detail-side-note">持仓列表不完整，暂不确认配对</p> : null}
     {keptAt ? <p className="detail-side-note">{keptAt}</p> : null}
+    {market === "anthropic" && shown.length > 0 ? <AnthropicTotals items={shown} incomplete={incomplete} retained={positions.status !== "ok"}/> : null}
     {pairs.length ? <ul className="related-spread-pairs">{pairs.map(pair => <li key={pair.key} data-pair-status={pair.status}><span>{pair.label}</span>{pair.status === "paired" ? <PairDetail pair={pair} market={pairMarket!}/> : <p className="related-unpaired">无法配对 · {unpairedText(market)[pair.reason]}</p>}</li>)}</ul> : null}
     {shown.length ? <PositionRows items={shown}/> : null}
     {pairMarket && pairs.length ? <p className="detail-side-foot">{pairFoot[pairMarket]}</p> : null}

@@ -47,7 +47,7 @@ export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chart
     }),
   ];
 }
-export function fillsStatusText(view, formatTime) {
+export function fillsStatusText(view, formatTime, sources = '仅支持 Binance、Bybit、OKX') {
   const state = {
     standalone: '请在工作台中查看账户成交', unsupported: '工作台版本不支持成交读取', connecting: '正在连接工作台',
     loading: '读取中…', unauthorized: '登录状态不可用，请返回工作台重新登录', unavailable: view.timedOut ? '20 秒内未收到工作台回复' : '工作台暂时无法读取成交',
@@ -63,6 +63,6 @@ export function fillsStatusText(view, formatTime) {
     failed ? `部分账户失败（${failed} 个范围）` : null,
     view.incomplete ? '覆盖不完整，部分成交开平未知或数据陈旧' : null,
     view.truncated ? '成交记录已截断' : null,
-    '仅支持 Binance、Bybit、OKX', '最近 85 天',
+    sources, '最近 85 天',
   ].filter(Boolean).join(' · ');
 }
