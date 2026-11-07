@@ -5,7 +5,7 @@ export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], ant
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillBase = (typeof FILL_MARKETS)[FillMarket][number];
 export type Fill = {
-  id: string; symbol: string; base: FillBase; time: string; side: 'buy' | 'sell';
+  id: string; orderId?: string | null; symbol: string; base: FillBase; time: string; side: 'buy' | 'sell';
   positionSide: 'long' | 'short' | 'net'; quantity: string; quantityUnit: string;
   price: string; priceCurrency: 'USDT' | 'USDC';
   fee: string | null; feeCurrency: string | null; realizedPnl: string | null;
@@ -14,6 +14,8 @@ export type Fill = {
 /** Internal replay evidence is never serialized into the public response. */
 export type ReadFill = Omit<Fill, 'positionBefore' | 'positionAfter'> & { sizeAfter?: string | null; order?: number };
 export type FillsScope = {
+  /** SHA-256 of venue + verified UID; never a credential fingerprint or display account id. */
+  accountIdentity?: string | null;
   id: string; label: string; status: PositionsStatus; refreshing: boolean; fetchedAt: string | null;
   coverageStart: string | null; coverageEnd: string | null; truncated: boolean; error: string | null; fills: Fill[];
 };

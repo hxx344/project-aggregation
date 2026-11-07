@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { stripTypeScriptTypes } from 'node:module';
 import { openDatabase } from '../lib/sqlite.ts';
-import { createFillsService, fillsQueryMarket } from '../lib/hub-fills.ts';
-import { readFills } from '../lib/hub-fills-readers.ts';
+import { createFillsService as createRawFillsService, fillsQueryMarket } from '../lib/hub-fills.ts';
+import { readFills, readFillAccountIdentity } from '../lib/hub-fills-readers.ts';
+import { createHash } from 'node:crypto';
 import { FillConflict, mergeFills, replayFills } from '../lib/hub-fills-replay.ts';
 import { CYCLE_LOOKBACK_MS } from '../lib/positions-cycle.ts';
 import { historyContext } from '../lib/positions-history.ts';
@@ -14,6 +15,8 @@ import type { Position } from '../lib/positions-types.ts';
 import type { Credentials } from '../lib/validation.ts';
 
 const at = Date.parse('2026-10-01T00:00:00.000Z'), minute = 60_000, day = 86_400_000;
+// Service fixtures isolate every authenticated reader; identity has dedicated transport coverage below.
+const createFillsService = (options: Parameters<typeof createRawFillsService>[0] = {}) => createRawFillsService({ identity: async () => null, ...options });
 const keys = { apiKey: 'synthetic-key', apiSecret: 'synthetic-secret' };
 const okx: Credentials = { exchange: 'okx', ...keys, passphrase: 'synthetic-pass' };
 const binance: Credentials = { exchange: 'binance', ...keys };
@@ -161,6 +164,54 @@ test('deduplication rejects changed immutable contents and drops expired history
   assert.equal(mergeFills([original], [{ ...original, order: 9 }], at - day).length, 1);
   assert.throws(() => mergeFills([original], [{ ...original, price: '99' }], at - day), FillConflict);
   assert.deepEqual(mergeFills([fill('old', at - 86 * day, 'buy', '1')], [], at - 85 * day), []);
+  const enriched = { ...original, orderId: '123' };
+  assert.equal(mergeFills([original], [enriched], at - day)[0].orderId, '123');
+  assert.equal(mergeFills([enriched], [original], at - day)[0].orderId, '123');
+  assert.throws(() => mergeFills([enriched], [{ ...enriched, orderId: '456' }], at - day), FillConflict);
+});
+
+test('ANT identity reads only the fixed signed UID endpoint and fails without suppressing history', async () => {
+  for (const credential of [binance, okx]) {
+    const sample = mock(url => {
+      assert.equal(url.hostname, credential.exchange === 'binance' ? 'api.binance.com' : 'openapi.okx.com');
+      assert.equal(url.pathname, credential.exchange === 'binance' ? '/api/v3/account' : '/api/v5/account/config');
+      return credential.exchange === 'binance' ? { uid: 123 } : { code: '0', data: [{ uid: '123' }] };
+    });
+    assert.equal(await readFillAccountIdentity(credential, { fetcher: sample.fetcher }), createHash('sha256').update(`${credential.exchange}:123`).digest('hex'));
+    assert.equal(sample.calls.length, 1);
+  }
+  const failure = mock(() => { throw new Error('secret'); });
+  assert.equal(await readFillAccountIdentity(binance, { fetcher: failure.fetcher }), null); assert.equal(failure.calls.length, 1);
+  for (const uid of [null, 9007199254740992, 'abc', '0', '123\n']) {
+    assert.equal(await readFillAccountIdentity(binance, { fetcher: mock(() => ({ uid })).fetcher }), null);
+  }
+});
+
+test('ANT upgrades old cached order evidence once, retaining rows on failure and isolating credential identities', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(okx);
+  const old = fill('old-ant', at - day, 'buy', '1', { symbol: 'ANTHROPIC-USDT-SWAP', base: 'ANTHROPIC' });
+  const initial = createFillsService({ now: () => at, read: async () => [], fills: async () => [old] });
+  await initial.read(f.database, 'owner', f.unseal, 'anthropic'); await initial.idle(); initial.close();
+  const stored = await f.database.prepare('SELECT data FROM fill_cache WHERE scope=?').bind('anthropic:SWAP').first<{ data: string }>();
+  const legacy = JSON.parse(stored!.data); delete legacy.attributionVersion;
+  await f.database.prepare('UPDATE fill_cache SET data=? WHERE scope=?').bind(JSON.stringify(legacy), 'anthropic:SWAP').run();
+  let clock = at + minute, fail = true, identityReads = 0;
+  const starts: number[] = [];
+  const service = createFillsService({ now: () => clock, read: async () => [], identity: async () => { identityReads++; return identityReads === 1 ? null : 'a'.repeat(64); },
+    fills: async (_c, _s, request) => { starts.push(request.start); if (fail) throw new Error('unavailable'); return [{ ...old, orderId: '777' }]; } });
+  t.after(() => service.close());
+  assert.equal(scope(await service.read(f.database, 'owner', f.unseal, 'anthropic')).fills[0].id, old.id);
+  await service.idle();
+  assert.equal(scope(await service.read(f.database, 'owner', f.unseal, 'anthropic')).fills[0].orderId, undefined);
+  fail = false; clock += minute; await service.read(f.database, 'owner', f.unseal, 'anthropic'); await service.idle();
+  const upgraded = scope(await service.read(f.database, 'owner', f.unseal, 'anthropic'));
+  assert.equal(upgraded.fills[0].orderId, '777'); assert.equal(upgraded.accountIdentity, 'a'.repeat(64));
+  assert.deepEqual(starts, [at + minute - CYCLE_LOOKBACK_MS, clock - CYCLE_LOOKBACK_MS]);
+  clock += 5 * minute; await service.read(f.database, 'owner', f.unseal, 'anthropic'); await service.idle();
+  assert.equal(starts.at(-1), at + 2 * minute - 10 * minute); assert.equal(identityReads, 2, 'same credential UID is reused');
+  await f.save({ ...okx, apiKey: 'replacement-key' });
+  assert.equal(scope(await service.read(f.database, 'owner', f.unseal, 'anthropic')).accountIdentity, undefined);
+  await service.idle(); assert.equal(identityReads, 3);
 });
 
 test('fresh reads are immediate loading, then expose closed trades; credentials never enter response', async t => {
@@ -786,18 +837,20 @@ test('each market keeps its own entries and stored rows, and an unknown stored m
 test('ANT reads only verified Binance/OKX instruments and never queries Bybit', async () => {
   const request = { market: 'anthropic' as const, start: at - minute - 1, end: at };
   for (const product of ['um', 'pm-um']) {
-    const sample = mock(() => [{ symbol: 'ANTHROPICUSDT', id: 42, time: at - minute - 1, side: 'BUY', positionSide: 'BOTH',
+    const sample = mock(() => [{ symbol: 'ANTHROPICUSDT', id: 42, orderId: 777, time: at - minute - 1, side: 'BUY', positionSide: 'BOTH',
       qty: '1.000000000000000001', price: '80.000000000000000001', realizedPnl: '2.123456789012345678', commission: '0.000000000000000001', commissionAsset: 'USDT' }]);
     const fills = await readFills(binance, product, request, { fetcher: sample.fetcher, spacing: false });
     assert.equal(sample.calls.length, 1); assert.equal(sample.calls[0].searchParams.get('symbol'), 'ANTHROPICUSDT');
     assert.equal(sample.calls[0].pathname, product === 'um' ? '/fapi/v1/userTrades' : '/papi/v1/um/userTrades');
+    assert.equal(fills[0].orderId, '777');
     assert.deepEqual([fills[0].base, fills[0].quantity, fills[0].price, fills[0].fee, fills[0].realizedPnl],
       ['ANTHROPIC', '1.000000000000000001', '80.000000000000000001', '-0.000000000000000001', '2.123456789012345678']);
   }
-  const okxRows = mock(() => ({ code: '0', data: [{ billId: '1001', instId: 'ANTHROPIC-USDT-SWAP', ts: String(at - minute - 1),
+  const okxRows = mock(() => ({ code: '0', data: [{ billId: '1001', ordId: '9007199254740999999', instId: 'ANTHROPIC-USDT-SWAP', ts: String(at - minute - 1),
     side: 'sell', posSide: 'short', fillSz: '2.000000000000000001', fillPx: '80.2', fee: '-0.123', feeCcy: 'USDT', fillPnl: '1.2' }] }));
   const fills = await readFills(okx, 'SWAP', request, { fetcher: okxRows.fetcher, spacing: false });
   assert.equal(okxRows.calls.length, 1); assert.equal(okxRows.calls[0].searchParams.get('instId'), 'ANTHROPIC-USDT-SWAP');
+  assert.equal(fills[0].orderId, '9007199254740999999');
   assert.deepEqual([fills[0].base, fills[0].quantityUnit, fills[0].quantity], ['ANTHROPIC', '张', '2.000000000000000001']);
   const forbidden = mock(() => assert.fail('unsupported ANT scopes must not send an HTTP request'));
   for (const product of ['linear-usdt', 'linear-usdc']) await assert.rejects(readFills(bybit, product, request, { fetcher: forbidden.fetcher, spacing: false }));

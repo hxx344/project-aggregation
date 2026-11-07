@@ -9,7 +9,7 @@ type Fetcher = typeof fetch;
 type Json = Record<string, unknown>;
 const BYBIT_HOSTS = { global: 'https://api.bybit.com', nl: 'https://api.bybit.nl', tr: 'https://api.bybit-tr.com', kz: 'https://api.bybit.kz', ge: 'https://api.bybitgeorgia.ge', ae: 'https://api.bybit.ae', eu: 'https://api.bybit.eu' };
 const ENDPOINTS = {
-  binance: new Set(['/sapi/v1/account/apiRestrictions', '/fapi/v3/positionRisk', '/papi/v1/um/positionRisk', '/fapi/v1/exchangeInfo',
+  binance: new Set(['/api/v3/account', '/sapi/v1/account/apiRestrictions', '/fapi/v3/positionRisk', '/papi/v1/um/positionRisk', '/fapi/v1/exchangeInfo',
     '/dapi/v1/positionRisk', '/papi/v1/cm/positionRisk', '/dapi/v1/exchangeInfo',
     '/fapi/v1/userTrades', '/papi/v1/um/userTrades', '/fapi/v1/income', '/papi/v1/um/income']),
   bybit: new Set(['/v5/user/query-api', '/v5/position/list', '/v5/market/instruments-info', '/v5/account/transaction-log']),
@@ -39,7 +39,7 @@ export async function positionsGet(exchange: 'binance' | 'bybit' | 'okx', creden
   const c = credential; const query = new URLSearchParams(params); const headers: Record<string, string> = {};
   let host: string; let payload: unknown;
   if (exchange === 'binance') {
-    host = path.startsWith('/sapi/') ? 'https://api.binance.com' : path.startsWith('/papi/') ? 'https://papi.binance.com'
+    host = path.startsWith('/sapi/') || path === '/api/v3/account' ? 'https://api.binance.com' : path.startsWith('/papi/') ? 'https://papi.binance.com'
       : path.startsWith('/dapi/') ? 'https://dapi.binance.com' : 'https://fapi.binance.com';
     if (!path.endsWith('/exchangeInfo')) {
       query.set('timestamp', String(Date.now())); query.set('recvWindow', '10000');

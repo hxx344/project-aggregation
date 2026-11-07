@@ -26,7 +26,8 @@ export function mergeFills(previous: readonly ReadFill[], incoming: readonly Rea
     if (Date.parse(fill.time) < lookbackStart) continue;
     const existing = byId.get(fill.id);
     if (existing && identity(existing) !== identity(fill)) throw new FillConflict();
-    byId.set(fill.id, fill);
+    if (existing?.orderId && fill.orderId && existing.orderId !== fill.orderId) throw new FillConflict();
+    byId.set(fill.id, existing?.orderId && !fill.orderId ? { ...fill, orderId: existing.orderId } : fill);
   }
   return [...byId.values()].sort(fillsNewestFirst);
 }

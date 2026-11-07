@@ -1,4 +1,6 @@
+import { createHash } from 'node:crypto';
 import type { Credentials } from './validation.ts';
+import { positionsGet } from './positions-readers.ts';
 import { FILL_MARKETS } from './hub-fills-types.ts';
 import type { FillMarket, ReadFill } from './hub-fills-types.ts';
 import { decimal, text, POSITIONS_INVALID } from './positions-values.ts';
@@ -13,6 +15,21 @@ export type FillsRequest = { market: FillMarket; start: number; end: number };
 export const fillsSupported = (exchange: string, scope: string, market: FillMarket) =>
   cycleSupported(exchange, scope) && (market !== 'anthropic' || exchange === 'binance' || exchange === 'okx');
 const optional = (value: unknown, parse = decimal) => value === undefined || value === null || value === '' ? null : parse(value);
+const orderId = (value: unknown) => value === undefined || value === null ? null : identifier(value);
+
+/** Optional attribution evidence: one fixed GET, 2s, no retries. Failure never removes fills.
+ * A successful UID is cached by the caller only for the same encrypted credential revision. */
+export async function readFillAccountIdentity(credentials: Credentials, options: HistoryOptions = {}): Promise<string | null> {
+  if (credentials.exchange !== 'binance' && credentials.exchange !== 'okx') return null;
+  try {
+    const signal = AbortSignal.any([AbortSignal.timeout(2000), ...(options.signal ? [options.signal] : [])]);
+    const result = await positionsGet(credentials.exchange, credentials, credentials.exchange === 'binance' ? '/api/v3/account' : '/api/v5/account/config',
+      new URLSearchParams(credentials.exchange === 'binance' ? { omitZeroBalances: 'true' } : {}), options.fetcher, signal);
+    const row = credentials.exchange === 'binance' ? result : Array.isArray(result) && result.length === 1 ? result[0] : null;
+    const uid = row && typeof row === 'object' && 'uid' in row ? identifier(row.uid) : '';
+    return /^[1-9][0-9]{0,39}$/.test(uid) ? createHash('sha256').update(`${credentials.exchange}:${uid}`).digest('hex') : null;
+  } catch { return null; }
+}
 const fee = (value: unknown, parse = decimal) => { const result = optional(value, parse); return result === null ? null : negate(result); };
 function inRange(value: unknown, start: number, end: number | null) {
   const time = millis(value);
@@ -40,7 +57,7 @@ export async function readFills(credentials: Credentials, scope: string, request
         for (const row of list) {
           if (row.symbol !== symbol || !['BUY', 'SELL'].includes(String(row.side)) || !['BOTH', 'LONG', 'SHORT'].includes(String(row.positionSide))) throw new Error(POSITIONS_INVALID);
           // Binance trade ids are unique per symbol, not per account scope.
-          push({ id: symbol + ':' + identifier(row.id), symbol, base, time: inRange(row.time, start, end),
+          push({ id: symbol + ':' + identifier(row.id), ...(request.market === 'anthropic' ? { orderId: orderId(row.orderId) } : {}), symbol, base, time: inRange(row.time, start, end),
             side: row.side === 'BUY' ? 'buy' : 'sell', positionSide: row.positionSide === 'BOTH' ? 'net' : row.positionSide === 'LONG' ? 'long' : 'short',
             quantity: positive(row.qty), quantityUnit: base, price: positive(row.price), priceCurrency: 'USDT',
             realizedPnl: optional(row.realizedPnl), fee: fee(row.commission), feeCurrency: row.commissionAsset ? text(row.commissionAsset) : null });
@@ -67,7 +84,7 @@ export async function readFills(credentials: Credentials, scope: string, request
       const symbol = base + '-USDT-SWAP', next = okxFillPages(ctx, symbol, request.start);
       for (let page = await next(); page; page = await next()) for (const row of page) {
         if (!['buy', 'sell'].includes(String(row.side)) || !['net', 'long', 'short'].includes(String(row.posSide))) throw new Error(POSITIONS_INVALID);
-        push({ id: identifier(row.billId), symbol, base, time: inRange(row.ts, request.start, null),
+        push({ id: identifier(row.billId), ...(request.market === 'anthropic' ? { orderId: orderId(row.ordId) } : {}), symbol, base, time: inRange(row.ts, request.start, null),
           side: row.side as 'buy' | 'sell', positionSide: row.posSide as 'long' | 'short' | 'net', quantity: positive(row.fillSz), quantityUnit: '张',
           price: positive(row.fillPx), priceCurrency: 'USDT', realizedPnl: optional(row.fillPnl),
           fee: optional(row.fee), feeCurrency: row.feeCcy ? text(row.feeCcy) : null });

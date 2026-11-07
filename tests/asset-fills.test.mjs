@@ -144,6 +144,16 @@ test('background warming runs only for a market a page read recently', async t =
 test('ANT preserves native decimals, rejects unsupported venues and isolates failures from other markets', async t => {
   const data = anthropicPayload();
   assert.deepEqual(scope(normalizeAssetFills(data, NOW, 'anthropic')).fills, scope(data).fills);
+  scope(data).accountIdentity = 'a'.repeat(64); scope(data).fills[0].orderId = '9007199254740999999';
+  scope(data).fills[0].execution = { jobId: 'upstream-claim' };
+  const normalized = scope(normalizeAssetFills(data, NOW, 'anthropic'));
+  assert.equal(normalized.accountIdentity, 'a'.repeat(64)); assert.equal(normalized.fills[0].orderId, '9007199254740999999');
+  assert.equal(normalized.fills[0].execution, undefined, 'only local task evidence may annotate fills');
+  delete scope(data).fills[0].execution;
+  for (const bad of ['uid', 'a'.repeat(63), { identity: 'a'.repeat(64) }]) {
+    scope(data).accountIdentity = bad; assert.throws(() => normalizeAssetFills(data, NOW, 'anthropic'), /invalid_fills/);
+  }
+  scope(data).accountIdentity = 'a'.repeat(64);
   for (const market of ['oil', 'hynix']) assert.throws(() => normalizeAssetFills(data, NOW, market), /invalid_fills/);
   for (const exchange of ['bybit', 'hyperliquid', 'rh']) {
     const unsupported = anthropicPayload(); unsupported.exchanges[0].id = exchange;

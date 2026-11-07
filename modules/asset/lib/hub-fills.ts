@@ -7,7 +7,7 @@ import { defaultRead, sourceAccounts, revisionOf } from './hub-positions.ts';
 import type { Database, SourceAccount, Unseal, ConnectionRow } from './hub-positions.ts';
 import { CYCLE_LOOKBACK_MS } from './positions-cycle.ts';
 import { MAX_REQUESTS } from './positions-history.ts';
-import { fillsSupported, readFills } from './hub-fills-readers.ts';
+import { fillsSupported, readFills, readFillAccountIdentity } from './hub-fills-readers.ts';
 import type { FillsRequest } from './hub-fills-readers.ts';
 import { FillConflict, fillsNewestFirst, mergeFills, replayFills } from './hub-fills-replay.ts';
 import { FILL_MARKETS } from './hub-fills-types.ts';
@@ -25,10 +25,11 @@ type Entry = {
   market: FillMarket; revision: string; scope: FillsScope; raw: ReadFill[]; touchedAt: number; retryAt: number; cursor: number | null;
   snapshotOkAt?: number; snapshotHealthy?: boolean; pending?: Promise<void>; abort?: AbortController;
   timer?: ReturnType<typeof setTimeout>; retryScheduled: boolean; automaticRetries: number;
+  attributionVersion?: number;
 };
 // Bump whenever readFills ids/normalization or mergeFills identity change: stored raw fills are merged with new reads.
 const FILL_CACHE_FORMAT = 1;
-type Stored = Pick<Entry, 'scope' | 'raw' | 'cursor' | 'retryAt' | 'snapshotOkAt' | 'snapshotHealthy'> & { version: number };
+type Stored = Pick<Entry, 'scope' | 'raw' | 'cursor' | 'retryAt' | 'snapshotOkAt' | 'snapshotHealthy' | 'attributionVersion'> & { version: number };
 // One scope per exchange across all owners, markets and service instances: exchanges rate-limit by IP,
 // so accounts of one exchange stay serial while Binance, Bybit and OKX read in parallel.
 const queues = new Map<string, Promise<void>>();
@@ -81,13 +82,13 @@ export function fillsQueryMarket(url: string): FillMarket | null {
  * Successes refresh after 5m, failures after 60s.
  * Snapshot uncertainty schedules at most 10 consecutive automatic retries, 30s apart, then waits for a read.
  * Each refresh has a 45s total deadline, <=80 HTTP requests (including positions), no in-request retries. */
-export function createFillsService(options: { now?: () => number; deadline?: number; read?: ReadPositions; fills?: ReadFills; fetcher?: typeof fetch } = {}) {
+export function createFillsService(options: { now?: () => number; deadline?: number; read?: ReadPositions; fills?: ReadFills; identity?: typeof readFillAccountIdentity; fetcher?: typeof fetch } = {}) {
   const now = options.now ?? Date.now, entries = new Map<string, Entry>(), jobs = new Set<Promise<void>>();
   let closed = false;
   // A failed cache write only costs the next cold read a full history read.
   async function save(database: Database, owner: string, account: SourceAccount, entry: Entry) {
-    const { market, scope, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy } = entry;
-    const stored: Stored = { version: FILL_CACHE_FORMAT, scope: { ...scope, refreshing: false }, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy };
+    const { market, scope, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy, attributionVersion } = entry;
+    const stored: Stored = { version: FILL_CACHE_FORMAT, scope: { ...scope, refreshing: false }, raw, cursor, retryAt, snapshotOkAt, snapshotHealthy, attributionVersion };
     await database.prepare('INSERT INTO fill_cache(owner,account,scope,revision,data,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(owner,account,scope) DO UPDATE SET revision=excluded.revision,data=excluded.data,updated_at=excluded.updated_at')
       .bind(owner, account.key, slotOf(market, scope.id), entry.revision, JSON.stringify(stored), now()).run().catch(() => {});
   }
@@ -180,12 +181,16 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           // This local completion time only anchors older windows; the newest query has no local upper bound.
           const snapshotAt = Math.max(snapshotStart, now());
           const lookback = snapshotAt - CYCLE_LOOKBACK_MS;
-          const start = Math.max(lookback, entry.cursor === null ? lookback : entry.cursor - OVERLAP);
+          // Backfill only ANT metadata once; keep the old rows visible until it succeeds.
+          const backfill = entry.market === 'anthropic' && entry.attributionVersion !== 1;
+          const start = Math.max(lookback, entry.cursor === null || backfill ? lookback : entry.cursor - OVERLAP);
+          const accountIdentity = entry.market === 'anthropic'
+            ? entry.scope.accountIdentity ?? await (options.identity ?? readFillAccountIdentity)(credentials, { signal: abort.signal, fetcher }) : undefined;
           const incoming = await (options.fills ?? readFills)(credentials, entry.scope.id, { market: entry.market, start, end: snapshotAt }, { signal: abort.signal, fetcher });
           const raw = mergeFills(entry.raw, incoming, lookback);
           if (raw.some(fill => Date.parse(fill.time) > now() + 60_000)) throw new Error(FAILED);
           const replayed = replayFills(raw, positions, snapshotStart, account.exchange);
-          return { raw, replayed, snapshotAt, positions, lookback };
+          return { raw, replayed, snapshotAt, positions, lookback, accountIdentity };
         };
         const result = await Promise.race([work(), new Promise<never>((_, reject) => {
           onAbort = () => reject(new Error(FAILED));
@@ -194,11 +199,12 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           if (abort.signal.aborted) onAbort();
         })]);
         if (!await valid()) return;
-        const { raw, replayed, snapshotAt, positions, lookback } = result;
+        const { raw, replayed, snapshotAt, positions, lookback, accountIdentity } = result;
+        if (entry.market === 'anthropic') entry.attributionVersion = 1;
         const truncated = raw.length > 2000 || (entry.scope.truncated && Date.parse(entry.scope.coverageStart ?? '') > lookback);
         entry.raw = raw.slice(0, 2000);
         const fills = replayed.fills.slice(0, 2000);
-        entry.scope = { ...entry.scope, fills, truncated, refreshing: false,
+        entry.scope = { ...entry.scope, ...(entry.market === 'anthropic' ? { accountIdentity } : {}), fills, truncated, refreshing: false,
           status: positions === null ? entry.scope.fetchedAt ? 'stale' : 'error' : 'live',
           error: positions === null ? '持仓快照读取失败，成交开平仓方向暂不可用' : null,
           fetchedAt: positions === null ? entry.scope.fetchedAt : iso(now()),
@@ -255,7 +261,8 @@ export function createFillsService(options: { now?: () => number; deadline?: num
             if (!entry) {
               // Old mode evidence would pin a Binance account to both modes; a clock set back must not postpone refresh.
               const stored = restored.get(key), recent = stored?.snapshotOkAt !== undefined && tick - stored.snapshotOkAt < IDLE;
-              entry = stored ? { market, revision, scope: stored.scope, raw: stored.raw, touchedAt: tick, retryAt: Math.min(stored.retryAt, tick + TTL), cursor: stored.cursor,
+              entry = stored ? { market, revision, scope: stored.scope, raw: stored.raw, attributionVersion: stored.attributionVersion, touchedAt: tick,
+                retryAt: market === 'anthropic' && stored.attributionVersion !== 1 ? -Infinity : Math.min(stored.retryAt, tick + TTL), cursor: stored.cursor,
                 ...(recent ? { snapshotOkAt: stored.snapshotOkAt, snapshotHealthy: stored.snapshotHealthy } : {}), retryScheduled: false, automaticRetries: 0 }
                 : { market, revision, scope: empty(definition, true, true, market), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null,
                   retryScheduled: false, automaticRetries: 0 };

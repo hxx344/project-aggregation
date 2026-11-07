@@ -3,7 +3,9 @@ import { createHubRequester, HUB_REQUEST_ID, type RequestTimers } from './hub-re
 /** Fixed perpetual bases per arbitrage market, matching the host and Asset allowlists. */
 export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'XYZANT', 'IOANTH'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
+export type FillExecution = { jobId: string; phase: number; batch: number; comparisonLeg: 'rh' | 'xyz' | 'io'; cex: 'binance' | 'okx' };
 export type HubFillItem = {
+  orderId?: string; execution?: FillExecution;
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
   symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
   quantity: string; quantityUnit: string; price: string; priceCurrency: string | null;
@@ -37,6 +39,15 @@ const optionalIso = (value: unknown) => value === null ? null : iso(value);
 const currency = (value: unknown) => typeof value === 'string' && /^[A-Z0-9]{1,20}$/.test(value) ? value : undefined;
 const nativeCurrency = (value: unknown) => typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(value) ? value : undefined;
 const bool = (value: unknown) => typeof value === 'boolean' ? value : undefined;
+function parseExecution(value: unknown, exchange: unknown, symbol: unknown): FillExecution | null {
+  const v = record(value);
+  if (!v || typeof v.jobId !== 'string' || !/^[0-9a-f-]{36}$/i.test(v.jobId)
+    || !Number.isSafeInteger(v.phase) || Number(v.phase) < 0 || !Number.isSafeInteger(v.batch) || Number(v.batch) < 0
+    || !['rh', 'xyz', 'io'].some(leg => leg === v.comparisonLeg) || !['binance', 'okx'].some(cex => cex === v.cex)) return null;
+  const expected = v.comparisonLeg === 'rh' ? ['rh-lighter', 'ANTHROPIC'] : ['hyperliquid', v.comparisonLeg === 'xyz' ? 'xyz:ANT' : 'io:ANTH'];
+  if (exchange !== v.cex && (exchange !== expected[0] || symbol !== expected[1])) return null;
+  return { jobId: v.jobId, phase: v.phase as number, batch: v.batch as number, comparisonLeg: v.comparisonLeg as FillExecution['comparisonLeg'], cex: v.cex as FillExecution['cex'] };
+}
 function parseItem(value: unknown, market: FillMarket): HubFillItem | null {
   const v = record(value); if (!v) return null;
   const nativeAnt = market === 'anthropic' && ['hyperliquid', 'rh-lighter'].includes(String(v.exchangeId));
@@ -66,7 +77,10 @@ function parseItem(value: unknown, market: FillMarket): HubFillItem | null {
     if (result.symbol !== expected && !usdcPerpetual || result.quantityUnit !== (result.exchangeId === 'okx' ? '张' : result.base)) return null;
   }
   if ((result.positionBefore === null) !== (result.positionAfter === null)) return null;
-  return result as HubFillItem;
+  const orderId = market === 'anthropic' && v.orderId !== undefined ? text(v.orderId, 200) : undefined;
+  const execution = market === 'anthropic' && v.execution !== undefined ? parseExecution(v.execution, result.exchangeId, result.symbol) : undefined;
+  if (market === 'anthropic' && (v.orderId !== undefined && !orderId || v.execution !== undefined && (!execution || !orderId))) return null;
+  return { ...result, ...(orderId ? { orderId } : {}), ...(execution ? { execution } : {}) } as HubFillItem;
 }
 function parseCoverage(value: unknown): FillCoverage | null {
   const v = record(value); if (!v) return null;

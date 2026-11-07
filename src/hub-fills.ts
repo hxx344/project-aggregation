@@ -11,7 +11,9 @@ export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], ant
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillsRequest = { requestId: string; market: FillMarket };
 type ScopeStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';
+export type FillExecution = { jobId: string; phase: number; batch: number; comparisonLeg: 'rh' | 'xyz' | 'io'; cex: 'binance' | 'okx' };
 export type HubFillItem = {
+  orderId?: string; execution?: FillExecution;
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
   symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
   quantity: string; quantityUnit: string; price: string; priceCurrency: string | null;
@@ -55,6 +57,16 @@ function decimal(value: unknown, positive = false): string | null {
   if (result === null ? positive : result.length > 128 || !/^-?\d+(?:\.\d+)?$/.test(result)
     || positive && (result.startsWith('-') || !/[1-9]/.test(result))) throw new MalformedFills();
   return result;
+}
+
+function executionOf(value: unknown, exchange: string, symbol: string): FillExecution {
+  const v = object(value);
+  if (typeof v.jobId !== 'string' || !/^[0-9a-f-]{36}$/i.test(v.jobId)
+    || !Number.isSafeInteger(v.phase) || Number(v.phase) < 0 || !Number.isSafeInteger(v.batch) || Number(v.batch) < 0) throw new MalformedFills();
+  const comparisonLeg = enumeration(v.comparisonLeg, ['rh', 'xyz', 'io'] as const), cex = enumeration(v.cex, ['binance', 'okx'] as const);
+  const expected = comparisonLeg === 'rh' ? ['rh-lighter', 'ANTHROPIC'] : ['hyperliquid', comparisonLeg === 'xyz' ? 'xyz:ANT' : 'io:ANTH'];
+  if (exchange !== cex && (exchange !== expected[0] || symbol !== expected[1])) throw new MalformedFills();
+  return { jobId: v.jobId, phase: v.phase as number, batch: v.batch as number, comparisonLeg, cex };
 }
 
 export function fillItems(response: unknown, now: number, market: FillMarket = 'oil') {
@@ -117,7 +129,11 @@ export function fillItems(response: unknown, now: number, market: FillMarket = '
             const positionBefore = decimal(fill.positionBefore), positionAfter = decimal(fill.positionAfter);
             if ((positionBefore === null) !== (positionAfter === null)) throw new MalformedFills();
             incomplete ||= positionBefore === null || positionAfter === null;
-            items.push({ key, sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, accountId, account: accountName, scope: scopeId,
+            const orderId = market === 'anthropic' && fill.orderId != null ? text(fill.orderId) : null;
+            if (orderId !== null && (!orderId || orderId.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(orderId))) throw new MalformedFills();
+            const execution = market === 'anthropic' && fill.execution != null ? executionOf(fill.execution, exchangeId, symbol) : null;
+            if (execution && !orderId) throw new MalformedFills();
+            items.push({ ...(orderId ? { orderId } : {}), ...(execution ? { execution } : {}), key, sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, accountId, account: accountName, scope: scopeId,
               symbol, base, time, side: enumeration(fill.side, ['buy', 'sell'] as const), positionSide: enumeration(fill.positionSide, ['long', 'short', 'net'] as const),
               quantity: decimal(fill.quantity, true)!, quantityUnit: enumeration(fill.quantityUnit, [exchangeId === 'okx' ? '张' : exchangeId === 'hyperliquid' ? symbol.split(':')[1] : base]), price: decimal(fill.price, true)!, priceCurrency,
               fee: decimal(fill.fee), feeCurrency: optional(fill.feeCurrency), realizedPnl: decimal(fill.realizedPnl), positionBefore, positionAfter, stale });

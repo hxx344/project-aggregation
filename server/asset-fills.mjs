@@ -82,7 +82,7 @@ export function normalizeAssetFills(data, now = Date.now(), market = 'oil') {
             if (!symbols.includes(symbol) || market === 'anthropic' && !['binance', 'okx'].includes(exchange.id)
               || exchange.id !== 'bybit' && row.priceCurrency !== 'USDT'
               || row.quantityUnit !== (exchange.id === 'okx' ? '张' : row.base)) throw malformed();
-            const fill = { id: row.id, symbol, base: row.base, time: timestamp(row.time, now, false), side: row.side, positionSide: row.positionSide,
+            const fill = { id: row.id, ...(market === 'anthropic' && row.orderId != null ? { orderId: label(row.orderId, 200) } : {}), symbol, base: row.base, time: timestamp(row.time, now, false), side: row.side, positionSide: row.positionSide,
               quantity: decimal(row.quantity, true), quantityUnit: row.quantityUnit, price: decimal(row.price, true), priceCurrency: row.priceCurrency,
               fee: decimal(row.fee), feeCurrency: row.feeCurrency === null ? null : label(row.feeCurrency, 160),
               realizedPnl: decimal(row.realizedPnl), positionBefore: decimal(row.positionBefore), positionAfter: decimal(row.positionAfter) };
@@ -95,7 +95,9 @@ export function normalizeAssetFills(data, now = Date.now(), market = 'oil') {
           const error = scope.status === 'unsupported' ? 'Asset 暂不支持此产品范围的成交读取'
             : scope.status === 'error' ? 'Asset 读取此范围失败，请在 Asset 检查连接与权限'
               : scope.status === 'stale' ? '成交数据已过期，等待 Asset 更新' : null;
-          return { id: scope.id, label: label(scope.label), status: scope.status, refreshing: scope.refreshing, fetchedAt, coverageStart, coverageEnd,
+          const accountIdentity = scope.accountIdentity == null ? null : scope.accountIdentity;
+          if (market === 'anthropic' && accountIdentity !== null && (typeof accountIdentity !== 'string' || !/^[a-f0-9]{64}$/.test(accountIdentity))) throw malformed();
+          return { id: scope.id, ...(market === 'anthropic' ? { accountIdentity } : {}), label: label(scope.label), status: scope.status, refreshing: scope.refreshing, fetchedAt, coverageStart, coverageEnd,
             truncated: scope.truncated, error, fills };
         }),
       };

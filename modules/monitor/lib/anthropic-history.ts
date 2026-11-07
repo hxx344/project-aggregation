@@ -63,7 +63,7 @@ export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartCo
     tradeEvents: items => anthropicTradeEvents(items, leg), tradeMarkers: (events, points) => anthropicTradeMarkers(events, points, leg), tradeMarket: "anthropic",
     trade: { priceUnit: "", chartLabel: "图表同 15 分钟溢价率", chartNote: "已收盘 K 线，非双腿成交价差", metricName: "溢价率",
       sources: "CEX 来源为资产账本；Hyperliquid、Lighter RH 来源为当前实盘连接账户，手动成交同样读取",
-      note: `图上仅标记 ${name} 的真实成交；其他比较合约不混入。Binance、OKX 单腿无法确认配对归属，仅保留明细。纵坐标取同一根已收盘 15 分钟 K 线，不代表双腿成交价差；缺失或未收盘时仅列出成交。` },
+      note: `图上标记 ${name} 的真实成交，以及按账户和订单编号核实属于本组合的 Binance、OKX 成交。关联未知的成交仅保留明细，不代表没有组合下单。纵坐标取同一根已收盘 15 分钟 K 线，不代表双腿成交价差；缺失或未收盘时仅列出成交。` },
     emptyText: { loading: "正在载入 15 分钟 K 线", hint: `Binance ANTHROPICUSDT / ${label} 同一时段已收盘 K 线` },
   };
 }

@@ -116,6 +116,7 @@ test('native history reads manual RH fills with true timestamp, signed positions
   const h = harness({ routes: { '/api/v1/trades': query => {
     assert.equal(query.get('account_index'), '12345'); assert.equal(query.get('market_id'), '7');
     assert.equal(query.get('aggregate'), 'false'); assert.equal(query.get('sort_by'), 'timestamp');
+    assert.equal(query.get('limit'), '100', 'official trades maximum is 100; 500 is rejected');
     return ok({ trades: [tradeRow(), tradeRow({ trade_id_str: '2', timestamp: T0 - 2000, ask_account_id: 12345, bid_account_id: 12,
       is_maker_ask: false, taker_position_size_before: '2', ask_account_pnl: undefined })] });
   } } });
@@ -129,6 +130,15 @@ test('native history reads manual RH fills with true timestamp, signed positions
   assert.deepEqual(h.paths(), ['/api/v1/orderBooks', '/api/v1/trades']);
 });
 
+test('RH history preserves the queried side client order index as exact text', async () => {
+  const h = harness({ routes: { '/api/v1/trades': () => ok({ trades: [
+    tradeRow({ bid_client_id_str: '281474976710655', ask_client_id_str: '99' }),
+    tradeRow({ trade_id_str: '2', timestamp: T0 - 2000, ask_account_id: 12345, bid_account_id: 12, ask_client_id_str: '123', bid_client_id_str: '456' }),
+  ] }) } });
+  const result = await h.client.history(credentials, { start: T0 - DAY, end: T0 });
+  assert.deepEqual(result.fills.map(fill => fill.orderId), ['281474976710655', '123']);
+});
+
 test('native RH history deduplicates cursor boundaries and bounds repeated or full pagination', async () => {
   let page = 0;
   const h = harness({ routes: { '/api/v1/trades': () => ok({ trades: [tradeRow()], next_cursor: ++page === 1 ? 'a' : 'a' }) } });
@@ -137,11 +147,11 @@ test('native RH history deduplicates cursor boundaries and bounds repeated or fu
   assert.equal(repeated.coverageStart, repeated.fills[0].time);
   let fullPage = 0;
   const full = harness({ routes: { '/api/v1/trades': () => {
-    const offset = fullPage++ * 500;
-    return ok({ trades: Array.from({ length: 500 }, (_, i) => tradeRow({ trade_id_str: String(offset + i), timestamp: T0 - offset - i })), next_cursor: `page-${fullPage}` });
+    const offset = fullPage++ * 100;
+    return ok({ trades: Array.from({ length: 100 }, (_, i) => tradeRow({ trade_id_str: String(offset + i), timestamp: T0 - offset - i })), next_cursor: `page-${fullPage}` });
   } } });
   const result = await full.client.history(credentials, { start: T0 - DAY, end: T0 });
-  assert.equal(fullPage, 4); assert.equal(result.fills.length, 2000); assert.equal(result.truncated, true);
+  assert.equal(fullPage, 20); assert.equal(result.fills.length, 2000); assert.equal(result.truncated, true);
 });
 
 test('native RH history rejects foreign, malformed or changed duplicate rows and honors cooldown', async () => {

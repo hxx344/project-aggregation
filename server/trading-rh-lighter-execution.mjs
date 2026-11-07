@@ -477,7 +477,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     return { identity: k.address, modes: Object.fromEntries(selected.map(symbol => [symbol, 'one-way'])), positions, openOrders, strategies: [], leverage };
   }
 
-  // Actual trades include manual orders too. Read at most four 500-row pages,
+  // Actual trades include manual orders too. Read at most twenty 100-row pages,
   // sharing the existing 40/min budget; no immediate retries or order reads.
   // https://github.com/elliottech/lighter-python/blob/main/docs/OrderApi.md#trades
   async function history(credentials, { start, end, signal } = {}) {
@@ -488,11 +488,11 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     const fills = new Map(), cursors = new Set();
     let cursor = '', complete = false, previousTime = Infinity;
     const optionalAmount = value => value === null || value === undefined ? null : amount(value);
-    for (let page = 0; page < 4; page += 1) {
+    for (let page = 0; page < 20; page += 1) {
       checkAbort(signal); if (k.era !== generation) fail('aborted');
       const data = await request('/api/v1/trades', { token, signal, query: { account_index: String(k.accountIndex), market_id: String(marketId),
-        sort_by: 'timestamp', sort_dir: 'desc', limit: '500', aggregate: 'false', ...(cursor ? { cursor } : {}) } });
-      if (!Array.isArray(data.trades) || data.trades.length > 500 || data.next_cursor !== undefined && data.next_cursor !== null && (typeof data.next_cursor !== 'string' || data.next_cursor.length > 2048)) fail();
+        sort_by: 'timestamp', sort_dir: 'desc', limit: '100', aggregate: 'false', ...(cursor ? { cursor } : {}) } });
+      if (!Array.isArray(data.trades) || data.trades.length > 100 || data.next_cursor !== undefined && data.next_cursor !== null && (typeof data.next_cursor !== 'string' || data.next_cursor.length > 2048)) fail();
       let beforeStart = false;
       for (const row of data.trades) {
         if (!object(row) || row.market_id !== marketId || !Number.isSafeInteger(row.timestamp) || row.timestamp < 1e11 || row.timestamp > now() + 60_000
@@ -510,7 +510,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
         if (row.timestamp > end) continue;
         const quantity = amount(row.size, { positive: true });
         const positionBefore = optionalAmount(ask === row.is_maker_ask ? row.maker_position_size_before : row.taker_position_size_before);
-        const fill = { id, symbol: 'ANTHROPIC', base: 'ANTHROPIC', time: new Date(row.timestamp).toISOString(), side: ask ? 'sell' : 'buy', positionSide: 'net',
+        const clientId = ask ? row.ask_client_id_str ?? row.ask_client_id : row.bid_client_id_str ?? row.bid_client_id;
+        const orderId = typeof clientId === 'string' && /^\d{1,20}$/.test(clientId) ? clientId : Number.isSafeInteger(clientId) && clientId >= 0 ? String(clientId) : null;
+        const fill = { id, ...(orderId ? { orderId } : {}), symbol: 'ANTHROPIC', base: 'ANTHROPIC', time: new Date(row.timestamp).toISOString(), side: ask ? 'sell' : 'buy', positionSide: 'net',
           quantity, quantityUnit: 'ANTHROPIC', price: amount(row.price, { positive: true }), priceCurrency: 'USDG',
           // The API reports integer fees but does not document their unit. Do
           // not interpret them as USDG or replace an absent PnL with zero.

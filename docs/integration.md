@@ -175,6 +175,14 @@ Binance U 本位（含统一账户）、Bybit 统一账户 USDT/USDC 永续与 O
 
 ## Asset 只读套利成交
 
+Anthropic 另支持 `market=anthropic`，CEX 为 Binance `ANTHROPICUSDT` 与 OKX `ANTHROPIC-USDT-SWAP`，工作台追加当前实盘连接账户的 Lighter RH `ANTHROPIC` 和 Hyperliquid `xyz:ANT` / `io:ANTH` 原生成交。Lighter 每页最多 100 笔、最多 20 页（共 2000 笔，沿用 45 秒总期限和共享限流），未读完明确截断；Hyperliquid 最多读取最近 2000 笔并声明覆盖不完整。
+
+ANT 成交可带原生 `orderId`。Asset 的 ANT 范围另带可选 `accountIdentity`：固定只读接口核验交易所 UID 后对 `exchange:uid` 做 SHA-256，绝不使用显示账号 ID 或凭据哈希代替身份。身份请求最多一次、2 秒、不重试，失败保留真实成交并让组合归属未知；成功证据仅在同一 owner / 账户 / 加密凭据版本内复用，失败随下次正常成交刷新重试。旧 ANT 缓存缺元数据版本时保留旧显示并回补整个历史窗口，成功后恢复增量读取，其他市场缓存不失效。
+
+工作台服务端以账户身份、Binance UM/PM 模式、原生合约、订单编号、买卖和持仓方向匹配持久化组合订单，返回可选 `execution={jobId,phase,batch,comparisonLeg,cex}`，账户证明哈希不转发浏览器。恢复任务按原始完整 `totals` 识别双腿组合，从已受理历史预览核对对应账户版本；证据缺失、冲突或多任务命中均不关联。同一 L1 下 RH 子账户不能只凭地址相认，原生成交另要求当前连接 revision 与订单一致。只支持明确的 CEX + RH/xyz/io 双腿任务，多对手方任务保留关联未知。
+
+Monitor 按经核验的组合任务和批次分组；关联 CEX 只进入对应比较图，原生成交按实际合约路由，未知 CEX 留在明细并标“组合关联未知”。RH 历史失败不抹掉已核实的 Binance 订单归属。标记时间为真实成交时间，纵坐标仍为同一根已收盘 K 线参考值，不代表双腿真实成交价差；任务创建或核对时间不用于伪造成交点。
+
 `GET /api/hub/fills` 沿用 Asset 仓位接口的鉴权，仅接受可选 `schemaVersion=1` 与 `market=oil|hynix`（缺省为 `oil`，参数重复或出现其它参数时返回 400），立即返回缓存并在后台刷新。固定读取最近 85 天成交：`oil` 为 CL/BZ，`hynix` 为 SKHY/SKHYNIX（Binance 与 Bybit USDT 永续为 `SKHYUSDT/SKHYNIXUSDT`，Bybit USDC 永续为 `<合约>USDC` 或 `<合约>PERP`，OKX 为 `SKHY-USDT-SWAP/SKHYNIX-USDT-SWAP`），支持 Binance UM/PM-UM、Bybit USDT/USDC 永续与 OKX SWAP；其它已配置范围报告 `unsupported`。响应沿用 `exchanges/accounts/scopes` 层级，增加 `lookbackStart`；范围带 `coverageStart/coverageEnd/truncated` 与新到旧的 `fills[]`，每范围最多 2000 笔、全响应最多 5000 笔。成交包含原生合约、方向、方向腿、数量及单位、价格及计价币、手续费现金流、已实现盈亏和成交前后持仓；金额为十进制字符串，未知回推为 `null`。各交易所的读取互不等待，同一交易所的账户与市场仍串行，遵守按 IP 计算的限流。成交缓存按市场分开：本地缓存表的范围列原油沿用原范围 ID，海力士为 `hynix:<范围 ID>`；回退到不支持海力士的旧版 Asset 时，这些行会在恢复时被删除，再次升级后重新全量读取。
 
 工作台 `GET /api/trading/fills` 只读取已配置 Asset 的固定路径，登录保护、返回前会话复查、HTTPS/回环限制与仓位接口相同，拒绝非 GET；只接受无查询参数（原油）或恰好一个 `market=oil|hynix`，其它查询返回 400。原油请求 Asset 原路径，海力士请求 `?market=hynix`；旧版 Asset 对海力士返回 400 时提示先更新 Asset。响应为 `generatedAt/sources[]`；来源状态为 `ready/stale/unavailable/unconfigured`。每个市场独立读取：请求合并，超时 12 秒，结果缓存 20 秒，任一范围仍在加载或刷新时只缓存 3 秒；页面在最近 6 小时内读过的市场每 60 秒在后台预热一次（未配置 Asset 同步时关闭），超过 6 小时无人读取即停止，再次打开时由 Asset 本地缓存先返回上次成交；鉴权失效最多重登一次且共用截止时间。响应上限 12 MiB，为 5000 笔带高精度十进制字符串的成交及范围元数据预留空间。全部字段白名单校验，任一成交非法则整源失败，不静默漏掉成交；失败保留旧快照并标 `stale`，范围超过 15 分钟未成功刷新也标过期。项目配置或凭据变更、停用、删除及关闭服务会清除缓存并中止旧请求。

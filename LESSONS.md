@@ -1805,6 +1805,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `ant-history-pair-attribution-20261107`；P1 逃逸缺陷，用户反馈后修复；已扩充审查清单的身份归属项，留作下次复盘输入，不推进复盘检查点。
 
+**工作台订单关联补充（2026-11-08）：** 用户确认截图中的 Binance–Lighter RH 来自工作台组合下单。基线 `f24140d` 虽已保存任务和订单，成交链路却丢弃订单编号、没有账户证明，仍把所有 CEX 统一标为“未关联”。真实归属优先连接已有任务证据：Asset 的显示账号 `default` 和随机加密凭据哈希不是交易所 UID；按固定只读 UID、原生合约、订单编号、方向和模式核对。继续剩余会覆盖 `job.plan` 且移除已成腿，完整组合取 `totals`，账户版本从已受理预览补证，缺证据不猜。旧缓存必须一次性补读订单元数据，不能只等十分钟增量窗口自然补齐。另核对 [Lighter 官方 SDK](https://github.com/elliottech/lighter-python/blob/main/lighter/api/order_api.py) 发现成交历史 `limit<=100`，原实现请求 500；本轮改为 100 并保留有界分页。验证见 [归属回归](tests/trading-fill-attribution.test.mjs)、Asset 成交缓存与读者测试、ANT 标记和工作台入口夹具。没有读取用户真实私有账户，不断言参数错误是截图故障的唯一原因。沿用事件 `ant-history-pair-attribution-20261107`，不新增独立事件、不推进复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

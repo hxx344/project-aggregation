@@ -17,16 +17,24 @@ const unassigned = (fill: HubFillsView['items'][number]) => fill.base === 'ANTHR
     || fill.exchangeId === 'okx' && fill.symbol === 'ANTHROPIC-USDT-SWAP'
   );
 
-/** Native counterpart fills have a contract identity. CEX fills alone do not prove a pair. */
+/** Verified task/batch evidence routes CEX fills; proximity or current holdings never establishes a pair. */
 export function anthropicTradeEvents(items: HubFillsView['items'], leg: AnthropicComparisonLeg): TradeEvent[] {
-  return [...groupTradeEvents(items.filter(fill => belongs(fill, leg)), singleLeg),
-    ...groupTradeEvents(items.filter(unassigned), singleLeg)].sort((a, b) => a.time - b.time || a.key.localeCompare(b.key));
+  const groups = new Map<string, HubFillsView['items']>();
+  for (const fill of items) {
+    const link = fill.execution;
+    if (link ? link.comparisonLeg !== leg : !belongs(fill, leg) && !unassigned(fill)) continue;
+    const key = link ? JSON.stringify([link.jobId, link.phase, link.batch]) : belongs(fill, leg) ? 'native' : 'unknown';
+    const group = groups.get(key) ?? []; group.push(fill); groups.set(key, group);
+  }
+  return [...groups.values()].flatMap(group => groupTradeEvents(group, singleLeg)).sort((a, b) => a.time - b.time || a.key.localeCompare(b.key));
 }
 
 /** Plot real fill times against the selected chart's closed bar, never an order price. */
 export const anthropicTradeMarkers = (events: TradeEvent[], points: Point[], leg: AnthropicComparisonLeg): SpreadTradeMarker[] =>
   spreadTradeMarkers(events, points, { intervalMs: ANTHROPIC_CANDLE_MS, rightPerUnit: 1,
     tradedBasis: '成交溢价率', chartBasis: `${contract[leg].name} 成交时图表溢价率` }).map(marker =>
-    marker.event.fills.every((fill: HubFillsView['items'][number]) => belongs(fill, leg))
-      ? { ...marker, venueLabel: contract[leg].name }
-      : { ...marker, value: null, usd: null, chartSpread: null, venueLabel: '未关联组合的 CEX', basis: '仅成交明细，不绘制标记' });
+    marker.event.fills.every((fill: HubFillsView['items'][number]) => fill.execution?.comparisonLeg === leg)
+      ? { ...marker, venueLabel: `${marker.event.fills[0].execution.cex === 'binance' ? 'Binance' : 'OKX'} ↔ ${contract[leg].name}（工作台组合）`, basis: '已关联组合 · 图表溢价率' }
+      : marker.event.fills.every((fill: HubFillsView['items'][number]) => belongs(fill, leg))
+        ? { ...marker, venueLabel: contract[leg].name }
+        : { ...marker, value: null, usd: null, chartSpread: null, venueLabel: 'CEX（组合关联未知）', basis: '仅成交明细，不绘制标记' });

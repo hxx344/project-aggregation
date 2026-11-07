@@ -50,11 +50,12 @@ const signer = call => {
 };
 
 test('native history reads master fills for both ANT contracts and never double counts builder fee', async () => {
-  const rows = ['xyz:ANT', 'io:ANTH', 'BTC'].map((coin, i) => ({ coin, tid: 20 + i, hash: '0x' + 'ab'.repeat(32), time: T0 - 1000 * (i + 1),
+  const rows = ['xyz:ANT', 'io:ANTH', 'BTC'].map((coin, i) => ({ coin, oid: 120 + i, tid: 20 + i, hash: '0x' + 'ab'.repeat(32), time: T0 - 1000 * (i + 1),
     side: i ? 'B' : 'A', sz: '0.5', px: '100', startPosition: i ? '-1' : '2', closedPnl: i ? undefined : '3', fee: '0.1', feeToken: 'USDC', builderFee: '0.05' }));
   const h = harness({ info: { userFills: payload => { assert.equal(payload.user, MASTER); assert.equal(payload.aggregateByTime, false); return [...rows, rows[0]]; } } });
   const result = await h.client.history(credentials, { start: T0 - 86_400_000, end: T0 });
   assert.equal(result.fills.length, 2); assert.equal(result.truncated, true);
+  assert.deepEqual(result.fills.map(row => row.orderId), ['120', '121']);
   assert.deepEqual(result.fills.map(row => [row.symbol, row.base, row.quantityUnit, row.positionBefore, row.positionAfter, row.fee, row.priceCurrency, row.realizedPnl]),
     [['xyz:ANT', 'XYZANT', 'ANT', '2', '1.5', '-0.1', null, '3'], ['io:ANTH', 'IOANTH', 'ANTH', '-1', '-0.5', '-0.1', null, null]]);
   assert.equal(h.exchanges.length, 0); assert.deepEqual(h.calls.map(call => call.payload.type), ['userFills']);

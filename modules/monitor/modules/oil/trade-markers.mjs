@@ -31,6 +31,7 @@ export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chart
   return [
     `${type.symbol} ${marker.venueLabel ? `${marker.venueLabel} ` : ''}${type.label} · ${formatTime(event.time)} 北京时间`,
     `${event.fills.length} 笔成交 · 至 ${formatTime(event.end)}${event.stale ? ' · 保留旧数据' : ''}`,
+    ...[...new Set(event.fills.filter(fill => fill.execution).map(fill => `工作台组合任务 ${fill.execution.jobId} · 阶段 ${fill.execution.phase + 1} · 第 ${fill.execution.batch + 1} 批`))],
     `${basis} ${spreadText(value, unit)}${event.spreadVenue ? ` · ${labels.get(event.spreadVenue.key)}` : ''}`,
     `${chartLabel} ${spreadText(chartSpread, unit)}（${chartNote}）`,
     ...event.venues.flatMap(venue => [
@@ -43,7 +44,7 @@ export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chart
     `已实现盈亏合计 ${cashText(event.realizedPnl)}（不含手续费）`,
     ...event.fills.map(fill => {
       const parts = byFill.get(fill.key).map(effect => `${effects[effect.effect]} ${effect.quantity} ${fill.quantityUnit}`).join(' → ');
-      return `${formatTime(fill.time)} · ${labels.get(tradeVenueKey(fill))} · ${fill.symbol} · ${parts}`;
+      return `${formatTime(fill.time)} · ${labels.get(tradeVenueKey(fill))} · ${fill.symbol} · ${parts}${fill.orderId ? ` · 订单 ${fill.orderId}` : ''}`;
     }),
   ];
 }

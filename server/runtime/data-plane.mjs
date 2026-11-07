@@ -13,6 +13,7 @@ import { createTradingAuto } from '../trading-auto.mjs';
 import { createAnthropicWatch } from '../trading-anthropic-watch.mjs';
 import { createAnthropicReduction } from '../trading-anthropic-reduction.mjs';
 import { createAnthropicHistory } from '../trading-anthropic-history.mjs';
+import { createFillAttribution } from '../trading-fill-attribution.mjs';
 import { ExecutionError } from '../trading-execution-plan.mjs';
 import { normalizeTradingPair } from '../trading-markets.mjs';
 import { UpdateError } from '../updates.mjs';
@@ -77,6 +78,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const sharedAccountWriter = accountWriter || (embeddedModules || existsSync(writerDatabase) || existsSync(`${writerDatabase}.required`) ? createAccountWriter({ databasePath: writerDatabase, runtimeId: randomUUID(), moduleId: 'hub' }) : null);
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
   const anthropicHistory = createAnthropicHistory({ execution, now: executionNow });
+  const attributeFills = createFillAttribution({ db, stmt });
   const executionEntries = createExecutionEntries({ db, log, readMaintenance: () => control.getSetting('updates-maintenance') === '1', refuse: () => { throw new UpdateError(409, EXECUTION_MAINTENANCE); } });
   // Automatic rules create jobs through the same maintenance entry as a manual start.
   const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
@@ -413,11 +415,12 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (method !== 'GET') throw new HttpError(405, '成交接口仅支持只读查询');
       const market = url.search ? url.searchParams.get('market') : 'oil';
       if (url.search && ([...url.searchParams.keys()].join() !== 'market' || !Object.hasOwn(FILL_MARKETS, market))) throw new HttpError(400, '成交接口只接受 market 参数');
-      const data = await assetFillsByMarket[market].state();
+      let data = await assetFillsByMarket[market].state();
       if (market === 'anthropic') {
         const native = anthropicHistory.state();
         data.sources.push(native.source);
         data.pending = !!data.pending || native.pending;
+        data = attributeFills(data, native.source, execution.historyConnections());
       }
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
       return reply(200, data);

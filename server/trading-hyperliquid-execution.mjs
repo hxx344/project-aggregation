@@ -453,7 +453,7 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
       const side = ORDER_SIDES[row.side], quantity = amount(row.sz, { positive: true }), positionBefore = optionalAmount(row.startPosition);
       const feeCurrency = row.feeToken === null || row.feeToken === undefined ? null : typeof row.feeToken === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/.test(row.feeToken.trim()) ? row.feeToken.trim() : fail();
       const id = `${row.coin}:${row.tid}:${row.hash}`, fee = optionalAmount(row.fee);
-      const fill = { id, symbol: row.coin, base: row.coin === 'xyz:ANT' ? 'XYZANT' : 'IOANTH', time: new Date(row.time).toISOString(), side, positionSide: 'net',
+      const fill = { id, ...(Number.isSafeInteger(row.oid) && row.oid > 0 ? { orderId: String(row.oid) } : {}), symbol: row.coin, base: row.coin === 'xyz:ANT' ? 'XYZANT' : 'IOANTH', time: new Date(row.time).toISOString(), side, positionSide: 'net',
         quantity, quantityUnit: row.coin === 'xyz:ANT' ? 'ANT' : 'ANTH', price: amount(row.px, { positive: true }),
         // feeToken does not prove the price/PnL quote token of a HIP-3 market.
         priceCurrency: null, fee: fee === null ? null : fromUnits(-units(fee)), feeCurrency, realizedPnl: optionalAmount(row.closedPnl), positionBefore,

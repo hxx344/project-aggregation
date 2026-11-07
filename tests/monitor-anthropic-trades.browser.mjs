@@ -26,8 +26,14 @@ async page => {
     fills: [fill('rh-entry', end - 2 * day + 60_000, false), fill('rh-exit', end - day + 60_000, true), fill('rh-old', end - 20 * day + 60_000, false)].map(row => ({ ...row, symbol: 'ANTHROPIC', price: '1530.9', priceCurrency: 'USDG', fee: null, feeCurrency: null, realizedPnl: null })) }] }] },
     { id: 'hyperliquid', name: 'Hyperliquid', accounts: [{ id: 'main', name: '当前实盘连接主账户', scopes: [{ id: 'perpetual', status: 'live', refreshing: false, fetchedAt: stamp, coverageStart: lookbackStart, coverageEnd: stamp, truncated: true, fills: [] }] }] }];
   fills.sources.push(native);
+  const execution = index => ({ jobId: `11111111-1111-4111-8111-${String(index + 1).padStart(12, '0')}`, phase: 0, batch: 0, comparisonLeg: 'rh', cex: 'binance' });
+  for (const source of fills.sources) for (const venue of source.data.exchanges) if (['binance', 'rh-lighter'].includes(venue.id)) {
+    venue.accounts[0].scopes[0].fills.forEach((row, index) => Object.assign(row, { orderId: `${venue.id}-${index}`, execution: execution(index),
+      ...(venue.id === 'binance' ? { side: row.side === 'buy' ? 'sell' : 'buy', positionBefore: String(-Number(row.positionBefore)), positionAfter: String(-Number(row.positionAfter)) } : {}) }));
+  }
   const errors = [], requests = [], listener = error => errors.push(error.stack ?? error.message);
   let failReads = false;
+  let missingRh = false;
   let launchMonitor = 'anthropic';
   const handler = async route => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname;
@@ -48,7 +54,12 @@ async page => {
     if (path === '/api/overview/events' || path === '/api/system/updates/events') return route.abort();
     if (path === '/api/overview') return send(overview);
     if (path === '/api/system/updates') return send({ enabled: false, checking: false, checkedAt: null, checkError: null, planId: null, expiresAt: null, modules: [], job: null });
-    if (path === '/api/trading/fills') { requests.push(url.searchParams.get('market') ?? 'oil'); return failReads ? send({ error: 'Fixture unavailable' }, 503) : send(url.searchParams.get('market') === 'anthropic' ? fills : { generatedAt: stamp, sources: [] }); }
+    if (path === '/api/trading/fills') {
+      requests.push(url.searchParams.get('market') ?? 'oil');
+      const data = structuredClone(fills);
+      if (missingRh) Object.assign(data.sources[1].data.exchanges[0].accounts[0].scopes[0], { status: 'error', fetchedAt: null, coverageStart: null, coverageEnd: null, fills: [] });
+      return failReads ? send({ error: 'Fixture unavailable' }, 503) : send(url.searchParams.get('market') === 'anthropic' ? data : { generatedAt: stamp, sources: [] });
+    }
     if (path === '/api/trading/positions') return failReads ? send({ error: 'Fixture unavailable' }, 503) : send(positions);
     if (path === '/api/trading/anthropic') return send(legs);
     if (path.startsWith('/api/')) return send({ error: 'Controlled unavailable fixture' }, 503);
@@ -69,12 +80,13 @@ async page => {
     const entry = panel.locator('.trade-marker[data-trade-type="entry"]'), exit = panel.locator('.trade-marker[data-trade-type="exit"]');
     await entry.first().waitFor(); await exit.first().waitFor();
     check(await entry.count() === 1 && await exit.count() === 1, 'one entry and exit event in the one-week chart');
-    check((await entry.getAttribute('aria-label')).includes('Lighter RH 入场') && (await entry.getAttribute('aria-label')).includes('100.000%'), 'RH entry names its native venue and uses only RH chart premium');
+    check((await entry.getAttribute('aria-label')).includes('Binance ↔ Lighter RH（工作台组合）') && (await entry.getAttribute('aria-label')).includes('100.000%'), 'linked entry names the verified combination and uses only RH chart premium');
     await entry.focus(); await page.keyboard.press('Enter');
     const details = panel.getByLabel('套利成交明细');
     await details.waitFor();
     check((await details.innerText()).includes('2 ANTHROPIC @ 1530.9 USDG'), 'RH keeps its native trade price');
-    check((await details.innerText()).includes('手续费合计 未知'), 'missing RH fee is never zero');
+    check((await details.innerText()).includes('未知 未知币种'), 'missing RH fee is never zero');
+    check((await details.innerText()).includes('工作台组合任务 11111111') && (await details.innerText()).includes('订单 binance-0'), 'task and exact order evidence is inspectable');
     check((await panel.locator('.trade-status').innerText()).includes('当前实盘连接账户'), 'history account scope is explicit');
     const side = frame.locator('[data-related-positions="anthropic"]'), pair = side.locator('[data-ant-pair="rh"]');
     await pair.waitFor();
@@ -87,7 +99,8 @@ async page => {
       await panel.getByRole('button', { name, exact: true }).click();
       await panel.locator('.trade-panel').waitFor();
       check(await panel.locator('.trade-marker').count() === 0, `${name} has no RH or ambiguous Binance marker`);
-      check((await panel.locator('.trade-list-item').first().innerText()).includes('未关联组合的 CEX'), 'unassigned CEX trade remains in the list only');
+      check((await panel.locator('.trade-list-item').first().innerText()).includes('组合关联未知'), 'unassigned CEX trade remains in the list only');
+      check(!(await panel.locator('.trade-list-item').allInnerTexts()).some(text => text.includes('工作台组合')), 'verified RH combination never appears on another comparison');
       check(!(await panel.locator('.trade-list-item').allInnerTexts()).some(text => text.includes('Lighter RH 入场')), 'RH history never leaks into another comparison');
       check((await pair.innerText()).includes('+394.84 USD'), 'current pair remains RH, not retroactively reassigned by chart selection');
     }
@@ -148,6 +161,13 @@ async page => {
     await chart.getByRole('button', { name: '1 周', exact: true }).click();
     await chart.getByRole('button', { name: '溢价率', exact: true }).click();
     await entry.first().waitFor(); await exit.first().waitFor();
+    missingRh = true;
+    await page.clock.fastForward(301_000);
+    await panel.getByText(/Lighter RH：读取失败或陈旧/).waitFor();
+    check(await entry.count() === 1 && (await entry.getAttribute('aria-label')).includes('工作台组合'), 'verified Binance order retains RH association when native history fails');
+    await entry.focus(); await page.keyboard.press('Enter');
+    await details.filter({ hasText: '订单 binance-0' }).waitFor();
+    check(!(await details.innerText()).includes('订单 rh-lighter-0'), 'missing native fills are not synthesized');
     failReads = true;
     await page.clock.fastForward(301_000);
     await panel.locator('.trade-status').filter({ hasText: '刷新失败，保留上次成功数据' }).waitFor();

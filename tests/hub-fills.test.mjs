@@ -9,6 +9,22 @@ import { NOW, STAMP, LOOKBACK, response, scope, fill, hynixPayload, anthropicPay
 const request = { type: 'fills-request', requestId: 'fills-1', market: 'oil' };
 const reply = data => fillsReply(fillsRequest(request), { status: 'ok', data, at: 0 }, NOW);
 
+test('verified ANT order attribution crosses both contracts, while malformed identities are rejected', () => {
+  const raw = response(); raw.sources[0].data = anthropicPayload();
+  const item = scope(raw.sources[0].data).fills[0];
+  item.orderId = '9007199254740999999';
+  item.execution = { jobId: '11111111-1111-4111-8111-111111111111', phase: 1, batch: 2, comparisonLeg: 'rh', cex: 'binance' };
+  const mapped = () => fillsReply({ requestId: 'linked', market: 'anthropic' }, { status: 'ok', data: raw }, NOW);
+  assert.deepEqual(parseFillsReply(mapped(), 'anthropic').items[0].execution, item.execution);
+  assert.equal(parseFillsReply(mapped(), 'anthropic').items[0].orderId, item.orderId);
+  for (const patch of [{ comparisonLeg: ['rh'] }, { batch: -1 }, { phase: 1.2 }, { cex: 'okx' }, { jobId: 'invalid' }]) {
+    const valid = { ...item.execution }; Object.assign(item.execution, patch);
+    assert.equal(mapped().status, 'unavailable'); item.execution = valid;
+    const reply = mapped(); Object.assign(reply.items[0].execution, patch); assert.equal(parseFillsReply(reply, 'anthropic'), null);
+  }
+  delete item.orderId; assert.equal(mapped().status, 'unavailable');
+});
+
 test('fills requests only accept the fixed markets without symbol or URL overrides', () => {
   assert.deepEqual(fillsRequest(request), { requestId: 'fills-1', market: 'oil' });
   assert.deepEqual(fillsRequest({ ...request, market: 'hynix' }), { requestId: 'fills-1', market: 'hynix' });
