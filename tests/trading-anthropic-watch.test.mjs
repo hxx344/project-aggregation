@@ -129,6 +129,28 @@ test('read-only legs alert on stale monitoring and on recovery', async () => {
   } finally { h.cleanup(); }
 });
 
+test('Binance quantity events cannot renew risk freshness or clear an active liquidation warning', async () => {
+  const h = harness();
+  try {
+    const at = () => new Date(h.now()).toISOString();
+    const position = { id: 'binance:ANTHROPICUSDT:one-way:short', exchange: 'binance', symbol: 'ANTHROPICUSDT', side: 'short', quantity: '3',
+      entryPrice: '100', markPrice: '100', liquidationPrice: '110', riskFetchedAt: at() };
+    h.source.value = [{ exchange: 'binance', connected: true, state: 'live', fetchedAt: at(), error: null, positions: [position] }];
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    await h.watch.poll(); assert.equal(h.posts.length, 1); assert.match(h.posts[0], /距强平 10.00%/);
+    h.advance(1000);
+    position.quantity = '4'; position.markPrice = position.liquidationPrice = position.riskFetchedAt = null;
+    await h.watch.poll(); assert.equal(h.posts.length, 1, 'unknown risk is not recovery');
+    assert.equal(h.watch.state().sources.find(source => source.exchange === 'binance').state, 'stale');
+    assert.equal(h.watch.state().sources.find(source => source.exchange === 'binance').positions[0].alerting, true);
+    position.markPrice = '100'; position.liquidationPrice = '130'; position.riskFetchedAt = new Date(h.now() - 80_000).toISOString();
+    h.source.value[0].fetchedAt = at();
+    await h.watch.poll(); assert.equal(h.posts.length, 1, 'new snapshot time cannot make an old risk observation current');
+    position.riskFetchedAt = at();
+    await h.watch.poll(); assert.equal(h.posts.length, 2); assert.match(h.posts[1], /距强平已回到 30.00%，解除预警/);
+  } finally { h.cleanup(); }
+});
+
 test('a failed claim sends nothing; a definite refusal retries later; an uncertain send is not repeated', async () => {
   const h = harness();
   try {

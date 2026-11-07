@@ -283,7 +283,9 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
     let cex = [];
     try { cex = readCex(); } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 只读仓位读取失败'); }
     const walletState = w => !w.address ? 'unconfigured' : !w.fetchedAt ? w.error ? 'error' : 'loading' : w.error || current - timeOf(w.fetchedAt) > LIVE_MS ? 'stale' : 'live';
-    const list = [...cex.map(item => ({ exchange: item.exchange, connected: item.connected, state: item.state, fetchedAt: item.fetchedAt, error: item.error, refreshing: !!item.refreshing,
+    const list = [...cex.map(item => ({ exchange: item.exchange, connected: item.connected,
+      state: item.state === 'live' && item.positions.some(row => Object.hasOwn(row, 'riskFetchedAt') && (timeOf(row.riskFetchedAt) === null || current - timeOf(row.riskFetchedAt) > LIVE_MS)) ? 'stale' : item.state,
+      fetchedAt: item.fetchedAt, error: item.error, refreshing: !!item.refreshing,
       positions: item.positions.map(row => ({ ...row, quantityUnit: row.quantityUnit ?? null, marginMode: row.marginMode ?? null, marginUsed: null })) })),
     ...WALLETS.map(exchange => { const w = wallets[exchange];
       return { exchange, connected: !!w.address, address: w.address, state: walletState(w), fetchedAt: w.fetchedAt, error: w.error, refreshing: !!polling, positions: w.rows }; })];

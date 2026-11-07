@@ -1727,6 +1727,12 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 验证见 [流回归](tests/trading-rh-lighter-stream.test.mjs)、[适配器回归](tests/trading-rh-lighter-execution.test.mjs)、[引擎回归](tests/trading-execution-rh-lighter.test.mjs) 与 [本次记录](docs/reviews/2026-11-07-lighter-ws-reprice.md)。受控连续一分钟的健康推送没有 REST 盘口/查单；总量 10、已成 3、改单途中再成 2 后仍为总量 10、累计 5、剩余 5。两项退避边界在修复前的新回归均失败。独立审查另复现并关闭两个 P1：私有证据须在读取前/等待后检查绝对截止，不能只靠定时器；订单行 nonce 是队列字段，不能用统一递增门槛否决更高改单版本，买单队列计数可能下降。增量独立探针确认过期立即撤权、同一轮仅重订阅一次，以及更高版本/较低 nonce 后 inspect 不回退且零 REST。真实公开 RH ticker 已只读核对；未使用真实私有账户下单。事件 `rh-lighter-ws-native-amend-20261107`，关联同日限流改进，不推进复盘检查点。
 
+**Binance WS 与校时补充（2026-11-07）：** 用户截图中的只读组合保证金仓位 HTTP 400 / -1021 是时间戳拒绝，不是限流；执行与只读客户端的校时逻辑须一起检查。明确 -1021 才允许有界校时后重签一次，未知交易结果不能套用此重试。Binance 订单流不提供账户完整快照，仓位增量也不提供最新强平价等风险字段；先建立流再读取 REST 基线，断线、换凭据或 ready/校时失败即撤销旧基线，恢复前只缓存事件。否则旧 socket 在 REST fallback 后到达，会把新快照回退到旧时间和仓位。推送更新数量不能给旧风险字段续期，风险未知不得授权自动减仓。事件 `binance-readonly-clock-ws-baseline-20261107`；真实流管理器回归复现基线回退并验证恢复，见 [只读流测试](tests/trading-binance-readonly-stream.test.mjs) 与 [本次记录](docs/reviews/2026-11-07-binance-ws-clock.md)。属于本轮增量修复，不推进复盘检查点。
+
+同轮自审还确认：WS 入口即使检查来源年龄，下游执行器也必须保留该来源时间（只做校时坐标换算），不能改成本机接收时间。否则到达时旧 4 秒、等另一腿 7 秒，执行器会把实际旧 11 秒当作旧 7 秒。普通/PM 两项真实流加 `normalizeMarket` 回归先红后绿，见 [执行 WS 测试](tests/trading-binance-execution-stream.test.mjs)；同一事件补充，不增加事件次数。
+
+独立审查另确认只读可见性缺口：余额事件的空 `P` 不代表清仓，但非空 `B` 及其他合约仓位变化仍会影响 cross/PM 强平风险，不能因合约不在关注列表就忽略风险失效信号。只转发余额变化布尔，在过滤仓位前清旧风险并递增在途 REST 的风险序列；数量和基线时间保留，下一次完整 REST 可恢复。四项普通/PM 回归先红后绿。ANT 自动减仓本身另读实盘 `execution.account` 风险，不将只读监控显示缺陷夸大为交易授权漏洞。
+
 ### L104：`submit()` 的失败分支提前返回前必须重新保存委托
 
 **适用条件：** 在 `server/trading-execution.mjs` 的 `submit()` catch 块里新增任何提前 `return` 的分支（延后重发、bounce 重挂、已接受待可见等）。

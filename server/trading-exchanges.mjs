@@ -1,8 +1,10 @@
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { decimal, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createOkxTradingClient } from './trading-okx-readonly.mjs';
 import { TRADING_ANTHROPIC_SYMBOLS, TRADING_HYNIX_SYMBOLS } from './trading-markets.mjs';
+import { createBinanceClock } from './trading-binance-clock.mjs';
+import { createBinanceStreams } from './trading-binance-stream.mjs';
 
 const SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
 const BYBIT_BASE_COINS = Object.freeze({ CLUSDT: 'CL', BZUSDT: 'BZ' });
@@ -196,11 +198,14 @@ function normalizeReceipt(exchange, row, { symbol, start, end }) {
   return { id: `${exchange}:${row.symbol}:${binance ? 'FUNDING_FEE:' : ''}${identifier}`, exchange, symbol: row.symbol, time: new Date(time).toISOString(), amount: value, currency: 'USDT' };
 }
 
-export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000 } = {}) {
+export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000, WebSocketImpl = globalThis.WebSocket, binanceClock, binanceStreams } = {}) {
   if (exchange === 'okx') return createOkxTradingClient({ fetchImpl, now, timeoutMs, ErrorClass: TradingExchangeError });
   if (!Object.hasOwn(ENDPOINTS, exchange)) throw new TradingExchangeError('不支持的交易所', 'exchange');
   if (typeof fetchImpl !== 'function' || typeof now !== 'function' || !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new TradingExchangeError('交易所读取配置无效', 'configuration');
   const clock = () => timestamp(now());
+  const signingClock = exchange === 'binance' ? binanceClock ?? createBinanceClock({ fetchImpl, now, timeoutMs }) : null;
+  const streams = exchange === 'binance' ? binanceStreams ?? createBinanceStreams({ fetchImpl, WebSocketImpl, now, exchangeNow: signingClock.serverNow, ensureClock: options => signingClock.sync(options), timeoutMs, purpose: 'readonly' }) : null;
+  const sessions = new Map(), permissionReads = new Map();
   const fetchedAt = () => new Date(clock()).toISOString();
   function modeOf(value) {
     const mode = value === undefined ? (exchange === 'binance' ? 'standard' : 'unified') : value;
@@ -226,7 +231,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     return errorFor(operation, accountMode, 'transport');
   }
 
-  async function request(operation, credentials, parameters = {}, signal, budget, accountMode) {
+  async function rawRequest(operation, credentials, parameters = {}, signal, budget, accountMode) {
     checkAbort(signal);
     if (!object(credentials) || typeof credentials.apiKey !== 'string' || !/^[\x21-\x7e]{1,512}$/.test(credentials.apiKey) || typeof credentials.apiSecret !== 'string' || !credentials.apiSecret.trim() || credentials.apiSecret.length > 1024 || /[\r\n\0]/.test(credentials.apiSecret)) throw errorFor(operation, accountMode, 'credentials');
     if (budget && ++budget.requests > MAX_REQUESTS) throw errorFor(operation, accountMode, 'page_limit');
@@ -238,7 +243,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
       return errorFor(operation, accountMode, status === undefined ? 'api' : 'http', { httpStatus: status, providerCode: code });
     }
     const params = new URLSearchParams(parameters);
-    const time = String(clock());
+    const time = String(signingClock ? signingClock.timestamp() : clock());
     const headers = {};
     let query;
     if (exchange === 'binance') {
@@ -309,18 +314,207 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     }
   }
 
-  async function permissions(credentials, signal, budget, accountMode) {
-    const info = await request('permissions', credentials, {}, signal, budget, accountMode);
-    if (exchange === 'binance') {
-      if (!object(info) || info.enableReading !== true || CORE_WRITE_PERMISSIONS.some(field => info[field] !== false) || OPTIONAL_WRITE_PERMISSIONS.some(field => Object.hasOwn(info, field) && info[field] !== false) || (Object.hasOwn(info, 'enableFixReadOnly') && typeof info.enableFixReadOnly !== 'boolean')) throw errorFor('permissions', accountMode, 'permissions');
-    } else {
-      if (info.readOnly !== 1) throw errorFor('permissions', accountMode, 'permissions');
-      const account = await request('account', credentials, {}, signal, budget);
-      if (![3, 4, 5, 6].includes(account.unifiedMarginStatus)) throw errorFor('account', accountMode, 'account_mode');
+  async function request(operation, credentials, parameters = {}, signal, budget, accountMode) {
+    try { return await rawRequest(operation, credentials, parameters, signal, budget, accountMode); }
+    catch (error) {
+      if (exchange !== 'binance' || error?.diagnostic?.providerCode !== -1021) throw error;
+      // An explicit timestamp rejection is safe to retry exactly once. The
+      // caller's existing deadline also bounds the public time read and retry.
+      try { await signingClock.sync({ signal, force: true }); }
+      catch (cause) { if (cause?.name === 'AbortError') throw cause; throw errorFor(operation, accountMode, 'timestamp', { providerCode: -1021 }); }
+      return rawRequest(operation, credentials, parameters, signal, budget, accountMode);
     }
   }
 
+  async function permissions(credentials, signal, budget, accountMode) {
+    try {
+      const info = exchange === 'binance' ? await sharedPermissionRead(credentials, signal, budget, accountMode) : await request('permissions', credentials, {}, signal, budget, accountMode);
+      if (exchange === 'binance') {
+        if (!object(info) || info.enableReading !== true || CORE_WRITE_PERMISSIONS.some(field => info[field] !== false) || OPTIONAL_WRITE_PERMISSIONS.some(field => Object.hasOwn(info, field) && info[field] !== false) || (Object.hasOwn(info, 'enableFixReadOnly') && typeof info.enableFixReadOnly !== 'boolean')) throw errorFor('permissions', accountMode, 'permissions');
+      } else {
+        if (info.readOnly !== 1) throw errorFor('permissions', accountMode, 'permissions');
+        const account = await request('account', credentials, {}, signal, budget);
+        if (![3, 4, 5, 6].includes(account.unifiedMarginStatus)) throw errorFor('account', accountMode, 'account_mode');
+      }
+    } catch (error) {
+      if (exchange === 'binance' && error?.name !== 'AbortError') {
+        const session = sessions.get(sessionKey(credentials, accountMode));
+        if (session) suspend(session);
+      }
+      throw error;
+    }
+  }
+
+  const watchedSymbols = new Set([...SYMBOLS, ...TRADING_HYNIX_SYMBOLS, ...TRADING_ANTHROPIC_SYMBOLS]);
+  const sessionKey = (credentials, accountMode) => createHash('sha256').update(JSON.stringify([accountMode, credentials?.apiKey, credentials?.apiSecret])).digest('hex');
+  async function sharedPermissionRead(credentials, signal, budget, accountMode) {
+    checkAbort(signal);
+    if (budget && ++budget.requests > MAX_REQUESTS) throw errorFor('permissions', accountMode, 'page_limit');
+    const key = sessionKey(credentials, accountMode);
+    let entry = permissionReads.get(key);
+    if (!entry) {
+      entry = { controller: new AbortController(), waiters: 0, promise: null };
+      const pending = entry;
+      entry.promise = request('permissions', credentials, {}, entry.controller.signal, undefined, accountMode)
+        .finally(() => { if (permissionReads.get(key) === pending) permissionReads.delete(key); });
+      permissionReads.set(key, entry);
+    }
+    entry.waiters++;
+    let abort;
+    const interrupted = new Promise((_, reject) => { abort = () => reject(abortError()); signal?.addEventListener('abort', abort, { once: true }); if (signal?.aborted) abort(); });
+    try { return await Promise.race([entry.promise, interrupted]); }
+    finally {
+      signal?.removeEventListener('abort', abort);
+      if (--entry.waiters === 0 && permissionReads.get(key) === entry) { permissionReads.delete(key); entry.controller.abort(); }
+    }
+  }
+  function notify(session, changedSymbols) {
+    for (const listener of session.listeners) {
+      if (changedSymbols && !listener.symbols.some(symbol => changedSymbols.has(symbol))) continue;
+      const snapshots = listener.symbols.map(symbol => session.baselines.get(symbol));
+      if (snapshots.some(value => !value)) continue;
+      // fetchedAt remains the oldest REST risk observation. Account events do
+      // not contain mark/liquidation prices and must never renew their age.
+      const result = { fetchedAt: new Date(Math.min(...snapshots.map(value => Date.parse(value.fetchedAt)))).toISOString(),
+        positions: snapshots.flatMap(value => [...value.rows.values()].map(row => ({ ...row }))) };
+      try { listener.onSnapshot(result); } catch { /* A consumer cannot stop the private stream. */ }
+    }
+  }
+  function suspend(session, reason = 'stream_reset') {
+    session.subscription = null; session.epoch++; session.generation = null; session.baselines.clear(); session.events.clear();
+    session.unsubscribe?.(); session.unsubscribe = null;
+    streams.forget?.(session.credentials, { accountMode: session.accountMode });
+    for (const listener of session.listeners) { try { listener.onReset?.(reason); } catch { /* Isolated consumer. */ } }
+  }
+  function invalidateRisk(row) {
+    return { ...row, markPrice: null, notional: null, leverage: null, liquidationPrice: null, riskFetchedAt: null };
+  }
+  function receive(session, event) {
+    if (sessions.get(session.key) !== session) return;
+    if (session.generation === null) session.generation = event.generation;
+    if (session.generation !== event.generation) return;
+    const eventTime = timestamp(event.transactionTime ?? event.eventTime);
+    const parsed = [], changedSymbols = new Set();
+    const accountRiskChanged = event.balanceChanged === true || event.positions.some(row => !watchedSymbols.has(row?.s));
+    for (const row of event.positions) {
+      if (!watchedSymbols.has(row?.s)) continue;
+      const position = normalizePosition('binance', { symbol: row.s, positionSide: row.ps, positionAmt: row.pa,
+        entryPrice: row.ep, unRealizedProfit: row.up, marginAsset: 'USDT', updateTime: eventTime }, row.s, session.accountMode);
+      const id = `binance:${row.s}:${row.ps}`, previous = session.events.get(id);
+      if (previous && (previous.time > eventTime || previous.time === eventTime && JSON.stringify(previous.position) === JSON.stringify(position ? invalidateRisk(position) : null))) continue;
+      parsed.push({ id, symbol: row.s, time: eventTime, position: position ? invalidateRisk(position) : null, sequence: ++session.sequence });
+    }
+    if (!parsed.length && !accountRiskChanged) return;
+    if (accountRiskChanged) {
+      // Collateral and other contracts can change cross/portfolio liquidation
+      // risk without changing any watched quantity. Also invalidate REST reads
+      // that were already in flight when this account event arrived.
+      session.riskSequence++;
+      for (const [symbol, snapshot] of session.baselines) {
+        if (eventTime < snapshot.startedAt) continue;
+        for (const [id, position] of snapshot.rows) {
+          if (position.riskFetchedAt !== null) changedSymbols.add(symbol);
+          snapshot.rows.set(id, invalidateRisk(position));
+        }
+      }
+    }
+    for (const update of parsed) {
+      session.events.set(update.id, update);
+      const baseline = session.baselines.get(update.symbol);
+      if (!baseline) { session.riskSequence++; continue; }
+      const previous = baseline.rows.get(update.id), previousTime = baseline.times.get(update.id) ?? baseline.startedAt;
+      if (update.time < previousTime) continue;
+      session.riskSequence++;
+      changedSymbols.add(update.symbol);
+      baseline.times.set(update.id, update.time);
+      if (update.position) baseline.rows.set(update.id, update.position); else baseline.rows.delete(update.id);
+      // A changed cross/portfolio position can change another leg's risk too.
+      if (!previous || !update.position || previous.quantity !== update.position.quantity || previous.entryPrice !== update.position.entryPrice) {
+        for (const [symbol, snapshot] of session.baselines) for (const [id, position] of snapshot.rows) {
+          if (position.riskFetchedAt !== null) changedSymbols.add(symbol);
+          snapshot.rows.set(id, invalidateRisk(position));
+        }
+      }
+    }
+    notify(session, changedSymbols);
+  }
+  async function prepareStream(session, signal) {
+    if (!session.unsubscribe) {
+      const subscription = {}; session.subscription = subscription;
+      session.unsubscribe = streams.subscribePositions(session.credentials, { accountMode: session.accountMode,
+        onEvent(event) { if (session.subscription !== subscription) return; try { receive(session, event); } catch { suspend(session, 'invalid_data'); } },
+        onReset(event) {
+          if (sessions.get(session.key) !== session || session.subscription !== subscription) return;
+          session.epoch++; session.generation = event.generation; session.baselines.clear(); session.events.clear();
+          for (const listener of session.listeners) { try { listener.onReset?.('stream_reset'); } catch { /* Isolated consumer. */ } }
+        },
+        onError() {
+          if (session.subscription !== subscription) return;
+          for (const listener of session.listeners) { try { listener.onReset?.('stream_error'); } catch { /* Isolated consumer. */ } }
+        },
+      });
+    }
+    const ready = await streams.ready(session.credentials, { accountMode: session.accountMode, signal });
+    if (session.generation !== ready.generation) { session.epoch++; session.generation = ready.generation; session.baselines.clear(); session.events.clear(); }
+  }
+  function watchPositions(credentials, { accountMode: requestedMode, symbols = SYMBOLS, onSnapshot, onReset } = {}) {
+    if (exchange !== 'binance' || !streams) return () => {};
+    const accountMode = modeOf(requestedMode), key = sessionKey(credentials, accountMode);
+    if (!Array.isArray(symbols) || !symbols.length || symbols.some(symbol => !watchedSymbols.has(symbol)) || typeof onSnapshot !== 'function') throw errorFor('positions', accountMode, 'configuration');
+    let session = sessions.get(key);
+    if (!session) {
+      session = { key, credentials: { ...credentials }, accountMode, listeners: new Set(), baselines: new Map(), events: new Map(), generation: null, epoch: 0, sequence: 0, riskSequence: 0, requestSequence: 0, unsubscribe: null };
+      sessions.set(key, session);
+    }
+    const listener = { symbols: [...symbols], onSnapshot, onReset };
+    session.listeners.add(listener);
+    return () => {
+      session.listeners.delete(listener);
+      if (!session.listeners.size && sessions.get(key) === session) { sessions.delete(key); suspend(session); streams.forget?.(credentials, { accountMode }); }
+    };
+  }
   async function readPositions(credentials, signal, accountMode, symbols = SYMBOLS) {
+    const session = exchange === 'binance' ? sessions.get(sessionKey(credentials, accountMode)) : null;
+    if (!session) return readRestPositions(credentials, signal, accountMode, symbols);
+    let connected = false;
+    try { await prepareStream(session, signal); connected = true; }
+    catch (error) {
+      checkAbort(signal);
+      // Clock/ready checks may fail while the old socket still emits. A REST
+      // fallback cannot leave that socket's earlier baseline publishable.
+      session.epoch++; session.baselines.clear(); session.events.clear();
+    }
+    const epoch = session.epoch, startedAt = signingClock.serverNow(), sequence = session.sequence, riskSequence = session.riskSequence, requestSequence = ++session.requestSequence;
+    const result = await readRestPositions(credentials, signal, accountMode, symbols);
+    if (sessions.get(session.key) !== session || session.epoch !== epoch || !connected) return result;
+    for (const symbol of symbols) {
+      if ((session.baselines.get(symbol)?.requestSequence ?? 0) > requestSequence) continue;
+      const rows = new Map(result.positions.filter(row => row.symbol === symbol).map(row => [row.id, { ...row, riskFetchedAt: result.fetchedAt }]));
+      // A different cross/portfolio leg may change while this multi-symbol
+      // REST batch is pending. Its earlier risk reads are no longer current.
+      if (session.riskSequence !== riskSequence) for (const [id, row] of rows) rows.set(id, invalidateRisk(row));
+      const times = new Map([...rows].map(([id, row]) => [id, Date.parse(row.sourceUpdatedAt) || 0]));
+      for (const update of session.events.values()) {
+        if (update.symbol !== symbol) continue;
+        const previousTime = times.get(update.id), observed = rows.get(update.id);
+        // updateTime need not advance for a balance/PnL-only account event.
+        // A later REST observation of the same amount and entry proves the
+        // position is reflected and can restore its separately-read risk.
+        if (update.sequence <= sequence && observed && update.position && observed.quantity === update.position.quantity && observed.entryPrice === update.position.entryPrice) {
+          times.set(update.id, Math.max(previousTime ?? 0, update.time));
+          continue;
+        }
+        if (previousTime !== undefined ? update.time < previousTime || update.time === previousTime && update.sequence <= sequence : update.sequence <= sequence && update.time < startedAt) continue;
+        times.set(update.id, update.time);
+        if (update.position) rows.set(update.id, update.position); else rows.delete(update.id);
+      }
+      session.baselines.set(symbol, { rows, times, fetchedAt: result.fetchedAt, startedAt, requestSequence });
+    }
+    notify(session, new Set(symbols));
+    return { fetchedAt: result.fetchedAt, positions: symbols.flatMap(symbol => [...session.baselines.get(symbol).rows.values()].map(row => ({ ...row }))) };
+  }
+
+  async function readRestPositions(credentials, signal, accountMode, symbols = SYMBOLS) {
     const positions = [], ids = new Set(), modes = new Map();
     for (const symbol of symbols) {
       let cursor = '';
@@ -466,5 +660,10 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     return snapshot(diagnostic === null, diagnostic);
   }
 
-  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding });
+  function close() {
+    for (const pending of permissionReads.values()) pending.controller.abort(); permissionReads.clear();
+    for (const session of sessions.values()) { session.listeners.clear(); suspend(session); }
+    sessions.clear(); streams?.close?.(); signingClock?.forget();
+  }
+  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding, ...(exchange === 'binance' ? { watchPositions, close } : {}) });
 }

@@ -3,6 +3,8 @@ import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
 import { createHyperliquidExecutionClient } from './trading-hyperliquid-execution.mjs';
 import { createRhLighterExecutionClient } from './trading-rh-lighter-execution.mjs';
+import { createBinanceStreams } from './trading-binance-stream.mjs';
+import { createBinanceClock } from './trading-binance-clock.mjs';
 import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs';
 
 /**
@@ -306,7 +308,8 @@ function upstreamFailure(exchange, status, data, mutation) {
   });
 }
 
-export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000 } = {}) {
+export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000,
+  binanceStreams = null, binanceClock = null, WebSocketImpl = globalThis.WebSocket } = {}) {
   if (exchange === 'okx') return createOkxExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
   if (exchange === 'hyperliquid') return createHyperliquidExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
   if (exchange === 'rh-lighter') return createRhLighterExecutionClient({ fetchImpl, now, timeoutMs, ErrorClass: ExecutionExchangeError });
@@ -315,6 +318,40 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   const SYMBOLS = EXECUTION_VENUE_SYMBOLS[exchange];
   let timeOffset = 0;
   const ruleCache = new Map();
+  const binanceTime = exchange === 'binance' ? binanceClock ?? createBinanceClock({ fetchImpl, now, timeoutMs }) : null;
+  const streams = exchange === 'binance' ? binanceStreams ?? createBinanceStreams({ fetchImpl, WebSocketImpl, now,
+    exchangeNow: () => binanceTime.serverNow(), ensureClock: options => binanceTime.sync(options), purpose: 'execution', timeoutMs: Math.min(5000, timeoutMs) }) : null;
+  const recoveredBooks = new Map(), recoveredOrders = new Map(), requiredRest = new Set(), orderEpochs = new Map();
+  let streamGeneration = 0, mutationEpoch = 0;
+  const streamKey = (credentials, options, spec) => createHash('sha256').update(`${options.accountMode}\0${credentials.apiKey}\0${credentials.apiSecret}\0${spec.symbol}\0${spec.clientId}`).digest('hex');
+  function streamFailure(error, signal) {
+    checkAbort(signal);
+    if (error?.code === 'aborted' || error?.name === 'AbortError') fail('aborted');
+    if (error?.code === 'invalid_data') fail('invalid_data', { detail: 'Binance 推送状态无法确认，请核对原委托' });
+    // Listen-key availability is not an account/transaction authorization.
+    // A bounded REST recovery still undergoes the normal signing and validation.
+  }
+  async function prepareStream(credentials, options) {
+    if (!streams) return;
+    validateCredentials(credentials);
+    try { await streams.ready(credentials, options); } catch (error) { streamFailure(error, options.signal); }
+  }
+  function invalidateStreamOrder(credentials, spec, options) {
+    const key = streamKey(credentials, options, spec);
+    const at = performance.now();
+    for (const [id, entry] of orderEpochs) if (at - entry.at > 300_000) { orderEpochs.delete(id); requiredRest.delete(id); recoveredOrders.delete(id); }
+    if (!orderEpochs.has(key) && orderEpochs.size >= 4096) fail('response_limit');
+    recoveredOrders.delete(key); requiredRest.add(key); orderEpochs.set(key, { version: ++mutationEpoch, at });
+    try { streams.invalidateOrder(credentials, spec, options); } catch { /* REST reconciliation remains required. */ }
+    return key;
+  }
+  function seedStreamOrder(credentials, row, spec, options) {
+    const key = streamKey(credentials, options, spec);
+    // ACK-only responses cannot prime a full order. REST inspection remains
+    // the fallback if an optional cache cannot validate the complete shape.
+    if (!Number.isSafeInteger(row?.updateTime)) return;
+    try { streams.seedOrder(credentials, row, options); requiredRest.delete(key); } catch { requiredRest.add(key); }
+  }
   let identityEvidence = null;
   function clock() { const value = now(); if (!Number.isSafeInteger(value) || value <= 0) fail('configuration'); return value; }
   function modeOf(value) {
@@ -337,7 +374,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     if (authenticated) validateCredentials(credentials);
     const headers = {};
     let query = '', body;
-    const timestamp = String(clock() + timeOffset);
+    const timestamp = String(exchange === 'binance' ? binanceTime.timestamp() : clock() + timeOffset);
     if (exchange === 'binance') {
       const params = new URLSearchParams(parameters);
       if (authenticated) {
@@ -410,6 +447,11 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (!(error instanceof ExecutionExchangeError) || error.code !== 'timestamp' || error.uncertain) throw error;
       // The rejected request did not execute. A single retry preserves the same
       // client id and business payload; public time reads never retry recursively.
+      if (exchange === 'binance') {
+        try { await binanceTime.sync({ signal: options.signal, force: true }); }
+        catch (cause) { checkAbort(options.signal); fail(cause?.code === 'timeout' ? 'timeout' : 'clock'); }
+        return rawRequest(operation, credentials, parameters, options);
+      }
       const before = clock();
       const time = await rawRequest('time', null, {}, options);
       const after = clock();
@@ -567,6 +609,9 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     const options = { accountMode: modeOf(accountMode), signal, requireIdentity }, selected = executionSymbols(symbols, SYMBOLS);
     if (!selected) fail('input');
     const snapshot = await permissionSnapshot(credentials, options);
+    // Start the read-only user stream during the account preflight, before the
+    // engine sends either trading leg. Failure keeps exact REST checks in use.
+    await prepareStream(credentials, options);
     const positions = [], openOrders = [], strategies = [], modes = {}, seenOrders = new Set(), seenStrategies = new Set();
     for (const symbol of selected) {
       if (exchange === 'binance') {
@@ -717,17 +762,31 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   async function market(symbol, { signal, withRule = true } = {}) {
     if (!SYMBOLS.includes(symbol)) fail('input');
     checkAbort(signal);
-    const [rule, book] = await Promise.all([
+    const readBook = async () => {
+      if (streams) {
+        try { const pushed = await streams.book(symbol, { signal }); if (pushed) return { book: pushed, pushed: true }; }
+        catch (error) { streamFailure(error, signal); }
+        const cached = recoveredBooks.get(symbol), time = clock();
+        if (cached && time >= cached.at && time - cached.at < 5000) return { book: cached.book, pushed: false };
+      }
+      const book = await request('book', null, exchange === 'binance' ? { symbol } : { category: 'linear', symbol, limit: '1' }, { signal });
+      if (streams) recoveredBooks.set(symbol, { book, at: clock() });
+      return { book, pushed: false };
+    };
+    const [rule, received] = await Promise.all([
       withRule ? loadRule(symbol, signal) : null,
-      request('book', null, exchange === 'binance' ? { symbol } : { category: 'linear', symbol, limit: '1' }, { signal }),
+      readBook(),
     ]);
+    const { book } = received;
     requireObject(book);
     let bid, ask, at;
     if (exchange === 'binance') {
       if (book.symbol !== symbol) fail();
       bid = amount(book.bidPrice, { positive: true }); ask = amount(book.askPrice, { positive: true });
       amount(book.bidQty, { positive: true }); amount(book.askQty, { positive: true });
-      at = iso(book.time);
+      // Keep transport delay in the shared execution freshness budget for
+      // both WS and REST; only translate venue time into the local clock.
+      at = iso(milliseconds(book.time) - (binanceTime.serverNow() - clock()));
     } else {
       if (book.s !== symbol || array(book.b, 1).length !== 1 || array(book.a, 1).length !== 1
         || array(book.b[0], 2).length !== 2 || array(book.a[0], 2).length !== 2) fail();
@@ -759,6 +818,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       // maxChasePrice is optional: without it the strategy follows the book until filled or stopped.
       reduceOnly: spec.reduceOnly, chaseDistance: '0', ...(spec.stopPrice === null ? {} : { maxChasePrice: spec.stopPrice }),
     };
+    if (streams) { validateCredentials(credentials); invalidateStreamOrder(credentials, spec, options); }
     const result = await request(exchange === 'bybit' && market ? 'orderCreate' : 'create', credentials, parameters, options);
     try {
       requireObject(result);
@@ -771,6 +831,9 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
         const id = identifier(result.orderId);
         if (!/^\d{1,30}$/.test(id) || Object.hasOwn(result, 'symbol') && result.symbol !== spec.symbol
           || Object.hasOwn(result, 'clientOrderId') && result.clientOrderId !== spec.clientId) fail();
+        // New client IDs cannot have earlier live events. Once creation was
+        // accepted, its private stream can supply the first full status.
+        requiredRest.delete(streamKey(credentials, options, spec));
         return { id, kind: 'order' };
       }
       if (result.result !== null) fail();
@@ -782,6 +845,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     if (exchange !== 'binance') fail('input');
     const options = { accountMode: modeOf(accountMode), signal, beforeMutation }, spec = validateSpec(rawSpec, true);
     if (spec.id === null || spec.orderType !== 'chase') fail('input');
+    validateCredentials(credentials); invalidateStreamOrder(credentials, spec, options);
     const row = await request('amend', credentials, {
       symbol: spec.symbol, side: spec.side.toUpperCase(), orderId: spec.id,
       quantity: spec.quantity, ...(spec.limitPrice === null ? { priceMatch: 'QUEUE' } : { price: spec.limitPrice }),
@@ -796,6 +860,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
         || result.quantity !== spec.quantity || row.clientOrderId !== spec.clientId
         || row.type !== 'LIMIT' || row.timeInForce !== 'GTX'
         || spec.limitPrice !== null && (result.price === null || compareDecimals(result.price, spec.limitPrice) !== 0)) fail();
+      seedStreamOrder(credentials, row, spec, options);
       return result;
     } catch { fail('invalid_data', { uncertain: true }); }
   }
@@ -803,11 +868,37 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   async function inspect(credentials, rawSpec, { accountMode, signal } = {}) {
     const options = { accountMode: modeOf(accountMode), signal }, spec = validateSpec(rawSpec, true);
     if (exchange === 'binance') {
-      const row = await request('inspect', credentials, { symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { origClientOrderId: spec.clientId }) }, options);
+      validateCredentials(credentials);
+      const key = streamKey(credentials, options, spec), epoch = orderEpochs.get(key)?.version, generation = streamGeneration;
+      let row, fetched = false;
+      if (!requiredRest.has(key)) {
+        try { row = await streams.order(credentials, spec, options); } catch (error) { streamFailure(error, signal); }
+        if (row) recoveredOrders.delete(key);
+      }
+      if (!row) {
+        const cached = recoveredOrders.get(key), time = clock();
+        if (cached && time >= cached.at && time - cached.at < 5000) row = cached.row;
+        else {
+          row = await request('inspect', credentials, { symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { origClientOrderId: spec.clientId }) }, options);
+          fetched = true;
+          if (generation !== streamGeneration) fail('aborted');
+          if (epoch !== orderEpochs.get(key)?.version) fail('upstream', { detail: '订单读取早于最近写入，请重新核对' });
+        }
+      }
+      checkAbort(signal);
       const result = parseBinanceOrder(row);
       if (result.symbol !== spec.symbol || result.side !== spec.side || result.positionSide !== spec.positionSide
         || result.reduceOnly !== spec.reduceOnly || spec.id && result.id !== spec.id || row.clientOrderId !== spec.clientId
         || (spec.orderType === 'market' ? row.type !== 'MARKET' : row.type !== 'LIMIT' || row.timeInForce !== 'GTX')) fail();
+      if (generation !== streamGeneration) fail('aborted');
+      if (epoch !== orderEpochs.get(key)?.version) fail('upstream', { detail: '订单读取早于最近写入，请重新核对' });
+      // Never renew cached evidence by reading it again; the stream owns its
+      // own timestamp and the REST repair retains its original receipt time.
+      if (fetched) {
+        if (recoveredOrders.size >= 4096 && !recoveredOrders.has(key)) recoveredOrders.delete(recoveredOrders.keys().next().value);
+        recoveredOrders.set(key, { row, at: clock() });
+        seedStreamOrder(credentials, row, spec, options);
+      }
       return result;
     }
     if (!spec.strategy) {
@@ -856,6 +947,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
 
   async function stop(credentials, rawSpec, { accountMode, signal, beforeMutation } = {}) {
     const options = { accountMode: modeOf(accountMode), signal, beforeMutation }, spec = validateSpec(rawSpec, true);
+    if (streams) { validateCredentials(credentials); invalidateStreamOrder(credentials, spec, options); }
     const result = exchange === 'binance'
       ? await request('stop', credentials, { symbol: spec.symbol, ...(spec.id ? { orderId: spec.id } : { origClientOrderId: spec.clientId }) }, options)
       : spec.strategy ? await request('stop', credentials, { strategyId: spec.id }, options)
@@ -867,9 +959,15 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       else {
         const id = identifier(result.orderId);
         if (spec.id && id !== spec.id || result.symbol !== spec.symbol || result.clientOrderId !== spec.clientId) fail();
+        seedStreamOrder(credentials, result, spec, options);
       }
     } catch { fail('invalid_data', { uncertain: true }); }
   }
 
-  return Object.freeze({ verify, account, endedStrategies, market, create, amend, inspect, stop });
+  function forget() {
+    streamGeneration += 1; identityEvidence = null; recoveredBooks.clear(); recoveredOrders.clear(); requiredRest.clear(); orderEpochs.clear();
+    streams?.forget(); binanceTime?.forget();
+  }
+  return Object.freeze({ verify, account, endedStrategies, market, create, amend, inspect, stop, forget,
+    close() { forget(); streams?.close(); } });
 }

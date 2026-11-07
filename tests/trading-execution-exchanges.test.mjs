@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
+import { unavailableBinanceStreams } from './fixtures/binance-stream.mjs';
 
 const NOW = Date.parse('2026-10-07T12:00:00Z');
 const credentials = Object.freeze({ apiKey: 'fixture-execution-key', apiSecret: 'fixture-execution-secret' });
@@ -33,7 +34,7 @@ const binanceRule = symbol => ({ symbol, status: 'TRADING', contractType: 'PERPE
 const json = (value, status = 200, headers) => new Response(JSON.stringify(value), { status, headers });
 function harness(exchange, handler = () => undefined, options = {}) {
   const calls = [];
-  const client = createExecutionExchangeClient(exchange, { now: () => NOW, ...options, fetchImpl: async (url, init) => {
+  const client = createExecutionExchangeClient(exchange, { now: () => NOW, binanceStreams: unavailableBinanceStreams(), ...options, fetchImpl: async (url, init) => {
     const parsed = new URL(url), parameters = init.body === undefined ? Object.fromEntries(parsed.searchParams) : JSON.parse(init.body);
     const call = { url: parsed, init, parameters }; calls.push(call);
     let value = await handler(call, calls);
@@ -162,7 +163,7 @@ for (const mode of ['standard', 'portfolio-margin']) {
     assert.equal(calls.length, 3); assert.equal(writes, 2); assert.equal(guards, 2);
     assert.deepEqual(calls.map(call => call.init.method), ['PUT', 'GET', 'PUT']);
     assert.equal(calls[1].url.pathname, '/fapi/v1/time');
-    assert.deepEqual(calls[1].init.headers, {});
+    assert.deepEqual([...new Headers(calls[1].init.headers)], []);
     for (const call of [calls[0], calls[2]]) {
       authenticatedSignature('binance', call);
       assert.equal(call.parameters.orderId, ORDER); assert.equal(call.parameters.quantity, '2'); assert.equal(call.parameters.priceMatch, 'QUEUE');
@@ -366,7 +367,7 @@ for (const exchange of ['binance', 'bybit']) {
     const first = calls[0], retried = calls[2];
     assert.equal(first.url.pathname, retried.url.pathname);
     assert.equal(calls[1].url.pathname, exchange === 'binance' ? '/fapi/v1/time' : '/v5/market/time');
-    assert.deepEqual(calls[1].init.headers, {});
+    assert.deepEqual([...new Headers(calls[1].init.headers)], []);
     if (exchange === 'binance') {
       assert.equal(first.parameters.timestamp, String(NOW)); assert.equal(retried.parameters.timestamp, String(NOW + 2000));
       assert.equal(first.parameters.newClientOrderId, retried.parameters.newClientOrderId);
@@ -449,7 +450,8 @@ for (const exchange of ['binance', 'bybit']) {
     for (const call of calls) { assert.deepEqual(call.init.headers, {}); assert.equal(call.init.method, 'GET'); assert.equal(call.url.searchParams.has('signature'), false); }
     await client.market('CLUSDT');
     assert.equal(calls.filter(call => call.url.pathname.endsWith('exchangeInfo') || call.url.pathname.endsWith('instruments-info')).length, 1);
-    assert.equal(calls.filter(call => call.url.pathname.endsWith('bookTicker') || call.url.pathname.endsWith('orderbook')).length, 2);
+    assert.equal(calls.filter(call => call.url.pathname.endsWith('bookTicker') || call.url.pathname.endsWith('orderbook')).length, exchange === 'binance' ? 1 : 2,
+      'Binance shares a bounded REST repair while the stream is unavailable');
   });
 
   test(`${exchange} display market reads the book only, without downloading rules`, async () => {

@@ -88,6 +88,7 @@ function normalizePositions(result, exchange, now, symbols = SYMBOLS) {
       quantity: decimal(item.quantity, { positive: true }), entryPrice: optional(item.entryPrice, true), markPrice: optional(item.markPrice, true),
       notional: optional(item.notional, true), unrealizedPnl: optional(item.unrealizedPnl), leverage: optional(item.leverage, true),
       liquidationPrice: optional(item.liquidationPrice, true), sourceUpdatedAt: timeOf(item.sourceUpdatedAt) === null ? null : iso(timeOf(item.sourceUpdatedAt)),
+      ...(Object.hasOwn(item, 'riskFetchedAt') ? { riskFetchedAt: timeOf(item.riskFetchedAt) === null ? null : iso(timeOf(item.riskFetchedAt)) } : {}),
       ...(exchange === 'okx' ? { marginMode: item.marginMode, instrumentId: okxInstrumentId(item.symbol), quantityUnit: '张', contractSize: decimal(item.contractSize, { positive: true }) } : {}) };
   });
   for (const symbol of symbols) {
@@ -191,7 +192,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   const entriesFor = (pair = EXCHANGES) => pair.map(exchange => ({ row: rowFor(exchange), snapshot: cache.get(exchange) }));
   const recordPnl = () => TRADING_PAIRS.map(pair => pnl.record(entriesFor(pair), now())).some(Boolean);
   const clients = new Map(EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
-  const jobs = new Map(), validations = new Map();
+  const jobs = new Map(), validations = new Map(), watchers = new Map();
   db.exec('CREATE TABLE IF NOT EXISTS trading_views_v2 (pair_key TEXT NOT NULL, days INTEGER NOT NULL, version INTEGER NOT NULL, source_key TEXT NOT NULL, json TEXT NOT NULL, PRIMARY KEY(pair_key,days))');
   let views = new Map(), viewsDirty = false, viewTimer = null;
   let viewError = null, viewRetryAt = 0, viewRetryDelay = 750;
@@ -222,12 +223,34 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     finally { clearTimeout(timer); controller.signal.removeEventListener('abort', abort); }
   }
   function cancel(exchange) {
+    for (const [key, watcher] of watchers) if (key.startsWith(`${exchange}:`)) { watchers.delete(key); watcher.unsubscribe(); }
     for (const [key, job] of jobs) if (key.startsWith(`${exchange}:`)) { job.controller.abort(); jobs.delete(key); }
   }
   function privateCredentials(row) {
     const value = decrypt(row.credentials);
     if (!value || value.exchange !== row.exchange) throw new Error('Invalid credential identity');
     return credentialsOf(value, row.exchange);
+  }
+  function watch(row, kind, credentials, accountMode) {
+    const client = clients.get(row.exchange), key = `${row.exchange}:${kind}`;
+    if (kind === 'funding' || typeof client.watchPositions !== 'function') return null;
+    if (watchers.get(key)?.revision === row.revision) return watchers.get(key);
+    watchers.get(key)?.unsubscribe();
+    const watcher = { revision: row.revision, version: 0, unsubscribe: () => {} };
+    watchers.set(key, watcher);
+    watcher.unsubscribe = client.watchPositions(credentials, { accountMode, symbols: SIDE_MARKETS[kind]?.symbols ?? SYMBOLS,
+      onSnapshot(result) {
+        if (closed || watchers.get(key) !== watcher || rowFor(row.exchange).revision !== row.revision) return;
+        const value = normalizePositions(result, row.exchange, now(), SIDE_MARKETS[kind]?.symbols ?? SYMBOLS);
+        if (write(row.exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], ...value, error: null, diagnostic: null } }))) watcher.version++;
+      },
+      onReset() {
+        if (closed || watchers.get(key) !== watcher || rowFor(row.exchange).revision !== row.revision) return;
+        const diagnostic = normalizeTradingDiagnostic({ version: 1, exchange: row.exchange, accountMode, operation: 'positions', code: 'transport' });
+        write(row.exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], diagnostic, error: formatTradingDiagnostic(diagnostic) } }));
+      },
+    });
+    return watcher;
   }
   function run(exchange, kind, { force = false, end = now() } = {}) {
     if (closed) return Promise.resolve();
@@ -258,11 +281,12 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       try {
         const credentials = privateCredentials(row), accountMode = accountModeOf(exchange, row.account_mode);
         const client = clients.get(exchange);
+        const watcher = watch(row, kind, credentials, accountMode), streamVersion = watcher?.version;
         const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? client.positions(credentials, { signal, accountMode })
           : kind === 'hynix' ? client.hynixPositions(credentials, { signal, accountMode }) : kind === 'anthropic' ? client.anthropicPositions(credentials, { signal, accountMode }) : client.funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
         if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
         if (kind === 'funding') saveFunding(result);
-        else {
+        else if (!watcher || watcher.version === streamVersion) {
           const value = normalizePositions(result, exchange, now(), SIDE_MARKETS[kind]?.symbols ?? SYMBOLS);
           write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], ...value, error: null, diagnostic: null } }));
         }
@@ -520,6 +544,6 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     });
   }
   return { state, refresh, connect, disconnect, anthropic,
-    async close() { closed = true; clearInterval(timer); clearTimeout(first); clearTimeout(viewTimer); for (const controller of validations.values()) controller.abort(); for (const job of jobs.values()) job.controller.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise)); jobs.clear(); validations.clear(); },
+    async close() { closed = true; clearInterval(timer); clearTimeout(first); clearTimeout(viewTimer); for (const watcher of watchers.values()) watcher.unsubscribe(); watchers.clear(); for (const client of clients.values()) client.close?.(); for (const controller of validations.values()) controller.abort(); for (const job of jobs.values()) job.controller.abort(); await Promise.allSettled([...jobs.values()].map(job => job.promise)); jobs.clear(); validations.clear(); },
   };
 }

@@ -1,5 +1,5 @@
 const OPERATIONS = Object.freeze({ permissions: '只读权限检查', account: '账户检查', positions: '仓位读取', funding: '资金费读取' });
-const CODES = new Set(['upstream', 'transport', 'http', 'api', 'timeout', 'response_limit', 'permissions', 'account_mode', 'credentials', 'invalid_data', 'pagination', 'page_limit', 'record_limit', 'duplicate', 'duplicate_conflict', 'window_range', 'currency', 'range']);
+const CODES = new Set(['upstream', 'transport', 'http', 'api', 'timeout', 'timestamp', 'response_limit', 'permissions', 'account_mode', 'credentials', 'invalid_data', 'pagination', 'page_limit', 'record_limit', 'duplicate', 'duplicate_conflict', 'window_range', 'currency', 'range']);
 const FIELDS = new Set(['result', 'list', 'record', 'symbol', 'transactionTime', 'type', 'category', 'funding', 'id', 'nextPageCursor']);
 const VALUE_TYPES = Object.freeze({ missing: '缺失', null: '空值', string: '字符串', number: '数字', boolean: '布尔值', array: '数组', object: '对象' });
 const REASONS = Object.freeze({ format: '格式无效', empty: '为空', type: '类型不符', unexpected: '与请求不符', limit: '超过支持范围' });
@@ -32,6 +32,7 @@ export function formatTradingDiagnostic(value) {
   if (providerCode !== undefined) details.push(`${name} ${providerCode}`);
   const suffix = details.length ? `（${details.join('，')}）` : '';
   // Also correct diagnostics restored from snapshots written by older builds.
+  if (exchange === 'binance' && (providerCode === -1021 || code === 'timestamp')) return `${label}失败${suffix}，请求时间与 Binance 服务器时间不一致，请检查服务器时钟同步`;
   if (exchange === 'okx' && (httpStatus === 429 || providerCode === 50011)) return `${name} 请求频率受限${suffix}，请稍后重试`;
   switch (code) {
     case 'http': case 'api': return `${label}失败${suffix}，请检查账户模式、API 读取权限、IP 白名单与服务器时间`;
