@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 from pathlib import Path
 import shutil
 import socket
@@ -117,18 +118,49 @@ class RelayTLSEndToEndTests(unittest.TestCase):
         self.collector.samples[("oi", SYMBOL)] = Sample("oi", SYMBOL, wall, ticks, 1, self.oi)
         self.collector.samples[("brackets", SYMBOL)] = Sample("brackets", SYMBOL, wall, ticks, 2, self.brackets)
 
-    def client(self, token=TOKEN, *, trust=True, url=None):
-        client = PublicCapacityRelayClient(url or self.url, token, ca_file=self.cert if trust else None)
+    def client(self, token=TOKEN, *, trust=True, url=None, connector=None):
+        client = PublicCapacityRelayClient(url or self.url, token,
+            ca_file=self.cert if trust else None, connect=connector)
         self.addCleanup(client.close)
         return client
 
-    def test_real_wss_push_and_https_fallback_share_cache_without_upstream_requests(self):
-        streamed = self.client()
+    def start_stream(self, *, connector=connect, startup_timeout=None, sample_timeout=3):
+        handshake_finished = threading.Event()
+        handshake_errors = []
         received = threading.Event()
+
+        @contextmanager
+        def observed_connect(*args, **kwargs):
+            try:
+                connection = connector(*args, **kwargs)
+            except Exception as error:
+                # Report the phase and error class, never handshake headers.
+                handshake_errors.append(type(error).__name__)
+                raise
+            finally:
+                handshake_finished.set()
+            with connection:
+                yield connection
+
+        streamed = self.client(connector=observed_connect)
         streamed.set_update_listener(lambda symbol, kind: received.set() if kind == "brackets" else None)
         streamed.start()
-        self.assertTrue(received.wait(3), "TLS WebSocket did not deliver initial cached samples")
+        # Thread scheduling and TLS/WS establishment must not consume the
+        # initial-push budget; connect itself retains its production timeout.
+        if startup_timeout is None:
+            startup_timeout = streamed._OPEN_TIMEOUT + 2
+        self.assertTrue(handshake_finished.wait(startup_timeout),
+                        f"TLS WebSocket handshake did not finish: {streamed.status()}")
+        self.assertEqual(handshake_errors, [],
+                         f"TLS WebSocket handshake failed: {streamed.status()}")
+        self.assertTrue(received.wait(sample_timeout),
+                        f"TLS WebSocket connected but did not deliver initial cached samples: {streamed.status()}")
         self.assertTrue(streamed.status()["connected"])
+        self.assertEqual(streamed.status()["ws"]["connection_attempts"], 1)
+        return streamed
+
+    def test_real_wss_push_and_https_fallback_share_cache_without_upstream_requests(self):
+        streamed = self.start_stream()
         # Risk brackets have a 60-second refresh target, so this assertion does
         # not depend on the machine finishing its TLS handshake within 0.5s.
         started, checked, payload = streamed.sample("brackets", SYMBOL, 300)
@@ -139,17 +171,58 @@ class RelayTLSEndToEndTests(unittest.TestCase):
 
         streamed.close()
         self.assertFalse(streamed._thread.is_alive())
-        # A separate HTTP-only client models loss of the push connection. Both
-        # HTTPS reads consume the relay's same immutable cached samples.
+        # A separate HTTP-only client models loss of the push connection and
+        # consumes the same immutable bracket sample.
         fallback = self.client()
         _, fallback_checked, bracket_payload = fallback.sample("brackets", SYMBOL, 300)
-        _, oi_checked, oi_payload = fallback.sample("oi", SYMBOL, 8)
         self.assertEqual(bracket_payload, self.brackets)
-        self.assertEqual(oi_payload, self.oi)
         self.assertLessEqual(fallback_checked, self.collector.samples[("brackets", SYMBOL)].sampled_at + 0.001)
-        self.assertLessEqual(oi_checked, self.collector.samples[("oi", SYMBOL)].sampled_at + 0.001)
-        self.assertEqual(self.snapshots, [200, 200])
+        self.assertEqual(self.snapshots, [200])
         self.assertFalse(fallback.status()["running"])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_real_https_oi_fallback_keeps_cached_sample_time_without_upstream_requests(self):
+        # OI expires at the server after 3s, independently of the WS handshake.
+        # Give this HTTP-only assertion its own fresh fixture instead of making
+        # it wait for the preceding TLS/WS startup and shutdown.
+        fallback = self.client()
+        _, oi_checked, oi_payload = fallback.sample("oi", SYMBOL, 8)
+        self.assertEqual(oi_payload, self.oi)
+        self.assertLessEqual(oi_checked, self.collector.samples[("oi", SYMBOL)].sampled_at + 0.001)
+        self.assertEqual(self.snapshots, [200])
+        self.assertFalse(fallback.status()["running"])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_delayed_connection_start_does_not_consume_initial_push_budget(self):
+        # Simulate a receiver thread delayed before it enters the real TLS/WS
+        # handshake. The old start()->received.wait(3) fails in this schedule.
+        delay = 3.1
+
+        def delayed_connect(*args, **kwargs):
+            time.sleep(delay)
+            return connect(*args, **kwargs)
+
+        streamed = self.start_stream(connector=delayed_connect,
+            startup_timeout=delay + PublicCapacityRelayClient._OPEN_TIMEOUT + 2)
+        _, _, payload = streamed.sample("brackets", SYMBOL, 300)
+        self.assertEqual(payload, self.brackets)
+        self.assertEqual(self.snapshots, [])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_failed_handshake_is_reported_before_initial_push_phase(self):
+        def failed_connect(*args, **kwargs):
+            raise TimeoutError("injected handshake timeout")
+
+        with self.assertRaisesRegex(AssertionError, "TLS WebSocket handshake failed"):
+            self.start_stream(connector=failed_connect)
+        self.assertEqual(self.snapshots, [])
+        self.assertEqual(self.upstream_requests, [])
+
+    def test_connected_stream_without_initial_cache_still_fails_push_phase(self):
+        self.collector.samples.clear()
+        with self.assertRaisesRegex(AssertionError, "connected but did not deliver initial cached samples"):
+            self.start_stream(sample_timeout=0.1)
+        self.assertEqual(self.snapshots, [])
         self.assertEqual(self.upstream_requests, [])
 
     def test_real_tls_rejects_wrong_token_untrusted_ca_hostname_and_expired_cache(self):
