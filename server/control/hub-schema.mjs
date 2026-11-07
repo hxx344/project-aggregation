@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { immediate } from './schema.mjs';
 
 // Version contract of hub.sqlite (docs/hub-schema-inventory.md). Version 1 is
 // the layout the current creators produce on an empty database; each object is
@@ -99,4 +100,44 @@ export function inspectHubSchema(db) {
   const complete = !missing.length && !legacy.length;
   if (userVersion === HUB_SCHEMA_VERSION) return result(complete ? 'v1' : 'unknown');
   return result(complete ? 'v0-complete' : 'v0-legacy');
+}
+
+const LOGGED_NAMES = 20;
+const brief = report => ({ state: report.state, userVersion: report.userVersion,
+  ...Object.fromEntries(['missing', 'legacy', 'mismatched', 'unexpected'].map(key => [key, report[key].slice(0, LOGGED_NAMES)])) });
+
+/**
+ * The runtime calls this once every creator has run: a complete version 0
+ * layout becomes version 1 under the write lock, decided again inside the
+ * transaction. Any other layout keeps its user_version. This never fails
+ * startup: a busy or failing database stays unmarked, is logged, and the next
+ * start tries again. Earlier releases ignore user_version, so they still read
+ * and write a marked database.
+ */
+export function markHubSchema(db, { log = console } = {}) {
+  let report;
+  try {
+    report = immediate(db, () => {
+      const current = inspectHubSchema(db);
+      if (current.state === 'v0-complete') db.exec(`PRAGMA user_version=${HUB_SCHEMA_VERSION}`);
+      return current;
+    });
+  } catch (error) {
+    log.error({ err: error, type: 'hub-schema' }, '工作台数据库版本未能标记，下次启动重试');
+    return null;
+  }
+  if (report.state === 'v0-complete') log.info({ type: 'hub-schema', version: HUB_SCHEMA_VERSION }, `工作台数据库已标记为版本 ${HUB_SCHEMA_VERSION}`);
+  else if (report.state === 'newer') log.warn({ type: 'hub-schema', ...brief(report) }, '工作台数据库版本高于本程序，按兼容方式继续运行，未改动版本');
+  else if (report.state !== 'v1') log.warn({ type: 'hub-schema', ...brief(report) }, '工作台数据库结构不在当前版本的支持范围内，未标记版本');
+  return report;
+}
+
+// A candidate API slot must not take over a database newer than its code
+// supports: its startup fails and the serving slot stays (design doc api-dual-slot 3.5).
+// Defensive: this file is part of the runtime component, so an API-only switch
+// never pairs slots with different versions; it is not a rollback barrier.
+export function assertCandidateSchema(db) {
+  const report = inspectHubSchema(db);
+  if (report.state === 'newer') throw new Error(`候选实例：工作台数据库版本 ${report.userVersion} 高于本程序支持的版本 ${HUB_SCHEMA_VERSION}`);
+  return report;
 }

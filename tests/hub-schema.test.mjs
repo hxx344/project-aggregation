@@ -5,7 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { openHubDatabase } from '../server/control/schema.mjs';
-import { inspectHubSchema } from '../server/control/hub-schema.mjs';
+import { assertCandidateSchema, inspectHubSchema, markHubSchema } from '../server/control/hub-schema.mjs';
 import { createTrading } from '../server/trading.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
 import { createTradingAuto } from '../server/trading-auto.mjs';
@@ -122,4 +122,79 @@ test('inspection reads a query-only connection and leaves the version unmarked',
   t.after(() => db.close());
   assert.equal(inspectHubSchema(db).state, 'v0-complete');
   assert.equal(inspectHubSchema(db).userVersion, 0);
+});
+
+function recorder() {
+  const lines = [];
+  const log = Object.fromEntries(['info', 'warn', 'error'].map(level => [level, (fields, message) => lines.push({ level, fields, message })]));
+  return { log, lines };
+}
+const version = db => db.prepare('PRAGMA user_version').get().user_version;
+
+test('a complete version 0 database is marked once and stays version 1', async t => {
+  const db = await runCreators(await hubFile(t));
+  t.after(() => db.close());
+  const { log, lines } = recorder();
+  assert.equal(markHubSchema(db, { log }).state, 'v0-complete');
+  assert.equal(version(db), 1);
+  assert.equal(inspectHubSchema(db).state, 'v1');
+  assert.equal(markHubSchema(db, { log }).state, 'v1');
+  assert.equal(version(db), 1);
+  assert.deepEqual(lines.map(line => line.level), ['info']);
+});
+
+// The creators are unchanged since febdee1, the previous release; that code was
+// also run against a marked database by hand (commit evidence of E1b-2).
+test('creators that ignore user_version keep a marked database intact', async t => {
+  const file = await hubFile(t);
+  const first = await runCreators(file);
+  markHubSchema(first, { log: recorder().log });
+  first.close();
+  // The same creators again, as the previous release runs them after a rollback.
+  const db = await runCreators(file);
+  t.after(() => db.close());
+  const report = inspectHubSchema(db);
+  assert.equal(report.state, 'v1');
+  assert.deepEqual(diff(report), clean);
+});
+
+test('a legacy, unknown or newer layout keeps its version and is logged', async t => {
+  const legacy = new DatabaseSync(await hubFile(t, LEGACY_SQL));
+  const unknown = await runCreators(await hubFile(t));
+  unknown.exec('CREATE TABLE future_rows (id TEXT PRIMARY KEY)');
+  const newer = await runCreators(await hubFile(t));
+  newer.exec('PRAGMA user_version=2');
+  t.after(() => { legacy.close(); unknown.close(); newer.close(); });
+  for (const [db, state, before] of [[legacy, 'v0-legacy', 0], [unknown, 'unknown', 0], [newer, 'newer', 2]]) {
+    const { log, lines } = recorder();
+    assert.equal(markHubSchema(db, { log }).state, state);
+    assert.equal(version(db), before);
+    assert.deepEqual(lines.map(line => [line.level, line.fields.state]), [['warn', state]]);
+  }
+});
+
+test('a busy database stays unmarked without failing startup', async t => {
+  const file = await hubFile(t);
+  (await runCreators(file)).close();
+  const holder = new DatabaseSync(file), db = new DatabaseSync(file);
+  t.after(() => { holder.close(); db.close(); });
+  db.exec('PRAGMA busy_timeout=0');
+  holder.exec('BEGIN IMMEDIATE');
+  const { log, lines } = recorder();
+  assert.equal(markHubSchema(db, { log }), null);
+  assert.deepEqual(lines.map(line => line.level), ['error']);
+  holder.exec('ROLLBACK');
+  assert.equal(version(db), 0);
+  assert.equal(markHubSchema(db, { log }).state, 'v0-complete');
+  assert.equal(version(db), 1);
+});
+
+test('a candidate refuses only a database newer than its code', async t => {
+  const db = await runCreators(await hubFile(t));
+  t.after(() => db.close());
+  assert.equal(assertCandidateSchema(db).state, 'v0-complete');
+  db.exec('CREATE TABLE future_rows (id TEXT PRIMARY KEY)');
+  assert.equal(assertCandidateSchema(db).state, 'unknown');
+  db.exec('PRAGMA user_version=2');
+  assert.throws(() => assertCandidateSchema(db), /工作台数据库版本 2 高于本程序支持的版本 1/);
 });

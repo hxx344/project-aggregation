@@ -9,6 +9,7 @@ import { validateAuthOrigin } from '../adapters.mjs';
 import { assertRecoveryStartup } from '../recovery/startup.mjs';
 import { acquireLifecycleLock } from '../recovery/lifecycle-lock.mjs';
 import { openHubDatabase, seedComplete, seedProjects } from '../control/schema.mjs';
+import { assertCandidateSchema } from '../control/hub-schema.mjs';
 import { logWriteWaits } from '../sqlite-writes.mjs';
 import { createControlStore } from '../control/store.mjs';
 import { createProjectCatalog } from '../control/projects.mjs';
@@ -83,6 +84,7 @@ export async function startApi({ dataDir, logger = defaultLogger, signal, fail =
       await ensurePassword(control, { initialPassword: env.INITIAL_PASSWORD, log: logger });
       seedProjects(control, { embeddedModules: true });
     } else if (!control.getSetting('password') || !seedComplete(control, { embeddedModules: true })) throw new Error('候选实例：管理员密码或项目种子尚未初始化');
+    if (!serving) assertCandidateSchema(db);
     stopped();
     const dir = runtimeDir(resolvedData, env);
     // A new runtime instance restarted every module in maintenance: take them all through the durable value again.

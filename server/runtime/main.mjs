@@ -10,6 +10,7 @@ import { createAccountWriter } from '../execution/account-writer.mjs';
 import { acquireRuntimeLock } from '../recovery/lifecycle-lock.mjs';
 import { assertRecoveryStartup } from '../recovery/startup.mjs';
 import { openHubDatabase } from '../control/schema.mjs';
+import { markHubSchema } from '../control/hub-schema.mjs';
 import { logWriteWaits } from '../sqlite-writes.mjs';
 import { createControlStore } from '../control/store.mjs';
 import { createProjectCatalog } from '../control/projects.mjs';
@@ -110,6 +111,8 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
     await dataPlane.initialize();
     lock.assertHeld(); stopped();
     dataPlane.startBaseline();
+    // Every hub.sqlite creator has run now (the baseline last).
+    markHubSchema(db, { log: logger });
     internal = await startInternalServer({ service, dataPlane, dir: runDir, logger });
     lock.assertHeld(); stopped();
     // From here a crashed module restarts alone instead of failing startup.
