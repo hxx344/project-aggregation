@@ -9,7 +9,7 @@ async (page) => {
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const WETH = '0x4200000000000000000000000000000000000006', USDC = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913', CBBTC = '0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf';
   // Fixture server model.
-  let usdcDecimals = 6, cbbtcPerDay = '1000000', batch = null, persistError = null, reads = 0;
+  let usdcDecimals = 6, cbbtcPerDay = '1000000', batch = null, persistError = null, reads = 0, heldClear = null;
   const posts = [], errors = [];
   const allowances = () => [{ token: WETH, symbol: 'WETH', perDay: '1000000000000000000' }, { token: USDC, symbol: 'USDC', perDay: '1000000000' }, { token: CBBTC, symbol: 'cbBTC', perDay: cbbtcPerDay }];
   const state = () => ({
@@ -33,6 +33,7 @@ async (page) => {
     if (url.pathname === '/api/overview') return send({ projects: [], generatedAt: new Date().toISOString() });
     if (url.pathname === root && method === 'GET') { reads += 1; return send(state()); }
     if (url.pathname === `${root}/changes/allowances` && method === 'POST') { posts.push(request.postDataJSON()); return send(state()); }
+    if (url.pathname === `${root}/changes/clear` && method === 'POST') { heldClear = route; return; }
     return send({ error: 'isolated fixture' }, 404);
   };
   // The page re-reads its state when it becomes visible: a deterministic stand-in for the 15 s poll.
@@ -44,7 +45,7 @@ async (page) => {
     await page.waitForTimeout(100);
   };
   page.on('pageerror', (error) => errors.push(error.message));
-  page.on('dialog', (dialog) => dialog.accept());
+  await page.addInitScript(() => { window.confirm = () => true; });
   await page.route('**/*', handler);
   try {
     await page.goto(`${origin}/?view=aero&tab=config`);
@@ -115,9 +116,27 @@ async (page) => {
     await page.getByText('这份批次来自旧版本，没有记录 Safe 与 Roles 地址', { exact: false }).waitFor();
     assert(await page.getByRole('button', { name: '已执行，核对并启用' }).count() === 0, 'a stale batch has no apply button');
     await page.getByRole('alert').filter({ hasText: 'changes.json 写入失败' }).waitFor();
+
+    // 4. A queued write waits for the server/API's result, beyond both the old 20 s
+    // page limit and the 60 s API budget, then releases the button on rejection.
+    await page.clock.install();
+    const clear = page.getByRole('button', { name: '全部放弃', exact: true });
+    for (const elapsed of [25_000, 61_000]) {
+      await clear.click();
+      for (let i = 0; i < 100 && !heldClear; i++) await page.waitForTimeout(10);
+      assert(heldClear, 'the clear request reached the server fixture');
+      await page.clock.runFor(elapsed);
+      assert(await clear.isDisabled(), `the page still awaits the authoritative result at ${elapsed} ms`);
+      const route = heldClear; heldClear = null;
+      await route.fulfill({ status: 504, json: { error: '清空待变更超过 50 秒（含排队等待其他操作），未清空待变更，请稍后重试' } });
+      await page.getByRole('alert').filter({ hasText: '未清空待变更，请稍后重试' }).waitFor();
+      assert(await clear.isEnabled(), 'a rejected write releases the pending action');
+    }
+    await page.clock.resume();
     assert(errors.length === 0, `page errors: ${errors.join('; ')}`);
     return 'aero safe changes browser fixture passed';
   } finally {
+    if (heldClear) await heldClear.abort();
     await page.unroute('**/*', handler);
   }
 }

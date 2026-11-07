@@ -11,6 +11,7 @@ import * as executor from '../tools/aero-roles/executor.mjs';
 import { ROLES_ABI } from '../tools/aero-roles/roles-calls.mjs';
 import { CHANGE_BUDGET_MS, CHANGE_DEADLINE_MARGIN_MS, PENDING_STALE_MS, PREVIEW_TTL_MS, createAeroSafe, strictAeroSafeConfig } from '../server/automation/aero-safe.mjs';
 import { createApp } from '../server/app.mjs';
+import { HttpError } from '../server/http-common.mjs';
 import { FORWARD_BUDGET } from '../server/runtime/data-client.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -1142,6 +1143,9 @@ test('waiting in the serial queue counts toward the batch budget, and a callback
     } };
   const { manager } = managerWith(directory, { chain, manager: { now: () => Number(day0 + 3600n) * 1000, changeBudgetMs: 300 } });
   const open = { pool: OTHER, tickLower: -100, tickUpper: 100, shareBps: 5_000 };
+  // Preview now has its own budget too. Give the queued request an earlier API deadline,
+  // so the assertion proves queue expiry rather than racing the preview's expiry.
+  const queuedDeadline = () => ({ deadline: Number(day0 + 3600n) * 1000 + CHANGE_DEADLINE_MARGIN_MS + 150 });
   const batched = () => manager.state().events.filter((e) => e.event === 'changes_batched').length;
   try {
     await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
@@ -1153,7 +1157,7 @@ test('waiting in the serial queue counts toward the batch budget, and a callback
     previewGate = new Promise((resolve) => { release = resolve; });
     let previewing = manager.preview(open);
     let started = Date.now();
-    await assert.rejects(manager.buildChangeBatch(), (error) => error.status === 504 && /含排队等待其他操作/.test(error.message));
+    await assert.rejects(manager.buildChangeBatch(undefined, queuedDeadline()), (error) => error.status === 504 && /含排队等待其他操作/.test(error.message));
     assert.ok(Date.now() - started < 2_000, 'the queue wait is bounded by the budget');
     release(); await previewing; previewGate = null;
 
@@ -1162,7 +1166,7 @@ test('waiting in the serial queue counts toward the batch budget, and a callback
     readGate = new Promise((resolve) => { releaseRead = resolve; });
     previewGate = new Promise((resolve) => { release = resolve; });
     started = Date.now();
-    const building = manager.buildChangeBatch();
+    const building = manager.buildChangeBatch(undefined, queuedDeadline());
     await new Promise((resolve) => setTimeout(resolve, 20));
     previewing = manager.preview(open);
     releaseRead();
@@ -1199,14 +1203,15 @@ test('add-pool and apply count queue waits and slow reads toward the change budg
   const hold = () => { previewGate = deferred(); const previewing = manager.preview(open); return () => { previewGate.resolve(); previewGate = null; return previewing; }; };
   // Any queued callback left behind has run once a later queued step completes.
   const drain = () => manager.preview(open);
-  const add = () => manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } });
+  const queuedDeadline = () => ({ deadline: Date.now() + CHANGE_DEADLINE_MARGIN_MS + 150 });
+  const add = (options) => manager.addPoolChange({ pool: POOL, allowances: { [WETH]: '1' } }, undefined, options);
   try {
     await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
     await until(() => manager.state().chain);
 
     // 加池 1：队列被占住，第一步排不上；之后轮到也不读链、不写入。
     let free = hold(), started = Date.now();
-    await assert.rejects(add(), timedOut('加池'));
+    await assert.rejects(add(queuedDeadline()), timedOut('加池'));
     assert.ok(Date.now() - started < 2_000, 'the first queue wait is bounded by the budget');
     await free(); await drain();
     assert.deepEqual([inspected.length, manager.state().changes.pools.length, queuedOnDisk()], [0, 0, 0]);
@@ -1220,7 +1225,7 @@ test('add-pool and apply count queue waits and slow reads toward the change budg
 
     // 加池 3：核验返回了，但回到队列前队列又被占住；超时后轮到的回调不写入。
     inspectGate = deferred();
-    const adding = add();
+    const adding = add(queuedDeadline());
     await until(() => inspected.length === 2);
     free = hold();
     inspectGate.resolve(); inspectGate = null;
@@ -1236,7 +1241,7 @@ test('add-pool and apply count queue waits and slow reads toward the change budg
 
     // 启用 1：队列被占住，第一步排不上；之后轮到也不核对、不占用核对标记。
     free = hold(); started = Date.now();
-    await assert.rejects(manager.applyChangeBatch(), timedOut('核对启用'));
+    await assert.rejects(manager.applyChangeBatch(undefined, queuedDeadline()), timedOut('核对启用'));
     assert.ok(Date.now() - started < 2_000);
     await free(); await drain();
     assert.equal(verified.length, 0);
@@ -1251,7 +1256,7 @@ test('add-pool and apply count queue waits and slow reads toward the change budg
 
     // 启用 3：核对通过了，但回到队列前队列又被占住；超时后轮到的回调不写配置，批次保留。
     verifyGate = deferred();
-    const applying = manager.applyChangeBatch();
+    const applying = manager.applyChangeBatch(undefined, queuedDeadline());
     await until(() => verified.length === 2);
     free = hold();
     verifyGate.resolve(); verifyGate = null;
@@ -1277,6 +1282,169 @@ test('change requests answer before the API forward timeout, and the page waits 
   assert.ok(CHANGE_BUDGET_MS + 5_000 <= FORWARD_BUDGET, 'the server gives up and explains why before the API forward times out');
   assert.ok(pageMs >= FORWARD_BUDGET + 5_000, 'the page waits for the API reply, including its own timeout reply');
   assert.equal(FORWARD_BUDGET - CHANGE_DEADLINE_MARGIN_MS, CHANGE_BUDGET_MS, 'counted from the API receipt, the forwarded deadline gives the same budget');
+});
+
+test('all page writes and execute abandon an expired queue entry without changing files or starting a job', { timeout: 10_000 }, async () => {
+  const directory = fixtureDir(), gate = deferred(), entered = deferred();
+  let held = true, authorized = 0;
+  const chain = { ...fakeChain(), previewOpen: async () => { if (held) { entered.resolve(); await gate.promise; } return { amount0: 1n }; } };
+  const { manager } = managerWith(directory, { chain });
+  const open = { pool: OTHER, tickLower: -100, tickUpper: 100 };
+  const files = ['config.json', 'wallet.json', 'auto.json', 'policy.json', 'changes.json', 'pending.json', 'txs.jsonl'];
+  const disk = () => files.map((name) => { const file = join(directory, 'aero-safe', name); return existsSync(file) ? readFileSync(file, 'utf8') : null; });
+  let previewing;
+  try {
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+    await until(() => manager.state().chain && !manager.state().refreshing);
+    const before = disk(), events = manager.state().events;
+    previewing = manager.preview(open); await entered.promise;
+    const authorize = () => { authorized++; };
+    const options = { deadline: Date.now() + CHANGE_DEADLINE_MARGIN_MS + 100 };
+    const calls = [
+      () => manager.save({ ...baseConfig, slippageBps: 80 }, authorize, options),
+      () => manager.setKey('0x' + '22'.repeat(32), authorize, options),
+      () => manager.clearKey(authorize, options),
+      () => manager.setAuto({ enabled: false }, authorize, options),
+      () => manager.discardAuto(authorize, options),
+      () => manager.setPolicy({ pool: OTHER, state: 'stopped', capUsd: null, auto: false }, authorize, options),
+      () => manager.setAllowanceChanges({ [USDC]: '500' }, authorize, options),
+      () => manager.removePoolChange({ pool: OTHER }, authorize, options),
+      () => manager.clearChanges(authorize, options),
+      () => manager.preview(open, authorize, options),
+      () => manager.execute('claim', {}, authorize, options),
+    ];
+    const results = await Promise.allSettled(calls.map((call) => call()));
+    for (const result of results) { assert.equal(result.status, 'rejected'); assert.equal(result.reason.status, 504); }
+    assert.equal(authorized, 0, 'expired callbacks never enter the operation');
+    held = false; gate.resolve(); await previewing;
+    await manager.preview(open); // drain every abandoned callback
+    assert.equal(authorized, 0);
+    assert.deepEqual(disk(), before);
+    assert.deepEqual(manager.state().events, events);
+    assert.equal(manager.state().job, null); assert.deepEqual(chain.calls, []);
+    assert.equal((await manager.save({ ...baseConfig, slippageBps: 80 })).config.slippageBps, 80);
+  } finally { held = false; gate.resolve(); await previewing?.catch(() => {}); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('execute and preview stop after a slow connection; a late connection cannot start a job or block a new write', { timeout: 10_000 }, async () => {
+  for (const action of ['execute', 'preview']) {
+    const directory = fixtureDir(), gate = deferred(), entered = deferred();
+    let clock = Date.now(), held = false;
+    const base = fakeChain();
+    const chain = { ...base, connect: async (args) => { if (held) { entered.resolve(); await gate.promise; } return base.connect(args); } };
+    const { manager } = managerWith(directory, { chain, manager: { now: () => clock } });
+    try {
+      await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+      await until(() => manager.state().chain && !manager.state().refreshing);
+      clock += 11 * 60_000; held = true;
+      const options = { deadline: clock + CHANGE_DEADLINE_MARGIN_MS + 100 };
+      const pending = action === 'execute' ? manager.execute('claim', {}, undefined, options)
+        : manager.preview({ pool: OTHER, tickLower: -100, tickUpper: 100 }, undefined, options);
+      const rejected = assert.rejects(pending, (error) => error.status === 504);
+      await entered.promise; await rejected;
+      // The bounded read releases the serial queue even while the original RPC is still pending.
+      await manager.setPolicy({ pool: OTHER, state: 'stopped', capUsd: null, auto: false });
+      held = false; gate.resolve(); await delay(10);
+      assert.equal(manager.state().job, null); assert.deepEqual(chain.calls, []);
+      assert.equal(existsSync(join(directory, 'aero-safe/pending.json')), false);
+      assert.equal(existsSync(join(directory, 'aero-safe/txs.jsonl')), false);
+      await manager.execute('claim', {});
+      await until(() => manager.state().job?.status === 'done');
+      assert.equal(chain.calls.filter((call) => call === 'claim').length, 1);
+    } finally { held = false; gate.resolve(); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+  }
+});
+
+test('an execute timeout during pending settlement leaves the original durable record and ignores the late receipt', { timeout: 10_000 }, async () => {
+  const directory = fixtureDir(), gate = deferred(), entered = deferred();
+  let mode = 'waiting', manager, reads = 0;
+  const chain = fakeChain({ resolvePending: async () => {
+    reads++;
+    if (mode === 'waiting') return { state: 'waiting' };
+    if (mode === 'held') { entered.resolve(); await gate.promise; }
+    return { state: 'confirmed', receipt: { status: 1, blockNumber: 5, gasUsed: 1n, fee: 1n } };
+  } });
+  try {
+    manager = managerWith(directory, { chain }).manager;
+    await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY); await manager.close();
+    const file = join(directory, 'aero-safe/pending.json');
+    writeFileSync(file, JSON.stringify({ hash: '0x' + 'ab'.repeat(32), raw: '0x00', from: BOT.address, nonce: 0, label: '旧交易', at: Date.now() }));
+    manager = managerWith(directory, { chain }).manager;
+    await manager.initialize(); await until(() => manager.state().chain && !manager.state().refreshing);
+    const before = readFileSync(file, 'utf8');
+    // Invalid new requests must not recover or settle an old signed transaction.
+    for (mode of ['waiting', 'confirmed']) {
+      const previousReads = reads;
+      await assert.rejects(manager.execute('close', {}), (error) => error.status === 400 && /tokenId/.test(error.message));
+      assert.equal(reads, previousReads, 'validate the new request before querying an old receipt');
+      assert.equal(readFileSync(file, 'utf8'), before);
+      assert.equal(manager.state().ledger.length, 0);
+    }
+    mode = 'held';
+    const rejected = assert.rejects(manager.execute('claim', {}, undefined, { deadline: Date.now() + CHANGE_DEADLINE_MARGIN_MS + 100 }), (error) => error.status === 504);
+    await entered.promise; await rejected;
+    gate.resolve(); await delay(10);
+    assert.equal(readFileSync(file, 'utf8'), before);
+    assert.equal(manager.state().job, null); assert.deepEqual(chain.calls, []);
+    assert.equal(manager.state().ledger.length, 0);
+    mode = 'confirmed'; await manager.execute('claim', {});
+    await until(() => manager.state().job?.status === 'done');
+    assert.equal(manager.state().ledger.find((entry) => entry.label === '旧交易').status, 'confirmed');
+  } finally { gate.resolve(); await manager?.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('pending recovery rechecks the request before rebroadcasting an already signed transaction', async () => {
+  const gate = deferred(), entered = deferred(), rpc = fakeRpc({ nonce: 5 });
+  let expired = false;
+  rpc.getTransactionCount = async () => { entered.resolve(); await gate.promise; return 5; };
+  const pending = { hash: '0x' + 'cd'.repeat(32), raw: '0x01', from: BOT.address, nonce: 5 };
+  const resolving = executor.resolvePending(ctxWith(rpc), pending, { check: () => { if (expired) throw new Error('expired'); } });
+  const rejected = assert.rejects(resolving, /expired/);
+  await entered.promise; expired = true; gate.resolve(); await rejected;
+  assert.deepEqual(rpc.broadcasts, []);
+});
+
+test('opening rechecks preview expiry after recovering an old transaction and starts no new job', async () => {
+  const directory = fixtureDir();
+  let clock = Date.now(), recover = false, manager;
+  const chain = fakeChain({ resolvePending: async () => {
+    if (!recover) return { state: 'waiting' };
+    clock += 200;
+    return { state: 'confirmed', receipt: { status: 1, blockNumber: 5, gasUsed: 1n, fee: 1n } };
+  } });
+  const make = () => managerWith(directory, { chain, manager: { now: () => clock } }).manager;
+  try {
+    manager = make(); await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY); await manager.close();
+    writeFileSync(join(directory, 'aero-safe/pending.json'), JSON.stringify({ hash: '0x' + 'ac'.repeat(32), raw: '0x00', from: BOT.address, nonce: 0, label: '旧交易', at: clock }));
+    manager = make(); await manager.initialize(); await until(() => manager.state().chain && !manager.state().refreshing);
+    recover = true;
+    await assert.rejects(manager.execute('open', { pool: OTHER, tickLower: -100, tickUpper: 100,
+      expect: { previewedAt: clock - PREVIEW_TTL_MS + 100, amount0: '1', amount1: '0' } }),
+    (error) => error.status === 409 && /预览已超过/.test(error.message));
+    assert.equal(manager.state().ledger.length, 1, 'the initially valid request may settle the prior receipt');
+    assert.equal(manager.state().pending, null);
+    assert.equal(manager.state().job, null); assert.deepEqual(chain.calls, []);
+  } finally { await manager?.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('execute rechecks login and maintenance after reading, before starting any task', { timeout: 10_000 }, async () => {
+  for (const denial of ['login', 'maintenance']) {
+    const directory = fixtureDir(), gate = deferred(), entered = deferred();
+    let clock = Date.now(), held = false, active = true, maintenance = false;
+    const base = fakeChain(), chain = { ...base, connect: async (args) => { if (held) { entered.resolve(); await gate.promise; } return base.connect(args); } };
+    const { manager } = managerWith(directory, { chain, manager: { now: () => clock, readMaintenance: () => maintenance } });
+    try {
+      await manager.initialize(); await manager.save(baseConfig); await manager.setKey(KEY);
+      await until(() => manager.state().chain && !manager.state().refreshing);
+      clock += 11 * 60_000; held = true;
+      const executing = manager.execute('claim', {}, () => { if (!active) throw new HttpError(401, 'expired login'); });
+      const rejected = assert.rejects(executing, (error) => error.status === (denial === 'login' ? 401 : 503));
+      await entered.promise;
+      if (denial === 'login') active = false; else maintenance = true;
+      held = false; gate.resolve(); await rejected;
+      assert.equal(manager.state().job, null); assert.deepEqual(chain.calls, []);
+    } finally { gate.resolve(); await manager.close(); rmSync(directory, { recursive: true, force: true }); }
+  }
 });
 
 // Each step gets only what is left of the one deadline: a slow read after a long queue wait, or a held queue after a slow read,

@@ -310,7 +310,13 @@ test('an unreadable auto record halts auto and cannot be switched back on from t
   } finally { await manager.close(); rmSync(directory, { recursive: true }); }
 });
 
-const due = async (manager, clock) => { await manager.setAuto({ enabled: true }); await settled(manager); await manager.tickAuto(); clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager); };
+const due = async (manager, clock) => {
+  await manager.setAuto({ enabled: true });
+  // Consume the enable-triggered zero-delay tick before advancing the fake clock;
+  // otherwise it can become a second retry of the future operation under test.
+  await delay(0); await settled(manager); await manager.tickAuto();
+  clock.at += 5 * MIN; await manager.tickAuto(); await settled(manager);
+};
 
 test('a close stopped by maintenance before anything was signed is rolled back and retried later', async () => {
   const clock = { at: 1_000_000 };

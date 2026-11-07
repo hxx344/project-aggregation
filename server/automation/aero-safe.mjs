@@ -23,7 +23,7 @@ const REFRESH_MIN_MS = 5_000;
 // 头寸判为已销毁后，须隔这么久、且区块号前进后再次判定才删除记录（防负载均衡后面滞后的节点）。
 const BURN_CONFIRM_MS = 60_000;
 const REFRESH_BUDGET_MS = 60_000;
-// 白名单变更中要读链的请求（加池、生成批次、核对启用）从开始处理起的总时限，含两次排队等待与队列外读链
+// 页面操作从开始处理起的总时限，含排队等待与读链
 // （单次读取另有 20 秒超时、最多 2 次）：须短于 API 转发时限（60 秒），超时即不写盘，
 // 避免浏览器或 API 已放弃后仍在后台加入待加池、冻结批次或启用批次。页面等待时间相应长于 API 时限。
 export const CHANGE_BUDGET_MS = 50_000;
@@ -420,31 +420,30 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     if (applied) record({ event: 'changes_batch_recognized', pools: changes.batch.pools });
     keepChanges(next, '白名单待变更文件 aero-safe/changes.json 写入失败，页面显示的是整理后的内容；重启后会按配置重新整理。请检查数据目录权限');
   }
-  // 一次白名单变更请求的整体期限（changeBudgetMs，从开始处理起；有请求截止时间 requestDeadline 时不晚于它减去余量）：
-  // 两次排队与队列外读链都计入，超时返回 504。提示里的秒数按从 API 收到请求起算。
-  // 超时后才轮到的队列回调直接放弃、不写盘。queued 的回调须同步完成写盘，开始写盘后期限不会打断它，不会半写。
+  // 一次页面请求的整体期限，含排队与读链；超时返回 504，之后不能写盘或启动任务。
+  // 同步写入不会被定时器打断；异步回调须用 read 包住每次等待，并在副作用前 check。
   function changeBudget(what, undone, requestDeadline) {
     const own = now() + changeBudgetMs;
     const deadline = Number.isSafeInteger(requestDeadline) ? Math.min(own, requestDeadline - CHANGE_DEADLINE_MARGIN_MS) : own;
     let abandoned = false;
     const late = () => { abandoned = true; return new HttpError(504, `${what}超过 ${changeBudgetMs / 1000} 秒（含排队等待其他操作），${undone}，请稍后重试`); };
-    const left = () => { const ms = deadline - now(); if (ms <= 0) throw late(); return ms; };
+    const left = () => { const ms = deadline - now(); if (abandoned || ms <= 0) throw late(); return ms; };
     const queued = (fn) => {
       let ms;
       try { ms = left(); } catch (error) { return Promise.reject(error); }
       let timer;
       const budget = new Promise((_, reject) => { timer = setTimeout(() => reject(late()), ms); timer.unref?.(); });
-      return Promise.race([serial(() => { if (abandoned || now() >= deadline) throw late(); return fn(); }), budget]).finally(() => clearTimeout(timer));
+      return Promise.race([serial(() => { left(); return fn(); }), budget]).finally(() => clearTimeout(timer));
     };
     // start 在确认还有剩余时间后才调用，免得已超时仍发出读链请求。
     const read = async (start, label) => {
       const ms = left();
-      try { return await withBudget(start(), ms, label); } catch (error) {
+      try { const result = await withBudget(start(), ms, label); left(); return result; } catch (error) {
         if (error instanceof HttpError && error.status === 504) throw late();
         throw error;
       }
     };
-    return { queued, read };
+    return { queued, read, check: left };
   }
   // 链上读取并核验池子，返回带精度与符号的池子信息。
   async function inspect(poolAddress, cfg, budget) {
@@ -480,7 +479,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     return key;
   }
   // 连接按配置与钱包缓存 10 分钟；配置或钱包变化时作废。
-  async function connection() {
+  async function connection(check = () => {}) {
     if (!config) throw new HttpError(409, '请先保存 Safe 配置');
     const stamp = `${JSON.stringify(config)}:${wallet}`;
     if (context?.stamp === stamp && now() - context.at < CONTEXT_TTL_MS) return context.ctx;
@@ -488,6 +487,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     let key = null;
     try { key = readKey(); } catch { throw new HttpError(500, '已保存的 bot 私钥无法读取，请重新填写'); }
     const ctx = await chain.connect({ rpc, signer: key ? new Wallet(key, rpc) : null, safe: config.safe, roles: config.roles, config: config.permissions, now });
+    check();
     context = { stamp, at: now(), ctx };
     return ctx;
   }
@@ -516,11 +516,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   }
   // 结清上一笔已签名交易。返回 null（无待确认）或 'waiting'。
   // await 期间 pending 可能被同 nonce 替换，结清只针对开始时的那一笔。
-  async function resolve(ctx) {
+  async function resolve(ctx, check = () => {}) {
     const current = pending;
     if (!current) return null;
     if (current.unreadable) return 'waiting';
-    const result = await chain.resolvePending(ctx, current);
+    const result = await chain.resolvePending(ctx, current, { check });
+    check();
     if (result.state === 'waiting') return 'waiting';
     // 替换交易被丢弃而旧交易上链：先按旧交易的回执改记（台账按哈希取最新一行），再结清替换交易。
     // 旧交易那一行没写上时不结清替换交易：保留待确认记录，下次重试补记。
@@ -937,7 +938,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (config) void refresh();
     },
     // 保存自动调仓设置；重新启用会清除停用原因，若有待重开的币，下一轮先重开。
-    setAuto: (value, authorize = () => {}) => serial(() => {
+    setAuto: (value, authorize = () => {}, { deadline } = {}) => changeBudget('保存自动调仓设置', '未保存设置', deadline).queued(() => {
       authorize();
       if (autoCorrupt) throw new HttpError(409, autoCorrupt);
       const next = strictAutoConfig(value);
@@ -957,7 +958,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     }),
     // 保存一个池子的仓位策略 { pool, state, capUsd, auto }：立即生效，不需要 Safe 签名。
     // 不等进行中的任务：任务在开仓、重开前按最新策略再核对；已签名的步骤不受影响。
-    setPolicy: (value, authorize = () => {}) => serial(() => {
+    setPolicy: (value, authorize = () => {}, { deadline } = {}) => changeBudget('保存仓位策略', '未保存策略', deadline).queued(() => {
       authorize();
       if (policy.corrupt) throw new HttpError(409, policy.corrupt);
       const entry = strictPoolPolicy(value);
@@ -971,7 +972,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       return state();
     }),
     // 放弃进行中调仓的记录（平仓中断、待重开）：人工核对 Safe 后使用，之后自动调仓不再续做这一次。
-    discardAuto: (authorize = () => {}) => serial(() => {
+    discardAuto: (authorize = () => {}, { deadline } = {}) => changeBudget('放弃调仓记录', '未放弃记录', deadline).queued(() => {
       authorize();
       if (autoCorrupt) throw new HttpError(409, autoCorrupt);
       requireIdle('请等它结束');
@@ -989,7 +990,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       return state();
     }),
     refresh: (authorize = () => {}) => { authorize(); if (!config) throw new HttpError(409, '请先保存 Safe 配置'); if (!refreshing && snapshotAt && now() - snapshotAt < REFRESH_MIN_MS) return state(); void refresh(); return state(); },
-    save: (value, authorize = () => {}) => serial(() => {
+    save: (value, authorize = () => {}, { deadline } = {}) => changeBudget('保存配置', '未保存配置', deadline).queued(() => {
       authorize();
       requireIdle('不能修改配置');
       if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
@@ -1045,7 +1046,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       });
     },
     // 设定每日额度：{ 代币地址: 十进制数量 | null }。null 撤回对已有额度的调整；待加池新代币的额度只能改不能撤。
-    setAllowanceChanges: (input, authorize = () => {}) => serial(() => {
+    setAllowanceChanges: (input, authorize = () => {}, { deadline } = {}) => changeBudget('修改待变更额度', '未修改额度', deadline).queued(() => {
       authorize();
       requireChangesConfig();
       const given = input && typeof input === 'object' && !Array.isArray(input) ? input : null;
@@ -1072,7 +1073,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       return state();
     }),
     // 移出一个待加池（{ pool }）；它独有的新代币额度一并移除。
-    removePoolChange: (input, authorize = () => {}) => serial(() => {
+    removePoolChange: (input, authorize = () => {}, { deadline } = {}) => changeBudget('移出待加池', '未移出池子', deadline).queued(() => {
       authorize();
       requireChangesConfig();
       const poolAddress = address(input?.pool, '池子地址');
@@ -1187,12 +1188,12 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       } finally { if (claimed) verifyingBatch = false; }
     },
     // 放弃全部待变更与已生成的批次（批次如已在 Safe 执行，链上权限不会因此撤回）。
-    clearChanges: (authorize = () => {}) => serial(() => {
+    clearChanges: (authorize = () => {}, { deadline } = {}) => changeBudget('清空待变更', '未清空待变更', deadline).queued(() => {
       authorize();
       saveChanges({ ...EMPTY_CHANGES });
       return state();
     }),
-    setKey: (privateKey, authorize = () => {}) => serial(() => {
+    setKey: (privateKey, authorize = () => {}, { deadline } = {}) => changeBudget('保存 bot 私钥', '未保存私钥', deadline).queued(() => {
       authorize();
       if (typeof privateKey !== 'string' || !PRIVATE_KEY_PATTERN.test(privateKey.trim())) throw new HttpError(400, '私钥须为 64 位十六进制字符（可带 0x 前缀）');
       requireIdle('不能更换 bot 私钥');
@@ -1208,7 +1209,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (config) void refresh();
       return state();
     }),
-    clearKey: (authorize = () => {}) => serial(() => {
+    clearKey: (authorize = () => {}, { deadline } = {}) => changeBudget('清除 bot 私钥', '未清除私钥', deadline).queued(() => {
       authorize();
       requireIdle('不能清除 bot 私钥');
       if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能清除 bot 私钥');
@@ -1218,41 +1219,59 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       }
       wallet = null; context = null; return state();
     }),
-    preview: (params, authorize = () => {}) => serial(async () => {
-      authorize();
-      const parsed = parseParams('open', params, config ?? DEFAULTS, null);
-      let ctx;
-      try { ctx = await connection(); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
-      try {
-        const { cap, limit } = await openLimit(ctx, parsed.pool, parsed.cap);
-        return jsonable({ ...(await chain.previewOpen(ctx, { ...parsed, cap })), capUsd: cap?.usd ?? null, limit, previewedAt: now() });
-      } catch (error) {
-        if (error instanceof chain.ExecError) throw new HttpError(400, error.message);
-        throw new HttpError(502, `预览失败：${error.message}`);
-      }
-    }),
+    preview: (params, authorize = () => {}, { deadline } = {}) => {
+      const budget = changeBudget('预览', '未生成预览', deadline);
+      const check = () => { budget.check(); authorize(); if (closed) throw new HttpError(503, 'Aero 实盘服务正在关闭'); };
+      return budget.queued(async () => {
+        check();
+        const parsed = parseParams('open', params, config ?? DEFAULTS, null);
+        let ctx;
+        try { ctx = await budget.read(() => connection(check), '连接链上'); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
+        try {
+          const { cap, limit } = await budget.read(() => openLimit(ctx, parsed.pool, parsed.cap), '核对仓位上限');
+          const result = await budget.read(() => chain.previewOpen(ctx, { ...parsed, cap }), '预览开仓');
+          check();
+          return jsonable({ ...result, capUsd: cap?.usd ?? null, limit, previewedAt: now() });
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          if (error instanceof chain.ExecError) throw new HttpError(400, error.message);
+          throw new HttpError(502, `预览失败：${error.message}`);
+        }
+      });
+    },
     // 启动任务后立即返回；页面轮询 state().job。
-    execute: (action, params, authorize = () => {}) => serial(async () => {
-      authorize();
-      if (!ACTIONS.has(action)) throw new HttpError(404, '未知操作');
-      if (!config) throw new HttpError(409, '请先保存 Safe 配置');
-      if (!wallet) throw new HttpError(409, '请先填写 bot 私钥');
-      const hold = holdReason();
-      if (hold) throw new HttpError(503, hold);
-      requireIdle('请等它结束');
-      if (pending?.unreadable) throw new HttpError(409, '待确认交易记录损坏，请核对 bot 地址的链上交易后删除 aero-safe/pending.json');
-      let ctx;
-      try { ctx = await connection(); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
-      const parsed = parseParams(action, params, config, ctx.tokens, now(), action === 'open');
-      if (pending) {
-        let status;
-        try { status = await resolve(ctx); } catch (error) { throw new HttpError(502, `核对上一笔交易失败：${error.message}`); }
-        if (status === 'waiting' && ledgerError) throw new HttpError(409, ledgerError);
-        if (status === 'waiting' && now() - pending.at < PENDING_STALE_MS) throw new HttpError(409, `上一笔交易（${pending.label}）仍在等待上链，请稍后再试`);
-      }
-      startJob(action, parsed);
-      return state();
-    }),
+    execute: (action, params, authorize = () => {}, { deadline } = {}) => {
+      const budget = changeBudget('启动执行', '未启动任务', deadline);
+      const check = () => {
+        budget.check(); authorize();
+        if (closed) throw new HttpError(503, 'Aero 实盘服务正在关闭');
+        const hold = holdReason();
+        if (hold) throw new HttpError(503, hold);
+      };
+      return budget.queued(async () => {
+        check();
+        if (!ACTIONS.has(action)) throw new HttpError(404, '未知操作');
+        if (!config) throw new HttpError(409, '请先保存 Safe 配置');
+        if (!wallet) throw new HttpError(409, '请先填写 bot 私钥');
+        requireIdle('请等它结束');
+        if (pending?.unreadable) throw new HttpError(409, '待确认交易记录损坏，请核对 bot 地址的链上交易后删除 aero-safe/pending.json');
+        let ctx;
+        try { ctx = await budget.read(() => connection(check), '连接链上'); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `连接链上失败：${error.message}`); }
+        const parsed = parseParams(action, params, config, ctx.tokens, now(), action === 'open');
+        if (pending) {
+          let status;
+          try { status = await budget.read(() => resolve(ctx, check), '核对上一笔交易'); } catch (error) { if (error instanceof HttpError) throw error; throw new HttpError(502, `核对上一笔交易失败：${error.message}`); }
+          if (status === 'waiting' && ledgerError) throw new HttpError(409, ledgerError);
+          if (status === 'waiting' && now() - pending.at < PENDING_STALE_MS) throw new HttpError(409, `上一笔交易（${pending.label}）仍在等待上链，请稍后再试`);
+        }
+        check();
+        requireIdle('请等它结束');
+        // 参数先于旧交易恢复校验；等待回执期间预览可能到期，启动前再核对时效。
+        if (action === 'open') parseExpect(params.expect, now());
+        startJob(action, parsed);
+        return state();
+      });
+    },
     // 更新停机前：维护标记已让任务在下一次签名前停下；只有已签名、回执未到时拒绝停机。
     async prepareStop() {
       // 调仓任务在平仓与落盘待重开之间也没有待确认交易，停机会丢进度：等它在下一次签名前因维护停下。

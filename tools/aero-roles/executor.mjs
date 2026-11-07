@@ -459,7 +459,7 @@ export async function readState(ctx, { knownIds = [] } = {}) {
 }
 
 // 已签名交易的去向：confirmed / reverted（已上链）、dropped（同一 nonce 已被其他交易占用，这笔不会再上链）、waiting（仍可能上链，重新广播一次）。
-export async function resolvePending(ctx, pending) {
+export async function resolvePending(ctx, pending, { check = () => {} } = {}) {
   const receipt = await read('交易回执', () => ctx.rpc.getTransactionReceipt(pending.hash));
   if (receipt) return { state: receipt.status === 1 ? 'confirmed' : 'reverted', receipt };
   const nonce = await read('bot nonce', () => ctx.rpc.getTransactionCount(pending.from, 'latest'));
@@ -474,6 +474,8 @@ export async function resolvePending(ctx, pending) {
     }
     return { state: 'dropped', replaced: null, replacedReceipt: null };
   }
+  // 请求触发的核对可能已超时或登录/维护状态改变；后台恢复沿用默认检查。
+  check();
   try { await ctx.rpc.broadcastTransaction(pending.raw); } catch {}
   return { state: 'waiting' };
 }

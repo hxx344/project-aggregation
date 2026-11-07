@@ -335,18 +335,17 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
       authorize();
       const only = (...keys) => { if (Object.keys(body).some((key) => !keys.includes(key))) throw new HttpError(400, '请求包含未知字段'); };
-      if (action === 'save') { only('config'); return reply(200, await aeroSafe.save(body.config, authorize)); }
-      if (action === 'setKey') { only('privateKey'); return reply(200, await aeroSafe.setKey(body.privateKey, authorize)); }
-      if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize)); }
-      if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize)); }
-      if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize)); }
-      if (action === 'setPolicy') { only('policy'); return reply(200, await aeroSafe.setPolicy(body.policy, authorize)); }
+      if (action === 'save') { only('config'); return reply(200, await aeroSafe.save(body.config, authorize, { deadline })); }
+      if (action === 'setKey') { only('privateKey'); return reply(200, await aeroSafe.setKey(body.privateKey, authorize, { deadline })); }
+      if (action === 'preview') { only('params'); return reply(200, await aeroSafe.preview(body.params, authorize, { deadline })); }
+      if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize, { deadline })); }
+      if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize, { deadline })); }
+      if (action === 'setPolicy') { only('policy'); return reply(200, await aeroSafe.setPolicy(body.policy, authorize, { deadline })); }
       if (action === 'addPoolChange') { only('pool', 'allowances'); return reply(200, await aeroSafe.addPoolChange(body, authorize, { deadline })); }
-      if (action === 'setAllowanceChanges') { only('allowances'); return reply(200, await aeroSafe.setAllowanceChanges(body.allowances, authorize)); }
-      if (action === 'removePoolChange') { only('pool'); return reply(200, await aeroSafe.removePoolChange(body, authorize)); }
+      if (action === 'setAllowanceChanges') { only('allowances'); return reply(200, await aeroSafe.setAllowanceChanges(body.allowances, authorize, { deadline })); }
+      if (action === 'removePoolChange') { only('pool'); return reply(200, await aeroSafe.removePoolChange(body, authorize, { deadline })); }
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
-      if (action === 'buildChangeBatch' || action === 'applyChangeBatch') return reply(200, await aeroSafe[action](authorize, { deadline }));
-      return reply(200, await aeroSafe[action](authorize));
+      return reply(200, await aeroSafe[action](authorize, { deadline }));
     }
     if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {
       if (url.search) throw new HttpError(400, '汇总接口不接受查询参数');

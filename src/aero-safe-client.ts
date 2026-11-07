@@ -3,7 +3,7 @@ import { api, ApiError } from './api';
 import type { AeroPoolPolicy, AeroPoolState, AeroSafeAction, AeroSafeChain, AeroSafeChangeBatch, AeroSafePreview, AeroSafeState } from './aero-safe-types';
 
 export const AERO_SAFE_ROOT = '/api/automation/aero-safe';
-// 加池、生成批次、核对启用：服务端从收到请求起 50 秒内（含排队）给出结果，API 转发时限 60 秒；
+// 预览、执行与配置写入：服务端从收到请求起 50 秒内（含排队）给出结果，API 转发时限 60 秒；
 // 页面等得比二者都长，让知道原因的一层先回复。
 export const CHANGE_TIMEOUT_MS = 70_000;
 const message = (reason: unknown) => (reason instanceof Error ? reason.message : '请求失败，请重试。');
@@ -80,7 +80,7 @@ export function useAeroSafe(onExpired: () => void) {
     return () => { clearInterval(poll); document.removeEventListener('visibilitychange', visibility); };
   }, [read, active]);
   // 写操作：成功返回最新状态；失败把错误放进 actionError 并返回 null。
-  const call = useCallback(async (name: string, path: string, method: 'PUT' | 'POST', body: unknown, timeoutMs = 20_000): Promise<AeroSafeState | null> => {
+  const call = useCallback(async (name: string, path: string, method: 'PUT' | 'POST', body: unknown, timeoutMs = CHANGE_TIMEOUT_MS): Promise<AeroSafeState | null> => {
     const signal = lifetime.current?.signal;
     if (busyRef.current || !signal || signal.aborted) return null;
     busyRef.current = name; setBusy(name); setActionError('');
@@ -89,12 +89,12 @@ export function useAeroSafe(onExpired: () => void) {
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);
-  const execute = useCallback((action: AeroSafeAction, params: Record<string, unknown>) => call(action, '/execute', 'POST', { action, params }, 60_000), [call]);
+  const execute = useCallback((action: AeroSafeAction, params: Record<string, unknown>) => call(action, '/execute', 'POST', { action, params }), [call]);
   const preview = useCallback(async (params: Record<string, unknown>): Promise<AeroSafePreview | null> => {
     const signal = lifetime.current?.signal;
     if (busyRef.current || !signal || signal.aborted) return null;
     busyRef.current = 'preview'; setBusy('preview'); setActionError('');
-    try { return await api<AeroSafePreview>(`${AERO_SAFE_ROOT}/preview`, { method: 'POST', body: JSON.stringify({ params }), signal, timeoutMs: 60_000 }); }
+    try { return await api<AeroSafePreview>(`${AERO_SAFE_ROOT}/preview`, { method: 'POST', body: JSON.stringify({ params }), signal, timeoutMs: CHANGE_TIMEOUT_MS }); }
     catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = ''; if (!signal.aborted) setBusy(''); }
   }, [fail]);
