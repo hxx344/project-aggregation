@@ -4,7 +4,7 @@ import { ArrowRightLeft, ChevronDown, CircleAlert, Clock3, Link2, LoaderCircle, 
 import { api, ApiError } from './api';
 import { pairExchanges } from './trading-cache';
 import type { TradingExchange, TradingPair } from './trading-types';
-import type { AnthropicShares, ExecutionAccountMode, ExecutionAction, ExecutionConnection, ExecutionExchange, ExecutionJob, ExecutionLegInput, ExecutionMarket, ExecutionOrderType, ExecutionPlanInput, ExecutionPreset, ExecutionPreview, ExecutionSide, ExecutionState, ExecutionSymbol } from './trading-execution-types';
+import type { AnthropicShares, ExecutionAccountMode, ExecutionAction, ExecutionConnection, ExecutionExchange, ExecutionJob, ExecutionLegInput, ExecutionMarket, ExecutionOrderType, ExecutionPlanInput, ExecutionPreset, ExecutionPreview, ExecutionSide, ExecutionState, ExecutionSubmission, ExecutionSymbol } from './trading-execution-types';
 import { ANTHROPIC_CONTRACTS, contractKey, findContract, sharesProblem } from './trading-anthropic';
 import { readTradingPreferences, saveTradingPreferences, TRADING_PAIRS } from './trading-preferences';
 import type { ExecutionPreferences } from './trading-preferences';
@@ -42,6 +42,19 @@ const orderSide = (action: ExecutionAction, side: ExecutionSide) => (action === 
 const operation = (action: ExecutionAction, side: ExecutionSide) => `${orderSide(action, side) === 'buy' ? '买入' : '卖出'}${action === 'open' ? '开' : '平'}${side === 'long' ? '多' : '空'}`;
 const legKey = (leg: Pick<ExecutionLegInput, 'exchange' | 'symbol'>) => `${leg.exchange}-${leg.symbol}`;
 const terminal = (job: ExecutionJob) => job.status === 'completed' || job.status === 'stopped';
+const TRACKING_STATUS: Record<ExecutionJob['status'], string> = {
+  queued: '组合已受理，正在等待执行。', running: '组合正在成交，持续跟踪各腿进度。',
+  stopping: '正在撤销余单并核对成交，尚未结束。', paused: '组合已暂停，尚未全部成交；请核对原因后决定是否继续剩余数量。',
+  attention: '组合待核对，尚不能确认完成；请核对下方委托状态。',
+  completed: '组合已全部成交，成交结果保留如下。', stopped: '组合已停止，已成交仓位保留；未成交数量不会继续执行。',
+};
+// Display progress only: exact decimals prevent a small remainder rounding up to 100%.
+const fillPercent = (filled: string, target: string) => {
+  const scaled = (value: string) => { const [integer, fraction = ''] = value.split('.'); return BigInt(integer + fraction.padEnd(18, '0')); };
+  if (![filled, target].every(value => /^\d+(?:\.\d{1,18})?$/.test(value)) || !positive(target)) return '—';
+  const tenths = scaled(filled) * 1000n / scaled(target);
+  return `${tenths / 10n}${tenths % 10n ? `.${tenths % 10n}` : ''}%`;
+};
 type LegStructure = Pick<ExecutionLegInput, 'exchange' | 'symbol' | 'side'>;
 type MutationResult<T> = { ok: true; value: T } | { ok: false; error?: unknown };
 type Write = (suffix: string, body: object, method?: 'POST' | 'PUT' | 'DELETE') => Promise<boolean>;
@@ -156,8 +169,8 @@ const JobCard = memo(function JobCard({ job, disabled, canPreview, write, resume
     {job.reason ? <p className="execution-job-reason" role={job.status === 'attention' ? 'alert' : undefined}>{job.reason}</p> : null}
     <div className="execution-table-wrap"><table className="execution-progress-table"><thead><tr><th scope="col">交易腿</th><th scope="col">已成交 / 目标<small>原生合约单位</small></th><th scope="col">剩余数量</th><th scope="col">当前委托 / 策略</th><th scope="col">最后对账<small>北京时间</small></th></tr></thead><tbody>{job.legs.map(leg => <tr key={leg.id}>
       <th scope="row"><strong>{EXCHANGES[leg.exchange]} {leg.symbol}</strong><span className={`execution-side ${leg.side}`}>{operation(job.action, leg.side)}</span></th>
-      <td data-label="已成交 / 目标"><strong>{amount(leg.filledQuantity)}</strong> / {amount(leg.quantity)}{leg.exchange === 'okx' ? ' 张' : ''}</td><td data-label="剩余数量">{amount(leg.remainingQuantity)}{leg.exchange === 'okx' ? ' 张' : ''}</td>
-      <td data-label="当前委托 / 策略">{leg.currentOrder ? <><span className={leg.currentOrder.unknown ? 'execution-warning' : ''}>{leg.currentOrder.unknown ? '结果未知，等待核对' : leg.currentOrder.state}</span><small>{leg.currentOrder.kind === 'strategy' ? 'Bybit 原生追逐' : leg.orderType === 'market' ? `${EXCHANGES[leg.exchange]} 市价单` : `${EXCHANGES[leg.exchange]} 同向价一`}{leg.currentOrder.price ? ` · ${amount(leg.currentOrder.price)} ${quoteAsset(leg.exchange)}` : ''}</small>{leg.currentOrder.id || leg.currentOrder.kind !== 'strategy' && leg.currentOrder.clientId ? <small style={{ maxWidth: '26ch', marginLeft: 'auto', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{leg.currentOrder.id ? `${leg.currentOrder.kind === 'strategy' ? '策略' : '订单'} ID：${leg.currentOrder.id}` : `客户单号：${leg.currentOrder.clientId}`}</small> : null}</> : '尚无活动委托'}</td>
+      <td data-label="已成交 / 目标"><span><strong>{amount(leg.filledQuantity)}</strong> / {amount(leg.quantity)}{leg.exchange === 'okx' ? ' 张' : ''}<small>成交进度 {fillPercent(leg.filledQuantity, leg.quantity)}</small></span></td><td data-label="剩余数量">{amount(leg.remainingQuantity)}{leg.exchange === 'okx' ? ' 张' : ''}</td>
+      <td data-label="当前委托 / 策略">{leg.currentOrder ? <><span className={leg.currentOrder.unknown ? 'execution-warning' : ''}>{leg.currentOrder.unknown ? '结果未知，等待核对' : leg.currentOrder.state}</span><small>{leg.currentOrder.kind === 'strategy' ? 'Bybit 原生追逐' : leg.orderType === 'market' ? `${EXCHANGES[leg.exchange]} 市价单` : `${EXCHANGES[leg.exchange]} 同向价一`}{leg.currentOrder.price ? ` · 委托价 ${amount(leg.currentOrder.price)} ${quoteAsset(leg.exchange)}` : ''}</small>{leg.currentOrder.id || leg.currentOrder.kind !== 'strategy' && leg.currentOrder.clientId ? <small style={{ maxWidth: '26ch', marginLeft: 'auto', whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{leg.currentOrder.id ? `${leg.currentOrder.kind === 'strategy' ? '策略' : '订单'} ID：${leg.currentOrder.id}` : `客户单号：${leg.currentOrder.clientId}`}</small> : null}</> : '尚无活动委托'}</td>
       <td data-label="最后对账">{date(leg.currentOrder?.lastCheckedAt ?? null)}</td>
     </tr>)}</tbody></table></div>
     {job.legs.filter(leg => leg.currentOrder?.unknown).map(leg => {
@@ -199,6 +212,7 @@ const Preview = memo(function Preview({ preview, expired, disabled, uncertain, o
 
 export default function TradingExecution({ pair, onPair, onExpired, shares, onShares }: { pair: TradingPair; onPair: (value: TradingPair) => void; onExpired: () => void; shares: AnthropicShares; onShares: (value: AnthropicShares) => void }) {
   const [state, setState] = useState<ExecutionState | null>(null);
+  const [trackedJob, setTrackedJob] = useState<ExecutionJob | null>(null);
   const [busy, setBusy] = useState(false), [reading, setReading] = useState(false);
   const [readError, setReadError] = useState(''), [writeError, setWriteError] = useState(''), [notice, setNotice] = useState('');
   const [offline, setOffline] = useState(!navigator.onLine), [expiredSession, setExpiredSession] = useState(false);
@@ -216,21 +230,27 @@ export default function TradingExecution({ pair, onPair, onExpired, shares, onSh
   const mounted = useRef(false), busyRef = useRef(false), readController = useRef<AbortController | null>(null), writeController = useRef<AbortController | null>(null);
   const responseVersion = useRef(0), lastSuccess = useRef<number | null>(null), expiresHandler = useRef(onExpired);
   const connectionsRef = useRef<HTMLDetailsElement>(null), reviewRef = useRef<HTMLDivElement>(null);
+  const trackingRef = useRef<HTMLElement>(null), focusTracking = useRef(false);
+  const trackedJobId = useRef<string | null>(null);
+  trackedJobId.current = trackedJob?.id ?? null;
   expiresHandler.current = onExpired;
   const pairRef = useRef(pair);
   const pairVersion = useRef(0);
   pairRef.current = pair;
   // Reset before children commit, so a new pair never exposes the old direction or preview.
   if (draftPair !== pair) { pairVersion.current++; setDraftPair(pair); updatePreferences({ orientation: '' }); setValues({}); setEqualSize(''); setReview(null); setWriteError(''); setNotice(''); }
-  const acceptState = useCallback((value: ExecutionState) => { lastSuccess.current = performance.now(); setState(value); setReadError(''); }, []);
-  const expire = useCallback(() => { if (!mounted.current) return; readController.current?.abort(); writeController.current?.abort(); setState(null); setReview(null); setExpiredSession(true); expiresHandler.current(); }, []);
+  const acceptState = useCallback((value: ExecutionState) => {
+    lastSuccess.current = performance.now(); setState(value); setReadError('');
+    setTrackedJob(current => current ? value.jobs.find(job => job.id === current.id) ?? current : value.jobs.find(job => !job.auto) ?? null);
+  }, []);
+  const expire = useCallback(() => { if (!mounted.current) return; readController.current?.abort(); writeController.current?.abort(); setState(null); setTrackedJob(null); setReview(null); setExpiredSession(true); expiresHandler.current(); }, []);
   const load = useCallback(async (force = false) => {
     if (!mounted.current || busyRef.current || !navigator.onLine) return;
     if (readController.current) { if (!force) return; readController.current.abort(); }
     const controller = new AbortController(), version = responseVersion.current;
     readController.current = controller; setReading(true);
     try {
-      const value = await api<ExecutionState>(BASE, { signal: controller.signal, timeoutMs: 12_000 });
+      const value = await api<ExecutionState>(BASE + (trackedJobId.current ? `?jobId=${encodeURIComponent(trackedJobId.current)}` : ''), { signal: controller.signal, timeoutMs: 12_000 });
       if (mounted.current && !controller.signal.aborted && version === responseVersion.current) acceptState(value);
     } catch (error) {
       if (!mounted.current || controller.signal.aborted) return;
@@ -279,6 +299,7 @@ export default function TradingExecution({ pair, onPair, onExpired, shares, onSh
     return () => { disposed = true; mounted.current = false; cancelResume(); clearTimeout(timer); clearInterval(clock); readController.current?.abort(); writeController.current?.abort(); document.removeEventListener('visibilitychange', wake); window.removeEventListener('focus', wake); window.removeEventListener('pageshow', wake); window.removeEventListener('online', wake); window.removeEventListener('offline', disconnected); };
   }, [load]);
   useEffect(() => { if (review) reviewRef.current?.querySelector<HTMLElement>('.execution-review')?.focus(); }, [review?.preview.id]);
+  useEffect(() => { if (trackedJob && focusTracking.current) { focusTracking.current = false; trackingRef.current?.focus(); } }, [trackedJob]);
 
   async function mutate<T>(suffix: string, body: object, method: 'POST' | 'PUT' | 'DELETE' = 'POST'): Promise<MutationResult<T>> {
     if (busyRef.current || !navigator.onLine || !mounted.current || expiredSession) return { ok: false };
@@ -329,8 +350,12 @@ export default function TradingExecution({ pair, onPair, onExpired, shares, onSh
     const current = review;
     const requestedVersion = pairVersion.current;
     setReview({ ...current, uncertain: true });
-    const result = await mutate<ExecutionState>('/jobs', { previewId: current.preview.id, requestId: current.requestId, confirmLive: true });
-    if (result.ok) { acceptState(result.value); setReview(null); setNotice('组合已受理。实际成交与余单状态见执行进度。'); }
+    const result = await mutate<ExecutionSubmission>('/jobs', { previewId: current.preview.id, requestId: current.requestId, confirmLive: true });
+    if (result.ok) {
+      acceptState(result.value); setReview(null);
+      if (result.value.acceptedJob) { focusTracking.current = true; setTrackedJob(result.value.acceptedJob); }
+      else setNotice('组合已受理，但未返回本次执行编号，请在执行进度核对。');
+    }
     // The server resolves a persisted request ID before checking preview expiry.
     // A definite rejection therefore lets this same submission return to editing.
     else if (result.error instanceof ApiError && [400, 403, 404, 409, 422].includes(result.error.status) && mounted.current && current.pair === pairRef.current && requestedVersion === pairVersion.current) setReview({ ...current, uncertain: false });
@@ -349,7 +374,9 @@ export default function TradingExecution({ pair, onPair, onExpired, shares, onSh
   const serverNow = state ? Date.parse(state.generatedAt) + elapsed : Date.now();
   const reviewExpired = !!review && serverNow >= Date.parse(review.preview.expiresAt);
   const disabled = busy || offline;
-  const activeJobs = state?.jobs.filter(job => !terminal(job)) ?? [], pastJobs = state?.jobs.filter(terminal) ?? [];
+  const activeJobs = state?.jobs.filter(job => !terminal(job) && job.id !== trackedJob?.id) ?? [], pastJobs = state?.jobs.filter(job => terminal(job) && job.id !== trackedJob?.id) ?? [];
+  const trackingMissing = !!trackedJob && !terminal(trackedJob) && !state?.jobs.some(job => job.id === trackedJob.id);
+  const trackingStale = offline || stale || !!readError || trackingMissing;
   const [leftName, rightName] = pairExchanges(pair).map(exchange => EXCHANGES[exchange]);
   if (expiredSession) return <section className="trading-panel execution-panel"><p className="execution-session-expired">登录已过期，请重新登录后核对执行状态。</p></section>;
   return <section className="trading-panel execution-panel" aria-labelledby="execution-title">
@@ -358,6 +385,12 @@ export default function TradingExecution({ pair, onPair, onExpired, shares, onSh
     {readError ? <p className="execution-message warning" role="alert">{readError}</p> : null}
     {writeError ? <p className="execution-message warning" role="alert"><CircleAlert size={16} />{writeError}</p> : null}
     {notice ? <p className="execution-message" role="status">{notice}</p> : null}
+    {trackedJob ? <section ref={trackingRef} tabIndex={-1} className="execution-jobs execution-tracking" aria-label="组合成交跟踪">
+      <h3>成交进度与结果</h3>
+      <p className={`execution-tracking-status${trackingStale || ['paused', 'attention', 'stopping'].includes(trackedJob.status) ? ' warning' : ''}`} role="status">{trackingStale ? '进度暂未更新，以下保留上次确认的结果；恢复后继续核对。' : TRACKING_STATUS[trackedJob.status]}</p>
+      <p className="execution-tracking-id">执行编号：{trackedJob.id}{trackingMissing ? ' · 本轮未返回此任务，尚不能确认完成' : ''}</p>
+      <JobCard key={trackedJob.id} job={trackedJob} disabled={disabled || trackingMissing} canPreview={!review && !trackingStale} write={write} resume={id => void preview({ resumeJobId: id })} />
+    </section> : null}
     {activeJobs.length ? <div className="execution-jobs" aria-label="当前执行"><h3>执行进度</h3>{activeJobs.map(job => <JobCard key={job.id} job={job} disabled={disabled} canPreview={!review} write={write} resume={id => void preview({ resumeJobId: id })} />)}</div> : null}
     <div ref={reviewRef}>{review ? <Preview preview={review.preview} expired={reviewExpired} disabled={disabled} uncertain={review.uncertain} onSubmit={() => void confirm()} onEdit={() => { setReview(null); setWriteError(''); }} /> : null}</div>
     <form className="execution-builder" onSubmit={submit} aria-label="组合交易参数">

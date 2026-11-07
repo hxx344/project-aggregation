@@ -419,7 +419,10 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // them (withExecutionEntry); here each one also holds an execution entry
     // against the durable maintenance flag. Stop and reconcile stay open.
     if (pathname === '/api/trading/execution' || pathname.startsWith('/api/trading/execution/')) {
-      if (pathname === '/api/trading/execution' && method === 'GET') return reply(200, execution.state());
+      if (pathname === '/api/trading/execution' && method === 'GET') {
+        if (url.search && [...url.searchParams.keys()].join() !== 'jobId') throw new HttpError(400, '执行状态只接受一个 jobId 参数');
+        return reply(200, execution.state(url.searchParams.get('jobId')));
+      }
       if (pathname === '/api/trading/execution/quotes' && method === 'GET') {
         if (url.search) throw new HttpError(400, '行情接口不接受查询参数');
         const data = await execution.quotes();

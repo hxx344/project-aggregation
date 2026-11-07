@@ -124,6 +124,9 @@
 
 .execution-jobs{padding:14px 16px 0}
 .execution-jobs>h3{font-size:14px;margin-bottom:12px;color:var(--text-primary)}
+.execution-tracking-status{margin-bottom:8px;color:var(--execution-accent);font-size:13px;line-height:1.8}
+.execution-tracking-status.warning{color:var(--execution-alert)}
+.execution-tracking-id{margin-bottom:12px;color:var(--execution-muted);font-size:11px;overflow-wrap:anywhere}
 
 .execution-job{border:1px solid var(--execution-border);border-radius:var(--radius-md);background:var(--surface-2);overflow:hidden;margin-bottom:12px}
 .execution-job>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:11px 14px}

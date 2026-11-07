@@ -70,7 +70,7 @@ async (page) => {
       jobs = [{ id: 'fixture-job-1', market: 'anthropic', preset: preview.preset, action: 'open', status: 'running', createdAt: stamp(), updatedAt: stamp(), deadlineAt: new Date(Date.now() + 120_000).toISOString(), batchIndex: 0, batchCount: 1, reason: null, canResume: false,
         legs: preview.legs.map(leg => ({ ...leg, filledQuantity: '0', remainingQuantity: leg.quantity, currentOrder: { id: `9${leg.id.slice(-1)}001`, clientId: null, kind: 'order', state: '挂单中', lastCheckedAt: stamp(), price: leg.orderSide === 'buy' ? leg.bid : leg.ask, filledQuantity: '0', unknown: false } })),
         events: [{ time: stamp(), message: '模拟执行已受理。' }] }];
-      return send(execution(), 202);
+      return send({ ...execution(), acceptedJob: jobs[0] }, 202);
     }
     return send({ error: 'Unexpected execution fixture route' }, 404);
   });
@@ -194,9 +194,9 @@ async (page) => {
   const same = lastPreview();
   assert(same.preset === 'same-exchange' && JSON.stringify(same.legs.map(leg => [leg.symbol, leg.side])) === JSON.stringify([['io:ANTH', 'short'], ['xyz:ANT', 'long']]), 'reverse same-venue pair');
   await panel.getByRole('button', { name: '确认并一键开仓' }).click();
-  await panel.getByText('组合已受理。', { exact: false }).waitFor();
+  await panel.getByText('组合正在成交，持续跟踪各腿进度。', { exact: true }).waitFor();
   const card = await panel.locator('.execution-job').first().innerText();
-  assert(card.includes('Anthropic同所两腿开仓') && card.includes('Hyperliquid 同向价一 · 150.3 USDC'), 'job card names the market and the USDC price');
+  assert(card.includes('Anthropic同所两腿开仓') && card.includes('Hyperliquid 同向价一 · 委托价 150.3 USDC'), 'job card names the market and the USDC price');
 
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(200);

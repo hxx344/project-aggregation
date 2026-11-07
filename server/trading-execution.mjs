@@ -381,13 +381,17 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     for (const symbol of symbols) symbolsAt[symbol] = at;
     return { at, symbolsAt, account: { ...account, positions: [...kept, ...account.positions] } };
   }
-  function state() {
+  function state(trackedJobId = null) {
+    if (trackedJobId !== null && (typeof trackedJobId !== 'string' || !/^[0-9a-f-]{36}$/i.test(trackedJobId))) throw new ExecutionError(400, '执行编号无效');
     const rows = EXECUTION_EXCHANGES.map(accountRow);
+    const jobs = [...unfinishedJobs().sort((a, b) => b.createdAt.localeCompare(a.createdAt)), ...finishedJobs(FINISHED_JOB_PAGE)];
+    // A long-running job can finish behind newer history; its observer still needs the final receipt.
+    if (trackedJobId && !jobs.some(job => job.id === trackedJobId)) jobs.push(jobFor(trackedJobId));
     return { generatedAt: iso(now()), connections: rows.map(connection), positions: rows.flatMap(row => {
       if (!row.snapshot) return [];
       const snapshot = JSON.parse(row.snapshot);
       return snapshot.account.positions.map(position => ({ exchange: row.exchange, ...position, fetchedAt: snapshot.symbolsAt?.[position.symbol] ?? snapshot.at }));
-    }), jobs: [...unfinishedJobs().sort((a, b) => b.createdAt.localeCompare(a.createdAt)), ...finishedJobs(FINISHED_JOB_PAGE)].map(publicJob) };
+    }), jobs: jobs.map(publicJob) };
   }
   function checkAvailable(exchange, revision) {
     writable();
@@ -581,7 +585,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       const request = stmt.prepare('SELECT * FROM execution_requests WHERE id=?').get(body.requestId);
       if (request) {
         if (request.preview_id !== body.previewId || request.session !== session) throw new ExecutionError(409, '请求标识已被使用');
-        return state();
+        return { ...state(), acceptedJob: publicJob(jobFor(request.job_id)) };
       }
       const record = stmt.prepare('SELECT * FROM execution_previews WHERE id=?').get(body.previewId);
       if (!record || record.session !== session || record.expires <= now() || record.consumed) throw new ExecutionError(409, '预览已过期或已提交，请重新预览');
@@ -608,7 +612,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       for (const leg of plan.legs) stmt.prepare('INSERT OR IGNORE INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
       stmt.prepare('UPDATE execution_previews SET consumed=? WHERE id=?').run(job.id, plan.id);
       stmt.prepare('INSERT INTO execution_requests(id,preview_id,job_id,session) VALUES (?,?,?,?)').run(body.requestId, plan.id, job.id, session);
-      return state();
+      return { ...state(), acceptedJob: publicJob(job) };
     });
   }
   // The unfinished job (manual or automatic) holding one of the symbols, if any.

@@ -73,6 +73,8 @@ export type ExecutionJob = {
 export type ExecutionState = {
   generatedAt: string; connections: ExecutionConnection[]; positions: ExecutionPosition[]; jobs: ExecutionJob[];
 };
+/** The exact submission, including idempotent retries outside the recent history page. */
+export type ExecutionSubmission = ExecutionState & { acceptedJob: ExecutionJob };
 
 /** One top-of-book read; a failed read carries only `error`. */
 export type ExecutionQuoteBook = { exchange: ExecutionExchange; symbol: ExecutionSymbol; bid?: string; ask?: string; at?: string; error?: string };

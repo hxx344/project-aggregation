@@ -7,7 +7,7 @@ async (page) => {
   const assert = (condition, message) => { if (!condition) throw new Error(message); };
   const stamp = () => new Date().toISOString();
   const requests = [], pageErrors = [], previews = new Map(), jobsByRequest = new Map(), expiredPreviews = new Set();
-  let expire = false, readFailure = false, failFirstSubmit = true, dropNextBeforeSave = false, previewSequence = 0;
+  let expire = false, readFailure = false, failFirstSubmit = true, dropNextBeforeSave = false, previewSequence = 0, pagedOut = false;
   let jobs = [];
   const connections = ['binance', 'bybit'].map(exchange => ({ exchange, connected: false, revision: 0, accountMode: exchange === 'binance' ? 'standard' : 'unified', identity: null, keyLabel: null, verifiedAt: null, locked: false }));
   const execution = () => ({ generatedAt: stamp(), connections: structuredClone(connections), positions: connections.flatMap(connection => ['CLUSDT', 'BZUSDT'].flatMap(symbol => ['long', 'short'].map(side => ({ exchange: connection.exchange, symbol, side, quantity: '2', fetchedAt: stamp() })))), jobs: structuredClone(jobs) });
@@ -46,7 +46,7 @@ async (page) => {
     const request = route.request(), url = new URL(request.url()), method = request.method();
     assert(url.origin === origin, 'fixture API never leaves isolated origin');
     const body = request.postData() ? JSON.parse(request.postData()) : null;
-    requests.push({ path: url.pathname, method, body });
+    requests.push({ path: url.pathname, method, body, jobId: url.searchParams.get('jobId') });
     const send = (value, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(value) });
     if (url.pathname === '/api/session') return send({ authenticated: !expire, csrfToken: 'execution-fixture-csrf' });
     if (url.pathname === '/api/overview/events') return route.fulfill({ status: 200, contentType: 'text/event-stream', body: `data: ${JSON.stringify({ projects: [], generatedAt: stamp() })}\n\n` });
@@ -56,7 +56,11 @@ async (page) => {
     if (!url.pathname.startsWith('/api/trading/execution')) return send({ error: 'Unexpected fixture API' }, 404);
     if (expire) return send({ error: '登录已过期' }, 401);
     if (method !== 'GET') assert(request.headers()['x-csrf-token'] === 'execution-fixture-csrf', 'execution writes carry current session CSRF');
-    if (url.pathname === '/api/trading/execution' && method === 'GET') return readFailure ? send({ error: '模拟读取故障' }, 503) : send(execution());
+    if (url.pathname === '/api/trading/execution' && method === 'GET') {
+      const value = execution();
+      if (pagedOut && url.searchParams.get('jobId') !== jobs[0]?.id) value.jobs = [];
+      return readFailure ? send({ error: '模拟读取故障' }, 503) : send(value);
+    }
     const account = url.pathname.match(/\/accounts\/(binance|bybit)$/)?.[1];
     if (account && method === 'PUT') {
       const connection = connections.find(value => value.exchange === account);
@@ -70,7 +74,7 @@ async (page) => {
       assert(body.confirmLive === true && typeof body.requestId === 'string', 'explicit review confirmation required');
       assert(Object.keys(body).sort().join(',') === 'confirmLive,previewId,requestId', 'submission cannot replace reviewed legs');
       // Match the service contract: accepted requests are recovered before expiry.
-      if (jobsByRequest.has(body.requestId)) return send(execution(), 202);
+      if (jobsByRequest.has(body.requestId)) return send({ ...execution(), acceptedJob: jobs.find(job => job.id === jobsByRequest.get(body.requestId)) }, 202);
       if (dropNextBeforeSave) { dropNextBeforeSave = false; expiredPreviews.add(body.previewId); return send({ error: '模拟服务未保存提交，请核对本次请求' }, 503); }
       if (expiredPreviews.has(body.previewId)) return send({ error: '预览已过期或已提交，请重新预览' }, 409);
       if (!jobsByRequest.has(body.requestId)) {
@@ -78,12 +82,12 @@ async (page) => {
         const job = makeJob(preview, `fixture-job-${jobsByRequest.size + 1}`); jobsByRequest.set(body.requestId, job.id); jobs.unshift(job);
       }
       if (failFirstSubmit) { failFirstSubmit = false; return send({ error: '模拟响应丢失，提交结果尚未确认' }, 503); }
-      return send(execution(), 202);
+      return send({ ...execution(), acceptedJob: jobs.find(job => job.id === jobsByRequest.get(body.requestId)) }, 202);
     }
     const stop = url.pathname.match(/\/jobs\/([^/]+)\/stop$/)?.[1];
     if (stop && method === 'POST') {
       const job = jobs.find(value => value.id === stop); assert(job, 'stop existing execution');
-      job.status = 'stopped'; job.canResume = false; job.updatedAt = stamp(); job.reason = '余单已撤销，已成交仓位保留'; job.legs.forEach(leg => { leg.currentOrder = null; });
+      job.status = 'stopped'; job.canResume = false; job.updatedAt = stamp(); job.reason = '余单已撤销，已成交仓位保留'; job.legs.forEach(leg => { leg.currentOrder = { ...leg.currentOrder, state: '已撤销', lastCheckedAt: stamp() }; });
       return send(execution());
     }
     const reconcile = url.pathname.match(/\/jobs\/([^/]+)\/reconcile$/)?.[1];
@@ -150,7 +154,11 @@ async (page) => {
   await panel.getByText('本次提交结果尚未确认。', { exact: false }).waitFor();
   assert(await panel.getByRole('button', { name: '返回修改参数' }).isDisabled(), 'uncertain submission cannot be replaced by a fresh plan');
   await panel.getByRole('button', { name: '重新核对本次提交' }).click();
-  await panel.getByText('组合已受理。实际成交与余单状态见执行进度。', { exact: true }).waitFor();
+  const tracking = panel.getByRole('region', { name: '组合成交跟踪' });
+  await tracking.getByText('组合正在成交，持续跟踪各腿进度。', { exact: true }).waitFor();
+  assert((await tracking.innerText()).includes('fixture-job-1'), 'receipt tracks the exact accepted job');
+  assert(await tracking.evaluate(element => document.activeElement === element), 'accepted submission focuses the progress report');
+  assert(await tracking.getByText('成交进度 25%', { exact: true }).count() === 4, 'each leg reports its own progress');
   const submits = requests.filter(request => request.path.endsWith('/jobs') && request.method === 'POST');
   assert(submits.length === 2 && submits[0].body.requestId === submits[1].body.requestId && jobs.length === 1, 'uncertain retry reuses one idempotency key and execution');
   assert(await panel.getByText('已全部成交', { exact: true }).count() === 0, 'accepted job is never shown as fully filled');
@@ -164,8 +172,24 @@ async (page) => {
   await page.screenshot({ path: 'output/playwright/trading-execution-mobile-order-ids.png' });
   await page.setViewportSize({ width: 1440, height: 1100 });
 
+  const tracked = jobs[0];
+  const other = { ...structuredClone(tracked), id: 'unrelated-newer-job', market: 'hynix', auto: { ruleId: 'another-rule', action: 'open' } };
+  jobs.unshift(other);
+  tracked.legs[0].filledQuantity = '1.999999999999999999'; tracked.legs[0].remainingQuantity = '0.000000000000000001';
+  await tracking.getByText('成交进度 99.9%', { exact: true }).waitFor(); // The normal three-second poll, no refresh action.
+  assert((await tracking.innerText()).includes('fixture-job-1') && !(await tracking.innerText()).includes('unrelated-newer-job'), 'newer unrelated work cannot replace the tracked receipt');
+  tracked.legs[0].filledQuantity = '0.5'; tracked.legs[0].remainingQuantity = '1.5';
+  jobs = [tracked];
+  readFailure = true; await refresh();
+  await tracking.getByText('进度暂未更新', { exact: false }).waitFor();
+  assert((await tracking.innerText()).includes('1.999999999999999999'), 'failed read preserves the last confirmed fills');
+  readFailure = false; jobs = []; await refresh();
+  await tracking.getByText('本轮未返回此任务', { exact: false }).waitFor();
+  assert(!(await tracking.innerText()).includes('组合已全部成交'), 'a missing job is never inferred to be complete');
+  jobs = [tracked]; await refresh();
+
   jobs[0].status = 'paused'; jobs[0].canResume = true; jobs[0].reason = '模拟某腿暂停，保留已成交数量';
-  await refresh(); await panel.getByRole('button', { name: '预览继续剩余' }).click();
+  await refresh(); await tracking.getByText('组合已暂停，尚未全部成交', { exact: false }).waitFor(); await panel.getByRole('button', { name: '预览继续剩余' }).click();
   await panel.getByRole('heading', { name: '确认剩余数量的原油四腿组合开仓' }).waitFor();
   const resumed = requests.filter(request => request.path.endsWith('/preview')).at(-1).body;
   assert(Object.keys(resumed).join(',') === 'resumeJobId', 'resume preview is derived by the server');
@@ -173,6 +197,7 @@ async (page) => {
   jobs[0].status = 'attention'; jobs[0].canResume = false;
   const unknown = jobs[0].legs.find(leg => leg.exchange === 'bybit'); unknown.currentOrder = { ...unknown.currentOrder, id: null, state: 'unknown', unknown: true, confirmAfter: '2026-10-28T02:00:00.000Z' };
   await refresh();
+  await tracking.getByText('组合待核对，尚不能确认完成', { exact: false }).waitFor();
   const reconcileForm = panel.locator('.execution-reconcile');
   assert(await reconcileForm.getByRole('button', { name: '核对并停止策略余单' }).isDisabled(), 'unknown strategy is never guessed');
   assert(await reconcileForm.getByRole('button', { name: '确认策略未创建' }).isDisabled(), 'absent strategy needs explicit acknowledgment');
@@ -184,6 +209,8 @@ async (page) => {
   await panel.getByRole('button', { name: '停止并撤销余单' }).click();
   await panel.getByText('已请求停止，正在核对并撤销余单。已成交仓位保留。').waitFor();
   assert(jobs[0].legs.every(leg => leg.filledQuantity === '0.5'), 'stopping does not pretend to close filled positions');
+  await tracking.getByText('组合已停止，已成交仓位保留', { exact: false }).waitFor();
+  assert(await tracking.locator('.execution-job').isVisible(), 'stopped result remains expanded');
 
   await panel.getByRole('button', { name: /^同所两腿/ }).click();
   await choose('交易所', 'Bybit');
@@ -227,6 +254,7 @@ async (page) => {
   await panel.getByRole('button', { name: '返回修改参数' }).click();
 
   await choose('品种', '海力士');
+  await panel.getByRole('button', { name: /^跨所两腿/ }).click();
   await choose('交易动作', '开仓');
   await choose('合约', 'SKHYNIXUSDT');
   await direction('开仓方向', 0);
@@ -247,26 +275,38 @@ async (page) => {
   await panel.getByRole('button', { name: '返回修改参数' }).click();
 
   readFailure = true; await refresh(); await panel.getByText('模拟读取故障', { exact: true }).waitFor();
-  assert(await panel.locator('.execution-history').count() === 1, 'failed poll preserves prior execution evidence');
+  assert(await tracking.locator('.execution-job').isVisible(), 'failed poll preserves prior execution evidence');
   readFailure = false; await refresh();
   await page.evaluate(() => window.dispatchEvent(new Event('offline')));
   await panel.getByText('网络已断开，显示最后取得的执行状态。', { exact: false }).waitFor();
   assert(await panel.getByRole('button', { name: '预览开仓组合' }).isDisabled(), 'offline disables new writes');
   await refresh();
+  const writesBeforeCompletion = requests.filter(request => request.method !== 'GET').length;
+  pagedOut = true; // A completed long-running job is outside the normal recent-history page.
+  jobs[0].status = 'completed'; jobs[0].batchIndex = jobs[0].batchCount; jobs[0].reason = null; jobs[0].updatedAt = stamp();
+  jobs[0].legs.forEach(leg => { leg.filledQuantity = leg.quantity; leg.remainingQuantity = '0'; leg.currentOrder = { ...leg.currentOrder, state: '已成交', filledQuantity: leg.quantity, lastCheckedAt: stamp() }; });
+  await tracking.getByText('组合已全部成交，成交结果保留如下。', { exact: true }).waitFor();
+  assert(await tracking.getByText('成交进度 100%', { exact: true }).count() === 4, 'completed receipt retains all leg quantities');
+  await tracking.getByText('订单 ID：fixture-order-leg-1', { exact: true }).waitFor();
+  assert(requests.some(request => request.method === 'GET' && request.jobId === jobs[0].id), 'polling requests the exact job beyond recent history');
+  assert(requests.filter(request => request.method !== 'GET').length === writesBeforeCompletion, 'tracking completion issues no writes');
+  pagedOut = false;
+  await page.reload();
+  await tracking.getByText('组合已全部成交，成交结果保留如下。', { exact: true }).waitFor();
+  assert(requests.filter(request => request.method !== 'GET').length === writesBeforeCompletion, 'reload restores server evidence without submitting again');
   await page.setViewportSize({ width: 390, height: 844 });
-  await panel.locator('.execution-history > summary').click();
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), 'mobile execution does not overflow viewport');
   assert(await panel.locator('.execution-progress-table tbody tr').first().isVisible(), 'mobile retains individual leg evidence');
   await panel.screenshot({ path: 'output/playwright/trading-execution-mobile.png' });
   await panel.evaluate(element => element.scrollIntoView({ block: 'start' }));
   await page.screenshot({ path: 'output/playwright/trading-execution-mobile-viewport.png' });
   assert(await page.locator('.skip-link').evaluate(element => element.getBoundingClientRect().bottom <= 0), 'unfocused skip link remains outside the real viewport');
-  await panel.locator('.execution-history').evaluate(element => element.scrollIntoView({ block: 'start' }));
+  await tracking.evaluate(element => element.scrollIntoView({ block: 'start' }));
   await page.screenshot({ path: 'output/playwright/trading-execution-mobile-progress.png' });
   const text = await panel.innerText();
   assert(!text.includes('fixture_binance_secret') && !text.includes('fixture_bybit_secret'), 'secrets never appear in public state or rendered text');
   assert(requests.filter(request => request.body?.apiSecret).every(request => /\/accounts\/(binance|bybit)$/.test(request.path)), 'secrets sent only to connection save');
-  expire = true; await refresh();
+  expire = true; await page.evaluate(() => window.dispatchEvent(new Event('online')));
   await page.getByRole('button', { name: /登录|进入工作台/ }).first().waitFor();
   assert(await panel.count() === 0, 'session expiry removes execution data and secrets');
   assert(pageErrors.length === 0, `no browser exceptions: ${pageErrors.join('; ')}`);
