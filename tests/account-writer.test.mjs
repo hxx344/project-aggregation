@@ -651,6 +651,29 @@ test('Python and Node derive the same Hyperliquid wallet account key from any ad
   await python.close();
 });
 
+test('Lighter RH accounts are wallet-addressed: any address case is one account, distinct from other wallet venues', () => {
+  const wallet = `0x${'Aa'.repeat(20)}`;
+  const lighter = (accountId) => identity(accountId, { authority: 'rh-lighter' });
+  assert.equal(normalizeAccountIdentity(lighter(wallet)).accountId, wallet.toLowerCase());
+  assert.equal(accountKey(lighter(wallet)), accountKey(lighter(wallet.toLowerCase())));
+  assert.equal(accountKey(lighter(wallet)), accountKey(lighter(wallet.toUpperCase().replace('0X', '0x'))));
+  assert.notEqual(accountKey(lighter(wallet)), accountKey(identity(wallet, { authority: 'hyperliquid' })));
+  // The Lighter account index is not the identity: the hub binds the owning wallet address.
+  for (const bad of ['12345', 12345, `0x${'g'.repeat(40)}`, `0x${'a'.repeat(39)}`, `${'a'.repeat(40)}`]) assert.throws(() => accountKey(lighter(bad)), code('INVALID_IDENTITY'), String(bad));
+  assert.throws(() => accountKey(identity(wallet, { authority: 'lighter' })), code('INVALID_SCOPE'));
+});
+
+test('Python and Node derive the same Lighter RH wallet account key from any address case', async (t) => {
+  const f = fixture(t); const python = await pythonPeer(t, f.databasePath);
+  const mixed = { authority: 'rh-lighter', environment: 'mainnet', accountId: `0x${'aB'.repeat(20)}` };
+  assert.ok((await python.call('bind', 'python', mixed, 1)).result.verified);
+  const ticket = (await python.call('claim', [mixed])).result;
+  assert.equal(ticket.claims[0].accountKey, accountKey({ ...mixed, accountId: mixed.accountId.toLowerCase() }));
+  const refused = await python.call('bind', 'python-bad', { ...mixed, accountId: '12345' }, 1);
+  assert.equal(refused.result, undefined);
+  assert.equal(refused.code, 'INVALID_IDENTITY');
+  await python.close();
+});
 test('native Node and Python processes contend for the same SQLite account and retain permanent module pin', async (t) => {
   const f = fixture(t); const node = f.writer('hub'); const python = await pythonPeer(t, f.databasePath);
   node.bind('node', identity(), 1); assert.ok((await python.call('bind', 'python', identity(), 1)).result.verified);

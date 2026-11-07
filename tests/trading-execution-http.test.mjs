@@ -16,6 +16,7 @@ const credentials = suffix => ({ apiKey: `fixture_key_sensitive_${suffix}`, apiS
 const stamp = time => new Date(time).toISOString();
 // Fixture-only wallet strings; the client factory is mocked and never signs.
 const WALLET = { address: '0x' + 'a1'.repeat(20), agent: '0x' + 'b2'.repeat(18) + '7e57', agentKey: '0x' + 'c3d4'.repeat(16) };
+const LIGHTER = { address: '0x' + 'Ef'.repeat(20), apiKey: 'e5f6'.repeat(20) };
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 const leg = (exchange, symbol, side) => ({ exchange, symbol, side, quantity: '2', stopPrice: side === 'long' ? '90' : '50' });
 function intent(preset = 'cross-exchange') {
@@ -35,6 +36,7 @@ async function fixture(t) {
     modes: { CLUSDT: 'hedge', BZUSDT: 'hedge' }, positions: [], openOrders: [], strategies: [],
   }]));
   accounts.hyperliquid = { identity: WALLET.address, modes: { 'io:ANTH': 'one-way', 'xyz:ANT': 'one-way' }, positions: [], openOrders: [], strategies: [], leverage: { 'io:ANTH': { type: 'isolated', value: 5 }, 'xyz:ANT': { type: 'cross', value: 5 } } };
+  accounts['rh-lighter'] = { identity: LIGHTER.address.toLowerCase(), modes: { ANTHROPIC: 'one-way' }, positions: [], openOrders: [], strategies: [], leverage: { ANTHROPIC: { type: 'cross', value: 10 } } };
   const market = symbol => ({ symbol, bid: '70', ask: '70.01', at: stamp(clock),
     rule: { tickSize: '0.01', quantityStep: '0.001', minQuantity: '0.001', maxQuantity: '100', minNotional: '5', maxNotional: null } });
   const executionClientFactory = exchange => Object.fromEntries(['verify', 'account', 'market', 'create', 'inspect', 'stop'].map(method => [method, async (...args) => {
@@ -224,7 +226,28 @@ test('a Hyperliquid API wallet connects over HTTP and its private key never leav
   assert.equal(removed.status, 200); assert.equal(removed.data.connections.find(row => row.exchange === 'hyperliquid').connected, false);
   assert.equal(f.readOnlyCalls.length, 0);
 });
-
+test('a Lighter RH API key connects over HTTP with only its own fields and its private key never leaves the encrypted store', async t => {
+  const f = await fixture(t); await f.login();
+  const route = `${PREFIX}/accounts/rh-lighter`;
+  const body = { revision: 0, accountMode: 'api-key', address: LIGHTER.address, accountIndex: '12345', apiKeyIndex: 5, apiKey: '0x' + LIGHTER.apiKey.toUpperCase() };
+  for (const patch of [{ apiKey: undefined }, { apiKeyIndex: 157 }, { apiKeyIndex: 3 }, { accountIndex: 0 }, { accountMode: 'agent' }, { agentKey: WALLET.agentKey }, { apiSecret: 'fixture_secret_sensitive_x' }]) {
+    assert.equal((await f.request(route, { method: 'PUT', body: { ...body, ...patch } })).status, 400, JSON.stringify(patch));
+  }
+  assert.equal(f.calls.length, 0);
+  const connected = await f.request(route, { method: 'PUT', body });
+  assert.equal(connected.status, 200);
+  const view = connected.data.connections.find(row => row.exchange === 'rh-lighter');
+  assert.deepEqual({ connected: view.connected, accountMode: view.accountMode, keyLabel: view.keyLabel, identity: view.identity }, { connected: true, accountMode: 'api-key', keyLabel: '12345#5', identity: LIGHTER.address.toLowerCase() });
+  assert.ok(f.calls.length > 0 && f.calls.every(call => JSON.stringify(call.args[0]) === JSON.stringify({ address: LIGHTER.address.toLowerCase(), accountIndex: 12345, apiKeyIndex: 5, apiKey: LIGHTER.apiKey })));
+  for (const response of [connected, await f.request(PREFIX), await f.request('/api/trading')]) assert.equal(JSON.stringify(response.data).toLowerCase().includes(LIGHTER.apiKey), false);
+  for (const filename of (await readdir(f.dataDir)).filter(name => /^hub\.sqlite/.test(name))) {
+    const content = await readFile(path.join(f.dataDir, filename));
+    assert.equal(content.includes(Buffer.from(LIGHTER.apiKey)) || content.includes(Buffer.from(LIGHTER.apiKey.toUpperCase())), false);
+  }
+  const removed = await f.request(route, { method: 'DELETE', body: { revision: 1 } });
+  assert.equal(removed.status, 200); assert.equal(removed.data.connections.find(row => row.exchange === 'rh-lighter').connected, false);
+  assert.equal(f.readOnlyCalls.length, 0);
+});
 test('execution HTTP rejects market-order fields, injected internal options and malformed JSON before exchange reads', async t => {
   const f = await fixture(t); await f.login();
   for (const body of [{ ...intent(), orderType: 'MARKET' }, { ...intent(), type: 'MARKET' },

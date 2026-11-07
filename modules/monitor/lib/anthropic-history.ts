@@ -1,9 +1,10 @@
 import type { Point } from "./market.ts";
 import type { SpreadChartConfig } from "../app/spread-chart";
-import { ANTHROPIC_CANDLE_MS, ANTHROPIC_LEGS, anthropicChartRows, validateAnthropicCandles, validateAnthropicQuote } from "../modules/anthropic/market.mjs";
+import { ANTHROPIC_CANDLE_MS, ANTHROPIC_LEGS, ANTHROPIC_LEG_KEYS, anthropicChartRows, validateAnthropicCandles, validateAnthropicQuote } from "../modules/anthropic/market.mjs";
 import type { QuoteFreshness } from "./market-freshness.ts";
 
-export type HyperliquidLeg = "xyz" | "io";
+/** Contracts compared against Binance. */
+export type AnthropicComparisonLeg = "xyz" | "io" | "rh";
 type Snapshot = ReturnType<typeof validateAnthropicCandles>;
 export type AnthropicRow = Snapshot["data"][number];
 type Coverage = Pick<Snapshot["metadata"], "firstObservation" | "lastObservation" | "rows">;
@@ -39,28 +40,28 @@ export function retainAnthropicHistory(previous: AnthropicHistory | null, next: 
   if (Date.parse(next.fetchedAt) < Date.parse(previous.fetchedAt)) return previous;
   const same = previous.rows.length === next.rows.length && next.rows.every((row, index) => {
     const old = previous.rows[index];
-    return row.time === old.time && row.binance === old.binance && row.xyz === old.xyz && row.io === old.io;
+    return row.time === old.time && ANTHROPIC_LEG_KEYS.every(key => row[key] === old[key]);
   });
   return same ? { ...next, rows: previous.rows } : next;
 }
 
-/** Binance (`adr`) against one Hyperliquid leg (`equivalent`), both per share. */
-export const anthropicPoints = (rows: AnthropicRow[], leg: HyperliquidLeg): Point[] => anthropicChartRows(rows, leg);
+/** Binance (`adr`) against one comparison leg (`equivalent`), both per share. */
+export const anthropicPoints = (rows: AnthropicRow[], leg: AnthropicComparisonLeg): Point[] => anthropicChartRows(rows, leg);
 
 const BARS_PER_DAY = 86_400_000 / ANTHROPIC_CANDLE_MS;
 const usd = (v: number) => `$${v.toFixed(2)}`;
 const noTrades = () => [];
-/** Per-share premium chart of Binance against the selected Hyperliquid contract. */
-export function anthropicChartConfig(leg: HyperliquidLeg): SpreadChartConfig {
-  const symbol = ANTHROPIC_LEGS[leg].symbol;
+/** Per-share premium chart of Binance against the selected comparison contract. */
+export function anthropicChartConfig(leg: AnthropicComparisonLeg): SpreadChartConfig {
+  const { name, label } = ANTHROPIC_LEGS[leg];
   return {
     intervalMs: ANTHROPIC_CANDLE_MS, periods: { sma: 7 * BARS_PER_DAY, bands: ANTHROPIC_BANDS_DAYS * BARS_PER_DAY }, kicker: "PREMIUM MONITOR", bar: "15 分钟",
     span: count => `${(count / 4).toLocaleString()} 小时`, bars: count => `${count.toLocaleString()} 根连续 15 分钟 K 线`, checkCadence: "每分钟检查更新",
-    tabs: { premium: "溢价率", spread: "每股价差", price: "每股价格" }, units: { premium: `% · Binance 相对 ${symbol}`, spread: "USD / 股", price: "USD / 股" },
-    premiumName: "Binance 溢价率", spreadName: "每股价差", legs: ["Binance", symbol], zeroLabel: "0 = 同价", domainStep: 1, digits: 2, price: usd,
+    tabs: { premium: "溢价率", spread: "每股价差", price: "每股价格" }, units: { premium: `% · Binance 相对 ${name}`, spread: "USD / 股", price: "USD / 股" },
+    premiumName: "Binance 溢价率", spreadName: "每股价差", legs: ["Binance", name], zeroLabel: "0 = 同价", domainStep: 1, digits: 2, price: usd,
     tick: { premium: v => `${Number(v.toFixed(2))}%`, spread: v => `$${Number(v.toFixed(2))}`, price: v => `$${Number(v.toFixed(1))}` },
     tradeEvents: noTrades, tradeMarkers: noTrades, tradeMarket: null,
     trade: { priceUnit: "", chartLabel: "", chartNote: "", metricName: "溢价率" },
-    emptyText: { loading: "正在载入 15 分钟 K 线", hint: `Binance ANTHROPICUSDT / Hyperliquid ${symbol} 同一时段已收盘 K 线` },
+    emptyText: { loading: "正在载入 15 分钟 K 线", hint: `Binance ANTHROPICUSDT / ${label} 同一时段已收盘 K 线` },
   };
 }

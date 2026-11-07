@@ -11,10 +11,13 @@ export const EQUAL_SIZE_UNITS = Object.freeze({ oil: '桶', hynix: 'USDT', anthr
  * Anthropic shares one native unit stands for, under the caller's share-count
  * assumptions (billions). Binance quotes valuation per 1B reference shares,
  * OKX per 10B (rebased 2026-06-30), Entropy io per 1B fully diluted shares
- * after the IPO (its documented conversion), trade.xyz one Class A share.
+ * after the IPO (its documented conversion), trade.xyz one Class A share,
+ * Lighter RH per 1B fully diluted shares (its market-cap pricing).
  * These are assumptions about a future listing, not venue guarantees.
  */
-const SHARE_BASIS = Object.freeze({ 'binance:ANTHROPICUSDT': ['outstanding', '1'], 'okx:ANTHROPICUSDT': ['outstanding', '10'], 'hyperliquid:io:ANTH': ['diluted', '1'], 'hyperliquid:xyz:ANT': [null, '1'] });
+const SHARE_BASIS = Object.freeze({ 'binance:ANTHROPICUSDT': ['outstanding', '1'], 'okx:ANTHROPICUSDT': ['outstanding', '10'], 'hyperliquid:io:ANTH': ['diluted', '1'], 'hyperliquid:xyz:ANT': [null, '1'], 'rh-lighter:ANTHROPIC': ['diluted', '1'] });
+// Venues whose contract is addressed by a numeric market id and whose account leverage is reported, not changed.
+const NUMBERED_VENUES = new Set(['hyperliquid', 'rh-lighter']);
 export const SHARE_LIMITS = Object.freeze({ min: '1', max: '100' });
 export function sharesPerUnit(leg, shares, contractSize = '1') {
   const basis = SHARE_BASIS[`${leg.exchange}:${leg.symbol}`];
@@ -139,7 +142,7 @@ export function normalizeMarket(value, symbol, now) {
     if (!Number.isSafeInteger(value.rule.assetId) || value.rule.assetId < 0) throw new ExecutionError(502, '合约编号无效');
     rule.assetId = value.rule.assetId;
   }
-  if (value.rule.quoteAsset === 'USDC') rule.quoteAsset = 'USDC';
+  if (['USDC', 'USDG'].includes(value.rule.quoteAsset)) rule.quoteAsset = value.rule.quoteAsset;
   // null: the venue does not offer market orders for this contract.
   rule.maxMarketQuantity = value.rule.maxMarketQuantity === undefined || value.rule.maxMarketQuantity === null ? null : positive(value.rule.maxMarketQuantity, '合约规则');
   try {
@@ -172,8 +175,10 @@ export function checkChildQuantity(quantity, market, action, orderType = 'chase'
   if (rule.maxNotional !== null && compareNotional(quantity, market.ask, rule.maxNotional, rule.contractSize) > 0n) throw new ExecutionError(409, '单批名义金额超过合约允许值');
 }
 export function checkContract(leg, market) {
-  if (leg.exchange === 'hyperliquid') {
-    if (!Number.isSafeInteger(leg.rule?.assetId) || leg.rule.assetId !== market.rule.assetId || compareDecimals(leg.rule.quantityStep, market.rule.quantityStep) !== 0) throw new ExecutionError(409, 'Hyperliquid 合约编号或数量精度已改变，请重新预览');
+  if (NUMBERED_VENUES.has(leg.exchange)) {
+    if (!Number.isSafeInteger(leg.rule?.assetId) || leg.rule.assetId !== market.rule.assetId || compareDecimals(leg.rule.quantityStep, market.rule.quantityStep) !== 0) throw new ExecutionError(409, `${TRADING_NAMES[leg.exchange]} 合约编号或数量精度已改变，请重新预览`);
+    // Lighter RH prices are integers in units of a fixed tick; Hyperliquid's tick follows the price.
+    if (leg.exchange === 'rh-lighter' && compareDecimals(leg.rule.tickSize, market.rule.tickSize) !== 0) throw new ExecutionError(409, 'Lighter RH 合约价格精度已改变，请重新预览');
     return;
   }
   if (leg.exchange !== 'okx') return;
@@ -254,10 +259,10 @@ export function equalQuantity(intent, leg, market) {
   return fromUnits(lots * units(rule.quantityStep));
 }
 
-// Hyperliquid margin mode and leverage are the account's own settings; this module only reports them.
-function leverageOf(account, symbol) {
+// Hyperliquid and Lighter RH margin mode and leverage are the account's own settings; this module only reports them.
+function leverageOf(account, exchange, symbol) {
   const value = account?.leverage?.[symbol];
-  if (!object(value) || !['cross', 'isolated'].includes(value.type) || !Number.isSafeInteger(value.value) || value.value < 1 || value.value > 100) throw new ExecutionError(502, `无法读取 Hyperliquid ${symbol} 当前杠杆，暂不下单`);
+  if (!object(value) || !['cross', 'isolated'].includes(value.type) || !Number.isSafeInteger(value.value) || value.value < 1 || value.value > 100) throw new ExecutionError(502, `无法读取 ${TRADING_NAMES[exchange]} ${symbol} 当前杠杆，暂不下单`);
   return { type: value.type, value: value.value };
 }
 export function buildPlan(intent, snapshots, markets, connections, now, { resume = false } = {}) {
@@ -267,7 +272,7 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
     if (!connection?.connected) throw new ExecutionError(409, `${input.exchange} 尚未连接实盘账户`);
     const market = normalizeMarket(markets.get(`${input.exchange}:${input.symbol}`), input.symbol, now);
     const leg = { ...input, id: legId(input), orderType: legOrderType(input), stopPrice: input.stopPrice ?? null, orderSide: orderSide(intent.action, input.side), positionMode: account?.modes?.[input.symbol], accountRevision: connection.revision,
-      ...(input.exchange === 'hyperliquid' ? { leverage: leverageOf(account, input.symbol) } : {}) };
+      ...(NUMBERED_VENUES.has(input.exchange) ? { leverage: leverageOf(account, input.exchange, input.symbol) } : {}) };
     if (intent.equalSize) leg.quantity = equalQuantity(intent, leg, market);
     const currentQuantity = checkPosition(account, leg, intent.action, leg.quantity);
     ensureNoExternalOrders(account, leg.symbol);
@@ -303,11 +308,11 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
   return { ...intent, batchCount: count, legs,
     notes: [
       ...sizing,
-      ...(chase.length ? [`追价限价腿：${names(chase)}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量；Hyperliquid 以只挂单（ALO）挂在同侧最优价，价格变化时按原订单号撤单、确认结束后对剩余数量重新挂单。`] : []),
+      ...(chase.length ? [`追价限价腿：${names(chase)}。Bybit 使用原生追逐策略；Binance 使用 LIMIT / GTX / QUEUE，OKX 使用 post_only，同向一档追价调用原生改单并保留原订单号与总数量；Hyperliquid 以只挂单（ALO）挂在同侧最优价，价格变化时按原订单号撤单、确认结束后对剩余数量重新挂单。${chase.some(leg => leg.exchange === 'rh-lighter') ? 'Lighter RH 同样以只挂单（post-only）挂在同侧最优价、撤单后重挂；受 Standard 账户每分钟 60 次请求限制，盘口与委托状态最多缓存 4 秒，追价间隔至少 5 秒。' : ''}`] : []),
       ...(chase.some(leg => leg.stopPrice !== null) ? ['追价界限用于触达后停止追价并撤销余单，不是对所有成交价格的硬保证。'] : []),
       ...(chase.some(leg => leg.stopPrice === null) ? [`未设追价界限：${names(chase.filter(leg => leg.stopPrice === null))} 会一直跟随盘口，直到成交、手动停止或达到最长执行时间。`] : []),
-      ...(takers.length ? [`市价腿：${names(takers)}。每批发送一次市价单，按对手盘吃单成交，不设价格界限，成交价可能明显偏离预览盘口；未全部成交（流动性不足或交易所价格保护）时暂停后续批次，不自动补单。${takers.some(leg => leg.exchange === 'hyperliquid') ? 'Hyperliquid 没有原生市价单，按对手价 ±1% 的立即成交否则取消（IOC）委托发送。' : ''}`] : []),
-      ...(wallets.length ? [`Hyperliquid 按账户当前保证金模式与杠杆成交，本系统不修改：${wallets.map(leg => `${leg.symbol} ${leg.leverage.type === 'isolated' ? '逐仓' : '全仓'} ${leg.leverage.value}x`).join('、')}；逐仓仓位单独承担强平风险，请先在 Hyperliquid 确认保证金与杠杆。`] : []),
+      ...(takers.length ? [`市价腿：${names(takers)}。每批发送一次市价单，按对手盘吃单成交，不设价格界限，成交价可能明显偏离预览盘口；未全部成交（流动性不足或交易所价格保护）时暂停后续批次，不自动补单。${takers.some(leg => leg.exchange === 'hyperliquid') ? 'Hyperliquid 没有原生市价单，按对手价 ±1% 的立即成交否则取消（IOC）委托发送。' : ''}${takers.some(leg => leg.exchange === 'rh-lighter') ? 'Lighter RH 市价腿按对手价 ±1% 的 IOC 限价委托发送。' : ''}`] : []),
+      ...(wallets.length ? [`${[...new Set(wallets.map(leg => TRADING_NAMES[leg.exchange]))].join('、')} 按账户当前保证金模式与杠杆成交，本系统不修改：${wallets.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${leg.leverage.type === 'isolated' ? '逐仓' : '全仓'} ${leg.leverage.value}x`).join('、')}；逐仓仓位单独承担强平风险，请先在交易所确认保证金与杠杆。`] : []),
       '失败时不用市价补齐或回滚。',
       '同一批所有腿完成且委托终结后才进入下一批；任一腿失败会暂停后续批次并撤销余单，已成交仓位不会自动撤回。',
       ...(count > intent.batchCount ? [`按交易所单笔数量上限，批次数已从 ${intent.batchCount} 增加至 ${count}，请核对预览。`] : []),

@@ -13,6 +13,7 @@ import type { CycleRequest } from './positions-cycle-readers.ts';
 import { readBinancePositions, readBybitPositions, readOkxPositions, readAsterPositions } from './positions-readers.ts';
 import type { BinanceScope, BybitScope } from './positions-readers.ts';
 import { readVariationalPythonPositions } from './variational-python-client.ts';
+import { readRhLighterPositions } from './rh-lighter.ts';
 
 export type Database = Pick<ReturnType<typeof openDatabase>, 'prepare'>;
 export type ConnectionRow = { exchange: string; encrypted: string };
@@ -25,8 +26,9 @@ type CycleSlot = { side: Position['side']; quantity: string; entryPrice: string 
 type Entry = { revision: string; scope: PositionsScope; attemptedAt: number; touchedAt: number; pending?: Promise<void>; abort?: AbortController;
   cycles?: Map<string, CycleSlot>; cycleJob?: Promise<void>; cycleAbort?: AbortController };
 const TTL = 5_000;
-// Variational reads start a Python process per refresh.
-const SLOW_TTL: Partial<Record<PositionsExchangeId, number>> = { variational: 30_000 };
+// Variational reads start a Python process per refresh. Lighter RH shares a 60-requests-per-minute limit with other
+// modules; its reader also reuses one account read per address for 30 seconds.
+const SLOW_TTL: Partial<Record<PositionsExchangeId, number>> = { variational: 30_000, 'rh-lighter': 30_000 };
 const STALE_AFTER = 90_000;
 const DEADLINE = 25_000;
 // Cycle summaries walk fill history, so they refresh far less often than positions: on a quantity change after
@@ -42,6 +44,7 @@ export async function defaultRead(credentials: Credentials, scope: string, signa
     case 'okx': return readOkxPositions(credentials, scope as 'SWAP' | 'FUTURES', fetcher, signal);
     case 'aster': return readAsterPositions(credentials, fetcher, signal);
     case 'variational': return readVariationalPythonPositions(credentials, signal);
+    case 'rh-lighter': return readRhLighterPositions(credentials, fetcher, signal);
     default: throw new Error(POSITIONS_FAILED);
   }
 }

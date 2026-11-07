@@ -13,6 +13,9 @@ export const control = {
   /** The next Hyperliquid read answers with this total or rejects with this error. */
   hyperliquid: 0 as number | Error,
   hyperliquidCalls: [] as { walletAddress: string; verifyRole: boolean }[],
+  /** The next Lighter RH read answers with this total or rejects with this error. */
+  rhLighter: 0 as number | Error,
+  rhLighterCalls: [] as string[],
 };
 
 let database: ReturnType<typeof openDatabase> | undefined;
@@ -45,5 +48,10 @@ export async function syncHyperliquid(c: { walletAddress: string }, _fetcher?: u
   control.hyperliquidCalls.push({ walletAddress: c.walletAddress, verifyRole: !!options.verifyRole });
   if (control.hyperliquid instanceof Error) throw control.hyperliquid;
   return { total: control.hyperliquid, details: [] as Balance[], updatedAt: new Date().toISOString() };
+}
+export async function syncRhLighter(c: { walletAddress: string }) {
+  control.rhLighterCalls.push(c.walletAddress);
+  if (control.rhLighter instanceof Error) throw control.rhLighter;
+  return { total: control.rhLighter, details: [] as Balance[], updatedAt: new Date().toISOString() };
 }
 export const hubPositionsService = { peek: async () => null };

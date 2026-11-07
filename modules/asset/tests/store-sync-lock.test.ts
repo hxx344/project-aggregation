@@ -8,7 +8,7 @@ import { join } from 'node:path';
 // Run the real lib/store.ts: resolve its extensionless imports and swap only the modules with
 // external effects (exchanges, vault, positions cache, database file) for tests/fixtures/store-fakes.ts.
 const fakes = new URL('./fixtures/store-fakes.ts', import.meta.url).href;
-const faked = new Set(['./exchanges', './okx', './gate', './variational', './hyperliquid', './fx', './vault', './hub-positions', './sqlite']);
+const faked = new Set(['./exchanges', './okx', './gate', './variational', './hyperliquid', './rh-lighter', './fx', './vault', './hub-positions', './sqlite']);
 registerHooks({
   resolve(specifier, context, nextResolve) {
     if (context.parentURL?.endsWith('/lib/store.ts') && faked.has(specifier)) return { url: fakes, shortCircuit: true };
@@ -142,4 +142,42 @@ test('Hyperliquid connects by address, keeps the last value on failed refreshes 
   ledger = await store.disconnect(owner, 'hyperliquid');
   asset = ledger.assets.find(a => a.mode === 'hyperliquid')!;
   assert.deepEqual([ledger.connections.hyperliquid.configured, asset.value, asset.status], [false, 200, '已断开 · 保留旧值']);
+});
+
+test('Lighter RH connects by address, keeps the last value on failed refreshes and hides unexpected errors', async t => {
+  t.mock.timers.enable({ apis: ['Date', 'setInterval'], now: Date.parse('2026-10-30T05:00:00Z') });
+  const owner = 'rh-lighter-owner', walletAddress = '0x' + 'cd'.repeat(19) + 'e2';
+  control.rhLighter = 77.5;
+  let ledger = await store.connect(owner, { exchange: 'rh-lighter', walletAddress });
+  const created = ledger.assets.find(a => a.mode === 'rh-lighter')!;
+  assert.deepEqual([created.project, created.value, created.status], ['Lighter RH', 77.5, '只读同步 · 获取时间']);
+  assert.deepEqual([ledger.connections['rh-lighter'].configured, ledger.connections['rh-lighter'].label], [true, 'cde2']);
+  assert.deepEqual(control.rhLighterCalls.splice(0), [walletAddress]);
+  await assert.rejects(store.editAsset(owner, { id: created.id, quantity: 1, price: 1 }), /只读接口/);
+
+  control.rhLighter = new Error('Lighter RH 读取受到限流：60 秒内不再请求，请减少手动刷新；已保留上次数据');
+  ledger = await store.refresh(owner);
+  let asset = ledger.assets.find(a => a.mode === 'rh-lighter')!;
+  assert.deepEqual([asset.value, asset.status, asset.error], [77.5, '同步失败 · 保留旧值', control.rhLighter.message]);
+  assert.equal(ledger.connections['rh-lighter'].error, control.rhLighter.message);
+  assert.deepEqual(control.rhLighterCalls.splice(0), [walletAddress]);
+
+  t.mock.timers.tick(31_000);
+  control.rhLighter = new Error('connect ECONNRESET secret-host');
+  asset = (await store.refresh(owner)).assets.find(a => a.mode === 'rh-lighter')!;
+  assert.equal(asset.error, 'Lighter RH 同步失败，请更新连接或稍后重试；已保留上次数据');
+
+  t.mock.timers.tick(31_000);
+  control.rhLighter = 90;
+  ledger = await store.refresh(owner);
+  asset = ledger.assets.find(a => a.mode === 'rh-lighter')!;
+  assert.deepEqual([asset.value, asset.status, asset.error, ledger.connections['rh-lighter'].error], [90, '只读同步 · 获取时间', undefined, null]);
+  assert.equal(ledger.assets.filter(a => a.mode === 'rh-lighter').length, 1, 'refresh and reconnect reuse one asset row');
+
+  ledger = await store.disconnect(owner, 'rh-lighter');
+  asset = ledger.assets.find(a => a.mode === 'rh-lighter')!;
+  assert.deepEqual([ledger.connections['rh-lighter'].configured, asset.value, asset.status], [false, 90, '已断开 · 保留旧值']);
+  control.rhLighterCalls.length = 0;
+  await store.refresh(owner);
+  assert.deepEqual(control.rhLighterCalls, [], 'a disconnected address is not read');
 });

@@ -28,14 +28,14 @@ export function buildHubSummary(input: SummaryInput, now = Date.now()) {
   // but is no longer expected to refresh. Missing connection context stays conservative.
   // Aster's multi-account aggregate keeps its separate freshness semantics.
   const retained = new Set(assets.filter(asset => input.connectedExchanges !== undefined
-    && ['bybit', 'binance', 'okx', 'gate', 'variational', 'hyperliquid'].includes(asset.mode ?? '')
+    && ['bybit', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'].includes(asset.mode ?? '')
     && !input.connectedExchanges.includes(asset.mode!)));
   const dynamic = assets.filter(asset => asset.mode !== 'manual' && !retained.has(asset));
   const staticValuation = assets.length > 0 && dynamic.length === 0;
   const manualAt = oldest(manual.map(asset => asset.updatedAt));
   const retainedAt = oldest([...retained].map(asset => asset.updatedAt));
   const updatedAt = staticValuation ? oldest(assets.map(asset => asset.updatedAt)) : oldest(dynamic.map(asset => asset.updatedAt));
-  const unknownMode = dynamic.some(asset => !['market', 'bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid'].includes(asset.mode ?? ''));
+  const unknownMode = dynamic.some(asset => !['market', 'bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'].includes(asset.mode ?? ''));
   const values = assets.map(knownAssetValue);
   const total = values.every(value => value !== null) ? values.reduce<number>((sum, value) => sum + value!, 0) : null;
   const withdrawals = sumKnownValues(assets.filter(asset => asset.project?.trim() === '出金')).total;

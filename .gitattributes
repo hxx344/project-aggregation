@@ -30,6 +30,8 @@
 *.db binary
 *.sqlite binary
 *.sqlite3 binary
+*.wasm binary
+*.br binary
 
 # Git hooks must keep LF on every platform (CRLF breaks the shebang in bash)
 .githooks/* text eol=lf

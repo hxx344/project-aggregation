@@ -5,10 +5,11 @@ import { api, ApiError } from './api';
 import type { AnthropicShares } from './trading-execution-types';
 import { contractKey, findContract, sharesPerUnit } from './trading-anthropic';
 
-type Source = 'binance' | 'okx' | 'hyperliquid';
+type Source = 'binance' | 'okx' | 'hyperliquid' | 'rh-lighter';
 type ReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
 type Position = {
-  id: string; exchange: Source; symbol: string; side: 'long' | 'short'; quantity: string; quantityUnit: string | null; contractSize?: string;
+  /** account: Lighter RH account index; an L1 address can hold several accounts. */
+  id: string; exchange: Source; symbol: string; account?: number; side: 'long' | 'short'; quantity: string; quantityUnit: string | null; contractSize?: string;
   entryPrice: string | null; markPrice: string | null; notional: string | null; unrealizedPnl: string | null; leverage: string | null;
   marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; alerting: boolean;
 };
@@ -18,9 +19,9 @@ type HistoryEntry = { at: string; status: 'sent' | 'failed' | 'uncertain'; count
 type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { config: AlertConfig; channel: { configured: boolean; source: 'own' | 'digest' | null; host: string | null; error: string | null }; history: HistoryEntry[]; error: string | null; staleAfterSeconds: number; hysteresisPercent: number } };
 
 const BASE = '/api/trading/anthropic';
-const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid' };
+const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' };
 const STATES: Record<ReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
-const UNCONNECTED: Record<Source, string> = { binance: '在下方「账户连接」连接 Binance 只读账户后显示。', okx: '在下方「账户连接」连接 OKX 只读账户后显示。', hyperliquid: '在上方实盘执行区连接 Hyperliquid 后，按主账户地址读取。' };
+const UNCONNECTED: Record<Source, string> = { binance: '在下方「账户连接」连接 Binance 只读账户后显示。', okx: '在下方「账户连接」连接 OKX 只读账户后显示。', hyperliquid: '在上方实盘执行区连接 Hyperliquid 后，按主账户地址读取。', 'rh-lighter': '在上方实盘执行区连接 Lighter RH 后，按钱包地址读取其下全部账户。' };
 const HISTORY: Record<HistoryEntry['status'], string> = { sent: '已发送', failed: '发送失败', uncertain: '结果未知' };
 const dateFormat = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const formatDate = (value: string | null) => value && Number.isFinite(Date.parse(value)) ? dateFormat.format(new Date(value)) : '尚未读取';
@@ -111,7 +112,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
   const dirty = !!draft && !!config && (draft.enabled !== config.enabled || Number(draft.threshold) !== config.thresholdPercent || Number(draft.repeat) !== config.repeatMinutes);
 
   return <section className="trading-panel trading-positions trading-anthropic-positions" aria-labelledby="trading-anthropic-title">
-    <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>Binance / OKX 用只读账户 · Hyperliquid 用实盘连接的主账户地址（公开接口）· 每 30 秒读取，强平距离按标记价计算</p></div></div>
+    <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>Binance / OKX 用只读账户 · Hyperliquid / Lighter RH 用实盘连接的账户地址（公开接口）· 每 30 秒读取，强平距离按标记价计算</p></div></div>
     {!data ? <div className="trading-anthropic-loading" role="status">{error ? <span className="trading-warning">{error}</span> : <><LoaderCircle className="spin" size={20} /><span>正在读取 Anthropic 仓位…</span></>}</div> : <>
       <div className="trading-account-statuses">{data.sources.map(source => <div className="trading-account-status" key={source.exchange}>
         <div><strong>{NAMES[source.exchange]}</strong><span className={`trading-status ${source.state}`}><i aria-hidden="true" />{STATES[source.state]}</span>{source.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div>
@@ -124,7 +125,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
       </tr></thead><tbody>{estimates.map(({ position, shares: estimate }) => {
         const distance = position.distancePercent, near = distance !== null && threshold !== null && Number(distance) <= threshold;
         return <tr key={position.id} className={`trading-leg-start${near ? ' trading-anthropic-near' : ''}`} data-position-id={position.id}>
-          <th scope="row" className="trading-leg-name"><strong>{position.symbol}</strong><span>{NAMES[position.exchange]}</span></th>
+          <th scope="row" className="trading-leg-name"><strong>{position.symbol}</strong><span>{NAMES[position.exchange]}{position.account === undefined ? '' : ` · 账户 ${position.account}`}</span></th>
           <td data-label="方向"><span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span></td>
           <td data-label="数量 · 估算股数">{amount(position.quantity)}{position.quantityUnit ? ` ${position.quantityUnit}` : ''}<small className="trading-anthropic-shares">{estimate === null ? '股数未知' : `≈ ${shareText(estimate)} 股`}</small></td>
           <td data-label="开仓均价">{amount(position.entryPrice)}</td>
@@ -175,7 +176,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
           <time dateTime={entry.at}>{formatDate(entry.at)}</time> · <span className={entry.status === 'sent' ? '' : 'trading-warning'}>{HISTORY[entry.status]}</span> · {entry.summary.join('；')}{entry.error ? `（${entry.error}）` : ''}
         </li>)}</ul></details> : null}
       </div>
-      <p className="trading-footnote">强平价与标记价来自交易所账户接口；Hyperliquid 标记价按仓位价值 ÷ 数量折算。估算股数沿用页面的股数假设，只用于核对多空是否大致相等。</p>
+      <p className="trading-footnote">强平价与标记价来自交易所账户接口；Hyperliquid 与 Lighter RH 标记价按仓位价值 ÷ 数量折算。估算股数沿用页面的股数假设，只用于核对多空是否大致相等。</p>
     </>}
   </section>;
 }

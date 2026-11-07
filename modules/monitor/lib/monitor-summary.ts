@@ -2,6 +2,8 @@ import type { LiveQuote } from "./market";
 import { createTrend, type MonitorTrend, type TrendHistory } from "./monitor-trend.ts";
 import { hynixExchangeQuote, type ExchangeQuote } from "./exchange-quotes.ts";
 import { getQuoteStaleAfterMs } from './market-freshness.ts';
+import { ANTHROPIC_COMPARISON_LEGS, ANTHROPIC_LEGS } from '../modules/anthropic/market.mjs';
+import type { AnthropicComparisonLeg } from './anthropic-history.ts';
 
 export type SummaryStatus = "loading" | "live" | "snapshot" | "stale" | "error";
 export type SummaryMetric = { label: string; value: string; tone?: "positive" | "negative" };
@@ -92,10 +94,9 @@ export function summaryExpired(summary: MonitorSummary, intervalMs: number, now:
 export const anthropicTrendOptions = { days: 7, intervalMs: 900_000, label: "7 天 · 15 分钟线", shortLabel: "7天", unit: "%" };
 export type AnthropicSummaryUpdate = {
   status: SummaryStatus;
-  /** Binance per-share premium over xyz:ANT and io:ANTH, in percent. */
-  premiumXyz: number | null;
-  premiumIo: number | null;
-  /** Hyperliquid contract the trend follows. */
+  /** Binance per-share premium over each comparison contract, in percent. */
+  premiums: Partial<Record<AnthropicComparisonLeg, number | null>>;
+  /** Comparison contract the trend follows. */
   trendLeg: string;
   fetchedAt: string | null;
   staleAfterMs?: number;
@@ -107,8 +108,8 @@ export function anthropicSummary(update?: AnthropicSummaryUpdate, trend?: Monito
     status: update?.status ?? "loading",
     fetchedAt: update?.fetchedAt ?? null,
     staleAfterMs: getQuoteStaleAfterMs({ collection: { maxAgeMs: update?.staleAfterMs } }, 35_000),
-    metrics: [metric("溢价 · xyz:ANT", update?.premiumXyz, 2, "%"), metric("溢价 · io:ANTH", update?.premiumIo, 2, "%")],
-    note: `Binance 每股价格相对 Hyperliquid · 走势取 ${update?.trendLeg ?? "xyz:ANT"}`,
+    metrics: ANTHROPIC_COMPARISON_LEGS.map(leg => metric(`溢价 · ${ANTHROPIC_LEGS[leg].name}`, update?.premiums[leg], 2, "%")),
+    note: `Binance 每股价格相对 Hyperliquid / rh-Lighter · 走势取 ${update?.trendLeg ?? ANTHROPIC_LEGS[ANTHROPIC_COMPARISON_LEGS[0]].name}`,
     trend: trend ?? createTrend(update?.history, anthropicTrendOptions, update?.status === "error"),
   };
 }

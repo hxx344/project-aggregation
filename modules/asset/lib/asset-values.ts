@@ -42,7 +42,7 @@ export function workbookMissingValueSql(row: string) {
   return `(${missingValueSql(row)} AND NOT (${blank}))`;
 }
 
-const EXCHANGE_MODES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid'] as const;
+const EXCHANGE_MODES = ['bybit', 'aster', 'binance', 'okx', 'gate', 'variational', 'hyperliquid', 'rh-lighter'] as const;
 type ExchangeConnections = Record<(typeof EXCHANGE_MODES)[number], Pick<Connection, 'configured'>>;
 
 /** Exchanges whose credentials are currently saved; Aster counts as configured while any account is. */

@@ -16,6 +16,8 @@ async (page) => {
       positions: [leg('okx', 'ANTHROPICUSDT', 'short', { quantity: '300', quantityUnit: '张', contractSize: '1', markPrice: '183.6', notional: '5508', unrealizedPnl: '-108', liquidationPrice: '240', distancePercent: '30.72', alerting: false, marginMode: 'cross' })] },
     { exchange: 'hyperliquid', connected: true, address: '0x' + 'ab'.repeat(20), state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
       positions: [leg('hyperliquid', 'xyz:ANT', 'long', { quantity: '100', markPrice: '14.4', notional: '1440', liquidationPrice: null, distancePercent: null, alerting: false })] },
+    { exchange: 'rh-lighter', connected: true, address: '0x' + 'cd'.repeat(20), state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
+      positions: [{ ...leg('rh-lighter', 'ANTHROPIC', 'short', { quantity: '0.6', markPrice: '1520.1', notional: '912.06', liquidationPrice: '1900.5', distancePercent: '25.02', alerting: false, marginMode: 'cross' }), id: 'rh-lighter:ANTHROPIC:22163:short', account: 22163 }] },
   ], alerts: { config, channel, history: [{ at: fixedTime, status: 'sent', count: 1, summary: ['Binance ANTHROPICUSDT 做多：距强平 18.20%（阈值 20%）'], error: null }], error: null, staleAfterSeconds: 180, hysteresisPercent: 2 } });
   const trading = () => ({ mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, cache: { builtAt: fixedTime, servedAt: fixedTime, rebuilding: false }, period: { days: 7, start, end: fixedTime },
     exchanges: ['binance', 'bybit'], accounts: [], legs: [], structure: { state: 'opposed', message: '' },
@@ -55,16 +57,18 @@ async (page) => {
   await page.goto(`${origin}/?view=trading&tradingSection=oil`);
   await section.getByRole('heading', { name: 'Anthropic 套利仓位', exact: true }).waitFor();
   await rows.first().waitFor();
-  assert(await rows.count() === 3, 'one row per leg across Binance, OKX and Hyperliquid');
+  assert(await rows.count() === 4, 'one row per leg across Binance, OKX, Hyperliquid and Lighter RH');
   const texts = await rows.allInnerTexts();
   assert(texts[0].includes('ANTHROPICUSDT') && texts[0].includes('做多') && texts[0].includes('≈ 381 股') && texts[0].includes('150.1') && texts[0].includes('18.20%') && texts[0].includes('预警中'), `Binance near row: ${texts[0]}`);
   assert(await rows.nth(0).evaluate(row => row.classList.contains('trading-anthropic-near')), 'a leg inside the threshold is highlighted');
   assert(texts[1].includes('300 张') && texts[1].includes('≈ 381 股') && texts[1].includes('全仓') && !(await rows.nth(1).evaluate(row => row.classList.contains('trading-anthropic-near'))), `OKX row: ${texts[1]}`);
   assert(texts[2].includes('xyz:ANT') && texts[2].includes('≈ 100 股') && texts[2].includes('未提供'), `Hyperliquid row without a liquidation price: ${texts[2]}`);
+  assert(texts[3].includes('ANTHROPIC') && texts[3].includes('Lighter RH · 账户 22163') && texts[3].includes('≈ 10.02 股') && texts[3].includes('25.02%') && texts[3].includes('全仓'), `Lighter RH row names its account: ${texts[3]}`);
   const statuses = await section.locator('.trading-account-status').allInnerTexts();
   assert(statuses[1].includes('数据已过期') && statuses[1].includes('OKX 仓位读取超时'), `OKX stale status: ${statuses[1]}`);
   assert(statuses[2].includes('0xabab…abab'), `Hyperliquid address is masked: ${statuses[2]}`);
-  assert((await section.locator('.trading-structure').innerText()).includes('多头 ≈ 481 股 · 空头 ≈ 381 股 · 差 100 股'), 'long and short shares are summed under the share assumption');
+  assert(statuses[3].includes('Lighter RH') && statuses[3].includes('0xcdcd…cdcd'), `Lighter RH address is masked: ${statuses[3]}`);
+  assert((await section.locator('.trading-structure').innerText()).includes('多头 ≈ 481 股 · 空头 ≈ 391 股 · 差 89.98 股'), 'long and short shares are summed under the share assumption');
 
   const save = section.getByRole('button', { name: '保存', exact: true });
   assert(await save.isDisabled(), 'save waits for a change');
@@ -110,5 +114,5 @@ async (page) => {
   assert(await section.locator('.trading-position-table thead').isHidden(), 'phone uses labelled position cards');
   await section.screenshot({ path: 'output/playwright/trading-anthropic-positions-mobile.png' });
   assert(!pageErrors.length, `No uncaught browser errors: ${pageErrors.join('; ')}`);
-  return { passed: true, scenarios: ['three sources with stale and masked address', 'near highlight and share estimates', 'save exact body', 'test failure shown', 'no robot disables test', '390px mobile'] };
+  return { passed: true, scenarios: ['four sources with stale and masked addresses', 'near highlight and share estimates', 'save exact body', 'test failure shown', 'no robot disables test', '390px mobile'] };
 }
