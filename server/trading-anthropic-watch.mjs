@@ -2,6 +2,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path';
 import { atomicJson } from '../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from './http-common.mjs';
+import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
 import { postCard, validateChannel } from './automation/feishu-digest-core.mjs';
 import { decimal } from './trading-decimal.mjs';
 import { EXECUTION_VENUE_SYMBOLS, TRADING_NAMES } from './trading-markets.mjs';
@@ -128,25 +129,14 @@ export function parseRhLighterAccounts(body) {
   return rows;
 }
 
-// Reads at most MAX_BODY_BYTES of the body as it streams; the fetch signal also aborts the read.
-async function readLimited(response, name) {
-  const length = response.headers?.get?.('content-length');
-  if (length && Number(length) > MAX_BODY_BYTES) throw new Error(`${name} 响应过大`);
-  if (!response.body?.getReader) throw new Error(`${name} 仓位数据无法识别`);
-  const reader = response.body.getReader(), chunks = [];
-  let size = 0, done = false;
-  try {
-    while (true) {
-      const chunk = await reader.read();
-      if (chunk.done) { done = true; break; }
-      size += chunk.value.byteLength;
-      if (size > MAX_BODY_BYTES) throw new Error(`${name} 响应过大`);
-      chunks.push(Buffer.from(chunk.value));
-    }
-    return Buffer.concat(chunks, size).toString('utf8');
-  } finally {
-    if (!done) void reader.cancel().catch(() => {});
-    reader.releaseLock();
+// The shared bounded reader (docs/evolution-plan.md E2). No signal is passed:
+// the fetch signal already ends the body, and its own timeout error keeps the
+// caller's read-timeout message.
+async function readJson(response, name) {
+  try { return await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES }); }
+  catch (error) {
+    if (!(error instanceof ExchangeResponseError)) throw error;
+    throw new Error(error.code === 'response_limit' ? `${name} 响应过大` : `${name} 仓位数据无法识别`);
   }
 }
 
@@ -231,8 +221,8 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
       redirect: 'error', cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
     if (response.status === 429) throw new Error(`${name} 请求过于频繁，稍后自动重试`);
     if (!response.ok) throw new Error(`${name} 返回 HTTP ${response.status}`);
-    const text = await readLimited(response, name);
-    try { return parseHyperliquidState(JSON.parse(text), dex); } catch { throw new Error(`${name} 仓位数据无法识别`); }
+    const body = await readJson(response, name);
+    try { return parseHyperliquidState(body, dex); } catch { throw new Error(`${name} 仓位数据无法识别`); }
   }
   async function readRhLighter(address, signal) {
     const name = TRADING_NAMES['rh-lighter'], limited = () => { rhCooldownUntil = now() + RH_COOLDOWN_MS; return new Error(`${name} 请求过于频繁，稍后自动重试`); };
@@ -241,9 +231,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
     const response = await fetcher(url, { method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) });
     if (response.status === 429 || response.status === 405) { void response.body?.cancel().catch(() => {}); throw limited(); }
     if (!response.ok && response.status !== 400) throw new Error(`${name} 返回 HTTP ${response.status}`);
-    const text = await readLimited(response, name);
-    let body;
-    try { body = JSON.parse(text); } catch { throw new Error(`${name} 仓位数据无法识别`); }
+    const body = await readJson(response, name);
     if (response.status === 400) {
       if (object(body) && body.code === RH_NOT_FOUND) return [];
       if (object(body) && body.code === RH_RATE_LIMITED) throw limited();

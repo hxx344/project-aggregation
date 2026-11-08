@@ -54,6 +54,11 @@ test('Binance clock bounds an uncooperative transport and cancels the last pendi
   await assert.rejects(clock.sync({ signal: alreadyAborted.signal }), { name: 'AbortError' });
 });
 
+test('Binance clock reads a non-JSON time answer as a transport failure', async () => {
+  const clock = createBinanceClock({ now: () => NOW, fetchImpl: async () => new Response('<html>busy</html>') });
+  await assert.rejects(clock.sync(), { code: 'transport' }); assert.equal(clock.timestamp(), NOW);
+});
+
 test('Binance clock rejects malformed, oversized and implausible time samples', async () => {
   for (const response of [json({ serverTime: NOW + 300001 }), json({ serverTime: String(NOW) }), json({ serverTime: -1 }), json({ serverTime: NOW }, 500), json({ serverTime: NOW, padding: 'x'.repeat(5000) })]) {
     const clock = createBinanceClock({ now: () => NOW, fetchImpl: async () => response });

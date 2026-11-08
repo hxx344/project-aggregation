@@ -1,3 +1,5 @@
+import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
+
 const TIME_URL = 'https://fapi.binance.com/fapi/v1/time';
 const MAX_OFFSET_MS = 300_000;
 const MAX_BODY_BYTES = 4096;
@@ -6,6 +8,17 @@ export class BinanceClockError extends Error {
   constructor(code) { super('Binance 服务器时间同步失败'); this.name = 'BinanceClockError'; this.code = code; }
 }
 const aborted = () => new DOMException('读取已取消', 'AbortError');
+
+// The shared bounded reader (docs/evolution-plan.md E2), with this clock's
+// codes: an oversized answer is a clock failure, an unparsable one transport.
+async function readClockJson(response, signal) {
+  try { return await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal }); }
+  catch (error) {
+    if (!(error instanceof ExchangeResponseError)) throw error;
+    if (error.code === 'aborted') throw aborted();
+    throw new BinanceClockError(error.code === 'response_limit' ? 'clock' : 'transport');
+  }
+}
 
 /** Public server time only: no credentials, signed URLs or private account state. */
 export function createBinanceClock({ fetchImpl = fetch, now = Date.now, timeoutMs = 12_000,
@@ -37,22 +50,8 @@ export function createBinanceClock({ fetchImpl = fetch, now = Date.now, timeoutM
       const response = await fetchImpl(TIME_URL, { method: 'GET', redirect: 'error', cache: 'no-store', signal: controller.signal });
       if (controller.signal.aborted) throw aborted();
       if (!response.ok || response.redirected) throw new BinanceClockError('clock');
-      const length = response.headers?.get('content-length');
-      if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES) || !response.body?.getReader) throw new BinanceClockError('clock');
-      const reader = response.body.getReader(), chunks = [];
-      let size = 0, finished = false;
-      try {
-        while (true) {
-          if (controller.signal.aborted) throw aborted();
-          const { done, value } = await reader.read();
-          if (done) { finished = true; break; }
-          size += value.byteLength;
-          if (size > MAX_BODY_BYTES) throw new BinanceClockError('clock');
-          chunks.push(Buffer.from(value));
-        }
-      } finally { if (!finished) void reader.cancel().catch(() => {}); reader.releaseLock(); }
-      if (controller.signal.aborted) throw aborted();
-      const data = JSON.parse(Buffer.concat(chunks, size).toString('utf8'));
+      if (!response.body?.getReader) throw new BinanceClockError('clock');
+      const data = await readClockJson(response, controller.signal);
       const after = local(), monotonicAt = monotonicNow(), rtt = after - before;
       const offset = Math.round(data?.serverTime - (before + after) / 2);
       if (!Number.isSafeInteger(data?.serverTime) || data.serverTime < 0 || rtt < 0 || rtt > 5000

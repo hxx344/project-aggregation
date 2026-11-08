@@ -3,4 +3,7 @@ export class ExchangeResponseError extends Error {
   readonly code: ExchangeResponseErrorCode;
   constructor(code: ExchangeResponseErrorCode);
 }
-export function readJsonResponse(response: Response, options: { maxBytes: number; signal?: AbortSignal }): Promise<unknown>;
+/** An error thrown by reviver propagates unchanged; context.source is the numeric token text (Node >= 24). */
+export function readJsonResponse(response: Response, options: {
+  maxBytes: number; signal?: AbortSignal; reviver?: (this: unknown, key: string, value: unknown, context?: { source?: string }) => unknown;
+}): Promise<unknown>;

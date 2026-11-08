@@ -3,6 +3,7 @@ import { Wallet } from 'ethers';
 import { compareDecimals, decimal } from './trading-decimal.mjs';
 import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs';
 import { signL1Action } from './trading-hyperliquid-signing.mjs';
+import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
 
 // Hyperliquid HIP-3 perps (io:ANTH, xyz:ANT) through an API (agent) wallet.
 // Only `order` and `cancel` actions exist here: no transfer, withdrawal,
@@ -151,26 +152,14 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
     return { master: credentials.address.toLowerCase(), agent: wallet.address.toLowerCase(), wallet };
   }
 
+  // The shared bounded reader (docs/evolution-plan.md E2). Its codes keep their
+  // meaning here; one it may add later reads as invalid_data, which keeps an
+  // unreadable send response uncertain.
   async function readJson(response, signal) {
-    const length = response.headers?.get?.('content-length');
-    if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES)) fail('response_limit');
-    if (!response.body?.getReader) fail();
-    const reader = response.body.getReader(), chunks = [];
-    let size = 0, done = false;
-    try {
-      while (true) {
-        checkAbort(signal);
-        const chunk = await reader.read();
-        checkAbort(signal);
-        if (chunk.done) { done = true; break; }
-        size += chunk.value.byteLength;
-        if (size > MAX_BODY_BYTES) fail('response_limit');
-        chunks.push(Buffer.from(chunk.value));
-      }
-      try { return JSON.parse(Buffer.concat(chunks, size).toString('utf8')); } catch { return fail(); }
-    } finally {
-      if (!done) void reader.cancel().catch(() => {});
-      reader.releaseLock();
+    try { return await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal }); }
+    catch (error) {
+      if (error instanceof ExchangeResponseError) fail(['response_limit', 'aborted'].includes(error.code) ? error.code : 'invalid_data');
+      throw error;
     }
   }
 

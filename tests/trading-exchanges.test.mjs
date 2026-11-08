@@ -209,6 +209,19 @@ test('Binance keeps large int64 ids losslessly and separates symbol identities',
   assert.equal(result.complete, true); assert.equal(result.events.length, 2); assert.ok(result.events.every(row => row.id.endsWith(id))); assert.equal(addDecimals(result.events.map(row => row.amount)), '-0.002469135780246912');
 });
 
+test('Binance reads an unusable tranId as invalid data and a non-JSON body as a transport failure', async () => {
+  for (const id of ['-1', '1.5']) {
+    const { client } = harness('binance', url => {
+      if (!url.pathname.endsWith('/income')) return;
+      return new Response(`[{"symbol":"${url.searchParams.get('symbol')}","incomeType":"FUNDING_FEE","income":"0.1","asset":"USDT","time":${NOW - 1},"tranId":${id}}]`);
+    });
+    const result = await client.funding(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, false); assert.equal(result.diagnostic.code, 'invalid_data', id);
+  }
+  const html = harness('binance', () => new Response('<html>private</html>'));
+  await assert.rejects(html.client.verify(credentials), { code: 'transport' });
+});
+
 test('Binance reads every full page and deduplicates overlap without losing later records', async () => {
   const start = NOW - DAY;
   const rows = Array.from({ length: 1000 }, (_, index) => income('CLUSDT', start + index, { tranId: String(index) }));
