@@ -27,6 +27,32 @@ export function summarizeSources(projects, now) {
   return result;
 }
 
+// A valid_sample column with another expression (left by another release
+// before a rollback to this one, or by a hand edit) would count samples by that
+// rule, so it is rebuilt with this one under the write lock
+// (docs/hub-schema-inventory.md sections 5 and 6). Its index goes with it and
+// is created again by the caller. Failure keeps the column, is logged, and the
+// next start tries again: the baseline never blocks startup.
+// Another object referencing the column (a view, trigger, index or generated
+// column) makes DROP COLUMN fail, and so does any broken view in the database.
+const flatSql = sql => String(sql).replace(/\s+/g, ' ').trim();
+function replaceChangedColumn(db, column, logger) {
+  // The definition must start a column: a column named like prev_valid_sample is not this one.
+  const definition = new RegExp(`[(,] ?${flatSql(column).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} ?[,)]`);
+  const changed = () => !definition.test(flatSql(db.prepare("SELECT sql FROM sqlite_schema WHERE type='table' AND name='platform_baseline_samples'").get()?.sql ?? ''));
+  if (!changed()) return;
+  try {
+    immediate(db, () => {
+      if (!changed()) return;
+      db.exec(`DROP INDEX IF EXISTS platform_baseline_valid_bucket; ALTER TABLE platform_baseline_samples DROP COLUMN valid_sample; ALTER TABLE platform_baseline_samples ADD COLUMN ${column}`);
+    });
+  } catch (error) {
+    logger.error?.({ err: error, type: 'hub-schema' }, '基线样本有效性列的定义与本程序不同且未能重建，下次启动重试');
+    return;
+  }
+  logger.info?.({ type: 'hub-schema' }, '基线样本有效性列的定义与本程序不同，已按本程序重建');
+}
+
 /** Bounded minute observations, independent of browser activity and upstream refreshes. */
 export function createBaseline({ db, readSnapshot, readCapabilities = async () => [], now = Date.now, intervalMs = BASELINE_INTERVAL_MS, logger = console }) {
   validateBaselineInterval(intervalMs);
@@ -47,9 +73,10 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
     AND json_extract(json,'$.summaries.eligible')=json_extract(json,'$.summaries.fresh')+json_extract(json,'$.summaries.stale')+json_extract(json,'$.summaries.missing'),0) ELSE 0 END`;
   // The generated column's index is updated with the JSON, including repairs/corruption.
   // Historical coverage reads use that index instead of parsing 28 days of payloads.
-  if (!db.prepare('PRAGMA table_xinfo(platform_baseline_samples)').all().some(column => column.name === 'valid_sample')) {
-    db.exec(`ALTER TABLE platform_baseline_samples ADD COLUMN valid_sample INTEGER GENERATED ALWAYS AS (${valid}) VIRTUAL`);
-  }
+  const column = `valid_sample INTEGER GENERATED ALWAYS AS (${valid}) VIRTUAL`;
+  const hasColumn = () => db.prepare('PRAGMA table_xinfo(platform_baseline_samples)').all().some(info => info.name === 'valid_sample');
+  if (!hasColumn()) db.exec(`ALTER TABLE platform_baseline_samples ADD COLUMN ${column}`);
+  else replaceChangedColumn(db, column, logger);
   db.exec('CREATE INDEX IF NOT EXISTS platform_baseline_valid_bucket ON platform_baseline_samples(valid_sample,bucket_ms)');
   const recent = db.prepare('SELECT bucket_ms,schema_version,json FROM platform_baseline_samples WHERE valid_sample=1 AND bucket_ms>=? AND bucket_ms<=? ORDER BY bucket_ms DESC LIMIT 60');
   const bounds = db.prepare('SELECT COUNT(*) AS count,MIN(bucket_ms) AS first,MAX(bucket_ms) AS last FROM platform_baseline_samples WHERE valid_sample=1 AND bucket_ms>=? AND bucket_ms<=?');

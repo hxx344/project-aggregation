@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
+import { inspectHubSchema } from '../server/control/hub-schema.mjs';
 import { createBaseline, summarizeSources, validateBaselineInterval, BASELINE_INTERVAL_MS, BASELINE_RETENTION_MS, BASELINE_MAX_BUCKETS } from '../server/observability.mjs';
 
 const time = Date.parse('2026-10-19T00:00:00Z');
@@ -115,6 +116,46 @@ test('validity index upgrades an existing minute table idempotently and follows 
   assert.equal(second.read().sampling.retainedBuckets, 0); assert.equal(second.read().sampling.invalidSamples, 1);
   db.prepare('UPDATE platform_baseline_samples SET json=?').run(json);
   assert.equal(first.read().sampling.retainedBuckets, 1); assert.equal(first.read().sampling.invalidSamples, 0);
+});
+
+test('a validity column with another expression is rebuilt with this one, and a failed rebuild keeps startup', async t => {
+  const f = fixture(t); await f.baseline.sample();
+  const json = f.db.prepare('SELECT json FROM platform_baseline_samples').get().json;
+  const legacy = db => {
+    db.exec('CREATE TABLE platform_baseline_samples (bucket_ms INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, json TEXT NOT NULL, valid_sample INTEGER GENERATED ALWAYS AS (1) VIRTUAL); CREATE INDEX platform_baseline_valid_bucket ON platform_baseline_samples(valid_sample,bucket_ms)');
+    const insert = db.prepare('INSERT INTO platform_baseline_samples(bucket_ms,schema_version,json) VALUES (?,1,?)');
+    insert.run(time, json); insert.run(time - BASELINE_INTERVAL_MS, '{broken');
+  };
+  const db = new DatabaseSync(':memory:'), logs = [];
+  legacy(db);
+  const logger = { info: (_, message) => logs.push(['info', message]), warn() {}, error: (_, message) => logs.push(['error', message]) };
+  const options = { db, intervalMs: 0, now: () => time, logger, readSnapshot: () => ({ projects: [], sseConnections: 0 }) };
+  const rebuilt = createBaseline(options), again = createBaseline(options);
+  t.after(async () => { await rebuilt.close(); await again.close(); db.close(); });
+  assert.deepEqual(logs.map(([level]) => level), ['info'], 'rebuilt once; the second start finds this definition');
+  assert.equal(rebuilt.read().sampling.invalidSamples, 1); assert.equal(rebuilt.read().sampling.retainedBuckets, 1);
+  assert.equal(db.prepare('SELECT count(*) AS n FROM platform_baseline_samples').get().n, 2, 'rows are kept');
+  const report = inspectHubSchema(db);
+  assert.ok(!report.mismatched.includes('platform_baseline_samples') && !report.mismatched.includes('platform_baseline_valid_bucket'), JSON.stringify(report));
+  assert.ok(!report.missing.includes('platform_baseline_valid_bucket'));
+
+  // A column whose name ends in valid_sample and carries this expression does not count as valid_sample itself.
+  const definition = db.prepare("SELECT sql FROM sqlite_schema WHERE name='platform_baseline_samples'").get().sql.match(/valid_sample INTEGER GENERATED[\s\S]*VIRTUAL/)[0];
+  const shadowed = new DatabaseSync(':memory:');
+  shadowed.exec(`CREATE TABLE platform_baseline_samples (bucket_ms INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, json TEXT NOT NULL, prev_${definition}, valid_sample INTEGER GENERATED ALWAYS AS (1) VIRTUAL)`);
+  shadowed.prepare('INSERT INTO platform_baseline_samples(bucket_ms,schema_version,json) VALUES (?,1,?)').run(time, '{broken');
+  const reread = createBaseline({ ...options, db: shadowed, logger: quiet });
+  t.after(async () => { await reread.close(); shadowed.close(); });
+  assert.equal(reread.read().sampling.retainedBuckets, 0, 'the broken row is not counted as valid');
+
+  // A view on the column makes DROP COLUMN fail: the column and its index stay, startup continues.
+  const blocked = new DatabaseSync(':memory:'), errors = [];
+  legacy(blocked); blocked.exec('CREATE VIEW valid_rows AS SELECT bucket_ms FROM platform_baseline_samples WHERE valid_sample=1');
+  const kept = createBaseline({ ...options, db: blocked, logger: { info() {}, warn() {}, error: (_, message) => errors.push(message) } });
+  t.after(async () => { await kept.close(); blocked.close(); });
+  assert.equal(errors.length, 1);
+  assert.match(blocked.prepare("SELECT sql FROM sqlite_schema WHERE name='platform_baseline_samples'").get().sql, /AS \(1\) VIRTUAL/);
+  assert.ok(blocked.prepare("SELECT 1 FROM sqlite_schema WHERE name='platform_baseline_valid_bucket'").get());
 });
 
 test('sampling runs without readers and close aborts in-flight capability work without writing a sample', async t => {

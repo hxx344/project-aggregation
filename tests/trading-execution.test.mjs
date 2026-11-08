@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
 import { createExecutionJobsReader, UNFINISHED_EXECUTION_JOB_SQL } from '../server/control/execution-jobs.mjs';
+import { inspectHubSchema } from '../server/control/hub-schema.mjs';
 import { createExecutionExchangeClient, ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 import { createOkxExecutionClient } from '../server/trading-okx-execution.mjs';
 import { normalizeIntent, splitQuantity } from '../server/trading-execution-plan.mjs';
@@ -1446,10 +1447,100 @@ test('missing job index recovery retries only once and leaves other database err
   try {
     assert.throws(() => f.service.state(), error => error === failure);
     assert.equal(reads, 2); assert.equal(repairs, 1);
+    failure = new Error('no query solution'); reads = 0; repairs = 0;
+    assert.throws(() => f.service.state(), error => error === failure, 'a definition that already matches is not hidden by the retry');
+    assert.equal(reads, 2); assert.equal(repairs, 1);
     failure = new Error('disk I/O error'); reads = 0; repairs = 0;
     assert.throws(() => f.service.state(), error => error === failure);
     assert.equal(reads, 1); assert.equal(repairs, 0);
   } finally { f.db.prepare = prepare; f.db.exec = exec; }
+});
+
+const READ_INDEXES = ['execution_jobs_unfinished', 'execution_jobs_finished', 'execution_orders_unsettled'];
+const OTHER_INDEX_SQL = {
+  execution_jobs_unfinished: "CREATE INDEX execution_jobs_unfinished ON execution_jobs(json_extract(json,'$.createdAt')) WHERE json_extract(json,'$.status') NOT IN ('completed')",
+  execution_jobs_finished: "CREATE INDEX execution_jobs_finished ON execution_jobs(json_extract(json,'$.createdAt')) WHERE json_extract(json,'$.status') IN ('completed','stopped','cancelled')",
+  execution_orders_unsettled: "CREATE INDEX execution_orders_unsettled ON execution_orders(job_id) WHERE json_extract(json,'$.settled') IS NOT 1",
+};
+
+test('read indexes of the same name with another definition are replaced at startup', async t => {
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL); CREATE TABLE execution_orders (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, json TEXT NOT NULL)');
+  for (const name of READ_INDEXES) db.exec(OTHER_INDEX_SQL[name]);
+  const insert = db.prepare('INSERT INTO execution_jobs(id,json) VALUES (?,?)');
+  for (const [id, status] of [['paused', 'paused'], ['done', 'completed'], ['stopped', 'stopped']]) insert.run(id, JSON.stringify({ id, status, createdAt: new Date(baseTime).toISOString(), updatedAt: new Date(baseTime).toISOString(), deadlineAt: new Date(baseTime + 60_000).toISOString(),
+    batchIndex: 0, phase: 0, totals: [], plan: { market: 'oil', preset: 'cross-exchange', action: 'open', batchCount: 1, legs: [] }, events: [] }));
+  db.prepare('INSERT INTO execution_orders(id,job_id,json) VALUES (?,?,?)').run('order', 'done', JSON.stringify({ settled: false }));
+  const create = () => createTradingExecution({ db, now: () => baseTime, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: () => ({}) });
+  const service = create();
+  t.after(async () => { await service.close(); db.close(); });
+  assert.deepEqual(inspectHubSchema(db).mismatched.filter(name => READ_INDEXES.includes(name)), []);
+  assert.deepEqual(service.state().jobs.map(job => job.id).sort(), ['done', 'paused', 'stopped']);
+  const stored = () => db.prepare("SELECT name,sql FROM sqlite_schema WHERE type='index' ORDER BY name").all().map(row => `${row.name}:${row.sql}`);
+  const before = stored(), exec = db.exec;
+  let writes = 0;
+  db.exec = sql => { if (/DROP INDEX/.test(sql)) writes++; return exec.call(db, sql); };
+  try { await create().close(); } finally { db.exec = exec; }
+  assert.equal(writes, 0, 'a matching definition is left alone'); assert.deepEqual(stored(), before);
+});
+
+test('a fresh database gets the read indexes without a replacement, and a differently cased name is still replaced', async t => {
+  const fresh = new DatabaseSync(':memory:'), exec = fresh.exec;
+  let drops = 0;
+  fresh.exec = sql => { if (/DROP INDEX/.test(sql)) drops++; return exec.call(fresh, sql); };
+  const options = { now: () => baseTime, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: () => ({}) };
+  await createTradingExecution({ db: fresh, ...options }).close();
+  await createTradingExecution({ db: fresh, ...options }).close();
+  fresh.exec = exec;
+  assert.equal(drops, 0);
+  assert.deepEqual(inspectHubSchema(fresh).mismatched, []);
+  fresh.close();
+
+  const db = new DatabaseSync(':memory:');
+  db.exec(`CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL); ${OTHER_INDEX_SQL.execution_jobs_unfinished.replace('execution_jobs_unfinished', 'EXECUTION_JOBS_UNFINISHED')}`);
+  const service = createTradingExecution({ db, ...options });
+  t.after(async () => { await service.close(); db.close(); });
+  assert.deepEqual(service.state().jobs, []);
+  assert.deepEqual(db.prepare("SELECT name FROM sqlite_schema WHERE name LIKE 'execution_jobs_unfinished'").all().map(row => row.name), ['execution_jobs_unfinished']);
+  assert.ok(!inspectHubSchema(db).mismatched.includes('execution_jobs_unfinished'));
+});
+
+test('a busy database at startup leaves the index replacement to a later read; other errors still fail startup', async t => {
+  for (const [label, failure] of [['busy', Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR', errcode: 5 })], ['other', new Error('disk I/O error')]]) await t.test(label, async t => {
+    const db = new DatabaseSync(':memory:'), exec = db.exec;
+    db.exec(`CREATE TABLE execution_jobs (id TEXT PRIMARY KEY, json TEXT NOT NULL); ${OTHER_INDEX_SQL.execution_jobs_unfinished}`);
+    let refused = false;
+    db.exec = sql => { if (!refused && sql === 'BEGIN IMMEDIATE') { refused = true; throw failure; } return exec.call(db, sql); };
+    const create = () => createTradingExecution({ db, now: () => baseTime, intervalMs: 0, encrypt: value => JSON.stringify(value), decrypt: JSON.parse, clientFactory: () => ({}) });
+    if (label === 'other') { assert.throws(create, error => error === failure); db.close(); return; }
+    const service = create();
+    t.after(async () => { await service.close(); db.close(); });
+    assert.ok(refused);
+    assert.deepEqual(service.state().jobs, []);
+    assert.ok(!inspectHubSchema(db).mismatched.includes('execution_jobs_unfinished'));
+  });
+});
+
+test('a read index redefined after startup is replaced once for cached and fresh statements', async t => {
+  for (const cached of [false, true]) await t.test(cached ? 'cached' : 'fresh', async t => {
+    const f = historyFixture(t, 40, { cached });
+    const expected = f.service.state().jobs.map(job => job.id);
+    for (const name of READ_INDEXES.slice(0, 2)) {
+      f.db.exec(`DROP INDEX ${name}; ${OTHER_INDEX_SQL[name]}`);
+      assert.deepEqual(f.service.state().jobs.map(job => job.id), expected, name);
+      assert.ok(!inspectHubSchema(f.db).mismatched.includes(name), name);
+    }
+    await f.service.tick();
+  });
+});
+
+test('a redefinition inside a caller transaction stays inside it', t => {
+  const f = historyFixture(t, 4), expected = f.service.state().jobs.map(job => job.id);
+  f.db.exec(`DROP INDEX execution_jobs_unfinished; ${OTHER_INDEX_SQL.execution_jobs_unfinished}`);
+  f.db.exec('BEGIN IMMEDIATE');
+  try { assert.deepEqual(f.service.state().jobs.map(job => job.id), expected); assert.ok(f.db.isTransaction); }
+  finally { f.db.exec('ROLLBACK'); }
+  assert.ok(inspectHubSchema(f.db).mismatched.includes('execution_jobs_unfinished'), 'the caller rolled the replacement back with its own work');
 });
 
 test('close releases its lease even when either unfinished job query fails', async t => {
