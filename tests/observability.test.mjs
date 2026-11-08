@@ -156,6 +156,22 @@ test('a validity column with another expression is rebuilt with this one, and a 
   assert.equal(errors.length, 1);
   assert.match(blocked.prepare("SELECT sql FROM sqlite_schema WHERE name='platform_baseline_samples'").get().sql, /AS \(1\) VIRTUAL/);
   assert.ok(blocked.prepare("SELECT 1 FROM sqlite_schema WHERE name='platform_baseline_valid_bucket'").get());
+
+  // The index is created inside the rebuild: when it cannot be, the rebuild is rolled back as a whole.
+  const clash = new DatabaseSync(':memory:');
+  clash.exec('CREATE TABLE platform_baseline_samples (bucket_ms INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, json TEXT NOT NULL, valid_sample INTEGER GENERATED ALWAYS AS (1) VIRTUAL); CREATE TABLE platform_baseline_valid_bucket (x)');
+  t.after(() => clash.close());
+  assert.throws(() => createBaseline({ ...options, db: clash, logger: quiet }), /already a table named platform_baseline_valid_bucket/);
+  assert.match(clash.prepare("SELECT sql FROM sqlite_schema WHERE name='platform_baseline_samples'").get().sql, /AS \(1\) VIRTUAL/, 'old column kept');
+
+  // The column name is matched like SQLite does, without case.
+  const upper = new DatabaseSync(':memory:'), upperLogs = [];
+  upper.exec('CREATE TABLE platform_baseline_samples (bucket_ms INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, json TEXT NOT NULL, VALID_SAMPLE INTEGER GENERATED ALWAYS AS (1) VIRTUAL)');
+  upper.prepare('INSERT INTO platform_baseline_samples(bucket_ms,schema_version,json) VALUES (?,1,?)').run(time, '{broken');
+  const renamed = createBaseline({ ...options, db: upper, logger: { info: (_, message) => upperLogs.push(message), warn() {}, error: (_, message) => upperLogs.push(message) } });
+  t.after(async () => { await renamed.close(); upper.close(); });
+  assert.equal(upperLogs.length, 1); assert.equal(renamed.read().sampling.retainedBuckets, 0);
+  assert.ok(!inspectHubSchema(upper).mismatched.includes('platform_baseline_samples'));
 });
 
 test('sampling runs without readers and close aborts in-flight capability work without writing a sample', async t => {

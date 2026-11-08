@@ -189,6 +189,45 @@ test('CrossEx and Asset application key mismatches are detected by real cipherte
   await assert.rejects(f.restore('asset-bad-key',{backupDir:path.join(f.root,'asset-backup')}),/CREDENTIAL_VALIDATION_FAILED/);
 });
 
+test('a handoff never retires the source while its credential material is missing, malformed or does not decrypt', async t => {
+  const f=await setup(t);
+  const handoff=async (pattern, name) => {
+    const destination=path.join(f.root,name);
+    await assert.rejects(createBackup({...f.backupOptions,kind:'handoff',destination}),pattern);
+    assert.equal(readRegistry(f.source).state.state,'normal'); assert.equal(fs.existsSync(destination),false);
+    assert.deepEqual(fs.readdirSync(f.root).filter(name => name.includes('.incomplete-')),[]);
+  };
+  const crossKey=path.join(f.source,'modules/crossex/credentials.key'), crossBytes=fs.readFileSync(crossKey);
+  fs.renameSync(crossKey,crossKey+'.moved');
+  await handoff(/RECOVERY_CREDENTIAL_KEY_MISSING/,'no-cross-key');
+  // An ordinary backup keeps the fact; its restore fails the same way.
+  await createBackup(f.backupOptions); await assert.rejects(f.restore('no-cross-key-target'),/RECOVERY_CREDENTIAL_KEY_MISSING/);
+  fs.renameSync(crossKey+'.moved',crossKey);
+  fs.writeFileSync(crossKey,crossBytes.subarray(0,16)); await handoff(/RECOVERY_CREDENTIAL_KEY_INVALID/,'short-cross-key');
+  // A well-formed key that does not decrypt the stored credentials is refused before retirement too.
+  fs.writeFileSync(crossKey,randomBytes(32)); await handoff(/RECOVERY_CREDENTIAL_VALIDATION_FAILED/,'other-cross-key');
+  fs.writeFileSync(crossKey,crossBytes);
+  const hubKey=path.join(f.source,'credentials.key'), hubBytes=fs.readFileSync(hubKey);
+  fs.writeFileSync(hubKey,randomBytes(32)); await handoff(/RECOVERY_CREDENTIAL_VALIDATION_FAILED/,'other-hub-key');
+  fs.writeFileSync(hubKey,hubBytes);
+  // Corrupt stored credentials are a validation failure, not an unclassified error.
+  const crossDb=new DatabaseSync(path.join(f.source,'modules/crossex/crossex.sqlite')), password=crossDb.prepare("SELECT value FROM settings WHERE key='monitorPassword'").get();
+  assert.ok(password); crossDb.prepare("UPDATE settings SET value='{' WHERE key='monitorPassword'").run();
+  await handoff(/RECOVERY_CREDENTIAL_VALIDATION_FAILED/,'corrupt-cross-password');
+  crossDb.prepare("UPDATE settings SET value=? WHERE key='monitorPassword'").run(password.value); crossDb.exec('PRAGMA wal_checkpoint(TRUNCATE)'); crossDb.close();
+  const configPath=path.join(f.source,'modules/asset/config.json'), config=fs.readFileSync(configPath);
+  fs.writeFileSync(configPath,'null'); await handoff(/RECOVERY_CREDENTIAL_KEY_INVALID/,'null-config');
+  fs.writeFileSync(configPath,'{'); await handoff(/RECOVERY_JSON_INVALID/,'broken-config');
+  fs.unlinkSync(configPath); await handoff(/RECOVERY_CREDENTIAL_KEY_MISSING/,'no-config');
+  const other=JSON.parse(config); other.credentialKey=randomBytes(32).toString('hex');
+  fs.writeFileSync(configPath,JSON.stringify(other)); await handoff(/RECOVERY_CREDENTIAL_VALIDATION_FAILED/,'other-asset-key');
+  fs.writeFileSync(configPath,config);
+  // Asset creates its ledger lazily: a configuration without a ledger is a valid source.
+  fs.renameSync(path.join(f.source,'modules/asset/ledger.sqlite'),path.join(f.root,'ledger.sqlite'));
+  await createBackup({...f.backupOptions,kind:'handoff',destination:path.join(f.root,'handoff')});
+  assert.equal(readRegistry(f.source).state.state,'retired');
+});
+
 test('source consumption committed before target activation can resume only the recorded target inode', async t => {
   const f=await setup(t); await createBackup({...f.backupOptions,kind:'handoff'}); const first=await f.restore('first'), clone=await f.restore('clone');
   const registry=readRegistry(first.targetDir), sourceDb=new DatabaseSync(path.join(f.source,'execution-control.sqlite'));
@@ -357,6 +396,10 @@ test('cold registry reads and SQLite backup sources do not create WAL/SHM files'
   const assertNoSidecars = () => { for (const name of sourceFiles) for (const suffix of ['-wal','-shm']) assert.equal(fs.existsSync(path.join(f.source,name+suffix)),false,name+suffix); };
   assertNoSidecars(); readRegistry(f.source); const db=openSourceDatabase(path.join(f.source,'hub.sqlite')); db.prepare('SELECT count(*) FROM settings').get(); db.close(); assertNoSidecars();
   await createBackup(f.backupOptions); assertNoSidecars();
+  // A handoff refused at credential validation has read the sources read-only too.
+  const crossKey=path.join(f.source,'modules/crossex/credentials.key'), crossBytes=fs.readFileSync(crossKey); fs.writeFileSync(crossKey,randomBytes(32));
+  await assert.rejects(createBackup({...f.backupOptions,kind:'handoff',destination:path.join(f.root,'refused')}),/RECOVERY_CREDENTIAL_VALIDATION_FAILED/);
+  assertNoSidecars(); fs.writeFileSync(crossKey,crossBytes);
 });
 
 test('a committed retirement WAL is authoritative and missing SHM recovery requires the real cold lock', async t => {

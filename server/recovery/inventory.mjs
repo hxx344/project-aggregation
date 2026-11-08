@@ -9,7 +9,7 @@ import { hash } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
 import { ASTER_CA, ASTER_ENV, category, CHECKPOINT_JOURNALS, CHECKPOINT_SIZED, REGISTRY, REQUIRED_MATERIAL } from './data-catalog.mjs';
 
-export const MODULES = ['monitor', 'asset', 'crossex', 'greeks', 'aster'];
+export const MODULES = Object.freeze(['monitor', 'asset', 'crossex', 'greeks', 'aster']);
 export { ASTER_CA, ASTER_ENV, category, REGISTRY };
 export const CONTROL = 'recovery-control.json';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
