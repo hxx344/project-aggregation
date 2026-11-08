@@ -2,6 +2,7 @@ import type { Balance } from './types';
 import { readVariationalPythonBalance } from './variational-python-client.ts';
 import { validateVariationalCredential, variationalDecimal as decimal, VARIATIONAL_ERRORS } from './variational-shared.ts';
 import type { VariationalCredential } from './variational-shared.ts';
+import { ExchangeResponseError, readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 
 export type { VariationalCredential } from './variational-shared.ts';
 export { hasValidVariationalBalance } from './variational-shared.ts';
@@ -48,20 +49,15 @@ async function read(url: string, headers: Record<string, string>, fetcher: typeo
     }
     const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
     if (contentType && contentType !== 'application/json' && !/^application\/[a-z0-9.+-]+\+json$/.test(contentType)) return rejectResponse(INVALID);
-    if (Number(response.headers.get('content-length') || 0) > MAX_BYTES || !response.body) return rejectResponse(INVALID);
-    const reader = response.body.getReader();
-    const chunks: Uint8Array[] = [];
-    let size = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        size += value.byteLength;
-        if (size > MAX_BYTES) { await reader.cancel(); throw new Error(INVALID); }
-        chunks.push(value);
-      }
-    } finally { reader.releaseLock(); }
-    const data: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (!response.body) return rejectResponse(INVALID);
+    // The shared bounded reader (docs/evolution-plan.md E2): oversized is invalid
+    // data, an unparsable body a network failure, as before.
+    let data: unknown;
+    try { data = await readJsonResponse(response, { maxBytes: MAX_BYTES }); }
+    catch (error) {
+      if (error instanceof ExchangeResponseError) throw new Error(error.code === 'response_limit' ? INVALID : FAILED);
+      throw error;
+    }
     if (!object(data)) throw new Error(INVALID);
     return data;
   } catch (error) {

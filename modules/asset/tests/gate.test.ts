@@ -167,9 +167,13 @@ test('Gate uses validated account retrieval time when it precedes the quote, ign
       publicRequest(url, init);
       return Response.json(quote(1, (now + 7000) / 1000));
     }
-    const response = Response.json(valuation());
-    response.json = async () => { t.mock.timers.setTime(now + 6000); return { ...valuation(), ts: '1', updated_at: 'invalid' }; };
-    return response;
+    // The account body arrives 6 s after the request started.
+    const text = new TextEncoder().encode(JSON.stringify({ ...valuation(), ts: '1', updated_at: 'invalid' }));
+    let sent = false;
+    return new Response(new ReadableStream({ pull(controller) {
+      if (sent) { controller.close(); return; }
+      t.mock.timers.setTime(now + 6000); sent = true; controller.enqueue(text);
+    } }, { highWaterMark: 0 }), { headers: { 'content-type': 'application/json' } });
   });
   assert.equal(result.updatedAt, new Date(now + 6000).toISOString());
 });
@@ -487,6 +491,13 @@ test('Gate never treats a 2xx error label or invalid JSON as a successful balanc
     });
   }
   await assert.rejects(syncGate(credential, async () => new Response(sensitive, { status: 200 })), error => diagnostic(error));
+});
+
+test('Gate stops reading an account body past 2 MiB without echoing it', async () => {
+  const declared = streamedResponse([Buffer.from(sensitive)], { 'content-length': String(2 * 1024 * 1024 + 1) }, 200);
+  await assert.rejects(syncGate(credential, async () => declared.response), error => /超过 2MB/.test((error as Error).message) && !(error as Error).message.includes(sensitive));
+  assert.equal(declared.reads(), 0);
+  assert.equal(declared.canceled(), true);
 });
 
 test('Gate limits error bodies to 16 KiB of declared and actual bytes and cancels oversized streams', async () => {

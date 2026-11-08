@@ -1,5 +1,6 @@
 import { gateAuthHeaders } from '../../../server/exchange-transport/gate.mjs';
 import type { Balance } from './types';
+import { ExchangeResponseError, readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 
 export type GateCredential = { apiKey: string; apiSecret: string };
 type Json = Record<string, unknown>;
@@ -9,6 +10,7 @@ const BALANCE_PATH = '/api/v4/wallet/total_balance';
 const QUERY = 'currency=USDT';
 const COINGECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd&include_last_updated_at=true';
 const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDT';
+const MAX_ACCOUNT_BYTES = 2 * 1024 * 1024;
 const QUOTE_FAILED = 'Gate USDT/USD 汇率读取失败或已过期；本次未更新资产数据';
 const ACCOUNT_NAMES = {
   cross_margin: '全仓杠杆账户',
@@ -163,27 +165,13 @@ async function quoteJson(url: string, fetcher: Fetcher): Promise<Json> {
     method: 'GET', headers: { Accept: 'application/json' },
     redirect: 'manual', cache: 'no-store', signal: AbortSignal.timeout(12000),
   });
-  const limit = 128 * 1024;
-  if (!response.ok || response.redirected || Number(response.headers.get('content-length')) > limit || !response.body) {
+  if (!response.ok || response.redirected) {
     void response.body?.cancel().catch(() => {});
     throw new Error(QUOTE_FAILED);
   }
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > limit) {
-        void reader.cancel().catch(() => {});
-        throw new Error(QUOTE_FAILED);
-      }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  const data: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  let data: unknown;
+  try { data = await readJsonResponse(response, { maxBytes: 128 * 1024 }); }
+  catch { throw new Error(QUOTE_FAILED); }
   if (!isObject(data)) throw new Error(QUOTE_FAILED);
   return data;
 }
@@ -243,9 +231,10 @@ export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher 
     throw apiFailure(response.status, error);
   }
   let data: unknown;
-  try { data = await response.json(); }
-  catch {
+  try { data = await readJsonResponse(response, { maxBytes: MAX_ACCOUNT_BYTES, signal }); }
+  catch (error) {
     if (signal?.aborted) throw readFailure('读取账户响应超时（12 秒）；请检查服务器到 Gate API 的网络连接后重试', response.status);
+    if (error instanceof ExchangeResponseError && error.code === 'response_limit') throw readFailure('账户响应超过 2MB 上限，已停止读取；请检查服务器网络或代理，稍后重试', response.status);
     throw readFailure('账户响应无法解析为 JSON；请检查服务器网络或代理，稍后重试', response.status);
   }
   if (!isObject(data)) throw new Error(INCOMPLETE);
