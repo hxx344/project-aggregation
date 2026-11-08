@@ -5,7 +5,7 @@
 ## 1 结论
 
 - **业务正确性首轮已完成**：A–F 批次引用的 18 个 Issue 及后续 #179、#185、#187 全部关闭，两项产品决策已定（#91 ADL 按合约推进；#94 流水线只部署本轮提交）。多数修复没有经过真实交易所或生产验收。
-- **结构演进**：E2、E7 已完成；E1 已完成盘点、版本标记与同名不同定义的兼容处理（E1c-1），有序迁移 E1c-2 待回滚集合满足条件且有结构变更需求时进行；E3–E6、E8 未实施。盘点见 [hub.sqlite 结构盘点](hub-schema-inventory.md)。其前置验收已完成：#71 安装器真实 `main()` 串联覆盖（PR #188、#213），#107 浏览器重连问题确认在夹具而非进程拓扑（PR #188）。
+- **结构演进**：E2、E7 已完成；E1 已完成盘点、版本标记与同名不同定义的兼容处理（E1c-1），有序迁移 E1c-2 待回滚集合满足条件且有结构变更需求时进行；E6 已完成数据声明；E3–E5、E8 未实施。盘点见 [hub.sqlite 结构盘点](hub-schema-inventory.md)。其前置验收已完成：#71 安装器真实 `main()` 串联覆盖（PR #188、#213），#107 浏览器重连问题确认在夹具而非进程拓扑（PR #188）。
 - **基础不变**：模块化单体、API/运行时分进程、模块 worker 隔离、SQLite WAL、五个内置模块统一仓库统一发布。#90/#179 已用部分索引解决已测的全量解析，仍没有证据需要拆服务、换数据库或换语言（进入条件见第 6 节）。
 - **不再列为待办**的事项见第 8 节。
 
@@ -79,7 +79,7 @@ Binance、Bybit、OKX 的签名、时间戳、超时、限流退避和数字解�
 
 **S5 超时预算靠注释对齐。** API 转发到 runtime 用从接收时刻计算的 60 s 截止（`server/api/server.mjs`）；Portal 取得模块 socket 后直接代理，连接与响应头预算默认 10/90 s（`server/portal.mjs`），两者不是同一条链。`server/modules/python-module.mjs` 读完请求体后才创建 60 s pending timer，其 `server.requestTimeout = 30_000` 是接收完整请求的预算，不是 Python 响应的内层预算。停止关系分散：`server/modules/runtime.mjs` 注释记录 ASTER worker 110 s、bridge 约 102 s、监督者 115 s；安装器生成的 systemd 停止时限为 runtime 150 s、API 75 s、entry 15 s。
 
-**S6 恢复与凭据的耦合。** `inventory.mjs` 的 `DATA_FILES` 与 `restore.mjs`、`admission.mjs` 分散维护模块路径、类别与结构检查。inventory 递归发现数据根下未排除的文件，未知路径默认归为 `secrets`，不会因未列入 `DATA_FILES` 而漏备份。Hub 和 CrossEx 各有 `credentials.key`，Asset 的 `config.json` 另含凭据密钥与会话材料；恢复还处理环境配置、ASTER CA 引用绑定、会话撤销及隔离准入。
+**S6 恢复与凭据的耦合。** `inventory.mjs` 的 `DATA_FILES`（E6 已迁至 `data-catalog.mjs`）与 `restore.mjs`、`admission.mjs` 分散维护模块路径、类别与结构检查。inventory 递归发现数据根下未排除的文件，未知路径默认归为 `secrets`，不会因未列入声明而漏备份。Hub 和 CrossEx 各有 `credentials.key`，Asset 的 `config.json` 另含凭据密钥与会话材料；恢复还处理环境配置、ASTER CA 引用绑定、会话撤销及隔离准入。
 
 **S7 跨语言栅栏与锁协议。** `server/execution/account-writer.mjs` 与 `account_writer.py` 实现跨语言账户写入契约，ASTER 和 Greeks 共用 Python 实现；`tests/account-writer.test.mjs` 已有真实进程互操作用例。两侧错误码通过 `fail(code)` / `_fail(code)` 使用散落字符串，没有可枚举的协议目录。`lifecycle-lock.mjs` 启动 `lifecycle_lock.py`，Node 是包装与协议层，Python 承担 OS 锁，不是两套独立实现。
 
@@ -147,6 +147,7 @@ Binance、Bybit、OKX 的签名、时间戳、超时、限流退避和数字解�
 - 在 `server/modules/catalog.mjs` 或模块清单中集中声明已知数据路径、类别、结构检查和密钥/配置关联。inventory 继续递归发现，保留未知文件 `secrets` 兜底，不改成白名单。
 - 保留密钥、配置材料、外部引用绑定的完整检查与恢复后的会话撤销、未决记录和隔离准入。
 - 退出条件：旧备份按声明的支持范围恢复；未声明的新文件、改名、密钥缺失/不匹配、引用缺失均有确定结果。调整既有类别前先定义备份清单版本兼容方式。凭据密钥合并另行评估，不是本项前置条件。
+- 状态（2026-11-08 已完成）：声明放在 `server/recovery/data-catalog.mjs`（恢复代码不引用 `server/modules`，后者带传输层依赖）；inventory、restore 与 backup 的类别、必需材料、凭据密钥位置、检查点证据限量的日志表与模块列表都从该声明推出，行为不变；交接时各模块的结构检查仍在 `admission.mjs`。支持范围为 manifest schema 1，类别集合由 `tests/recovery-data-catalog.test.mjs` 锁定，类别变化须先引入新清单版本；同一测试核对模块列表与 `moduleIds` 一致、密钥目标已声明为 `secrets`、`server/recovery/` 下源码以字面量引用的 `modules/` 路径及根级 `.sqlite`、`.key` 文件均已声明（分段拼接的路径不在扫描范围内）。各情形的确定结果见 [备份恢复](backup-recovery.md#一致性与备份内容)。凭据密钥布局未改。待办：备份时拦截只有大小写不同的并存路径（现为备份成功、恢复拒绝）；`deploy/migrate-modules.py` 另有一处 CrossEx 库与密钥的关联检查，未从声明推出。
 
 #### E7 栅栏一致性向量（S7）
 
