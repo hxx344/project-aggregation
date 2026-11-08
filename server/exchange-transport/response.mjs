@@ -17,7 +17,11 @@ export async function readJsonResponse(response, { maxBytes, signal, reviver } =
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) throw new TypeError('maxBytes must be a positive integer');
   if (reviver !== undefined && typeof reviver !== 'function') throw new TypeError('reviver must be a function');
   const length = response?.headers?.get?.('content-length');
-  if (length && (!/^\d+$/.test(length) || Number(length) > maxBytes)) fail('response_limit');
+  if (length && (!/^\d+$/.test(length) || Number(length) > maxBytes)) {
+    // Refused unread: release the connection instead of leaving the body open.
+    try { void response.body?.cancel?.()?.catch?.(() => {}); } catch { /* already locked or gone */ }
+    fail('response_limit');
+  }
   if (typeof response?.body?.getReader !== 'function') fail('invalid_data');
   const reader = response.body.getReader(), chunks = [];
   let size = 0, finished = false;

@@ -1,6 +1,7 @@
 import { hasValidVariationalBalance, variationalRequestHeaders } from './variational.ts';
 import type { VariationalCredential } from './variational.ts';
 import type { VariationalDiagnosticReport, VariationalDiagnosticResult } from './variational-diagnostic-types.ts';
+import { ExchangeResponseError, readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 
 const TARGETS = [
   { endpoint: 'session', path: '/api/me' },
@@ -16,25 +17,15 @@ function contentKind(value: string | null): VariationalDiagnosticResult['content
   return 'other';
 }
 
+// The shared bounded reader (docs/evolution-plan.md E2). A cancelled read
+// rethrows the signal's own reason so probe() can tell timeout from cancel.
 async function limitedJson(response: Response, signal: AbortSignal): Promise<unknown> {
-  if (Number(response.headers.get('content-length') || 0) > MAX_BYTES || !response.body) throw new SyntaxError('Invalid diagnostic response');
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  const cancel = () => { void reader.cancel().catch(() => {}); };
-  signal.addEventListener('abort', cancel, { once: true });
-  try {
-    for (;;) {
-      signal.throwIfAborted();
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_BYTES) { await reader.cancel(); throw new SyntaxError('Invalid diagnostic response'); }
-      chunks.push(value);
-    }
-    signal.throwIfAborted();
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } finally { signal.removeEventListener('abort', cancel); reader.releaseLock(); }
+  try { return await readJsonResponse(response, { maxBytes: MAX_BYTES, signal }); }
+  catch (error) {
+    if (!(error instanceof ExchangeResponseError)) throw error;
+    if (error.code === 'aborted') signal.throwIfAborted();
+    throw new SyntaxError('Invalid diagnostic response');
+  }
 }
 
 async function probe(target: typeof TARGETS[number], headers: Record<string, string>, fetcher: typeof fetch, callerSignal?: AbortSignal): Promise<VariationalDiagnosticResult> {

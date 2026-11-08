@@ -122,6 +122,11 @@ test('bounded JSON reading parses a body within the limit', async () => {
 test('bounded JSON reading refuses oversized, unreadable and cancelled bodies', async () => {
   await assert.rejects(readJsonResponse(stream(['{}'], { length: '17' }), { maxBytes: 16 }), code('response_limit'));
   await assert.rejects(readJsonResponse(stream(['{}'], { length: '1e3' }), { maxBytes: 16 }), code('response_limit'));
+  let declaredCancelled = false;
+  const declared = new Response(new ReadableStream({ pull() {}, cancel() { declaredCancelled = true; } }), { headers: { 'content-length': '17' } });
+  await assert.rejects(readJsonResponse(declared, { maxBytes: 16 }), code('response_limit'));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(declaredCancelled, true, 'a body refused by its declared length is cancelled unread');
   let cancelled = false;
   const endless = new Response(new ReadableStream({ pull(controller) { controller.enqueue(new Uint8Array(8)); }, cancel() { cancelled = true; } }));
   await assert.rejects(readJsonResponse(endless, { maxBytes: 20 }), code('response_limit'));

@@ -1,5 +1,6 @@
 import type { Balance } from './types';
 import { mapConcurrent } from './concurrency.ts';
+import { ExchangeResponseError, readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 
 export type HyperliquidCredential = { walletAddress: string };
 type Json = Record<string, unknown>;
@@ -70,26 +71,13 @@ function dexLabel(dex: string, index: number) {
   return /^[a-z0-9]{1,16}$/i.test(dex) ? dex : `其他 DEX ${index}`;
 }
 
+// The shared bounded reader (docs/evolution-plan.md E2): every refusal reads as invalid data.
 async function boundedJson(response: Response, limit: number): Promise<unknown> {
-  const length = response.headers.get('content-length');
-  if ((length && /^\d+$/.test(length) && Number(length) > limit) || !response.body) {
-    void response.body?.cancel().catch(() => {});
-    fail(HYPERLIQUID_ERRORS.invalid);
+  try { return await readJsonResponse(response, { maxBytes: limit }); }
+  catch (error) {
+    if (error instanceof ExchangeResponseError) fail(HYPERLIQUID_ERRORS.invalid);
+    throw error;
   }
-  const reader = response.body!.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > limit) { void reader.cancel().catch(() => {}); fail(HYPERLIQUID_ERRORS.invalid); }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-  catch { return fail(HYPERLIQUID_ERRORS.invalid); }
 }
 
 /** Public, unauthenticated reads from the fixed official info endpoint; no request carries a key or signature. */

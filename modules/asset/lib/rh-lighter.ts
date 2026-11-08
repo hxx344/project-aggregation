@@ -1,6 +1,7 @@
 import type { Balance } from './types';
 import type { Position } from './positions-types.ts';
 import { positionId } from './positions-values.ts';
+import { ExchangeResponseError, readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 
 export type RhLighterCredential = { walletAddress: string };
 type Json = Record<string, unknown>;
@@ -113,26 +114,13 @@ function parseAccount(item: unknown, user: string, at: string): Account {
     pooled: rows(item.shares, true).length > 0, binary: rows(item.bo_positions, true).length > 0 };
 }
 
+// The shared bounded reader (docs/evolution-plan.md E2): every refusal reads as invalid data.
 async function boundedJson(response: Response): Promise<unknown> {
-  const length = response.headers.get('content-length');
-  if ((length && /^\d+$/.test(length) && Number(length) > MAX_BYTES) || !response.body) {
-    void response.body?.cancel().catch(() => {});
-    fail(RH_LIGHTER_ERRORS.invalid);
+  try { return await readJsonResponse(response, { maxBytes: MAX_BYTES }); }
+  catch (error) {
+    if (error instanceof ExchangeResponseError) fail(RH_LIGHTER_ERRORS.invalid);
+    throw error;
   }
-  const reader = response.body!.getReader();
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      size += value.byteLength;
-      if (size > MAX_BYTES) { void reader.cancel().catch(() => {}); fail(RH_LIGHTER_ERRORS.invalid); }
-      chunks.push(value);
-    }
-  } finally { reader.releaseLock(); }
-  try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
-  catch { return fail(RH_LIGHTER_ERRORS.invalid); }
 }
 
 /** One public, unauthenticated GET with no retry; only messages built here may reach the page. */

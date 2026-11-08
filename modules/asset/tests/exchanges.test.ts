@@ -68,6 +68,12 @@ test('Redirects are not followed by authenticated requests',async()=>{
  const redirect=(async(_u:unknown,init:RequestInit)=>{assert.equal(init.redirect,'manual');return new Response('',{status:302,headers:{location:'https://example.net'}});}) as typeof fetch;
  await assert.rejects(readJson('https://api.bybit.com',{},redirect),/HTTP 302/);
 });
+test('Unreadable or oversized bodies fail with a fixed message that never echoes the body',async()=>{
+ const reply=(body:string,headers:Record<string,string>={})=>(async()=>new Response(body,{headers})) as typeof fetch;
+ await assert.rejects(readJson('https://api.bybit.com',{},reply('<html>SECRET page</html>')),(error:Error)=>/无法识别/.test(error.message)&&!error.message.includes('SECRET'));
+ await assert.rejects(readJson('https://api.bybit.com',{},reply('{}',{'content-length':String(3*1024*1024)})),/超过 2MB/);
+ assert.deepEqual(await readJson('https://api.bybit.com',{},reply('{"retCode":0}')),{retCode:0});
+});
 test('Coinbase backup quote converts coins per USD to USD per coin',async()=>{
  const result=await quotes(mock(u=>u.host==='api.coingecko.com'?{}:{data:{currency:'USD',rates:{VIRTUAL:'2',USDT:'1.01',USDC:'1'}}}));
  assert.equal(result.VIRTUAL.price,0.5);assert.equal(result.USDT.price,1/1.01);assert.match(result.VIRTUAL.source,/Coinbase/);
