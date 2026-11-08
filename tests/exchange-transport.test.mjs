@@ -2,6 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { okxAuthHeaders, okxSignature } from '../server/exchange-transport/okx.mjs';
 import { ExchangeResponseError, readJsonResponse } from '../server/exchange-transport/response.mjs';
+import { binanceSignedQuery } from '../server/exchange-transport/binance.mjs';
+import { bybitAuthHeaders } from '../server/exchange-transport/bybit.mjs';
+import { gateAuthHeaders } from '../server/exchange-transport/gate.mjs';
 import { createOkxProtocol, OkxProtocolError } from '../server/trading-okx-common.mjs';
 
 // Shared exchange transport (docs/evolution-plan.md E2). The pinned signatures
@@ -28,6 +31,43 @@ test('OKX signing refuses a request it cannot sign exactly', () => {
     { timestamp: at, method: 'POST', requestPath: '/api/v5/trade/order', body: { sz: '1' } },
   ]) assert.throws(() => okxSignature('test-secret', request), TypeError, JSON.stringify(request));
   assert.throws(() => okxSignature('', { timestamp: at, method: 'GET', requestPath: '/api/v5/account/config' }), TypeError);
+});
+
+// Expected signatures computed independently (Python hmac/hashlib).
+test('Binance, Bybit and Gate signatures match pinned vectors', () => {
+  const signed = binanceSignedQuery(credentials, { symbol: 'CLUSDT', timestamp: '1', recvWindow: '1' }, { timestamp: '1789776000000', recvWindow: '5000' });
+  assert.deepEqual(signed, {
+    query: 'symbol=CLUSDT&timestamp=1789776000000&recvWindow=5000&signature=28eb33550a1196b6820c375b21360d1501ba3562e1ec026d566dfdbf4ece5b7f',
+    headers: { 'X-MBX-APIKEY': 'test-key' },
+  }, 'given timestamp and recvWindow are replaced in place');
+  const bybit = (payload) => bybitAuthHeaders(credentials, { timestamp: '1789776000000', recvWindow: '5000', payload });
+  assert.deepEqual(bybit('category=linear&symbol=CLUSDT'), {
+    'X-BAPI-API-KEY': 'test-key', 'X-BAPI-TIMESTAMP': '1789776000000', 'X-BAPI-RECV-WINDOW': '5000',
+    'X-BAPI-SIGN': 'e343616e1191829610b517d02de25ec12ad6f30bddf8a7cd18c7596c5c65dc43',
+  });
+  assert.equal(bybit('{"category":"linear","symbol":"CLUSDT","side":"Buy"}')['X-BAPI-SIGN'], 'e561008309026045f2ec59da11e25f0ad6e4d965ccfe98cf65cb0fede5f916b8');
+  assert.deepEqual(gateAuthHeaders(credentials, { method: 'GET', path: '/api/v4/wallet/total_balance', query: 'currency=USDT', timestamp: '1789776000' }), {
+    KEY: 'test-key', Timestamp: '1789776000',
+    SIGN: '03722785c90e9c0b7afbe926849494961415b6bf6ccc72d3ca4230022e0a21b835672610ee57c4abae0f94b5bb6fb5ef71702e3f670fbb255281ce21e0cc788e',
+  });
+  assert.equal(gateAuthHeaders(credentials, { method: 'POST', path: '/api/v4/crossex/orders', body: '{"symbol":"BTC_USDT","size":"1"}', timestamp: '1789776000' }).SIGN,
+    '47844c4e5da3ecc5d9a541015239c59bb1efb7728dbe448b4452143610572b785f9eada4a010d2a67cfd95aa0d3c38ca13580b664d23adca0183f27b30deeebc');
+});
+
+test('Binance, Bybit and Gate signing refuse a request they cannot sign exactly', () => {
+  const window = { timestamp: '1789776000000', recvWindow: '5000' };
+  for (const options of [{ ...window, timestamp: '1.5' }, { ...window, timestamp: 1789776000000 }, { ...window, recvWindow: '' }]) {
+    assert.throws(() => binanceSignedQuery(credentials, {}, options), TypeError);
+    assert.throws(() => bybitAuthHeaders(credentials, options), TypeError);
+  }
+  assert.throws(() => binanceSignedQuery({ ...credentials, apiSecret: '' }, {}, window), TypeError);
+  assert.throws(() => bybitAuthHeaders({ ...credentials, apiSecret: '' }, window), TypeError);
+  assert.throws(() => bybitAuthHeaders(credentials, { ...window, payload: {} }), TypeError);
+  const gate = { method: 'GET', path: '/api/v4/wallet/total_balance', timestamp: '1789776000' };
+  for (const request of [{ ...gate, method: 'get' }, { ...gate, path: 'https://api.gateio.ws/api/v4/x' }, { ...gate, query: '?a=1' }, { ...gate, body: {} }, { ...gate, timestamp: '1789776000000.5' }]) {
+    assert.throws(() => gateAuthHeaders(credentials, request), TypeError);
+  }
+  assert.throws(() => gateAuthHeaders({ ...credentials, apiSecret: '' }, gate), TypeError);
 });
 
 test('the Hub protocol signs with the exact path, query and body it sends', async () => {

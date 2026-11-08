@@ -26,6 +26,7 @@ test('Binance UM and PM UM preserve precision, both hedge legs, fixed GET signat
       assert.equal((init.headers as Record<string, string>)['X-MBX-APIKEY'], c.apiKey);
       const query = new URLSearchParams(url.search); const signature = query.get('signature'); query.delete('signature');
       assert.equal(signature, createHmac('sha256', c.apiSecret).update(query.toString()).digest('hex'));
+      assert.equal(query.get('recvWindow'), '10000');
       if (url.pathname.includes('apiRestrictions')) return permissions();
       assert.equal(url.hostname, scope === 'um' ? 'fapi.binance.com' : 'papi.binance.com');
       return [linearPosition('1.000000000000000001', 'LONG'), linearPosition('-2', 'SHORT'), linearPosition('0', 'BOTH')];

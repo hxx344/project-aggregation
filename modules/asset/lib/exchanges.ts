@@ -1,4 +1,6 @@
 import type { Balance } from './types';
+import { binanceSignedQuery } from '../../../server/exchange-transport/binance.mjs';
+import { bybitAuthHeaders } from '../../../server/exchange-transport/bybit.mjs';
 import { Wallet } from 'ethers/wallet';
 
 type Json = Record<string, any>;
@@ -15,10 +17,6 @@ export async function readJson(url: string, init: RequestInit = {}, fetcher: Fet
   catch{throw new Error('行情或交易所连接超时，请稍后重试；已保留上次数据');}
   if (!response.ok) throw new Error(`服务暂时不可用（HTTP ${response.status}），保留上次数据`);
   return response.json();
-}
-export async function hmac(secret: string, message: string): Promise<string> {
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), {name:'HMAC',hash:'SHA-256'}, false, ['sign']);
-  return Array.from(new Uint8Array(await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message)))).map(n=>n.toString(16).padStart(2,'0')).join('');
 }
 export type Quote = { price: number; at: string; source: string };
 export async function coingeckoQuotes(fetcher: Fetcher = fetch): Promise<Record<string, Quote>> {
@@ -63,9 +61,8 @@ const BYBIT_HOSTS = { global:'https://api.bybit.com', nl:'https://api.bybit.nl',
 const BYBIT_READ_PATHS = new Set(['/v5/user/query-api','/v5/account/wallet-balance','/v5/asset/transfer/query-account-coins-balance']);
 export async function bybitGet(c: BybitCredential, path: string, query: string, fetcher: Fetcher = fetch): Promise<Json> {
   if (!BYBIT_READ_PATHS.has(path) || !BYBIT_HOSTS[c.region]) throw new Error('仅支持只读账户接口');
-  const timestamp = String(Date.now());
-  const signature = await hmac(c.apiSecret, timestamp+c.apiKey+'10000'+query);
-  const data = await readJson(BYBIT_HOSTS[c.region]+path+(query?'?'+query:''), { method:'GET', headers:{'X-BAPI-API-KEY':c.apiKey,'X-BAPI-TIMESTAMP':timestamp,'X-BAPI-RECV-WINDOW':'10000','X-BAPI-SIGN':signature} }, fetcher);
+  const headers = bybitAuthHeaders(c, { timestamp: String(Date.now()), recvWindow: '10000', payload: query });
+  const data = await readJson(BYBIT_HOSTS[c.region]+path+(query?'?'+query:''), { method:'GET', headers }, fetcher);
   if (data.retCode !== 0) throw new Error(`Bybit 读取失败（${Number(data.retCode) || '未知代码'}），请检查权限、IP 白名单及地区`);
   return data.result;
 }
@@ -99,14 +96,11 @@ export async function binanceGet(c: BinanceCredential, path: string, fetcher: Fe
   if (typeof c?.apiKey !== 'string' || !c.apiKey.trim() || typeof c?.apiSecret !== 'string' || !c.apiSecret.trim()) throw new Error('Binance API Key 与 Secret 不能为空');
   const params = new URLSearchParams();
   if (path === '/sapi/v1/asset/wallet/balance') params.set('quoteAsset', 'USDT');
-  params.set('timestamp', String(Date.now()));
-  params.set('recvWindow', '10000');
   // Sign the exact encoded query sent to the fixed official host; no caller-supplied parameters.
-  const query = params.toString();
   let data: unknown;
   try {
-    const signature = await hmac(c.apiSecret, query);
-    data = await readJson('https://api.binance.com' + path + '?' + query + '&signature=' + signature, { method: 'GET', headers: { 'X-MBX-APIKEY': c.apiKey } }, fetcher);
+    const { query, headers } = binanceSignedQuery(c, params, { timestamp: String(Date.now()), recvWindow: '10000' });
+    data = await readJson('https://api.binance.com' + path + '?' + query, { method: 'GET', headers }, fetcher);
   } catch (error) {
     // JSON parse and transport errors may contain response text or signed URLs. Never expose them.
     const http = error instanceof Error ? /^服务暂时不可用（HTTP (\d{3})），保留上次数据$/.exec(error.message) : null;

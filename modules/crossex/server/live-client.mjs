@@ -1,4 +1,4 @@
-import { createHash, createHmac } from 'node:crypto';
+import { gateAuthHeaders } from '../../../server/exchange-transport/gate.mjs';
 import { isIP } from 'node:net';
 import Decimal from 'decimal.js';
 
@@ -213,8 +213,9 @@ export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = D
     if (authenticated) {
       const at = clock(); requireValue(Number.isSafeInteger(at) && at > 0, inputError);
       const timestamp = String(Math.floor(at / 1000));
-      const signature = [method, pathname, queryString, createHash('sha512').update(body).digest('hex'), timestamp].join('\n');
-      Object.assign(headers, { KEY: apiKey, Timestamp: timestamp, SIGN: createHmac('sha512', apiSecret).update(signature).digest('hex') });
+      // A request the shared signer refuses is invalid input and is never sent.
+      try { Object.assign(headers, gateAuthHeaders({ apiKey, apiSecret }, { method, path: pathname, query: queryString, body, timestamp })); }
+      catch { throw inputError(); }
     }
     const controller = new AbortController(); let timer;
     const work = async () => {
