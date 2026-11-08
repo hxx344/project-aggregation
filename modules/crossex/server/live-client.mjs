@@ -213,7 +213,8 @@ export function createGateClient({ apiKey, apiSecret, fetcher = fetch, clock = D
     if (authenticated) {
       const at = clock(); requireValue(Number.isSafeInteger(at) && at > 0, inputError);
       const timestamp = String(Math.floor(at / 1000));
-      // A request the shared signer refuses is invalid input and is never sent.
+      // A request the shared signer refuses is invalid input and is never sent;
+      // the runtime still treats a failed submit as uncertain and reconciles it.
       try { Object.assign(headers, gateAuthHeaders({ apiKey, apiSecret }, { method, path: pathname, query: queryString, body, timestamp })); }
       catch { throw inputError(); }
     }
