@@ -1,4 +1,5 @@
-import { createHmac } from 'node:crypto';
+import { okxAuthHeaders } from './exchange-transport/okx.mjs';
+import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
 import { decimal, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 
 // OKX v5 protocol, checked against official documentation and public oil
@@ -137,26 +138,15 @@ export function positionSize(row, symbol, mode) {
   return { quantity, side: row.posSide === 'short' || row.posSide === 'net' && compareDecimals(signed, '0') < 0 ? 'short' : 'long' };
 }
 
+// The shared bounded reader (docs/evolution-plan.md E2); its failures keep
+// this protocol's codes, so retry and mutation uncertainty rules are unchanged.
+// A code the shared reader may add later is read as invalid_data, which keeps
+// an unreadable mutation response uncertain.
 async function readJson(response, signal) {
-  const length = response.headers?.get('content-length');
-  if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES)) fail('response_limit');
-  if (!response.body?.getReader) fail();
-  const reader = response.body.getReader(), chunks = [];
-  let size = 0, finished = false;
-  try {
-    while (true) {
-      checkAbort(signal);
-      const chunk = await reader.read();
-      checkAbort(signal);
-      if (chunk.done) { finished = true; break; }
-      size += chunk.value.byteLength;
-      if (size > MAX_BODY_BYTES) fail('response_limit');
-      chunks.push(Buffer.from(chunk.value));
-    }
-    try { return JSON.parse(Buffer.concat(chunks, size).toString('utf8')); } catch { fail(); }
-  } finally {
-    if (!finished) void reader.cancel().catch(() => {});
-    reader.releaseLock();
+  try { return await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal }); }
+  catch (error) {
+    if (error instanceof ExchangeResponseError) fail(['response_limit', 'aborted'].includes(error.code) ? error.code : 'invalid_data');
+    throw error;
   }
 }
 function providerFailure(raw, httpStatus, mutation) {
@@ -212,11 +202,7 @@ export function createOkxProtocol({ fetchImpl = fetch, now = Date.now, timeoutMs
     const requestPath = path + (query ? '?' + query : ''), headers = {};
     if (mutation) headers['Content-Type'] = 'application/json';
     if (authenticated) {
-      const timestamp = new Date(clock()).toISOString();
-      headers['OK-ACCESS-KEY'] = credentials.apiKey;
-      headers['OK-ACCESS-PASSPHRASE'] = credentials.passphrase;
-      headers['OK-ACCESS-TIMESTAMP'] = timestamp;
-      headers['OK-ACCESS-SIGN'] = createHmac('sha256', credentials.apiSecret).update(timestamp + method + requestPath + (body ?? '')).digest('base64');
+      Object.assign(headers, okxAuthHeaders(credentials, { timestamp: new Date(clock()).toISOString(), method, requestPath, body: body ?? '' }));
     }
     // A caller's lease guard remains outside transport wrapping, and is run
     // again for the sole permitted retry after an explicit timestamp rejection.
