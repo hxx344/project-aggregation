@@ -647,6 +647,14 @@
       }
     },
     {
+      "id": "dev.watch-stop",
+      "ms": 240000,
+      "source": {
+        "file": "server/dev-watch.mjs",
+        "pattern": "const STOP_MS = ([\\d_]+), RESIDUE_GRACE_MS"
+      }
+    },
+    {
       "id": "launcher.api-ready",
       "ms": 60000,
       "source": {
@@ -906,6 +914,16 @@
       "inner": [
         "runtime.stop-aster",
         "runtime.kill-grace"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
+      "id": "dev-watch-covers-launcher-stop",
+      "outer": "dev.watch-stop",
+      "inner": [
+        "launcher.api-stop",
+        "launcher.runtime-stop"
       ],
       "minMarginMs": 10000,
       "status": "holds"

@@ -120,6 +120,6 @@ M2a/M2b、E1、M5a/b/c、M7a/b 是上位文档 v1.1 对原批次的细分。下�
 | M6 主库切换 | 尚未实施，按需进入 | 用写等待与实际需求决策；迁移域事件完整性、影子复制、水位及恢复演练完成后才切单写源 |
 | M7a/b 多实例 | 尚未实施 | 同机 API 先验证容量收益与共享控制状态；跨主机另验共享账户保护和旧写者出站隔离，不能以主库迁移代替 |
 
-M3 的 Linux 受管部署由 `server/runtime/main.mjs` 与 `server/api/main.mjs` 两个单元入口承载；手动 POSIX 入口 `server/index.mjs` 通过启动器组合两进程。Windows 的该入口保留 `server/workbench.mjs` 单进程兼容形态，`pnpm dev:server` 也使用兼容入口；其通过不代替 Linux 双单元验收。相关失败场景见 `tests/embedded-runtime.test.mjs`、`tests/process-split.test.mjs` 与 `tests/entry-symlink.test.mjs`，正式包入口见 `scripts/verify-embedded.mjs`；测试存在不代表本轮重新运行。
+M3 的 Linux 受管部署由 `server/runtime/main.mjs` 与 `server/api/main.mjs` 两个单元入口承载；手动 POSIX 入口 `server/index.mjs` 通过启动器组合两进程。Windows 的该入口保留 `server/workbench.mjs` 单进程兼容形态，Linux 的 `pnpm dev:server` 自 E3 起经 `server/dev-watch.mjs` 运行启动器，其它平台仍用兼容入口；其通过不代替 Linux 双单元验收。相关失败场景见 `tests/embedded-runtime.test.mjs`、`tests/process-split.test.mjs` 与 `tests/entry-symlink.test.mjs`，正式包入口见 `scripts/verify-embedded.mjs`；测试存在不代表本轮重新运行。
 
 本文件不推进历史提交复盘检查点。后续批次按源码与真实验证结果更新状态，不把已新增接口或测试夹具等同于完成生产容量、恢复或执行验收。

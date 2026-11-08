@@ -41,7 +41,7 @@ python -m venv .venv-aster
 .venv-aster/Scripts/python.exe -m pip install --require-hashes -r modules/aster/requirements.lock
 ```
 
-将 `GREEKS_PYTHON`、`ASTER_PYTHON` 分别设置为对应虚拟环境 Python 的绝对路径后运行 `pnpm start`。开发工作台前端可额外运行 `pnpm run dev`。一次安装覆盖根目录与四个 Node workspace（含 ASTER dashboard），共享版本由 workspace catalog 维护，`pnpm-lock.yaml` 提交到仓库。模块构建按源码、workspace 依赖和构建环境缓存，无变化时跳过。详见 [pnpm workspace 说明](docs/pnpm-workspace-migration.md)。
+将 `GREEKS_PYTHON`、`ASTER_PYTHON` 分别设置为对应虚拟环境 Python 的绝对路径后运行 `pnpm start`。开发时运行 `pnpm run dev:server`：Linux 上与生产一样分 runtime、API 两个进程，源码变更后等整组退出再重启；其它平台运行单进程工作台。开发工作台前端可额外运行 `pnpm run dev`。一次安装覆盖根目录与四个 Node workspace（含 ASTER dashboard），共享版本由 workspace catalog 维护，`pnpm-lock.yaml` 提交到仓库。模块构建按源码、workspace 依赖和构建环境缓存，无变化时跳过。详见 [pnpm workspace 说明](docs/pnpm-workspace-migration.md)。
 
 ## 项目结构
 
