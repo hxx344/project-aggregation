@@ -107,7 +107,7 @@
     },
     {
       "id": "client.asset-sync",
-      "ms": 60000,
+      "ms": 70000,
       "source": {
         "file": "server/runtime/data-client.mjs",
         "pattern": "ASSET_SYNC_BUDGET = ([\\d_]+);"
@@ -392,7 +392,7 @@
     },
     {
       "id": "python.pending-default",
-      "ms": 60000,
+      "ms": 55000,
       "source": {
         "file": "server/modules/python-module.mjs",
         "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+), requireWriterProtection",
@@ -427,7 +427,7 @@
     },
     {
       "id": "greeks.pending",
-      "ms": 60000,
+      "ms": 55000,
       "source": {
         "file": "server/modules/greeks.mjs",
         "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+) \\}\\)",
@@ -454,7 +454,7 @@
     },
     {
       "id": "aster.pending",
-      "ms": 60000,
+      "ms": 55000,
       "source": {
         "file": "server/modules/aster.mjs",
         "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+) \\}\\)",
@@ -653,6 +653,14 @@
       "source": {
         "file": "src/UpdateStatus.tsx",
         "pattern": "\\(kind === 'apply' \\? \\{ timeoutMs: ([\\d_]+) \\} : \\{\\}\\)"
+      }
+    },
+    {
+      "id": "browser.asset-sync",
+      "ms": 80000,
+      "source": {
+        "file": "modules/asset/app/dashboard.tsx",
+        "pattern": "timeoutMs=path==='/api/sync'\\?([\\d_]+):"
       }
     },
     {
@@ -893,6 +901,15 @@
       "status": "holds"
     },
     {
+      "id": "browser-asset-covers-asset-sync",
+      "outer": "browser.asset-sync",
+      "inner": [
+        "client.asset-sync"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
       "id": "browser-aero-covers-forward",
       "outer": "browser.aero-change",
       "inner": [
@@ -920,9 +937,8 @@
         "python.receive",
         "greeks.pending"
       ],
-      "minMarginMs": 1000,
-      "status": "conflict",
-      "conflict": "C1"
+      "minMarginMs": 5000,
+      "status": "holds"
     },
     {
       "id": "portal-covers-aster-request",
@@ -931,9 +947,8 @@
         "python.receive",
         "aster.pending"
       ],
-      "minMarginMs": 1000,
-      "status": "conflict",
-      "conflict": "C1"
+      "minMarginMs": 5000,
+      "status": "holds"
     },
     {
       "id": "api-drain-covers-portal-request",
@@ -943,7 +958,7 @@
         "portal.response-header"
       ],
       "minMarginMs": 0,
-      "status": "conflict",
+      "status": "accepted",
       "conflict": "C2"
     },
     {
@@ -952,9 +967,8 @@
       "inner": [
         "aster.pending"
       ],
-      "minMarginMs": 1000,
-      "status": "conflict",
-      "conflict": "C14"
+      "minMarginMs": 5000,
+      "status": "holds"
     },
     {
       "id": "api-drain-covers-update-apply",
@@ -966,7 +980,7 @@
         "protocol.maintenance"
       ],
       "minMarginMs": 0,
-      "status": "conflict",
+      "status": "accepted",
       "conflict": "C15"
     },
     {
@@ -976,17 +990,15 @@
         "runtime.asset-sync",
         "runtime.summary-read"
       ],
-      "minMarginMs": 0,
-      "status": "conflict",
-      "conflict": "C16"
+      "minMarginMs": 5000,
+      "status": "holds"
     },
     {
-      "id": "maintenance-covers-queued-resyncs",
+      "id": "maintenance-covers-two-api-syncs",
       "outer": "protocol.maintenance",
       "inner": [
         "runtime.sync-deadline",
-        "runtime.sync-deadline",
-        "runtime.sync-deadline",
+        "updates.module-maintenance",
         "updates.module-maintenance"
       ],
       "minMarginMs": 0,

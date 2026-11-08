@@ -367,7 +367,7 @@ test('a retry waits while another maintenance sync is running; a first sync afte
   t.after(() => runtime.close());
   onModuleReady({ id: 'aster', generation: 2 });
   assert.ok(await until(() => warnings.length >= 1));
-  // A sync that does not finish: aster's retries are skipped, neither sent nor logged.
+  // A sync that does not finish: aster's retries wait for the next batch, neither sent nor logged.
   const release = modules.hold('crossex');
   onModuleReady({ id: 'crossex', generation: 2 });
   assert.ok(await until(() => modules.maintenanceCalls.crossex === 1));
@@ -393,5 +393,28 @@ test('the first sync of a restarted module waits behind a running one instead of
   await new Promise(resolve => setTimeout(resolve, 100));
   release();
   assert.ok(await until(() => modules.maintenanceCalls.aster === 1, 5000), 'sent right after the running sync, not one retry delay later');
+  await runtime.close();
+});
+
+test('modules restarted while a runtime sync runs share the next one', { skip, timeout: 60_000 }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const quiet = { info() {}, debug() {}, warn() {}, error() {} };
+  const modules = fakeModules(path.join(dataDir, 'modules'));
+  let onModuleReady;
+  const runtime = await startRuntime({ dataDir, logger: quiet, env, dataPlaneOptions, syncRetryMs: [60_000], startModules: options => { onModuleReady = options.onModuleReady; return modules.startModules(options); } });
+  t.after(() => runtime.close());
+  const releaseCrossex = modules.hold('crossex');
+  onModuleReady({ id: 'crossex', generation: 2 });
+  assert.ok(await until(() => modules.maintenanceCalls.crossex === 1));
+  onModuleReady({ id: 'aster', generation: 2 });
+  onModuleReady({ id: 'greeks', generation: 2 });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.deepEqual([modules.maintenanceCalls.aster, modules.maintenanceCalls.greeks], [0, 0], 'both wait behind the running sync');
+  // With one sync each, greeks would wait behind the held aster call until
+  // its 4 s deadline; the shared sync reaches both well before that.
+  const releaseAster = modules.hold('aster');
+  releaseCrossex();
+  assert.ok(await until(() => modules.maintenanceCalls.aster === 1 && modules.maintenanceCalls.greeks === 1, 2000), 'one sync carries both modules');
+  releaseAster();
   await runtime.close();
 });

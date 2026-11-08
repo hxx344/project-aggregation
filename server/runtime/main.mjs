@@ -22,9 +22,11 @@ import { ensureRuntimeDir, runtimeDir, socketPathFor } from './protocol.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 // A restarted trading module that could not take the durable maintenance value
-// is tried again with this backoff until it confirms or restarts again. Each
-// try waits at most SYNC_DEADLINE_MS for the module, so an API sync queued
-// behind it (10 s per module) stays within the API's 15 s maintenance budget.
+// is tried again with this backoff until it confirms or restarts again. The
+// runtime keeps at most one of its own syncs in the service queue, and each
+// waits at most SYNC_DEADLINE_MS for the modules, so an API sync queued behind
+// it (10 s) stays within the API's 15 s maintenance budget however many modules
+// restart together (docs/timeout-budgets.md, C18).
 const SYNC_RETRY_MS = [1000, 2000, 5000, 10_000, 30_000], SYNC_DEADLINE_MS = 4000;
 
 // The runtime process (design doc 3.1): the embedded modules, the data plane
@@ -38,6 +40,23 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
   let lock = null, accountWriter = null, modules = null, moduleStartup = null, db = null, dataPlane = null, internal = null, service = null, ready = false;
   let closing = null;
   const generations = new Map(), retries = new Set();
+  // Modules due while a runtime sync is queued or running join the next one,
+  // which enters the service queue only after it: one sync for all of them.
+  // The batch skips (null) while another sync is queued only if every member
+  // is a retry. Each caller gets the rows of its own module.
+  let syncTail = Promise.resolve(), syncBatch = null;
+  const syncModule = (id, ifIdle) => {
+    if (!syncBatch) {
+      const batch = syncBatch = { ids: new Set(), ifIdle: true };
+      batch.result = syncTail.then(() => {
+        syncBatch = null;
+        return closing ? null : service.syncMaintenance([...batch.ids], { ifIdle: batch.ifIdle, deadlineMs: SYNC_DEADLINE_MS });
+      });
+      syncTail = batch.result.catch(() => {});
+    }
+    syncBatch.ids.add(id); syncBatch.ifIdle &&= ifIdle;
+    return syncBatch.result.then(result => result && { ...result, modules: result.modules.filter(row => row.id === id) });
+  };
   const stopWriteLog = logWriteWaits({ logger, role: 'runtime' });
   function close() {
     return closing ??= (async () => {
@@ -75,7 +94,7 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
     // A restarted trading module starts in maintenance and takes the durable
     // value at once; modules of the first start are synchronized by the API.
     // Retries stop once the module confirms, a new instance of it is ready or
-    // the runtime closes. A retry is skipped while another sync is queued and
+    // the runtime closes. A retry is skipped while an API sync is queued and
     // waits its delay again; the first failures and then every 20th are logged.
     const onModuleReady = ({ id, generation }) => {
       if (!service || !tradingModules.includes(id)) return;
@@ -85,7 +104,7 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
       const retry = delay => { const timer = setTimeout(() => { retries.delete(timer); void sync(); }, delay); timer.unref?.(); retries.add(timer); };
       const sync = async () => {
         if (!current()) return;
-        const result = await Promise.resolve().then(() => service.syncMaintenance([id], { ifIdle: attempt > 0, deadlineMs: SYNC_DEADLINE_MS })).catch(error => ({ error }));
+        const result = await syncModule(id, attempt > 0).catch(error => ({ error }));
         if (!current() || result?.modules?.every(module => module.confirmed)) return;
         // A skipped retry waits the delay it just waited, not the next one.
         const delay = syncRetryMs[Math.min(result === null ? Math.max(attempt - 1, 0) : attempt, syncRetryMs.length - 1)];

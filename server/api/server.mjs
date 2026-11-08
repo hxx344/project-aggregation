@@ -477,7 +477,8 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   // timeouts and closeIdleConnections() rely on.
   const attached = new Set(), traffic = new WeakSet();
   const isProbe = socket => privateProbe && !traffic.has(socket);
-  const server = http.createServer((req, res) => { const task = handle(req, res), done = () => handlers.delete(task); handlers.add(task); task.then(done, error => { done(); log.error({ err: error, type: 'request' }, '请求处理失败'); }); });
+  // Node checks requestTimeout and headersTimeout only every connectionsCheckingInterval (30 s by default).
+  const server = http.createServer({ connectionsCheckingInterval: 1000 }, (req, res) => { const task = handle(req, res), done = () => handlers.delete(task); handlers.add(task); task.then(done, error => { done(); log.error({ err: error, type: 'request' }, '请求处理失败'); }); });
   async function handle(req, res) {
     receivedAt.set(req, Date.now());
     inFlight.add(res);

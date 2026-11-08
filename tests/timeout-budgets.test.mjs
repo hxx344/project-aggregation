@@ -90,6 +90,14 @@ test('every registered budget equals the value read from where it takes effect',
   }
 });
 
+test('servers with a registered receive timeout check it every second', () => {
+  // Node checks requestTimeout and headersTimeout only every connectionsCheckingInterval
+  // (30 s by default), which would stretch a registered 30 s limit to as much as 60 s.
+  const files = new Set(table.budgets.filter(budget => /server\\\.(requestTimeout|headersTimeout)/.test(budget.source?.pattern ?? '')).map(budget => budget.source.file));
+  assert.ok(files.size >= 4, 'receive timeouts are registered');
+  for (const file of files) assert.match(read(file), /createServer\(\{ connectionsCheckingInterval: 1000 \}, /, file);
+});
+
 test('generated units leave the stop timeout to TimeoutStopSec alone', () => {
   // docs/timeout-budgets.md relies on these: no ExecStop, default control-group
   // KillMode (SIGTERM to every process at once), no TimeoutSec= overriding the stop limit.
@@ -104,12 +112,15 @@ test('nested and sequential budgets keep their margins; registered conflicts sti
     assert.ok(!ids.has(relation.id), `relation ${relation.id} is unique`); ids.add(relation.id);
     assert.ok(Number.isInteger(relation.minMarginMs) && relation.minMarginMs >= 0, relation.id);
     const spare = value(relation.outer) - relation.inner.reduce((total, id) => total + value(id), 0) - relation.minMarginMs;
-    if (relation.status === 'holds') assert.ok(spare >= 0, `${relation.id}: ${relation.outer} lacks ${-spare} ms over ${relation.inner.join(' + ')} + ${relation.minMarginMs} ms margin`);
-    else {
-      assert.equal(relation.status, 'conflict', relation.id);
+    if (relation.status === 'holds') {
+      assert.equal(relation.conflict, undefined, `${relation.id}: a relation that holds names no conflict`);
+      assert.ok(spare >= 0, `${relation.id}: ${relation.outer} lacks ${-spare} ms over ${relation.inner.join(' + ')} + ${relation.minMarginMs} ms margin`);
+    } else {
+      // A conflict is still to be fixed; an accepted one is cut on purpose (docs section 5).
+      assert.ok(['conflict', 'accepted'].includes(relation.status), relation.id);
       assert.match(relation.conflict ?? '', /^C\d+$/, `${relation.id}: names its conflict`);
-      // Fixed conflicts must be turned into holds so the margin stays checked.
-      assert.ok(spare < 0, `${relation.id}: conflict ${relation.conflict} now holds; mark it holds`);
+      // Ones that hold now must be turned into holds so the margin stays checked.
+      assert.ok(spare < 0, `${relation.id}: ${relation.status} ${relation.conflict} now holds; mark it holds`);
     }
   }
 });
@@ -125,7 +136,7 @@ test('the document lists every budget and relation with the registered value', (
   }
   for (const relation of table.relations) {
     assert.ok(listed.has(relation.id), `docs list relation ${relation.id}`);
-    assert.equal(listed.get(relation.id), relation.status === 'holds' ? '成立' : `冲突 ${relation.conflict}`, `docs status of ${relation.id}`);
+    assert.equal(listed.get(relation.id), relation.status === 'holds' ? '成立' : `${relation.status === 'accepted' ? '接受' : '冲突'} ${relation.conflict}`, `docs status of ${relation.id}`);
     const formula = ['`' + relation.outer + '` ⊇ ' + relation.inner.map(id => '`' + id + '`').join(' + '), `${relation.minMarginMs / 1000} s`].join(' + ');
     assert.equal(formulas.get(relation.id), formula, `docs formula of ${relation.id}`);
     if (relation.conflict) assert.match(doc, new RegExp(`^\\| ${relation.conflict} \\|`, 'm'), `docs describe ${relation.conflict}`);

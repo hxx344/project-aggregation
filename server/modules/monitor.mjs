@@ -39,7 +39,8 @@ export async function createModule({ root, dataDir, secret, environment = {} }) 
     const handler = createHandler({ services, username, password, pageHandler: pages.handle });
     const expected = Buffer.from(secret);
     const authorization = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
-    server = createServer((request, response) => {
+    // Node checks requestTimeout only every connectionsCheckingInterval (30 s by default).
+    server = createServer({ connectionsCheckingInterval: 1000 }, (request, response) => {
       const supplied = Buffer.from(request.headers['x-workspace-key'] ?? '');
       if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
         response.writeHead(401, { 'Cache-Control': 'no-store' }); response.end(); return;
