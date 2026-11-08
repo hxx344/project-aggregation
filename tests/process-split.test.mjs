@@ -171,7 +171,64 @@ test('an API that outlives its runtime reports it unavailable, then reaches the 
   assert.deepEqual(await runtime.exited, { code: 0, signal: null }, runtime.stderr());
 });
 
-test('over the socket, execution entries keep the runtime\'s 409 and 503 and outlive a crashed API', { skip, timeout: 90_000 }, async t => {
+// A browser's overview stream on the API: `next(predicate)` resolves with the next event that matches.
+function overviewStream(t, port, session) {
+  const events = [], waiting = [];
+  let buffer = '', ended = false;
+  const req = http.request({ hostname: '127.0.0.1', port, path: '/api/overview/events', agent: false,
+    headers: { Host: `hub.localhost:${port}`, Cookie: session.cookie, 'Sec-Fetch-Site': 'same-origin' } }, res => {
+    assert.equal(res.statusCode, 200);
+    res.setEncoding('utf8');
+    res.on('data', chunk => {
+      buffer += chunk;
+      for (let end; (end = buffer.indexOf('\n\n')) >= 0; buffer = buffer.slice(end + 2)) {
+        const data = buffer.slice(0, end).split('\n').find(line => line.startsWith('data: '));
+        if (!data) continue;
+        const event = JSON.parse(data.slice(6)); events.push(event);
+        for (const entry of waiting.splice(0)) if (entry.predicate(event)) entry.resolve(event); else waiting.push(entry);
+      }
+    });
+    res.on('close', () => { ended = true; });
+  });
+  req.on('error', () => { ended = true; }); req.end();
+  t.after(() => req.destroy());
+  return { events, ended: () => ended,
+    next(predicate, ms = 30_000) {
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`No matching overview event: ${JSON.stringify(events.at(-1))?.slice(0, 400)}`)), ms);
+        waiting.push({ predicate, resolve: event => { clearTimeout(timer); resolve(event); } });
+      });
+    } };
+}
+
+test('a browser overview stream on the API stays open through a runtime restart and carries the next instance\'s events', { skip, timeout: 90_000 }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const quiet = { info() {}, debug() {}, warn() {}, error() {} };
+  let runtime = spawnFixture(t, 'split-runtime.mjs', env);
+  await runtime.next('ready');
+  const api = await startApi({ dataDir, logger: quiet, env, port: 0, distDir: path.join(dataDir, 'dist'), updatesClient: { status: async () => unavailableUpdateState() } });
+  t.after(() => api.close());
+  const c = client(api.ready.port);
+  await c.login();
+  const stream = overviewStream(t, api.ready.port, c.session);
+  const order = (event, id) => event.projects.find(item => item.project?.id === id)?.project.order;
+  await stream.next(event => Array.isArray(event.projects) && event.projects.length > 0);
+
+  runtime.child.kill('SIGKILL'); await runtime.exited;
+  runtime = spawnFixture(t, 'split-runtime.mjs', env);
+  await runtime.next('ready');
+  // The change is written by the API and announced to the new instance, whose
+  // event reaches this stream only once the API's subscription has reconnected.
+  const changed = stream.next(event => order(event, 'crossex') === 7);
+  assert.ok(await until(async () => (await c.request('/api/ready')).status === 200), 'the API found the new instance');
+  assert.equal((await c.request('/api/projects/crossex', { method: 'PUT', body: { order: 7 } })).status, 200);
+  await changed;
+  assert.equal(stream.ended(), false, 'the browser stream was never closed');
+  runtime.child.kill('SIGTERM');
+  assert.deepEqual(await runtime.exited, { code: 0, signal: null }, runtime.stderr());
+});
+
+test('over the socket, execution entries keep the runtime\'s 409 and 503 and outlive a crashed API',{ skip, timeout: 90_000 }, async t => {
   const { dataDir, env } = await dataDirectory(t);
   const quiet = { info() {}, debug() {}, warn() {}, error() {} };
   // Every exchange call of the runtime waits while `gate` is set.

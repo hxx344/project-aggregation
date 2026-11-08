@@ -1,10 +1,13 @@
-// Windows-native fixture for the real single-process server/workbench.mjs and embedded ASTER UI.
-// Run: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
+// Fixture for the real Hub and the embedded ASTER UI. Run from the repository root:
+// node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
+// server/index.mjs is the launcher with separate runtime and API processes on
+// Linux and the single-process server/workbench.mjs on Windows. The launcher
+// forks both with this --import; they share the data directory the first
+// process created, and only the runtime starts the fixture modules.
 // Only module workers are replaced. Hub login, launch, proxy and bridge stay real.
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, existsSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,8 +19,16 @@ import { createStaticResponder } from '../../server/static-response.mjs';
 
 const root = fileURLToPath(new URL('../..', import.meta.url));
 const dist = path.join(root, 'modules/aster/dashboard/dist/client');
-const directory = mkdtempSync(path.join(tmpdir(), 'aster-notices-browser-'));
-if (process.platform === 'win32') {
+const inherited = process.env.ASTER_NOTICES_FIXTURE_DIR;
+const directory = inherited || mkdtempSync(path.join(tmpdir(), 'aster-notices-browser-'));
+process.env.ASTER_NOTICES_FIXTURE_DIR = directory;
+// Removed by the process that created it once it exits, after the runtime has
+// released its lock and account writer; removing it on close() broke both.
+if (!inherited) process.once('exit', () => {
+  try { rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); }
+  catch (error) { console.warn(`ASTER notices fixture: ${directory} was not removed: ${error.message}`); }
+});
+if (!inherited && process.platform === 'win32') {
   const secure = spawnSync(process.env.PYTHON || 'python', ['-I', path.join(root, 'tests/test_lifecycle_lock.py'), '--secure-dir', directory],
     { windowsHide: true, timeout: 5000 });
   if (secure.status !== 0) throw new Error('Cannot protect the isolated browser fixture data directory');
@@ -73,6 +84,5 @@ export async function startFixtureModules() {
   return { markStarted() {}, status: () => [], restart: () => false, close: async () => {
     for (const unregister of remove) unregister();
     await new Promise(resolve => server.close(resolve));
-    await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   } };
 }
