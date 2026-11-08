@@ -225,20 +225,27 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     else void check(id).catch(() => {});
   }
 
-  async function coordinateAssetSync(projectId, revision) {
+  // `signal` ends when the caller stops waiting; a sync started for it alone stops too (C7).
+  async function coordinateAssetSync(projectId, revision, { signal } = {}) {
     if (closed || projectRevision(projectId) !== revision) return null;
-    const status = await assetSync.run(projectId);
+    const status = await assetSync.run(projectId, { signal });
     return !closed && projectRevision(projectId) === revision ? status : null;
   }
 
   // A business route forwarded by the API. `target` is the path and query of
   // the browser request; `body` is read only where the route reads it.
+  // `signal` aborts once the API stopped waiting (its caller left or its
+  // deadline passed): no route starts its work after that, and execution
+  // previews and account checks stop their exchange calls (C7).
   async function handle(request) {
     try { return await route(request); } catch (error) { return respond(error); }
   }
-  async function route({ method, target, sessionId, contentType, deadline, body: stream }) {
+  async function route({ method, target, sessionId, contentType, deadline, body: stream, signal }) {
     const url = new URL(target, 'http://runtime.internal');
     const pathname = url.pathname;
+    // A caller that left before a new connection, preview or job began gets
+    // nothing started; a stop, reconcile or rule change still runs (C7).
+    const gone = () => { if (signal?.aborted) throw new HttpError(503, '请求已取消，未执行'); };
     const bodyOf = () => readJson(contentType, stream);
     const reply = (status, body) => ({ status, body });
     // The API checked the session; it may have ended while the request waited for admission.
@@ -455,10 +462,10 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (autoRule && !autoRule[2] && method === 'DELETE') return reply(200, executionAuto.remove(autoRule[1], await signedBody()));
       if (autoRule && autoRule[2] && method === 'POST') return reply(200, executionAuto.act(autoRule[1], autoRule[2], await signedBody()));
       const account = pathname.match(/^\/api\/trading\/execution\/accounts\/(binance|bybit|okx|hyperliquid|rh-lighter)$/);
-      const entered = async operation => { const body = await bodyOf(); return executionEntries.run(() => operation(body)); };
-      if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId)));
-      if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId)));
-      if (pathname === '/api/trading/execution/preview' && method === 'POST') return reply(200, await entered(body => execution.preview(body, sessionId)));
+      const entered = async (operation, cancelable = true) => { const body = await bodyOf(); return executionEntries.run(() => { if (cancelable) gone(); return operation(body); }); };
+      if (account && method === 'PUT') return reply(200, await entered(body => execution.connect(account[1], body, sessionId, { signal })));
+      if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId), false));
+      if (pathname === '/api/trading/execution/preview' && method === 'POST') return reply(200, await entered(body => execution.preview(body, sessionId, { signal })));
       if (pathname === '/api/trading/execution/jobs' && method === 'POST') return reply(202, await entered(body => execution.start(body, sessionId)));
       const job = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/(stop|reconcile)$/);
       if (job && method === 'POST') { const body = await bodyOf(); return reply(200, job[2] === 'stop' ? execution.stop(job[1], body, sessionId) : await execution.reconcile(job[1], body, sessionId)); }

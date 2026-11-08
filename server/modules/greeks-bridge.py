@@ -21,7 +21,11 @@ def emit(value):
     PROTOCOL.flush()
 
 
-async def serve(app, shutdown_timeout=90):
+class StreamingUnsupported(RuntimeError):
+    pass
+
+
+async def serve(app, shutdown_timeout=90, startup_timeout=90):
     incoming = asyncio.Queue()
     outgoing = asyncio.Queue()
     state = {}
@@ -55,16 +59,25 @@ async def serve(app, shutdown_timeout=90):
                 pass
 
     threading.Thread(target=read_parent, name="workspace-stdin", daemon=True).start()
+    parent = os.getppid()
+
+    def stop_signal(*_):
+        # systemd signals every process of the runtime unit at once. While the
+        # worker lives it ends this bridge through stdin, in the runtime's order
+        # (docs/timeout-budgets.md, C8); an orphan stops on the signal.
+        if os.getppid() != parent:
+            loop.call_soon_threadsafe(frames.put_nowait, b"")
+
     previous_signals = {}
     for signum in (signal.SIGTERM, signal.SIGINT):
-        previous_signals[signum] = signal.signal(signum, lambda *_: loop.call_soon_threadsafe(frames.put_nowait, b""))
+        previous_signals[signum] = signal.signal(signum, stop_signal)
     lifecycle = asyncio.create_task(app({"type": "lifespan", "asgi": {"version": "3.0", "spec_version": "2.0"}, "state": state}, incoming.get, outgoing.put))
 
     async def transition(kind):
         await incoming.put({"type": "lifespan." + kind})
         message_task = asyncio.create_task(outgoing.get())
         try:
-            completed, _ = await asyncio.wait({message_task, lifecycle}, timeout=90 if kind == "startup" else shutdown_timeout,
+            completed, _ = await asyncio.wait({message_task, lifecycle}, timeout=startup_timeout if kind == "startup" else shutdown_timeout,
                                             return_when=asyncio.FIRST_COMPLETED)
             if message_task not in completed or message_task.result().get("type") != "lifespan." + kind + ".complete":
                 raise RuntimeError("ASGI lifespan did not complete")
@@ -102,6 +115,10 @@ async def serve(app, shutdown_timeout=90):
                     raise RuntimeError("Duplicate response start")
                 status = event["status"]
                 headers = [[key.decode("latin-1"), value.decode("latin-1")] for key, value in event.get("headers", [])]
+                # The reply travels whole, so an event stream would only end at
+                # the worker's request timeout; refuse it at once (C13).
+                if any(key.lower() == "content-type" and value.lower().startswith("text/event-stream") for key, value in headers):
+                    raise StreamingUnsupported("Streaming responses are not supported")
             elif event["type"] == "http.response.body":
                 if status is None or finished:
                     raise RuntimeError("Invalid response body")
@@ -187,7 +204,8 @@ if __name__ == "__main__":
     module, name = (sys.argv[1] if len(sys.argv) > 1 else "app.main:app").split(":", 1)
     try:
         asyncio.run(serve(getattr(importlib.import_module(module), name),
-                          float(sys.argv[2]) if len(sys.argv) > 2 else 90))
+                          float(sys.argv[2]) if len(sys.argv) > 2 else 90,
+                          float(sys.argv[3]) if len(sys.argv) > 3 else 90))
     except Exception as exc:
         print("Workspace ASGI bridge failed:", type(exc).__name__, file=sys.stderr)
         sys.exit(1)

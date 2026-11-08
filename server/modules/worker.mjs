@@ -70,4 +70,7 @@ process.on('message', async message => {
   }
 });
 process.once('disconnect', () => void close());
-for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => void close());
+// systemd signals every process of the runtime unit at once. While the runtime
+// is connected it stops this worker itself (shutdown, or disconnect), after the
+// API sees it unavailable (docs/timeout-budgets.md, C8).
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { if (!process.connected) void close(); });

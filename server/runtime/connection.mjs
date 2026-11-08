@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { BUDGETS, MAX_RESPONSE_BYTES, readDiscovery, RUNTIME_KEY_HEADER, SUPPORTED_PROTOCOLS, unavailable, validateStatus } from './protocol.mjs';
+import { BUDGETS, MAX_RESPONSE_BYTES, readDiscovery, RUNTIME_KEY_HEADER, SUPPORTED_PROTOCOLS, timedOut, unavailable, validateStatus } from './protocol.mjs';
 
 // The API's link to the runtime's private socket, shared by the supervisor and
 // data-plane clients. The discovery record is cached until a call reports it
@@ -10,14 +10,24 @@ export function createRuntimeConnection({ dir, protocols = SUPPORTED_PROTOCOLS, 
 
   // One HTTP exchange bounded by `deadline` (wall clock, so slow trickles end
   // too); the reply is parsed as JSON up to `maxBytes`. A failure after the
-  // connection was made is `uncertain` for anything but GET and HEAD.
-  function exchange(target, { method, route, headers = {}, body = null, deadline, maxBytes = MAX_RESPONSE_BYTES }) {
+  // connection was made is `uncertain` for anything but GET and HEAD. The
+  // deadline answers 504 (timedOut), like the data plane's own budgets; an
+  // aborted `signal` closes the socket once the request is written whole, so
+  // the runtime decides what a caller that left still gets: a stop runs, a
+  // preview does not (docs/timeout-budgets.md, C7). The caller is answered at once.
+  function exchange(target, { method, route, headers = {}, body = null, deadline, maxBytes = MAX_RESPONSE_BYTES, signal }) {
     return new Promise((resolve, reject) => {
       const remaining = deadline - Date.now();
-      if (remaining <= 0) { reject(unavailable()); return; }
-      let settled = false, connected = false;
-      const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); if (error) reject(error); else resolve(value); };
-      const fail = () => finish(unavailable(!['GET', 'HEAD'].includes(method) && connected));
+      if (remaining <= 0) { reject(timedOut()); return; }
+      let settled = false, connected = false, written = false;
+      const uncertain = () => !['GET', 'HEAD'].includes(method) && connected;
+      const finish = (error, value) => { if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', cancel); if (error) reject(error); else resolve(value); };
+      const fail = () => finish(unavailable(uncertain()));
+      const cancel = () => {
+        finish(unavailable(!['GET', 'HEAD'].includes(method)));
+        if (written) req.destroy();
+        else setTimeout(() => req.destroy(), Math.max(0, deadline - Date.now())).unref?.();
+      };
       const req = http.request({ socketPath: target.socketPath, path: route, method, agent: false,
         headers: { ...headers, [RUNTIME_KEY_HEADER]: target.secret, ...(body ? { 'Content-Length': body.length } : {}) } }, res => {
         const chunks = []; let size = 0;
@@ -33,8 +43,10 @@ export function createRuntimeConnection({ dir, protocols = SUPPORTED_PROTOCOLS, 
       });
       req.on('socket', socket => { if (!socket.connecting) connected = true; else socket.once('connect', () => { connected = true; }); });
       req.on('error', fail);
-      const timer = setTimeout(() => { fail(); req.destroy(); }, remaining);
+      req.once('finish', () => { written = true; if (signal?.aborted) req.destroy(); });
+      const timer = setTimeout(() => { finish(timedOut(uncertain())); req.destroy(); }, remaining);
       timer.unref?.();
+      if (signal?.aborted) cancel(); else signal?.addEventListener('abort', cancel, { once: true });
       req.end(body);
     });
   }
@@ -44,7 +56,8 @@ export function createRuntimeConnection({ dir, protocols = SUPPORTED_PROTOCOLS, 
     try { next = readDiscovery(dir); } catch { throw unavailable(); }
     if (!next || !protocols.includes(next.protocol)) throw unavailable();
     // The file alone is not proof: the instance behind the socket must confirm its identity.
-    const reply = await exchange(next, { method: 'GET', route: '/internal/v1/status', deadline });
+    // A probe that runs out of time is discovery failing, not a slow answer.
+    const reply = await exchange(next, { method: 'GET', route: '/internal/v1/status', deadline }).catch(() => { throw unavailable(); });
     let status;
     try { if (reply.status !== 200) throw unavailable(); status = validateStatus(reply.body, protocols); } catch { throw unavailable(); }
     if (status.instanceId !== next.instanceId || status.protocol !== next.protocol) throw unavailable();

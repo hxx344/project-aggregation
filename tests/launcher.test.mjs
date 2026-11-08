@@ -75,6 +75,20 @@ test('an API that ignores SIGTERM is killed after the stop deadline and the exit
   for (const pid of [apiPid, runtimePid]) assert.throws(() => process.kill(pid, 0));
 });
 
+test('a runtime that ignores SIGTERM is killed after its own stop deadline', { skip, timeout: 30_000 }, async t => {
+  const s = await scripts(t);
+  const runtimeEntry = s.write('runtime.mjs', "process.on('SIGTERM', () => {}); process.send({ type: 'ready', port: 1 }); setInterval(() => {}, 1000);");
+  const apiEntry = s.write('api.mjs', readyChild);
+  let ready; const apiReady = new Promise(resolve => { ready = resolve; });
+  const launcher = launch({ runtimeEntry, apiEntry, logger: quiet, runtimeStopMs: 200, onApiReady: ready });
+  t.after(() => launcher.stop(0));
+  const { runtimePid } = await apiReady;
+  const started = Date.now();
+  assert.equal(await launcher.stop(0), 1);
+  assert.ok(Date.now() - started < 5000);
+  assert.throws(() => process.kill(runtimePid, 0));
+});
+
 test('children ended by the SIGTERM of stop() count as stopped', { skip, timeout: 30_000 }, async t => {
   const s = await scripts(t);
   // Neither child has a SIGTERM handler, like a child still loading its modules.

@@ -13,7 +13,10 @@ const HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', '
 // bridge's 504 answers first (docs/timeout-budgets.md, C1 and C14).
 export async function createPythonModule({ root, secret, env, executable, application, label,
   privateHeaders, requestTimeout = 55_000, startupTimeout = 90_000, shutdownTimeout = 10_000, requireWriterProtection = false }) {
-  const child = spawn(executable, ['-u', bridge, application, String(shutdownTimeout / 1000)], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  // The bridge times its own startup and shutdown with these values (C3); it
+  // ignores SIGTERM while this worker lives (C8), so ending its stdin starts
+  // its shutdown and SIGKILL after shutdownTimeout ends it (C6).
+  const child = spawn(executable, ['-u', bridge, application, String(shutdownTimeout / 1000), String(startupTimeout / 1000)], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   // Windows has no process group to probe; the supervisor waits for this pid
   // before starting a successor.
   if (process.platform === 'win32' && child.pid) process.send?.({ type: 'child', pid: child.pid });
@@ -72,7 +75,7 @@ export async function createPythonModule({ root, secret, env, executable, applic
     }
     pending.clear();
     child.stdin.end();
-    const termination = setTimeout(() => child.kill(), shutdownTimeout);
+    const termination = setTimeout(() => child.kill('SIGKILL'), shutdownTimeout);
     termination.unref();
     exited.then(() => clearTimeout(termination));
     if (!closing && server.listening) server.emit('error', new Error(`${label} bridge exited`));
@@ -110,7 +113,8 @@ export async function createPythonModule({ root, secret, env, executable, applic
     }
   });
   const timer = setTimeout(fail, startupTimeout);
-  try { await started; } catch (error) { closing = true; child.kill(); throw error; } finally { clearTimeout(timer); }
+  // fail() already ended stdin and armed the SIGKILL.
+  try { await started; } catch (error) { closing = true; throw error; } finally { clearTimeout(timer); }
   if (requireWriterProtection) {
     try {
       await new Promise((resolve, reject) => {
@@ -127,7 +131,7 @@ export async function createPythonModule({ root, secret, env, executable, applic
         pending.set(id, { response, timer });
         write({ type: 'request', id, method: 'GET', url: '/__workspace/writer-status', scheme: 'http', headers: [['host', 'localhost'], ...privateHeaders], body: '' });
       });
-    } catch (error) { closing = true; fail(); child.kill(); await exited; throw error; }
+    } catch (error) { closing = true; fail(); await exited; throw error; }
   }
   let closePromise;
   return { server, child, writerProtectionVersion: requireWriterProtection ? 1 : null, recoveryProtectionVersion: requireWriterProtection ? 1 : null, close() {
@@ -136,7 +140,7 @@ export async function createPythonModule({ root, secret, env, executable, applic
       for (const { response, timer } of pending.values()) { clearTimeout(timer); if (!response.destroyed) response.writeHead(503).end(`${label} shutting down`); }
       pending.clear();
       write({ type: 'shutdown' }); child.stdin.end();
-      const kill = setTimeout(() => child.kill(), shutdownTimeout);
+      const kill = setTimeout(() => child.kill('SIGKILL'), shutdownTimeout);
       try { await exited; } finally { clearTimeout(kill); }
     })();
   } };

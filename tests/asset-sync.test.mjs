@@ -77,6 +77,40 @@ test('a hanging asset sync has its own deadline and does not block another targe
   assert.match(worker.getStatus('slow').message, /超时/);
 });
 
+test('a sync run for callers alone stops when the last of them leaves; a background round keeps it running', async t => {
+  const targets = [fixture('asset')]; let reads = 0, aborts = 0;
+  const worker = createAssetSync({ listTargets: () => targets, autoStart: false, timeoutMs: 5000,
+    syncReader: async (_project, _credentials, { signal }) => {
+      reads += 1;
+      await new Promise((_, reject) => signal.addEventListener('abort', () => { aborts += 1; reject(signal.reason); }, { once: true }));
+    },
+  });
+  t.after(() => worker.close());
+  const first = new AbortController(), second = new AbortController();
+  const runs = [worker.run('asset', { signal: first.signal }), worker.run('asset', { signal: second.signal })];
+  await until(() => reads === 1);
+  first.abort(); await delay(20);
+  assert.equal(aborts, 0, 'another caller still waits');
+  second.abort(); await Promise.all(runs);
+  assert.equal(aborts, 1);
+  assert.equal(worker.getStatus('asset').state, 'error');
+  assert.match(worker.getStatus('asset').message, /已取消.*保留已有账本/);
+  // The canceled round still counts against the interval: Asset may still be finishing it.
+  assert.equal((await worker.run('asset', { signal: new AbortController().signal })).state, 'error');
+  assert.equal(reads, 1);
+  // A refresh that joins a caller's round keeps it going after the caller leaves.
+  const other = createAssetSync({ listTargets: () => [fixture('joined')], autoStart: false, timeoutMs: 5000,
+    syncReader: async (_project, _credentials, { signal }) => { reads += 1; await new Promise((_, reject) => signal.addEventListener('abort', () => { aborts += 1; reject(signal.reason); }, { once: true })); } });
+  t.after(() => other.close());
+  const third = new AbortController();
+  const run = other.run('joined', { signal: third.signal });
+  await until(() => reads === 2);
+  void other.refresh();
+  third.abort(); await delay(20);
+  assert.equal(aborts, 1, 'the background round still needs it');
+  await other.close(); await run;
+});
+
 test('changed revisions, disabled targets and deleted targets cannot publish old results', async () => {
   for (const change of ['revision', 'disabled', 'deleted']) {
     let targets = [fixture()]; let release; const completions = [];

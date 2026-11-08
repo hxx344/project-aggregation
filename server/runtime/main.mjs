@@ -24,17 +24,28 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 // A restarted trading module that could not take the durable maintenance value
 // is tried again with this backoff until it confirms or restarts again. The
 // runtime keeps at most one of its own syncs in the service queue, and each
-// waits at most SYNC_DEADLINE_MS for the modules, so an API sync queued behind
-// it (10 s) stays within the API's 15 s maintenance budget however many modules
-// restart together (docs/timeout-budgets.md, C18).
+// waits at most SYNC_DEADLINE_MS for the modules. The API's 25 s maintenance
+// budget covers its sync (10 s) behind that one and, during a dual-slot
+// handoff, the other API's sync as well, however many modules restart
+// together (docs/timeout-budgets.md, C18).
 const SYNC_RETRY_MS = [1000, 2000, 5000, 10_000, 30_000], SYNC_DEADLINE_MS = 4000;
+// Closing the data plane waits for in-flight work (exchange calls, an Aero
+// operation); past this the runtime logs it and closes the rest, so the unit's
+// 150 s TimeoutStopSec is not the only bound. As long as the slowest module
+// stop, which runs alongside (docs/timeout-budgets.md, C11).
+const DATA_PLANE_CLOSE_MS = 120_000;
+const bounded = (work, ms, message) => {
+  let timer;
+  const expired = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); timer.unref?.(); });
+  return Promise.race([Promise.resolve(work), expired]).finally(() => clearTimeout(timer));
+};
 
 // The runtime process (design doc 3.1): the embedded modules, the data plane
 // and the internal server the API reaches it through. It holds `.runtime.lock`
 // from its first step until close() has stopped everything else. The API
 // seeds the control tables; the runtime only reads them.
 // `startModules` and `dataPlaneOptions` are replaced by the two-process tests.
-export async function startRuntime({ dataDir, logger = defaultLogger, signal, fail = () => {}, env = process.env, startModules: launchModules = startModules, dataPlaneOptions = {}, syncRetryMs = SYNC_RETRY_MS }) {
+export async function startRuntime({ dataDir, logger = defaultLogger, signal, fail = () => {}, env = process.env, startModules: launchModules = startModules, dataPlaneOptions = {}, syncRetryMs = SYNC_RETRY_MS, dataPlaneCloseMs = DATA_PLANE_CLOSE_MS }) {
   const resolvedData = path.resolve(dataDir);
   const stopped = () => { if (signal?.aborted) throw new Error('运行时启动已中止'); };
   let lock = null, accountWriter = null, modules = null, moduleStartup = null, db = null, dataPlane = null, internal = null, service = null, ready = false;
@@ -70,7 +81,7 @@ export async function startRuntime({ dataDir, logger = defaultLogger, signal, fa
       await step(() => internal?.close());
       // Workers drain while the data plane closes, as in the single process.
       const workers = Promise.resolve().then(() => (modules ?? moduleStartup)?.close());
-      await step(() => dataPlane?.close() ?? accountWriter?.close());
+      await step(() => bounded(dataPlane ? dataPlane.close() : accountWriter?.close(), dataPlaneCloseMs, '数据面未在期限内关闭'));
       await step(() => workers);
       await step(stopWriteLog);
       await step(() => db?.close());

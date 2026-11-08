@@ -193,7 +193,9 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     try {
       const data = await api<UpdateState>(`/api/system/updates${kind === 'read' ? '' : `/${kind}`}`, {
         signal: controller.signal,
-        ...(kind === 'apply' ? { timeoutMs: 120_000 } : {}),
+        // A read or check may wait for the update service and one module
+        // maintenance sync (docs/timeout-budgets.md, browser-covers-update-read).
+        ...(kind === 'apply' ? { timeoutMs: 140_000 } : kind === 'read' || kind === 'check' ? { timeoutMs: 40_000 } : {}),
         ...(kind === 'read' ? {} : { method: 'POST', body: JSON.stringify(kind === 'apply' ? { planId: value, ...(mode ? { deployMode: mode } : {}), ...(phase ? { phase } : {}) } : kind === 'token' ? { token: value } : {}) }),
       });
       if (controller.signal.aborted) return null;

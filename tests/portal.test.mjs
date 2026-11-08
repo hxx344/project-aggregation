@@ -471,10 +471,12 @@ test('asset coordination failures and timeouts are JSON errors and never masquer
   const failedGrant = await failed.authorize();
   const result = await failed.request('/api/sync', { method: 'POST', cookie: `${failedGrant.cookie}; asset_session=valid`, headers: { Origin: `http://${failed.host('asset')}` }, body: '{}' });
   assert.equal(result.status, 502); assert.deepEqual(JSON.parse(result.body), { error: '上游同步失败' }); assert.equal(failed.ledgerReads, 1);
-  const timed = await fixture(t, { assetLedger: true, responseHeaderTimeoutMs: 60, coordinateAssetSync: () => new Promise(() => {}) });
+  let timedSignal;
+  const timed = await fixture(t, { assetLedger: true, responseHeaderTimeoutMs: 60, coordinateAssetSync: ({ signal }) => { timedSignal = signal; return new Promise(() => {}); } });
   const timedGrant = await timed.authorize();
   const timeout = await timed.request('/api/sync', { method: 'POST', cookie: `${timedGrant.cookie}; asset_session=valid`, headers: { Origin: `http://${timed.host('asset')}` }, body: '{}' });
   assert.equal(timeout.status, 504); assert.match(JSON.parse(timeout.body).error, /超时/); assert.equal(timed.ledgerReads, 1);
+  assert.equal(timedSignal.aborted, true, 'nobody waits for the runtime sync any more');
 });
 
 test('asset coordination rechecks session and revision after waiting and does not expose another ledger', async t => {
@@ -691,6 +693,12 @@ test('revoked sessions and changed settings abort an in-flight login and cannot 
     const result = await pending; assert.ok(result.error || result.response.status === 401); assert.equal(result.response?.headers['set-cookie'], undefined);
     gate.resolve();
     assert.equal((await f.request(path)).status, 401); assert.equal(f.calls, 0);
+  }
+});
+
+test('an authentication timeout the Portal cannot use is refused instead of capped', () => {
+  for (const value of [0, -1, 1.5, 2 ** 31, Number.NaN, '10000']) {
+    assert.throws(() => createPortal({ store: {}, getProjects: () => ({}), getProjectRevision: () => 1, isSessionValid: () => true, authenticationTimeoutMs: value }), TypeError, String(value));
   }
 });
 

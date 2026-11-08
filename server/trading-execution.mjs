@@ -384,11 +384,18 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       : { apiKey: credentials.apiKey, apiSecret: credentials.apiSecret, ...(exchange === 'okx' ? { passphrase: credentials.passphrase } : {}) };
     return { row, credentials: secrets, client: clients.get(exchange), options: { accountMode: row.account_mode, beforeMutation: requireLease } };
   }
-  async function call(fn) {
+  // `outer` is the page request's signal for the calls a request makes itself
+  // (account checks, previews); it ends them once the API stopped waiting.
+  async function call(fn, outer) {
+    if (outer?.aborted) throw new ExecutionError(503, '请求已取消，未执行');
     const controller = new AbortController(); controllers.add(controller);
     const timer = setTimeout(() => controller.abort(new DOMException('Execution deadline', 'TimeoutError')), callTimeoutMs); timer.unref?.();
+    const cancel = () => controller.abort(new DOMException('Request canceled', 'AbortError'));
+    outer?.addEventListener('abort', cancel, { once: true });
     const promise = Promise.resolve().then(() => fn(controller.signal)); pending.add(promise);
-    try { return await promise; } finally { clearTimeout(timer); controllers.delete(controller); pending.delete(promise); }
+    try { return await promise; }
+    catch (error) { if (outer?.aborted) throw new ExecutionError(503, '请求已取消，未完成'); throw error; }
+    finally { clearTimeout(timer); outer?.removeEventListener('abort', cancel); controllers.delete(controller); pending.delete(promise); }
   }
   const totalFilled = (all, legId, phase, batch) => addDecimals(all.filter(order => order.legId === legId && (phase === undefined || order.phase === phase) && (batch === undefined || order.batch === batch)).map(order => order.filledQuantity));
   function reductionPositionBaselines(job) {
@@ -439,7 +446,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (!validRevision(revision) || accountRow(exchange).revision !== revision) throw new ExecutionError(409, '连接版本已改变，请刷新后重试');
     if (locked(exchange)) throw new ExecutionError(409, '该交易所有未结束任务，先停止并完成委托核对后再更换连接');
   }
-  async function connect(exchange, body, session) {
+  async function connect(exchange, body, session, { signal } = {}) {
     const wallet = exchange === 'hyperliquid', lighter = exchange === 'rh-lighter';
     exactKeys(body, ['revision', 'accountMode', ...(wallet ? ['address', 'agentKey'] : lighter ? ['address', 'accountIndex', 'apiKeyIndex', 'apiKey'] : ['apiKey', 'apiSecret']), ...(exchange === 'okx' ? ['passphrase'] : [])]); checkSession(session); checkAvailable(exchange, body.revision);
     const mode = modeOf(exchange, body.accountMode);
@@ -462,7 +469,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         : lighter ? { address: body.address.toLowerCase(), accountIndex: index(body.accountIndex, 1, Number.MAX_SAFE_INTEGER), apiKeyIndex: index(body.apiKeyIndex, 4, 254), apiKey: body.apiKey.replace(/^0x/, '').toLowerCase() }
         : { apiKey: body.apiKey, apiSecret: body.apiSecret, ...(exchange === 'okx' ? { passphrase: body.passphrase } : {}) }, client = clients.get(exchange);
       const symbols = connectSymbols(exchange);
-      const result = await call(async signal => { const options = { accountMode: mode, signal, requireIdentity: !!accountWriter }; const verified = await client.verify(credentials, options); const account = await client.account(credentials, { ...options, symbols: [...symbols] }); return { verified, account }; });
+      const result = await call(async callSignal => { const options = { accountMode: mode, signal: callSignal, requireIdentity: !!accountWriter }; const verified = await client.verify(credentials, options); const account = await client.account(credentials, { ...options, symbols: [...symbols] }); return { verified, account }; }, signal);
+      // The page was told the result is unconfirmed; it must find the old connection.
+      if (signal?.aborted) throw new ExecutionError(503, '请求已取消，未保存实盘连接');
       checkSession(session); checkAvailable(exchange, body.revision);
       if (result.verified.identity && result.account.identity && result.verified.identity !== result.account.identity) throw new ExecutionError(409, '交易账户身份不一致');
       if (accountWriter) {
@@ -493,8 +502,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     stmt.prepare('UPDATE execution_accounts SET revision=revision+1,credentials=NULL,identity=NULL,key_label=NULL,verified_at=NULL,snapshot=NULL WHERE exchange=?').run(exchange);
     return state();
   }
-  async function readCall(exchange, symbol, operation) {
-    try { return await call(operation); }
+  async function readCall(exchange, symbol, operation, outer) {
+    try { return await call(operation, outer); }
     catch (error) {
       // Only a known read can acquire this classification. A create/cancel
       // response, including an uncertain send, never becomes a retryable read.
@@ -512,7 +521,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const hard = errors.find(error => !(error instanceof RateLimitedReadError));
     throw hard ?? errors.reduce((latest, error) => error.retryAt > latest.retryAt ? error : latest);
   }
-  async function collectMarkets(legs, validate = () => {}) {
+  async function collectMarkets(legs, validate = () => {}, outer) {
     const markets = new Map(), received = new Map();
     const checked = (leg, value, allowStale = false) => {
       let market;
@@ -521,7 +530,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       validate(leg, market);
     };
     const read = async leg => {
-      const value = await readCall(leg.exchange, leg.symbol, signal => clients.get(leg.exchange).market(leg.symbol, { signal }));
+      const value = await readCall(leg.exchange, leg.symbol, signal => clients.get(leg.exchange).market(leg.symbol, { signal }), outer);
       requireLease();
       const key = `${leg.exchange}:${leg.symbol}`;
       markets.set(key, value); received.set(key, now());
@@ -541,13 +550,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     for (const leg of legs) checked(leg, markets.get(`${leg.exchange}:${leg.symbol}`));
     requireLease(); return { markets, received };
   }
-  async function collect(legs, { validateAccount = () => {}, validateMarket, requireIdentity = false } = {}) {
+  async function collect(legs, { validateAccount = () => {}, validateMarket, requireIdentity = false, signal: outer } = {}) {
     const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), connections = new Map(), positionWaits = [];
     await readGroup(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
       const symbols = [...new Set(legs.filter(leg => leg.exchange === exchange).map(leg => leg.symbol))];
-      const account = await readCall(exchange, symbols.join(' / '), async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter || requireIdentity, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity || requireIdentity && (!verified.identity || !snapshot.identity)) throw new ExecutionError(409, '交易账户身份不一致或无法核验'); return snapshot; });
+      const account = await readCall(exchange, symbols.join(' / '), async signal => { const options = { ...ctx.options, signal, requireIdentity: !!accountWriter || requireIdentity, symbols }; const verified = await ctx.client.verify(ctx.credentials, options); const snapshot = await ctx.client.account(ctx.credentials, options); if (verified.identity && snapshot.identity && verified.identity !== snapshot.identity || requireIdentity && (!verified.identity || !snapshot.identity)) throw new ExecutionError(409, '交易账户身份不一致或无法核验'); return snapshot; }, outer);
       requireLease();
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
@@ -567,7 +576,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       snapshots.set(exchange, account); connections.set(exchange, connection(ctx.row));
       stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(mergeSnapshot(ctx.row.snapshot, account, symbols)), exchange, ctx.row.revision);
     }));
-    const { markets, received } = await collectMarkets(legs, validateMarket);
+    const { markets, received } = await collectMarkets(legs, validateMarket, outer);
     if (positionWaits.length) throw positionWaits[0];
     requireLease(); return { snapshots, markets, connections, received };
   }
@@ -605,7 +614,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     return promise;
   }
 
-  async function preview(body, session) {
+  async function preview(body, session, { signal } = {}) {
     writable(); checkSession(session);
     if (typeof session !== 'string' || !session) throw new ExecutionError(401, '请重新登录');
     let intent, resumeJobId = null;
@@ -621,7 +630,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (lock && lock.job_id !== resumeJobId) throw new ExecutionError(409, '所选合约已有未结束任务');
     }
     let collected;
-    try { collected = await collect(intent.legs); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
+    try { collected = await collect(intent.legs, { signal }); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(400, safeError(error)); }
+    if (signal?.aborted) throw new ExecutionError(503, '请求已取消，未生成预览');
     const plan = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now(), { resume: !!resumeJobId });
     const value = { ...plan, id: randomUUID(), expiresAt: iso(now() + PREVIEW_TTL), resumeJobId, connections: [...collected.connections.values()] };
     writable(); checkSession(session); stmt.prepare('DELETE FROM execution_previews WHERE expires<? AND consumed IS NULL').run(now());

@@ -169,6 +169,12 @@ test('supervisor readies all real workers on authenticated private pipes and clo
     // Only CrossEx declares a dependency; nobody receives its own or a peer's credentials otherwise.
     assert.deepEqual(row.dependencies, row.id === 'crossex' ? ['monitor'] : []);
   }
+  if (process.platform !== 'win32') {
+    // systemd signals every process of the unit; a worker whose runtime lives waits to be stopped in order (C8).
+    for (const row of rows) process.kill(row.pid, 'SIGTERM');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    for (const row of rows) { assert.equal(hasProcess(row.pid), true, row.id); assert.equal((await request(registered(row.id))).status, 200, row.id); }
+  }
   await bounded(runtime.close(), 5000, 'shutdown');
   assertUnavailable();
   for (const row of rows) { assert.equal(hasProcess(row.pid), false); assert.equal(await f.closed(row.id), true); }

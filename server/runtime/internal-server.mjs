@@ -25,14 +25,14 @@ export function createInternalHandler({ service, dataPlane = null, secret, logge
   const routes = [
     ['GET', /^\/internal\/v1\/status$/, () => service.status()],
     ['GET', /^\/internal\/v1\/modules\/([a-z]+)\/transport$/, (_, id) => service.resolveTransport(id)],
-    ['POST', /^\/internal\/v1\/maintenance\/sync$/, body => service.syncMaintenance(body?.modules)],
+    ['POST', /^\/internal\/v1\/maintenance\/sync$/, ({ body }) => service.syncMaintenance(body?.modules)],
     ['POST', /^\/internal\/v1\/maintenance\/prepare-stop$/, () => service.prepareStop()],
     ['POST', /^\/internal\/v1\/modules\/([a-z]+)\/restart$/, (_, id) => service.restartModule(id)],
     ...(dataPlane ? [
       ['GET', /^\/internal\/v1\/overview$/, () => dataPlane.overview()],
-      ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/changed$`), (body, id) => { dataPlane.projectChanged(validateProjectId(id), validateChange(body)); return { accepted: true }; }],
-      ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/asset-sync$`), async (body, id) => ({ status: await dataPlane.coordinateAssetSync(validateProjectId(id), validateRevision(body?.revision)) })],
-      ['POST', /^\/internal\/v1\/api-stats$/, body => { dataPlane.reportApiStats(validateApiStats(body)); return { accepted: true }; }],
+      ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/changed$`), ({ body }, id) => { dataPlane.projectChanged(validateProjectId(id), validateChange(body)); return { accepted: true }; }],
+      ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/asset-sync$`), async ({ body, signal }, id) => ({ status: await dataPlane.coordinateAssetSync(validateProjectId(id), validateRevision(body?.revision), { signal }) })],
+      ['POST', /^\/internal\/v1\/api-stats$/, ({ body }) => { dataPlane.reportApiStats(validateApiStats(body)); return { accepted: true }; }],
     ] : []),
   ];
   function events(res) {
@@ -43,20 +43,24 @@ export function createInternalHandler({ service, dataPlane = null, secret, logge
     write(dataPlane.overviewEvent());
   }
   // The browser request's path, query, method, content type and body, checked again on this side.
-  async function forward(req, res, url) {
+  async function forward(req, res, url, signal) {
     const deadline = req.headers[DEADLINE_HEADER], override = req.headers[METHOD_HEADER];
     if (override !== undefined && (override !== 'HEAD' || req.method !== 'GET')) throw new RuntimeError(400, '转发请求的方法无效');
     const request = validateForward({ method: override ?? req.method, target: url.pathname.slice(FORWARD_PREFIX.length) + url.search, sessionId: req.headers[SESSION_HEADER],
-      contentType: req.headers['content-type'], deadline: deadline === undefined ? undefined : /^\d{1,16}$/.test(deadline) ? Number(deadline) : NaN, body: req });
+      contentType: req.headers['content-type'], deadline: deadline === undefined ? undefined : /^\d{1,16}$/.test(deadline) ? Number(deadline) : NaN, body: req, signal });
     // The client checks the reply against the contract, as it does in process.
     const reply = await dataPlane.handle(request);
     json(res, 200, { status: reply?.status, body: reply?.body });
   }
+  // The API closes the connection when its caller is gone or its deadline passed;
+  // `signal` then stops the call (docs/timeout-budgets.md, C7).
   return async (req, res) => {
+    const controller = new AbortController();
+    res.once('close', () => { if (!res.writableFinished) controller.abort(); });
     try {
       if (!equalSecret(req.headers[RUNTIME_KEY_HEADER], secret)) { req.resume(); json(res, 401, { error: { message: '内部请求未授权' } }); return; }
       const url = new URL(req.url, 'http://runtime.internal');
-      if (dataPlane && url.pathname.startsWith(`${FORWARD_PREFIX}/`)) { await forward(req, res, url); return; }
+      if (dataPlane && url.pathname.startsWith(`${FORWARD_PREFIX}/`)) { await forward(req, res, url, controller.signal); return; }
       if (url.search) throw new RuntimeError(400, '内部接口不接受查询参数');
       if (dataPlane && url.pathname === '/internal/v1/overview/events') {
         if (req.method !== 'GET') throw new RuntimeError(405, '内部接口方法不匹配');
@@ -67,7 +71,7 @@ export function createInternalHandler({ service, dataPlane = null, secret, logge
       const route = matches.find(item => item.method === req.method);
       if (!route) throw new RuntimeError(405, '内部接口方法不匹配');
       const body = req.method === 'POST' ? await readBody(req) : (req.resume(), null);
-      json(res, 200, await route.handle(body, ...route.match.slice(1)));
+      json(res, 200, await route.handle({ body, signal: controller.signal }, ...route.match.slice(1)));
     } catch (error) {
       if (res.headersSent) { res.destroy(); return; }
       if (error instanceof RuntimeError) { json(res, error.status, { error: { message: error.message } }); return; }
@@ -85,7 +89,9 @@ export async function startInternalServer({ service, dataPlane = null, dir, rele
   removeStaleRuntimeFiles(dir, service.instanceId);
   // Node checks requestTimeout and headersTimeout only every connectionsCheckingInterval (30 s by default).
   const server = http.createServer({ connectionsCheckingInterval: 1000 }, createInternalHandler({ service, dataPlane, secret, logger }));
-  // prepare-stop may take up to 70 s; headers must still arrive promptly.
+  // requestTimeout bounds receiving a request only, not handling it: the API
+  // sends small JSON bodies at once, so 75 s is a generous ceiling. Handling
+  // ends with each caller's own budget, prepare-stop's 70 s the longest (C4).
   server.requestTimeout = 75_000; server.headersTimeout = 5000; server.keepAliveTimeout = 1000;
   if (!windows) rmSync(socketPath, { force: true });
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(socketPath, () => { server.off('error', reject); resolve(); }); });
