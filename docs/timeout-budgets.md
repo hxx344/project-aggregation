@@ -19,7 +19,7 @@
   - runtime 单元运行 `server/runtime/main.mjs`，负责模块 worker 与 Python bridge；
   - API 单元（单槽）或 `api@a`/`api@b` 槽单元（双槽）运行 `server/api/main.mjs`；
   - 双槽另有 entry 单元。
-- `server/launcher.mjs` 只用于 `npm start`，在一个进程组里运行 runtime 和 API。
+- `server/launcher.mjs` 用于 `npm start` 和 Linux 上的 `pnpm dev:server`，在一个进程组里运行 runtime 和 API；`dev:server` 由 `server/dev-watch.mjs` 在源码变更时整组重启。
 - 共有四条请求链：
   - **链 1**：浏览器 → API → runtime 转发，业务在 runtime 的 data plane 内处理；只有个别路由（如模块能力读取）再经模块 socket 读取，带自己的时限；
   - **链 2**：Portal（在 API 进程内）→ 模块 socket；
@@ -128,9 +128,10 @@ bridge 把响应体整包回传，不支持流式；应用返回 `text/event-str
 | `api.coordinator-close` | 5 s | 之后 | API | 停止等待状态读取与模块同步 | — |
 | `api.close-report` | 0.5 s | 与上一项并行 | API | 停止等待最后一次统计汇报 | — |
 | `entry.close-grace` | 5 s | entry 开始关闭 | entry | 关闭剩余连接 | — |
-| `launcher.api-stop` | 75 s | launcher 停止 API | launcher（仅 `npm start`） | SIGKILL；之后停止 runtime | — |
-| `launcher.runtime-stop` | 150 s | launcher 停止 runtime | launcher（仅 `npm start`） | SIGKILL（C10） | — |
+| `launcher.api-stop` | 75 s | launcher 停止 API | launcher（`npm start`、Linux 的 `dev:server`） | SIGKILL；之后停止 runtime | — |
+| `launcher.runtime-stop` | 150 s | launcher 停止 runtime | launcher（`npm start`、Linux 的 `dev:server`） | SIGKILL（C10） | — |
 | `launcher.api-ready` | 60 s | launcher 启动 API | launcher | 结束 API 并按退避重启 | — |
+| `dev.watch-stop` | 240 s | 源码变更或收到关闭信号后，watch 向 launcher 发 SIGTERM | `server/dev-watch.mjs`（Linux 的 `dev:server`） | 对 launcher 进程组发 SIGKILL；之后按环境标记结束仍在的进程（worker 各自是进程组组长），再启动下一组 | — |
 | `unit.runtime` | 150 s | systemd 开始停止 | systemd（runtime 单元） | SIGKILL | 见下文 |
 | `unit.api` | 75 s | 同上 | systemd（API 单元，单槽） | SIGKILL | — |
 | `unit.slot` | 75 s | 同上 | systemd（槽单元，双槽） | SIGKILL | — |
@@ -168,6 +169,7 @@ bridge 把响应体整包回传，不支持流式；应用返回 `text/event-str
 | `runtime-unit-covers-data-plane-close` | 成立 | `unit.runtime` ⊇ `runtime.data-plane-close` + 10 s | 余量给内部服务、数据库和锁的关闭（C11） |
 | `data-plane-close-covers-execution-call` | 成立 | `runtime.data-plane-close` ⊇ `execution.call` + 5 s | 关闭时在途的交易所调用能等到自身时限 |
 | `launcher-covers-runtime-stop` | 成立 | `launcher.runtime-stop` ⊇ `runtime.stop-aster` + `runtime.kill-grace` + 10 s | 开发入口与 runtime 单元相同（C10） |
+| `dev-watch-covers-launcher-stop` | 成立 | `dev.watch-stop` ⊇ `launcher.api-stop` + `launcher.runtime-stop` + 10 s | launcher 先停 API 再停 runtime，两段相加 |
 | `launcher-covers-data-plane-close` | 成立 | `launcher.runtime-stop` ⊇ `runtime.data-plane-close` + 10 s | 同上 |
 | `module-start-covers-greeks-startup` | 成立 | `runtime.module-start` ⊇ `greeks.startup` + `python.writer-handshake` + 5 s | — |
 | `module-start-covers-aster-startup` | 成立 | `runtime.module-start` ⊇ `aster.startup` + `python.writer-handshake` + 5 s | — |
