@@ -1,4 +1,6 @@
-import { createHmac, createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { binanceSignedQuery } from './exchange-transport/binance.mjs';
+import { bybitAuthHeaders } from './exchange-transport/bybit.mjs';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
 import { createHyperliquidExecutionClient } from './trading-hyperliquid-execution.mjs';
@@ -385,23 +387,19 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     const headers = {};
     let query = '', body;
     const timestamp = String(exchange === 'binance' ? binanceTime.timestamp() : clock() + timeOffset);
+    // A request the shared signer refuses is a configuration fault that was never sent.
+    const sign = create => { try { return create(); } catch { return fail('configuration'); } };
     if (exchange === 'binance') {
       const params = new URLSearchParams(parameters);
       if (authenticated) {
-        params.set('timestamp', timestamp); params.set('recvWindow', RECV_WINDOW);
-        headers['X-MBX-APIKEY'] = credentials.apiKey;
-        query = params.toString();
-        query += '&signature=' + createHmac('sha256', credentials.apiSecret).update(query).digest('hex');
+        const signed = sign(() => binanceSignedQuery(credentials, params, { timestamp, recvWindow: RECV_WINDOW }));
+        Object.assign(headers, signed.headers);
+        query = signed.query;
       } else query = params.toString();
     } else {
       if (method === 'GET') query = new URLSearchParams(parameters).toString();
       else { body = JSON.stringify(parameters); headers['Content-Type'] = 'application/json'; }
-      if (authenticated) {
-        headers['X-BAPI-API-KEY'] = credentials.apiKey;
-        headers['X-BAPI-TIMESTAMP'] = timestamp;
-        headers['X-BAPI-RECV-WINDOW'] = RECV_WINDOW;
-        headers['X-BAPI-SIGN'] = createHmac('sha256', credentials.apiSecret).update(timestamp + credentials.apiKey + RECV_WINDOW + (body ?? query)).digest('hex');
-      }
+      if (authenticated) Object.assign(headers, sign(() => bybitAuthHeaders(credentials, { timestamp, recvWindow: RECV_WINDOW, payload: body ?? query })));
     }
     // Keep this outside transport error handling and leave no await before fetch.
     // A lost execution lease must retain its original error, including on retry.

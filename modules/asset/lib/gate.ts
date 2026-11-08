@@ -1,4 +1,4 @@
-import { createHash, createHmac } from 'node:crypto';
+import { gateAuthHeaders } from '../../../server/exchange-transport/gate.mjs';
 import type { Balance } from './types';
 
 export type GateCredential = { apiKey: string; apiSecret: string };
@@ -10,7 +10,6 @@ const QUERY = 'currency=USDT';
 const COINGECKO = 'https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=usd&include_last_updated_at=true';
 const COINBASE = 'https://api.coinbase.com/v2/exchange-rates?currency=USDT';
 const QUOTE_FAILED = 'Gate USDT/USD 汇率读取失败或已过期；本次未更新资产数据';
-const EMPTY_PAYLOAD_HASH = createHash('sha512').update('').digest('hex');
 const ACCOUNT_NAMES = {
   cross_margin: '全仓杠杆账户',
   spot: '现货账户',
@@ -225,11 +224,9 @@ export async function gateGet(c: GateCredential, path: string, fetcher: Fetcher 
   try {
     signal = AbortSignal.timeout(12000);
     const timestamp = String(Math.floor(Date.now() / 1000));
-    const payload = ['GET', BALANCE_PATH, QUERY, EMPTY_PAYLOAD_HASH, timestamp].join('\n');
-    const signature = createHmac('sha512', c.apiSecret).update(payload).digest('hex');
     response = await fetcher('https://api.gateio.ws' + BALANCE_PATH + '?' + QUERY, {
       method: 'GET',
-      headers: { Accept: 'application/json', 'Content-Type': 'application/json', KEY: c.apiKey, Timestamp: timestamp, SIGN: signature },
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json', ...gateAuthHeaders(c, { method: 'GET', path: BALANCE_PATH, query: QUERY, timestamp }) },
       redirect: 'manual',
       signal,
     });

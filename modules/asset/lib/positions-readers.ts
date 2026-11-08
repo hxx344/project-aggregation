@@ -1,4 +1,5 @@
-import { createHmac } from 'node:crypto';
+import { binanceSignedQuery } from '../../../server/exchange-transport/binance.mjs';
+import { bybitAuthHeaders } from '../../../server/exchange-transport/bybit.mjs';
 import { okxAuthHeaders } from '../../../server/exchange-transport/okx.mjs';
 import { readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 import { nextAsterNonce, validateAsterWallet } from './exchanges.ts';
@@ -37,12 +38,14 @@ export async function positionsGet(exchange: 'binance' | 'bybit' | 'okx', creden
   if (exchange === 'binance') {
     host = path.startsWith('/sapi/') || path === '/api/v3/account' ? 'https://api.binance.com' : path.startsWith('/papi/') ? 'https://papi.binance.com'
       : path.startsWith('/dapi/') ? 'https://dapi.binance.com' : 'https://fapi.binance.com';
+    let search = query.toString();
     if (!path.endsWith('/exchangeInfo')) {
-      query.set('timestamp', String(Date.now())); query.set('recvWindow', '10000');
-      query.set('signature', createHmac('sha256', c.apiSecret).update(query.toString()).digest('hex'));
-      headers['X-MBX-APIKEY'] = c.apiKey;
+      try {
+        const signed = binanceSignedQuery(c as BinanceCredential, query, { timestamp: String(Date.now()), recvWindow: '10000' });
+        search = signed.query; Object.assign(headers, signed.headers);
+      } catch { throw new Error(POSITIONS_FAILED); }
     }
-    payload = await getJson(host + path + (query.size ? '?' + query : ''), headers, fetcher, signal);
+    payload = await getJson(host + path + (search ? '?' + search : ''), headers, fetcher, signal);
     if (!Array.isArray(payload) && Object.hasOwn(record(payload), 'code')) throw new Error(POSITIONS_FAILED);
     return payload;
   }
@@ -51,9 +54,8 @@ export async function positionsGet(exchange: 'binance' | 'bybit' | 'okx', creden
     if (!Object.hasOwn(BYBIT_HOSTS, region)) throw new Error(POSITIONS_FAILED);
     host = BYBIT_HOSTS[region];
     if (!path.startsWith('/v5/market/')) {
-      const at = String(Date.now());
-      Object.assign(headers, { 'X-BAPI-API-KEY': c.apiKey, 'X-BAPI-TIMESTAMP': at, 'X-BAPI-RECV-WINDOW': '10000',
-        'X-BAPI-SIGN': createHmac('sha256', c.apiSecret).update(at + c.apiKey + '10000' + query).digest('hex') });
+      try { Object.assign(headers, bybitAuthHeaders(c as BybitCredential, { timestamp: String(Date.now()), recvWindow: '10000', payload: query.toString() })); }
+      catch { throw new Error(POSITIONS_FAILED); }
     }
     const data = record(await getJson(host + path + (query.size ? '?' + query : ''), headers, fetcher, signal));
     if (data.retCode !== 0) throw new Error(POSITIONS_FAILED);

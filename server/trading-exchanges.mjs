@@ -1,4 +1,6 @@
-import { createHash, createHmac } from 'node:crypto';
+import { createHash } from 'node:crypto';
+import { binanceSignedQuery } from './exchange-transport/binance.mjs';
+import { bybitAuthHeaders } from './exchange-transport/bybit.mjs';
 import { decimal, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createOkxTradingClient } from './trading-okx-readonly.mjs';
@@ -247,16 +249,12 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     const headers = {};
     let query;
     if (exchange === 'binance') {
-      params.set('timestamp', time); params.set('recvWindow', '5000');
-      query = params.toString();
-      query += '&signature=' + createHmac('sha256', credentials.apiSecret).update(query).digest('hex');
-      headers['X-MBX-APIKEY'] = credentials.apiKey;
+      const signed = binanceSignedQuery(credentials, params, { timestamp: time, recvWindow: '5000' });
+      query = signed.query;
+      Object.assign(headers, signed.headers);
     } else {
       query = params.toString();
-      headers['X-BAPI-API-KEY'] = credentials.apiKey;
-      headers['X-BAPI-TIMESTAMP'] = time;
-      headers['X-BAPI-RECV-WINDOW'] = '5000';
-      headers['X-BAPI-SIGN'] = createHmac('sha256', credentials.apiSecret).update(time + credentials.apiKey + '5000' + query).digest('hex');
+      Object.assign(headers, bybitAuthHeaders(credentials, { timestamp: time, recvWindow: '5000', payload: query }));
     }
     const controller = new AbortController();
     let timedOut = false;
