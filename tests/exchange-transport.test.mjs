@@ -133,3 +133,25 @@ test('bounded JSON reading refuses oversized, unreadable and cancelled bodies', 
   await assert.rejects(readJsonResponse(stream(['{}']), { maxBytes: 64, signal: controller.signal }), code('aborted'));
   await assert.rejects(readJsonResponse(stream(['{}']), { maxBytes: 0 }), TypeError);
 });
+
+test('bounded JSON reading applies a reviver and passes its refusal through', async () => {
+  const keepSource = (key, value, context) => key === 'id' ? context.source : value;
+  assert.deepEqual(await readJsonResponse(stream(['{"id":9007199254740993}']), { maxBytes: 64, reviver: keepSource }), { id: '9007199254740993' });
+  const refusal = new RangeError('id refused');
+  await assert.rejects(readJsonResponse(stream(['{"id":1}']), { maxBytes: 64, reviver: () => { throw refusal; } }), (error) => error === refusal);
+  await assert.rejects(readJsonResponse(stream(['{}']), { maxBytes: 64, reviver: 'id' }), TypeError);
+  await assert.rejects(readJsonResponse(stream(['not json']), { maxBytes: 64, reviver: keepSource }), code('invalid_data'));
+  const holders = [];
+  await readJsonResponse(stream(['{"a":{"b":1}}']), { maxBytes: 64, reviver(key, value) { if (key === 'b') holders.push(this); return value; } });
+  assert.deepEqual(holders, [{ b: 1 }], 'the reviver sees the holding object as this');
+});
+
+test('bounded JSON reading cancels a body that stalls when its signal aborts', async () => {
+  let cancelled = false;
+  const stalled = new Response(new ReadableStream({ pull: () => new Promise(() => {}), cancel() { cancelled = true; } }));
+  const controller = new AbortController();
+  const reading = readJsonResponse(stalled, { maxBytes: 64, signal: controller.signal });
+  setTimeout(() => controller.abort(), 10);
+  await assert.rejects(reading, code('aborted'));
+  assert.equal(cancelled, true, 'the pending read is cancelled');
+});

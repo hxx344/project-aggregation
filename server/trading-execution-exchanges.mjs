@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { binanceSignedQuery } from './exchange-transport/binance.mjs';
 import { bybitAuthHeaders } from './exchange-transport/bybit.mjs';
+import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
 import { decimal, addDecimals, compareDecimals, negateDecimal } from './trading-decimal.mjs';
 import { createOkxExecutionClient } from './trading-okx-execution.mjs';
 import { createHyperliquidExecutionClient } from './trading-hyperliquid-execution.mjs';
@@ -213,36 +214,22 @@ function volumes(quantity, filledQuantity) {
   return { quantity, filledQuantity };
 }
 function array(value, limit = MAX_ROWS) { if (!Array.isArray(value) || value.length > limit) fail(); return value; }
-function parseJson(text) {
-  return JSON.parse(text, (key, value, context) => {
-    if (!ID_KEYS.has(key) || typeof value !== 'number') return value;
-    if (context?.source && /^\d{1,30}$/.test(context.source)) return context.source;
-    if (Number.isSafeInteger(value) && value >= 0) return String(value);
-    fail();
-  });
+// Order and transaction ids stay as their original int64 text (Node >= 24).
+function idText(key, value, context) {
+  if (!ID_KEYS.has(key) || typeof value !== 'number') return value;
+  if (context?.source && /^\d{1,30}$/.test(context.source)) return context.source;
+  if (Number.isSafeInteger(value) && value >= 0) return String(value);
+  return fail();
 }
 
+// The shared bounded reader (docs/evolution-plan.md E2). Its codes keep their
+// meaning here; one it may add later reads as invalid_data, which keeps an
+// unreadable mutation response uncertain.
 async function readJson(response, signal) {
-  const length = response.headers?.get('content-length');
-  if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES)) fail('response_limit');
-  if (!response.body?.getReader) fail();
-  const reader = response.body.getReader(), chunks = [];
-  let size = 0, done = false;
-  try {
-    while (true) {
-      checkAbort(signal);
-      const chunk = await reader.read();
-      checkAbort(signal);
-      if (chunk.done) { done = true; break; }
-      size += chunk.value.byteLength;
-      if (size > MAX_BODY_BYTES) fail('response_limit');
-      chunks.push(Buffer.from(chunk.value));
-    }
-    try { return parseJson(Buffer.concat(chunks, size).toString('utf8')); }
-    catch (error) { if (error instanceof ExecutionExchangeError) throw error; fail(); }
-  } finally {
-    if (!done) void reader.cancel().catch(() => {});
-    reader.releaseLock();
+  try { return await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal, reviver: idText }); }
+  catch (error) {
+    if (error instanceof ExchangeResponseError) fail(['response_limit', 'aborted'].includes(error.code) ? error.code : 'invalid_data');
+    throw error;
   }
 }
 

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { binanceSignedQuery } from './exchange-transport/binance.mjs';
 import { bybitAuthHeaders } from './exchange-transport/bybit.mjs';
+import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
 import { decimal, negateDecimal, compareDecimals } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createOkxTradingClient } from './trading-okx-readonly.mjs';
@@ -105,36 +106,24 @@ function bybitFundingAmount(value) {
 
 // Node >=24 provides the original numeric token to JSON.parse revivers. Keeping
 // tranId as text prevents int64 transaction identifiers from being rounded.
-function parseResponse(text) {
-  return JSON.parse(text, (key, value, context) => {
-    if (key !== 'tranId' || typeof value !== 'number') return value;
-    if (context?.source && /^\d{1,30}$/.test(context.source)) return context.source;
-    if (Number.isSafeInteger(value) && value >= 0) return String(value);
-    throw invalidData();
-  });
+function tranIdText(key, value, context) {
+  if (key !== 'tranId' || typeof value !== 'number') return value;
+  if (context?.source && /^\d{1,30}$/.test(context.source)) return context.source;
+  if (Number.isSafeInteger(value) && value >= 0) return String(value);
+  throw invalidData();
 }
 
+// The shared bounded reader (docs/evolution-plan.md E2) with this client's
+// codes: a missing body is invalid data, while a body that is not JSON stays a
+// transport failure (a SyntaxError reaches the request's generic catch).
 async function limitedJson(response, signal) {
-  const length = response.headers?.get('content-length');
-  if (length && (!/^\d+$/.test(length) || Number(length) > MAX_BODY_BYTES)) throw new TradingExchangeError('交易所响应超过大小限制', 'response_limit');
-  if (!response.body?.getReader) throw invalidData();
-  const reader = response.body.getReader();
-  const chunks = [];
-  let size = 0, finished = false;
-  try {
-    while (true) {
-      checkAbort(signal);
-      const { done, value } = await reader.read();
-      checkAbort(signal);
-      if (done) { finished = true; break; }
-      size += value.byteLength;
-      if (size > MAX_BODY_BYTES) throw new TradingExchangeError('交易所响应超过大小限制', 'response_limit');
-      chunks.push(Buffer.from(value));
-    }
-    return parseResponse(Buffer.concat(chunks, size).toString('utf8'));
-  } finally {
-    if (!finished) await reader.cancel().catch(() => {});
-    reader.releaseLock();
+  try { return await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES, signal, reviver: tranIdText }); }
+  catch (error) {
+    if (!(error instanceof ExchangeResponseError)) throw error;
+    if (error.code === 'response_limit') throw new TradingExchangeError('交易所响应超过大小限制', 'response_limit');
+    if (error.code === 'aborted') throw abortError();
+    if (!response.body?.getReader) throw invalidData();
+    throw new SyntaxError('Exchange response is not JSON');
   }
 }
 
