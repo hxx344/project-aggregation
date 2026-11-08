@@ -1,4 +1,6 @@
 import { createHmac } from 'node:crypto';
+import { okxAuthHeaders } from '../../../server/exchange-transport/okx.mjs';
+import { readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 import { nextAsterNonce, validateAsterWallet } from './exchanges.ts';
 import type { AsterCredential, BinanceCredential, BybitCredential } from './exchanges.ts';
 import type { OkxCredential } from './okx.ts';
@@ -19,16 +21,10 @@ const ENDPOINTS = {
 
 async function getJson(url: string, headers: Record<string, string>, fetcher: Fetcher, signal?: AbortSignal): Promise<unknown> {
   try {
-    const response = await fetcher(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store',
-      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) });
-    if (!response.ok || response.redirected || Number(response.headers.get('content-length')) > 2_000_000) throw new Error();
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error();
-    const chunks: Uint8Array[] = []; let bytes = 0;
-    try {
-      for (;;) { const { done, value } = await reader.read(); if (done) break; bytes += value.byteLength; if (bytes > 2_000_000) { await reader.cancel(); throw new Error(); } chunks.push(value); }
-    } finally { reader.releaseLock(); }
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const limit = signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000);
+    const response = await fetcher(url, { method: 'GET', headers, redirect: 'manual', cache: 'no-store', signal: limit });
+    if (!response.ok || response.redirected) throw new Error();
+    return await readJsonResponse(response, { maxBytes: 2_000_000, signal: limit });
   } catch { throw new Error(POSITIONS_FAILED); }
 }
 
@@ -66,9 +62,8 @@ export async function positionsGet(exchange: 'binance' | 'bybit' | 'okx', creden
   host = 'https://openapi.okx.com';
   const requestPath = path + (query.size ? '?' + query : '');
   if (!path.startsWith('/api/v5/public/')) {
-    const at = new Date().toISOString();
-    Object.assign(headers, { 'OK-ACCESS-KEY': c.apiKey, 'OK-ACCESS-TIMESTAMP': at, 'OK-ACCESS-PASSPHRASE': (c as OkxCredential).passphrase,
-      'OK-ACCESS-SIGN': createHmac('sha256', c.apiSecret).update(at + 'GET' + requestPath).digest('base64') });
+    try { Object.assign(headers, okxAuthHeaders(c as OkxCredential, { timestamp: new Date().toISOString(), method: 'GET', requestPath })); }
+    catch { throw new Error(POSITIONS_FAILED); }
   }
   const data = record(await getJson(host + requestPath, headers, fetcher, signal));
   if (data.code !== '0') throw new Error(POSITIONS_FAILED);

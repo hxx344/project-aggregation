@@ -1634,6 +1634,8 @@ input_keys() {
   local -A module_dependency_digests=()
   local -a navigation_inputs=(server/hub-navigation.mjs server/hub-navigation.d.mts server/asset-identity.mjs server/asset-identity.d.mts)
   local -a module_shared_inputs=("${navigation_inputs[@]}" server/capital-metrics.mjs server/capital-metrics.d.mts)
+  # Asset reads exchanges through the shared transport (docs/evolution-plan.md E2).
+  local -a asset_shared_inputs=(server/exchange-transport)
   local -a module_inputs
   legacy_module_build_keys=()
   previous_module_build_keys=()
@@ -1647,7 +1649,7 @@ input_keys() {
   runtime_tree=$(tree_hash server tools/entropy-lighter-lab tools/aero-roles package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
   runtime_listing=$(git --git-dir="$APP_DIR/repository.git" ls-tree -r "$commit" -- server tools/entropy-lighter-lab tools/aero-roles package.json deploy/migrate-modules.py deploy/diagnose-aster-margin.py) || return
   runtime_component_tree=$(printf '%s\n' "$runtime_listing" | awk -F '\t' '$2 !~ /^server\/api\//' | hash)
-  embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py deploy/diagnose-aster-margin.py .env .env.local .env.production .env.production.local) || return
+  embedded_tree=$(tree_hash modules "${module_shared_inputs[@]}" "${asset_shared_inputs[@]}" scripts/modules.mjs deploy/build-artifact-cache.py deploy/package-release.py deploy/pnpm-runtime-lock.mjs deploy/migrate-modules.py deploy/diagnose-aster-margin.py .env .env.local .env.production .env.production.local) || return
   runtime_dependency_tree=$(tree_hash deploy/package-release.py deploy/pnpm-runtime-lock.mjs) || return
   # Recipes describe preparation semantics, independently of installer comments/docs.
   dependency_key=$(printf '%s\n%s\n%s\n%s' "$dependency_recipe" "$dependency_tree" "$runtime_key" "$PNPM_VERSION" | hash)
@@ -1680,6 +1682,8 @@ input_keys() {
         modules/aster/.env modules/aster/.env.local modules/aster/.env.production modules/aster/.env.production.local)
     elif [[ "$module" == monitor || "$module" == crossex ]]; then
       module_inputs=("modules/$module" "${module_shared_inputs[@]}")
+    elif [[ "$module" == asset ]]; then
+      module_inputs=(modules/asset "${asset_shared_inputs[@]}")
     else
       module_inputs=("modules/$module")
     fi

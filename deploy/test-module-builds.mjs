@@ -91,3 +91,18 @@ test('shared navigation, asset identities and capital metrics invalidate only th
     assert.equal(f.calls().length, before + 2, 'unchanged inputs reuse the successful build');
   }
 });
+
+test('the shared exchange transport invalidates only the Asset build, including a new file', t => {
+  const f = fixture(t);
+  assert.equal(f.run().status, 0);
+  mkdirSync(path.join(f.root, 'server', 'exchange-transport'), { recursive: true });
+  for (const filename of ['okx.mjs', 'okx.d.mts', 'added.mjs']) {
+    const before = f.calls().length;
+    writeFileSync(path.join(f.root, 'server', 'exchange-transport', filename), 'changed shared input');
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls().slice(before), ['asset']);
+    assert.equal(f.run().status, 0);
+    assert.equal(f.calls().length, before + 1, 'unchanged inputs reuse the successful build');
+  }
+});
