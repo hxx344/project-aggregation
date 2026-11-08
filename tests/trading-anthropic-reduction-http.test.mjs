@@ -129,7 +129,7 @@ test('HTTP rejects invalid parameters and injected account risk without altering
     const response = await f.save(patch);
     assert.equal(response.status, 400, JSON.stringify(patch));
   }
-  for (const extra of [{ snapshot: { positions: [] } }, { accounts: { binance: { identity: 'injected', revision: 0 } } }, { live: { met: true } }]) {
+  for (const extra of [{ snapshot: { positions: [] } }, { accounts: { binance: { identity: 'injected', revision: 0 } } }, { live: { met: true } }, { previousJobId: 'injected' }]) {
     assert.equal((await f.save({}, extra)).status, 400);
   }
   assert.equal((await f.request(`${ROUTE}?risk=0`)).status, 400);
@@ -162,7 +162,7 @@ test('HTTP saves and disables use optimistic revisions with verified execution c
   assert.equal(disabled.data.revision, enabled.data.revision + 1); assert.equal(f.creates.length, 0);
 });
 
-test('the real app timer consumes HTTP configuration and completes one live reduction task', async t => {
+test('the real app timer repeats reduction from remaining positions and honors HTTP disable', async t => {
   const f = await fixture(t, { timers: true }); await f.login(); await f.connect();
   const enabled = await f.save({ enabled: true }, { confirmLive: true }); assert.equal(enabled.status, 200);
   const triggered = await f.pulse();
@@ -173,7 +173,14 @@ test('the real app timer consumes HTTP configuration and completes one live redu
   await f.app.execution.tick(); assert.equal(f.creates.length, 2);
   assert.deepEqual(f.creates.map(row => [row.exchange, row.spec.quantity]), [['binance', '5'], ['okx', '15']]);
   f.fill(); await f.app.execution.tick(); const completed = await f.pulse();
-  assert.equal(completed.data.state.phase, 'completed'); assert.equal(completed.data.config.enabled, false);
+  assert.equal(completed.data.state.phase, 'armed'); assert.equal(completed.data.config.enabled, true);
   assert.equal(completed.data.job.status, 'completed'); assert.equal(completed.data.job.id, triggered.data.job.id);
-  await f.pulse(); assert.equal(f.creates.length, 2); assert.equal(f.readOnlyCalls.length, 0);
+  const next = await f.pulse(); await f.app.execution.tick();
+  assert.equal(next.data.state.phase, 'reducing'); assert.notEqual(next.data.job.id, triggered.data.job.id);
+  assert.deepEqual(f.creates.slice(2).map(row => [row.exchange, row.spec.quantity]), [['binance', '2.5'], ['okx', '7.5']]);
+  const disabled = await f.request(`${ROUTE}/disable`, { method: 'POST', body: { revision: next.data.revision } });
+  assert.equal(disabled.status, 200); assert.equal(disabled.data.config.enabled, false);
+  f.fill(); await f.app.execution.tick(); await f.pulse(); await f.pulse();
+  assert.equal(f.rows('SELECT * FROM execution_jobs').length, 2);
+  assert.equal(f.creates.length, 4); assert.equal(f.readOnlyCalls.length, 0);
 });

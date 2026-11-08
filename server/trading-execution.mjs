@@ -362,6 +362,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     try { return await promise; } finally { clearTimeout(timer); controllers.delete(controller); pending.delete(promise); }
   }
   const totalFilled = (all, legId, phase, batch) => addDecimals(all.filter(order => order.legId === legId && (phase === undefined || order.phase === phase) && (batch === undefined || order.batch === batch)).map(order => order.filledQuantity));
+  function reductionPositionBaselines(job) {
+    const baseline = (leg, phase) => ({ quantity: leg.currentQuantity, positionMode: leg.positionMode, phase });
+    const positions = Object.fromEntries(job.totals.map(leg => [leg.id, baseline(leg, 0)]));
+    Object.assign(positions, job.riskReduction?.positionBaselines);
+    for (const leg of job.plan.legs) positions[leg.id] = baseline(leg, job.phase);
+    return positions;
+  }
   const unsettled = order => !order.settled;
   function publicJob(job) {
     const all = orders(job.id);
@@ -614,7 +621,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         job = jobFor(plan.resumeJobId);
         if (!publicJob(job).canResume) throw new ExecutionError(409, '任务状态已改变，请重新预览');
         for (const leg of plan.legs) if (compareDecimals(publicJob(job).legs.find(row => row.id === leg.id).remainingQuantity, leg.quantity) !== 0) throw new ExecutionError(409, '已成交数量改变，请重新预览');
+        // Preserve every leg's last confirmed position baseline even when a
+        // fully filled leg drops out of a later manual remaining-quantity plan.
+        const reductionPositions = job.riskReduction ? reductionPositionBaselines(job) : null;
         job.plan = plan; job.phase += 1;
+        if (reductionPositions) {
+          for (const leg of plan.legs) reductionPositions[leg.id] = { quantity: leg.currentQuantity, positionMode: leg.positionMode, phase: job.phase };
+          job.riskReduction.positionBaselines = reductionPositions;
+        }
         // A person confirmed the remaining quantity: the rule's threshold no longer holds it back.
         if (job.auto?.guard) job.auto = { ...job.auto, guard: null };
       } else job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [] };
@@ -679,7 +693,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   }
   // Risk reductions have no spread guard. The same fresh, authenticated
   // snapshot supplies both the liquidation trigger and the native quantities.
-  async function startRiskReduction(body, { ruleId, accounts, check, commit }) {
+  async function startRiskReduction(body, { ruleId, accounts, previousJobId = null, check, commit }) {
     writable();
     const config = normalizeReductionConfig(body);
     if (!config.enabled || ruleId !== 'anthropic-reduction' || typeof check !== 'function' || typeof commit !== 'function') throw new ExecutionError(500, '自动减仓参数无效');
@@ -689,11 +703,42 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       return { ...leg, accountRevision: binding.revision };
     });
     if (lockOwner(legs)) throw new WaitError(409, '所选合约已有未结束任务，等待其结束后重新核验');
+    // A completed order does not prove that the account snapshot reflects its
+    // fills. Reconcile once between rounds before sizing from the remainder.
+    let previousLegs = null;
+    if (previousJobId) {
+      const previous = jobFor(previousJobId), all = orders(previousJobId);
+      if (previous.status !== 'completed' || previous.riskReduction?.ruleId !== ruleId || all.some(order => !order.settled || order.unknown)) throw new ExecutionError(409, '上一轮减仓尚未完整确认，不能开始下一轮');
+      const baselines = reductionPositionBaselines(previous);
+      previousLegs = legs.map(leg => {
+        const prior = previous.totals.find(item => item.exchange === leg.exchange && item.symbol === leg.symbol && item.side === leg.side);
+        const binding = previous.riskReduction.accounts[leg.exchange];
+        // A new credential revision may re-verify the same account. The old
+        // fills are evidence only; every live read/send uses the new binding.
+        if (!prior || binding?.identity !== accounts[leg.exchange].identity) throw new ExecutionError(409, '上一轮减仓合约或账户身份不一致，请恢复原账户完成剩余持仓核对');
+        const baseline = baselines[prior.id], legOrders = all.filter(order => order.legId === prior.id);
+        const expected = subtract(baseline.quantity, totalFilled(legOrders.filter(order => order.phase >= baseline.phase), prior.id));
+        if (compareDecimals(totalFilled(legOrders, prior.id), prior.quantity) !== 0 || compareDecimals(expected, '0') < 0) throw new ExecutionError(409, '上一轮减仓成交数量无法核对，请核对');
+        const last = legOrders.filter(order => compareDecimals(order.filledQuantity, '0') > 0).sort((a, b) => b.phase - a.phase || b.batch - a.batch)[0];
+        return { leg: { ...prior, positionMode: baseline.positionMode }, expected,
+          beforeLast: addDecimals([expected, totalFilled(legOrders, prior.id, last.phase, last.batch)]) };
+      });
+    }
     let collected;
     try { collected = await collect(legs, { requireIdentity: true, validateAccount(leg, account) {
       if (account.identity !== accounts[leg.exchange].identity) throw new ExecutionError(409, '自动减仓账户身份已变化');
+      const previous = previousLegs?.find(item => item.leg.exchange === leg.exchange && item.leg.symbol === leg.symbol && item.leg.side === leg.side);
+      if (previous) {
+        const current = checkPosition(account, previous.leg, 'close', '0');
+        if (compareDecimals(current, previous.expected) !== 0) {
+          if (compareDecimals(current, previous.beforeLast) === 0) throw new ExecutionError(502, `${leg.exchange} ${leg.symbol} 持仓尚未反映上一轮最后一批成交，等待核对后再触发`);
+          throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 持仓与上一轮减仓后的预期不一致，请核对`);
+        }
+      }
     } }); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(502, safeError(error)); }
     check();
+    if (previousLegs?.every(item => compareDecimals(item.expected, '0') === 0)) return { jobId: null, live: null, exhausted: true };
+    if (previousLegs?.some(item => compareDecimals(item.expected, '0') === 0)) throw new ExecutionError(409, '其中一条腿已无可减仓持仓，请核对双边剩余仓位');
     const reading = readReductionRisk(config, collected.snapshots, now());
     // Quantity and batch feasibility changes with the live position. Check it
     // on every monitoring round, before the liquidation trigger is reached.
@@ -739,6 +784,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     return { jobId, live: reading };
   }
   const jobView = id => publicJob(jobFor(id));
+  const canRepeatRiskReduction = id => { const job = jobFor(id); return job.status === 'completed' && job.riskReduction?.ruleId === 'anthropic-reduction' && job.phase === 0; };
   const jobAccounts = id => (jobFor(id).plan.connections ?? []).map(row => ({ exchange: row.exchange, revision: row.revision, identity: row.identity ?? null }));
   const connectionOf = exchange => { const row = accountRow(exchange); return { revision: row.revision, connected: !!row.credentials }; };
   // Narrow read-only bridge: credentials stay in the execution service and
@@ -1585,7 +1631,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       for (const controller of historyControllers) controller.abort();

@@ -4,7 +4,7 @@ import { immediate } from './control/schema.mjs';
 
 const FINAL = new Set(['completed', 'stopped']);
 const iso = time => new Date(time).toISOString();
-const initialState = () => ({ phase: 'disabled', jobId: null, reason: null, triggeredAt: null, events: [], failures: 0, retryAt: null });
+const initialState = () => ({ phase: 'disabled', jobId: null, lastJobId: null, previousJobId: null, reason: null, triggeredAt: null, events: [], failures: 0, retryAt: null });
 class ChangedError extends ExecutionError {}
 
 /** One explicitly chosen ANT pair. Reads never trigger work; only the leader's bounded tick can do so. */
@@ -45,7 +45,7 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
   }
   function state() {
     const value = record();
-    return { generatedAt: iso(now()), revision: value.revision, config: value.config, state: value.state, live, connections: connections(), maintenance: !!readMaintenance(), job: associated(value) };
+    return { generatedAt: iso(now()), revision: value.revision, config: value.config, state: value.state, live, connections: connections(), maintenance: !!readMaintenance(), job: associated(value) ?? (value.state.lastJobId ? execution.jobView(value.state.lastJobId) : null) };
   }
   function save(body) {
     exactKeys(body, ['revision', 'config', 'confirmLive']);
@@ -55,11 +55,16 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
       const value = record(); checkRevision(value, body.revision);
       const job = associated(value);
       if (job && !FINAL.has(job.status)) throw new ExecutionError(409, '关联减仓任务尚未结束，请先在执行进度核对并停止后再修改');
+      // Saving parameters or disabling must not discard unobserved fills,
+      // including a job that completed just before this scheduler settled it.
+      const previousJobId = value.state.previousJobId ?? (job?.status === 'completed' ? job.id : null);
+      if (previousJobId && JSON.stringify(config.legs) !== JSON.stringify(value.config.legs)) throw new ExecutionError(409, '上一轮剩余持仓尚未核对，暂不能更换减仓合约或方向');
       if (config.enabled && readMaintenance()) throw new ExecutionError(409, '系统正在维护，暂不能启用自动减仓');
       if (config.enabled && execution.lockOwner(config.legs)) throw new ExecutionError(409, '所选合约已有未结束任务，请先核对');
       const next = { revision: value.revision, config, accounts: config.enabled ? accountBindings(config) : null, state: { ...initialState(), events: value.state.events, phase: config.enabled ? 'armed' : 'disabled',
+        previousJobId, lastJobId: previousJobId ?? value.state.lastJobId ?? null, triggeredAt: previousJobId ? value.state.triggeredAt : null,
         reason: config.enabled ? '等待核验当前持仓、减仓数量和分批限制；核验通过后才可触发' : null } };
-      event(next, config.enabled ? `已绑定当前实盘账户；${next.state.reason}；本轮完成后自动停用` : '设置已保存，自动减仓未启用'); write(next);
+      event(next, config.enabled ? `已绑定当前实盘账户；${next.state.reason}；每轮完成后继续监测，达到阈值时按剩余持仓再次减仓` : '设置已保存，自动减仓未启用'); write(next);
     });
     live = null; return state();
   }
@@ -76,10 +81,17 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
   function settle(value) {
     const job = associated(value);
     if (!job || ['queued', 'running', 'stopping'].includes(job.status)) return false;
-    const phase = job.status === 'completed' ? 'completed' : 'review';
-    if (value.state.phase === phase && !value.config.enabled) return true;
+    const repeatable = job.status === 'completed' && execution.canRepeatRiskReduction(job.id);
+    if (repeatable && value.config.enabled) {
+      value.state = { ...value.state, phase: 'armed', jobId: null, lastJobId: job.id, previousJobId: job.id, reason: null, failures: 0, retryAt: null };
+      event(value, '本轮分批减仓已完成，继续监测；核对剩余持仓后，达到阈值将开始下一轮');
+      write(value); live = null; return true;
+    }
+    const phase = repeatable ? 'completed' : 'review';
+    if (value.state.phase === phase && !value.config.enabled && (job.status !== 'completed' || value.state.previousJobId === job.id)) return true;
     value.config.enabled = false; value.state.phase = phase;
-    value.state.reason = job.status === 'completed' ? '本轮分批减仓已完成，规则已停用；如需下一轮请重新启用' : `减仓任务${job.reason ? '：' + job.reason : '需人工核对'}；规则已停用，请在执行进度处理原任务`;
+    if (job.status === 'completed') value.state.previousJobId = job.id;
+    value.state.reason = job.status === 'completed' ? (repeatable ? '本轮分批减仓已完成，新触发已关闭' : '本轮经人工继续后完成，规则已停用；如需持续监测请核对后重新启用') : `减仓任务${job.reason ? '：' + job.reason : '需人工核对'}；规则已停用，请在执行进度处理原任务`;
     event(value, value.state.reason); write(value); return true;
   }
   async function run() {
@@ -100,10 +112,10 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
     };
     try {
       check();
-      const result = await admit(() => execution.startRiskReduction(value.config, { ruleId: 'anthropic-reduction', accounts: value.accounts, check, commit: (jobId, reading) => {
+      const result = await admit(() => execution.startRiskReduction(value.config, { ruleId: 'anthropic-reduction', accounts: value.accounts, previousJobId: value.state.previousJobId, check, commit: (jobId, reading) => {
         check();
         const latest = record();
-        latest.state = { ...latest.state, phase: 'reducing', jobId, triggeredAt: iso(now()), reason: null, failures: 0, retryAt: null };
+        latest.state = { ...latest.state, phase: 'reducing', jobId, previousJobId: null, triggeredAt: iso(now()), reason: null, failures: 0, retryAt: null };
         event(latest, `任一腿距强平 ≤ ${latest.config.thresholdPercent}%，触发双边总计 ${latest.config.reducePercent}% 分批市价减仓`);
         write(latest); live = reading;
       } }));
@@ -111,7 +123,13 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
         immediate(db, () => {
           check(); live = result.live;
           const latest = record();
-          if (latest.state.reason || latest.state.failures) { latest.state.reason = null; latest.state.failures = 0; latest.state.retryAt = null; write(latest); }
+          if (result.exhausted) {
+            latest.config.enabled = false; latest.state.phase = 'completed'; latest.state.previousJobId = null;
+            latest.state.reason = '两条腿持仓已全部减完，自动减仓已结束'; latest.state.failures = 0; latest.state.retryAt = null;
+            event(latest, latest.state.reason); write(latest);
+          } else if (latest.state.previousJobId || latest.state.reason || latest.state.failures) {
+            latest.state.previousJobId = null; latest.state.reason = null; latest.state.failures = 0; latest.state.retryAt = null; write(latest);
+          }
         });
       }
     } catch (error) {

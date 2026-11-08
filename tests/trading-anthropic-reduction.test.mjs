@@ -142,7 +142,7 @@ test('missing, stale or future risk on either leg never creates a task or sends 
   });
 });
 
-test('three two-sided batches conserve separately rounded native totals and finish disabled even after risk recovers', async t => {
+test('three two-sided batches resume monitoring and repeat from remaining positions when risk returns', async t => {
   const f = await fixture(t); f.enable(); await f.reduction.tick();
   assert.deepEqual(f.jobs[0].legs.map(leg => [leg.exchange, leg.quantity]), [['binance', '3.3'], ['okx', '10']]);
   assert.equal(f.state.state.phase, 'reducing'); assert.equal(f.jobs[0].batchCount, 3);
@@ -158,14 +158,271 @@ test('three two-sided batches conserve separately rounded native totals and fini
   f.advance(1); await f.execution.tick(); assert.equal(f.creates.length, 4);
   await f.finishBatch(); f.advance(1000); await f.execution.tick(); assert.equal(f.creates.length, 6);
   await f.finishBatch(); await f.reduction.tick();
-  assert.equal(f.jobs[0].status, 'completed'); assert.equal(f.state.state.phase, 'completed');
-  assert.equal(f.state.config.enabled, false); assert.deepEqual(f.locks(), []);
+  assert.equal(f.jobs[0].status, 'completed'); assert.equal(f.state.state.phase, 'armed');
+  assert.equal(f.state.config.enabled, true); assert.deepEqual(f.locks(), []);
+  const firstId = f.jobs[0].id;
+  assert.equal(f.state.state.jobId, null); assert.equal(f.state.job.id, firstId);
   assert.deepEqual(f.creates.filter(row => row.exchange === 'binance').map(row => row.spec.quantity), ['1.1', '1.1', '1.1']);
   assert.deepEqual(f.creates.filter(row => row.exchange === 'okx').map(row => row.spec.quantity), ['4', '3', '3']);
   assert.ok(f.creates.every(row => row.spec.reduceOnly && row.spec.orderType === 'market'));
   assert.deepEqual([f.accounts.binance.positions[0].quantity, f.accounts.okx.positions[0].quantity], ['6.8', '21']);
-  f.accounts.binance.positions[0].risk.liquidationPrice = '99';
   await f.reduction.tick(); await f.execution.tick(); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 6);
+  assert.equal(f.state.state.previousJobId, null, 'fresh post-fill positions complete the one-time reconciliation');
+  f.accounts.binance.positions[0].risk.liquidationPrice = '99';
+  await Promise.all([f.reduction.tick(), f.reduction.tick(), f.reduction.tick()]);
+  assert.equal(f.jobs.length, 2); assert.notEqual(f.state.job.id, firstId);
+  assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.2', '6']);
+  await f.execution.tick(); assert.equal(f.creates.length, 8);
+});
+
+test('continued risk starts exactly one next round from the remaining positions after restart', async t => {
+  const f = await fixture(t, { guarded: true }); f.enable({ batchCount: 1 });
+  await f.reduction.tick(); await f.execution.tick(); await f.finishBatch();
+  const firstId = f.state.job.id;
+  await f.restart();
+  await Promise.all([f.reduction.tick(), f.reduction.tick()]);
+  assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true);
+  assert.equal(f.state.job.id, firstId); assert.equal(f.state.state.previousJobId, firstId);
+  await f.restart(); await Promise.all([f.reduction.tick(), f.reduction.tick()]);
+  assert.equal(f.jobs.length, 2); assert.equal(f.state.state.phase, 'reducing');
+  assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.2', '6']);
+  assert.equal(f.state.state.previousJobId, null);
+  await f.execution.tick(); assert.equal(f.creates.length, 4);
+  await f.finishBatch(); await f.reduction.tick();
+  assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true);
+});
+
+test('manual disable before or after completion never rearms on ticks or restart', async t => {
+  for (const afterSettlement of [false, true]) await t.test(afterSettlement ? 'monitoring' : 'running', async t => {
+    const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+    if (afterSettlement) { await f.finishBatch(); await f.reduction.tick(); }
+    f.reduction.disable({ revision: f.state.revision });
+    if (!afterSettlement) { await f.finishBatch(); await f.reduction.tick(); }
+    await f.restart(); await f.reduction.tick(); await f.reduction.tick(); await f.execution.tick();
+    assert.equal(f.state.config.enabled, false); assert.equal(f.state.job.status, 'completed');
+    assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+  });
+});
+
+test('saving parameters or enablement preserves unresolved post-fill positions, including before settlement', async t => {
+  for (const action of ['parameters', 'disable-save-enable', 'before-settlement', 'disabled-completion', 'same-account-reconnect']) await t.test(action, async t => {
+    const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+    if (action === 'disabled-completion') f.reduction.disable({ revision: f.state.revision });
+    await f.finishBatch(); const firstId = f.state.job.id;
+    if (action !== 'before-settlement') await f.reduction.tick();
+    f.accounts.binance.positions[0].quantity = '10.1';
+    if (action === 'disable-save-enable') f.enable({ enabled: false, batchCount: 1 });
+    if (action === 'same-account-reconnect') {
+      const connection = f.execution.state().connections.find(row => row.exchange === 'binance');
+      await f.execution.connect('binance', { revision: connection.revision, ...credentials('binance') });
+    }
+    f.enable({ thresholdPercent: '6', batchCount: 1 });
+    assert.equal(f.state.state.previousJobId, firstId); assert.equal(f.state.job.id, firstId);
+    await f.reduction.tick(); await f.execution.tick();
+    assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+    assert.match(f.state.state.reason, /尚未反映上一轮/);
+    f.accounts.binance.positions[0].quantity = '6.8';
+    await f.wait(30_000); await f.reduction.tick(); await f.execution.tick();
+    assert.equal(f.jobs.length, 2); assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.2', '6']);
+    assert.equal(f.creates.length, 4);
+  });
+});
+
+test('unresolved post-fill positions cannot be discarded by changing legs or account identity', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+  await f.finishBatch(); await f.reduction.tick(); const firstId = f.state.job.id;
+  const legs = [{ exchange: 'hyperliquid', symbol: 'io:ANTH', side: 'long' }, config().legs[1]];
+  assert.throws(() => f.enable({ enabled: false, legs, batchCount: 1 }), /上一轮.*核对.*合约/);
+  assert.equal(f.state.state.previousJobId, firstId);
+  f.accounts.binance.identity = 'different-live-account';
+  const connection = f.execution.state().connections.find(row => row.exchange === 'binance');
+  await f.execution.connect('binance', { revision: connection.revision, ...credentials('binance') });
+  f.enable({ batchCount: 1 }); await f.reduction.tick();
+  assert.equal(f.state.state.phase, 'review'); assert.equal(f.state.config.enabled, false);
+  assert.equal(f.state.state.previousJobId, firstId); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+});
+
+test('a manual resume after an unobserved pause cannot silently restore continuous reduction', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick();
+  const firstId = f.state.job.id;
+  f.accounts.okx.positions[0].quantity = '30'; await f.execution.tick();
+  assert.equal(f.state.job.status, 'paused'); assert.equal(f.state.config.enabled, true);
+  f.accounts.okx.positions[0].quantity = '31';
+  const preview = await f.execution.preview({ resumeJobId: firstId }, 'fixture-resume-session');
+  await f.execution.start({ previewId: preview.id, requestId: randomUUID(), confirmLive: true }, 'fixture-resume-session');
+  await f.execution.tick(); await f.finishBatch();
+  assert.equal(f.state.job.status, 'completed');
+  await f.reduction.tick(); await f.reduction.tick(); await f.execution.tick();
+  assert.equal(f.state.state.phase, 'review'); assert.equal(f.state.config.enabled, false);
+  assert.match(f.state.state.reason, /人工继续/); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+});
+
+test('re-enabling after one-leg manual completion reconciles both legs whether the pause or completion was observed', async t => {
+  for (const observePause of [false, true]) for (const settleFirst of [false, true]) await t.test(`pause=${observePause}, settle=${settleFirst}`, async t => {
+    const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+    const firstId = f.state.job.id, firstOrders = [...f.records.values()];
+    f.fill(firstOrders[0]); f.fill(firstOrders[1], '5'); await f.execution.tick();
+    assert.equal(f.state.job.status, 'paused');
+    if (observePause) await f.reduction.tick();
+    const session = 'fixture-partial-resume', plan = await f.execution.preview({ resumeJobId: firstId }, session);
+    assert.equal(plan.legs.length, 1, 'the fully filled leg is absent from the remaining plan');
+    f.execution.start({ previewId: plan.id, requestId: randomUUID(), confirmLive: true }, session);
+    await f.execution.tick(); await f.finishBatch(); assert.equal(f.state.job.status, 'completed');
+    if (settleFirst) { await f.reduction.tick(); assert.equal(f.state.config.enabled, false); }
+    f.accounts.okx.positions[0].quantity = '26';
+    f.enable({ batchCount: 1 }); assert.equal(f.state.state.previousJobId, firstId);
+    await f.reduction.tick(); await f.execution.tick();
+    assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 3); assert.match(f.state.state.reason, /尚未反映上一轮/);
+    f.accounts.okx.positions[0].quantity = '21';
+    await f.wait(30_000); await f.reduction.tick(); await f.execution.tick();
+    assert.equal(f.jobs.length, 2); assert.equal(f.creates.length, 5);
+    assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.2', '6']);
+  });
+});
+
+test('each leg keeps its latest manually confirmed position baseline across multiple partial resumes and restart', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+  const firstId = f.state.job.id, firstOrders = [...f.records.values()];
+  f.fill(firstOrders[0], '1'); f.fill(firstOrders[1], '5'); await f.execution.tick(); await f.reduction.tick();
+  const resume = async () => {
+    const session = 'fixture-multiple-resumes', plan = await f.execution.preview({ resumeJobId: firstId }, session);
+    f.execution.start({ previewId: plan.id, requestId: randomUUID(), confirmLive: true }, session);
+    await f.execution.tick();
+  };
+  // A manual remaining-quantity confirmation adopts the current position,
+  // which may include an independently verified external adjustment.
+  f.accounts.binance.positions[0].quantity = '10.1'; await resume();
+  const secondOrders = [...f.records.values()].filter(row => !row.terminal);
+  f.fill(secondOrders[0]); f.fill(secondOrders[1], '2'); await f.execution.tick();
+  assert.equal(f.state.job.status, 'paused');
+  f.accounts.okx.positions[0].quantity = '25'; await resume(); await f.finishBatch();
+  assert.equal(f.state.job.status, 'completed');
+  assert.deepEqual([f.accounts.binance.positions[0].quantity, f.accounts.okx.positions[0].quantity], ['7.8', '22']);
+  await f.reduction.tick(); await f.restart(); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+  assert.equal(f.jobs.length, 2); assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.5', '7']);
+});
+
+test('a multi-batch round reconciles its last batch before the next round', async t => {
+  const f = await fixture(t); f.enable(); await f.reduction.tick(); await f.execution.tick();
+  await f.finishBatch(); f.advance(1000); await f.execution.tick(); await f.finishBatch(); f.advance(1000); await f.execution.tick();
+  const beforeLast = f.accounts.okx.positions[0].quantity;
+  await f.finishBatch(); await f.reduction.tick(); f.accounts.okx.positions[0].quantity = beforeLast;
+  await f.reduction.tick(); assert.equal(f.jobs.length, 1); assert.match(f.state.state.reason, /尚未反映上一轮/);
+  f.accounts.okx.positions[0].quantity = '21'; await f.wait(30_000);
+  for (const account of Object.values(f.accounts)) for (const position of account.positions) position.risk.at = stamp(TIME + 32_000);
+  await f.reduction.tick(); await f.execution.tick();
+  assert.equal(f.jobs.length, 2); assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.2', '6']);
+  assert.equal(f.creates.length, 8);
+});
+
+test('next round waits for post-fill positions, preserves cooldown on restart and uses the confirmed remainder', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+  await f.finishBatch(); await f.reduction.tick(); const firstId = f.state.job.id;
+  f.accounts.binance.positions[0].quantity = '10.1';
+  await f.reduction.tick();
+  assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.state.failures, 1);
+  assert.equal(f.state.state.previousJobId, firstId); assert.match(f.state.state.reason, /尚未反映上一轮/);
+  assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+  const retryAt = f.state.state.retryAt;
+  await f.restart(); const reads = f.calls.length;
+  await f.reduction.tick(); assert.equal(f.calls.length, reads); assert.equal(f.state.state.retryAt, retryAt);
+  await f.wait(30_000); f.accounts.binance.positions[0].quantity = '6.8';
+  for (const account of Object.values(f.accounts)) account.positions[0].risk.at = stamp(Date.parse(retryAt));
+  await f.reduction.tick(); await f.execution.tick();
+  assert.equal(f.jobs.length, 2); assert.equal(f.creates.length, 4);
+  assert.deepEqual(f.state.job.legs.map(leg => leg.quantity), ['2.2', '6']);
+  assert.equal(f.state.state.previousJobId, null); assert.equal(f.state.state.failures, 0);
+});
+
+test('persistently unreflected final fills exhaust the durable retry budget without a second task', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+  await f.finishBatch(); await f.reduction.tick(); f.accounts.okx.positions[0].quantity = '31';
+  await f.reduction.tick(); await f.restart();
+  await f.wait(30_000); await f.reduction.tick();
+  await f.wait(30_000); await f.reduction.tick();
+  assert.equal(f.state.state.phase, 'review'); assert.equal(f.state.config.enabled, false);
+  assert.equal(f.state.state.failures, 3); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+  assert.equal(f.state.job.status, 'completed');
+});
+
+test('unexpected post-fill positions or modes pause, while a confirmed remainder does not pin future monitoring', async t => {
+  for (const change of ['quantity', 'mode', 'after-confirmation']) await t.test(change, async t => {
+    const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+    await f.finishBatch(); await f.reduction.tick();
+    if (change === 'after-confirmation') {
+      f.accounts.binance.positions[0].risk.liquidationPrice = '50';
+      await f.reduction.tick(); assert.equal(f.state.state.previousJobId, null);
+      f.accounts.binance.positions[0].risk.liquidationPrice = '95';
+    }
+    if (change === 'mode') f.accounts.okx.modes[SYMBOL] = 'one-way';
+    else f.accounts.okx.positions[0].quantity = '24';
+    await f.reduction.tick();
+    if (change === 'after-confirmation') {
+      assert.equal(f.jobs.length, 2); assert.equal(f.state.job.legs[1].quantity, '7');
+    } else {
+      assert.equal(f.state.state.phase, 'review'); assert.equal(f.state.config.enabled, false);
+      assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+    }
+  });
+});
+
+test('continued monitoring respects maintenance, account changes and disable during its pending read', async t => {
+  for (const action of ['maintenance', 'account', 'disable']) await t.test(action, async t => {
+    const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+    await f.finishBatch(); await f.reduction.tick();
+    if (action === 'maintenance') {
+      f.flags.maintenance = true; const reads = f.calls.length;
+      await f.reduction.tick(); assert.equal(f.calls.length, reads);
+      f.flags.maintenance = false; await f.reduction.tick(); assert.equal(f.jobs.length, 2);
+    } else if (action === 'account') {
+      const connection = f.execution.state().connections.find(row => row.exchange === 'binance');
+      await f.execution.connect('binance', { revision: connection.revision, ...credentials('binance') });
+      await f.reduction.tick(); assert.equal(f.state.state.phase, 'review'); assert.equal(f.jobs.length, 1);
+    } else {
+      let enter, release;
+      const entered = new Promise(resolve => { enter = resolve; }), blocked = new Promise(resolve => { release = resolve; });
+      f.hooks.account = async exchange => { if (exchange === 'binance') { enter(); await blocked; } };
+      const pending = f.reduction.tick();
+      try { await entered; f.reduction.disable({ revision: f.state.revision }); }
+      finally { release(); await pending; }
+      assert.equal(f.state.config.enabled, false); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+    }
+  });
+});
+
+test('failed settlement or next-task persistence retains the completed round and cannot send again', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
+  await f.finishBatch(); const firstId = f.state.job.id;
+  f.db.exec("CREATE TEMP TRIGGER reject_rule_settlement BEFORE UPDATE ON execution_anthropic_reduction BEGIN SELECT RAISE(ABORT, 'fixture disk failure'); END");
+  await f.reduction.tick(); await f.reduction.tick();
+  assert.equal(f.state.state.jobId, firstId); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+  f.db.exec('DROP TRIGGER reject_rule_settlement'); await f.reduction.tick();
+  f.db.exec("CREATE TEMP TRIGGER reject_next_round BEFORE INSERT ON execution_jobs BEGIN SELECT RAISE(ABORT, 'fixture disk failure'); END");
+  await f.reduction.tick(); await f.execution.tick();
+  assert.equal(f.state.state.jobId, null); assert.equal(f.state.state.previousJobId, firstId);
+  assert.equal(f.state.job.id, firstId); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2); assert.deepEqual(f.locks(), []);
+});
+
+test('fully reduced positions finish normally and a sub-step remainder never creates another task', async t => {
+  for (const percent of ['100', '99']) await t.test(percent, async t => {
+    const f = await fixture(t); f.enable({ batchCount: 1, reducePercent: percent });
+    await f.reduction.tick(); await f.execution.tick(); await f.finishBatch(); await f.reduction.tick();
+    await f.reduction.tick(); await f.execution.tick();
+    assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+    if (percent === '100') {
+      assert.equal(f.state.state.phase, 'completed'); assert.equal(f.state.config.enabled, false);
+      assert.match(f.state.state.reason, /持仓已全部减完/);
+    } else assert.match(f.state.state.reason, /不足一个下单步长/);
+  });
+});
+
+test('a legacy completed and disabled rule is not reactivated by the new service', async t => {
+  const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick(); await f.finishBatch();
+  const row = f.db.prepare('SELECT json FROM execution_anthropic_reduction WHERE id=1').get(), value = JSON.parse(row.json);
+  value.config.enabled = false; value.state.phase = 'completed'; delete value.state.lastJobId; delete value.state.previousJobId;
+  f.db.prepare('UPDATE execution_anthropic_reduction SET json=? WHERE id=1').run(JSON.stringify(value));
+  await f.restart(); await f.reduction.tick(); await f.reduction.tick();
+  assert.equal(f.state.config.enabled, false); assert.equal(f.state.state.phase, 'completed'); assert.equal(f.jobs.length, 1);
 });
 
 test('recovered risk before the first send stops both legs without a mutation', async t => {
@@ -258,7 +515,7 @@ test('managed account writing permits the bound reduction and settles both origi
   assert.equal(f.jobs.length, 1); await f.execution.tick(); assert.equal(f.creates.length, 2);
   assert.deepEqual(f.writer.snapshot().operations, [{ moduleId: 'hub', state: 'confirmed', count: 2 }]);
   await f.finishBatch(); await f.reduction.tick();
-  assert.equal(f.jobs[0].status, 'completed'); assert.equal(f.state.config.enabled, false);
+  assert.equal(f.jobs[0].status, 'completed'); assert.equal(f.state.config.enabled, true); assert.equal(f.state.state.phase, 'armed');
   assert.deepEqual(f.locks(), []);
 });
 

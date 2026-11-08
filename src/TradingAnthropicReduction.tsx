@@ -8,7 +8,7 @@ import type { AnthropicShares } from './trading-execution-types';
 import type { AnthropicReductionConfig, AnthropicReductionState } from './trading-anthropic-reduction-types';
 
 const BASE = '/api/trading/execution/anthropic-reduction';
-const PHASES: Record<AnthropicReductionState['state']['phase'], string> = { disabled: '已停用', armed: '监测中', reducing: '减仓执行中', completed: '本轮完成 · 已自动停用', review: '已暂停 · 请核对' };
+const PHASES: Record<AnthropicReductionState['state']['phase'], string> = { disabled: '已停用', armed: '监测中', reducing: '减仓执行中', completed: '已完成 · 新触发已关闭', review: '已暂停 · 请核对' };
 type Draft = {
   revision: number; enabled: boolean; contracts: [string, string]; shares: AnthropicShares;
   threshold: string; percent: string; batches: string; interval: string; timeout: string;
@@ -109,7 +109,7 @@ export default function TradingAnthropicReduction({ shares, onExpired }: { share
 
   return <section className="trading-anthropic-alerts trading-anthropic-reduction" aria-labelledby="anthropic-reduction-title">
     <h3 id="anthropic-reduction-title"><ArrowDownToLine size={16} />ANT 自动多批减仓</h3>
-    <p>任一指定腿距强平 ≤ 阈值时，对两条腿同时市价减仓。第一批下单前再次核对风险；本轮完成后自动停用，需要手动再次启用。</p>
+    <p>任一指定腿距强平 ≤ 阈值时，对两条腿同时市价减仓。第一批下单前再次核对风险；每轮完成后继续监测，仍达到或再次达到阈值时，按剩余持仓开始下一轮。</p>
     {!data || !form ? <div role="status">{readError ?? '正在读取自动减仓设置…'}{readError ? <button className="button secondary" type="button" onClick={() => void load()}>重新读取</button> : <LoaderCircle size={16} className="spin" />}</div> : <>
       <p className="trading-anthropic-reduction-status" role="status"><strong>{PHASES[data.state.phase]}</strong> · 新触发{data.config?.enabled ? '已启用' : '已关闭'}{data.state.triggeredAt ? ` · 触发于 ${beijingTime(data.state.triggeredAt)}（北京时间）` : ''}</p>
       {data.state.reason ? <p className="trading-warning" role="alert">{data.state.reason}</p> : null}
@@ -117,7 +117,7 @@ export default function TradingAnthropicReduction({ shares, onExpired }: { share
       {executing ? <p className="trading-muted">当前减仓任务尚未结束；请先在「价差下单」核对执行，之后再修改规则。</p> : null}
       {data.live?.warning ? <p className="trading-warning" role="alert">{data.live.warning}</p> : null}
       {data.live ? <div className="trading-anthropic-reduction-live"><p>最近风险检查：{beijingTime(data.live.checkedAt)}（北京时间） · {data.live.met ? '已达到触发阈值' : '未达到触发阈值'}</p><ul>{data.live.legs.map(leg => <li key={`${leg.exchange}:${leg.symbol}:${leg.side}`}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 持仓 {amount(leg.quantity)} 原生单位 · 距强平 {leg.distancePercent === null ? '未提供' : `${leg.distancePercent}%`}</li>)}</ul></div> : <p className="trading-muted">尚无自动减仓风险检查结果。两腿都需要有效、新鲜的强平价；缺少任一腿的数据时，不会自动发送委托。</p>}
-      {data.job ? <div className="trading-anthropic-reduction-progress" aria-label="自动减仓执行进度"><strong>执行进度 · 第 {Math.min(data.job.batchIndex + 1, data.job.batchCount)} / {data.job.batchCount} 批</strong><ul>{data.job.legs.map(leg => <li key={leg.id}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 已成交 {amount(leg.filledQuantity)} / 目标 {amount(leg.quantity)} · 剩余 {amount(leg.remainingQuantity)} 原生单位</li>)}</ul><p>执行编号：{data.job.id}</p></div> : null}
+      {data.job ? <div className="trading-anthropic-reduction-progress" aria-label="自动减仓执行进度"><strong>{data.job.status === 'completed' ? '上一轮已完成' : '执行进度'} · 第 {Math.min(data.job.batchIndex + 1, data.job.batchCount)} / {data.job.batchCount} 批</strong><ul>{data.job.legs.map(leg => <li key={leg.id}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 已成交 {amount(leg.filledQuantity)} / 目标 {amount(leg.quantity)} · 剩余 {amount(leg.remainingQuantity)} 原生单位</li>)}</ul><p>执行编号：{data.job.id}</p></div> : null}
       <form onSubmit={event => void write('save', event)} aria-label="ANT 自动减仓设置">
         <fieldset className="trading-anthropic-reduction-fields" disabled={!!busy || executing}>
           {([0, 1] as const).map(index => <label key={index}>{index === 0 ? '减仓多头合约' : '减仓空头合约'}<select value={form.contracts[index]} onChange={event => { const contracts: [string, string] = [...form.contracts]; contracts[index] = event.target.value; edit({ contracts }); }}>{ANTHROPIC_CONTRACTS.map(contract => <option key={contractKey(contract)} value={contractKey(contract)} disabled={contractKey(contract) === form.contracts[1 - index]}>{contract.label}</option>)}</select></label>)}
@@ -128,7 +128,7 @@ export default function TradingAnthropicReduction({ shares, onExpired }: { share
           <label>最长执行时间（秒）<input type="number" min={30} max={3600} step="0.001" value={form.timeout} onChange={event => edit({ timeout: event.target.value })} /></label>
           <label className="trading-anthropic-reduction-toggle"><input type="checkbox" checked={form.enabled} onChange={event => edit({ enabled: event.target.checked })} />启用自动减仓</label>
         </fieldset>
-        <p className="trading-anthropic-rule">每条腿以触发时各自的持仓总量 × 总减仓比例作为本轮目标，再拆成指定批数；按原生单位精度向下取整，数量不足以拆分全部批次时拒绝执行。受单笔数量上限影响，实际批数可能增加，以执行进度为准。异常会停止后续批次，请在「价差下单 → 执行进度」核对已成交数量。</p>
+        <p className="trading-anthropic-rule">每轮以触发时各自的剩余持仓 × 总减仓比例作为该腿本轮目标，再拆成指定批数；按原生单位精度向下取整，数量不足以拆分全部批次时拒绝执行。受单笔数量上限影响，实际批数可能增加，以执行进度为准。异常会停止后续批次和新触发，请在「价差下单 → 执行进度」核对已成交数量。</p>
         <p>本规则股数快照：流通 {form.shares.outstanding}B · 完全稀释 {form.shares.diluted}B。页面股数变化不会修改已保存规则。</p>
         {!sameShares(form.shares, shares) ? <p>当前页面为 {shares.outstanding}B / {shares.diluted}B。<button className="button secondary" type="button" disabled={!!busy || executing} onClick={() => edit({ shares: { ...shares } })}>使用当前页面股数</button></p> : null}
         {draft && draft.revision !== data.revision ? <p className="trading-warning" role="alert">服务器规则已变化，当前草稿仍保留；请放弃草稿并读取当前规则后重新编辑。</p> : null}

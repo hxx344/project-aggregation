@@ -137,6 +137,21 @@ async (page) => {
     await refresh(); await section.getByLabel('自动减仓执行进度').waitFor();
     assert((await section.getByLabel('自动减仓执行进度').innerText()).includes('第 2 / 4 批'), 'actual job batch progress is displayed');
     assert(await threshold.isDisabled() && await saveEnabled.isDisabled(), 'running job blocks configuration edits');
+    const firstJobId = job.id, writesBeforeCompletion = writes.length;
+    phase = 'armed'; job.status = 'completed'; job.batchIndex = 4;
+    job.legs = job.legs.map(leg => ({ ...leg, filledQuantity: leg.quantity, remainingQuantity: '0' }));
+    revision++; await refresh();
+    await section.getByText('监测中', { exact: true }).waitFor();
+    assert(await enabled.isChecked() && !(await threshold.isDisabled()), 'completed round keeps monitoring enabled');
+    assert((await section.getByLabel('自动减仓执行进度').innerText()).includes('上一轮已完成'), 'completed round receipt remains visible');
+    assert((await section.getByLabel('自动减仓执行进度').innerText()).includes(firstJobId), 'completed receipt retains its task identity');
+    assert(writes.length === writesBeforeCompletion, 'monitoring after completion does not send a browser write');
+    phase = 'reducing'; job = { ...job, id: 'ant-reduce-next-round', status: 'running', batchIndex: 0,
+      legs: job.legs.map(leg => ({ ...leg, quantity: '10', filledQuantity: '0', remainingQuantity: '10' })) };
+    revision++; await refresh();
+    assert((await section.getByLabel('自动减仓执行进度').innerText()).includes('ant-reduce-next-round'), 'next round replaces the displayed receipt by exact identity');
+    assert(await threshold.isDisabled(), 'next active round locks configuration again');
+    checks.push('continuous monitoring, retained completed receipt and exact next-round progress');
     await section.getByRole('button', { name: '停用新触发' }).click();
     await section.getByText('已停用新触发；在途批次不会撤销，请到「价差下单」查看或停止执行。').waitFor();
     assert(writes.at(-1).path === `${root}/disable` && Object.keys(writes.at(-1).body).join(',') === 'revision', 'disable uses current CAS revision and never posts job stop');
@@ -145,9 +160,9 @@ async (page) => {
     await section.getByRole('alert').filter({ hasText: reason }).waitFor();
     assert(await section.getByRole('link', { name: '到价差下单核对执行' }).getAttribute('href') === '?view=trading&tradingSection=trade', 'review links to the actual execution entry');
     phase = 'completed'; reason = null; job.status = 'completed'; revision++; await refresh();
-    await section.getByText('本轮完成 · 已自动停用', { exact: true }).waitFor();
-    assert(!(await enabled.isChecked()), 'completion does not auto-rearm');
-    checks.push('revision conflict, actual batch progress, in-flight disable, failure review and manual rearm');
+    await section.getByText('已完成 · 新触发已关闭', { exact: true }).waitFor();
+    assert(!(await enabled.isChecked()), 'completion respects explicit disable');
+    checks.push('revision conflict, actual batch progress, in-flight disable and failure review');
 
     await section.getByLabel('减仓批次数').fill('200'); await section.getByLabel('减仓批次间隔（秒）').fill('600');
     await section.getByRole('alert').filter({ hasText: '最长执行时间须覆盖全部批次间隔' }).waitFor();
