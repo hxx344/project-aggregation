@@ -5,7 +5,7 @@
 ## 1 结论
 
 - **业务正确性首轮已完成**：A–F 批次引用的 18 个 Issue 及后续 #179、#185、#187 全部关闭，两项产品决策已定（#91 ADL 按合约推进；#94 流水线只部署本轮提交）。多数修复没有经过真实交易所或生产验收。
-- **结构演进**：E2、E7 已完成；E1 已完成盘点、版本标记与同名不同定义的兼容处理（E1c-1），有序迁移 E1c-2 待回滚集合满足条件且有结构变更需求时进行；E6 已完成数据声明；E5 已完成首批登记，第二批修正了数值冲突（C1、C14、C16、C18 修正，C2、C15 按设计接受），第三批修正了其余冲突（C3–C13、C17 与 C18 剩余部分）；E3 已完成开发入口（Linux 的 `dev:server` 改用 launcher 加 watch），浏览器夹具迁移未做；E4、E8 未实施。盘点见 [hub.sqlite 结构盘点](hub-schema-inventory.md)。其前置验收已完成：#71 安装器真实 `main()` 串联覆盖（PR #188、#213），#107 浏览器重连问题确认在夹具而非进程拓扑（PR #188）。
+- **结构演进**：E2、E7 已完成；E1 已完成盘点、版本标记与同名不同定义的兼容处理（E1c-1），有序迁移 E1c-2 待回滚集合满足条件且有结构变更需求时进行；E6 已完成数据声明；E5 已完成首批登记，第二批修正了数值冲突（C1、C14、C16、C18 修正，C2、C15 按设计接受），第三批修正了其余冲突（C3–C13、C17 与 C18 剩余部分）；E3 已完成（Linux 的 `dev:server` 改用 launcher 加 watch，浏览器夹具覆盖分进程的 API 单独重启、runtime 故障与 socket 重连）；E4、E8 未实施。盘点见 [hub.sqlite 结构盘点](hub-schema-inventory.md)。其前置验收已完成：#71 安装器真实 `main()` 串联覆盖（PR #188、#213），#107 浏览器重连问题确认在夹具而非进程拓扑（PR #188）。
 - **基础不变**：模块化单体、API/运行时分进程、模块 worker 隔离、SQLite WAL、五个内置模块统一仓库统一发布。#90/#179 已用部分索引解决已测的全量解析，仍没有证据需要拆服务、换数据库或换语言（进入条件见第 6 节）。
 - **不再列为待办**的事项见第 8 节。
 
@@ -36,7 +36,7 @@
 
 | 事项 | 现状 | 退出条件 |
 | --- | --- | --- |
-| 浏览器夹具 | `trading-okx`、`trading-resume`、`hub-positions` 在 PR #249 时于 main 上失败，此后夹具文件未改动，本版未重跑 | 恢复通过，或记录无法修复的原因 |
+| 浏览器夹具 | `trading-okx`、`trading-resume`、`hub-positions` 在 PR #249 时于 main 上失败，此后夹具文件未改动，本版未重跑；E3 第二批（2026-11-08）另发现 `aster-monitor-center`（断言"zero capacity and a missing tier: 5x capacity display"）与 `asset-performance`（等待页面元素超时）在单进程和分进程下同样失败，重建 ASTER 与 Asset 前端后仍失败，与进程拓扑无关 | 恢复通过，或记录无法修复的原因 |
 | ASTER 规划补单 | `trading/engine.py` 规划阶段仍 `book.require_fresh()`，行情持续中断时补偿以 10 秒退避等待且不转 attention；配对准入后不复核 BBO（PR #115 登记） | 决定是否在行情长时间中断时转人工；配对发送前是否复核 BBO |
 | OKX 撤单 | 撤单前读单失败仍占撤单预算（PR #116 登记，修复可能造成忙等） | 有界且不忙等的读单失败处理 |
 | 流水线状态 | 未加 `--apply` 时 `activate` 返回 deferred 但不撤销上一提交的成功记录，`status` 可能显示“新提交 + activate ok”（仅显示误导，`inputKey` 含提交不会误命中缓存） | `deferred` 一律清除旧成功记录 |
@@ -127,7 +127,8 @@ Binance、Bybit、OKX 的签名、时间戳、超时、限流退避和数字解�
 - 目标：Linux 开发和相关浏览器夹具覆盖 runtime/API 分进程行为；生产双槽另按真实服务单元验收。
 - 做法：Linux 的 `dev:server` 使用 launcher，Windows 保留 `workbench.mjs`。watch 观察子进程源码，等待整组退出再启动下一组，有自己的停止截止与残留检查。先迁移涉及重连和实时流的夹具。
 - 退出条件：分进程夹具覆盖 API 单独重启、runtime 故障、socket 重连及 watch 无残留；生产侧复用 `deploy/test-slots-systemd.sh` 核对候选、切流、旧槽排空与回滚。Linux 验收用既有 CI 或非 WSL 环境。
-- 状态（2026-11-08 第一批完成）：`pnpm dev:server` 在 Linux 上运行 `server/dev-watch.mjs`，由它启动 `server/launcher.mjs`；Windows 和 macOS 仍是 `node --watch server/workbench.mjs`。watch 监视 `server/` 与各模块服务端源码（monitor 的 `server/`、`lib/`、`modules/`、`web/`，crossex 的 `server/`，asset 的 `lib/`、`scripts/`，greeks 的 `app/`，aster 的 `trading/`；数据文件与构建产物不监视），变更后先等整组退出再启动下一组，下一组启动前到达的变更都由这次重启覆盖。停止期限 240 s 覆盖 launcher 的 75 s 加 150 s 并留 15 s（[超时预算表](timeout-budgets.md) `dev-watch-covers-launcher-stop`），到期对 launcher 进程组发 SIGKILL。worker 各自是进程组组长，所以残留检查按每组独有的环境标记 `WORKBENCH_DEV_RUN` 扫描 `/proc`，组退出后仍在的进程被强制结束；组自行退出时同样检查，之后等源码变更再启动。标记还带启动它的 watch 的 pid 与仓库路径，watch 被强杀后留下的进程组由下一次启动的 watch 先结束；第二次 Ctrl-C 立即结束整组。待做：先迁移涉及重连和实时流的浏览器夹具到分进程（它们现在用 `node --import` 加载单进程 workbench），再补 API 单独重启、runtime 故障、socket 重连的夹具覆盖。
+- 状态（2026-11-08 第一批完成）：`pnpm dev:server` 在 Linux 上运行 `server/dev-watch.mjs`，由它启动 `server/launcher.mjs`；Windows 和 macOS 仍是 `node --watch server/workbench.mjs`。watch 监视 `server/` 与各模块服务端源码（monitor 的 `server/`、`lib/`、`modules/`、`web/`，crossex 的 `server/`，asset 的 `lib/`、`scripts/`，greeks 的 `app/`，aster 的 `trading/`；数据文件与构建产物不监视），变更后先等整组退出再启动下一组，下一组启动前到达的变更都由这次重启覆盖。停止期限 240 s 覆盖 launcher 的 75 s 加 150 s 并留 15 s（[超时预算表](timeout-budgets.md) `dev-watch-covers-launcher-stop`），到期对 launcher 进程组发 SIGKILL。worker 各自是进程组组长，所以残留检查按每组独有的环境标记 `WORKBENCH_DEV_RUN` 扫描 `/proc`，组退出后仍在的进程被强制结束；组自行退出时同样检查，之后等源码变更再启动。标记还带启动它的 watch 的 pid 与仓库路径，watch 被强杀后留下的进程组由下一次启动的 watch 先结束；第二次 Ctrl-C 立即结束整组。
+- 状态（2026-11-08 第二批完成，E3 完成）：经过真实 Hub 的两个 `--import` 夹具（`tests/fixtures/aster-notices-workbench.mjs`、`asset-performance-workbench.mjs`，供 9 个 ASTER/Asset 浏览器用例使用）改为以 `server/index.mjs` 启动：Linux 上是 launcher 分进程，Windows 上仍是单进程 workbench。launcher 把 `--import` 带给两个子进程，它们沿用第一个进程创建的数据目录，只有 runtime 启动夹具模块；数据目录改由创建它的进程退出时删除（原先在模块 `close()` 里删除，早于 runtime 释放运行锁与账户写入器，单进程下关闭时也会报 `RUNTIME_LOCK_UNAVAILABLE`、`REGISTRY_MISSING`）。其余浏览器用例用 `page.route` 拦截接口，不经过进程拓扑，不需迁移。新增 `tests/fixtures/split-browser.mjs`：真实 runtime（假模块）与带构建前端的真实 API 各为独立进程，退出 1 s 后重启（同服务单元的 `Restart=`），另有只监听 127.0.0.1 的控制口可强杀、暂停与改模块顺序；`tests/split-reconnect.browser.mjs` 不刷新页面依次验证：API 单独重启后总览事件流重连到新 API、会话仍有效、事件继续送达，runtime 未重启；runtime 故障时 API 用心跳保持浏览器流，30 s 后各模块显示数据过期；下一个 runtime 实例就绪后 API 的 socket 订阅重连，新实例的事件经同一条浏览器流送达，页面没有改用总览轮询。把 API 订阅重连退避改为 10 分钟时该用例在最后一步失败（已验证）。CI 不跑浏览器，同一条链路另在 `tests/process-split.test.mjs` 以浏览器式 SSE 覆盖：runtime 被强杀并换实例后，同一条流收到新实例推送的项目变更（变更只经 runtime 推送到达；同样的变异下失败）。watch 无残留由第一批的 `tests/dev-watch.test.mjs` 覆盖；生产侧候选、负载下切流、旧槽排空与回滚由 CI 中真实 systemd 的 `deploy/test-slots-systemd.sh` 覆盖。
 
 #### E4 部署决策收拢（S4）
 

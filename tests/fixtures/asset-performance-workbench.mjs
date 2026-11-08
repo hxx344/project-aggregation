@@ -1,13 +1,16 @@
-// Windows-native fixture for the real Hub and production Asset Next application.
+// Fixture for the real Hub and production Asset Next application.
 // Build Hub + Asset first, then run from the repository root:
-// node --import ./tests/fixtures/asset-performance-workbench.mjs server/workbench.mjs
+// node --import ./tests/fixtures/asset-performance-workbench.mjs server/index.mjs
+// server/index.mjs is the launcher with separate runtime and API processes on
+// Linux and the single-process server/workbench.mjs on Windows. The launcher
+// forks both with this --import; they share the data directory the first
+// process created, and only the runtime starts the fixture modules.
 // Open http://hub.localhost:39153/?view=project&id=asset
 // Password: asset-performance-browser-fixture
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
-import { rm } from 'node:fs/promises';
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import http from 'node:http';
 import { registerHooks } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -20,7 +23,8 @@ const root = fileURLToPath(new URL('../..', import.meta.url));
 const assetRoot = path.join(root, 'modules', 'asset');
 const worker = process.argv[2] === '--asset-worker';
 const temporaryRoot = realpathSync(tmpdir());
-const directory = worker ? path.resolve(process.argv[3]) : mkdtempSync(path.join(temporaryRoot, 'asset-performance-browser-'));
+const directory = worker ? path.resolve(process.argv[3])
+  : process.env.ASSET_PERFORMANCE_FIXTURE_DIR || mkdtempSync(path.join(temporaryRoot, 'asset-performance-browser-'));
 const nativeFetch = globalThis.fetch;
 
 // Both processes reject non-local fetches; there is no live provider fallback.
@@ -33,8 +37,18 @@ globalThis.fetch = async (input, init) => {
 };
 
 if (!worker) {
+  // Removed by the process that created it once it exits, after the runtime has
+  // released its lock and account writer; removing it on close() broke both.
+  if (!process.env.ASSET_PERFORMANCE_FIXTURE_DIR) process.once('exit', () => {
+    if (!existsSync(directory)) return;
+    const resolved = realpathSync(directory), location = path.relative(temporaryRoot, resolved);
+    assert.ok(location && !location.startsWith('..') && !path.isAbsolute(location)
+      && path.basename(resolved).startsWith('asset-performance-browser-'), 'Cleanup must remain inside the fixture temporary directory');
+    try { rmSync(resolved, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+    catch (error) { console.warn(`Asset fixture: ${resolved} was not removed: ${error.message}`); }
+  });
   Object.assign(process.env, {
-    DATA_DIR: directory, PORT: '39153', HOST: '127.0.0.1', PUBLIC_ORIGIN: '',
+    ASSET_PERFORMANCE_FIXTURE_DIR: directory, DATA_DIR: directory, PORT: '39153', HOST: '127.0.0.1', PUBLIC_ORIGIN: '',
     COOKIE_SECURE: 'false', WARMUP_ENABLED: 'false',
     INITIAL_PASSWORD: 'asset-performance-browser-fixture', NEXT_TELEMETRY_DISABLED: '1',
   });
@@ -106,10 +120,6 @@ export async function startFixtureModules({ logger = console, onFailure = () => 
           else child.kill();
         }),
       ]);
-      const resolved = realpathSync(directory), location = path.relative(temporaryRoot, resolved);
-      assert.ok(location && !location.startsWith('..') && !path.isAbsolute(location)
-        && path.basename(resolved).startsWith('asset-performance-browser-'), 'Cleanup must remain inside the fixture temporary directory');
-      await rm(resolved, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     })();
     return closing;
   }

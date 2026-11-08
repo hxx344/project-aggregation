@@ -1,4 +1,4 @@
-// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/workbench.mjs
+// Start: node --import ./tests/fixtures/aster-notices-workbench.mjs server/index.mjs
 // Run: playwright-cli -s=aster-adl-margin run-code --filename tests/aster-adl-margin.browser.mjs
 // Real Hub login, proxy and embedded built UI; only isolated API evidence is supplied.
 async (page) => {
