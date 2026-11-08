@@ -1823,6 +1823,20 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **工作台订单关联补充（2026-11-08）：** 用户确认截图中的 Binance–Lighter RH 来自工作台组合下单。基线 `f24140d` 虽已保存任务和订单，成交链路却丢弃订单编号、没有账户证明，仍把所有 CEX 统一标为“未关联”。真实归属优先连接已有任务证据：Asset 的显示账号 `default` 和随机加密凭据哈希不是交易所 UID；按固定只读 UID、原生合约、订单编号、方向和模式核对。继续剩余会覆盖 `job.plan` 且移除已成腿，完整组合取 `totals`，账户版本从已受理预览补证，缺证据不猜。旧缓存必须一次性补读订单元数据，不能只等十分钟增量窗口自然补齐。另核对 [Lighter 官方 SDK](https://github.com/elliottech/lighter-python/blob/main/lighter/api/order_api.py) 发现成交历史 `limit<=100`，原实现请求 500；本轮改为 100 并保留有界分页。验证见 [归属回归](tests/trading-fill-attribution.test.mjs)、Asset 成交缓存与读者测试、ANT 标记和工作台入口夹具。没有读取用户真实私有账户，不断言参数错误是截图故障的唯一原因。沿用事件 `ant-history-pair-attribution-20261107`，不新增独立事件、不推进复盘检查点。
 
+### L109：IF NOT EXISTS 不修复同名不同定义的索引或生成列，回滚目标须能改回自己的定义
+
+**适用条件：** SQLite 结构由各进程启动时用 `CREATE ... IF NOT EXISTS` 或“按列名判断再 `ADD COLUMN`”补齐，且查询依赖对象的精确定义（`INDEXED BY` 部分索引、生成列表达式）；或计划做改索引条件、改生成列表达式的迁移。
+
+**根因：** `IF NOT EXISTS` 和按名判断只看名字。同名但条件不同的部分索引保持原样，`INDEXED BY` 直接报 `no query solution`，执行器构造失败、runtime 起不来；表达式不同的生成列被沿用，统计按旧口径静默计算。新版本改了定义后回滚到旧版本，同样会遇到这种情况。
+
+**以后做法：** 依赖精确定义的对象在启动时（以及读取报 `no query solution` 或缺索引时）比较 `sqlite_schema.sql`（SQLite 去掉 `IF NOT EXISTS`、保留原文空白，比较前归一空白），不符时在写锁内删除重建，调用方已在事务内则并入该事务；非关键对象重建失败只记日志、不阻塞启动。改这类定义的迁移要等安装器保留集合里的版本都包含这项兼容处理后才能执行。
+
+**如何验证：** 在临时库预置同名不同定义的对象后走真实创建函数：启动成功、行数不变，`inspectHubSchema` 不再列为不符；定义一致时不写库；运行中被改定义后，缓存语句和新编译的语句各自恢复一次。用修复前的源码跑同一组测试应报 `no query solution`。
+
+**证据：** project-aggregation E1a 盘点（`docs/hub-schema-inventory.md` 第 5 节，PR #253）在临时库复现执行器构造抛出 `no query solution`；E1c-1 在 `server/trading-execution.mjs` 的 `replaceChangedIndexes` 与 `server/observability.mjs` 的 `replaceChangedColumn` 修复，测试见 [执行器测试](tests/trading-execution.test.mjs) 与 [基线测试](tests/observability.test.mjs)。线上定义与代码一致，没有发生过线上事故。
+
+**事件记录：** `hub-same-name-definition-drift-20261107`；盘点发现，修复前未在生产出现。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

@@ -9,6 +9,7 @@ import { createStatementCache } from './db-cache.mjs';
 import { accountKey } from './execution/account-writer.mjs';
 import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL, UNFINISHED_EXECUTION_JOB_SQL } from './control/execution-jobs.mjs';
 import { immediate } from './control/schema.mjs';
+import { isSqliteBusy } from './sqlite-writes.mjs';
 import { evaluateRule, boundsFor, SPREADS } from './trading-auto.mjs';
 import { normalizeReductionConfig, readReductionRisk, reductionQuantities, reductionIntent, checkReductionDuration } from './trading-reduction-plan.mjs';
 
@@ -63,17 +64,28 @@ const UNFINISHED_JOB = UNFINISHED_EXECUTION_JOB_SQL, FINISHED_JOB = `${JOB_STATU
 const FINISHED_JOB_PAGE = 30;
 // Automatic jobs send only from books received within this window of the send decision.
 const AUTO_BOOK_WINDOW_MS = 1500;
-const JOB_INDEXES_SQL = `
-  CREATE INDEX IF NOT EXISTS execution_jobs_unfinished ON execution_jobs(${JOB_CREATED}) WHERE ${UNFINISHED_JOB};
-  CREATE INDEX IF NOT EXISTS execution_jobs_finished ON execution_jobs(${JOB_CREATED}) WHERE ${FINISHED_JOB};`;
 // Only JSON true or 1 counts as settled here. Other truthy values and rows
 // that are not strict JSON are indexed as unsettled, which costs a read but
 // never skips them. This assumes rows the executor wrote with JSON.stringify:
 // with duplicate settled keys SQLite takes the first and JSON.parse the last,
 // which only a hand-edited row can contain.
 const UNSETTLED_ORDER = "(CASE WHEN json_valid(json) THEN json_extract(json,'$.settled') END) IS NOT 1";
-const ORDER_INDEX_SQL = `
-  CREATE INDEX IF NOT EXISTS execution_orders_unsettled ON execution_orders(job_id) WHERE ${UNSETTLED_ORDER};`;
+// The partial indexes read with INDEXED BY must have exactly these
+// definitions: SQLite answers "no query solution" when an index of the same
+// name has another condition, and IF NOT EXISTS keeps such an index. One can be
+// left by another release (a later one that changed the condition, before a
+// rollback to this one) or by a hand edit, so this code replaces any other
+// definition of them (docs/hub-schema-inventory.md sections 5 and 6).
+const READ_INDEXES = Object.freeze({
+  execution_jobs_unfinished: `CREATE INDEX execution_jobs_unfinished ON execution_jobs(${JOB_CREATED}) WHERE ${UNFINISHED_JOB}`,
+  execution_jobs_finished: `CREATE INDEX execution_jobs_finished ON execution_jobs(${JOB_CREATED}) WHERE ${FINISHED_JOB}`,
+  execution_orders_unsettled: `CREATE INDEX execution_orders_unsettled ON execution_orders(job_id) WHERE ${UNSETTLED_ORDER}`,
+});
+const ifMissing = name => `${READ_INDEXES[name].replace(/^CREATE INDEX /, 'CREATE INDEX IF NOT EXISTS ')};`;
+const JOB_INDEXES_SQL = ifMissing('execution_jobs_unfinished') + ifMissing('execution_jobs_finished');
+const ORDER_INDEX_SQL = ifMissing('execution_orders_unsettled');
+// SQLite stores the CREATE text without IF NOT EXISTS; whitespace is not significant.
+const sameSql = (a, b) => String(a).replace(/\s+/g, ' ').trim() === String(b).replace(/\s+/g, ' ').trim();
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
 class PositionProjectionWait extends ExecutionError {}
 class RateLimitedReadError extends ExecutionError {
@@ -111,6 +123,21 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     CREATE TABLE IF NOT EXISTS execution_lease (id INTEGER PRIMARY KEY CHECK(id=1), owner TEXT NOT NULL, expires INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS execution_stop_requests (job_id TEXT PRIMARY KEY, requested_at INTEGER NOT NULL);
   `);
+  // Replaces, under the write lock, each read index whose stored definition is
+  // not this code's; a missing one is left to IF NOT EXISTS. Object names are
+  // case-insensitive in SQLite, so the stored name is the one dropped. A
+  // connection already in a transaction keeps the change inside it.
+  const replaceChangedIndexes = () => {
+    const stored = stmt.prepare("SELECT name,sql FROM sqlite_schema WHERE type='index' AND name=? COLLATE NOCASE");
+    const changed = () => Object.entries(READ_INDEXES).map(([name, sql]) => [stored.get(name), sql]).filter(([row, sql]) => row && !sameSql(row.sql, sql));
+    if (!changed().length) return;
+    const replace = () => { for (const [row, sql] of changed()) db.exec(`DROP INDEX "${row.name.replaceAll('"', '""')}"; ${sql}`); };
+    if (db.isTransaction) replace(); else immediate(db, replace);
+  };
+  // Only this replacement tolerates a busy database (later startup writes still
+  // wait and may fail): an indexed read that the old definition cannot serve
+  // retries it. One that still serves the query leaves it to the next start.
+  try { replaceChangedIndexes(); } catch (error) { if (!isSqliteBusy(error)) throw error; }
   for (const exchange of EXECUTION_EXCHANGES) stmt.prepare('INSERT OR IGNORE INTO execution_accounts(exchange,account_mode) VALUES (?,?)').run(exchange, DEFAULT_MODES[exchange]);
   const owner = randomUUID(), clients = new Map(EXECUTION_EXCHANGES.map(exchange => [exchange, clientFactory(exchange)]));
   const pending = new Set(), controllers = new Set(), busyJobs = new Set(), connecting = new Set();
@@ -134,11 +161,13 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   // SQLite otherwise favours a rowid table scan to preserve insertion order,
   // evaluating JSON status across all history. INDEXED BY forces the partial
   // indexes; rowid ordering still keeps tick and restart processing stable.
+  // An index dropped or redefined after startup is restored once per read.
   const indexedJobRows = (sql, ...args) => {
     const read = () => stmt.prepare(sql).all(...args);
     try { return read(); }
     catch (error) {
-      if (!/^no such index: execution_(jobs_unfinished|jobs_finished|orders_unsettled)$/.test(error?.message)) throw error;
+      if (!/^(no such index: execution_(jobs_unfinished|jobs_finished|orders_unsettled)|no query solution)$/.test(error?.message)) throw error;
+      replaceChangedIndexes();
       db.exec(JOB_INDEXES_SQL + ORDER_INDEX_SQL);
       return read();
     }
