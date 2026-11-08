@@ -1,0 +1,997 @@
+{
+  "schema": 1,
+  "about": "Timeout budget table (docs/timeout-budgets.md, evolution plan E5). Each budget is read from its source; relations say which budgets must cover which. A relation with status conflict is known not to hold and is registered for a separate fix.",
+  "budgets": [
+    {
+      "id": "api.request",
+      "ms": 60000,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "const REQUEST_TIMEOUT_MS = ([\\d_]+), HANDLER_GRACE_MS"
+      }
+    },
+    {
+      "id": "api.receive",
+      "ms": 60000,
+      "sameAs": "api.request",
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "server\\.requestTimeout = REQUEST_TIMEOUT_MS;"
+      }
+    },
+    {
+      "id": "api.headers",
+      "ms": 10000,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "server\\.headersTimeout = ([\\d_]+); server\\.maxHeadersCount"
+      }
+    },
+    {
+      "id": "api.forward-deadline",
+      "ms": 60000,
+      "sameAs": "api.request",
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "\\?\\? Date\\.now\\(\\)\\) \\+ REQUEST_TIMEOUT_MS;"
+      }
+    },
+    {
+      "id": "api.drain",
+      "ms": 60000,
+      "sameAs": "api.request",
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "drainMs = REQUEST_TIMEOUT_MS \\}"
+      },
+      "overrides": [
+        {
+          "file": "server/api/main.mjs",
+          "absent": "drainMs"
+        }
+      ]
+    },
+    {
+      "id": "api.handler-grace",
+      "ms": 2000,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "HANDLER_GRACE_MS = ([\\d_]+), COORDINATOR_CLOSE_MS"
+      }
+    },
+    {
+      "id": "api.coordinator-close",
+      "ms": 5000,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "COORDINATOR_CLOSE_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "api.close-report",
+      "ms": 500,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "CLOSE_REPORT_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "api.overview-heartbeat",
+      "ms": 15000,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "const OVERVIEW_HEARTBEAT_MS = ([\\d_]+),"
+      }
+    },
+    {
+      "id": "api.runtime-stale",
+      "ms": 30000,
+      "source": {
+        "file": "server/api/server.mjs",
+        "pattern": "RUNTIME_STALE_MS = ([\\d_]+), NOTICE_RETRY_MS"
+      }
+    },
+    {
+      "id": "client.forward",
+      "ms": 60000,
+      "source": {
+        "file": "server/runtime/data-client.mjs",
+        "pattern": "export const FORWARD_BUDGET = ([\\d_]+), ASSET_SYNC_BUDGET"
+      },
+      "overrides": [
+        {
+          "file": "server/api/main.mjs",
+          "absent": "budgets"
+        }
+      ]
+    },
+    {
+      "id": "client.asset-sync",
+      "ms": 60000,
+      "source": {
+        "file": "server/runtime/data-client.mjs",
+        "pattern": "ASSET_SYNC_BUDGET = ([\\d_]+);"
+      },
+      "overrides": [
+        {
+          "file": "server/api/main.mjs",
+          "absent": "budgets"
+        }
+      ]
+    },
+    {
+      "id": "client.events-idle",
+      "ms": 45000,
+      "source": {
+        "file": "server/runtime/data-client.mjs",
+        "pattern": "export const EVENTS_IDLE_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "protocol.read",
+      "ms": 5000,
+      "source": {
+        "file": "server/runtime/protocol.mjs",
+        "pattern": "BUDGETS = Object\\.freeze\\(\\{ read: ([\\d_]+), maintenance: ([\\d_]+), prepareStop: ([\\d_]+) \\}\\)",
+        "group": 1
+      },
+      "overrides": [
+        {
+          "file": "server/api/main.mjs",
+          "absent": "budgets"
+        }
+      ]
+    },
+    {
+      "id": "protocol.maintenance",
+      "ms": 15000,
+      "source": {
+        "file": "server/runtime/protocol.mjs",
+        "pattern": "BUDGETS = Object\\.freeze\\(\\{ read: ([\\d_]+), maintenance: ([\\d_]+), prepareStop: ([\\d_]+) \\}\\)",
+        "group": 2
+      },
+      "overrides": [
+        {
+          "file": "server/api/main.mjs",
+          "absent": "budgets"
+        }
+      ]
+    },
+    {
+      "id": "protocol.prepare-stop",
+      "ms": 70000,
+      "source": {
+        "file": "server/runtime/protocol.mjs",
+        "pattern": "BUDGETS = Object\\.freeze\\(\\{ read: ([\\d_]+), maintenance: ([\\d_]+), prepareStop: ([\\d_]+) \\}\\)",
+        "group": 3
+      },
+      "overrides": [
+        {
+          "file": "server/api/main.mjs",
+          "absent": "budgets"
+        }
+      ]
+    },
+    {
+      "id": "internal.receive",
+      "ms": 75000,
+      "source": {
+        "file": "server/runtime/internal-server.mjs",
+        "pattern": "server\\.requestTimeout = ([\\d_]+); server\\.headersTimeout = ([\\d_]+); server\\.keepAliveTimeout",
+        "group": 1
+      }
+    },
+    {
+      "id": "internal.headers",
+      "ms": 5000,
+      "source": {
+        "file": "server/runtime/internal-server.mjs",
+        "pattern": "server\\.requestTimeout = ([\\d_]+); server\\.headersTimeout = ([\\d_]+); server\\.keepAliveTimeout",
+        "group": 2
+      }
+    },
+    {
+      "id": "runtime.sync-deadline",
+      "ms": 4000,
+      "source": {
+        "file": "server/runtime/main.mjs",
+        "pattern": "SYNC_DEADLINE_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "updates.module-maintenance",
+      "ms": 10000,
+      "source": {
+        "file": "server/modules/updates.mjs",
+        "pattern": "\\{ deadlineMs = ([\\d_]+) \\} = \\{\\}"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/internal-server.mjs",
+          "absent": "deadlineMs"
+        }
+      ]
+    },
+    {
+      "id": "updates.capabilities",
+      "ms": 5000,
+      "source": {
+        "file": "server/modules/updates.mjs",
+        "pattern": "readModuleCapabilities\\(id, \\{ request, deadline: Date\\.now\\(\\) \\+ ([\\d_]+) \\}\\)"
+      }
+    },
+    {
+      "id": "updates.status-aster",
+      "ms": 60000,
+      "source": {
+        "file": "server/modules/updates.mjs",
+        "pattern": "'/__workspace/update-status', \\{ deadline: Date\\.now\\(\\) \\+ \\(id === 'aster' \\? ([\\d_]+) : ([\\d_]+)\\) \\}\\)",
+        "group": 1
+      }
+    },
+    {
+      "id": "updates.status-default",
+      "ms": 10000,
+      "source": {
+        "file": "server/modules/updates.mjs",
+        "pattern": "'/__workspace/update-status', \\{ deadline: Date\\.now\\(\\) \\+ \\(id === 'aster' \\? ([\\d_]+) : ([\\d_]+)\\) \\}\\)",
+        "group": 2
+      }
+    },
+    {
+      "id": "updates.client",
+      "ms": 8000,
+      "source": {
+        "file": "server/updates.mjs",
+        "pattern": "createUpdateClient\\(\\{ socketPath = SOCKET_PATH, timeoutMs = ([\\d_]+) \\} = \\{\\}\\)"
+      },
+      "overrides": [
+        {
+          "file": "server/api/server.mjs",
+          "absent": "createUpdateClient\\(\\{"
+        }
+      ]
+    },
+    {
+      "id": "runtime.events-heartbeat",
+      "ms": 15000,
+      "source": {
+        "file": "server/runtime/data-plane.mjs",
+        "pattern": "const heartbeat = setInterval\\(publish, ([\\d_]+)\\);"
+      }
+    },
+    {
+      "id": "runtime.capabilities-read",
+      "ms": 5000,
+      "source": {
+        "file": "server/runtime/data-plane.mjs",
+        "pattern": "capabilities: await readModuleCapabilities\\(id, \\{ request: capabilitiesRequest, deadline: Date\\.now\\(\\) \\+ ([\\d_]+), signal \\}\\)"
+      }
+    },
+    {
+      "id": "runtime.summary-read",
+      "ms": 5000,
+      "source": {
+        "file": "server/runtime/data-plane.mjs",
+        "pattern": "refreshInterval = 30000, timeoutMs = ([\\d_]+), summaryReader"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/main.mjs",
+          "after": "dataPlane = createDataPlane({",
+          "until": "});",
+          "absent": "timeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "runtime.asset-sync",
+      "ms": 60000,
+      "source": {
+        "file": "server/asset-sync.mjs",
+        "pattern": "intervalMs = 60000, timeoutMs = ([\\d_]+),"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/data-plane.mjs",
+          "after": "assetSync = createAssetSync({",
+          "until": "\n  });",
+          "absent": "timeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "aero.change-budget",
+      "ms": 50000,
+      "source": {
+        "file": "server/automation/aero-safe.mjs",
+        "pattern": "export const CHANGE_BUDGET_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "aero.deadline-margin",
+      "ms": 10000,
+      "source": {
+        "file": "server/automation/aero-safe.mjs",
+        "pattern": "export const CHANGE_DEADLINE_MARGIN_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "portal.connect",
+      "ms": 10000,
+      "source": {
+        "file": "server/portal.mjs",
+        "pattern": "connectTimeoutMs = ([\\d_]+), responseHeaderTimeoutMs = ([\\d_]+),",
+        "group": 1
+      },
+      "overrides": [
+        {
+          "file": "server/api/server.mjs",
+          "absent": "connectTimeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "portal.response-header",
+      "ms": 90000,
+      "source": {
+        "file": "server/portal.mjs",
+        "pattern": "connectTimeoutMs = ([\\d_]+), responseHeaderTimeoutMs = ([\\d_]+),",
+        "group": 2
+      },
+      "overrides": [
+        {
+          "file": "server/api/server.mjs",
+          "absent": "responseHeaderTimeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "portal.authentication",
+      "ms": 10000,
+      "source": {
+        "file": "server/portal.mjs",
+        "pattern": "authenticationTimeoutMs = ([\\d_]+), now"
+      },
+      "overrides": [
+        {
+          "file": "server/api/server.mjs",
+          "absent": "authenticationTimeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "portal.ticket-ttl",
+      "ms": 30000,
+      "source": {
+        "file": "server/portal.mjs",
+        "pattern": "ticketTtlMs = ([\\d_]+), grantTtlMs"
+      },
+      "overrides": [
+        {
+          "file": "server/api/server.mjs",
+          "absent": "ticketTtlMs"
+        }
+      ]
+    },
+    {
+      "id": "monitor.receive",
+      "ms": 30000,
+      "source": {
+        "file": "server/modules/monitor.mjs",
+        "pattern": "server\\.requestTimeout = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "python.receive",
+      "ms": 30000,
+      "source": {
+        "file": "server/modules/python-module.mjs",
+        "pattern": "server\\.requestTimeout = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "python.pending-default",
+      "ms": 60000,
+      "source": {
+        "file": "server/modules/python-module.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+), requireWriterProtection",
+        "group": 1
+      }
+    },
+    {
+      "id": "python.startup-default",
+      "ms": 90000,
+      "source": {
+        "file": "server/modules/python-module.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+), requireWriterProtection",
+        "group": 2
+      }
+    },
+    {
+      "id": "python.shutdown-default",
+      "ms": 10000,
+      "source": {
+        "file": "server/modules/python-module.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+), requireWriterProtection",
+        "group": 3
+      }
+    },
+    {
+      "id": "python.writer-handshake",
+      "ms": 5000,
+      "source": {
+        "file": "server/modules/python-module.mjs",
+        "pattern": "account protection handshake timed out`\\)\\); \\}, ([\\d_]+)\\);"
+      }
+    },
+    {
+      "id": "greeks.pending",
+      "ms": 60000,
+      "source": {
+        "file": "server/modules/greeks.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+) \\}\\)",
+        "group": 1
+      }
+    },
+    {
+      "id": "greeks.startup",
+      "ms": 90000,
+      "source": {
+        "file": "server/modules/greeks.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+) \\}\\)",
+        "group": 2
+      }
+    },
+    {
+      "id": "greeks.shutdown",
+      "ms": 10000,
+      "sameAs": "python.shutdown-default",
+      "source": {
+        "file": "server/modules/greeks.mjs",
+        "absent": "shutdownTimeout"
+      }
+    },
+    {
+      "id": "aster.pending",
+      "ms": 60000,
+      "source": {
+        "file": "server/modules/aster.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+) \\}\\)",
+        "group": 1
+      }
+    },
+    {
+      "id": "aster.startup",
+      "ms": 90000,
+      "source": {
+        "file": "server/modules/aster.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+) \\}\\)",
+        "group": 2
+      }
+    },
+    {
+      "id": "aster.shutdown",
+      "ms": 100000,
+      "source": {
+        "file": "server/modules/aster.mjs",
+        "pattern": "requestTimeout = ([\\d_]+), startupTimeout = ([\\d_]+), shutdownTimeout = ([\\d_]+) \\}\\)",
+        "group": 3
+      }
+    },
+    {
+      "id": "bridge.startup",
+      "ms": 90000,
+      "source": {
+        "file": "server/modules/greeks-bridge.py",
+        "pattern": "timeout=(\\d+) if kind == \"startup\" else shutdown_timeout",
+        "scale": 1000
+      }
+    },
+    {
+      "id": "bridge.exit-extra",
+      "ms": 2000,
+      "source": {
+        "file": "server/modules/greeks-bridge.py",
+        "pattern": "threading\\.Timer\\(shutdown_timeout \\+ (\\d+), lambda: os\\._exit\\(1\\)\\)",
+        "scale": 1000
+      }
+    },
+    {
+      "id": "greeks.bridge-exit",
+      "ms": 12000,
+      "sum": [
+        "greeks.shutdown",
+        "bridge.exit-extra"
+      ]
+    },
+    {
+      "id": "aster.bridge-exit",
+      "ms": 102000,
+      "sum": [
+        "aster.shutdown",
+        "bridge.exit-extra"
+      ]
+    },
+    {
+      "id": "worker.close-aster",
+      "ms": 110000,
+      "source": {
+        "file": "server/modules/worker.mjs",
+        "pattern": "closeTimeoutMs = id === 'aster' \\? ([\\d_]+) : ([\\d_]+);",
+        "group": 1
+      }
+    },
+    {
+      "id": "worker.close-default",
+      "ms": 30000,
+      "source": {
+        "file": "server/modules/worker.mjs",
+        "pattern": "closeTimeoutMs = id === 'aster' \\? ([\\d_]+) : ([\\d_]+);",
+        "group": 2
+      }
+    },
+    {
+      "id": "runtime.stop-aster",
+      "ms": 115000,
+      "source": {
+        "file": "server/modules/runtime.mjs",
+        "pattern": "const stopBudget = id => id === 'aster' \\? ([\\d_]+) : ([\\d_]+);",
+        "group": 1
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/main.mjs",
+          "after": "launchModules({",
+          "until": "});",
+          "absent": "drainTimeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "runtime.stop-default",
+      "ms": 32000,
+      "source": {
+        "file": "server/modules/runtime.mjs",
+        "pattern": "const stopBudget = id => id === 'aster' \\? ([\\d_]+) : ([\\d_]+);",
+        "group": 2
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/main.mjs",
+          "after": "launchModules({",
+          "until": "});",
+          "absent": "drainTimeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "runtime.kill-grace",
+      "ms": 5000,
+      "source": {
+        "file": "server/modules/runtime.mjs",
+        "pattern": "killGraceMs = ([\\d_]+), probeMs"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/main.mjs",
+          "after": "launchModules({",
+          "until": "});",
+          "absent": "killGraceMs"
+        }
+      ]
+    },
+    {
+      "id": "runtime.module-start",
+      "ms": 120000,
+      "source": {
+        "file": "server/modules/runtime.mjs",
+        "pattern": "timeoutMs = ([\\d_]+), restartPolicy"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/main.mjs",
+          "after": "launchModules({",
+          "until": "});",
+          "absent": "timeoutMs"
+        }
+      ]
+    },
+    {
+      "id": "entry.close-grace",
+      "ms": 5000,
+      "source": {
+        "file": "server/entry/main.mjs",
+        "pattern": "export const ENTRY_CLOSE_GRACE_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "launcher.api-stop",
+      "ms": 75000,
+      "source": {
+        "file": "server/launcher.mjs",
+        "pattern": "API_STOP_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "launcher.api-ready",
+      "ms": 60000,
+      "source": {
+        "file": "server/launcher.mjs",
+        "pattern": "API_READY_MS = ([\\d_]+), API_STOP_MS"
+      }
+    },
+    {
+      "id": "browser.aero-change",
+      "ms": 70000,
+      "source": {
+        "file": "src/aero-safe-client.ts",
+        "pattern": "export const CHANGE_TIMEOUT_MS = ([\\d_]+);"
+      }
+    },
+    {
+      "id": "browser.execution-account-write",
+      "ms": 45000,
+      "source": {
+        "file": "src/TradingExecution.tsx",
+        "pattern": "timeoutMs: suffix\\.startsWith\\('/accounts/'\\) \\? ([\\d_]+) : ([\\d_]+) \\}\\)",
+        "group": 1
+      }
+    },
+    {
+      "id": "browser.execution-write",
+      "ms": 30000,
+      "source": {
+        "file": "src/TradingExecution.tsx",
+        "pattern": "timeoutMs: suffix\\.startsWith\\('/accounts/'\\) \\? ([\\d_]+) : ([\\d_]+) \\}\\)",
+        "group": 2
+      }
+    },
+    {
+      "id": "browser.update-apply",
+      "ms": 120000,
+      "source": {
+        "file": "src/UpdateStatus.tsx",
+        "pattern": "\\(kind === 'apply' \\? \\{ timeoutMs: ([\\d_]+) \\} : \\{\\}\\)"
+      }
+    },
+    {
+      "id": "unit.runtime",
+      "ms": 150000,
+      "source": {
+        "unit": "service",
+        "key": "TimeoutStopSec"
+      }
+    },
+    {
+      "id": "unit.api",
+      "ms": 75000,
+      "source": {
+        "unit": "api.service",
+        "key": "TimeoutStopSec"
+      }
+    },
+    {
+      "id": "unit.entry",
+      "ms": 15000,
+      "source": {
+        "unit": "entry.service",
+        "key": "TimeoutStopSec"
+      }
+    },
+    {
+      "id": "unit.slot",
+      "ms": 75000,
+      "source": {
+        "unit": "slot.service",
+        "key": "TimeoutStopSec"
+      }
+    }
+  ],
+  "relations": [
+    {
+      "id": "api-drain-covers-forward",
+      "outer": "api.drain",
+      "inner": [
+        "client.forward"
+      ],
+      "minMarginMs": 0,
+      "status": "holds"
+    },
+    {
+      "id": "forward-covers-capabilities",
+      "outer": "client.forward",
+      "inner": [
+        "runtime.capabilities-read"
+      ],
+      "minMarginMs": 1000,
+      "status": "holds"
+    },
+    {
+      "id": "forward-covers-aero-change",
+      "outer": "client.forward",
+      "inner": [
+        "aero.change-budget",
+        "aero.deadline-margin"
+      ],
+      "minMarginMs": 0,
+      "status": "holds"
+    },
+    {
+      "id": "events-idle-covers-two-heartbeats",
+      "outer": "client.events-idle",
+      "inner": [
+        "runtime.events-heartbeat",
+        "runtime.events-heartbeat"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "stale-covers-heartbeat",
+      "outer": "api.runtime-stale",
+      "inner": [
+        "runtime.events-heartbeat"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "api-unit-covers-api-close",
+      "outer": "unit.api",
+      "inner": [
+        "api.drain",
+        "api.handler-grace",
+        "api.coordinator-close"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "slot-unit-covers-api-close",
+      "outer": "unit.slot",
+      "inner": [
+        "api.drain",
+        "api.handler-grace",
+        "api.coordinator-close"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "launcher-covers-api-close",
+      "outer": "launcher.api-stop",
+      "inner": [
+        "api.drain",
+        "api.handler-grace",
+        "api.coordinator-close"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "coordinator-covers-close-report",
+      "outer": "api.coordinator-close",
+      "inner": [
+        "api.close-report"
+      ],
+      "minMarginMs": 0,
+      "status": "holds"
+    },
+    {
+      "id": "entry-unit-covers-entry-close",
+      "outer": "unit.entry",
+      "inner": [
+        "entry.close-grace"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "aster-worker-covers-bridge-exit",
+      "outer": "worker.close-aster",
+      "inner": [
+        "aster.bridge-exit"
+      ],
+      "minMarginMs": 1000,
+      "status": "holds"
+    },
+    {
+      "id": "aster-stop-covers-worker-close",
+      "outer": "runtime.stop-aster",
+      "inner": [
+        "worker.close-aster"
+      ],
+      "minMarginMs": 1000,
+      "status": "holds"
+    },
+    {
+      "id": "runtime-unit-covers-aster-stop",
+      "outer": "unit.runtime",
+      "inner": [
+        "runtime.stop-aster",
+        "runtime.kill-grace"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
+      "id": "greeks-worker-covers-bridge-exit",
+      "outer": "worker.close-default",
+      "inner": [
+        "greeks.bridge-exit"
+      ],
+      "minMarginMs": 1000,
+      "status": "holds"
+    },
+    {
+      "id": "default-stop-covers-worker-close",
+      "outer": "runtime.stop-default",
+      "inner": [
+        "worker.close-default"
+      ],
+      "minMarginMs": 1000,
+      "status": "holds"
+    },
+    {
+      "id": "runtime-unit-covers-default-stop",
+      "outer": "unit.runtime",
+      "inner": [
+        "runtime.stop-default",
+        "runtime.kill-grace"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
+      "id": "module-start-covers-greeks-startup",
+      "outer": "runtime.module-start",
+      "inner": [
+        "greeks.startup",
+        "python.writer-handshake"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "module-start-covers-aster-startup",
+      "outer": "runtime.module-start",
+      "inner": [
+        "aster.startup",
+        "python.writer-handshake"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "maintenance-covers-module-maintenance",
+      "outer": "protocol.maintenance",
+      "inner": [
+        "runtime.sync-deadline",
+        "updates.module-maintenance"
+      ],
+      "minMarginMs": 1000,
+      "status": "holds"
+    },
+    {
+      "id": "prepare-stop-covers-module-evidence",
+      "outer": "protocol.prepare-stop",
+      "inner": [
+        "updates.capabilities",
+        "updates.status-aster"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "portal-covers-asset-sync",
+      "outer": "portal.response-header",
+      "inner": [
+        "client.asset-sync"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "browser-aero-covers-forward",
+      "outer": "browser.aero-change",
+      "inner": [
+        "client.forward"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "browser-covers-update-apply",
+      "outer": "browser.update-apply",
+      "inner": [
+        "protocol.maintenance",
+        "protocol.prepare-stop",
+        "updates.client",
+        "protocol.maintenance"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "portal-covers-greeks-request",
+      "outer": "portal.response-header",
+      "inner": [
+        "python.receive",
+        "greeks.pending"
+      ],
+      "minMarginMs": 1000,
+      "status": "conflict",
+      "conflict": "C1"
+    },
+    {
+      "id": "portal-covers-aster-request",
+      "outer": "portal.response-header",
+      "inner": [
+        "python.receive",
+        "aster.pending"
+      ],
+      "minMarginMs": 1000,
+      "status": "conflict",
+      "conflict": "C1"
+    },
+    {
+      "id": "api-drain-covers-portal-request",
+      "outer": "api.drain",
+      "inner": [
+        "protocol.read",
+        "portal.response-header"
+      ],
+      "minMarginMs": 0,
+      "status": "conflict",
+      "conflict": "C2"
+    },
+    {
+      "id": "aster-status-covers-bridge",
+      "outer": "updates.status-aster",
+      "inner": [
+        "aster.pending"
+      ],
+      "minMarginMs": 1000,
+      "status": "conflict",
+      "conflict": "C14"
+    },
+    {
+      "id": "api-drain-covers-update-apply",
+      "outer": "api.drain",
+      "inner": [
+        "protocol.maintenance",
+        "protocol.prepare-stop",
+        "updates.client",
+        "protocol.maintenance"
+      ],
+      "minMarginMs": 0,
+      "status": "conflict",
+      "conflict": "C15"
+    },
+    {
+      "id": "client-asset-sync-covers-runtime-sync",
+      "outer": "client.asset-sync",
+      "inner": [
+        "runtime.asset-sync",
+        "runtime.summary-read"
+      ],
+      "minMarginMs": 0,
+      "status": "conflict",
+      "conflict": "C16"
+    },
+    {
+      "id": "maintenance-covers-queued-resyncs",
+      "outer": "protocol.maintenance",
+      "inner": [
+        "runtime.sync-deadline",
+        "runtime.sync-deadline",
+        "runtime.sync-deadline",
+        "updates.module-maintenance"
+      ],
+      "minMarginMs": 0,
+      "status": "conflict",
+      "conflict": "C18"
+    }
+  ]
+}
