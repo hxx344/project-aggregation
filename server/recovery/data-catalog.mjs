@@ -15,8 +15,9 @@
 //   owner          hub, shared, or the module id
 //   category       data (application-encrypted databases and identity evidence) or secrets
 //   required       every backup and restore refuses a checkpoint without it
-//   key            the material that decrypts its credentials (restore.mjs checks
-//                  it against real ciphertext and fails when it is missing)
+//   key            the material that decrypts its credentials; credentials.mjs
+//                  checks it against the stored ciphertext before a handoff
+//                  retires the source and before a restore publishes
 //   checkpoint     bounded by checkpoint evidence, which every handoff and every
 //                  restore runs: `tables` are the journals whose rows and record
 //                  sizes are bounded, `size` bounds the file itself. Absent

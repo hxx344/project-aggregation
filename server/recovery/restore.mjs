@@ -1,13 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { createDecipheriv, randomBytes, randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { parseEnv } from 'node:util';
 import { authenticate, canonical, decryptFile, fileHash, hash, keys, verify } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
 import { registryTransaction, setMeta } from './backup.mjs';
 import { ASTER_CA, ASTER_ENV, budget, category, checkpointEvidence, CONTROL, databaseEvidence, identity, MODULES, readLockedRegistry, readRegistry, REGISTRY, safePath, safeRelative, syncDirectory, syncTreeDirectories, tables, within, writeJson } from './inventory.mjs';
-import { credentialKey, REQUIRED_MATERIAL } from './data-catalog.mjs';
+import { validateCredentials } from './credentials.mjs';
+import { REQUIRED_MATERIAL } from './data-catalog.mjs';
 
 // These represent structurally readable business journals that must survive a
 // quarantined restore. Schema/JSON/enum failures and all future unknown reasons
@@ -83,51 +84,19 @@ async function verifyEmbeddedPaths(directory, body, limits, { source = false, en
     if (await fileHash(safePath(expected), limits.check) !== dependency.sha256) throw new Error('RECOVERY_DEPENDENCY_INVALID');
   }
 }
-function validateCipher(value, key, { tagFirst = false, additionalData, asset = false } = {}) {
-  if (!value) return;
-  try {
-    if (typeof value !== 'string' || value.length > 8 * 1024 * 1024) throw new Error();
-    let iv, encrypted, tag;
-    if (asset) { const data = JSON.parse(value); iv = Buffer.from(data.iv); const all = Buffer.from(data.cipher); encrypted = all.subarray(0, -16); tag = all.subarray(-16); }
-    else { const data = Buffer.from(value, 'base64'); iv = data.subarray(0,12); tag = tagFirst ? data.subarray(12,28) : data.subarray(-16); encrypted = tagFirst ? data.subarray(28) : data.subarray(12,-16); }
-    if (iv.length !== 12 || tag.length !== 16) throw new Error();
-    const cipher = createDecipheriv('aes-256-gcm', key, iv); cipher.setAuthTag(tag); if (additionalData !== undefined) cipher.setAAD(Buffer.from(additionalData));
-    const plaintext = Buffer.concat([cipher.update(encrypted), cipher.final()]);
-    if (asset || tagFirst) JSON.parse(plaintext.toString('utf8')); plaintext.fill(0);
-  } catch { throw new Error('RECOVERY_CREDENTIAL_VALIDATION_FAILED'); }
-}
 function withDb(filename, action) { safePath(filename); const db = new DatabaseSync(filename); try { db.exec('PRAGMA busy_timeout=750; PRAGMA synchronous=FULL'); return action(db, tables(db)); } finally { db.close(); } }
-function keyFile(filename) { safePath(filename); if (fs.statSync(filename).size !== 32) throw new Error('RECOVERY_CREDENTIAL_KEY_INVALID'); return fs.readFileSync(filename); }
 function validateAndRevoke(directory) {
-  const hubKey = keyFile(path.join(directory, credentialKey('hub.sqlite')));
+  const asset = validateCredentials(directory, withDb);
   withDb(path.join(directory, 'hub.sqlite'), (db, present) => {
-    for (const table of ['settings', 'projects', 'sessions']) if (!present.has(table)) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
-    for (const table of ['projects','trading_accounts','execution_accounts']) if (present.has(table)) for (const row of db.prepare('SELECT credentials FROM ' + table + ' WHERE credentials IS NOT NULL').iterate()) validateCipher(row.credentials, hubKey, { tagFirst: true });
     for (const table of ['sessions','execution_previews','execution_lease','execution_entries','login_ip_attempts','login_account_guard','login_pending','portal_tickets','portal_grants']) if (present.has(table)) db.exec('DELETE FROM ' + table);
     db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   });
   const cross = path.join(directory, 'modules/crossex/crossex.sqlite');
-  if (fs.existsSync(cross)) {
-    const crossKey = keyFile(path.join(directory, credentialKey('modules/crossex/crossex.sqlite')));
-    withDb(cross, (db, present) => {
-      if (!present.has('settings')) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
-      const password = db.prepare("SELECT value FROM settings WHERE key='monitorPassword'").get(); if (password) validateCipher(JSON.parse(password.value), crossKey);
-      if (present.has('live_connection')) for (const row of db.prepare('SELECT json FROM live_connection').iterate()) { const value = JSON.parse(row.json); for (const k of ['apiKey','apiSecret']) validateCipher(value[k], crossKey); }
-      for (const table of ['live_previews','live_owner']) if (present.has(table)) db.exec('DELETE FROM ' + table);
-      db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-    });
-  }
-  const asset = path.join(directory, 'modules/asset/ledger.sqlite');
-  const configFile = path.join(directory, credentialKey('modules/asset/ledger.sqlite'));
-  if (fs.existsSync(asset) || fs.existsSync(configFile)) {
-    const config = loadJson(configFile);
-    if (!/^[a-f0-9]{64}$/i.test(config.credentialKey ?? '') || !/^[a-f0-9]{64}$/i.test(config.sessionSecret ?? '') || !/^[a-f0-9]{32}:[a-f0-9]{64}$/i.test(config.passwordHash ?? '')) throw new Error('RECOVERY_CREDENTIAL_KEY_INVALID');
-    if (fs.existsSync(asset)) withDb(asset, (db, present) => {
-      if (!present.has('connections') || !present.has('_schema_migrations')) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
-      for (const row of db.prepare('SELECT owner,exchange,encrypted FROM connections').iterate()) validateCipher(row.encrypted, Buffer.from(config.credentialKey, 'hex'), { asset: true, additionalData: row.owner + ':' + row.exchange });
-    });
-    writeJson(configFile, { ...config, sessionSecret: randomBytes(32).toString('hex') }, { replace: true });
-  }
+  if (fs.existsSync(cross)) withDb(cross, (db, present) => {
+    for (const table of ['live_previews','live_owner']) if (present.has(table)) db.exec('DELETE FROM ' + table);
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  });
+  if (asset) writeJson(asset.configFile, { ...asset.config, sessionSecret: randomBytes(32).toString('hex') }, { replace: true });
 }
 function quarantineRegistry(directory, body, recoveryId, authorityId) {
   const registry = readRegistry(directory, { marker: false });

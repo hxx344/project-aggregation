@@ -60,16 +60,16 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 
 | 情形 | 确定结果 |
 | --- | --- |
-| 已知模块目录下未声明的新文件（含新 SQLite、层级不同的同名文件） | 归 `secrets`，照常备份与恢复 |
+| 已知模块目录下未声明的新文件（含新 SQLite、层级不同的同名文件） | 归 `secrets`，照常备份与恢复。前提与其它文件相同：名字命中排除规则（锁、WAL/SHM、临时文件等）的不备份；SQLite 须通过完整性检查（`RECOVERY_DATABASE_INTEGRITY`）；`.json` 恢复时须是合法 JSON（`RECOVERY_JSON_INVALID`） |
 | `modules/` 下未知模块目录 | 备份拒绝（`RECOVERY_UNKNOWN_MODULE`） |
 | 只有大小写不同的两条路径并存 | 备份成功，恢复拒绝（`RECOVERY_MANIFEST_INVALID`）；备份时尚未拦截，待修复项见[演进计划 E6](evolution-plan.md#e6-模块数据声明s6) |
 | 共享保护库或其 `.required` 标记缺失或改名 | 备份与交接失败（`RECOVERY_FAILED`，读取注册表时即中止）；恢复拒绝（`RECOVERY_REQUIRED_MATERIAL_MISSING`） |
 | `hub.sqlite` 或 `credentials.key` 缺失或改名 | 备份与恢复都拒绝（`RECOVERY_REQUIRED_MATERIAL_MISSING`） |
 | `modules/crossex/crossex.sqlite` 或 `modules/aster/trading.sqlite3` 缺失或改名 | 普通备份成功（新名字归 `secrets`），交接和恢复在检查点证据阶段拒绝（`RECOVERY_CHECKPOINT_LIMIT_OR_INVALID`） |
 | Asset 账本、Monitor 行情库或 Greeks 文件缺失或改名 | 新名字归 `secrets`，按旧名的检查跳过，照常备份与恢复；缺 Greeks `engine_state.json` 时交接拒绝（`RECOVERY_HANDOFF_UNSAFE`），恢复后进入隔离态 |
-| CrossEx 密钥或 Asset `config.json` 缺失（对应库存在） | 恢复失败（`RECOVERY_FAILED`），不发布目标根 |
-| 密钥长度或 Asset 配置字段格式不对 | 恢复拒绝（`RECOVERY_CREDENTIAL_KEY_INVALID`）；配置不是合法 JSON 时为 `RECOVERY_JSON_INVALID` |
-| 密钥与库内密文不匹配 | 恢复拒绝（`RECOVERY_CREDENTIAL_VALIDATION_FAILED`）；库内没有密文时无从比对 |
+| CrossEx 密钥或 Asset `config.json` 缺失（对应库存在） | 交接在退役源端之前拒绝，普通备份照常完成；恢复拒绝。错误码均为 `RECOVERY_CREDENTIAL_KEY_MISSING`，不发布目标根 |
+| 密钥长度不对（对应库存在），或 Asset 配置（账本或配置存在时）不是对象、字段格式不对 | 交接在退役源端之前拒绝，恢复拒绝（`RECOVERY_CREDENTIAL_KEY_INVALID`）；配置不是合法 JSON 时为 `RECOVERY_JSON_INVALID` |
+| 密钥与库内密文不匹配 | 交接在退役源端之前拒绝，恢复拒绝（`RECOVERY_CREDENTIAL_VALIDATION_FAILED`）；库内没有密文时无从比对 |
 | 引用的材料缺失或在数据根外 | 记为未闭合 dependency，普通备份返回 `restorable: false`，`restore` 与 `handoff` 拒绝（`RECOVERY_DEPENDENCY_NOT_INCLUDED`） |
 | 清单条目类别与当前声明不同 | `RECOVERY_MANIFEST_INVALID` |
 

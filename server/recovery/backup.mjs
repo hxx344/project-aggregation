@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { authenticate, canonical, encryptFile, fileHash, hash, keys, verify } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
-import { ASTER_ENV, budget, MODULES, checkpointEvidence, checkpointSourceDatabase, databaseEvidence, discoverPathBindings, identity, inventory, openLockedSourceDatabase, readLockedRegistry, readRegistry, REGISTRY, safePath, syncDirectory, within, writeJson } from './inventory.mjs';
+import { ASTER_ENV, budget, category, MODULES, checkpointEvidence, checkpointSourceDatabase, databaseEvidence, discoverPathBindings, identity, inventory, openLockedSourceDatabase, tables, readLockedRegistry, readRegistry, REGISTRY, safePath, syncDirectory, within, writeJson } from './inventory.mjs';
+import { checkCredentialMaterial, validateCredentials } from './credentials.mjs';
 
 export function registryTransaction(dataDir, action) {
   const db = new DatabaseSync(path.join(dataDir, REGISTRY));
@@ -46,9 +47,10 @@ export async function createBackup(options) {
   const files = inventory(source, limits).filter(entry => !(rootEnvironment && entry.path === '_recovery/root.env'));
   const dependencies = discoverPathBindings(source, files, environment);
   if (kind === 'handoff' && dependencies.unresolvedDependencies.length) throw new Error('RECOVERY_DEPENDENCY_NOT_INCLUDED');
+  if (kind === 'handoff') checkCredentialMaterial(source);
   const workspace = path.join(path.dirname(target), '.' + path.basename(target) + '.incomplete-' + checkpointId);
   fs.mkdirSync(workspace, { mode: 0o700 }); const plain = path.join(workspace, '.plaintext'); fs.mkdirSync(plain, { mode: 0o700 });
-  for (const category of ['data', 'secrets']) fs.mkdirSync(path.join(workspace, category), { mode: 0o700 });
+  for (const bucket of ['data', 'secrets']) fs.mkdirSync(path.join(workspace, bucket), { mode: 0o700 });
   try {
     limits.space(workspace, files.reduce((n, f) => n + f.size * 2 + 1024, 0));
     let safety = null;
@@ -58,6 +60,11 @@ export async function createBackup(options) {
       }
       limits.check(); safety = await checkpointEvidence(source, limits, environment);
       if (safety?.safeForHandoff !== true) throw new Error('RECOVERY_HANDOFF_UNSAFE');
+      // The source is retired below; a restore of this archive must not fail on its credentials.
+      limits.check(); validateCredentials(source, (filename, action) => {
+        const db = openLockedSourceDatabase(filename, { lock, dataDir: source });
+        try { return action(db, tables(db)); } finally { db.close(); }
+      });
     }
     const entries = []; let actualBytes = 0, manifestBytes = 0;
     for (const file of files) {
@@ -85,20 +92,20 @@ export async function createBackup(options) {
       if (!Buffer.isBuffer(rootEnvironment.content) || rootEnvironment.relativeName !== 'root.env') throw new Error('RECOVERY_ENVIRONMENT_INVALID');
       if (actualBytes + rootEnvironment.content.length > limits.maxBytes) throw new Error('RECOVERY_LIMIT_EXCEEDED');
       limits.add(rootEnvironment.content.length); const staged = path.join(plain, 'root.env'); fs.writeFileSync(staged, rootEnvironment.content, { flag: 'wx', mode: 0o600 });
-      const entry = { path: '_recovery/root.env', size: rootEnvironment.content.length, sha256: hash(rootEnvironment.content), category: 'secrets' };
+      const entry = { path: '_recovery/root.env', size: rootEnvironment.content.length, sha256: hash(rootEnvironment.content), category: category('_recovery/root.env') };
       const payload = path.join(workspace, 'secrets', String(entries.length) + '.gcm');
       await encryptFile(staged, payload, secretsKey, checkpointId, entry, limits.check); entry.payloadSha256 = await fileHash(payload, limits.check); fs.rmSync(staged); entries.push(entry);
     }
     if (dependencies.syntheticEnv) {
       limits.add(0); const staged = path.join(plain, 'aster.env'); fs.writeFileSync(staged, '', { flag: 'wx', mode: 0o600 });
-      const entry = { path: ASTER_ENV, size: 0, sha256: hash(''), category: 'secrets' }; const payload = path.join(workspace, 'secrets', entries.length + '.gcm');
+      const entry = { path: ASTER_ENV, size: 0, sha256: hash(''), category: category(ASTER_ENV) }; const payload = path.join(workspace, 'secrets', entries.length + '.gcm');
       await encryptFile(staged, payload, secretsKey, checkpointId, entry, limits.check); entry.payloadSha256 = await fileHash(payload, limits.check); fs.rmSync(staged); entries.push(entry);
     }
     limits.check();
     const body = { schemaVersion: 1, protocol: 'cold-checkpoint-v1', checkpointId, kind, ...(handoffId ? { handoffId } : {}), sourceAuthorityId: registry.state.authorityId, registryId: registry.registryId, sourceIdentity: registry.identity, sourceMarker: registry.marker, commit, startedAt, completedAt: new Date().toISOString(), modules: MODULES, safety, pathBindings: dependencies.pathBindings, unresolvedDependencies: dependencies.unresolvedDependencies, entries };
     const manifest = authenticate(body, dataKey, secretsKey);
     fs.rmSync(plain, { recursive: true });
-    for (const category of ['data','secrets']) syncDirectory(path.join(workspace, category));
+    for (const bucket of ['data','secrets']) syncDirectory(path.join(workspace, bucket));
     writeJson(path.join(workspace, 'manifest.json'), manifest); limits.check();
     if (kind === 'handoff') {
       if ((await checkpointEvidence(source, limits, environment)).safeForHandoff !== true) throw new Error('RECOVERY_HANDOFF_UNSAFE');
