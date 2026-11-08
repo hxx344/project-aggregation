@@ -1,7 +1,7 @@
 import { createHmac } from 'node:crypto';
 
 // OKX v5 request signing (docs/evolution-plan.md E2): the one JS implementation
-// for Asset now and the Hub clients when they migrate. The prehash is
+// for Asset and the Hub OKX protocol (server/trading-okx-common.mjs). The prehash is
 // timestamp + method + requestPath (including ?query) + the exact body text.
 const METHODS = new Set(['GET', 'POST']);
 

@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { okxAuthHeaders, okxSignature } from '../server/exchange-transport/okx.mjs';
 import { ExchangeResponseError, readJsonResponse } from '../server/exchange-transport/response.mjs';
-import { createOkxProtocol } from '../server/trading-okx-common.mjs';
+import { createOkxProtocol, OkxProtocolError } from '../server/trading-okx-common.mjs';
 
 // Shared exchange transport (docs/evolution-plan.md E2). The pinned signatures
-// fix the OKX prehash; the Hub comparison proves the shared signer matches the
-// implementation the Hub clients still use until they migrate.
+// fix the OKX prehash (tests/trading-okx.test.mjs recomputes it independently);
+// the Hub comparison fixes that the signed path, query and body are the ones sent.
 const credentials = { apiKey: 'test-key', apiSecret: 'test-secret', passphrase: 'test-pass' };
 const at = '2026-11-07T00:00:00.000Z';
 const order = '{"instId":"CL-USDT-SWAP","sz":"1"}';
@@ -30,7 +30,7 @@ test('OKX signing refuses a request it cannot sign exactly', () => {
   assert.throws(() => okxSignature('', { timestamp: at, method: 'GET', requestPath: '/api/v5/account/config' }), TypeError);
 });
 
-test('the shared OKX signer sends the same headers as the Hub protocol', async () => {
+test('the Hub protocol signs with the exact path, query and body it sends', async () => {
   const sent = [];
   const fetchImpl = async (url, init) => {
     sent.push({ url: new URL(url), init });
@@ -44,6 +44,28 @@ test('the shared OKX signer sends the same headers as the Hub protocol', async (
     for (const [name, value] of Object.entries(expected)) assert.equal(init.headers[name], value, `${init.method} ${url.pathname} ${name}`);
   }
   assert.equal(sent.length, 2);
+});
+
+// The Hub keeps its own codes on top of the shared reader: a mutation whose
+// response is unreadable stays uncertain, a read does not.
+test('the Hub protocol maps shared reading failures to its codes and uncertainty', async () => {
+  const cases = [
+    ['positions', () => new Response('x'.repeat(2 * 1024 * 1024 + 1)), 'response_limit', false],
+    ['create', () => new Response('x'.repeat(2 * 1024 * 1024 + 1)), 'response_limit', true],
+    ['create', () => new Response('{"code":'), 'invalid_data', true],
+    ['positions', () => new Response('<html></html>', { status: 200 }), 'invalid_data', false],
+    ['positions', () => new Response('\ufeff{"code":"0","data":[]}'), null, false],
+  ];
+  // A failure code the shared reader does not have today.
+  const future = () => ({ ok: true, status: 200, headers: new Headers(), body: { getReader: () => ({
+    read: async () => { throw new ExchangeResponseError('future_code'); }, cancel: async () => {}, releaseLock() {} }) } });
+  cases.push(['create', future, 'invalid_data', true], ['positions', future, 'invalid_data', false]);
+  for (const [operation, reply, expected, uncertain] of cases) {
+    const protocol = createOkxProtocol({ fetchImpl: async () => reply(), now: () => Date.parse(at) });
+    const call = protocol.request(operation, credentials, operation === 'create' ? JSON.parse(order) : { instType: 'SWAP' });
+    if (expected === null) { assert.deepEqual(await call, [], 'a leading BOM is accepted'); continue; }
+    await assert.rejects(call, (error) => error instanceof OkxProtocolError && error.code === expected && error.uncertain === uncertain, `${operation} ${expected}`);
+  }
 });
 
 const stream = (chunks, { length } = {}) => new Response(new ReadableStream({
