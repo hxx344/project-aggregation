@@ -114,6 +114,7 @@ Binance、Bybit、OKX 的签名、时间戳、超时、限流退避和数字解�
 - 交付输入：共享包的直接和传递源码依赖必须进入消费者构建键、冻结安装材料、可信源码提取、独立发布包及 runtime 激活指纹，覆盖 `deploy/package-release.py`、`deploy/pnpm-module-inputs.py`、`scripts/modules.mjs` 与 `deploy/install.sh` 的固定输入。
 - 退出条件：按交易所记录已迁移调用方，范围内签名与解析只保留一份 JS 实现；仅改共享包源码时，Asset 缓存失效并重建，Hub runtime 激活指纹改变并重启。冷安装、跨目录热缓存及脱离工作树的发布包均加载目标实现，无变化重跑保留增量跳过。
 - 回滚：每个只读批次可还原调用方和包依赖并重新生成产物与指纹；执行批次另验证原持久记录的兼容恢复。
+- 状态（2026-11-07 第一批完成）：共享代码放在 `server/exchange-transport/`，消费方用相对路径引用，沿用 `server/hub-navigation.mjs` 的先例。`packages/` + `workspace:*` 会让 `deploy/pnpm-module-inputs.py`、`deploy/package-release.py` 拒绝 link 依赖，冻结依赖缓存里也只有空壳（L019），因此不采用。`okx.mjs` 是 OKX 签名，`response.mjs` 是有上限的 JSON 读取；已迁移 Asset `lib/okx.ts`（OKX 签名与读取）和 `lib/positions-readers.ts`（OKX 签名，以及所有交易所共用的响应读取）。该目录整体计入 Asset 构建键（`scripts/modules.mjs`、`deploy/install.sh`），由 `deploy/test-module-builds.mjs`、`deploy/test-inputs.sh` 验证；runtime 指纹、可信提取与发布包本来就覆盖 `server/`。尚未迁移：Hub `server/trading-okx-common.mjs` 仍有一份 OKX 签名与读取，它同时服务执行路径，下一批按 R3 迁移；Binance、Bybit 签名留到之后的批次。
 
 #### E3 对齐开发进程边界（S3）
 
@@ -203,7 +204,7 @@ flowchart TD
 ## 7 待决策
 
 1. ~~E1 盘点后确定完整的版本 1 布局、受支持历史布局和上一可回滚版本。~~ 已在 [hub.sqlite 结构盘点](hub-schema-inventory.md#7-唯一迁移入口与后续批次) 第 7 节确定。
-2. E2 首批固定包路径（优先 `packages/`）与交易所范围；若改为 `server/` 路径引用，仍须完成同样的依赖闭包与交付验收。
+2. ~~E2 首批固定包路径（优先 `packages/`）与交易所范围；若改为 `server/` 路径引用，仍须完成同样的依赖闭包与交付验收。~~ 已定为 `server/exchange-transport/`，首批为 OKX 只读，见 E2 状态。
 3. 凭据密钥是否合并（E6）单独评估，不阻塞声明整理；本文不授权变更现有密钥布局。
 
 ## 8 不再列为待办

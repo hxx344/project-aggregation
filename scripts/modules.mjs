@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -36,6 +36,8 @@ if (selected.some(id => !builds.some(build => build.id === id)) || new Set(selec
 const manifests = ['package.json', ...builds.map(({ importer }) => `${importer}/package.json`)];
 const sharedInputs = [...manifests, 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'scripts/modules.mjs'];
 const moduleSharedInputs = ['server/hub-navigation.mjs', 'server/hub-navigation.d.mts', 'server/asset-identity.mjs', 'server/asset-identity.d.mts', 'server/capital-metrics.mjs', 'server/capital-metrics.d.mts'];
+// Asset reads exchanges through the shared transport (docs/evolution-plan.md E2).
+const assetSharedInputs = ['server/exchange-transport'];
 const environment = JSON.stringify({
   node: process.version, platform: process.platform, arch: process.arch,
   manager: process.env.npm_config_user_agent.split(' ')[0],
@@ -44,11 +46,15 @@ const environment = JSON.stringify({
 const ignored = new Set(['node_modules', 'dist', '.next', '.vinext', '.wrangler', '.build-cache', '.module-cache', '.git', '__pycache__', '.pytest_cache', '.venv', '.data', 'output']);
 function digest(directory, buildDirectory) {
   const hash = createHash('sha256').update('embedded-workspace-build-v2:' + environment);
-  const inputs = ['monitor', 'crossex'].includes(path.basename(directory)) ? [...sharedInputs, ...moduleSharedInputs] : sharedInputs;
-  for (const relative of inputs) {
+  const name = path.basename(directory);
+  const inputs = ['monitor', 'crossex'].includes(name) ? [...sharedInputs, ...moduleSharedInputs] : name === 'asset' ? [...sharedInputs, ...assetSharedInputs] : sharedInputs;
+  const input = relative => {
     const file = path.join(root, relative);
-    hash.update(relative).update(existsSync(file) ? readFileSync(file) : '<absent>');
-  }
+    if (existsSync(file) && statSync(file).isDirectory()) {
+      for (const entry of readdirSync(file).sort()) if (!ignored.has(entry)) input(`${relative}/${entry}`);
+    } else hash.update(relative).update(existsSync(file) ? readFileSync(file) : '<absent>');
+  };
+  for (const relative of inputs) input(relative);
   // Environment files are build inputs, but their contents never enter logs/stamps.
   for (const base of new Set([root, directory, buildDirectory])) for (const name of ['.env', '.env.local', '.env.production', '.env.production.local']) {
     const file = path.join(base, name);

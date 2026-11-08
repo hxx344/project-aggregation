@@ -176,6 +176,17 @@ for file in capital-metrics.mjs capital-metrics.d.mts; do
      ${module_build_keys[aster]} == "${module_before[3]}" ]]
   module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
 done
+# The shared exchange transport is an Asset build input as a directory, so a
+# new file counts too; it is also Hub runtime source.
+mkdir -p "$source_dir/server/exchange-transport"
+for file in okx.mjs response.d.mts added.mjs; do
+  capture
+  embedded_before=$embedded_key
+  echo shared-transport > "$source_dir/server/exchange-transport/$file"; refresh; compare 0 0 1 0 1
+  compare_module_inputs 0 1 0 0
+  [[ $embedded_key != "$embedded_before" ]]
+  module_before=(${module_build_keys[monitor]} ${module_build_keys[asset]} ${module_build_keys[crossex]} ${module_build_keys[aster]})
+done
 capture
 echo source > "$source_dir/modules/monitor/server.mjs"; refresh; compare 0 0 1 0 1
 [[ ${module_build_keys[monitor]} != "${module_before[0]}" && ${module_build_keys[asset]} == "${module_before[1]}" &&

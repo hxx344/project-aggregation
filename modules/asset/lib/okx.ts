@@ -1,4 +1,5 @@
-import { createHmac } from 'node:crypto';
+import { okxAuthHeaders } from '../../../server/exchange-transport/okx.mjs';
+import { readJsonResponse } from '../../../server/exchange-transport/response.mjs';
 import type { Balance } from './types';
 
 export type OkxCredential = { apiKey: string; apiSecret: string; passphrase: string };
@@ -15,6 +16,7 @@ const ACCOUNT_NAMES = {
   classic: '经典账户（USD 估值）',
 } as const;
 const INCOMPLETE = 'OKX 返回的账户数据不完整；已保留上次数据';
+const MAX_BODY_BYTES = 2_000_000;
 const READ_FAILED = 'OKX 读取失败，请检查网络、API 权限、IP 白名单及服务器时间；已保留上次数据';
 
 function isObject(value: unknown): value is Json {
@@ -40,17 +42,9 @@ export async function okxGet(c: OkxCredential, path: string, fetcher: Fetcher = 
   const requestPath = path + (path === VALUATION_PATH ? '?ccy=USD' : '');
   let response: Response;
   try {
-    const timestamp = new Date().toISOString();
-    const signature = createHmac('sha256', c.apiSecret).update(timestamp + 'GET' + requestPath).digest('base64');
     response = await fetcher('https://openapi.okx.com' + requestPath, {
       method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'OK-ACCESS-KEY': c.apiKey,
-        'OK-ACCESS-SIGN': signature,
-        'OK-ACCESS-TIMESTAMP': timestamp,
-        'OK-ACCESS-PASSPHRASE': c.passphrase,
-      },
+      headers: { 'Content-Type': 'application/json', ...okxAuthHeaders(c, { timestamp: new Date().toISOString(), method: 'GET', requestPath }) },
       redirect: 'manual',
       signal: AbortSignal.timeout(12000),
     });
@@ -63,7 +57,7 @@ export async function okxGet(c: OkxCredential, path: string, fetcher: Fetcher = 
     throw new Error(`OKX 读取失败${status}，请检查网络、API 权限及服务器时间；已保留上次数据`);
   }
   let data: unknown;
-  try { data = await response.json(); }
+  try { data = await readJsonResponse(response, { maxBytes: MAX_BODY_BYTES }); }
   catch { throw new Error(READ_FAILED); }
   if (!isObject(data)) throw new Error(INCOMPLETE);
   if (data.code !== '0') {
