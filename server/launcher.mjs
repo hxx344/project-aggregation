@@ -7,10 +7,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // Initial design values (design doc 3.1): a crashed API restarts with this
 // backoff, which resets once an instance stayed up API_STABLE_MS; an API that
 // is not ready within API_READY_MS or does not stop within API_STOP_MS is
-// ended; API_STOP_MS covers the API's 60 s drain, like its unit's
-// TimeoutStopSec. The runtime gets no deadline here: the service manager's apply.
+// ended; API_STOP_MS covers the API's 61 s drain and RUNTIME_STOP_MS the
+// runtime's ASTER stop, like their units' TimeoutStopSec (docs/timeout-budgets.md, C10).
 const API_BACKOFF_MS = [1000, 2000, 4000, 8000, 16_000, 30_000];
-const API_STABLE_MS = 60_000, API_READY_MS = 60_000, API_STOP_MS = 75_000;
+const API_STABLE_MS = 60_000, API_READY_MS = 60_000, API_STOP_MS = 75_000, RUNTIME_STOP_MS = 150_000;
 const running = child => child.exitCode === null && child.signalCode === null;
 
 // Runs the runtime and the API as two child processes of one service unit.
@@ -19,7 +19,7 @@ const running = child => child.exitCode === null && child.signalCode === null;
 // first, then the runtime. `done` resolves with the exit code for the unit;
 // `onApiReady({ port, runtimePid, apiPid })` follows each API start.
 export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), apiEntry = path.join(here, 'api/main.mjs'), env = process.env, logger = defaultLogger, onApiReady = () => {},
-  apiBackoffMs = API_BACKOFF_MS, apiStableMs = API_STABLE_MS, apiReadyMs = API_READY_MS, apiStopMs = API_STOP_MS }) {
+  apiBackoffMs = API_BACKOFF_MS, apiStableMs = API_STABLE_MS, apiReadyMs = API_READY_MS, apiStopMs = API_STOP_MS, runtimeStopMs = RUNTIME_STOP_MS }) {
   let runtime = null, api = null, restartTimer = null, readyTimer = null, failures = 0, code = 0, stopping = null;
   let finish; const done = new Promise(resolve => { finish = resolve; });
   // `onExit({ ready, exitCode, signal })` runs once, also when the process could not be started.
@@ -56,10 +56,10 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
       restartTimer = setTimeout(startApi, delay);
     });
   }
-  async function terminate(child, graceMs) {
+  async function terminate(child, graceMs, label) {
     if (!child || !running(child)) return;
     child.kill('SIGTERM');
-    const timer = graceMs ? setTimeout(() => { logger.error({ type: 'launcher' }, 'API 未在期限内退出，正在强制结束'); child.kill('SIGKILL'); }, graceMs) : null;
+    const timer = setTimeout(() => { logger.error({ type: 'launcher' }, `${label}未在期限内退出，正在强制结束`); child.kill('SIGKILL'); }, graceMs);
     await child.exited; clearTimeout(timer);
   }
   function stop(value = 0) {
@@ -67,8 +67,8 @@ export function launch({ runtimeEntry = path.join(here, 'runtime/main.mjs'), api
     return stopping ??= (async () => {
       // The stop deadline applies from here on, not the ready deadline.
       clearTimeout(restartTimer); clearTimeout(readyTimer);
-      await terminate(api, apiStopMs);
-      await terminate(runtime, null);
+      await terminate(api, apiStopMs, 'API ');
+      await terminate(runtime, runtimeStopMs, '运行时');
       finish(code);
       return code;
     })();

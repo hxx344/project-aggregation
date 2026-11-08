@@ -98,6 +98,34 @@ test('managed native four-leg siblings share one preflight and all final sends u
   assert.deepEqual(f.writer.snapshot().operations, [{ moduleId: 'hub', state: 'confirmed', count: 4 }]);
 });
 
+test('a preview or connection whose caller left aborts its exchange calls and keeps nothing', async t => {
+  const f = await fixture(t);
+  const held = [];
+  const hold = (...args) => { const { signal } = args.find(arg => arg?.signal instanceof AbortSignal); held.push(signal); return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); };
+  f.handlers['binance:market'] = hold;
+  const preview = new AbortController();
+  const previewing = instancePreview(f, preview.signal);
+  await waitFor(() => held.length > 0);
+  preview.abort();
+  await assert.rejects(previewing, error => error.status === 503);
+  assert.ok(held.every(signal => signal.aborted));
+  delete f.handlers['binance:market'];
+  f.handlers['bybit:verify'] = hold;
+  const connection = new AbortController(), count = held.length;
+  const connecting = f.service.connect('bybit', { revision: 1, accountMode: 'unified', apiKey: 'replacement_key', apiSecret: 'replacement_secret' }, 'session-a', { signal: connection.signal });
+  await waitFor(() => held.length > count);
+  connection.abort();
+  await assert.rejects(connecting, error => error.status === 503);
+  delete f.handlers['bybit:verify'];
+  // Nothing was saved: the connection keeps its revision and an aborted signal never reaches an exchange.
+  await f.service.connect('bybit', { revision: 1, accountMode: 'unified', apiKey: 'replacement_key', apiSecret: 'replacement_secret' });
+  const calls = f.calls.length;
+  await assert.rejects(f.service.preview(intent(), 'session-a', { signal: AbortSignal.abort() }), error => error.status === 503);
+  assert.equal(f.calls.length, calls);
+});
+const instancePreview = (f, signal) => f.service.preview(intent(), 'session-a', { signal });
+const waitFor = async predicate => { const end = Date.now() + 2000; while (!predicate()) { assert.ok(Date.now() < end, 'timed out'); await new Promise(resolve => setTimeout(resolve, 5)); } };
+
 test('managed missing UID remains readable and cannot submit or unblock another module in the same scope', async t => {
   const f = await fixture(t, { guarded: true });
   f.accounts.bybit.identity = null;

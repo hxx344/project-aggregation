@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import http from 'node:http';
 import { createPythonModule } from '../server/modules/python-module.mjs';
 import { pythonExecutable } from '../server/modules/greeks.mjs';
 
@@ -27,4 +28,24 @@ test('real Python stdio handshake rejects missing, incompatible and unauthentica
     await assert.rejects(start(value), /shared account protection is unavailable/);
   }
   await assert.rejects(start(valid, []), /shared account protection is unavailable/);
+});
+
+test('the bridge ignores SIGTERM while its worker lives and refuses an event stream at once', async () => {
+  const module = await start(valid);
+  try {
+    await new Promise(resolve => module.server.listen(0, '127.0.0.1', resolve));
+    const get = path => new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port: module.server.address().port, path, agent: false, headers: { 'x-workspace-key': 'protocol-fixture-secret' } }, response => {
+      response.resume(); response.once('end', () => resolve(response.statusCode));
+    }).on('error', reject));
+    // systemd signals the whole unit; the worker, still alive, stops the bridge in its own order.
+    module.child.kill('SIGTERM');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(module.child.exitCode, null);
+    assert.equal(module.child.signalCode, null);
+    const started = Date.now();
+    assert.equal(await get('/fixture-stream'), 502);
+    assert.ok(Date.now() - started < 2000, 'refused at once, not at the pending deadline');
+    assert.equal(await get('/'), 200);
+  } finally { module.server.closeAllConnections(); await new Promise(resolve => module.server.close(resolve)); await module.close(); }
+  assert.ok(module.child.exitCode !== null || module.child.signalCode);
 });

@@ -12,6 +12,10 @@ async def app(scope, receive, send):
             elif event["type"] == "lifespan.shutdown":
                 await send({"type": "lifespan.shutdown.complete"})
                 return
+    if scope["path"] == "/fixture-stream":
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"text/event-stream")]})
+        await send({"type": "http.response.body", "body": b"data: 1\n\n", "more_body": True})
+        return
     headers = dict(scope["headers"])
     authenticated = headers.get(b"x-fixture-private") == b"trusted-parent"
     status = json.loads(os.environ["FIXTURE_WRITER_STATUS"])

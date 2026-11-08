@@ -60,9 +60,12 @@ export function createAssetSync({
     if (stored?.revision === target.revision) return { ...stored.status };
     return baseStatus('idle', '等待后台同步', lastStarts.has(id) ? asTime(lastStarts.get(id) + period) : null);
   }
-  function start(target) {
+  // A job started for run() callers alone (`cancelable`) is aborted once the
+  // last of them leaves; a background round or a caller without a signal keeps
+  // it running (docs/timeout-budgets.md, C7).
+  function start(target, cancelable = false) {
     const id = target.project.id;
-    if (pending.has(id)) return pending.get(id).promise;
+    if (pending.has(id)) { const job = pending.get(id); job.cancelable &&= cancelable; return job.promise; }
     if (!eligible(target) || closed) return Promise.resolve(null);
     const started = now();
     if (lastStarts.has(id) && started - lastStarts.get(id) < period) return Promise.resolve(getStatus(id));
@@ -72,7 +75,7 @@ export function createAssetSync({
     const status = { ...baseStatus('syncing', '正在后台同步资产', asTime(started + period)), startedAt: asTime(started), lastSuccessAt: priorSuccess };
     statuses.set(id, { revision: target.revision, status });
     const controller = new AbortController();
-    const job = { controller, revision: target.revision, promise: null };
+    const job = { controller, revision: target.revision, promise: null, cancelable, waiters: 0 };
     pending.set(id, job);
     const project = { ...target.project };
     const credentials = { ...target.credentials };
@@ -83,7 +86,7 @@ export function createAssetSync({
       let failure;
       try {
         const canceled = new Promise((_, reject) => {
-          aborted = () => reject(new UpstreamError('timeout', '资产同步超时'));
+          aborted = () => reject(controller.signal.reason instanceof UpstreamError ? controller.signal.reason : new UpstreamError('timeout', '资产同步超时'));
           controller.signal.addEventListener('abort', aborted, { once: true });
         });
         timeout = setTimeout(() => controller.abort(), timeLimit);
@@ -105,6 +108,7 @@ export function createAssetSync({
         if (failure) {
           state = failure.code === 'unauthorized' ? 'unauthorized' : 'error';
           message = state === 'unauthorized' ? '资产登录失效或来源配置不匹配，请检查项目设置' :
+            failure.code === 'canceled' ? '资产同步已取消（发起的请求已结束），保留已有账本' :
             failure.code === 'timeout' ? '资产同步超时，保留已有账本和源更新时间' : '资产同步未完成，保留已有账本，请检查原项目状态';
         }
         const finished = now();
@@ -120,14 +124,25 @@ export function createAssetSync({
     if (closed) return [];
     const currentTargets = targets();
     reconcile(currentTargets);
-    return Promise.allSettled([...currentTargets.values()].filter(eligible).map(start));
+    return Promise.allSettled([...currentTargets.values()].filter(eligible).map(target => start(target)));
   }
-  async function run(id) {
+  async function run(id, { signal } = {}) {
     if (closed) return null;
     const currentTargets = targets();
     reconcile(currentTargets);
     const target = currentTargets.get(id);
-    return target ? start(target) : null;
+    if (!target) return null;
+    if (signal?.aborted) return getStatus(id);
+    const promise = start(target, !!signal), job = pending.get(id);
+    if (!signal || job?.promise !== promise) return promise;
+    job.waiters += 1;
+    let left = false;
+    const leave = () => {
+      if (left) return; left = true; job.waiters -= 1;
+      if (!job.waiters && job.cancelable) job.controller.abort(new UpstreamError('canceled', '资产同步已取消'));
+    };
+    signal.addEventListener('abort', leave, { once: true });
+    try { return await promise; } finally { signal.removeEventListener('abort', leave); if (!left) { left = true; job.waiters -= 1; } }
   }
   async function close() {
     if (closed) return;

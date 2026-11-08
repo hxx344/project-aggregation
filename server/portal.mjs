@@ -24,6 +24,12 @@ const hopHeaders = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'p
 // still gets its 401, which the installer's probe expects.
 const CANDIDATE = '候选实例尚未接管服务';
 
+// Event streams and WebSockets have no response deadline and no idle limit (a
+// quiet stream is legitimate); TCP keepalive probes the browser's connection
+// from this long of silence on, so a peer that vanished from the network is
+// noticed instead of holding the stream until API drain (docs/timeout-budgets.md, C12).
+const STREAM_KEEPALIVE_MS = 30_000;
+
 class PortalError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
@@ -80,8 +86,8 @@ function framePolicy(value, hubOrigin) {
  * getProjectRevision(id): opaque revision string covering configuration and credentials.
  * isSessionValid(id): whether the hashed hub session id remains valid.
  * authenticateProject({projectId, revision, deadline, signal}): optional fresh server-side login per grant.
- * coordinateAssetSync({projectId, revision}): optional shared background Promise<{state, message}>.
- * Client cancellation never cancels that shared background promise.
+ * coordinateAssetSync({projectId, revision, signal}): optional shared background Promise<{state, message}>.
+ * One client leaving does not cancel it; `signal` aborts once no client waits any more.
  * createLaunch is called only by the authenticated, CSRF-protected hub API.
  * store: server/control/portal-store.mjs; tickets and grants without upstream
  * authentication live there, shared by every API instance. Grants carrying
@@ -89,6 +95,8 @@ function framePolicy(value, hubOrigin) {
  */
 export function createPortal({ store, getProjects, getProjectRevision, isSessionValid, coordinateAssetSync, authenticateProject, withMutation, resolveTransport = async base => moduleTransport(base), authenticationTimeoutMs = 10000, now = Date.now, ticketTtlMs = 30000, grantTtlMs = 12 * 3600000, connectTimeoutMs = 10000, responseHeaderTimeoutMs = 90000, maxRequestBytes = 16 * 1024 * 1024, dnsLookup = lookup, isServing = () => true } = {}) {
   if (![getProjects, getProjectRevision, isSessionValid].every(value => typeof value === 'function') || !store) throw new Error('项目代理需要授权存储以及项目、版本和会话校验回调');
+  // Used as given; a value it cannot use is refused instead of silently capped (docs/timeout-budgets.md, C9).
+  if (!Number.isSafeInteger(authenticationTimeoutMs) || authenticationTimeoutMs < 1 || authenticationTimeoutMs > 2 ** 31 - 1) throw new TypeError('authenticationTimeoutMs must be a whole number of milliseconds from 1 to 2^31-1');
   // revoking: stored grants this process revoked whose row could not be deleted yet (busy database).
   const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
   // draining: the API is closing; upgraded connections and event streams end, other requests finish.
@@ -214,7 +222,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     const stream = { grant: ticket, destroy: () => { abort(new PortalError(401, '项目入口已失效，请从工作台重新打开')); res.destroy(); } };
     const aborted = new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }));
     active.add(stream); res.once('close', disconnected); req.once('aborted', disconnected);
-    const limit = Math.max(1, Math.min(10000, authenticationTimeoutMs));
+    const limit = authenticationTimeoutMs;
     const timer = setTimeout(() => abort(new PortalError(504, '项目自动登录超时，请返回工作台检查登录信息后重新打开')), limit);
     const check = () => { if (!liveGrant(ticket) || req.aborted || req.socket.destroyed || res.destroyed || controller.signal.aborted) throw new PortalError(401, '项目入口已失效，请从工作台重新打开'); };
     try {
@@ -334,7 +342,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
 
   async function coordinatedSync(req, res, context, project, grant, target) {
     const transports = new Set();
-    let rejectStopped; let canceled = false;
+    let rejectStopped; let canceled = false; let joined = null;
     const stopped = new Promise((_, reject) => { rejectStopped = reject; });
     stopped.catch(() => {});
     const check = () => {
@@ -382,10 +390,14 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       let flight = syncFlights.get(key);
       if (!flight) {
         if (syncFlights.size >= 60) throw new PortalError(429, '资产同步等待过多，请稍后重试');
-        flight = Promise.resolve().then(() => { check(); return coordinateAssetSync({ projectId: project.id, revision: grant.revision }); }).finally(() => { if (syncFlights.get(key) === flight) syncFlights.delete(key); });
-        syncFlights.set(key, flight);
+        // The flight is aborted once its last waiter leaves, so the runtime's sync stops too (C7).
+        const entry = flight = { controller: new AbortController(), waiters: 0, settled: false };
+        entry.promise = Promise.resolve().then(() => { check(); return coordinateAssetSync({ projectId: project.id, revision: grant.revision, signal: entry.controller.signal }); })
+          .finally(() => { entry.settled = true; if (syncFlights.get(key) === entry) syncFlights.delete(key); });
+        syncFlights.set(key, entry);
       }
-      const result = await wait(flight); check();
+      joined = flight; flight.waiters += 1;
+      const result = await wait(flight.promise); check();
       if (!result || !['success', 'partial'].includes(result.state)) {
         const message = typeof result?.message === 'string' ? result.message.slice(0, 240) : '资产同步尚未完成，请稍后重试';
         const status = result?.state === 'unauthorized' ? 401 : result?.state === 'timeout' ? 504 : 502;
@@ -403,6 +415,10 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     } finally {
       clearTimeout(timer); res.removeListener('close', cancel); active.delete(stream);
       for (const transport of transports) transport.destroy();
+      if (joined && --joined.waiters === 0 && !joined.settled) {
+        joined.controller.abort();
+        if (syncFlights.get(project.id + ':' + grant.revision) === joined) syncFlights.delete(project.id + ':' + grant.revision);
+      }
     }
   }
   async function proxy(req, res, context, project, grant) {
@@ -421,7 +437,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       try {
         if (!liveGrant(grant)) throw new PortalError(401, '项目访问授权已失效');
         if (automaticAuthFailed(incoming, grant, project, target, req.url)) { incoming.destroy(); sendAutomaticAuthFailure(res, context, grant); return; }
-        if (/^text\/event-stream\b/i.test(incoming.headers['content-type'] || '')) { stream.long = true; if (draining) { stream.destroy(); return; } }
+        if (/^text\/event-stream\b/i.test(incoming.headers['content-type'] || '')) { stream.long = true; if (draining) { stream.destroy(); return; } req.socket.setKeepAlive(true, STREAM_KEEPALIVE_MS); }
         const headers = responseHeaders(incoming.headers, context, target, req.url, grant, incoming.statusCode);
         if (req.method === 'POST' && new URL(req.url, context.origin).pathname === '/api/logout' && incoming.statusCode >= 200 && incoming.statusCode < 300) {
           revokeGrant(grant); headers['set-cookie'] = [...(headers['set-cookie'] || []), clearPortalCookie(context)];
@@ -515,6 +531,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
       upstream.once('upgrade', (response, targetSocket, targetHead) => {
         clearTimeout(timer); peer = targetSocket;
         if (!liveGrant(grant)) { stream.destroy(); return; }
+        socket.setKeepAlive(true, STREAM_KEEPALIVE_MS);
         try {
           const headers = responseHeaders(response.headers, context, target, req.url, grant, response.statusCode); headers.connection = 'Upgrade'; headers.upgrade = 'websocket';
           const lines = Object.entries(headers).flatMap(([name, value]) => (Array.isArray(value) ? value : [value]).map(item => `${name}: ${item}`));
@@ -530,5 +547,5 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   }
 
   function drain() { draining = true; for (const stream of active) if (stream.long) { stream.destroy(); active.delete(stream); } }
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.withoutWaiting(() => store.revokeGrants([...revoking])); } catch {} authGrants.clear(); revoking.clear(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.withoutWaiting(() => store.revokeGrants([...revoking])); } catch {} authGrants.clear(); revoking.clear(); for (const flight of syncFlights.values()) flight.controller.abort(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }

@@ -162,10 +162,30 @@ test('socket: a forwarded write whose runtime vanishes is unconfirmed, while a m
   release({ status: 200, body: {} });
 });
 
+test('socket: a caller that stops waiting aborts the runtime call and the asset sync', { skip: windows }, async t => {
+  const signals = {}, counts = {};
+  const hold = name => ({ signal }) => { signals[name] = signal; counts[name] = (counts[name] ?? 0) + 1; return new Promise(() => {}); };
+  const fake = plane({ handle: hold('forward'), coordinateAssetSync: (_id, _revision, { signal }) => hold('sync')({ signal }) });
+  const client = createSocketDataClient({ dir: (await serve(t, fake)).dir });
+  const forward = new AbortController(), sync = new AbortController();
+  const calls = [client.forward(request({ method: 'POST', signal: forward.signal })), client.coordinateAssetSync('asset', revision, { signal: sync.signal })];
+  for (const call of calls) call.catch(() => {});
+  await until(() => signals.forward && signals.sync);
+  assert.equal(signals.forward.aborted, false);
+  forward.abort(); sync.abort();
+  await until(() => signals.forward.aborted && signals.sync.aborted);
+  for (const call of calls) await assert.rejects(call);
+  // A caller gone before the call was sent is answered at once, but the request
+  // still reaches the runtime, which decides what it still runs (a stop does).
+  await assert.rejects(client.forward(request({ method: 'POST', signal: AbortSignal.abort() })), error => error.status === 503 && error.uncertain);
+  await until(() => counts.forward === 2);
+});
+
 test('socket: a forwarded call is bounded by the deadline it carries', { skip: windows }, async t => {
   const { dir } = await serve(t, plane({ handle: () => new Promise(() => {}) }));
   const started = Date.now();
-  await assert.rejects(createSocketDataClient({ dir }).forward(request({ deadline: Date.now() + 200 })), error => error.status === 503);
+  await assert.rejects(createSocketDataClient({ dir }).forward(request({ deadline: Date.now() + 200 })), error => error.status === 504 && error.message === '运行时响应超时' && !error.uncertain);
+  await assert.rejects(createSocketDataClient({ dir }).forward(request({ method: 'POST', deadline: Date.now() + 200 })), error => error.status === 504 && error.uncertain && error.message === '运行时响应超时，结果未确认，请刷新后核对');
   assert.ok(Date.now() - started < 2000);
 });
 

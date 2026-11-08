@@ -35,13 +35,14 @@ export function validateRevision(revision) {
   if (typeof revision !== 'string' || !/^[0-9a-f]{64}$/.test(revision)) throw new RuntimeError(400, '项目版本无效');
   return revision;
 }
-// `target` is the normalized path and query; `deadline` is the browser request's remaining budget, if any.
+// `target` is the normalized path and query; `deadline` is the browser request's remaining budget, if any;
+// `signal` ends the call once the browser request is gone (docs/timeout-budgets.md, C7).
 export function validateForward(request) {
   if (!object(request) || typeof request.method !== 'string' || !/^[A-Z][A-Z-]{0,15}$/.test(request.method) || typeof request.target !== 'string' || !request.target.startsWith('/api/')
     || typeof request.sessionId !== 'string' || !request.sessionId || request.contentType !== undefined && typeof request.contentType !== 'string'
-    || request.deadline !== undefined && !Number.isSafeInteger(request.deadline)
+    || request.deadline !== undefined && !Number.isSafeInteger(request.deadline) || request.signal !== undefined && !(request.signal instanceof AbortSignal)
     || typeof (request.body?.[Symbol.asyncIterator] ?? request.body?.[Symbol.iterator]) !== 'function') throw new RuntimeError(400, '转发请求无效');
-  return { method: request.method, target: request.target, sessionId: request.sessionId, contentType: request.contentType, deadline: request.deadline, body: request.body };
+  return { method: request.method, target: request.target, sessionId: request.sessionId, contentType: request.contentType, deadline: request.deadline, body: request.body, signal: request.signal };
 }
 // The API's overview stream counts (design doc 5.8): open streams now, and
 // slow-consumer disconnects since that API instance started. `sequence` grows
@@ -67,7 +68,8 @@ export function validateReply(value) {
 const validateSyncStatus = value => { if (value !== null && !object(value)) throw unavailable(); return value; };
 const reads = new Set(['GET', 'HEAD']);
 // A write that may have reached the data plane: the browser must check before trying again.
-export const unconfirmed = () => new RuntimeError(503, '结果未确认，请刷新后核对', { origin: 'transport', uncertain: true });
+// A runtime that did not answer in time keeps its 504.
+export const unconfirmed = (status = 503) => new RuntimeError(status === 504 ? 504 : 503, status === 504 ? '运行时响应超时，结果未确认，请刷新后核对' : '结果未确认，请刷新后核对', { origin: 'transport', uncertain: true });
 const validateAccepted = value => { if (!object(value) || value.accepted !== true) throw unavailable(); return { accepted: true }; };
 
 // `invoke(name, argument)` performs one call; `subscribe(subscriber)` registers
@@ -81,12 +83,13 @@ function contract(invoke, subscribe) {
       return subscribe({ wants: () => subscriber.wants(), deliver: event => subscriber.deliver(validateOverviewEvent(event)) });
     },
     async projectChanged(id, change) { validateProjectId(id); const value = validateChange(change); return writeResult(invoke('projectChanged', { id, ...value }), validateAccepted); },
-    async coordinateAssetSync(id, revision) { validateProjectId(id); validateRevision(revision); return writeResult(invoke('coordinateAssetSync', { id, revision }), validateSyncStatus); },
+    // An aborted `signal` stops waiting; a sync no other caller waits for stops too.
+    async coordinateAssetSync(id, revision, { signal } = {}) { validateProjectId(id); validateRevision(revision); return writeResult(invoke('coordinateAssetSync', { id, revision, signal }), validateSyncStatus); },
     async forward(request) {
       const value = validateForward(request);
       if (reads.has(value.method)) return validateReply(await invoke('forward', value));
       try { return await writeResult(invoke('forward', value), validateReply); }
-      catch (error) { throw error instanceof RuntimeError && error.origin === 'transport' && error.uncertain ? unconfirmed() : error; }
+      catch (error) { throw error instanceof RuntimeError && error.origin === 'transport' && error.uncertain ? unconfirmed(error.status) : error; }
     },
     async reportApiStats(stats) { const value = validateApiStats(stats); return writeResult(invoke('reportApiStats', value), validateAccepted); },
   };
@@ -98,7 +101,7 @@ export function createInProcessDataClient(dataPlane, { log }) {
   const operations = {
     overview: () => dataPlane.overview(),
     projectChanged: ({ id, reason, clearSnapshot }) => { dataPlane.projectChanged(id, { reason, clearSnapshot }); return { accepted: true }; },
-    coordinateAssetSync: ({ id, revision }) => dataPlane.coordinateAssetSync(id, revision),
+    coordinateAssetSync: ({ id, revision, signal }) => dataPlane.coordinateAssetSync(id, revision, { signal }),
     forward: request => dataPlane.handle(request),
     reportApiStats: stats => { dataPlane.reportApiStats(stats); return { accepted: true }; },
   };
@@ -137,12 +140,12 @@ const BACKOFF_MS = [1000, 2000, 4000, 8000, 16_000, 30_000];
 export function createSocketDataClient({ dir, protocols = SUPPORTED_PROTOCOLS, connection = createRuntimeConnection({ dir, protocols }), budgets: overrides = {}, idleMs = EVENTS_IDLE_MS, backoffMs = BACKOFF_MS, log }) {
   if (!(idleMs > 0 && idleMs <= 2 ** 31 - 1)) throw new TypeError('Data-plane client needs idleMs between 1 and 2^31-1');
   const budgets = { read: BUDGETS.read, assetSync: ASSET_SYNC_BUDGET, forward: FORWARD_BUDGET, ...overrides };
-  const call = (route, { method = 'POST', body, budget = budgets.read, retry = false } = {}) => invokeOverSocket(connection, { method, route, body, budget, retry });
+  const call = (route, { method = 'POST', body, budget = budgets.read, retry = false, signal } = {}) => invokeOverSocket(connection, { method, route, body, budget, retry, signal });
   const operations = {
     overview: () => call('/internal/v1/overview', { method: 'GET', retry: true }),
     projectChanged: ({ id, reason, clearSnapshot }) => call(`/internal/v1/projects/${id}/changed`, { body: { reason, clearSnapshot } }),
-    coordinateAssetSync: async ({ id, revision }) => {
-      const value = await call(`/internal/v1/projects/${id}/asset-sync`, { body: { revision }, budget: budgets.assetSync });
+    coordinateAssetSync: async ({ id, revision, signal }) => {
+      const value = await call(`/internal/v1/projects/${id}/asset-sync`, { body: { revision }, budget: budgets.assetSync, signal });
       if (!object(value) || !('status' in value)) throw unavailable(true);
       return value.status;
     },
@@ -154,13 +157,14 @@ export function createSocketDataClient({ dir, protocols = SUPPORTED_PROTOCOLS, c
       try {
         target = await connection.resolve(deadline);
         const head = request.method === 'HEAD';
-        const reply = await connection.exchange(target, { method: head ? 'GET' : request.method, route: FORWARD_PREFIX + request.target, deadline, body: content.length ? content : null, maxBytes: MAX_FORWARD_REPLY_BYTES,
+        const reply = await connection.exchange(target, { method: head ? 'GET' : request.method, route: FORWARD_PREFIX + request.target, deadline, body: content.length ? content : null, maxBytes: MAX_FORWARD_REPLY_BYTES, signal: request.signal,
           headers: { [SESSION_HEADER]: request.sessionId, [DEADLINE_HEADER]: String(deadline), ...(head ? { [METHOD_HEADER]: 'HEAD' } : {}), ...(request.contentType !== undefined ? { 'Content-Type': request.contentType } : {}) } });
         if (reply.status === 401) throw unavailable();
         if (reply.status !== 200) throw runtimeErrorFrom(reply.status, reply.body);
         return reply.body;
       } catch (error) {
-        if (error instanceof RuntimeError && error.origin === 'transport') connection.invalidate(target);
+        // A caller that left says nothing about the runtime's discovery record.
+        if (error instanceof RuntimeError && error.origin === 'transport' && !request.signal?.aborted) connection.invalidate(target);
         throw error;
       }
     },

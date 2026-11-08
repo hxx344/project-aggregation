@@ -242,6 +242,27 @@ test('over the socket, execution entries keep the runtime\'s 409 and 503 and out
   await runtime.close();
 });
 
+test('closing the runtime stops waiting for a data plane that does not finish', { skip, timeout: 30_000 }, async t => {
+  const { dataDir, env } = await dataDirectory(t);
+  const quiet = { info() {}, debug() {}, warn() {}, error() {} };
+  // An exchange call that ignores its abort signal holds the data plane's close open.
+  let entered;
+  const reached = new Promise(resolve => { entered = resolve; });
+  const executionClientFactory = () => Object.fromEntries(['verify', 'account', 'market', 'create', 'inspect', 'stop'].map(method => [method, () => { entered(); return new Promise(() => {}); }]));
+  const modules = fakeModules(path.join(dataDir, 'modules'));
+  const runtime = await startRuntime({ dataDir, logger: quiet, env, startModules: modules.startModules, dataPlaneCloseMs: 300, dataPlaneOptions: { ...dataPlaneOptions, executionClientFactory } });
+  const api = spawnFixture(t, 'split-api.mjs', env);
+  const { port } = await api.next('ready'), c = client(port);
+  await c.login();
+  c.request('/api/trading/execution/accounts/binance', { method: 'PUT', body: { revision: 0, accountMode: 'standard', apiKey: 'fixture_key_close', apiSecret: 'fixture_secret_close' } }).catch(() => {});
+  await reached;
+  const started = Date.now();
+  await assert.rejects(runtime.close(), error => error instanceof AggregateError && error.errors.some(item => item.message === '数据面未在期限内关闭'));
+  assert.ok(Date.now() - started < 10_000);
+  api.child.kill('SIGTERM');
+  await api.exited;
+});
+
 test('a runtime directory too long for the runtime socket fails before any module starts', { skip }, async t => {
   const { dataDir, env } = await dataDirectory(t);
   const runDir = path.join(dataDir, 'r'.repeat(Math.max(1, 56 - dataDir.length - 1)));

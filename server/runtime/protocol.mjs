@@ -9,7 +9,7 @@ export const PROTOCOL_VERSION = 1;
 export const SUPPORTED_PROTOCOLS = Object.freeze([PROTOCOL_VERSION]);
 export const RUNTIME_KEY_HEADER = 'x-workspace-runtime-key';
 // Total wall-clock budgets per call, including discovery and the one read retry.
-export const BUDGETS = Object.freeze({ read: 5000, maintenance: 15_000, prepareStop: 70_000 });
+export const BUDGETS = Object.freeze({ read: 5000, maintenance: 25_000, prepareStop: 70_000 });
 export const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 export const MAX_REQUEST_BYTES = 16 * 1024;
 // A longer UDS path would be truncated and bind somewhere else.
@@ -28,6 +28,9 @@ export const MAX_MESSAGE_LENGTH = 400;
 // Truncate before trimming so that applying it twice (server, then client) changes nothing.
 export const publicMessage = message => (typeof message === 'string' ? message.replace(/[\u0000-\u001f\u007f]+/g, ' ').slice(0, MAX_MESSAGE_LENGTH).trim() : '') || UNAVAILABLE;
 export const unavailable = (uncertain = false) => new RuntimeError(503, UNAVAILABLE, { origin: 'transport', uncertain });
+// The runtime did not answer within the caller's budget: 504, as the data plane's own budgets answer (docs/timeout-budgets.md, C5).
+export const RUNTIME_TIMEOUT = '运行时响应超时';
+export const timedOut = (uncertain = false) => new RuntimeError(504, RUNTIME_TIMEOUT, { origin: 'transport', uncertain });
 const invalid = () => unavailable();
 
 export function equalSecret(value, expected) {

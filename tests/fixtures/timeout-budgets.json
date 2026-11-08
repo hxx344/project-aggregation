@@ -3,20 +3,11 @@
   "about": "Timeout budget table (docs/timeout-budgets.md, evolution plan E5). Each budget is read from its source; relations say which budgets must cover which. A relation with status conflict is known not to hold and is registered for a separate fix.",
   "budgets": [
     {
-      "id": "api.request",
-      "ms": 60000,
-      "source": {
-        "file": "server/api/server.mjs",
-        "pattern": "const REQUEST_TIMEOUT_MS = ([\\d_]+), HANDLER_GRACE_MS"
-      }
-    },
-    {
       "id": "api.receive",
       "ms": 60000,
-      "sameAs": "api.request",
       "source": {
         "file": "server/api/server.mjs",
-        "pattern": "server\\.requestTimeout = REQUEST_TIMEOUT_MS;"
+        "pattern": "RECEIVE_TIMEOUT_MS = ([\\d_]+), DRAIN_MS[\\s\\S]*?server\\.requestTimeout = RECEIVE_TIMEOUT_MS;"
       }
     },
     {
@@ -30,19 +21,17 @@
     {
       "id": "api.forward-deadline",
       "ms": 60000,
-      "sameAs": "api.request",
       "source": {
         "file": "server/api/server.mjs",
-        "pattern": "\\?\\? Date\\.now\\(\\)\\) \\+ REQUEST_TIMEOUT_MS;"
+        "pattern": "const FORWARD_DEADLINE_MS = ([\\d_]+), RECEIVE_TIMEOUT_MS[\\s\\S]*?\\?\\? Date\\.now\\(\\)\\) \\+ FORWARD_DEADLINE_MS;"
       }
     },
     {
       "id": "api.drain",
-      "ms": 60000,
-      "sameAs": "api.request",
+      "ms": 61000,
       "source": {
         "file": "server/api/server.mjs",
-        "pattern": "drainMs = REQUEST_TIMEOUT_MS \\}"
+        "pattern": "DRAIN_MS = ([\\d_]+);[\\s\\S]*?drainMs = DRAIN_MS \\}"
       },
       "overrides": [
         {
@@ -144,7 +133,7 @@
     },
     {
       "id": "protocol.maintenance",
-      "ms": 15000,
+      "ms": 25000,
       "source": {
         "file": "server/runtime/protocol.mjs",
         "pattern": "BUDGETS = Object\\.freeze\\(\\{ read: ([\\d_]+), maintenance: ([\\d_]+), prepareStop: ([\\d_]+) \\}\\)",
@@ -317,6 +306,20 @@
       }
     },
     {
+      "id": "execution.call",
+      "ms": 35000,
+      "source": {
+        "file": "server/control/execution-jobs.mjs",
+        "pattern": "export const EXECUTION_CALL_TIMEOUT_MS = ([\\d_]+);"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/data-plane.mjs",
+          "absent": "callTimeoutMs"
+        }
+      ]
+    },
+    {
       "id": "portal.connect",
       "ms": 10000,
       "source": {
@@ -373,6 +376,14 @@
           "absent": "ticketTtlMs"
         }
       ]
+    },
+    {
+      "id": "portal.stream-keepalive",
+      "ms": 30000,
+      "source": {
+        "file": "server/portal.mjs",
+        "pattern": "const STREAM_KEEPALIVE_MS = ([\\d_]+);"
+      }
     },
     {
       "id": "monitor.receive",
@@ -483,10 +494,10 @@
       "id": "bridge.startup",
       "ms": 90000,
       "source": {
-        "file": "server/modules/greeks-bridge.py",
-        "pattern": "timeout=(\\d+) if kind == \"startup\" else shutdown_timeout",
-        "scale": 1000
-      }
+        "file": "server/modules/python-module.mjs",
+        "pattern": "String\\(shutdownTimeout / 1000\\), String\\(startupTimeout / 1000\\)\\]"
+      },
+      "sameAs": "python.startup-default"
     },
     {
       "id": "bridge.exit-extra",
@@ -598,6 +609,20 @@
       ]
     },
     {
+      "id": "runtime.data-plane-close",
+      "ms": 120000,
+      "source": {
+        "file": "server/runtime/main.mjs",
+        "pattern": "const DATA_PLANE_CLOSE_MS = ([\\d_]+);"
+      },
+      "overrides": [
+        {
+          "file": "server/runtime/main.mjs",
+          "absent": "dataPlaneCloseMs:"
+        }
+      ]
+    },
+    {
       "id": "entry.close-grace",
       "ms": 5000,
       "source": {
@@ -610,7 +635,15 @@
       "ms": 75000,
       "source": {
         "file": "server/launcher.mjs",
-        "pattern": "API_STOP_MS = ([\\d_]+);"
+        "pattern": "API_STOP_MS = ([\\d_]+), RUNTIME_STOP_MS"
+      }
+    },
+    {
+      "id": "launcher.runtime-stop",
+      "ms": 150000,
+      "source": {
+        "file": "server/launcher.mjs",
+        "pattern": "RUNTIME_STOP_MS = ([\\d_]+);"
       }
     },
     {
@@ -630,29 +663,27 @@
       }
     },
     {
-      "id": "browser.execution-account-write",
-      "ms": 45000,
-      "source": {
-        "file": "src/TradingExecution.tsx",
-        "pattern": "timeoutMs: suffix\\.startsWith\\('/accounts/'\\) \\? ([\\d_]+) : ([\\d_]+) \\}\\)",
-        "group": 1
-      }
-    },
-    {
       "id": "browser.execution-write",
-      "ms": 30000,
+      "ms": 65000,
       "source": {
         "file": "src/TradingExecution.tsx",
-        "pattern": "timeoutMs: suffix\\.startsWith\\('/accounts/'\\) \\? ([\\d_]+) : ([\\d_]+) \\}\\)",
-        "group": 2
+        "pattern": "const WRITE_TIMEOUT_MS = ([\\d_]+);[\\s\\S]*?timeoutMs: WRITE_TIMEOUT_MS \\}"
       }
     },
     {
       "id": "browser.update-apply",
-      "ms": 120000,
+      "ms": 140000,
       "source": {
         "file": "src/UpdateStatus.tsx",
-        "pattern": "\\(kind === 'apply' \\? \\{ timeoutMs: ([\\d_]+) \\} : \\{\\}\\)"
+        "pattern": "\\(kind === 'apply' \\? \\{ timeoutMs: ([\\d_]+) \\} : kind"
+      }
+    },
+    {
+      "id": "browser.update-read",
+      "ms": 40000,
+      "source": {
+        "file": "src/UpdateStatus.tsx",
+        "pattern": "kind === 'read' \\|\\| kind === 'check' \\? \\{ timeoutMs: ([\\d_]+) \\}"
       }
     },
     {
@@ -703,7 +734,7 @@
       "inner": [
         "client.forward"
       ],
-      "minMarginMs": 0,
+      "minMarginMs": 1000,
       "status": "holds"
     },
     {
@@ -852,6 +883,43 @@
       "status": "holds"
     },
     {
+      "id": "runtime-unit-covers-data-plane-close",
+      "outer": "unit.runtime",
+      "inner": [
+        "runtime.data-plane-close"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
+      "id": "data-plane-close-covers-execution-call",
+      "outer": "runtime.data-plane-close",
+      "inner": [
+        "execution.call"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "launcher-covers-runtime-stop",
+      "outer": "launcher.runtime-stop",
+      "inner": [
+        "runtime.stop-aster",
+        "runtime.kill-grace"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
+      "id": "launcher-covers-data-plane-close",
+      "outer": "launcher.runtime-stop",
+      "inner": [
+        "runtime.data-plane-close"
+      ],
+      "minMarginMs": 10000,
+      "status": "holds"
+    },
+    {
       "id": "module-start-covers-greeks-startup",
       "outer": "runtime.module-start",
       "inner": [
@@ -919,11 +987,39 @@
       "status": "holds"
     },
     {
+      "id": "browser-execution-covers-forward",
+      "outer": "browser.execution-write",
+      "inner": [
+        "client.forward"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "forward-covers-execution-call",
+      "outer": "client.forward",
+      "inner": [
+        "execution.call"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
       "id": "browser-covers-update-apply",
       "outer": "browser.update-apply",
       "inner": [
         "protocol.maintenance",
         "protocol.prepare-stop",
+        "updates.client",
+        "protocol.maintenance"
+      ],
+      "minMarginMs": 5000,
+      "status": "holds"
+    },
+    {
+      "id": "browser-covers-update-read",
+      "outer": "browser.update-read",
+      "inner": [
         "updates.client",
         "protocol.maintenance"
       ],
@@ -1001,9 +1097,8 @@
         "updates.module-maintenance",
         "updates.module-maintenance"
       ],
-      "minMarginMs": 0,
-      "status": "conflict",
-      "conflict": "C18"
+      "minMarginMs": 1000,
+      "status": "holds"
     }
   ]
 }

@@ -45,15 +45,16 @@ const operations = {
 
 // Sends one JSON call over `connection`: the cached record is dropped on
 // refusal, disconnect, a rejected key or a different instance; a call marked
-// `retry` is retried once after re-resolving, within the same budget.
-export async function invokeOverSocket(connection, { method, route, body, budget, retry, maxBytes, check = () => {} }) {
+// `retry` is retried once after re-resolving, within the same budget. An
+// aborted `signal` closes the exchange and is not retried.
+export async function invokeOverSocket(connection, { method, route, body, budget, retry, maxBytes, signal, check = () => {} }) {
   const deadline = Date.now() + budget;
   const content = body === undefined ? null : Buffer.from(JSON.stringify(body));
   for (let attempt = 0; ; attempt += 1) {
     let target = null;
     try {
       target = await connection.resolve(deadline);
-      const reply = await connection.exchange(target, { method, route, deadline, maxBytes, body: content, headers: content ? { 'Content-Type': 'application/json' } : {} });
+      const reply = await connection.exchange(target, { method, route, deadline, maxBytes, signal, body: content, headers: content ? { 'Content-Type': 'application/json' } : {} });
       // A rejected key means the record is stale, not that the call was refused.
       if (reply.status === 401) throw unavailable();
       if (reply.status !== 200) throw runtimeErrorFrom(reply.status, reply.body);
@@ -61,8 +62,8 @@ export async function invokeOverSocket(connection, { method, route, body, budget
       return reply.body;
     } catch (error) {
       if (!(error instanceof RuntimeError) || error.origin !== 'transport') throw error;
-      connection.invalidate(target);
-      if (!retry || attempt > 0 || error.uncertain || Date.now() >= deadline) throw error;
+      if (!signal?.aborted) connection.invalidate(target);
+      if (!retry || attempt > 0 || error.uncertain || signal?.aborted || Date.now() >= deadline) throw error;
     }
   }
 }

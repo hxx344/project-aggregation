@@ -11,6 +11,9 @@ import type { ExecutionPreferences } from './trading-preferences';
 import './trading-execution.css';
 
 const BASE = '/api/trading/execution';
+// Writes wait past the API's 60 s forwarding deadline, so the server's own
+// answer (done, refused or unconfirmed) arrives first (docs/timeout-budgets.md, C17).
+const WRITE_TIMEOUT_MS = 65_000;
 const EXCHANGES: Record<ExecutionExchange, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' };
 // Oil and SK hynix trade on the read-only venues only; Hyperliquid lists neither.
 const PAIR_VENUES: TradingExchange[] = ['binance', 'bybit', 'okx'];
@@ -307,7 +310,7 @@ export default function TradingExecution({ pair, onPair, onExpired, shares, onSh
     readController.current?.abort();
     const controller = new AbortController(); writeController.current = controller;
     try {
-      const value = await api<T>(BASE + suffix, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: suffix.startsWith('/accounts/') ? 45_000 : 30_000 });
+      const value = await api<T>(BASE + suffix, { method, body: JSON.stringify(body), signal: controller.signal, timeoutMs: WRITE_TIMEOUT_MS });
       if (!mounted.current || controller.signal.aborted) return { ok: false };
       return { ok: true, value };
     } catch (error) {

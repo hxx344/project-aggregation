@@ -12,9 +12,9 @@ export const UNFINISHED_EXECUTION_JOB_SQL = `(${JOB_STATUS} IS NULL OR ${JOB_STA
 export const EXECUTION_MAINTENANCE = '系统正在更新或等待确认更新结果，暂不能新建实盘任务或修改实盘连接';
 // Each exchange call of the native executor is aborted after this long.
 export const EXECUTION_CALL_TIMEOUT_MS = 35_000;
-// The runtime does not abort a write when the API's forwarding deadline passes,
-// so the bound is the executor's: a preview makes two exchange calls of
-// EXECUTION_CALL_TIMEOUT_MS each. Expiry only keeps a crashed runtime from
+// A preview makes two exchange calls of EXECUTION_CALL_TIMEOUT_MS each; the
+// runtime ends them once the API stopped waiting (docs/timeout-budgets.md, C7),
+// but this bound does not rely on that. Expiry only keeps a crashed runtime from
 // blocking updates until the next one clears the table; both processes read
 // the same wall clock, so a forward clock jump can end an entry early.
 export const EXECUTION_ENTRY_TTL_MS = 90_000;

@@ -63,8 +63,13 @@ const admitted = (pathname, method) => /^\/api\/trading\/execution\/accounts\/(?
 // coordinator, project configuration, Portal, the overview streams and static
 // files. Business routes go to the data plane through `runtime`, module
 // supervision through `supervisor`; neither is reached any other way.
-// The browser request's budget, which a forwarded call keeps (design doc 5.2).
-const REQUEST_TIMEOUT_MS = 60_000, HANDLER_GRACE_MS = 2000, COORDINATOR_CLOSE_MS = 5000;
+// FORWARD_DEADLINE_MS is the browser request's budget from its arrival, which
+// a forwarded call keeps (design doc 5.2); receiving the body counts against
+// it. RECEIVE_TIMEOUT_MS bounds receiving any request, Portal uploads of up to
+// 16 MiB included. DRAIN_MS lets a forward accepted while closing still answer
+// at its own deadline (docs/timeout-budgets.md, C4).
+const FORWARD_DEADLINE_MS = 60_000, RECEIVE_TIMEOUT_MS = 60_000, DRAIN_MS = 61_000;
+const HANDLER_GRACE_MS = 2000, COORDINATOR_CLOSE_MS = 5000;
 // Overview streams get a frame at least this often, and project changes are
 // retried this many times at these delays (initial design values).
 const OVERVIEW_HEARTBEAT_MS = 15_000, RUNTIME_STALE_MS = 30_000, NOTICE_RETRY_MS = [1000, 5000];
@@ -95,7 +100,7 @@ export function supervisorTransports(supervisor) {
 // upgrades once the slot serves.
 export function createApiServer({ control, catalog, encrypt, decrypt, embeddedModules, log, supervisor, runtime, executionJobs, candidate = false, privateProbe = false,
   updatesClient, secureCookies, configuredOrigin, distDir, dataDir, loginLimits = resolveLoginLimits(), resolveTransport,
-  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS, statsIntervalMs = STATS_INTERVAL_MS, drainMs = REQUEST_TIMEOUT_MS }) {
+  overviewHeartbeatMs = OVERVIEW_HEARTBEAT_MS, runtimeStaleMs = RUNTIME_STALE_MS, noticeRetryMs = NOTICE_RETRY_MS, statsIntervalMs = STATS_INTERVAL_MS, drainMs = DRAIN_MS }) {
   const { loginWindowMs, accountLockoutMs } = loginLimits;
   const { getSetting, setSetting, sessions, projects } = control;
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
@@ -211,7 +216,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       if (closed || signal.aborted || projectRevision(projectId) !== revision) throw new HttpError(401, '页面授权已失效');
       return auth;
     },
-    coordinateAssetSync: async ({ projectId, revision }) => closed ? null : runtime.coordinateAssetSync(projectId, revision),
+    coordinateAssetSync: async ({ projectId, revision, signal }) => closed ? null : runtime.coordinateAssetSync(projectId, revision, { signal }),
   });
 
   function validateProject(body, existing) {
@@ -247,10 +252,18 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   // The target is the normalized path and query this API matched, not the raw request line.
   const receivedAt = new WeakMap();
   async function forward(req, res, url, current, { body = req, contentType = req.headers['content-type'], costResearch = false } = {}) {
-    const deadline = (receivedAt.get(req) ?? Date.now()) + REQUEST_TIMEOUT_MS;
-    const reply = await runtime.forward({ method: req.method, target: url.pathname + url.search, sessionId: current.id, contentType, deadline, body });
-    if (costResearch) await sendCostResearch(req, res, reply.status, reply.body);
-    else send(res, reply.status, reply.body);
+    const deadline = (receivedAt.get(req) ?? Date.now()) + FORWARD_DEADLINE_MS;
+    // A browser that went away ends the forward, so the runtime stops the call too (C7).
+    const controller = new AbortController(), gone = () => { if (!res.writableFinished) controller.abort(); };
+    res.once('close', gone);
+    // Gone already while it was admitted or its body read. `req` itself ends
+    // once its body is read, so the connection tells.
+    if (res.destroyed || req.socket.destroyed) gone();
+    try {
+      const reply = await runtime.forward({ method: req.method, target: url.pathname + url.search, sessionId: current.id, contentType, deadline, body, signal: controller.signal });
+      if (costResearch) await sendCostResearch(req, res, reply.status, reply.body);
+      else send(res, reply.status, reply.body);
+    } finally { res.off('close', gone); }
   }
   async function api(req, res, url) {
     const pathname = url.pathname;
@@ -518,7 +531,7 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     if (isProbe(socket)) { socket.on('error', () => {}); socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroySoon(); return; }
     void portal.handleUpgrade(req, socket, head).then(handled => { if (!handled) { socket.end('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroySoon(); } }).catch(() => socket.destroy());
   });
-  server.requestTimeout = REQUEST_TIMEOUT_MS; server.headersTimeout = 10000; server.maxHeadersCount = 80;
+  server.requestTimeout = RECEIVE_TIMEOUT_MS; server.headersTimeout = 10000; server.maxHeadersCount = 80;
 
   return {
     server, instanceId: apiInstanceId,
