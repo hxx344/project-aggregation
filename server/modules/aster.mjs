@@ -11,7 +11,7 @@ export function pythonExecutable(environment = {}) {
 export async function createModule(options) { return createAsterModule(options); }
 // The import hook is only for explicit local tests, never selected by a request.
 export async function createAsterModule({ root, dataDir, secret, environment = {}, application = 'trading.workspace:app',
-  requestTimeout = 60_000, startupTimeout = 90_000, shutdownTimeout = 100_000 }) {
+  requestTimeout = 55_000, startupTimeout = 90_000, shutdownTimeout = 100_000 }) {
   if (typeof secret !== 'string' || secret.length < 12) throw new Error('Missing ASTER worker secret');
   if (environment.WORKSPACE_MANAGED === '1' && (!environment.WORKSPACE_WRITER_DB || !environment.WORKSPACE_RUNTIME_ID)) throw new Error('Missing shared account protection');
   mkdirSync(dataDir, { recursive: true });

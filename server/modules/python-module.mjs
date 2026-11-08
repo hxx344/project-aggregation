@@ -7,8 +7,12 @@ const MAX_BODY = 1024 * 1024;
 const MAX_LINE = 24 * 1024 * 1024;
 const HOP_HEADERS = new Set(['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'x-workspace-key']);
 
+// requestTimeout counts from the end of the body read (at most 30 s). Portal's
+// 90 s response header covers both plus 5 s, and the runtime module guard's
+// 60 s update-status read (a GET) covers requestTimeout plus 5 s, so the
+// bridge's 504 answers first (docs/timeout-budgets.md, C1 and C14).
 export async function createPythonModule({ root, secret, env, executable, application, label,
-  privateHeaders, requestTimeout = 60_000, startupTimeout = 90_000, shutdownTimeout = 10_000, requireWriterProtection = false }) {
+  privateHeaders, requestTimeout = 55_000, startupTimeout = 90_000, shutdownTimeout = 10_000, requireWriterProtection = false }) {
   const child = spawn(executable, ['-u', bridge, application, String(shutdownTimeout / 1000)], { cwd: root, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   // Windows has no process group to probe; the supervisor waits for this pid
   // before starting a successor.
@@ -18,7 +22,8 @@ export async function createPythonModule({ root, secret, env, executable, applic
   let resolveReady, rejectReady;
   const started = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
   const exited = new Promise(resolve => child.once('close', resolve));
-  const server = createServer(async (request, response) => {
+  // Node checks requestTimeout only every connectionsCheckingInterval (30 s by default).
+  const server = createServer({ connectionsCheckingInterval: 1000 }, async (request, response) => {
     if (request.headers['x-workspace-key'] !== secret) { response.writeHead(403).end('Forbidden'); return; }
     if (!ready || failed || closing) { response.writeHead(503).end(`${label} unavailable`); return; }
     if (pending.size >= 64 || child.stdin.writableLength > 4 * MAX_BODY) { response.writeHead(503).end(`${label} busy`); return; }

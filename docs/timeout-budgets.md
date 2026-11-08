@@ -6,12 +6,12 @@
 - 两边一起改了，但某条关系不再成立；
 - 本文表格与登记表不一致。
 
-首批只做登记，不改任何预算。已知冲突在第 5 节单独登记，修正时另开批次处理。修正后把对应关系改为"成立"，测试会提示这一步。
+首批只做登记，不改任何预算；第二批修正了数值冲突 C1、C14、C16、C18，并把 C2、C15 改为按设计接受（第 5 节）。其余冲突仍按第 5 节另开批次处理。修正后把对应关系改为"成立"，测试会提示这一步。
 
 阅读约定：
 
 - 表中"起点"指计时开始的时刻。T0 是 API 收到浏览器请求的时刻（`server/api/server.mjs` 的 `receivedAt`）。
-- Node 的 `server.requestTimeout` 和 `headersTimeout` 只限制接收请求的时间，不限制处理请求或返回响应的时间。
+- Node 的 `server.requestTimeout` 和 `headersTimeout` 只限制接收请求的时间，不限制处理请求或返回响应的时间。Node 只按 `connectionsCheckingInterval` 定期检查这两个时限（默认 30 s，实际上限会多出最多 30 s），登记了接收时限的服务都设为 1 s，测试会检查。
 
 ## 1 拓扑
 
@@ -50,6 +50,7 @@
 | `browser.execution-write` | 30 s | 浏览器发起 | 前端执行页写操作 | 前端放弃等待，提示核对；短于转发截止（C17） | AbortSignal，服务端不感知 |
 | `browser.execution-account-write` | 45 s | 浏览器发起 | 前端执行账户写操作 | 同上（C17） | 同上 |
 | `browser.update-apply` | 120 s | 浏览器发起更新 | 前端更新面板 | 前端放弃等待；覆盖链 4 的整个更新请求 | AbortSignal |
+| `browser.asset-sync` | 80 s | 资产页点刷新 | 资产页 | 前端放弃等待，保留上次数据 | AbortSignal |
 
 ### 2.2 链 2：Portal → 模块
 
@@ -57,8 +58,8 @@
 | --- | --- | --- | --- | --- | --- |
 | `portal.connect` | 10 s | DNS 查询或上游连接开始 | Portal | 504"连接超时" | 销毁上游连接 |
 | `portal.response-header` | 90 s | 上游连接创建，包含上传请求体 | Portal | 504"响应超时"；资产同步的总时限也用这个值，其中还包括两次没有自身时限的账本请求 | 销毁上游连接；模块端收到关闭后向 bridge 发 cancel；不会中止 runtime 的资产同步（C7） |
-| `client.asset-sync` | 60 s | 资产同步开始 | API 的 runtime 客户端 | 503 | 不中止 runtime 的同步（C7） |
-| `runtime.asset-sync` | 60 s | 单轮同步开始 | runtime 资产同步 | 本轮记为超时；成功后再读一次摘要（C16） | — |
+| `client.asset-sync` | 70 s | 资产同步开始 | API 的 runtime 客户端 | 503；覆盖一轮同步加一次摘要读取 | 不中止 runtime 的同步（C7） |
+| `runtime.asset-sync` | 60 s | 单轮同步开始 | runtime 资产同步 | 本轮记为超时；成功后再读一次摘要，两者都在 `client.asset-sync` 之内 | — |
 | `runtime.summary-read` | 5 s | 读取开始 | runtime data plane | 本次摘要读取失败 | AbortSignal |
 | `portal.authentication` | 10 s | 兑换授权票据 | Portal | 504；传入值被钳到最多 10 s（C9） | AbortController 传给登录 |
 | `portal.ticket-ttl` | 30 s | 签发票据 | Portal | 401；属于授权有效期，不是请求预算 | — |
@@ -71,16 +72,16 @@ Portal 拿到 SSE 响应头或 WebSocket 101 后清除计时器，长连接不�
 | 预算 | 值 | 起点 | 拥有者 | 超时后 | 取消传播 |
 | --- | --- | --- | --- | --- | --- |
 | `python.receive` | 30 s | 收请求 | worker 内 HTTP 服务 | 408 | — |
-| `python.pending-default` | 60 s | 请求体读完 | worker | 504（`createPythonModule` 默认值） | 通过 stdin 发 cancel，bridge 取消对应任务 |
-| `greeks.pending` | 60 s | 同上 | Greeks worker | 504 | 同上 |
-| `aster.pending` | 60 s | 同上 | ASTER worker | 504 | 同上 |
+| `python.pending-default` | 55 s | 请求体读完 | worker | 504（`createPythonModule` 默认值） | 通过 stdin 发 cancel，bridge 取消对应任务 |
+| `greeks.pending` | 55 s | 同上 | Greeks worker | 504 | 同上 |
+| `aster.pending` | 55 s | 同上 | ASTER worker | 504 | 同上 |
 | `python.startup-default` | 90 s | spawn | worker | 启动失败，结束 bridge | — |
 | `greeks.startup` | 90 s | spawn | Greeks worker | 同上 | — |
 | `aster.startup` | 90 s | spawn | ASTER worker | 同上 | — |
 | `bridge.startup` | 90 s | bridge 开始启动生命周期 | Python bridge | 启动失败；写死，不随 `startupTimeout` 变化（C3） | — |
 | `python.writer-handshake` | 5 s | bridge 就绪 | worker | 启动失败 | 发 cancel |
 
-bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若增加 SSE，会在 60 s 等待时限到期时得到 504（C13）。
+bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若增加 SSE，会在 55 s 等待时限到期时得到 504（C13）。
 
 ### 2.4 链 4：更新准入
 
@@ -88,10 +89,10 @@ bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若�
 
 | 预算 | 值 | 起点 | 拥有者 | 超时后 | 取消传播 |
 | --- | --- | --- | --- | --- | --- |
-| `runtime.sync-deadline` | 4 s | runtime 自行重同步某个模块 | runtime | 本次重同步失败，按退避重试；排在它后面的 API 同步最多多等这么久 | — |
+| `runtime.sync-deadline` | 4 s | runtime 自行重同步某个模块 | runtime | 本次重同步失败，按退避重试；runtime 自身的重同步在服务队列里最多一项，期间就绪的模块并入下一项，排在后面的 API 同步最多多等这么久 | — |
 | `updates.module-maintenance` | 10 s | 向各交易模块设置维护状态（并行） | runtime 模块守卫 | 未确认的模块列为失败，503 | — |
 | `updates.capabilities` | 5 s | 停机准入读取模块能力 | runtime 模块守卫 | 503 | — |
-| `updates.status-aster` | 60 s | 读取能力之后 | runtime 模块守卫 | 503；与 bridge 的 60 s 等待并列（C14） | — |
+| `updates.status-aster` | 60 s | 读取能力之后 | runtime 模块守卫 | 503；比 bridge 的 55 s 等待晚 5 s | — |
 | `updates.status-default` | 10 s | 同上 | runtime 模块守卫 | 503 | — |
 | `updates.client` | 8 s | 请求更新服务 | API 更新客户端 | 失败；已发出时保持结果不确定 | — |
 
@@ -140,7 +141,7 @@ bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若�
 
 ## 4 关系
 
-关系的写法是"外层 ≥ 各内层之和 + 最小余量"。余量取当前实际值能满足的下限。
+关系的写法是"外层 ≥ 各内层之和 + 最小余量"。余量取当前实际值能满足的下限。状态"冲突"表示待修正；"接受"表示外层不覆盖内层是有意的设计（理由见第 5 节）。两者测试都要求关系当前仍不成立，一旦成立就要改为"成立"。
 
 | 关系 | 状态 | 外层 ⊇ 内层 + 余量 | 说明 |
 | --- | --- | --- | --- |
@@ -162,25 +163,26 @@ bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若�
 | `runtime-unit-covers-default-stop` | 成立 | `unit.runtime` ⊇ `runtime.stop-default` + `runtime.kill-grace` + 10 s | — |
 | `module-start-covers-greeks-startup` | 成立 | `runtime.module-start` ⊇ `greeks.startup` + `python.writer-handshake` + 5 s | — |
 | `module-start-covers-aster-startup` | 成立 | `runtime.module-start` ⊇ `aster.startup` + `python.writer-handshake` + 5 s | — |
-| `maintenance-covers-module-maintenance` | 成立 | `protocol.maintenance` ⊇ `runtime.sync-deadline` + `updates.module-maintenance` + 1 s | API 的维护同步可能排在 runtime 自身重同步之后（`runtime/main.mjs` 注释）；只在队列里最多一项重同步时成立，多项见 C18 |
+| `maintenance-covers-module-maintenance` | 成立 | `protocol.maintenance` ⊇ `runtime.sync-deadline` + `updates.module-maintenance` + 1 s | API 的维护同步可能排在 runtime 自身重同步之后（`runtime/main.mjs` 注释）；runtime 自身的重同步在队列里最多一项（C18） |
 | `prepare-stop-covers-module-evidence` | 成立 | `protocol.prepare-stop` ⊇ `updates.capabilities` + `updates.status-aster` + 5 s | 各模块并行，每个模块先读能力再读委托状态，取最长的 ASTER |
 | `portal-covers-asset-sync` | 成立 | `portal.response-header` ⊇ `client.asset-sync` + 5 s | — |
+| `browser-asset-covers-asset-sync` | 成立 | `browser.asset-sync` ⊇ `client.asset-sync` + 10 s | 资产页晚于 API 放弃；余量给 Portal 在同步前后各读一次的 ledger（本地模块，没有单独时限） |
 | `browser-aero-covers-forward` | 成立 | `browser.aero-change` ⊇ `client.forward` + 5 s | 浏览器晚于服务端放弃 |
 | `browser-covers-update-apply` | 成立 | `browser.update-apply` ⊇ `protocol.maintenance` + `protocol.prepare-stop` + `updates.client` + `protocol.maintenance` + 5 s | 浏览器晚于整个更新请求放弃 |
-| `portal-covers-greeks-request` | 冲突 C1 | `portal.response-header` ⊇ `python.receive` + `greeks.pending` + 1 s | 当前余量为 0 |
-| `portal-covers-aster-request` | 冲突 C1 | `portal.response-header` ⊇ `python.receive` + `aster.pending` + 1 s | 当前余量为 0 |
-| `api-drain-covers-portal-request` | 冲突 C2 | `api.drain` ⊇ `protocol.read` + `portal.response-header` + 0 s | 取模块地址的读取在响应头计时之前，两者串行 |
-| `aster-status-covers-bridge` | 冲突 C14 | `updates.status-aster` ⊇ `aster.pending` + 1 s | 当前余量为 0 |
-| `api-drain-covers-update-apply` | 冲突 C15 | `api.drain` ⊇ `protocol.maintenance` + `protocol.prepare-stop` + `updates.client` + `protocol.maintenance` + 0 s | 维护同步、停机准入、更新请求和结束时的维护同步串行 |
-| `client-asset-sync-covers-runtime-sync` | 冲突 C16 | `client.asset-sync` ⊇ `runtime.asset-sync` + `runtime.summary-read` + 0 s | 同步本身 60 s 之后还要读一次摘要 |
-| `maintenance-covers-queued-resyncs` | 冲突 C18 | `protocol.maintenance` ⊇ `runtime.sync-deadline` + `runtime.sync-deadline` + `runtime.sync-deadline` + `updates.module-maintenance` + 0 s | 三个交易模块同时重启时各排一次重同步 |
+| `portal-covers-greeks-request` | 成立 | `portal.response-header` ⊇ `python.receive` + `greeks.pending` + 5 s | bridge 的 504 先于 Portal（C1） |
+| `portal-covers-aster-request` | 成立 | `portal.response-header` ⊇ `python.receive` + `aster.pending` + 5 s | 同上 |
+| `api-drain-covers-portal-request` | 接受 C2 | `api.drain` ⊇ `protocol.read` + `portal.response-header` + 0 s | 取模块地址的读取在响应头计时之前，两者串行 |
+| `aster-status-covers-bridge` | 成立 | `updates.status-aster` ⊇ `aster.pending` + 5 s | bridge 的 504 先于 runtime 的 503（C14） |
+| `api-drain-covers-update-apply` | 接受 C15 | `api.drain` ⊇ `protocol.maintenance` + `protocol.prepare-stop` + `updates.client` + `protocol.maintenance` + 0 s | 维护同步、停机准入、更新请求和结束时的维护同步串行 |
+| `client-asset-sync-covers-runtime-sync` | 成立 | `client.asset-sync` ⊇ `runtime.asset-sync` + `runtime.summary-read` + 5 s | 同步本身 60 s 之后还要读一次摘要（C16） |
+| `maintenance-covers-two-api-syncs` | 冲突 C18 | `protocol.maintenance` ⊇ `runtime.sync-deadline` + `updates.module-maintenance` + `updates.module-maintenance` + 0 s | 双槽切换时两个 API 的维护同步互相排队，排在一项 runtime 重同步之后 |
 
 ## 5 已知冲突
 
-| 编号 | 冲突 | 影响 | 修正方向（另开批次） |
+| 编号 | 冲突 | 影响 | 修正方向或处理结果 |
 | --- | --- | --- | --- |
-| C1 | Portal 响应头 90 s，正好等于 bridge 收请求体 30 s 加等待 60 s | 请求体上传接近 30 s 时，Portal 的 504 和 bridge 的 504 同时触发，返回哪一个不确定 | 内层留出余量，或者 Portal 改用从截止时刻推算的剩余时间 |
-| C2 | Portal 请求最长 5 s 取模块地址加 90 s 响应头，API 排空只等 60 s | 停止或切换时，等待超过 60 s 的 Portal 请求会被强制断开 | 统一 Portal 和 API 排空的上限 |
+| C1 | Portal 响应头 90 s，正好等于 bridge 收请求体 30 s 加等待 60 s | 请求体上传接近 30 s 时，Portal 的 504 和 bridge 的 504 同时触发，返回哪一个不确定 | 已修：Greeks 与 ASTER 的等待改为 55 s，30 + 55 + 5 = 90 s |
+| C2 | Portal 请求最长 5 s 取模块地址加 90 s 响应头，API 排空只等 60 s | 停止或切换时，等待超过 60 s 的 Portal 请求会被强制断开 | 按设计接受：排空是 API 停止时长的上限，放宽到覆盖 95 s 会让单槽重启在有慢请求时停服更久，并连带调大三处 `TimeoutStopSec`。被断开的上游连接会让模块取消对应任务（bridge 收到 cancel），写操作不自动重试；受影响的主要是资产同步，runtime 的同步不随之中止（C7） |
 | C3 | bridge 启动时限写死为 90 s，不随 `startupTimeout` 变化 | Node 计时起点更早，所以通常先到期；但调大 `startupTimeout` 后，bridge 仍会在 90 s 时失败 | 由参数传入 bridge |
 | C4 | Node 的 `requestTimeout` 只限接收请求，`internal-server.mjs` 的注释却把 75 s 当作 prepare-stop 的处理时限；API 的接收时限和转发截止也共用一个常量 | 注释会误导以后的修改；请求体收得慢会挤占转发时间 | 改注释，并拆开两个常量 |
 | C5 | 转发超时返回 503，调仓超时返回 504 | 同一类超时状态码不同 | 统一 |
@@ -191,12 +193,12 @@ bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若�
 | C10 | 用 `npm start` 时 launcher 停止 runtime 没有时限 | 开发环境下 runtime 可能一直不退出 | launcher 给 runtime 设一个覆盖 `runtime.stop-aster` 的时限 |
 | C11 | runtime 单元的 150 s 里，data plane 关闭是一串没有时限的串行等待 | `runtime-unit-covers-aster-stop` 只覆盖模块，data plane 那部分的余量没人检查 | 给 data plane 关闭加时限，并纳入关系 |
 | C12 | Portal 代理的 SSE 和 WebSocket 没有空闲时限 | 只能靠 TCP 断开或 API 排空来结束 | 视需要加空闲时限，不套普通响应时限 |
-| C13 | bridge 整包回传响应体 | 以后在 Python 模块里加流式响应，会在 60 s 等待时限到期时得到 504 | 需要时再加流式协议 |
-| C14 | 停机准入读取 ASTER 委托状态的 60 s，正好等于 bridge 的 60 s 等待 | ASTER 慢时 runtime 的 503 与 bridge 的 504 同时触发 | 内层留出余量 |
-| C15 | 更新请求串行等待维护同步、停机准入、更新服务和结束时的维护同步，最长约 108 s，API 排空只等 60 s | 正在更新时停止 API，会在结果确认前断开浏览器请求 | 准入改为异步并轮询状态，或者让排空覆盖它 |
-| C16 | runtime 单轮资产同步 60 s 之后还要读一次摘要（5 s），API 只等 60 s | API 先返回 503，runtime 还在执行 | 内层留出余量或缩短同步时限 |
+| C13 | bridge 整包回传响应体 | 以后在 Python 模块里加流式响应，会在 55 s 等待时限到期时得到 504 | 需要时再加流式协议 |
+| C14 | 停机准入读取 ASTER 委托状态的 60 s，正好等于 bridge 的 60 s 等待 | ASTER 慢时 runtime 的 503 与 bridge 的 504 同时触发 | 已修：bridge 等待改为 55 s，比读取时限早 5 s |
+| C15 | 更新请求串行等待维护同步、停机准入、更新服务和结束时的维护同步，最长约 108 s，API 排空只等 60 s | 正在更新时停止 API，会在结果确认前断开浏览器请求 | 按设计接受：排空到期后 handler 再有 2 s，随后 `updates.close()` 对尚未发出的更新撤销准入（恢复准入前的维护状态），apply 在 `assertOpen` 处中止；已发出的更新照常进行。进程崩溃时由下一个实例按持久化的 owner 记录恢复。前端遇到断连显示"正在重连并核实更新进度"，重连后看到新任务就跟踪它，没有新任务就提示重新检查版本。排空不放宽，理由同 C2 |
+| C16 | runtime 单轮资产同步 60 s 之后还要读一次摘要（5 s），API 只等 60 s | API 先返回 503，runtime 还在执行 | 已修：API 等待改为 70 s；资产页的 75 s 和 Portal 的 90 s 仍覆盖它 |
 | C17 | 执行页写操作的前端时限 30 s 和 45 s，短于转发截止 60 s；路由内实际的处理时限未登记 | 浏览器先放弃，显示"尚未确认"，服务端仍可能成功 | 登记执行路由的内层时限后，再决定前端时限 |
-| C18 | runtime 自身的重同步每个模块排一项（首次不跳过），三个交易模块同时重启时 API 的维护同步最多等 3 × 4 + 10 = 22 s，超过 15 s；双槽切换时候选 API 初始化还会再排一项 | API 判定维护状态未确认，更新被拒绝或需要重试 | 重同步合并为一项，或 API 侧按队列长度放宽 |
+| C18 | runtime 自身的重同步每个模块排一项（首次不跳过），三个交易模块同时重启时 API 的维护同步最多等 3 × 4 + 10 = 22 s，超过 15 s；双槽切换时候选 API 初始化还会再排一项 | API 判定维护状态未确认，更新被拒绝或需要重试 | 已修：runtime 自身的重同步在服务队列里最多一项，期间就绪的模块并入下一项，API 最多等 4 + 10 = 14 s。剩余：双槽切换时两个 API 的维护同步相互排队仍可能超过 15 s（关系 `maintenance-covers-two-api-syncs` 锁定为冲突），结果同样是更新被拒绝、可重试 |
 
 ## 6 维护
 
@@ -206,6 +208,6 @@ bridge 把响应体整包回传，不支持流式；以后 Greeks 或 ASTER 若�
   - 受影响的关系。
 - 生成单元的值取自 `write_unit` 的实际输出。回退配置时，生成单元会跟着回退，不需要单独核对。
 - 参数默认值只有在生产调用处不传入覆盖值时才生效。登记默认值时，要在 `overrides` 里列出调用文件和不得出现的参数名；如果只检查某次调用，用 `after`、`until` 截取调用片段。
-- 修正冲突时，把相应关系改为"成立"，并保留余量。
+- 修正冲突时，把相应关系改为"成立"，并保留余量。改为"接受"时在第 5 节写明理由。
 - 正则命中位置所在行以注释开头时测试失败（`.py` 判断 `#`，其它判断 `//`、`/*`、`* `）；行尾注释不检测。
 - 未登记：entry 的 `ENTRY_STALL_MS`（30 s）与安装器约 40 s 等待循环之间的约束，超出时只记日志；外部交易所请求的时限，属于各模块自身的路径。

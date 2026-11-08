@@ -83,7 +83,8 @@ export async function startInternalServer({ service, dataPlane = null, dir, rele
   ensureRuntimeDir(dir);
   const secret = createSecret(), socketPath = socketPathFor(dir, service.instanceId);
   removeStaleRuntimeFiles(dir, service.instanceId);
-  const server = http.createServer(createInternalHandler({ service, dataPlane, secret, logger }));
+  // Node checks requestTimeout and headersTimeout only every connectionsCheckingInterval (30 s by default).
+  const server = http.createServer({ connectionsCheckingInterval: 1000 }, createInternalHandler({ service, dataPlane, secret, logger }));
   // prepare-stop may take up to 70 s; headers must still arrive promptly.
   server.requestTimeout = 75_000; server.headersTimeout = 5000; server.keepAliveTimeout = 1000;
   if (!windows) rmSync(socketPath, { force: true });

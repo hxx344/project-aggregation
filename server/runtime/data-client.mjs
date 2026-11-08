@@ -13,8 +13,9 @@ export const DEADLINE_HEADER = 'x-workspace-deadline';
 // A HEAD reply carries no body, so a forwarded HEAD travels as GET with this header.
 export const METHOD_HEADER = 'x-workspace-method';
 // Budgets of design doc 5.2: a forwarded request keeps the browser request's
-// remaining time, at most the API's 60 s request timeout.
-export const FORWARD_BUDGET = 60_000, ASSET_SYNC_BUDGET = 60_000;
+// remaining time, at most the API's 60 s request timeout. An asset sync runs
+// a 60 s round and then reads the summary (5 s), so its budget covers both.
+export const FORWARD_BUDGET = 60_000, ASSET_SYNC_BUDGET = 70_000;
 // Business replies such as fill histories may be larger than internal JSON.
 export const MAX_FORWARD_REPLY_BYTES = 16 * 1024 * 1024;
 const REASONS = new Set(['created', 'updated', 'deleted', 'preferences']);

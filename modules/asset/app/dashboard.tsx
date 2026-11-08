@@ -30,7 +30,7 @@ const connectionDescriptions={bybit:'统一账户净权益与资金账户余额�
 type Exchange=keyof typeof exchangeNames;
 function isExchangeMode(mode:Asset['mode']):mode is Exchange{return mode==='bybit'||mode==='binance'||mode==='okx'||mode==='gate'||mode==='aster'||mode==='variational'||mode==='hyperliquid'||mode==='rh-lighter';}
 async function api(path:string,method='GET',body?:unknown,signal?:AbortSignal):Promise<Ledger>{
- const timeoutMs=path==='/api/sync'?75_000:['/api/connections','/api/aster-accounts'].includes(path)?60_000:30_000;
+ const timeoutMs=path==='/api/sync'?80_000:['/api/connections','/api/aster-accounts'].includes(path)?60_000:30_000;
  return requestJson<Ledger>(path,{method,headers:method==='GET'?{}:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal,timeoutMs});
 }
 function badge(a:Asset,now:number){
