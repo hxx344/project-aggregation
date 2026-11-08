@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { stripTypeScriptTypes } from 'node:module';
 import { openDatabase } from '../lib/sqlite.ts';
 import { createFillsService as createRawFillsService, fillsQueryMarket } from '../lib/hub-fills.ts';
@@ -48,8 +50,8 @@ function mock(handler: (url: URL) => unknown) {
   }) as typeof fetch;
   return { calls, fetcher };
 }
-function fixture() {
-  const database = openDatabase(':memory:'), vault = new Map<string, Credentials>();
+function fixture(filename = ':memory:') {
+  const database = openDatabase(filename), vault = new Map<string, Credentials>();
   let revision = 0;
   const save = async (value: Credentials = okx, owner = 'owner') => {
     const encrypted = 'synthetic-' + ++revision; vault.set(encrypted, value);
@@ -249,7 +251,7 @@ test('incremental refresh overlaps ten minutes, deduplicates, recomputes all cac
   assert.equal(result.status, 'error'); assert.equal(result.fills.length, 2); assert.match(result.error!, /冲突/);
 });
 
-test('skew retries after 30 seconds without advancing the incremental cursor', async t => {
+test('skew retries after 30 seconds reuse complete history while replay stays unknown', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   let clock = at; const starts: number[] = [];
   const service = createFillsService({ now: () => clock, read: async () => [held('1')],
@@ -258,16 +260,42 @@ test('skew retries after 30 seconds without advancing the incremental cursor', a
   assert.equal(scope(await service.read(f.database, 'owner', f.unseal)).fills[0].positionBefore, null);
   clock += 29_999; await service.read(f.database, 'owner', f.unseal); await service.idle(); assert.equal(starts.length, 1);
   clock++; await service.read(f.database, 'owner', f.unseal); await service.idle();
-  assert.equal(starts[1], clock - CYCLE_LOOKBACK_MS, 'first skewed refresh did not establish a cursor');
+  assert.equal(starts[1], at - 10 * minute, 'uncertain replay reuses the complete history already read');
   assert.equal(scope(await service.read(f.database, 'owner', f.unseal)).fills[0].positionBefore, null);
   clock += 30_000; await service.read(f.database, 'owner', f.unseal); await service.idle();
-  assert.equal(starts[2], clock - CYCLE_LOOKBACK_MS);
+  assert.equal(starts[2], at + 30_000 - 10 * minute);
   assert.equal(scope(await service.read(f.database, 'owner', f.unseal)).fills[0].positionBefore, '0');
   clock += 5 * minute; await service.read(f.database, 'owner', f.unseal); await service.idle();
   assert.equal(starts[3], at + 60_000 - 10 * minute);
 });
 
-test('real readers include trades during a slow position read, isolate uncertain groups and recover without advancing the cursor', async t => {
+test('Binance replay retries reduce 85-day history from 26 requests to two while retaining older fills', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save(binance);
+  let clock = at;
+  const rows = [at - 1000, at - day].map((time, index) => ({ symbol: 'CLUSDT', id: 2 - index, time,
+    side: 'BUY', positionSide: 'BOTH', qty: '1', price: '80', realizedPnl: '0', commission: '0.1', commissionAsset: 'USDT' }));
+  const sample = mock(url => {
+    const { start, end } = historyBounds(url, 'binance', clock);
+    return url.searchParams.get('symbol') === 'CLUSDT' ? rows.filter(row => row.time >= start && row.time <= end) : [];
+  });
+  const service = createFillsService({ now: () => clock, read: async (_c, product) => {
+    assert.equal(product, 'pm-um'); return [held('2', 'long', 'net', 'CLUSDT')];
+  }, fills: (credentials, product, request, options) => readFills(credentials, product, request, { ...options, spacing: false }), fetcher: sample.fetcher });
+  t.after(() => service.close());
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal(sample.calls.length, 26);
+  for (const elapsed of [30_000, 60_000]) {
+    clock = at + elapsed; const before: number = sample.calls.length;
+    await service.read(f.database, 'owner', f.unseal); await service.idle();
+    assert.equal(sample.calls.length - before, 2, 'only the overlapping recent window for CL and BZ is read again');
+    const result = scope(await service.read(f.database, 'owner', f.unseal), 'binance', 'pm-um');
+    assert.deepEqual(result.fills.map(row => row.id), ['CLUSDT:2', 'CLUSDT:1']);
+    assert.equal(result.fills[0].positionBefore, elapsed === 30_000 ? null : '1');
+    assert.equal(result.fills[1].positionBefore, elapsed === 30_000 ? null : '0');
+  }
+});
+
+test('real readers include trades during a slow position read, isolate uncertain groups and recover from cached history', async t => {
   for (const [tradeOffset, duration, clockSkew] of [[1_000, 6_000, 0], [5_000, 6_000, 0], [1_000, 500, 1_000], [-1_000, 500, -1_000], [30_000, 500, 30_000]]) await t.test(`trade ${tradeOffset}ms, response ${duration}ms, exchange skew ${clockSkew}ms`, async t => {
     const f = fixture(); t.after(() => f.database.close()); await f.save();
     let clock = at, positionReads = 0;
@@ -318,7 +346,7 @@ test('real readers include trades during a slow position read, isolate uncertain
     clock += 60_001; const recoveredAt = clock;
     await service.read(f.database, 'owner', f.unseal); await service.idle();
     const recovered = scope(await service.read(f.database, 'owner', f.unseal));
-    assert.equal(history()[2].searchParams.get('begin'), String(recoveredAt - CYCLE_LOOKBACK_MS), 'uncertain read did not establish an incremental cursor');
+    assert.equal(history()[2].searchParams.get('begin'), String(at + duration - 10 * minute), 'uncertain replay does not force a full history read');
     assert.deepEqual(recovered.fills.filter(item => item.base === 'CL').map(item => [item.id, item.positionBefore, item.positionAfter]),
       [['3', '0', '-2'], ['2', '1', '0'], ['1', '0', '1']]);
     assert.equal(recovered.coverageEnd, iso(recoveredAt));
@@ -414,7 +442,7 @@ test('failures retain prior successful data as stale, sanitize text, retry after
   assert.equal(JSON.stringify(result).includes('PRIVATE'), false);
   clock += 59_999; await service.read(f.database, 'owner', f.unseal); await service.idle(); assert.equal(reads, 2);
   clock++; await service.read(f.database, 'owner', f.unseal); await service.idle(); assert.equal(reads, 3);
-  // Failed refreshes are never stored: the evicted entry comes back as the last success, now stale.
+  // Failed attempts retain both the old rows and their original success time across eviction.
   clock += 15 * minute; result = scope(await service.read(f.database, 'owner', f.unseal));
   assert.equal(result.status, 'stale'); assert.equal(result.fetchedAt, iso(at)); assert.equal(result.fills.length, 1); assert.equal(result.refreshing, true);
   await service.idle();
@@ -623,7 +651,7 @@ test('uncertainty retries without another read, keeps pending visible and stops 
   assert.equal(scope(await service.read(f.database, 'owner', f.unseal)).refreshing, true);
 });
 
-test('a stable later snapshot resolves the timer retry and advances the cursor only after uncertainty ends', async t => {
+test('a stable later snapshot resolves the timer retry using incrementally refreshed history', async t => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: at });
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   const starts: number[] = [];
@@ -637,7 +665,7 @@ test('a stable later snapshot resolves the timer retry and advances the cursor o
   assert.equal(scope(await service.read(f.database, 'owner', f.unseal)).fills[0].positionBefore, null);
   t.mock.timers.tick(30_000); await service.idle();
   const result = scope(await service.read(f.database, 'owner', f.unseal));
-  assert.equal(starts.length, 3); assert.equal(starts[2], Date.now() - CYCLE_LOOKBACK_MS);
+  assert.equal(starts.length, 3); assert.equal(starts[2], at + 30_000 - 10 * minute);
   assert.equal(result.refreshing, false); assert.equal(result.fills[0].positionBefore, '0');
   t.mock.timers.tick(30_000); await service.idle(); assert.equal(starts.length, 3);
   t.mock.timers.tick(270_000); await service.read(f.database, 'owner', f.unseal); await service.idle();
@@ -717,11 +745,109 @@ test('a restarted service serves stored fills at once, waits for the stored refr
   assert.equal(scope(await second.read(f.database, 'owner', f.unseal)).fetchedAt, iso(clock));
 });
 
+test('stored history resumes incrementally after database reopen even while position replay is uncertain', async t => {
+  for (const market of ['oil', 'hynix', 'anthropic'] as const) for (const failure of ['positions', 'skew']) await t.test(`${market}: ${failure}`, async t => {
+    const directory = await mkdtemp(path.join(tmpdir(), 'asset-fill-history-'));
+    const filename = path.join(directory, 'ledger.sqlite'), f = fixture(filename);
+    let database = f.database, service: ReturnType<typeof createFillsService>;
+    t.after(async () => {
+      service?.close(); await service?.idle(); database.close();
+      assert.equal(path.dirname(path.resolve(directory)), path.resolve(tmpdir()));
+      assert.ok(path.basename(directory).startsWith('asset-fill-history-'));
+      await rm(directory, { recursive: true, force: true });
+    });
+    await f.save();
+    let clock = at, healthy = false, reads = 0;
+    const starts: number[] = [], base = market === 'oil' ? 'CL' : market === 'hynix' ? 'SKHYNIX' : 'ANTHROPIC';
+    const symbol = base + '-USDT-SWAP';
+    const old = fill('old', at - day, 'buy', '1', { base, symbol });
+    const recent = fill('recent', at - 1000, 'buy', '1', { base, symbol });
+    const later = fill('later', at + 10_000, 'sell', '1', { base, symbol });
+    const options = { now: () => clock, read: async () => {
+      if (failure === 'positions' && !healthy) throw new Error('snapshot unavailable');
+      return [held(reads > 0 ? '1' : '2', 'long', 'net', symbol)];
+    }, fills: async (_c: Credentials, _s: string, request: { start: number }) => {
+      starts.push(request.start); reads++;
+      return [old, recent, ...(healthy ? [later] : [])].filter(row => Date.parse(row.time) >= request.start);
+    } };
+    service = createFillsService(options);
+    await service.read(database, 'owner', f.unseal, market); await service.idle();
+    const first = scope(await service.read(database, 'owner', f.unseal, market));
+    assert.equal(first.fills.length, 2); assert.ok(first.fills.every(row => row.positionBefore === null));
+    service.close(); await service.idle(); database.close(); database = openDatabase(filename);
+    clock += 20_000; service = createFillsService(options);
+    const restored = scope(await service.read(database, 'owner', f.unseal, market));
+    assert.deepEqual(restored.fills, first.fills); assert.equal(restored.fetchedAt, first.fetchedAt);
+    await service.idle(); assert.equal(reads, 1, 'opening stored history does not call the exchange before its retry time');
+    healthy = true; clock = at + 2 * minute;
+    await service.read(database, 'owner', f.unseal, market); await service.idle();
+    const recovered = scope(await service.read(database, 'owner', f.unseal, market));
+    assert.deepEqual(starts, [at - CYCLE_LOOKBACK_MS, at - 10 * minute]);
+    assert.deepEqual(recovered.fills.map(row => [row.id, row.positionBefore, row.positionAfter]),
+      [['later', '2', '1'], ['recent', '1', '2'], ['old', '0', '1']]);
+  });
+});
+
+test('failed history refresh persists its cooldown without advancing the stored history cursor', async t => {
+  for (const initialized of [false, true]) await t.test(initialized ? 'retained history' : 'first read', async t => {
+    const f = fixture(); t.after(() => f.database.close()); await f.save();
+    let clock = at, fail = !initialized, reads = 0;
+    const starts: number[] = [];
+    const options = { now: () => clock, read: async () => [], fills: async (_c: Credentials, _s: string, request: { start: number }) => {
+      reads++; starts.push(request.start); if (fail) throw new Error('incomplete history');
+      return [fill('old', at - day, 'buy', '1', { symbol: 'ANTHROPIC-USDT-SWAP', base: 'ANTHROPIC' })];
+    } };
+    const first = createFillsService(options); t.after(() => first.close());
+    await first.read(f.database, 'owner', f.unseal, 'anthropic'); await first.idle();
+    if (initialized) {
+      clock += 5 * minute; fail = true;
+      await first.read(f.database, 'owner', f.unseal, 'anthropic'); await first.idle();
+    }
+    const failed = scope(await first.read(f.database, 'owner', f.unseal, 'anthropic'));
+    first.close(); const before = reads;
+    clock += 59_999;
+    const second = createFillsService(options); t.after(() => second.close());
+    const restored = scope(await second.read(f.database, 'owner', f.unseal, 'anthropic'));
+    await second.idle();
+    assert.equal(reads, before, 'restart and metadata backfill must respect the last failed attempt cooldown');
+    assert.equal(restored.status, initialized ? 'stale' : 'error');
+    assert.equal(restored.fetchedAt, failed.fetchedAt); assert.deepEqual(restored.fills, failed.fills);
+    assert.equal(restored.refreshing, false);
+    clock++; fail = false;
+    await second.read(f.database, 'owner', f.unseal, 'anthropic'); await second.idle();
+    assert.equal(reads, before + 1);
+    assert.equal(starts.at(-1), initialized ? at - 10 * minute : clock - CYCLE_LOOKBACK_MS);
+  });
+});
+
+test('legacy stored history reuses its cursor and malformed new progress falls back to a full read', async t => {
+  for (const progress of [undefined, 'invalid', -1, 9e15]) await t.test(String(progress), async t => {
+    const f = fixture(); t.after(() => f.database.close()); await f.save();
+    let clock = at; const starts: number[] = [];
+    const options = { now: () => clock, read: async () => [], fills: async (_c: Credentials, _s: string, request: { start: number }) => {
+      starts.push(request.start); return [fill('old', at - day, 'buy', '1')];
+    } };
+    const first = createFillsService(options);
+    await first.read(f.database, 'owner', f.unseal); await first.idle(); first.close();
+    const stored = JSON.parse((await f.database.prepare('SELECT data FROM fill_cache').first<{ data: string }>())!.data);
+    if (progress === undefined) delete stored.historyCursor; else stored.historyCursor = progress;
+    await f.database.prepare('UPDATE fill_cache SET data=?').bind(JSON.stringify(stored)).run();
+    clock += 5 * minute;
+    const second = createFillsService(options); t.after(() => second.close());
+    const initial = scope(await second.read(f.database, 'owner', f.unseal)); await second.idle();
+    assert.equal(initial.fills.length, progress === undefined ? 1 : 0);
+    assert.equal(starts[1], progress === undefined ? at - 10 * minute : clock - CYCLE_LOOKBACK_MS);
+  });
+});
+
 test('stored fills are dropped for replaced or deleted credentials, conflicts and unreadable rows', async t => {
   const f = fixture(); t.after(() => f.database.close()); await f.save();
   const rows = async () => (await f.database.prepare('SELECT account,scope,revision FROM fill_cache WHERE owner = ?').bind('owner').all()).results;
-  let clock = at, conflict = false;
-  const options = { now: () => clock, read: async () => [held('1')], fills: async () => [fill('1', at - 2 * minute, 'buy', '1', conflict ? { price: '999' } : {})] };
+  let clock = at, conflict = false, failure = false;
+  const options = { now: () => clock, read: async () => [held('1')], fills: async () => {
+    if (failure) throw new Error('unavailable');
+    return [fill('1', at - 2 * minute, 'buy', '1', conflict ? { price: '999' } : {})];
+  } };
   const service = createFillsService(options); t.after(() => service.close());
   await service.read(f.database, 'owner', f.unseal); await service.idle();
   assert.equal((await rows()).length, 1);
@@ -739,7 +865,10 @@ test('stored fills are dropped for replaced or deleted credentials, conflicts an
   assert.match(scope(await service.read(f.database, 'owner', f.unseal)).error!, /冲突/);
   assert.deepEqual(await rows(), [], 'a conflicting history does not survive the process');
 
-  conflict = false; clock += minute;
+  failure = true; clock += minute;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.deepEqual(await rows(), [], 'a later failed attempt must not restore the invalidated history');
+  failure = false; conflict = false; clock += minute;
   await service.read(f.database, 'owner', f.unseal); await service.idle();
   assert.equal((await rows()).length, 1);
   await f.database.prepare('UPDATE fill_cache SET data = ? WHERE owner = ?').bind('{"version":1,"scope":{}}', 'owner').run();
