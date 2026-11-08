@@ -56,7 +56,24 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 | Greeks | `engine_state.json` 中的订单日志、任务、RFQ、持仓与绩效，以及模块 `.env` |
 | ASTER | `trading.sqlite3` 中的 intent、pair pending、划转、post-fill、ADL 与财务记录，以及含账户和主账户凭据的模块 `.env` |
 
-各模块 `.env`、JSON、应用解密密钥、引用的内部 CA 和未知文件默认归 `secrets`。已知业务库、共享保护库与身份标记归 `data`；未知 SQLite 文件仍按秘密材料处理。两类分别使用独立密钥进行 AES-256-GCM 加密，manifest 同时用两把密钥认证，关联固定发布提交、检查点、文件明文与密文摘要、大小和分类。成功制作只表示归档完成；返回 `restorable: null` 不等于已完成独立恢复验收。
+已知材料集中声明在 `server/recovery/data-catalog.mjs`：路径（或整路径正则）、所属模块、类别、是否必需、解密其中凭据的密钥/配置，以及检查点证据要限量的日志表与文件（每次交接和恢复都会运行）；种类与引用的环境变量只作说明。交接时各模块的结构检查仍在 `admission.mjs`。备份仍递归遍历整个数据根，声明只决定类别，不是白名单。各模块 `.env`、JSON、应用解密密钥、引用的内部 CA 和未声明的文件归 `secrets`。已知业务库、共享保护库与身份标记归 `data`；未声明的 SQLite 文件仍按秘密材料处理。
+
+| 情形 | 确定结果 |
+| --- | --- |
+| 已知模块目录下未声明的新文件（含新 SQLite、层级不同的同名文件） | 归 `secrets`，照常备份与恢复 |
+| `modules/` 下未知模块目录 | 备份拒绝（`RECOVERY_UNKNOWN_MODULE`） |
+| 只有大小写不同的两条路径并存 | 备份成功，恢复拒绝（`RECOVERY_MANIFEST_INVALID`）；备份时尚未拦截，待修复项见[演进计划 E6](evolution-plan.md#e6-模块数据声明s6) |
+| 共享保护库或其 `.required` 标记缺失或改名 | 备份与交接失败（`RECOVERY_FAILED`，读取注册表时即中止）；恢复拒绝（`RECOVERY_REQUIRED_MATERIAL_MISSING`） |
+| `hub.sqlite` 或 `credentials.key` 缺失或改名 | 备份与恢复都拒绝（`RECOVERY_REQUIRED_MATERIAL_MISSING`） |
+| `modules/crossex/crossex.sqlite` 或 `modules/aster/trading.sqlite3` 缺失或改名 | 普通备份成功（新名字归 `secrets`），交接和恢复在检查点证据阶段拒绝（`RECOVERY_CHECKPOINT_LIMIT_OR_INVALID`） |
+| Asset 账本、Monitor 行情库或 Greeks 文件缺失或改名 | 新名字归 `secrets`，按旧名的检查跳过，照常备份与恢复；缺 Greeks `engine_state.json` 时交接拒绝（`RECOVERY_HANDOFF_UNSAFE`），恢复后进入隔离态 |
+| CrossEx 密钥或 Asset `config.json` 缺失（对应库存在） | 恢复失败（`RECOVERY_FAILED`），不发布目标根 |
+| 密钥长度或 Asset 配置字段格式不对 | 恢复拒绝（`RECOVERY_CREDENTIAL_KEY_INVALID`）；配置不是合法 JSON 时为 `RECOVERY_JSON_INVALID` |
+| 密钥与库内密文不匹配 | 恢复拒绝（`RECOVERY_CREDENTIAL_VALIDATION_FAILED`）；库内没有密文时无从比对 |
+| 引用的材料缺失或在数据根外 | 记为未闭合 dependency，普通备份返回 `restorable: false`，`restore` 与 `handoff` 拒绝（`RECOVERY_DEPENDENCY_NOT_INCLUDED`） |
+| 清单条目类别与当前声明不同 | `RECOVERY_MANIFEST_INVALID` |
+
+路径的类别属于备份清单 schema 1 的一部分：恢复要求每个条目的类别等于当前声明给出的类别，因此新增、删除或改动任何 `data` 路径都会使包含该路径的旧备份无法恢复（反向同理）。当前支持范围是 manifest schema 1 及其固定的类别集合，`tests/recovery-data-catalog.test.mjs` 锁定该集合；调整类别必须先引入新的清单版本，并让旧版本备份继续按 schema 1 的类别校验。两类分别使用独立密钥进行 AES-256-GCM 加密，manifest 同时用两把密钥认证，关联固定发布提交、检查点、文件明文与密文摘要、大小和分类。成功制作只表示归档完成；返回 `restorable: null` 不等于已完成独立恢复验收。
 
 排除的可再生材料包括 `.runtime.lock`、`.api.lock`、模块进程锁、socket、临时文件、已被数据库快照吸收的 WAL/SHM 和旧恢复控制文件。符号链接、硬链接、特殊文件、不安全权限及路径越界直接拒绝，不会通过改名为排除项而放过。
 

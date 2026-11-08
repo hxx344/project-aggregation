@@ -7,16 +7,12 @@ import { DatabaseSync } from 'node:sqlite';
 import { parseEnv } from 'node:util';
 import { hash } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
+import { ASTER_CA, ASTER_ENV, category, CHECKPOINT_JOURNALS, CHECKPOINT_SIZED, REGISTRY, REQUIRED_MATERIAL } from './data-catalog.mjs';
 
 export const MODULES = ['monitor', 'asset', 'crossex', 'greeks', 'aster'];
-export const REGISTRY = 'execution-control.sqlite';
+export { ASTER_CA, ASTER_ENV, category, REGISTRY };
 export const CONTROL = 'recovery-control.json';
-export const ASTER_ENV = 'modules/aster/.env';
-export const ASTER_CA = 'ASTER_CAPACITY_RELAY_CA_FILE';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const DATA_FILES = new Set([REGISTRY, REGISTRY + '.required', 'hub.sqlite',
-  'modules/monitor/market.sqlite', 'modules/monitor/perpetual/market.sqlite',
-  'modules/asset/ledger.sqlite', 'modules/crossex/crossex.sqlite', 'modules/aster/trading.sqlite3']);
 export function safeRelative(value) {
   if (typeof value !== 'string' || !value || value.length > 1024 || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f]/.test(value) || value.split('/').some(p => !p || p === '.' || p === '..' || /[. ]$/.test(p) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p)) || path.isAbsolute(value)) throw new Error('RECOVERY_UNSAFE_PATH');
   return value;
@@ -112,14 +108,6 @@ export function excluded(relative) {
   const name = path.posix.basename(relative);
   return name === '.runtime.lock' || name === 'instance.lock' || name.endsWith('-wal') || name.endsWith('-shm') || /(?:\.sock|\.socket|\.tmp|\.lock)$/.test(name) || name.includes('.tmp-') || name === CONTROL;
 }
-export function category(relative) {
-  // Ordinary configuration and future/unknown paths may contain cleartext
-  // credentials at any nesting depth (including migrated notification channels).
-  // Only known application DBs (whose credentials are app-encrypted) and
-  // registry identity evidence use the data key. All other paths require the
-  // independently held secrets key, including unknown SQLite files.
-  return DATA_FILES.has(relative) || /^modules\/asset\/backups\/before-import-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.sqlite$/.test(relative) ? 'data' : 'secrets';
-}
 export function inventory(dataDir, limits) {
   const root = safePath(dataDir, { directory: true }); const entries = [];
   function walk(directory, prefix = '', depth = 0) {
@@ -138,7 +126,7 @@ export function inventory(dataDir, limits) {
     }
   }
   walk(root);
-  if (!entries.some(e => e.path === REGISTRY) || !entries.some(e => e.path === REGISTRY + '.required') || !entries.some(e => e.path === 'hub.sqlite') || !entries.some(e => e.path === 'credentials.key')) throw new Error('RECOVERY_REQUIRED_MATERIAL_MISSING');
+  if (REQUIRED_MATERIAL.some(required => !entries.some(e => e.path === required))) throw new Error('RECOVERY_REQUIRED_MATERIAL_MISSING');
   for (const moduleId of MODULES) safePath(path.join(root, 'modules', moduleId), { directory: true });
   return entries;
 }
@@ -195,15 +183,8 @@ export const databaseEvidence = (filename, limits) => boundedProbe('--database-e
 export const checkpointEvidence = (dataDir, limits, environment = {}) => boundedProbe('--checkpoint-evidence', dataDir, limits, { environment });
 function boundCheckpoint(dataDir, { maxCheckpointRows, maxRecordBytes }) {
   let rows = 0;
-  const journals = {
-    'hub.sqlite': ['execution_jobs','execution_orders','execution_locks','execution_stop_requests','projects','trading_accounts','execution_accounts'],
-    [REGISTRY]: ['aw_operations','aw_isolations'],
-    'modules/crossex/crossex.sqlite': ['live_executions','live_orders','live_cache','live_connection','settings'],
-    'modules/aster/trading.sqlite3': ['accounts','deleted_accounts','pairs','intents','kv'],
-    'modules/asset/ledger.sqlite': ['connections'],
-  };
-  for (const [relative, names] of Object.entries(journals)) {
-    if (relative === 'modules/asset/ledger.sqlite' && !fs.existsSync(path.join(dataDir, relative))) continue;
+  for (const { path: relative, checkpoint: { tables: names, optional } } of CHECKPOINT_JOURNALS) {
+    if (optional && !fs.existsSync(path.join(dataDir, relative))) continue;
     const filename = safePath(path.join(dataDir, relative)); const db = new DatabaseSync(`${pathToFileURL(filename).href}?immutable=1`, { readOnly: true });
     try {
       for (const name of names) {
@@ -219,9 +200,10 @@ function boundCheckpoint(dataDir, { maxCheckpointRows, maxRecordBytes }) {
       }
     } finally { db.close(); }
   }
-  for (const relative of ['modules/greeks/engine_state.json', 'modules/greeks/.env']) {
+  for (const { path: relative, checkpoint: { optional } } of CHECKPOINT_SIZED) {
     const filename = path.join(dataDir, relative);
-    if (fs.existsSync(filename) && fs.statSync(safePath(filename)).size > maxRecordBytes) throw new Error('RECOVERY_CHECKPOINT_LIMIT');
+    if (optional && !fs.existsSync(filename)) continue;
+    if (fs.statSync(safePath(filename)).size > maxRecordBytes) throw new Error('RECOVERY_CHECKPOINT_LIMIT');
   }
 }
 if (import.meta.main && ['--database-evidence','--checkpoint-evidence'].includes(process.argv[2])) {

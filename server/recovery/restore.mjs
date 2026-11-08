@@ -7,6 +7,7 @@ import { authenticate, canonical, decryptFile, fileHash, hash, keys, verify } fr
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
 import { registryTransaction, setMeta } from './backup.mjs';
 import { ASTER_CA, ASTER_ENV, budget, category, checkpointEvidence, CONTROL, databaseEvidence, identity, MODULES, readLockedRegistry, readRegistry, REGISTRY, safePath, safeRelative, syncDirectory, syncTreeDirectories, tables, within, writeJson } from './inventory.mjs';
+import { credentialKey, REQUIRED_MATERIAL } from './data-catalog.mjs';
 
 // These represent structurally readable business journals that must survive a
 // quarantined restore. Schema/JSON/enum failures and all future unknown reasons
@@ -32,7 +33,7 @@ function manifestBody(document, dataKey, secretsKey, limits) {
     if (entry.path === CONTROL || entry.path === '.runtime.lock' || entry.path === '.api.lock' || entry.path.startsWith('.recovery-stage-') || (entry.path.startsWith('_recovery/') && entry.path !== '_recovery/root.env')) throw new Error('RECOVERY_UNSAFE_PATH');
     seen.add(entry.path.toLowerCase());
   }
-  for (const required of [REGISTRY, REGISTRY + '.required', 'hub.sqlite', 'credentials.key']) if (!seen.has(required)) throw new Error('RECOVERY_REQUIRED_MATERIAL_MISSING');
+  for (const required of REQUIRED_MATERIAL) if (!seen.has(required)) throw new Error('RECOVERY_REQUIRED_MATERIAL_MISSING');
   validateBindings(body);
   return body;
 }
@@ -98,7 +99,7 @@ function validateCipher(value, key, { tagFirst = false, additionalData, asset = 
 function withDb(filename, action) { safePath(filename); const db = new DatabaseSync(filename); try { db.exec('PRAGMA busy_timeout=750; PRAGMA synchronous=FULL'); return action(db, tables(db)); } finally { db.close(); } }
 function keyFile(filename) { safePath(filename); if (fs.statSync(filename).size !== 32) throw new Error('RECOVERY_CREDENTIAL_KEY_INVALID'); return fs.readFileSync(filename); }
 function validateAndRevoke(directory) {
-  const hubKey = keyFile(path.join(directory, 'credentials.key'));
+  const hubKey = keyFile(path.join(directory, credentialKey('hub.sqlite')));
   withDb(path.join(directory, 'hub.sqlite'), (db, present) => {
     for (const table of ['settings', 'projects', 'sessions']) if (!present.has(table)) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
     for (const table of ['projects','trading_accounts','execution_accounts']) if (present.has(table)) for (const row of db.prepare('SELECT credentials FROM ' + table + ' WHERE credentials IS NOT NULL').iterate()) validateCipher(row.credentials, hubKey, { tagFirst: true });
@@ -107,7 +108,7 @@ function validateAndRevoke(directory) {
   });
   const cross = path.join(directory, 'modules/crossex/crossex.sqlite');
   if (fs.existsSync(cross)) {
-    const crossKey = keyFile(path.join(directory, 'modules/crossex/credentials.key'));
+    const crossKey = keyFile(path.join(directory, credentialKey('modules/crossex/crossex.sqlite')));
     withDb(cross, (db, present) => {
       if (!present.has('settings')) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
       const password = db.prepare("SELECT value FROM settings WHERE key='monitorPassword'").get(); if (password) validateCipher(JSON.parse(password.value), crossKey);
@@ -117,7 +118,7 @@ function validateAndRevoke(directory) {
     });
   }
   const asset = path.join(directory, 'modules/asset/ledger.sqlite');
-  const configFile = path.join(directory, 'modules/asset/config.json');
+  const configFile = path.join(directory, credentialKey('modules/asset/ledger.sqlite'));
   if (fs.existsSync(asset) || fs.existsSync(configFile)) {
     const config = loadJson(configFile);
     if (!/^[a-f0-9]{64}$/i.test(config.credentialKey ?? '') || !/^[a-f0-9]{64}$/i.test(config.sessionSecret ?? '') || !/^[a-f0-9]{32}:[a-f0-9]{64}$/i.test(config.passwordHash ?? '')) throw new Error('RECOVERY_CREDENTIAL_KEY_INVALID');

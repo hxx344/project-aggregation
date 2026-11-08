@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { authenticate, canonical, encryptFile, fileHash, hash, keys, verify } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
-import { ASTER_ENV, budget, checkpointEvidence, checkpointSourceDatabase, databaseEvidence, discoverPathBindings, identity, inventory, openLockedSourceDatabase, readLockedRegistry, readRegistry, REGISTRY, safePath, syncDirectory, within, writeJson } from './inventory.mjs';
+import { ASTER_ENV, budget, MODULES, checkpointEvidence, checkpointSourceDatabase, databaseEvidence, discoverPathBindings, identity, inventory, openLockedSourceDatabase, readLockedRegistry, readRegistry, REGISTRY, safePath, syncDirectory, within, writeJson } from './inventory.mjs';
 
 export function registryTransaction(dataDir, action) {
   const db = new DatabaseSync(path.join(dataDir, REGISTRY));
@@ -95,7 +95,7 @@ export async function createBackup(options) {
       await encryptFile(staged, payload, secretsKey, checkpointId, entry, limits.check); entry.payloadSha256 = await fileHash(payload, limits.check); fs.rmSync(staged); entries.push(entry);
     }
     limits.check();
-    const body = { schemaVersion: 1, protocol: 'cold-checkpoint-v1', checkpointId, kind, ...(handoffId ? { handoffId } : {}), sourceAuthorityId: registry.state.authorityId, registryId: registry.registryId, sourceIdentity: registry.identity, sourceMarker: registry.marker, commit, startedAt, completedAt: new Date().toISOString(), modules: ['monitor','asset','crossex','greeks','aster'], safety, pathBindings: dependencies.pathBindings, unresolvedDependencies: dependencies.unresolvedDependencies, entries };
+    const body = { schemaVersion: 1, protocol: 'cold-checkpoint-v1', checkpointId, kind, ...(handoffId ? { handoffId } : {}), sourceAuthorityId: registry.state.authorityId, registryId: registry.registryId, sourceIdentity: registry.identity, sourceMarker: registry.marker, commit, startedAt, completedAt: new Date().toISOString(), modules: MODULES, safety, pathBindings: dependencies.pathBindings, unresolvedDependencies: dependencies.unresolvedDependencies, entries };
     const manifest = authenticate(body, dataKey, secretsKey);
     fs.rmSync(plain, { recursive: true });
     for (const category of ['data','secrets']) syncDirectory(path.join(workspace, category));
