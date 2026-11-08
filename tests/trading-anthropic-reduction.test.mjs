@@ -34,6 +34,9 @@ async function fixture(t, { guarded = false } = {}) {
   accounts['rh-lighter'] = { identity: '0x' + 'ab'.repeat(20), modes: { ANTHROPIC: 'one-way' }, openOrders: [], strategies: [],
     positions: [{ symbol: 'ANTHROPIC', side: 'short', quantity: '31', risk: { markPrice: '100', liquidationPrice: '150', at: stamp(time) } }],
     leverage: { ANTHROPIC: { type: 'cross', value: 10 } } };
+  accounts.hyperliquid = { identity: '0x' + 'cd'.repeat(20), modes: { 'io:ANTH': 'one-way' }, openOrders: [], strategies: [],
+    positions: [{ symbol: 'io:ANTH', side: 'short', quantity: '31', risk: { markPrice: '100', liquidationPrice: '150', at: stamp(time) } }],
+    leverage: { 'io:ANTH': { type: 'cross', value: 10 } } };
   const factory = exchange => ({
     verify: async () => ({ identity: accounts[exchange].identity }),
     account: async () => { calls.push({ exchange, method: 'account' }); await hooks.account?.(exchange); return structuredClone(accounts[exchange]); },
@@ -43,6 +46,7 @@ async function fixture(t, { guarded = false } = {}) {
         tickSize: '0.01', quantityStep: exchange === 'okx' ? '1' : '0.1', minQuantity: exchange === 'okx' ? '1' : '0.1',
         maxQuantity: '1000', maxMarketQuantity: '1000', minNotional: '5', maxNotional: null, contractSize: '1',
         ...(exchange === 'rh-lighter' ? { assetId: 7, quoteAsset: 'USDG' } : {}),
+        ...(exchange === 'hyperliquid' ? { assetId: 120001, quoteAsset: 'USDC' } : {}),
       } };
       await hooks.market?.(exchange, market); return market;
     },
@@ -91,7 +95,11 @@ async function fixture(t, { guarded = false } = {}) {
     async wait(ms) { for (let left = ms; left > 0; left -= 10_000) { time += Math.min(left, 10_000); await execution.tick(); } },
     enable(overrides = {}) { return reduction.save({ revision: reduction.state().revision, config: config(overrides), confirmLive: true }); },
     locks() { return db.prepare('SELECT resource FROM execution_locks ORDER BY resource').all().map(row => row.resource); },
-    async restart() { await reduction.close(); await execution.close(); await open(); },
+    async restart({ crash = false } = {}) {
+      // Simulate a dead lease owner without orderly shutdown pausing its jobs.
+      if (crash) db.prepare('UPDATE execution_lease SET owner=?,expires=? WHERE id=1').run('crashed-fixture', time);
+      await reduction.close(); await execution.close(); await open();
+    },
     async finishBatch() { for (const record of records.values()) if (!record.terminal) fill(record); await execution.tick(); },
   };
 }
@@ -397,4 +405,155 @@ test('an owner order still present at the task deadline pauses the reduction for
   await f.wait(60_000); await f.reduction.tick();
   assert.notEqual(f.jobs[0].status, 'running'); assert.match(f.jobs[0].reason, /执行时间已到/);
   assert.equal(f.state.state.phase, 'review'); assert.equal(f.creates.length, 2, 'no batch is sent while the owner order remains');
+});
+
+test('reduction sizing is checked before the risk threshold, including independently rounded legs and batch limits', async t => {
+  for (const [name, change, settings, message] of [
+    ['one step times fifty percent', f => { f.accounts.binance.positions[0].quantity = '0.1'; }, { reducePercent: '50', batchCount: 1 }, /不足一个下单步长/],
+    ['the other leg has a different step', f => { f.accounts.okx.positions[0].quantity = '1'; }, { reducePercent: '50', batchCount: 1 }, /okx.*不足一个下单步长/],
+    ['batch too small', f => { f.accounts.okx.positions[0].quantity = '4'; }, { reducePercent: '50' }, /批次过多/],
+    ['venue minimum quantity', f => { f.hooks.market = (exchange, market) => { if (exchange === 'okx') market.rule.minQuantity = '5'; }; }, {}, /单批市价单数量/],
+    ['venue maximum notional', f => { f.hooks.market = (_exchange, market) => { market.rule.maxNotional = '1'; }; }, {}, /名义金额超过/],
+  ]) await t.test(name, async t => {
+    const f = await fixture(t); change(f);
+    f.enable({ thresholdPercent: '1', ...settings });
+    await f.reduction.tick(); await f.execution.tick();
+    assert.match(f.state.state.reason ?? '', message, 'an infeasible rule must be visible before danger is reached');
+    assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0); assert.deepEqual(f.locks(), []);
+  });
+});
+
+test('an armed reduction rechecks changed quantities and read failures before reaching its threshold', async t => {
+  const f = await fixture(t); f.enable({ thresholdPercent: '1', batchCount: 1, reducePercent: '50' });
+  assert.match(f.state.state.reason ?? '', /等待核验/);
+  await f.reduction.tick(); assert.equal(f.state.live.met, false); assert.equal(f.state.state.reason, null);
+  f.accounts.okx.positions[0].quantity = '1'; await f.reduction.tick();
+  assert.match(f.state.state.reason, /不足一个下单步长/); assert.equal(f.jobs.length, 0);
+  f.accounts.okx.positions[0].quantity = '31'; f.advance(30_000);
+  for (const account of Object.values(f.accounts)) for (const position of account.positions) position.risk.at = stamp(TIME + 30_000);
+  await f.reduction.tick(); assert.equal(f.state.state.reason, null); assert.equal(f.state.state.failures, 0);
+  f.hooks.account = () => { throw new ExecutionExchangeError('timeout'); };
+  await f.reduction.tick(); assert.ok(f.state.state.reason); assert.equal(f.state.live, null);
+  assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0);
+});
+
+test('minimum notional readiness preserves the documented RH IOC exception and surfaces unconfirmed Hyperliquid conditions', async t => {
+  for (const exchange of ['rh-lighter', 'hyperliquid']) await t.test(exchange, async t => {
+    const f = await fixture(t);
+    const symbol = exchange === 'rh-lighter' ? 'ANTHROPIC' : 'io:ANTH';
+    await f.execution.connect(exchange, { revision: 0, address: f.accounts[exchange].identity,
+      ...(exchange === 'rh-lighter' ? { accountMode: 'api-key', accountIndex: 12345, apiKeyIndex: 5, apiKey: 'cd'.repeat(40) }
+        : { accountMode: 'agent', agentKey: '0x' + 'ef'.repeat(32) }) });
+    f.hooks.market = (venue, market) => { if (venue === exchange) market.rule.minNotional = '10000'; };
+    f.enable({ thresholdPercent: '1', legs: [config().legs[0], { exchange, symbol, side: 'short' }] });
+    await f.reduction.tick();
+    assert.equal(f.state.state.reason, null); assert.equal(f.state.live.met, false);
+    if (exchange === 'rh-lighter') assert.equal(f.state.live.warning, null);
+    else assert.match(f.state.live.warning, /最低金额.*豁免条件未确认/);
+    assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0);
+  });
+});
+
+test('external orders cannot hide infeasible batch quantities before the reduction threshold', async t => {
+  const f = await fixture(t);
+  f.accounts.binance.openOrders = [{ symbol: SYMBOL, id: 'manual-order' }];
+  f.accounts.okx.positions[0].quantity = '4';
+  f.enable({ thresholdPercent: '1', reducePercent: '50', batchCount: 3 });
+  await f.reduction.tick();
+  assert.match(f.state.state.reason ?? '', /批次过多/);
+  assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0);
+  // Fixing the size exposes the still-present external order; it never bypasses it.
+  f.accounts.okx.positions[0].quantity = '31'; f.advance(30_000);
+  for (const account of Object.values(f.accounts)) for (const position of account.positions) position.risk.at = stamp(TIME + 30_000);
+  await f.reduction.tick();
+  assert.match(f.state.live.warning, /binance.*活动委托/);
+  assert.equal(f.state.state.reason, null); assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0);
+});
+
+async function afterFirstBatch(t) {
+  const f = await fixture(t); f.enable(); await f.reduction.tick(); await f.execution.tick();
+  const before = Object.fromEntries(['binance', 'okx'].map(exchange => [exchange, f.accounts[exchange].positions[0].quantity]));
+  await f.finishBatch(); f.advance(1000);
+  const after = Object.fromEntries(['binance', 'okx'].map(exchange => [exchange, f.accounts[exchange].positions[0].quantity]));
+  return { f, before, after };
+}
+
+test('a confirmed reduction batch waits for its exact pre-fill position and resumes without resending the first batch', async t => {
+  const { f, before, after } = await afterFirstBatch(t);
+  f.accounts.okx.positions[0].quantity = before.okx;
+  await f.execution.tick(); await f.reduction.tick();
+  assert.equal(f.jobs[0].status, 'running'); assert.match(f.jobs[0].reason, /等待.*持仓/);
+  assert.equal(f.creates.length, 2); assert.equal(f.calls.filter(row => row.method === 'stop').length, 0);
+  const id = f.jobs[0].id, waiting = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(id).json).positionReadWait;
+  assert.ok(waiting);
+  const reads = f.calls.length; await f.execution.tick(); assert.equal(f.calls.length, reads, 'waiting preserves retry spacing');
+  f.accounts.okx.positions[0].quantity = after.okx; f.advance(1000); await f.execution.tick();
+  assert.equal(f.jobs[0].id, id); assert.equal(f.creates.length, 4); assert.equal(f.jobs[0].batchIndex, 1);
+  assert.ok(f.jobs[0].events.some(row => /持仓.*已反映.*成交/.test(row.message)));
+  assert.equal(f.jobs[0].reason, null);
+  await f.finishBatch(); f.advance(1000); await f.execution.tick(); await f.finishBatch();
+  assert.equal(f.jobs[0].status, 'completed'); assert.equal(f.creates.length, 6);
+});
+
+test('post-fill position waits have durable attempt and absolute time limits', async t => {
+  for (const mode of ['attempts', 'time', 'late success']) await t.test(mode, async t => {
+    const { f, before, after } = await afterFirstBatch(t);
+    f.accounts.okx.positions[0].quantity = before.okx; await f.execution.tick();
+    assert.equal(f.jobs[0].status, 'running');
+    if (mode === 'attempts') {
+      for (let i = 0; i < 3; i++) { f.advance(1000); await f.execution.tick(); }
+    } else if (mode === 'time') { f.advance(20_000); await f.execution.tick(); }
+    else {
+      f.advance(1000); f.accounts.okx.positions[0].quantity = after.okx;
+      f.hooks.account = exchange => { if (exchange === 'okx') f.advance(20_000); };
+      await f.execution.tick();
+    }
+    await f.reduction.tick();
+    assert.equal(f.jobs[0].status, 'paused'); assert.match(f.jobs[0].reason, /持仓.*(?:上限|超时)/);
+    assert.equal(f.state.state.phase, 'review'); assert.equal(f.creates.length, 2);
+  });
+});
+
+test('post-fill waits never hide another leg identity, mode or external position change', async t => {
+  for (const [name, change] of [
+    ['identity', f => { f.accounts.okx.identity = 'another-account'; }],
+    ['mode', f => { f.accounts.okx.modes[SYMBOL] = 'one-way'; }],
+    ['quantity', f => { f.accounts.okx.positions[0].quantity = '26'; }],
+  ]) await t.test(name, async t => {
+    const { f, before } = await afterFirstBatch(t);
+    f.accounts.binance.positions[0].quantity = before.binance; change(f);
+    await f.execution.tick(); await f.reduction.tick();
+    assert.equal(f.jobs[0].status, 'paused'); assert.equal(f.state.state.phase, 'review'); assert.equal(f.creates.length, 2);
+  });
+});
+
+test('a restart during post-fill waiting retains the original task and follows the existing manual recovery policy', async t => {
+  const { f, before, after } = await afterFirstBatch(t);
+  f.accounts.okx.positions[0].quantity = before.okx; await f.execution.tick();
+  const id = f.jobs[0].id, stored = () => JSON.parse(f.db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(id).json);
+  const waiting = stored().positionReadWait;
+  await f.restart({ crash: true });
+  f.accounts.okx.positions[0].quantity = after.okx; f.advance(1000);
+  await f.execution.tick(); await f.reduction.tick();
+  assert.equal(f.jobs[0].id, id); assert.equal(f.jobs[0].status, 'paused'); assert.equal(f.creates.length, 2);
+  assert.match(f.jobs[0].reason, /服务恢复/); assert.equal(f.jobs[0].batchIndex, 1);
+  assert.deepEqual(stored().positionReadWait, waiting, 'the evidence and original budget survive a crash');
+  assert.equal(f.state.state.phase, 'review');
+  const session = 'fixture-session', plan = await f.execution.preview({ resumeJobId: id }, session);
+  f.execution.start({ previewId: plan.id, requestId: randomUUID(), confirmLive: true }, session);
+  assert.equal(stored().positionReadWait, undefined, 'an explicit remaining-quantity confirmation starts a new baseline');
+  await f.execution.tick(); assert.equal(f.creates.length, 4);
+  await f.finishBatch(); f.advance(1000); await f.execution.tick(); await f.finishBatch();
+  assert.equal(f.jobs[0].status, 'completed'); assert.equal(f.creates.length, 6);
+});
+
+test('stopping or reaching the task deadline overrides a post-fill position wait', async t => {
+  for (const stop of [true, false]) await t.test(stop ? 'user stop' : 'deadline', async t => {
+    const { f, before } = await afterFirstBatch(t);
+    f.accounts.okx.positions[0].quantity = before.okx; await f.execution.tick();
+    if (stop) f.execution.stop(f.jobs[0].id, {}, 'fixture-session'); else f.advance(59_000);
+    await f.execution.tick();
+    assert.equal(f.jobs[0].status, stop ? 'stopped' : 'paused'); assert.match(f.jobs[0].reason, stop ? /用户停止/ : /执行时间已到/);
+    assert.equal(f.creates.length, 2);
+  });
 });

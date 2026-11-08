@@ -135,6 +135,47 @@ async function fixture(t, { realLighter = false, guarded = false } = {}) {
 const message = item => item.message ?? item;
 const durableLighter = f => f.db.prepare('SELECT json FROM execution_orders').all().map(row => JSON.parse(row.json)).find(order => order.exchange === 'rh-lighter');
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+
+test('native Lighter position identity gates risk-reduction planning and never relabels another contract', async t => {
+  for (const [name, symbol] of [
+    ['matching', 'ANTHROPIC'], ['another contract', 'ETH'], ['missing', undefined], ['null', null], ['numeric', 7],
+    ['array', ['ANTHROPIC']], ['lowercase', 'anthropic'], ['whitespace', ' ANTHROPIC '],
+  ]) await t.test(name, async t => {
+    const f = await fixture(t, { realLighter: true, guarded: true });
+    await f.connectLighter();
+    f.accounts.binance.positions = [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '12',
+      risk: { markPrice: '100', liquidationPrice: '150', at: new Date(f.time).toISOString() } }];
+    f.real.answers['/api/v1/account'] = () => new Response(JSON.stringify({ code: 200, accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
+      { market_id: 0, symbol: 'ETH', position: '200', sign: 1, margin_mode: 0, initial_margin_fraction: '20', position_value: '20000', liquidation_price: '99' },
+      { market_id: 7, symbol, position: '10', sign: 1, margin_mode: 0, initial_margin_fraction: '20', position_value: '1000', liquidation_price: '95' },
+    ] }] }), { status: 200 });
+    const config = { enabled: true, legs: anthropic().legs.map(({ orderType: _orderType, ...leg }) => leg), shares: SHARES,
+      thresholdPercent: '5', reducePercent: '50', batchCount: 1, batchIntervalMs: 0, timeoutMs: 60_000 };
+    const accounts = Object.fromEntries(f.service.state().connections.map(row => [row.exchange, { revision: row.revision, identity: row.identity }]));
+    const commits = [];
+    const start = () => f.service.startRiskReduction(config, { ruleId: 'anthropic-reduction', accounts, check() {}, commit: (...args) => commits.push(args) });
+    if (symbol === 'ANTHROPIC') {
+      const result = await start();
+      assert.ok(result.jobId);
+      assert.equal(result.live.met, true);
+      assert.deepEqual(result.live.legs.find(leg => leg.exchange === 'rh-lighter'), {
+        exchange: 'rh-lighter', symbol: 'ANTHROPIC', side: 'long', quantity: '10', distancePercent: '5', met: true,
+      });
+      const job = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(result.jobId).json);
+      assert.equal(job.plan.legs.find(leg => leg.exchange === 'rh-lighter').quantity, '5');
+      assert.equal(commits.length, 1);
+    } else {
+      await assert.rejects(start(), error => error.status === 502 && /响应不完整或格式无效/.test(error.message));
+      await f.service.tick();
+      assert.equal(f.service.state().jobs.length, 0);
+      assert.deepEqual(f.db.prepare('SELECT resource FROM execution_locks').all(), []);
+      assert.equal(commits.length, 0);
+    }
+    assert.equal(f.creates().length, 0);
+    assert.equal(f.real.requests.filter(request => request.path === '/api/v1/sendTx').length, 0);
+  });
+});
+
 async function beginReprice(f, options = {}) {
   await f.connectLighter(); f.start(await f.preview(anthropic(options))); await f.service.tick();
   f.overrides['rh-lighter:ANTHROPIC'] = { bid: '352.2', ask: '352.3' }; f.advance(5000);

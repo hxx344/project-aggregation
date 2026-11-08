@@ -12,7 +12,7 @@ const hlPosition = (coin, szi, liquidationPx, positionValue = '1000') => ({ type
 function harness({ cex = [], configured = true } = {}) {
   const dataDir = mkdtempSync(path.join(tmpdir(), 'anthropic-watch-'));
   let time = Date.parse('2026-11-06T00:00:00Z');
-  const books = { io: [], xyz: [] }, posts = [], requests = [], ownPosts = [], rhRequests = [];
+  const books = { io: [], xyz: [] }, posts = [], cards = [], requests = [], ownPosts = [], rhRequests = [];
   let postFailure = null, hlFailure = null, rhFailure = null, gate = null, address = ADDRESS, rhAddress = null;
   const fetcher = async (url, init) => {
     if (String(url).startsWith('https://api.rh.lighter.xyz/')) {
@@ -29,14 +29,14 @@ function harness({ cex = [], configured = true } = {}) {
   };
   const feishu = {
     alertChannel: () => ({ configured: h.digest, title: '工作台汇总' }),
-    async postAlert(card) { if (gate) await gate; if (postFailure) throw postFailure; posts.push(card.elements[0].text.content); },
+    async postAlert(card) { if (gate) await gate; if (postFailure) throw postFailure; posts.push(card.elements[0].text.content); cards.push(card); },
   };
   const source = { value: cex };
   const create = () => {
     const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: exchange => exchange === 'hyperliquid' ? address : exchange === 'rh-lighter' ? rhAddress : null, feishu, encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed), log: quiet, fetcher, now: () => time, intervalMs: 0 });
     watch.initialize(); return watch;
   };
-  const h = { digest: configured, books, posts, ownPosts, requests, source, dataDir, advance: ms => { time += ms; }, now: () => time, fail: error => { postFailure = error; },
+  const h = { digest: configured, books, posts, cards, ownPosts, requests, source, dataDir, advance: ms => { time += ms; }, now: () => time, fail: error => { postFailure = error; },
     hlFail: make => { hlFailure = make; }, hold: promise => { gate = promise; }, setAddress: value => { address = value; },
     rhAccounts: [], rhRequests, rhFail: make => { rhFailure = make; }, setRhAddress: value => { rhAddress = value; },
     restart: async () => { await h.watch.close(); h.watch = create(); },
@@ -415,6 +415,120 @@ test('an own robot that breaks after startup refuses definitely without the dige
 
 const rhPosition = (symbol, sign, position, liquidation, extra = {}) => ({ market_id: symbol === 'ANTHROPIC' ? 38 : 0, symbol, initial_margin_fraction: '33.33', sign, position,
   avg_entry_price: '100.0', position_value: '1000.000000', unrealized_pnl: '-1.5', liquidation_price: liquidation, margin_mode: 0, allocated_margin: '0.000000', ...extra });
+
+for (const exchange of ['hyperliquid', 'rh-lighter']) {
+  const setPosition = (h, { mark = true, liquidation = '110', gone = false } = {}) => {
+    if (exchange === 'hyperliquid') h.books.io = gone ? [] : [hlPosition('io:ANTH', '-10', liquidation, mark ? '1000' : '0')];
+    else {
+      h.setRhAddress('0x' + 'c'.repeat(40));
+      h.rhAccounts = [{ index: 7, positions: gone ? [] : [rhPosition('ANTHROPIC', -1, '10', liquidation ?? '0', { position_value: mark ? '1000' : '0' })] }];
+    }
+  };
+
+  test(`${exchange} missing marks keep the liquidation warning, deduplicate unknown notices and survive restart`, async () => {
+    const h = harness();
+    const row = () => h.watch.state().sources.find(source => source.exchange === exchange).positions[0];
+    try {
+      h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+      setPosition(h); await h.watch.poll();
+      assert.equal(h.posts.length, 1); assert.match(h.posts[0], /🔴.*距强平 10\.00%/);
+      setPosition(h, { mark: false }); await h.watch.poll();
+      assert.equal(row().alerting, true, 'a missing mark cannot release a known liquidation warning');
+      assert.deepEqual([row().markPrice, row().liquidationPrice, row().distancePercent, row().riskUnknown], [null, '110', null, true]);
+      assert.equal(h.posts.length, 2); assert.match(h.posts[1], /⚠️.*标记价缺失.*无法计算.*保留预警/);
+      assert.doesNotMatch(h.posts[1], /🟢|解除预警|不再提供强平价/);
+      assert.equal(h.cards[1].header.template, 'red', 'the unknown notice is not a green recovery card');
+      h.advance(31 * 60_000); await h.watch.poll();
+      await h.restart(); await h.watch.poll();
+      assert.equal(h.posts.length, 2, 'persistent unknown risk does not repeat or turn into recovery after restart');
+      assert.equal(row().alerting, true);
+      setPosition(h, { mark: false, liquidation: null }); await h.watch.poll();
+      assert.equal(row().riskUnknown, true, 'a missing mark takes precedence over an absent liquidation price');
+      assert.equal(row().alerting, true); assert.equal(h.posts.length, 2);
+
+      setPosition(h, { liquidation: '121' }); await h.watch.poll();
+      assert.equal(row().riskUnknown, false); assert.equal(row().alerting, true);
+      assert.equal(h.posts.length, 2, 'valid data in the hysteresis band still does not clear the warning');
+      await h.restart();
+      setPosition(h, { mark: false }); await h.watch.poll();
+      assert.equal(h.posts.length, 3, 'a new interruption after valid data is reported even across restart');
+      assert.match(h.posts[2], /无法计算.*保留预警/);
+      setPosition(h, { liquidation: '130' }); await h.watch.poll();
+      assert.equal(row().alerting, false); assert.equal(row().riskUnknown, false);
+      assert.match(h.posts[3], /🟢.*距强平已回到 30\.00%，解除预警/);
+
+      setPosition(h); await h.watch.poll();
+      setPosition(h, { mark: false }); await h.watch.poll();
+      setPosition(h, { liquidation: null }); await h.watch.poll();
+      assert.equal(row().alerting, false); assert.equal(row().riskUnknown, false);
+      assert.match(h.posts.at(-1), /不再提供强平价.*解除预警/, 'a valid mark preserves the established no-liquidation-price contract');
+      setPosition(h); await h.watch.poll();
+      setPosition(h, { mark: false }); await h.watch.poll();
+      setPosition(h, { gone: true }); await h.watch.poll();
+      assert.match(h.posts.at(-1), /仓位已不在账户中/, 'a fresh missing position retains the gone warning');
+    } finally { await h.watch.close(); h.cleanup(); }
+  });
+
+  test(`${exchange} unknown notices preserve durable claims and definite or uncertain failure handling`, async () => {
+    const h = harness();
+    const row = () => h.watch.state().sources.find(source => source.exchange === exchange).positions[0];
+    const statePath = path.join(h.dataDir, 'anthropic-watch', 'state.json');
+    try {
+      h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+      setPosition(h); await h.watch.poll();
+      const original = readFileSync(statePath, 'utf8');
+      rmSync(statePath); mkdirSync(statePath);
+      setPosition(h, { mark: false }); await h.watch.poll();
+      assert.equal(h.posts.length, 1, 'unknown notice requires a durable claim');
+      assert.equal(row().alerting, true);
+      rmSync(statePath, { recursive: true }); writeFileSync(statePath, original);
+      h.fail(new Error('飞书发送失败（19024）')); await h.watch.poll();
+      assert.equal(row().alerting, true);
+      assert.equal(h.watch.state().alerts.history[0].status, 'failed');
+      h.fail(null); await h.watch.poll(); assert.equal(h.posts.length, 1);
+      h.advance(60_000); await h.watch.poll();
+      assert.equal(h.posts.length, 2); assert.match(h.posts[1], /无法计算.*保留预警/);
+      setPosition(h, { liquidation: '121' }); await h.watch.poll();
+      setPosition(h, { mark: false });
+      h.fail(Object.assign(new Error('飞书连接失败或超时'), { uncertain: true })); await h.watch.poll();
+      assert.equal(h.watch.state().alerts.history[0].status, 'uncertain');
+      assert.equal(row().alerting, true);
+      h.fail(null); await h.restart(); h.advance(31 * 60_000); await h.watch.poll();
+      assert.equal(h.posts.length, 2, 'an uncertain unknown notice is not resent after restart');
+      assert.equal(row().alerting, true);
+    } finally { await h.watch.close(); h.cleanup(); }
+  });
+
+  test(`${exchange} test notifications distinguish missing marks from a known absent liquidation price`, async () => {
+    const h = harness();
+    try {
+      setPosition(h, { mark: false, liquidation: null }); await h.watch.poll(); await h.watch.test();
+      assert.match(h.posts[0], /标记价缺失.*无法计算/); assert.doesNotMatch(h.posts[0], /未提供强平价/);
+      setPosition(h, { liquidation: null }); await h.watch.poll(); await h.watch.test();
+      assert.match(h.posts[1], /未提供强平价/);
+    } finally { await h.watch.close(); h.cleanup(); }
+  });
+
+  test(`${exchange} a resumed source with missing marks cannot announce restored monitoring`, async () => {
+    const h = harness();
+    const fail = exchange === 'hyperliquid' ? h.hlFail : h.rhFail;
+    try {
+      h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+      setPosition(h); await h.watch.poll();
+      setPosition(h, { mark: false }); await h.watch.poll();
+      fail(() => { throw new TypeError('fetch failed'); });
+      h.advance(180_000); await h.watch.poll();
+      assert.match(h.posts.at(-1), /仓位读取已中断/);
+      const count = h.posts.length;
+      fail(null); await h.watch.poll();
+      assert.equal(h.posts.length, count, 'successful transport without a usable mark does not restore monitoring');
+      setPosition(h, { liquidation: '130' }); await h.watch.poll();
+      assert.equal(h.posts.length, count + 1);
+      assert.match(h.posts.at(-1), /仓位读取已恢复/);
+      assert.match(h.posts.at(-1), /距强平已回到 30\.00%，解除预警/);
+    } finally { await h.watch.close(); h.cleanup(); }
+  });
+}
 
 test('Lighter RH accounts keep only the Anthropic market of each account under the address', () => {
   const rows = parseRhLighterAccounts({ accounts: [

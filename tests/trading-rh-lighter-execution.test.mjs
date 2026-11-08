@@ -412,8 +412,8 @@ test('an order timestamp in milliseconds is refused, since the venue reports sec
 test('account reports positions, open orders and the account leverage of the selected contract', async () => {
   const h = harness({ routes: {
     '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
-      { market_id: 0, position: '3', sign: 1, margin_mode: 0, initial_margin_fraction: '10.00' },
-      { market_id: 7, position: '1.50', sign: -1, margin_mode: 1, initial_margin_fraction: '20.00' },
+      { market_id: 0, symbol: 'ETH', position: '3', sign: 1, margin_mode: 0, initial_margin_fraction: '10.00' },
+      { market_id: 7, symbol: 'ANTHROPIC', position: '1.50', sign: -1, margin_mode: 1, initial_margin_fraction: '20.00' },
     ] }] }),
     '/api/v1/accountActiveOrders': ok({ orders: [
       { market_index: 7, client_order_index: 77, order_index: 5, is_ask: false, reduce_only: true, initial_base_amount: '2', filled_base_amount: '0.5' },
@@ -437,11 +437,11 @@ test('account reports positions, open orders and the account leverage of the sel
   const flat = harness();
   const empty = await flat.client.account(credentials);
   assert.deepEqual({ positions: empty.positions, openOrders: empty.openOrders, leverage: empty.leverage }, { positions: [], openOrders: [], leverage: { ANTHROPIC: { type: 'cross', value: 10 } } }, 'no position: the market default leverage');
-  const closed = await harness({ routes: { '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [{ market_id: 7, position: '0', sign: 0, margin_mode: 0, initial_margin_fraction: '33.33' }] }] }) } }).client.account(credentials);
+  const closed = await harness({ routes: { '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [{ market_id: 7, symbol: 'ANTHROPIC', position: '0', sign: 0, margin_mode: 0, initial_margin_fraction: '33.33' }] }] }) } }).client.account(credentials);
   assert.deepEqual({ positions: closed.positions, leverage: closed.leverage }, { positions: [], leverage: { ANTHROPIC: { type: 'cross', value: 3 } } });
 
   const account = positions => ({ '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions }] }) });
-  const position = overrides => ({ market_id: 7, position: '1', sign: 1, margin_mode: 0, initial_margin_fraction: '20', ...overrides });
+  const position = overrides => ({ market_id: 7, symbol: 'ANTHROPIC', position: '1', sign: 1, margin_mode: 0, initial_margin_fraction: '20', ...overrides });
   const active = orders => ({ '/api/v1/accountActiveOrders': ok({ orders }) });
   const open = overrides => ({ market_index: 7, client_order_index: 77, order_index: 5, is_ask: false, reduce_only: false, initial_base_amount: '1', filled_base_amount: '0', ...overrides });
   const cases = [
@@ -461,10 +461,27 @@ test('account reports positions, open orders and the account leverage of the sel
   await assert.rejects(harness().client.account(credentials, { symbols: ['CLUSDT'] }), isError('input'));
 });
 
+test('account refuses a selected market id unless its native position symbol matches exactly', async t => {
+  for (const [name, symbol] of [
+    ['another contract', 'ETH'], ['missing', undefined], ['null', null], ['numeric', 7], ['array', ['ANTHROPIC']],
+    ['object', { symbol: 'ANTHROPIC' }], ['empty', ''], ['lowercase', 'anthropic'], ['leading space', ' ANTHROPIC'], ['trailing space', 'ANTHROPIC '],
+  ]) await t.test(name, async () => {
+    for (const position of ['1', '0']) {
+      const h = harness({ routes: { '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
+        { market_id: 7, symbol, position, sign: position === '0' ? 0 : 1, margin_mode: 0, initial_margin_fraction: '20', position_value: '100', liquidation_price: '95' },
+      ] }] }) } });
+      await assert.rejects(h.client.account(credentials, { symbols: ['ANTHROPIC'] }), isError('invalid_data'));
+      assert.equal(h.of('/api/v1/accountActiveOrders').length, 0, 'position identity is checked before accepting the account snapshot');
+      assert.equal(h.of(SEND).length, 0);
+      assert.equal(h.signs.filter(row => row.method !== 'authToken').length, 0);
+    }
+  });
+});
+
 test('account risk uses the configured account index and exact notional over size before slow order reads', async () => {
   const h = harness({ routes: {
     '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
-      { market_id: 7, position: '1.5', sign: -1, margin_mode: 1, initial_margin_fraction: '20', position_value: '600.15', liquidation_price: '450.1234567890123456789012345' },
+      { market_id: 7, symbol: 'ANTHROPIC', position: '1.5', sign: -1, margin_mode: 1, initial_margin_fraction: '20', position_value: '600.15', liquidation_price: '450.1234567890123456789012345' },
     ] }] }),
     '/api/v1/accountActiveOrders': () => { h.advance(12_000); return ok({ orders: [] }); },
   } });
@@ -481,7 +498,7 @@ test('account risk rejects malformed and unavailable prices without rejecting a 
   for (const invalid of [undefined, null, '', '0', '-1', 42, [], {}, 'NaN', 'Infinity', '1e2', ' 2', '1.123456789012345678x', '1'.repeat(101)]) {
     for (const field of ['position_value', 'liquidation_price']) {
       const h = harness({ routes: { '/api/v1/account': ok({ accounts: [{ index: 12345, l1_address: ADDRESS, positions: [
-        { market_id: 7, position: '3', sign: 1, margin_mode: 0, initial_margin_fraction: '20', position_value: '1', liquidation_price: '0.2', [field]: invalid },
+        { market_id: 7, symbol: 'ANTHROPIC', position: '3', sign: 1, margin_mode: 0, initial_margin_fraction: '20', position_value: '1', liquidation_price: '0.2', [field]: invalid },
       ] }] }) } });
       const { positions } = await h.client.account(credentials);
       assert.deepEqual(positions, [{ symbol: 'ANTHROPIC', side: 'long', quantity: '3',

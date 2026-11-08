@@ -337,6 +337,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **多空方向与排序补充（2026-11-07）：** ANT 自动减仓开发中的初版表单把保存响应 `legs[0]` 当作多头，但执行计划会按交易所与合约排序；Binance 空头、Hyperliquid 多头的响应会把空头排到前面，再次保存就可能反转交易方向。腿的业务身份必须由 `exchange + symbol + side` 保留；固定多头/空头输入框按 `side` 查找，不按数组位置认领。[自动减仓浏览器回归](tests/trading-anthropic-reduction.browser.mjs) 覆盖服务端短腿在前、重新显示与保存仍维持原多空选择。事件 `ant-reduction-sorted-leg-direction-20261107`，作者自审在发布前发现并修复，未触发真实订单；不计作既有别名事件的复发。
 
+**RH 仓位身份补充（#259，2026-11-08）：** 基线 `9351de4` 的 RH 执行适配器按 `market_id` 找到仓位后，把调用方 `symbol` 写入投影而未核对返回符号。编号与原生符号都属于已返回的身份字段，必须与已验证市场目录一致；官方 AccountPosition 要求 symbol 为字符串，缺失、畸形、大小写或空白变体均拒绝，不猜测别名。零仓位行也可能携带杠杆配置，不能跳过身份检查。[适配器回归](tests/trading-rh-lighter-execution.test.mjs) 和 [真实适配器到风险规划回归](tests/trading-execution-rh-lighter.test.mjs) 在修复前确认错误身份未被拒绝，修复后错误场景零任务、零锁、零发送。事件 `rh-position-market-symbol-consistency`，沿用 Issue ID；为离线矛盾响应验证，未确认线上错合约或损失。
+
 ### L021：子面板样式不能改变公共页面的宽度
 
 **适用条件：** 多个市场面板共用导航、行情卡片和居中容器，子面板按需加载并在切换后保留挂载。
@@ -394,6 +396,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **如何验证：** 运行 [ADL 映射测试](tests/crossex-adl-indicator.test.mjs)。Gate `5,4,3,2,1` 与 Kraken `100,80,60,40,20` 映射为递增红灯；OKX/Bybit 的 `0` 保持零档；缺失、畸形和越界保持 `null`，不得画成低优先级；未核实交易所对 `1` 和 `5` 都返回 `null`，界面用灰灯表示 unknown。
 
 **事件记录：** `crossex-adl-mapping-20261014`；Seen 1×（2026-10-14）。
+
+**强平距离未知补充（#257，2026-11-08）：** 基线 `9351de4` 的 ANT 预警把无法计算距离的所有 null 都视为恢复；HL/RH 非零仓位的名义金额为零时，标记价不可用但强平价仍有效，旧告警被错误解除。先判断必要读数是否有效，再处理交易所明确不再提供强平价或仓位消失；接口读取成功也不能为缺价数据发送绿色恢复。已激活告警保持，未知通知沿原发送前持久占用去重，页面明确无法计算。[预警回归](tests/trading-anthropic-watch.test.mjs) 覆盖 HL/RH 缺价、读取中断后仍缺价、发送失败、跨重启及有效数据恢复；[工作台页面夹具](tests/trading-anthropic-positions.browser.mjs) 覆盖保警与恢复展示。事件 `anthropic-watch-missing-mark-false-recovery`，沿用 Issue ID；离线复现，不声称真实 API 已返回该异常组合。
 
 ### L025：账户流水按委托聚合时严格限定可聚合类型
 
@@ -907,6 +911,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **历史归档交付（#30，2026-11-05）：** 被挤出八批热索引的已知成交折叠进 `recovery_watch.history` 有界汇总（按账户、合约、方向记录退役成交计数与最新成交时间），压缩与 watch 写入同一 runtime 事务；旧数据首次读取时扫描观察与订单恢复记录迁移，按 watch 指纹缓存，热批次摘要变化即重新迁移。只有持仓方向带正的交易所更新时间且早于已知成交时才阻止采纳；时间缺失或为零、成交无时间、归档不完整（有退役标记却找不到材料记为 `unproven`）都不阻断，只留诊断，避免旧数据失去出口。滞后从本进程首次观察起按 `time.monotonic()` 计时，120 秒后放行并回到原数量核对：订单 `updateTime` 可能反映之后的 EXPIRED 而非成交，无限等待会卡死；也不能用本地墙钟减交易所时间判断到期，本地快 30 秒就会提前放行。按用户决定不设人工确认，删除配对不受该检查限制。审查还发现开仓守卫另读一份快照后仍用原快照发送：历史检查必须作用于规划、风险检查和发送实际使用的同一份快照及 guards，升杠杆覆盖刷新后的快照。验证入口为 [历史时间测试](modules/aster/tests/test_pair_history_times.py) 与 [同快照守卫测试](modules/aster/tests/test_pair_history_guards.py)。以上为同一事件 `aster-pair-terminal-recovery-lag-20261021` 的连续修补，不新增事件计数、不推进复盘检查点，也不描述为实盘验证。
 
 **模拟行情时序补充（2026-11-05）：** 本次成本研究的提交前审查复现：Maker 代理成交发生在 t1000，t1301 收到来源时间 t700 的 Lighter 帧，原逻辑仅因其晚于旧缓存而用它完成延迟对冲。接收时间越过等待期限不能证明行情产生于该期限后；修复同时检查单调到达时间、相对到期点的来源时间下界及明确的时钟误差容差，不通过放宽全局 TTL 修复。250ms 是本模块当前容差，不是其它交易路径的默认规则。[核心回归](tests/binance-lighter-core.test.mjs) 覆盖迟到旧帧、容差边界、新帧与超时。事件 `cost-research-late-pretrade-book-20261105`；相对 `4bb440e` 的未发布实现，不推进复盘检查点。
+
+**ANT 分批减仓补充（#260，2026-11-08）：** 基线 `9351de4` 在上一批已经完整成交、下一次账户仍返回成交前数量时立即暂停。只有原单全部已结算且非 unknown、当前数量精确等于可由上一批已确认成交推导的成交前数量，才允许暂缓下一批；旧读数不是下单许可。等待记录绑定原 phase/batch，持久保存绝对 20 秒上限、初读后的最多三次重读及间隔；恢复须取得精确预期数量并重新通过所有腿的身份、模式、合约、活动委托和盘口校验。成功但迟于截止的读取仍拒绝，兄弟腿硬错误优先。重启沿用原有暂停后人工确认剩余量政策，不自动续发或重复首批；明确确认新剩余计划才清除旧等待基线。[自动减仓回归](tests/trading-anthropic-reduction.test.mjs) 覆盖一次旧读恢复、次数/时间、迟到成功、外部变化、停止/任务截止、崩溃后证据保留和人工继续。事件 `ant-reduction-post-fill-read-lag`；沿用 Issue ID，离线复现，无真实成交验收。
 
 ### L055：构建优化必须覆盖冻结安装与真实缓存目录
 
@@ -1734,6 +1740,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 独立审查另确认只读可见性缺口：余额事件的空 `P` 不代表清仓，但非空 `B` 及其他合约仓位变化仍会影响 cross/PM 强平风险，不能因合约不在关注列表就忽略风险失效信号。只转发余额变化布尔，在过滤仓位前清旧风险并递增在途 REST 的风险序列；数量和基线时间保留，下一次完整 REST 可恢复。四项普通/PM 回归先红后绿。ANT 自动减仓本身另读实盘 `execution.account` 风险，不将只读监控显示缺陷夸大为交易授权漏洞。
 
 **推送故障与自动规则补充（2026-11-07）：** 合入后审查发现三处同类缺口。Binance 执行适配器把推送流的 `invalid_data` 直接报错，引擎随即暂停撤单；流里事件时间只容忍比校时估计超前 1 秒，样本过期后偏移又退回 0，时钟偏差主机在重新校时窗口即可触发。Lighter 订单快照含账户在该市场的全部订单，一行 `client_order_index` 为 0 的手动单就否决整份快照，且 `invalid_data` 不回退 REST，建单在发送前失败而同批 Binance 腿已发出。另外 Binance 断线或冷却期间读到的 REST 订单被写入流缓存，重连后新连接不补发断线期事件，旧 NEW 状态最长 30 秒仍作为当前状态返回。以后推送只是加速路径：任何非取消类的推送故障（含格式错误）只关闭本次推送读取并走有界 REST 精确补读，由 REST 结果自身的校验决定成败；推送时间超前归为 `upstream`；快照中本市场本账户 `client_order_index` 为 0 的手动单跳过，不能否决其它行，其它非法编号仍按格式错误处理；REST 结果（建单、改价、查询、撤单各路径）只能写入请求发出前已连接且代次未变的流缓存。自动减仓遇到用户自己的止盈止损或限价单（`ExternalOrdersError`）时保持启用并 30 秒重试、原因与事件可见，未达阈值时也提前给出预警，不能在触发时刻静默停用；任务进行中出现外部委托时，截止前只暂停发新批次、不撤本任务余单，截止后才按原路径暂停。验证见 `tests/trading-binance-execution-stream.test.mjs`、`tests/trading-binance-stream.test.mjs`、`tests/trading-rh-lighter-execution.test.mjs`、`tests/trading-rh-lighter-stream.test.mjs`、`tests/trading-anthropic-reduction.test.mjs` 本次新增用例，均做过去掉修复的变异验证。离线复现，未在真实账户触发。事件 `trading-stream-fault-review-20261107`；合入后审查发现，不推进复盘检查点。
+
+**自动减仓可执行性补充（#258，2026-11-08）：** 基线 `9351de4` 直到危险阈值达到才计算原生减仓量，一步仓位乘 50% 会在触发时才失败。保存后的“启用”须明确等待核验；监测阶段每轮用当前仓位完成向下取整、全部拆批、单批数量/金额及时间检查，触发和最终发送仍按最新证据检查，不自动提高比例。数量错误不能被可恢复的活动委托阻塞遮蔽：本次独立审查复现“Binance 有活动委托 + OKX 4 张、50%、3 批”只提示委托，移除委托才暴露拆批失败；修正为所有腿完成数量校验后仍严格拒绝外部委托。最低金额按交易所和订单类型区分：RH IOC 的官方验证器豁免最低名义额，HL 小额减仓豁免未取得明确契约，因此提前提示不确定条件而不宣称可执行。验证见 [自动减仓回归](tests/trading-anthropic-reduction.test.mjs) 的 `reduction sizing`、`minimum notional readiness`、`external orders cannot hide` 与读失败/数量变化场景。事件 `ant-reduction-size-readiness`，沿用 Issue ID；同轮审查补漏不另计事件，无真实下单。
 
 ### L104：`submit()` 的失败分支提前返回前必须重新保存委托
 

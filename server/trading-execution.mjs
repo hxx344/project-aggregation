@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType } from './trading-execution-plan.mjs';
+import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType, notional } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_VENUE_SYMBOLS } from './trading-markets.mjs';
 import { orderPrice, stepDecimals } from './trading-hyperliquid-execution.mjs';
 import { orderPrice as rhLighterOrderPrice, RH_LIGHTER_TX_EXPIRES_MS } from './trading-rh-lighter-execution.mjs';
@@ -27,6 +27,9 @@ const ATTENTION_RETRY_MS = 15_000, CANCEL_RETRY_MS = 10_000, CANCEL_ATTEMPTS = 5
 // pauses and cancels it (which would leave the filled sibling unhedged). Both
 // bounds apply, so a read that hangs until the call deadline still gets retries.
 const READ_RETRY_MS = 20_000, READ_RETRY_ATTEMPTS = 3;
+// Only a fully settled previous reduction batch may have a lagging position
+// projection. Initial read plus three retries, all inside this durable window.
+const POSITION_READ_WINDOW_MS = 20_000, POSITION_READ_ATTEMPTS = 4, POSITION_READ_INTERVAL_MS = 1000;
 // An explicit Lighter read cooldown can exceed the generic transport window.
 // Wait without polling, then re-enter all normal checks. Three recovery tries
 // and a fixed three-minute window bound the entire streak, not each endpoint.
@@ -72,6 +75,7 @@ const UNSETTLED_ORDER = "(CASE WHEN json_valid(json) THEN json_extract(json,'$.s
 const ORDER_INDEX_SQL = `
   CREATE INDEX IF NOT EXISTS execution_orders_unsettled ON execution_orders(job_id) WHERE ${UNSETTLED_ORDER};`;
 class NotSubmittedError extends ExecutionError { constructor(message) { super(409, message); } }
+class PositionProjectionWait extends ExecutionError {}
 class RateLimitedReadError extends ExecutionError {
   constructor(exchange, symbol, error) {
     super(502, `${TRADING_NAMES[exchange]} ${symbol}：${safeError(error)}`);
@@ -502,7 +506,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     requireLease(); return { markets, received };
   }
   async function collect(legs, { validateAccount = () => {}, validateMarket, requireIdentity = false } = {}) {
-    const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), connections = new Map();
+    const exchanges = [...new Set(legs.map(leg => leg.exchange))], snapshots = new Map(), connections = new Map(), positionWaits = [];
     await readGroup(exchanges.map(async exchange => {
       const expected = legs.find(leg => leg.exchange === exchange)?.accountRevision;
       const ctx = context(exchange, expected);
@@ -511,7 +515,15 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       requireLease();
       if (accountRow(exchange).revision !== ctx.row.revision) throw new ExecutionError(409, '实盘连接已改变，请重新预览');
       if (ctx.row.identity && account.identity && ctx.row.identity !== account.identity) throw new ExecutionError(409, '交易账户身份不一致');
-      for (const leg of legs.filter(item => item.exchange === exchange)) validateAccount(leg, account);
+      for (const leg of legs.filter(item => item.exchange === exchange)) {
+        try { validateAccount(leg, account); }
+        catch (error) {
+          // Inspect all sibling legs and books before deferring: a lagging
+          // position must not hide another leg's identity or contract failure.
+          if (!(error instanceof PositionProjectionWait)) throw error;
+          positionWaits.push(error);
+        }
+      }
       if (accountWriter) {
         if (!ctx.row.identity && account.identity) stmt.prepare('UPDATE execution_accounts SET identity=? WHERE exchange=? AND revision=?').run(account.identity, exchange, ctx.row.revision);
         bindAccount(exchange, ctx.row.revision, account.identity);
@@ -520,6 +532,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       stmt.prepare('UPDATE execution_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(JSON.stringify(mergeSnapshot(ctx.row.snapshot, account, symbols)), exchange, ctx.row.revision);
     }));
     const { markets, received } = await collectMarkets(legs, validateMarket);
+    if (positionWaits.length) throw positionWaits[0];
     requireLease(); return { snapshots, markets, connections, received };
   }
   // Display-only top of book on every venue (same-venue spreads are the main
@@ -606,6 +619,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         if (job.auto?.guard) job.auto = { ...job.auto, guard: null };
       } else job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [] };
       Object.assign(job, { status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs), sendDeferrals: {} });
+      // A newly confirmed remaining plan has its own position baseline.
+      delete job.positionReadWait;
       protectJob(job, !!plan.resumeJobId);
       recoveredWriterJobs.add(job.id);
       stmt.prepare('DELETE FROM execution_stop_requests WHERE job_id=?').run(job.id);
@@ -680,8 +695,16 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     } }); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(502, safeError(error)); }
     check();
     const reading = readReductionRisk(config, collected.snapshots, now());
-    if (!reading.met) {
-      // Surface what would block the trigger while there is still time to act.
+    // Quantity and batch feasibility changes with the live position. Check it
+    // on every monitoring round, before the liquidation trigger is reached.
+    const quantities = reductionQuantities(config, reading, collected.markets, now());
+    const intent = normalizeIntent(reductionIntent(config, quantities));
+    let built;
+    try { built = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()); }
+    catch (error) {
+      if (!(error instanceof ExternalOrdersError)) throw error;
+      error.reading = reading;
+      if (reading.met) throw error;
       const blocked = [];
       for (const leg of config.legs) {
         try { ensureNoExternalOrders(collected.snapshots.get(leg.exchange), leg.symbol); }
@@ -689,13 +712,15 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       }
       return { jobId: null, live: { ...reading, warning: blocked.length ? `${blocked.join('、')} 存在其它活动委托或无法核对委托；达到阈值时将等待其撤销后才能减仓` : null } };
     }
-    const quantities = reductionQuantities(config, reading, collected.markets, now());
-    const intent = normalizeIntent(reductionIntent(config, quantities));
-    let built;
-    try { built = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()); }
-    catch (error) { if (error instanceof ExternalOrdersError) error.reading = reading; throw error; }
+    checkReductionDuration(built.batchCount, built.batchIntervalMs, built.timeoutMs);
+    // Lighter IOC exempts the venue's minimum notional. Hyperliquid documents
+    // a general minimum but no blanket reduce-only exception: surface that
+    // uncertainty without changing the existing close-order send policy.
+    const small = built.legs.filter(leg => leg.exchange === 'hyperliquid' && leg.batchQuantities.some(quantity =>
+      compareDecimals(notional(quantity, leg.bid, leg.rule.contractSize), leg.rule.minNotional) < 0));
+    reading.warning = small.length ? `${small.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol}`).join('、')} 单批预计金额低于交易所一般最低金额，减仓豁免条件未确认；请核对或调整比例、批次数` : null;
+    if (!reading.met) return { jobId: null, live: reading };
     const plan = { ...built, id: randomUUID(), resumeJobId: null, connections: [...collected.connections.values()] };
-    checkReductionDuration(plan.batchCount, plan.batchIntervalMs, plan.timeoutMs);
     writable();
     const jobId = transaction(() => {
       check();
@@ -1280,6 +1305,33 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const job = jobFor(id); job.reason = null;
     event(job, '盘口已恢复新鲜，继续校验并执行'); saveJob(job);
   }
+  function deferPositionRead(id, error) {
+    const job = jobFor(id), previous = job.positionReadWait;
+    const time = now(), attempts = (previous?.attempts ?? 0) + 1;
+    const deadlineAt = previous?.deadlineAt ?? Math.min(time + POSITION_READ_WINDOW_MS, Date.parse(job.deadlineAt));
+    if (previous && (previous.phase !== job.phase || previous.batchIndex !== job.batchIndex)
+      || attempts >= POSITION_READ_ATTEMPTS || time >= deadlineAt) return false;
+    const reason = `${safeError(error)}；等待交易所持仓反映上一批成交，期间不发送新批次`;
+    if (!previous) event(job, `${reason}（最多重读 ${POSITION_READ_ATTEMPTS - 1} 次、${POSITION_READ_WINDOW_MS / 1000} 秒）`);
+    job.positionReadWait = { phase: job.phase, batchIndex: job.batchIndex, since: previous?.since ?? time, deadlineAt,
+      attempts, retryAt: time + POSITION_READ_INTERVAL_MS, reason };
+    job.reason = reason; saveJob(job); return true;
+  }
+  function checkPositionReadBudget(job) {
+    const wait = job.positionReadWait;
+    if (wait && (wait.phase !== job.phase || wait.batchIndex !== job.batchIndex || now() >= wait.deadlineAt || wait.attempts >= POSITION_READ_ATTEMPTS)) {
+      throw new ExecutionError(409, '持仓反映已成交减仓的等待已达上限，请核对后再继续');
+    }
+  }
+  function positionsRecovered(id) {
+    const job = jobFor(id), wait = job.positionReadWait;
+    if (!wait) return;
+    // A successful but slow read cannot extend the absolute wait window.
+    checkPositionReadBudget(job);
+    if (job.reason === wait.reason) job.reason = null;
+    delete job.positionReadWait;
+    event(job, '持仓已反映上一批确认成交，重新核验通过，继续下一批'); saveJob(job);
+  }
   async function runJob(id) {
     if (busyJobs.has(id)) return; busyJobs.add(id);
     try {
@@ -1290,6 +1342,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       if (!['queued', 'running'].includes(job.status)) return;
       protectJob(job);
       if (now() >= Date.parse(job.deadlineAt)) { pause(id, '执行时间已到，停止追价并撤销余单'); await stopping(jobFor(id)); return; }
+      checkPositionReadBudget(job);
+      if (job.positionReadWait && now() < job.positionReadWait.retryAt) return;
       const rateWait = rateReadFailures.get(id);
       if (rateWait && now() - rateWait.since >= RATE_READ_WINDOW_MS) throw new ExecutionError(502, 'Lighter RH 持续限速，自动恢复已达到时间上限，暂停并核对余单');
       if (rateWait && now() < rateWait.retryAt) return;
@@ -1412,7 +1466,17 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
             // Every batch must observe the prior fills. A stale pre-fill
             // position or an external position change cannot fund a new batch.
             const expected = subtract(leg.currentQuantity, totalFilled(all, leg.id, job.phase));
-            if (compareDecimals(current, expected) !== 0) throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 持仓未反映已成交减仓或被外部更改，请核对后再继续`);
+            if (compareDecimals(current, expected) !== 0) {
+              const prior = all.filter(order => order.legId === leg.id && order.phase === job.phase && order.batch === job.batchIndex - 1);
+              const filled = totalFilled(prior, leg.id, job.phase);
+              const knownPrior = job.batchIndex > 0 && prior.length > 0 && all.every(order => order.settled && !order.unknown)
+                && !all.some(order => order.phase === job.phase && order.batch >= job.batchIndex)
+                && compareDecimals(filled, leg.batchQuantities[job.batchIndex - 1]) === 0;
+              const message = `${leg.exchange} ${leg.symbol} 持仓未反映已成交减仓或被外部更改，请核对后再继续`;
+              if (!knownPrior || compareDecimals(current, addDecimals([expected, filled])) !== 0) throw new ExecutionError(409, message);
+              ensureNoExternalOrders(account, leg.symbol);
+              throw new PositionProjectionWait(409, `${leg.exchange} ${leg.symbol} 仍返回上一批成交前持仓`);
+            }
           }
           // Candidates have no unsettled own order. Even an eventually
           // consistent remaining venue order blocks another submit.
@@ -1425,7 +1489,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
           if (WALLET_VENUES.has(leg.exchange)) checkHyperliquidPrice(leg, market);
         },
       });
-      rateReadsRecovered(id); marketsRecovered(id); externalOrdersRecovered(id); job = jobFor(id);
+      positionsRecovered(id); rateReadsRecovered(id); marketsRecovered(id); externalOrdersRecovered(id); job = jobFor(id);
       if (job.riskReduction && !all.length && !readReductionRisk(job.riskReduction.config, snapshots, now()).met) {
         job.status = 'stopped'; job.reason = '首批发送前强平距离已恢复，本轮双边均未发送';
         event(job, job.reason);
@@ -1445,6 +1509,10 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         requireLease();
         const latest = jobFor(id);
         let message = safeError(error);
+        if (error instanceof PositionProjectionWait && latest.riskReduction && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
+          if (deferPositionRead(id, error)) return;
+          message = '持仓反映已成交减仓的等待已达上限，请核对后再继续';
+        }
         if (error instanceof RateLimitedReadError && !closing && !stopRequested(id) && ['queued', 'running'].includes(latest.status) && now() < Date.parse(latest.deadlineAt)) {
           if (deferRateRead(id, error)) return;
           message = `Lighter RH 持续限速，自动恢复已达到重试上限（${message}）`;

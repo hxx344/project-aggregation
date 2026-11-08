@@ -57,8 +57,9 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
       if (job && !FINAL.has(job.status)) throw new ExecutionError(409, '关联减仓任务尚未结束，请先在执行进度核对并停止后再修改');
       if (config.enabled && readMaintenance()) throw new ExecutionError(409, '系统正在维护，暂不能启用自动减仓');
       if (config.enabled && execution.lockOwner(config.legs)) throw new ExecutionError(409, '所选合约已有未结束任务，请先核对');
-      const next = { revision: value.revision, config, accounts: config.enabled ? accountBindings(config) : null, state: { ...initialState(), events: value.state.events, phase: config.enabled ? 'armed' : 'disabled' } };
-      event(next, config.enabled ? '已绑定当前实盘账户，等待强平距离阈值；本轮完成后自动停用' : '设置已保存，自动减仓未启用'); write(next);
+      const next = { revision: value.revision, config, accounts: config.enabled ? accountBindings(config) : null, state: { ...initialState(), events: value.state.events, phase: config.enabled ? 'armed' : 'disabled',
+        reason: config.enabled ? '等待核验当前持仓、减仓数量和分批限制；核验通过后才可触发' : null } };
+      event(next, config.enabled ? `已绑定当前实盘账户；${next.state.reason}；本轮完成后自动停用` : '设置已保存，自动减仓未启用'); write(next);
     });
     live = null; return state();
   }

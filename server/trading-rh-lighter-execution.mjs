@@ -455,6 +455,7 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
       if (entries.length > 1) fail();
       const entry = entries[0];
       if (entry) {
+        if (entry.symbol !== symbol) fail();
         const size = amount(entry.position, { nonnegative: true });
         if (size !== '0') {
           if (entry.sign !== 1 && entry.sign !== -1) fail();

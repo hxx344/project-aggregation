@@ -13,7 +13,7 @@ type Position = {
   /** account: Lighter RH account index; an L1 address can hold several accounts. */
   id: string; exchange: Source; symbol: string; account?: number; side: 'long' | 'short'; quantity: string; quantityUnit: string | null; contractSize?: string;
   entryPrice: string | null; markPrice: string | null; notional: string | null; unrealizedPnl: string | null; leverage: string | null;
-  marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; alerting: boolean;
+  marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; riskUnknown?: boolean; alerting: boolean;
 };
 type SourceState = { exchange: Source; connected: boolean; address?: string | null; state: ReadState; fetchedAt: string | null; error: string | null; refreshing: boolean; positions: Position[] };
 type AlertConfig = { enabled: boolean; thresholdPercent: number; repeatMinutes: number };
@@ -116,7 +116,8 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         <th scope="col">名义价值</th><th scope="col">未实现盈亏</th><th scope="col">强平价</th><th scope="col">距强平</th><th scope="col">杠杆</th>
       </tr></thead><tbody>{estimates.map(({ position, shares: estimate }) => {
         const distance = position.distancePercent, near = distance !== null && threshold !== null && Number(distance) <= threshold;
-        return <tr key={position.id} className={`trading-leg-start${near ? ' trading-anthropic-near' : ''}`} data-position-id={position.id}>
+        const riskUnknown = position.riskUnknown ?? (position.markPrice === null);
+        return <tr key={position.id} className={`trading-leg-start${near || riskUnknown && position.alerting ? ' trading-anthropic-near' : ''}`} data-position-id={position.id}>
           <th scope="row" className="trading-leg-name"><strong>{position.symbol}</strong><span>{NAMES[position.exchange]}{position.account === undefined ? '' : ` · 账户 ${position.account}`}</span></th>
           <td data-label="方向"><span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span></td>
           <td data-label="数量 · 估算股数">{amount(position.quantity)}{position.quantityUnit ? ` ${position.quantityUnit}` : ''}<small className="trading-anthropic-shares">{estimate === null ? '股数未知' : `≈ ${shareText(estimate)} 股`}</small></td>
@@ -125,7 +126,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
           <td data-label="名义价值">{amount(position.notional)}</td>
           <td data-label="未实现盈亏" className={polarity(position.unrealizedPnl)}>{amount(position.unrealizedPnl, true)}</td>
           <td data-label="强平价">{position.liquidationPrice === null ? <span className="trading-muted">未提供</span> : amount(position.liquidationPrice)}</td>
-          <td data-label="距强平" className={near ? 'trading-negative' : ''}>{distance === null ? '—' : `${distance}%`}{position.alerting ? <small className="trading-anthropic-alerting">预警中</small> : null}</td>
+          <td data-label="距强平" className={near ? 'trading-negative' : ''}>{riskUnknown ? <span className="trading-warning">标记价缺失，无法计算</span> : distance === null ? '—' : `${distance}%`}{position.alerting ? <small className="trading-anthropic-alerting">预警中</small> : null}</td>
           <td data-label="杠杆">{position.leverage ? `${amount(position.leverage)}×` : '—'}{position.marginMode ? ` ${position.marginMode === 'isolated' ? '逐仓' : position.marginMode === 'cross' ? '全仓' : position.marginMode}` : ''}</td>
         </tr>;
       })}</tbody></table></div> : <p className="trading-anthropic-empty">{data.sources.some(source => source.state === 'live') ? '已连接的账户当前没有 Anthropic 仓位。' : '尚无可确认的 Anthropic 仓位数据。'}</p>}

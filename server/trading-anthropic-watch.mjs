@@ -45,6 +45,7 @@ const WALLETS = Object.freeze(['hyperliquid', 'rh-lighter']);
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 const iso = time => new Date(time).toISOString();
 const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+const missingMark = row => !Number.isFinite(Number(row.markPrice)) || !(Number(row.markPrice) > 0);
 
 export function validateAlertConfig(value) {
   if (!object(value) || Object.keys(value).length !== 3 || !['enabled', 'thresholdPercent', 'repeatMinutes'].every(key => Object.hasOwn(value, key))) throw new Error('预警设置格式不正确');
@@ -166,12 +167,13 @@ function eventLine(event, threshold) {
   }
   if (event.type === 'recover') return event.distance === null ? `🟢 ${legName(event.row)}：交易所不再提供强平价（通常是保证金已充足），解除预警`
     : `🟢 ${legName(event.row)}：距强平已回到 ${event.distance.toFixed(2)}%，解除预警`;
+  if (event.type === 'unknown') return `⚠️ ${legName(event.row)}：标记价缺失，无法计算强平距离，保留预警`;
   if (event.type === 'gone') return `⚠️ ${event.label}：仓位已不在账户中（可能已平仓或被强平），请到交易所核对`;
   if (event.type === 'stale') return `⚠️ ${TRADING_NAMES[event.source]}：仓位读取已中断${event.minutes ? ` ${event.minutes} 分钟` : ''}，暂时无法监控强平距离`;
   return `🟢 ${TRADING_NAMES[event.source]}：仓位读取已恢复`;
 }
 export function alertCard(events, { title, threshold, at, test = false }) {
-  const danger = test || events.some(event => ['alert', 'repeat', 'gone', 'stale'].includes(event.type));
+  const danger = test || events.some(event => ['alert', 'repeat', 'unknown', 'gone', 'stale'].includes(event.type));
   const clock = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(at));
   const lines = test ? ['这是一条测试消息：Anthropic 强平预警会通过这个机器人发送。', ...events.map(line => `· ${line}`)] : events.map(event => eventLine(event, threshold));
   return { config: { wide_screen_mode: true },
@@ -207,7 +209,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
   }
   const NO_ROBOT = '请先保存预警机器人，或在「系统 → 飞书汇总」配置机器人';
   let config = { ...ANTHROPIC_ALERT_DEFAULTS }, loadError = null, stateError = null;
-  // active: leg id → { sentAt, label }; stale: source → sentAt. Both are claimed on disk before a send.
+  // active: leg id → { sentAt, label, unknownSentAt? }; stale: source → sentAt. Both are claimed on disk before a send.
   let alerts = { active: {}, stale: {} }, history = [], failedAt = 0, lastError = null;
   const emptyWallet = address => ({ address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null });
   const wallets = Object.fromEntries(WALLETS.map(exchange => [exchange, emptyWallet(null)]));
@@ -295,18 +297,31 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
   function evaluate(list) {
     const threshold = config.thresholdPercent, repeatMs = config.repeatMinutes * 60_000, current = now();
     const events = [], next = { active: { ...alerts.active }, stale: { ...alerts.stale } };
+    let clearedUnknown = false;
     for (const source of list) {
       const ids = new Set(source.positions.map(row => row.id));
       const watched = source.positions.length > 0 || Object.keys(next.active).some(id => id.startsWith(`${source.exchange}:`));
       if (source.state === 'live') delete notLiveSince[source.exchange];
       else notLiveSince[source.exchange] ??= current;
       if (source.state === 'live') {
-        if (next.stale[source.exchange]) { events.push({ type: 'stale-recover', source: source.exchange }); delete next.stale[source.exchange]; }
+        if (next.stale[source.exchange] && source.positions.every(row => !missingMark(row))) {
+          events.push({ type: 'stale-recover', source: source.exchange }); delete next.stale[source.exchange];
+        }
         for (const row of source.positions) {
           const distance = liquidationDistance(row), active = next.active[row.id];
+          // Missing marks are unknown risk even when the venue also omits its liquidation price.
+          if (missingMark(row)) {
+            if (active && !Object.hasOwn(active, 'unknownSentAt')) {
+              events.push({ type: 'unknown', row }); next.active[row.id] = { ...active, unknownSentAt: current };
+            }
+            continue;
+          }
           if (distance === null) {
             if (active) { events.push({ type: 'recover', row, distance: null }); delete next.active[row.id]; }
             continue;
+          }
+          if (active && Object.hasOwn(active, 'unknownSentAt')) {
+            next.active[row.id] = { sentAt: active.sentAt, label: active.label }; clearedUnknown = true;
           }
           if (distance <= threshold) {
             if (!active || current - active.sentAt >= repeatMs) { events.push({ type: active ? 'repeat' : 'alert', row, distance }); next.active[row.id] = { sentAt: current, label: legName(row) }; }
@@ -325,7 +340,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
         }
       }
     }
-    return { events, next };
+    return { events, next, clearedUnknown };
   }
 
   async function deliver(events, next) {
@@ -354,8 +369,12 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
       if (closed || sending || !config.enabled || loadError) return;
       const channel = robot();
       if (!channel.configured || failedAt && now() - failedAt < FAILURE_RETRY_MS) return;
-      const { events, next } = evaluate(sources());
-      if (!events.length) return;
+      const { events, next, clearedUnknown } = evaluate(sources());
+      if (!events.length) {
+        // Valid marks inside the hysteresis band retain the warning but rearm a future unknown notice.
+        if (clearedUnknown && persist(next)) alerts = next;
+        return;
+      }
       sending = deliver(events, next).finally(() => { sending = null; });
       await sending;
     })().catch(error => log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 仓位检查失败')).finally(() => { polling = null; });
@@ -366,7 +385,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
     const list = sources(), channel = robot();
     return { schema: 1, generatedAt: iso(now()), sources: list.map(source => ({ ...source, positions: source.positions.map(row => {
       const distance = liquidationDistance(row);
-      return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), alerting: Object.hasOwn(alerts.active, row.id) };
+      return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), riskUnknown: missingMark(row), alerting: Object.hasOwn(alerts.active, row.id) };
     }) })), alerts: { config: { ...config }, channel: { configured: channel.configured, source: channel.source, host: channel.host, error: channel.error }, history: structuredClone(history), error: loadError ?? stateError ?? lastError,
       staleAfterSeconds: STALE_ALERT_MS / 1000, hysteresisPercent: HYSTERESIS } };
   }
@@ -430,7 +449,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
       if (testing) throw new HttpError(409, '测试消息正在发送，请稍候');
       const lines = sources().flatMap(source => source.positions.map(row => {
         const distance = liquidationDistance(row);
-        return `${legName(row)}：距强平 ${distance === null ? '未提供强平价' : `${distance.toFixed(2)}%`}`;
+        return `${legName(row)}：${missingMark(row) ? '标记价缺失，无法计算强平距离' : `距强平 ${distance === null ? '未提供强平价' : `${distance.toFixed(2)}%`}`}`;
       }));
       testing = true;
       try { await post(alertCard(lines.length ? lines : ['当前没有读取到 Anthropic 仓位。'], { title: channel.title, threshold: config.thresholdPercent, at: now(), test: true })); }

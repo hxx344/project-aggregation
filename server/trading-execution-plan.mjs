@@ -282,7 +282,6 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
       ...(NUMBERED_VENUES.has(input.exchange) ? { leverage: leverageOf(account, input.exchange, input.symbol) } : {}) };
     if (intent.equalSize) leg.quantity = equalQuantity(intent, leg, market);
     const currentQuantity = checkPosition(account, leg, intent.action, leg.quantity);
-    ensureNoExternalOrders(account, leg.symbol);
     if (!isMultiple(leg.quantity, market.rule.quantityStep)) throw new ExecutionError(400, `${input.exchange} ${input.symbol} 数量须为 ${market.rule.quantityStep} 的整数倍`);
     if (leg.stopPrice !== null && !isMultiple(leg.stopPrice, market.rule.tickSize)) throw new ExecutionError(400, `${input.exchange} ${input.symbol} 追价界限须为 ${market.rule.tickSize} 的整数倍`);
     if (stopReached(leg, market)) throw new ExecutionError(409, `${input.exchange} ${input.symbol} 当前已达到追价界限`);
@@ -298,6 +297,9 @@ export function buildPlan(intent, snapshots, markets, connections, now, { resume
     for (const quantity of batchQuantities) checkChildQuantity(quantity, market, intent.action, leg.orderType);
     return { ...leg, batchQuantities, estimatedNotional: notional(leg.quantity, (leg.orderSide === 'buy') !== (legOrderType(leg) === 'market') ? market.bid : market.ask, market.rule.contractSize), bid: market.bid, ask: market.ask, quoteAt: market.at, rule: market.rule };
   });
+  // Report known sizing failures even when an owner's order currently blocks
+  // execution. The order guard still rejects every plan before it can return.
+  for (const leg of legs) ensureNoExternalOrders(snapshots.get(leg.exchange), leg.symbol);
   // Anthropic legs are always measured in shares: independent rounding of each venue's step can leave a visible gap.
   const balance = intent.equalSize && intent.market !== 'anthropic' ? null : hedgeBalance(intent.market, legs, intent.shares);
   // Per-leg sizes are native units (OKX in contracts). A fresh open where any

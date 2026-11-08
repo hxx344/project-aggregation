@@ -8,6 +8,7 @@ async (page) => {
   page.on('pageerror', error => pageErrors.push(error.message));
   const fixedTime = '2026-11-06T04:00:00.000Z', start = '2026-10-30T04:00:00.000Z';
   let config = { enabled: true, thresholdPercent: 20, repeatMinutes: 30 }, channel = { configured: true, source: 'digest', host: null, error: null }, testFailure = true;
+  let missingMarks = false;
   const leg = (exchange, symbol, side, extra) => ({ id: `${exchange}:${symbol}:${side}`, exchange, symbol, side, quantityUnit: null, contractSize: null, entryPrice: '180', unrealizedPnl: '0', leverage: '3', marginMode: 'isolated', ...extra });
   const watch = () => ({ generatedAt: fixedTime, sources: [
     { exchange: 'binance', connected: true, state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
@@ -15,9 +16,9 @@ async (page) => {
     { exchange: 'okx', connected: true, state: 'stale', fetchedAt: start, error: 'OKX 仓位读取超时', refreshing: false,
       positions: [leg('okx', 'ANTHROPICUSDT', 'short', { quantity: '300', quantityUnit: '张', contractSize: '1', markPrice: '183.6', notional: '5508', unrealizedPnl: '-108', liquidationPrice: '240', distancePercent: '30.72', alerting: false, marginMode: 'cross' })] },
     { exchange: 'hyperliquid', connected: true, address: '0x' + 'ab'.repeat(20), state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
-      positions: [leg('hyperliquid', 'xyz:ANT', 'long', { quantity: '100', markPrice: '14.4', notional: '1440', liquidationPrice: null, distancePercent: null, alerting: false })] },
+      positions: [leg('hyperliquid', 'xyz:ANT', 'long', { quantity: '100', markPrice: missingMarks ? null : '14.4', notional: missingMarks ? '0' : '1440', liquidationPrice: null, distancePercent: null, riskUnknown: missingMarks, alerting: missingMarks })] },
     { exchange: 'rh-lighter', connected: true, address: '0x' + 'cd'.repeat(20), state: 'live', fetchedAt: fixedTime, error: null, refreshing: false,
-      positions: [{ ...leg('rh-lighter', 'ANTHROPIC', 'short', { quantity: '0.6', markPrice: '1520.1', notional: '912.06', liquidationPrice: '1900.5', distancePercent: '25.02', alerting: false, marginMode: 'cross' }), id: 'rh-lighter:ANTHROPIC:22163:short', account: 22163 }] },
+      positions: [{ ...leg('rh-lighter', 'ANTHROPIC', 'short', { quantity: '0.6', markPrice: missingMarks ? null : '1520.1', notional: missingMarks ? '0' : '912.06', liquidationPrice: '1900.5', distancePercent: missingMarks ? null : '25.02', riskUnknown: missingMarks, alerting: missingMarks, marginMode: 'cross' }), id: 'rh-lighter:ANTHROPIC:22163:short', account: 22163 }] },
   ], alerts: { config, channel, history: [{ at: fixedTime, status: 'sent', count: 1, summary: ['Binance ANTHROPICUSDT 做多：距强平 18.20%（阈值 20%）'], error: null }], error: null, staleAfterSeconds: 180, hysteresisPercent: 2 } });
   const trading = () => ({ mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: fixedTime, cache: { builtAt: fixedTime, servedAt: fixedTime, rebuilding: false }, period: { days: 7, start, end: fixedTime },
     exchanges: ['binance', 'bybit'], accounts: [], legs: [], structure: { state: 'opposed', message: '' },
@@ -70,6 +71,19 @@ async (page) => {
   assert(statuses[3].includes('Lighter RH') && statuses[3].includes('0xcdcd…cdcd'), `Lighter RH address is masked: ${statuses[3]}`);
   assert((await section.locator('.trading-structure').innerText()).includes('多头 ≈ 481 股 · 空头 ≈ 391 股 · 差 89.98 股'), 'long and short shares are summed under the share assumption');
 
+  missingMarks = true;
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await rows.nth(2).getByText('标记价缺失，无法计算', { exact: true }).waitFor();
+  for (const index of [2, 3]) {
+    const text = await rows.nth(index).innerText();
+    assert(text.includes('标记价缺失，无法计算') && text.includes('预警中'), `unknown risk retains its warning: ${text}`);
+    assert(await rows.nth(index).evaluate(row => row.classList.contains('trading-anthropic-near')), 'unknown risk keeps the active warning highlighted');
+  }
+  missingMarks = false;
+  await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+  await rows.nth(3).getByText('25.02%', { exact: true }).waitFor();
+  assert(await section.getByText('标记价缺失，无法计算', { exact: true }).count() === 0, 'valid marks remove the unknown display');
+
   const save = section.getByRole('button', { name: '保存', exact: true });
   assert(await save.isDisabled(), 'save waits for a change');
   await section.getByLabel('距强平低于').fill('15');
@@ -114,5 +128,5 @@ async (page) => {
   assert(await section.locator('.trading-position-table thead').isHidden(), 'phone uses labelled position cards');
   await section.screenshot({ path: 'output/playwright/trading-anthropic-positions-mobile.png' });
   assert(!pageErrors.length, `No uncaught browser errors: ${pageErrors.join('; ')}`);
-  return { passed: true, scenarios: ['four sources with stale and masked addresses', 'near highlight and share estimates', 'save exact body', 'test failure shown', 'no robot disables test', '390px mobile'] };
+  return { passed: true, scenarios: ['four sources with stale and masked addresses', 'near highlight and share estimates', 'missing marks retain active warnings and recover', 'save exact body', 'test failure shown', 'no robot disables test', '390px mobile'] };
 }
