@@ -20,7 +20,7 @@ import { UpdateError } from '../updates.mjs';
 import { moduleIds } from '../modules/catalog.mjs';
 import { readModuleCapabilities } from '../modules/capabilities.mjs';
 import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from '../observability.mjs';
-import { createAccountWriter } from '../execution/account-writer.mjs';
+import { createAccountWriter, getAccountWriterDiagnostics } from '../execution/account-writer.mjs';
 import { createTradingAutoExposure } from '../trading-auto-exposure.mjs';
 import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
@@ -388,7 +388,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
       if (pathname === '/api/system/metrics') return reply(200, baseline.read());
       if (pathname === '/api/system/event-loop') return reply(200, eventLoop.read());
-      if (pathname === '/api/system/accounts') return reply(200, { schemaVersion: 1, enabled: !!sharedAccountWriter, ...(sharedAccountWriter?.snapshot() || { accounts: [], bindings: [], operations: [], isolations: [] }) });
+      if (pathname === '/api/system/accounts') return reply(200, getAccountWriterDiagnostics(sharedAccountWriter));
       if (pathname === '/api/system/recovery') return reply(200, { schemaVersion: 1, enabled: !!sharedAccountWriter, recovery: sharedAccountWriter?.snapshot().recovery ?? null });
       const controller = new AbortController(); controllers.add(controller);
       try {

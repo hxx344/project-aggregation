@@ -329,6 +329,129 @@ const defaultAlive = (pid) => { try { process.kill(pid, 0); return true; } catch
 
 export function createAccountWriter(options) { return new AccountWriter(options); }
 
+const DIAGNOSTIC_MODULES = ['hub', 'aster', 'greeks', 'crossex'];
+const DIAGNOSTIC_ROW_LIMIT = 200;
+const diagnosticRef = (writer, kind, value) => `${kind}-${digest(`${writer.registryId}\0${kind}\0${value}`).slice(0, 20)}`;
+const diagnosticModule = (value) => DIAGNOSTIC_MODULES.includes(value) ? value : 'other';
+const diagnosticTime = (value) => Number.isSafeInteger(value) && value >= 0 ? value : null;
+
+// Unlike the admission check, a diagnostic read never recovers marker links or
+// retires a writer. A marker being published is unknown until a later GET.
+function checkDiagnosticRegistry(writer) {
+  try {
+    const current = fileIdentity(writer.databasePath);
+    const marker = fs.lstatSync(writer.requiredPath, { bigint: true });
+    if (!marker.isFile() || marker.isSymbolicLink() || marker.size > 1024n) fail('REGISTRY_REPLACED');
+    if (marker.nlink === 2n) fail('REGISTRY_BUSY');
+    if (marker.nlink !== 1n) fail('REGISTRY_REPLACED');
+    const evidence = JSON.parse(fs.readFileSync(writer.requiredPath, 'utf8'));
+    if (!evidence || Object.keys(evidence).length !== 4 || evidence.schema !== 1 || evidence.registryId !== writer.registryId || evidence.dev !== current.dev || evidence.ino !== current.ino || current.dev !== writer.registryIdentity.dev || current.ino !== writer.registryIdentity.ino || String(marker.dev) !== writer.markerIdentity.dev || String(marker.ino) !== writer.markerIdentity.ino) fail('REGISTRY_REPLACED');
+  } catch (error) {
+    if (error.code === 'ENOENT') fail('REGISTRY_MISSING');
+    if (error instanceof AccountWriterError) throw error;
+    fail('REGISTRY_UNAVAILABLE');
+  }
+}
+
+function diagnosticProjection(writer, recovery, current, rowLimit) {
+  if (!Number.isSafeInteger(rowLimit) || rowLimit < 1 || rowLimit > DIAGNOSTIC_ROW_LIMIT) throw new RangeError('Invalid diagnostic row limit');
+  if (diagnosticTime(current) === null || (writer.lastNow !== undefined && current < writer.lastNow)) fail('INVALID_CLOCK');
+  // One statement observes rows, pending counts and module evidence together.
+  // Only the indexed pending junction is joined; no private ticket is selected.
+  const result = writer.db.prepare(`WITH
+    pending AS (
+      SELECT oa.account_key, SUM(o.state='sending') AS sending, SUM(o.state='unknown') AS unknown,
+        MIN(o.created_at) AS oldest_at, MAX(o.updated_at) AS latest_at
+      FROM aw_operation_accounts oa JOIN aw_operations o USING(operation_id)
+      WHERE o.state IN ('sending','unknown') GROUP BY oa.account_key
+    ), candidates AS (
+      SELECT account_key,module_id FROM aw_accounts
+      UNION SELECT account_key,module_id FROM aw_bindings WHERE active=1 AND account_key IS NOT NULL
+      UNION SELECT account_key,module_id FROM aw_isolations
+      UNION SELECT oa.account_key,o.module_id FROM aw_operation_accounts oa JOIN aw_operations o USING(operation_id) WHERE o.state IN ('sending','unknown')
+    ), limited AS (
+      SELECT *,COUNT(*) OVER() AS total_rows FROM candidates ORDER BY account_key,module_id LIMIT ?
+    )
+    SELECT c.*, COALESCE(a.authority,i.authority,(SELECT b.authority FROM aw_bindings b WHERE b.account_key=c.account_key AND b.active=1 LIMIT 1)) AS authority,
+      COALESCE(a.environment,i.environment,(SELECT b.environment FROM aw_bindings b WHERE b.account_key=c.account_key AND b.active=1 LIMIT 1)) AS environment,
+      a.owner_id,a.module_id AS lease_module,a.lease_until,ow.status AS owner_status,ow.last_now AS owner_seen_at,
+      p.sending,p.unknown,p.oldest_at,p.latest_at,i.reason AS isolation_reason,i.created_at AS isolation_at,
+      (SELECT json_group_array(module_id) FROM (
+        SELECT DISTINCT CASE WHEN b.module_id IN ('hub','aster','greeks','crossex') THEN b.module_id ELSE 'other' END AS module_id
+        FROM aw_bindings b WHERE b.active=1 AND b.account_key IS NULL AND b.module_id<>c.module_id
+          AND b.authority=COALESCE(a.authority,i.authority,(SELECT z.authority FROM aw_bindings z WHERE z.account_key=c.account_key AND z.active=1 LIMIT 1))
+          AND b.environment=COALESCE(a.environment,i.environment,(SELECT z.environment FROM aw_bindings z WHERE z.account_key=c.account_key AND z.active=1 LIMIT 1))
+        ORDER BY module_id)) AS unverified_modules,
+      (SELECT value FROM aw_meta WHERE key='recovery_state') AS recovery_state,
+      (SELECT json_group_array(json_object('moduleId',module_id,'active',active,'closed',closed,'lastSeenAt',last_seen)) FROM
+        (SELECT CASE WHEN module_id IN ('hub','aster','greeks','crossex') THEN module_id ELSE 'other' END AS module_id,
+          SUM(status='active') AS active,SUM(status='closed') AS closed,MAX(last_now) AS last_seen FROM aw_owners GROUP BY 1)) AS module_owners,
+      (SELECT json_group_array(json_object('moduleId',module_id,'count',count)) FROM
+        (SELECT CASE WHEN module_id IN ('hub','aster','greeks','crossex') THEN module_id ELSE 'other' END AS module_id,COUNT(*) AS count FROM aw_bindings WHERE active=1 AND account_key IS NULL GROUP BY 1)) AS unverified_bindings
+    FROM (SELECT 1) seed LEFT JOIN limited c ON 1=1
+    LEFT JOIN aw_accounts a ON a.account_key=c.account_key
+    LEFT JOIN aw_owners ow ON ow.owner_id=a.owner_id
+    LEFT JOIN pending p ON p.account_key=c.account_key
+    LEFT JOIN aw_isolations i ON i.account_key=c.account_key`).all(rowLimit);
+  const observedRecovery = JSON.parse(result[0].recovery_state);
+  if (!observedRecovery || observedRecovery.schemaVersion !== recovery.schemaVersion || observedRecovery.state !== recovery.state || RECOVERY_IDS.some((key) => observedRecovery[key] !== recovery[key])) fail('REGISTRY_BUSY');
+  const rows = result.filter((row) => row.account_key !== null).map((row) => {
+    const ownerState = row.owner_id === null ? 'missing' : row.owner_status === 'active' ? 'active' : row.owner_status === 'closed' ? 'closed' : row.owner_status === null ? 'missing' : 'unknown';
+    const leaseUntil = diagnosticTime(row.lease_until);
+    const leaseState = row.owner_id === null ? 'missing' : leaseUntil === null ? 'unknown' : leaseUntil <= current ? 'expired' : 'active';
+    const reasons = [];
+    const unverifiedModules = JSON.parse(row.unverified_modules);
+    if (recovery.state !== 'normal') reasons.push(recovery.state === 'quarantine' ? 'recovery-quarantine' : 'authority-retired');
+    if (writer.retired) reasons.push('writer-retired');
+    if (row.isolation_reason !== null) reasons.push('account-isolated');
+    if (unverifiedModules.length) reasons.push('unverified-binding');
+    if (ownerState !== 'active') reasons.push(`owner-${ownerState}`);
+    if (leaseState !== 'active') reasons.push(`lease-${leaseState}`);
+    if (row.lease_module !== null && row.lease_module !== row.module_id) reasons.push('lease-conflict');
+    if (row.sending > 0) reasons.push('sending');
+    if (row.unknown > 0) reasons.push('unknown-result');
+    return {
+      accountRef: diagnosticRef(writer, 'account', row.account_key), moduleId: diagnosticModule(row.module_id), moduleRef: diagnosticRef(writer, 'module', row.module_id),
+      authority: AUTHORITIES.has(row.authority) ? row.authority : 'unknown', environment: ENVIRONMENTS.has(row.environment) ? row.environment : 'unknown',
+      lease: { state: leaseState, until: leaseUntil, moduleId: row.lease_module === null ? null : diagnosticModule(row.lease_module) },
+      owner: { ref: row.owner_id === null ? null : diagnosticRef(writer, 'owner', row.owner_id), state: ownerState, lastSeenAt: diagnosticTime(row.owner_seen_at) },
+      pending: { sending: row.sending ?? 0, unknown: row.unknown ?? 0, oldestAt: diagnosticTime(row.oldest_at), latestAt: diagnosticTime(row.latest_at) },
+      isolation: row.isolation_reason === null ? null : { reason: ['legacy-conflict', 'identity-conflict', 'manual-isolation'].includes(row.isolation_reason) ? row.isolation_reason : 'unknown', since: diagnosticTime(row.isolation_at) },
+      unverifiedModules, reasons,
+    };
+  });
+  const owners = JSON.parse(result[0].module_owners);
+  const unverified = JSON.parse(result[0].unverified_bindings);
+  const modules = [...new Set([...DIAGNOSTIC_MODULES, ...owners.map((row) => diagnosticModule(row.moduleId)), ...unverified.map((row) => diagnosticModule(row.moduleId))])].map((moduleId) => {
+    const observed = owners.filter((row) => diagnosticModule(row.moduleId) === moduleId);
+    const unverifiedRows = unverified.filter((row) => diagnosticModule(row.moduleId) === moduleId);
+    return { moduleId, ownerEvidence: observed.length ? 'observed' : 'unknown', reachability: 'unknown',
+      activeOwners: observed.length ? observed.reduce((sum, row) => sum + row.active, 0) : null, closedOwners: observed.length ? observed.reduce((sum, row) => sum + row.closed, 0) : null,
+      lastSeenAt: observed.reduce((latest, row) => Math.max(latest ?? 0, diagnosticTime(row.lastSeenAt) ?? 0), null),
+      unverifiedBindings: observed.length || unverifiedRows.length ? unverifiedRows.reduce((sum, row) => sum + row.count, 0) : null };
+  });
+  const totalRows = result[0].total_rows ?? 0;
+  return { schemaVersion: 1, generatedAt: current, registry: 'available', completeness: totalRows > rowLimit ? 'truncated' : 'complete', scope: 'observed-registry',
+    rowLimit, totalRows, truncated: totalRows > rowLimit, recovery: { state: recovery.state, since: null }, modules, rows };
+}
+
+// The public GET remains useful when protection is disabled or its registry
+// cannot be read. Error text, paths and private identifiers never cross it.
+export function getAccountWriterDiagnostics(writer, { rowLimit = DIAGNOSTIC_ROW_LIMIT, now = Date.now } = {}) {
+  const empty = { schemaVersion: 1, enabled: Boolean(writer), accounts: [], bindings: [], operations: [], isolations: [] };
+  try {
+    if (writer) return { schemaVersion: 1, enabled: true, ...writer.snapshot({ includeDiagnostics: true, rowLimit }) };
+  } catch (error) {
+    const code = ['REGISTRY_MISSING', 'REGISTRY_REPLACED', 'REGISTRY_BUSY', 'WRITER_CLOSED', 'INVALID_CLOCK', 'INVALID_RECOVERY_STATE', 'UNSUPPORTED_RECOVERY_SCHEMA'].includes(error.code) ? error.code : 'REGISTRY_UNAVAILABLE';
+    return { ...empty, diagnostics: unavailableDiagnostics('unavailable', code, now(), rowLimit) };
+  }
+  return { ...empty, diagnostics: unavailableDiagnostics('disabled', 'PROTECTION_DISABLED', now(), rowLimit) };
+}
+function unavailableDiagnostics(registry, errorCode, generatedAt, rowLimit) {
+  return { schemaVersion: 1, generatedAt: diagnosticTime(generatedAt), registry, errorCode, completeness: 'unknown', scope: 'observed-registry', rowLimit, totalRows: null, truncated: false,
+    recovery: { state: 'unknown', since: null }, modules: DIAGNOSTIC_MODULES.map((moduleId) => ({ moduleId, ownerEvidence: 'unknown', reachability: 'unknown', activeOwners: null, closedOwners: null, lastSeenAt: null, unverifiedBindings: null })), rows: [] };
+}
+
 export class AccountWriter {
   get recoveryProtectionVersion() { return RECOVERY_SCHEMA_VERSION; }
   // heartbeatMs only shortens the renewal beat (tests); it can never exceed the production 5s beat.
@@ -689,17 +812,19 @@ export class AccountWriter {
       return true;
     });
   }
-  snapshot() {
+  snapshot({ includeDiagnostics = false, rowLimit = DIAGNOSTIC_ROW_LIMIT } = {}) {
     if (this.closed) fail('WRITER_CLOSED');
     try {
-      this._checkRegistryFile();
+      if (includeDiagnostics) checkDiagnosticRegistry(this); else this._checkRegistryFile();
       const recoveryState = this._recoveryState();
       const recovery = { schemaVersion: recoveryState.schemaVersion, state: recoveryState.state };
       for (const key of RECOVERY_IDS) if (Object.hasOwn(recoveryState, key)) recovery[key] = recoveryState[key];
       const accounts = this.db.prepare('SELECT authority,environment,module_id,lease_until,owner_id FROM aw_accounts ORDER BY authority,environment,module_id').all();
       const current = this.now();
       const isolations = this.db.prepare('SELECT authority,environment,reason,module_id FROM aw_isolations ORDER BY authority,environment,module_id').all().map((row) => ({ authority: row.authority, environment: row.environment, reason: row.reason, moduleId: row.module_id }));
-      return { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations, recovery, writerRetired: this.retired };
+      const snapshot = { accounts: accounts.map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, state: this.db.prepare('SELECT status FROM aw_owners WHERE owner_id=?').get(row.owner_id)?.status === 'closed' ? 'closed' : row.lease_until <= current ? 'expired' : 'owned' })), bindings: this.db.prepare('SELECT authority,environment,module_id,CASE WHEN account_key IS NULL THEN 0 ELSE 1 END AS verified,COUNT(*) AS count FROM aw_bindings WHERE active=1 GROUP BY authority,environment,module_id,verified').all().map((row) => ({ authority: row.authority, environment: row.environment, moduleId: row.module_id, verified: Boolean(row.verified), count: row.count })), operations: this.db.prepare('SELECT module_id,state,COUNT(*) AS count FROM aw_operations GROUP BY module_id,state').all().map((row) => ({ moduleId: row.module_id, state: row.state, count: row.count })), isolations, recovery, writerRetired: this.retired };
+      if (includeDiagnostics) { snapshot.diagnostics = diagnosticProjection(this, recovery, current, rowLimit); checkDiagnosticRegistry(this); }
+      return snapshot;
     } catch (error) { this._error(error); }
   }
   // Startup recovery maps these ids back to the private records that still

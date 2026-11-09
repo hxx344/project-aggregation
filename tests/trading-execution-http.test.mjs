@@ -208,6 +208,8 @@ test('exposure HTTP is authenticated, read only, uncached and revokes results af
   assert.equal(response.data.groups.every(group => group.actual.quantity === '0'), true);
   assert.deepEqual(persisted(), before); assert.equal(f.mutations.length, 0);
   assert.equal((await f.request(endpoint + '?fresh=1')).status, 400);
+  const diagnostics = await f.request('/api/system/accounts');
+  assert.equal(diagnostics.status, 200); assert.equal(diagnostics.data.diagnostics.registry, 'disabled');
   assert.deepEqual(persisted(), before);
   const gate = deferred(), entered = deferred();
   f.handlers['bybit:account'] = async () => { entered.resolve(); await gate.promise; return structuredClone(f.accounts.bybit); };

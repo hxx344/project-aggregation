@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Activity, Download, Pause, Play, RotateCcw } from 'lucide-react';
 import { createDiagnosticFetch } from './request-diagnostics';
+import AccountWriterDiagnostics from './AccountWriterDiagnostics';
 
 interface RequestLog {
   id: number;
@@ -23,7 +24,7 @@ interface RequestStats {
   byEndpoint: Record<string, { count: number; avgDuration: number; failed: number }>;
 }
 
-export default function DiagnosticPage() {
+export default function DiagnosticPage({ active, onExpired }: { active: boolean; onExpired: () => void }) {
   const [monitoring, setMonitoring] = useState(false);
   const [logs, setLogs] = useState<RequestLog[]>([]);
   const idCounter = useRef(0);
@@ -102,6 +103,7 @@ export default function DiagnosticPage() {
 
   return (
     <div className="diagnostic-page">
+      <AccountWriterDiagnostics active={active} onExpired={onExpired} />
       <div className="diagnostic-controls">
         <button
           className={`button ${monitoring ? 'danger' : 'primary'}`}
