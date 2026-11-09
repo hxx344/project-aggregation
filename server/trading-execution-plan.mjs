@@ -48,6 +48,14 @@ export class StaleMarketError extends ExecutionError {}
 // Another live order on the contract. Clears once the owner cancels it, so an
 // automatic rule waits instead of treating it as a permanent refusal.
 export class ExternalOrdersError extends ExecutionError {}
+// The selected position is missing or differs from what a reduction expects.
+// An exchange read can briefly omit or lag a position, so a rule retries it
+// within its bounded failure budget instead of disarming on the first read.
+export class PositionStateError extends ExecutionError {}
+// After a completed round the position no longer equals that round's expected
+// remainder for a reason other than an unreflected final fill (ADL, partial
+// liquidation, a manual change or the owner's own TP/SL filling).
+export class ReductionMismatchError extends PositionStateError {}
 export const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
 export function exactKeys(value, keys) {
   if (!object(value) || Object.keys(value).some(key => !keys.includes(key))) throw new ExecutionError(400, '交易参数包含不支持的字段');

@@ -8,13 +8,13 @@ async (page) => {
   const time = '2026-11-07T08:00:00.000Z', writes = [], errors = [], checks = [];
   const onError = error => errors.push(error.message);
   let revision = 0, config = null, failSave = false, failRead = false, unauthorized = false, watchFails = true;
-  let phase = 'disabled', reason = null, job = null, maintenance = false;
+  let phase = 'disabled', reason = null, job = null, maintenance = false, test = null, failTest = false;
   let nextRead = deferred(), nextWrite = null;
   const firstRead = nextRead.promise;
   const connections = ['binance', 'okx', 'hyperliquid', 'rh-lighter'].map(exchange => ({ exchange, connected: true, revision: 1, accountMode: exchange === 'hyperliquid' ? 'agent' : 'hedge', identity: null, keyLabel: null, verifiedAt: time, locked: false }));
   const snapshot = () => ({ generatedAt: time, revision, config: structuredClone(config), state: { phase, jobId: job?.id ?? null, reason, events: [], triggeredAt: job ? time : null },
     live: config ? { checkedAt: time, met: phase === 'reducing', legs: config.legs.map((leg, index) => ({ ...leg, quantity: index ? '1000' : '100', distancePercent: index ? '4' : '20' })) } : null,
-    connections: structuredClone(connections), maintenance, job: structuredClone(job) });
+    connections: structuredClone(connections), maintenance, job: structuredClone(job), test: structuredClone(test) });
   const trading = { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: time, cache: { builtAt: time, servedAt: time, rebuilding: false }, period: { days: 7, start: time, end: time }, exchanges: ['binance', 'bybit'], accounts: [], legs: [], structure: { state: 'opposed', message: '' },
     pnl: { currency: 'USDT', intervalMs: 60000, cumulativeStart: Date.parse(time), end: Date.parse(time), recordingStartedAt: Date.parse(time), pointCount: 0, points: [], latest: null, status: 'ready' }, funding: { complete: true, income: '0', expense: '0', net: '0', currency: 'USDT', events: [], pagination: { page: 0, pageSize: 50, total: 0, pages: 1 }, daily: [] } };
   const handler = async route => {
@@ -43,6 +43,14 @@ async (page) => {
       revision++; phase = config.enabled ? 'armed' : job ? phase : 'disabled';
       if (nextWrite) { const held = nextWrite; nextWrite = null; held.resolve({ route, data: snapshot() }); return; }
       return send(snapshot());
+    }
+    if (url.pathname === `${root}/test` && method === 'POST') {
+      const body = request.postDataJSON(); writes.push({ method, path: url.pathname, body });
+      if (failTest) { test = { jobId: null, startedAt: time, error: '持仓 0.05 小于测试所需的最小数量 0.1，测试未发送', job: null }; return send({ error: test.error }, 409); }
+      if (body.revision !== revision) return send({ error: '规则版本已变化' }, 409);
+      const legs = config.legs.map((leg, index) => ({ id: `test-leg-${index}`, exchange: leg.exchange, symbol: leg.symbol, side: leg.side, quantity: index ? '0.1' : '1', filledQuantity: '0', remainingQuantity: index ? '0.1' : '1' }));
+      test = { jobId: 'ant-reduce-test', startedAt: time, error: null, job: { id: 'ant-reduce-test', market: 'anthropic', preset: 'cross-exchange', action: 'close', status: 'running', createdAt: time, updatedAt: time, deadlineAt: time, batchIndex: 0, batchCount: 1, reason: null, legs } };
+      return send(snapshot(), 202);
     }
     return send({ error: `Unexpected isolated API: ${method} ${url.pathname}` }, 404);
   };
@@ -115,6 +123,31 @@ async (page) => {
     assert(config.legs[0].side === 'short', 'fixture uses server canonical ordering with short leg first');
     assert(await section.getByLabel('减仓多头合约').inputValue() === 'hyperliquid:io:ANTH' && await section.getByLabel('减仓空头合约').inputValue() === 'binance:ANTHROPICUSDT', 'server canonical ordering never reverses the configured directions');
     checks.push('canonical leg order preserves long and short identities');
+
+    const testSection = section.getByRole('region', { name: '实盘测试', exact: true });
+    const testConfirm = testSection.getByLabel('我确认发送两条腿各一笔最小数量的实盘市价减仓委托');
+    const testButton = testSection.getByRole('button', { name: '测试自动减仓（最小数量）', exact: true });
+    assert(await testButton.isDisabled(), 'live test needs explicit confirmation');
+    failTest = true; await testConfirm.check(); await testButton.click();
+    await section.getByRole('alert').filter({ hasText: '小于测试所需的最小数量' }).waitFor();
+    await refresh();
+    assert((await testSection.getByRole('status', { name: '自动减仓测试结果' }).innerText()).includes('测试结果 · 未发送委托'), 'refused test is shown as not sent');
+    failTest = false; const testWrites = writes.length;
+    await testConfirm.check(); await testButton.click();
+    await section.getByText('测试委托已受理；完成后结果显示在下方「测试结果」。').waitFor();
+    assert(JSON.stringify(writes[testWrites].body) === JSON.stringify({ revision, confirmLive: true }), 'test posts current revision with live confirmation only');
+    await refresh();
+    const result = testSection.getByRole('status', { name: '自动减仓测试结果' });
+    assert((await result.innerText()).includes('测试结果 · 进行中'), 'running test shows progress');
+    assert(await testButton.isDisabled() && (await testSection.innerText()).includes('上一次测试尚未结束。'), 'running test blocks a second click');
+    assert(await enabled.isChecked() && !(await threshold.isDisabled()), 'test never changes rule state');
+    test.job = { ...test.job, status: 'completed', batchIndex: 1, updatedAt: '2026-11-07T08:00:03.500Z', legs: test.job.legs.map(leg => ({ ...leg, filledQuantity: leg.quantity, remainingQuantity: '0' })) };
+    await refresh();
+    const finished = await result.innerText();
+    assert(finished.includes('测试结果 · 通过 · 两条腿均已按最小数量成交') && finished.includes('用时 3.5 秒') && finished.includes('测试数量 0.1') && finished.includes('ant-reduce-test'), `completed test shows verdict, elapsed time and quantities: ${finished}`);
+    await page.reload(); await result.waitFor();
+    assert((await result.innerText()).includes('测试结果 · 通过'), 'test result survives reload');
+    checks.push('live test confirmation, refusal, progress, completion result and reload');
 
     await page.getByRole('tab', { name: '价差下单', exact: true }).click();
     const execution = page.getByRole('region', { name: '组合交易', exact: true });

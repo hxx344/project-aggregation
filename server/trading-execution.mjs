@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createExecutionExchangeClient, ExecutionExchangeError, MAX_STRATEGY_WINDOW } from './trading-execution-exchanges.mjs';
 import { decimal, addDecimals, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType, notional } from './trading-execution-plan.mjs';
+import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, PositionStateError, ReductionMismatchError, EXECUTION_EXCHANGES, QUOTE_MAX_AGE, exactKeys, normalizeIntent, buildPlan, normalizeMarket, checkPosition, currentPosition, ensureNoExternalOrders, checkChildQuantity, checkContract, stopReached, subtract, positionSide, legOrderType, notional } from './trading-execution-plan.mjs';
 import { TRADING_NAMES, EXECUTION_MARKETS, EXECUTION_VENUE_SYMBOLS } from './trading-markets.mjs';
 import { orderPrice, stepDecimals } from './trading-hyperliquid-execution.mjs';
 import { orderPrice as rhLighterOrderPrice, RH_LIGHTER_TX_EXPIRES_MS } from './trading-rh-lighter-execution.mjs';
@@ -11,7 +11,7 @@ import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL, UNFINISHED_EXECUTI
 import { immediate } from './control/schema.mjs';
 import { isSqliteBusy } from './sqlite-writes.mjs';
 import { evaluateRule, boundsFor, SPREADS } from './trading-auto.mjs';
-import { REDUCTION_RISK_MAX_AGE_MS, normalizeReductionConfig, readReductionRisk, reductionQuantities, reductionIntent, checkReductionDuration } from './trading-reduction-plan.mjs';
+import { REDUCTION_RISK_MAX_AGE_MS, REDUCTION_TEST_RULE, REDUCTION_TEST_TIMEOUT_MS, normalizeReductionConfig, readReductionRisk, reductionQuantities, reductionTestQuantities, reductionIntent, checkReductionDuration } from './trading-reduction-plan.mjs';
 
 const iso = time => new Date(time).toISOString();
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
@@ -782,10 +782,14 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   }
   // Risk reductions have no spread guard. The same fresh, authenticated
   // snapshot supplies both the liquidation trigger and the native quantities.
-  async function startRiskReduction(body, { ruleId, accounts, previousJobId = null, check, commit }) {
+  // test: the owner's manual check of the same path. The threshold is treated
+  // as met, each leg closes only its venue's minimum quantity in one batch, and
+  // the job never touches the rule's rounds (no previous-round reconciliation).
+  async function startRiskReduction(body, { ruleId, accounts, previousJobId = null, check, commit, test = false }) {
     writable();
-    const config = normalizeReductionConfig(body);
-    if (!config.enabled || ruleId !== 'anthropic-reduction' || typeof check !== 'function' || typeof commit !== 'function') throw new ExecutionError(500, '自动减仓参数无效');
+    let config = normalizeReductionConfig(body);
+    if (!(test ? ruleId === REDUCTION_TEST_RULE && previousJobId === null : config.enabled && ruleId === 'anthropic-reduction') || typeof check !== 'function' || typeof commit !== 'function') throw new ExecutionError(500, '自动减仓参数无效');
+    if (test) config = { ...config, enabled: true, batchCount: 1, batchIntervalMs: 0, timeoutMs: REDUCTION_TEST_TIMEOUT_MS };
     const legs = config.legs.map(leg => {
       const binding = accounts?.[leg.exchange];
       if (!validRevision(binding?.revision) || typeof binding.identity !== 'string' || !binding.identity) throw new ExecutionError(409, '自动减仓缺少已核验的实盘账户绑定');
@@ -821,19 +825,19 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         const current = checkPosition(account, previous.leg, 'close', '0');
         if (compareDecimals(current, previous.expected) !== 0) {
           if (compareDecimals(current, previous.beforeLast) === 0) throw new ExecutionError(502, `${leg.exchange} ${leg.symbol} 持仓尚未反映上一轮最后一批成交，等待核对后再触发`);
-          throw new ExecutionError(409, `${leg.exchange} ${leg.symbol} 持仓与上一轮减仓后的预期不一致，请核对`);
+          throw new ReductionMismatchError(409, `${leg.exchange} ${leg.symbol} 持仓 ${current} 与上一轮减仓后的预期 ${previous.expected} 不一致`);
         }
       }
     } }); } catch (error) { if (error instanceof ExecutionError) throw error; throw new ExecutionError(502, safeError(error)); }
     check();
     if (previousLegs?.every(item => compareDecimals(item.expected, '0') === 0)) return { jobId: null, live: null, exhausted: true };
-    if (previousLegs?.some(item => compareDecimals(item.expected, '0') === 0)) throw new ExecutionError(409, '其中一条腿已无可减仓持仓，请核对双边剩余仓位');
-    const reading = readReductionRisk(config, collected.snapshots, now());
+    if (previousLegs?.some(item => compareDecimals(item.expected, '0') === 0)) throw new PositionStateError(409, '其中一条腿已无可减仓持仓，请核对双边剩余仓位');
+    const reading = readReductionRisk(config, collected.snapshots, now(), { simulated: test });
     // Quantity and batch feasibility changes with the live position. Check it
     // on every monitoring round, before the liquidation trigger is reached.
-    const quantities = reductionQuantities(config, reading, collected.markets, now());
+    const quantities = test ? reductionTestQuantities(reading, collected.markets, now()) : reductionQuantities(config, reading, collected.markets, now());
     // Display evidence only: the send path still performs its own fresh checks.
-    reading.validUntil = iso(Math.min(...reading.legs.flatMap(leg => [Date.parse(leg.riskAt) + REDUCTION_RISK_MAX_AGE_MS,
+    reading.validUntil = iso(Math.min(...reading.legs.flatMap(leg => [leg.riskAt ? Date.parse(leg.riskAt) + REDUCTION_RISK_MAX_AGE_MS : Infinity,
       Date.parse(collected.markets.get(`${leg.exchange}:${leg.symbol}`).at) + QUOTE_MAX_AGE])));
     const intent = normalizeIntent(reductionIntent(config, quantities));
     let built;
@@ -841,7 +845,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     catch (error) {
       if (!(error instanceof ExternalOrdersError)) throw error;
       error.reading = reading;
-      if (reading.met) throw error;
+      if (reading.met || test) throw error;
       const blocked = [];
       for (const leg of config.legs) {
         try { ensureNoExternalOrders(collected.snapshots.get(leg.exchange), leg.symbol); }
@@ -864,11 +868,12 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
       for (const leg of plan.legs) context(leg.exchange, leg.accountRevision);
       if (lockOwner(legs)) throw new WaitError(409, '所选合约已有未结束任务');
       const job = { id: randomUUID(), createdAt: iso(now()), totals: plan.legs, plan, phase: 0, events: [],
-        riskReduction: { ruleId, config, accounts, trigger: reading }, status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) };
+        riskReduction: { ruleId, config, accounts, trigger: reading, ...(test ? { test: true } : {}) }, status: 'queued', stopTarget: null, reason: null, batchIndex: 0, nextBatchAt: now(), deadlineAt: iso(now() + plan.timeoutMs) };
       commit(job.id, reading);
       try {
         protectJob(job); recoveredWriterJobs.add(job.id);
-        event(job, `ANT 强平距离触发双边市价减仓：总比例 ${config.reducePercent}%，实际 ${plan.batchCount} 批`); saveJob(job);
+        event(job, test ? `ANT 自动减仓测试：模拟达到阈值，双边各按最小下单量市价减仓（${plan.legs.map(leg => `${TRADING_NAMES[leg.exchange]} ${leg.symbol} ${leg.quantity}`).join('、')}）`
+          : `ANT 强平距离触发双边市价减仓：总比例 ${config.reducePercent}%，实际 ${plan.batchCount} 批`); saveJob(job);
         for (const leg of plan.legs) stmt.prepare('INSERT INTO execution_locks(resource,job_id) VALUES (?,?)').run(`${leg.exchange}:${leg.symbol}`, job.id);
       } catch (error) { writerTickets.delete(job.id); recoveredWriterJobs.delete(job.id); throw error; }
       return job.id;
@@ -1672,7 +1677,8 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
         },
       });
       positionsRecovered(id); rateReadsRecovered(id); marketsRecovered(id); externalOrdersRecovered(id); job = jobFor(id);
-      if (job.riskReduction && !all.length && !readReductionRisk(job.riskReduction.config, snapshots, now()).met) {
+      // A manual test has a simulated trigger: only a real rule round rechecks it.
+      if (job.riskReduction && !job.riskReduction.test && !all.length && !readReductionRisk(job.riskReduction.config, snapshots, now()).met) {
         job.status = 'stopped'; job.reason = '首批发送前强平距离已恢复，本轮双边均未发送';
         event(job, job.reason);
         transaction(() => { saveJob(job); stmt.prepare('DELETE FROM execution_locks WHERE job_id=?').run(id); });

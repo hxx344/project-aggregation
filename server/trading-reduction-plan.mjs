@@ -1,7 +1,9 @@
 import { decimal, compareDecimals } from './trading-decimal.mjs';
-import { ExecutionError, exactKeys, normalizeIntent, normalizeMarket, units, fromUnits } from './trading-execution-plan.mjs';
+import { ExecutionError, PositionStateError, exactKeys, normalizeIntent, normalizeMarket, units, fromUnits } from './trading-execution-plan.mjs';
 
 export const REDUCTION_RISK_MAX_AGE_MS = 30_000;
+// The manual minimum-quantity test: its own job marker, one batch, bounded run time.
+export const REDUCTION_TEST_RULE = 'anthropic-reduction-test', REDUCTION_TEST_TIMEOUT_MS = 120_000;
 const ONE = units('1');
 
 function percent(value, name) {
@@ -35,22 +37,42 @@ export function normalizeReductionConfig(value) {
   return config;
 }
 
-/** Exact comparison uses raw prices; rounding the displayed distance must never trigger a trade. */
-export function readReductionRisk(config, snapshots, now) {
+/** Exact comparison uses raw prices; rounding the displayed distance must never trigger a trade.
+ * A leg whose venue explicitly reports no liquidation price (risk.noLiquidation)
+ * has no distance and never meets the threshold; an absent or malformed price is
+ * still unknown risk. simulated (the manual test) treats the threshold as met
+ * and does not require risk prices, but still requires one current position. */
+export function readReductionRisk(config, snapshots, now, { simulated = false } = {}) {
   const legs = config.legs.map(leg => {
     const rows = snapshots.get(leg.exchange)?.positions?.filter(row => row.symbol === leg.symbol && row.side === leg.side) ?? [];
     const name = `${leg.exchange} ${leg.symbol}`;
-    if (rows.length !== 1) throw new ExecutionError(409, `${name} 所选方向没有唯一可确认的持仓，自动减仓未发送`);
+    if (rows.length !== 1) throw new PositionStateError(409, `${name} 所选方向没有唯一可确认的持仓，自动减仓未发送`);
     const row = rows[0];
-    let quantity, mark, liquidation;
-    try { quantity = decimal(row.quantity, { positive: true }); mark = units(decimal(row.risk?.markPrice, { positive: true })); liquidation = units(decimal(row.risk?.liquidationPrice, { positive: true })); }
-    catch { throw new ExecutionError(502, `${name} 缺少有效的标记价、强平价或持仓数量，自动减仓未发送`); }
-    const at = typeof row.risk?.at === 'string' ? Date.parse(row.risk.at) : NaN;
-    if (!Number.isFinite(at) || now - at > REDUCTION_RISK_MAX_AGE_MS || at - now > 1000) throw new ExecutionError(502, `${name} 强平风险快照已过期或时间无效，自动减仓未发送`);
-    const raw = leg.side === 'long' ? mark - liquidation : liquidation - mark, distance = raw > 0n ? raw : 0n;
-    return { ...leg, quantity, riskAt: new Date(at).toISOString(), distancePercent: fromUnits(distance * 100n * ONE / mark), met: distance * 100n * ONE <= units(config.thresholdPercent) * mark };
+    const invalid = () => new ExecutionError(502, `${name} 缺少有效的标记价、强平价或持仓数量，自动减仓未发送`);
+    let quantity;
+    try { quantity = decimal(row.quantity, { positive: true }); } catch { throw invalid(); }
+    try {
+      const risk = legRisk(config, row, name, now);
+      return { ...leg, quantity, ...risk, met: simulated || risk.met };
+    } catch (error) {
+      if (!simulated) throw error;
+      return { ...leg, quantity, riskAt: null, distancePercent: null, met: true };
+    }
   });
-  return { checkedAt: new Date(now).toISOString(), legs, met: legs.some(leg => leg.met) };
+  return { checkedAt: new Date(now).toISOString(), legs, met: legs.some(leg => leg.met), ...(simulated ? { simulated: true } : {}) };
+}
+function legRisk(config, row, name, now) {
+  const invalid = () => new ExecutionError(502, `${name} 缺少有效的标记价、强平价或持仓数量，自动减仓未发送`);
+  let mark, liquidation = null;
+  try { mark = units(decimal(row.risk?.markPrice, { positive: true })); } catch { throw invalid(); }
+  const none = row.risk?.noLiquidation === true && (row.risk.liquidationPrice === null || row.risk.liquidationPrice === undefined);
+  if (!none) { try { liquidation = units(decimal(row.risk?.liquidationPrice, { positive: true })); } catch { throw invalid(); } }
+  const at = typeof row.risk?.at === 'string' ? Date.parse(row.risk.at) : NaN;
+  if (!Number.isFinite(at) || now - at > REDUCTION_RISK_MAX_AGE_MS || at - now > 1000) throw new ExecutionError(502, `${name} 强平风险快照已过期或时间无效，自动减仓未发送`);
+  const riskAt = new Date(at).toISOString();
+  if (liquidation === null) return { riskAt, distancePercent: null, noLiquidation: true, met: false };
+  const raw = row.side === 'long' ? mark - liquidation : liquidation - mark, distance = raw > 0n ? raw : 0n;
+  return { riskAt, distancePercent: fromUnits(distance * 100n * ONE / mark), met: distance * 100n * ONE <= units(config.thresholdPercent) * mark };
 }
 
 export function reductionQuantities(config, reading, markets, now) {
@@ -60,6 +82,29 @@ export function reductionQuantities(config, reading, markets, now) {
     const lots = units(leg.quantity) * units(config.reducePercent) / (100n * ONE * step);
     if (lots <= 0n) throw new ExecutionError(400, `${leg.exchange} ${leg.symbol} 减仓量不足一个下单步长，请提高比例`);
     result.set(`${leg.exchange}:${leg.symbol}:${leg.side}`, fromUnits(lots * step));
+  }
+  return result;
+}
+
+// The manual test sends the smallest close each venue accepts. Hyperliquid
+// documents a general minimum order value with no confirmed reduce-only
+// exemption, so its leg is raised to 105% of that value at the closing side's
+// price; other venues exempt reduce-only/IOC closes or have no minimum value.
+export const REDUCTION_TEST_NOTIONAL_BUFFER = 105n;
+export function reductionTestQuantities(reading, markets, now) {
+  const result = new Map();
+  for (const leg of reading.legs) {
+    const market = normalizeMarket(markets.get(`${leg.exchange}:${leg.symbol}`), leg.symbol, now, leg.exchange), { rule } = market;
+    const step = units(rule.quantityStep), ceil = (value, by) => (value + by - 1n) / by;
+    let lots = ceil(units(rule.minQuantity) > step ? units(rule.minQuantity) : step, step);
+    if (leg.exchange === 'hyperliquid' && units(rule.minNotional) > 0n) {
+      const price = units(leg.side === 'long' ? market.bid : market.ask), size = units(rule.contractSize ?? '1');
+      const needed = ceil(units(rule.minNotional) * REDUCTION_TEST_NOTIONAL_BUFFER * ONE * ONE, 100n * step * price * size);
+      if (needed > lots) lots = needed;
+    }
+    const quantity = fromUnits(lots * step);
+    if (lots * step > units(leg.quantity)) throw new PositionStateError(409, `${leg.exchange} ${leg.symbol} 持仓 ${leg.quantity} 小于测试所需的最小数量 ${quantity}，测试未发送`);
+    result.set(`${leg.exchange}:${leg.symbol}:${leg.side}`, quantity);
   }
   return result;
 }

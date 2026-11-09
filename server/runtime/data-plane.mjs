@@ -478,6 +478,12 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId), false));
       if (pathname === '/api/trading/execution/preview' && method === 'POST') return reply(200, await entered(body => execution.preview(body, sessionId, { signal })));
       if (pathname === '/api/trading/execution/jobs' && method === 'POST') return reply(202, await entered(body => execution.start(body, sessionId)));
+      if (pathname === '/api/trading/execution/anthropic-reduction/test') {
+        if (url.search) throw new HttpError(400, '自动减仓接口不接受查询参数');
+        if (method !== 'POST') throw new HttpError(405, '自动减仓测试接口不支持此操作');
+        // A logout while the body was arriving must not send the test orders.
+        return reply(202, await entered(body => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台'); return anthropicReduction.test(body); }));
+      }
       const job = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/(stop|reconcile)$/);
       if (job && method === 'POST') { const body = await bodyOf(); return reply(200, job[2] === 'stop' ? execution.stop(job[1], body, sessionId) : await execution.reconcile(job[1], body, sessionId)); }
       throw new HttpError(404, '实盘执行接口不存在');

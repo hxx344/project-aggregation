@@ -153,7 +153,9 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
   function positionOf(row, symbol, config, receivedAt) {
     const size = positionSize(row, symbol, config.positionMode);
     return size && { symbol, ...size, ...(symbol === 'ANTHROPICUSDT'
-      ? { risk: { markPrice: riskPrice(row.markPx), liquidationPrice: riskPrice(row.liqPx), at: receivedAt } } : {}) };
+      ? { risk: { markPrice: riskPrice(row.markPx), liquidationPrice: riskPrice(row.liqPx), at: receivedAt,
+        // OKX returns an empty string (or zero) when there is no liquidation price; null or malformed stays unknown.
+        noLiquidation: riskPrice(row.liqPx) === null && (row.liqPx === '' || typeof row.liqPx === 'string' && /^0+(?:\.0+)?$/.test(row.liqPx)) } } : {}) };
   }
   const positionSnapshot = wrapped(async (credentials, { accountMode, signal, symbols } = {}) => {
     modeOf(accountMode);

@@ -115,7 +115,7 @@ async function fixture(t, { timers = false, withPositions = false } = {}) {
 }
 
 test('reduction HTTP reads and writes require a session; writes require same Origin and CSRF', async t => {
-  const f = await fixture(t), mutations = [[ROUTE, 'PUT'], [`${ROUTE}/disable`, 'POST']];
+  const f = await fixture(t), mutations = [[ROUTE, 'PUT'], [`${ROUTE}/disable`, 'POST'], [`${ROUTE}/test`, 'POST']];
   for (const [route, method] of [[ROUTE, 'GET'], ...mutations]) {
     assert.equal((await f.request(route, { method, ...(method === 'GET' ? {} : { body: {} }) })).status, 401);
   }
@@ -217,4 +217,19 @@ test('the real app timer repeats reduction from remaining positions and honors H
   f.fill(); await f.app.execution.tick(); await f.pulse(); await f.pulse();
   assert.equal(f.rows('SELECT * FROM execution_jobs').length, 2);
   assert.equal(f.creates.length, 4); assert.equal(f.readOnlyCalls.length, 0);
+});
+
+test('the HTTP test sends one minimum close per leg with a disabled rule and returns its tracked result', async t => {
+  const f = await fixture(t); await f.login(); await f.connect();
+  assert.equal((await f.request(`${ROUTE}/test`, { method: 'POST', body: { revision: 0, confirmLive: true } })).status, 409, 'no saved setting');
+  const saved = await f.save(); assert.equal(saved.status, 200); assert.equal(saved.data.config.enabled, false);
+  assert.equal((await f.request(`${ROUTE}/test`, { method: 'GET' })).status, 405);
+  assert.equal((await f.request(`${ROUTE}/test?x=1`, { method: 'POST', body: { revision: saved.data.revision, confirmLive: true } })).status, 400);
+  assert.equal((await f.request(`${ROUTE}/test`, { method: 'POST', body: { revision: saved.data.revision } })).status, 400);
+  assert.equal((await f.request(`${ROUTE}/test`, { method: 'POST', body: { revision: saved.data.revision, confirmLive: true, quantity: '5' } })).status, 400);
+  const accepted = await f.request(`${ROUTE}/test`, { method: 'POST', body: { revision: f.rows('SELECT revision FROM execution_anthropic_reduction')[0].revision, confirmLive: true } });
+  assert.equal(accepted.status, 202, JSON.stringify(accepted.data));
+  assert.deepEqual(accepted.data.test.job.legs.map(leg => [leg.exchange, leg.quantity]), [['binance', '0.1'], ['okx', '0.1']]);
+  assert.equal(accepted.data.config.enabled, false, 'a test never enables the rule'); assert.equal(accepted.data.state.phase, 'disabled');
+  const read = await f.request(); assert.equal(read.data.test.jobId, accepted.data.test.jobId);
 });

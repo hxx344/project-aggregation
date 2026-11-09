@@ -160,10 +160,11 @@ function eventLine(event, threshold) {
   if (event.type === 'unknown') return `⚠️ ${legName(event.row)}：${missingMark(event.row) ? '标记价缺失，无法计算强平距离' : '强平价缺失或无效，无法确认强平风险'}，保留预警`;
   if (event.type === 'gone') return `⚠️ ${event.label}：仓位已不在账户中（可能已平仓或被强平），请到交易所核对`;
   if (event.type === 'stale') return `⚠️ ${TRADING_NAMES[event.source]}：仓位读取已中断${event.minutes ? ` ${event.minutes} 分钟` : ''}，暂时无法监控强平距离`;
+  if (event.type === 'reduction') return `⚠️ ANT 自动减仓：${event.message}`;
   return `🟢 ${TRADING_NAMES[event.source]}：仓位读取已恢复`;
 }
 export function alertCard(events, { title, threshold, at, test = false }) {
-  const danger = test || events.some(event => ['alert', 'repeat', 'unknown', 'gone', 'stale'].includes(event.type));
+  const danger = test || events.some(event => ['alert', 'repeat', 'unknown', 'gone', 'stale', 'reduction'].includes(event.type));
   const clock = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date(at));
   const lines = test ? ['这是一条测试消息：Anthropic 强平预警会通过这个机器人发送。', ...events.map(line => `· ${line}`)] : events.map(event => eventLine(event, threshold));
   return { config: { wide_screen_mode: true },
@@ -201,6 +202,9 @@ export function createAnthropicWatch({ dataDir, executionPositions = null, readC
   let config = { ...ANTHROPIC_ALERT_DEFAULTS }, loadError = null, stateError = null;
   // active: leg id → { sentAt, label, unknownSentAt? }; stale: source → sentAt. Both are claimed on disk before a send.
   let alerts = { active: {}, stale: {} }, sourceBindings = {}, history = [], failedAt = 0, lastError = null;
+  // Last automatic-reduction notice number claimed for sending; null until the
+  // first poll records the current number as a baseline (nothing is replayed).
+  let reductionSeq = null;
   const emptyWallet = address => ({ address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null });
   const wallets = Object.fromEntries(WALLETS.map(exchange => [exchange, emptyWallet(null)]));
   let timer = null, first = null, closed = false, polling = null, sending = null, testing = false;
@@ -211,7 +215,7 @@ export function createAnthropicWatch({ dataDir, executionPositions = null, readC
   const controller = new AbortController();
 
   function persist(next = alerts) {
-    try { atomicJson(statePath, { alerts: next, history, ...(executionPositions ? { sourceBindings } : {}) }); stateError = null; return true; }
+    try { atomicJson(statePath, { alerts: next, history, reductionSeq, ...(executionPositions ? { sourceBindings } : {}) }); stateError = null; return true; }
     catch (error) { stateError = '预警状态无法保存，预警暂停发送，存储恢复后继续'; log.warn({ err: error, type: 'anthropic-watch' }, stateError); return false; }
   }
 
@@ -352,11 +356,23 @@ export function createAnthropicWatch({ dataDir, executionPositions = null, readC
     return { events, next, clearedUnknown };
   }
 
-  async function deliver(events, next) {
+  // The reduction rule numbers each notice (it disarmed itself, or a met
+  // trigger is held by the owner's orders). A lower number means the rule's
+  // record was replaced: rebaseline instead of replaying.
+  function reductionNotice() {
+    let notice = null;
+    try { notice = readProtection()?.notice ?? null; } catch { return null; }
+    const seq = Number.isSafeInteger(notice?.seq) && notice.seq >= 0 ? notice.seq : 0;
+    if (reductionSeq === null || seq < reductionSeq) return { seq, event: null };
+    if (seq === reductionSeq || typeof notice?.message !== 'string') return null;
+    return { seq, event: { type: 'reduction', message: notice.message.slice(0, 300) } };
+  }
+  async function deliver(events, next, claimSeq = reductionSeq) {
     const channel = robot();
-    const previous = alerts;
+    const previous = alerts, previousSeq = reductionSeq;
     // Claim before sending (L090): a failed claim sends nothing and keeps the events eligible.
-    if (!persist(next)) return;
+    reductionSeq = claimSeq;
+    if (!persist(next)) { reductionSeq = previousSeq; return; }
     alerts = next;
     const entry = { at: iso(now()), status: 'sent', count: events.length, summary: events.map(event => eventLine(event, config.thresholdPercent).split('\n')[0]).slice(0, 6), error: null };
     try { await post(alertCard(events, { title: channel.title, threshold: config.thresholdPercent, at: now() })); failedAt = 0; lastError = null; }
@@ -364,7 +380,7 @@ export function createAnthropicWatch({ dataDir, executionPositions = null, readC
       entry.status = error?.uncertain ? 'uncertain' : 'failed'; entry.error = String(error?.message || '飞书发送失败').slice(0, 200); lastError = entry.error;
       // A definite refusal releases the claim so the next check sends again; an uncertain one may have arrived.
       // Switching off or changing account replaces the alerts object; their result is never rolled back.
-      if (!error?.uncertain && !closed) { failedAt = now(); if (alerts === next) alerts = previous; }
+      if (!error?.uncertain && !closed) { failedAt = now(); if (alerts === next) alerts = previous; if (reductionSeq === claimSeq) reductionSeq = previousSeq; }
       log.warn({ status: entry.status, error: entry.error, type: 'anthropic-watch' }, 'Anthropic 强平预警发送失败');
     }
     history = [entry, ...history].slice(0, HISTORY_LIMIT);
@@ -386,12 +402,15 @@ export function createAnthropicWatch({ dataDir, executionPositions = null, readC
       const channel = robot();
       if (!channel.configured || failedAt && now() - failedAt < FAILURE_RETRY_MS) return;
       const { events, next, clearedUnknown } = evaluate(list);
+      const notice = reductionNotice();
+      if (notice && !notice.event) { const previousSeq = reductionSeq; reductionSeq = notice.seq; if (!persist()) reductionSeq = previousSeq; }
+      if (notice?.event) events.push(notice.event);
       if (!events.length) {
         // Valid marks inside the hysteresis band retain the warning but rearm a future unknown notice.
         if (clearedUnknown && persist(next)) alerts = next;
         return;
       }
-      sending = deliver(events, next).finally(() => { sending = null; });
+      sending = deliver(events, next, notice?.event ? notice.seq : reductionSeq).finally(() => { sending = null; });
       await sending;
     })().catch(error => log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 仓位检查失败')).finally(() => { polling = null; });
     return polling;
@@ -427,6 +446,7 @@ export function createAnthropicWatch({ dataDir, executionPositions = null, readC
         const saved = readBounded(statePath);
         if (saved && object(saved.alerts) && object(saved.alerts.active) && object(saved.alerts.stale)) alerts = { active: saved.alerts.active, stale: saved.alerts.stale };
         if (saved && Array.isArray(saved.history)) history = saved.history.slice(0, HISTORY_LIMIT);
+        if (Number.isSafeInteger(saved?.reductionSeq) && saved.reductionSeq >= 0) reductionSeq = saved.reductionSeq;
         if (executionPositions && object(saved?.sourceBindings)) sourceBindings = Object.fromEntries(Object.entries(saved.sourceBindings).filter(([exchange, key]) => SOURCES.includes(exchange) && typeof key === 'string' && /^[a-f0-9]{64}$/.test(key)));
       } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警状态无法读取，从空状态开始'); }
       try { if (existsSync(channelPath)) ownHost = new URL(readOwn().webhookUrl).hostname; }

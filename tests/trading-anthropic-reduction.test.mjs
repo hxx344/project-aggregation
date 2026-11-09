@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createAccountWriter } from '../server/execution/account-writer.mjs';
 import { createTradingExecution } from '../server/trading-execution.mjs';
 import { createAnthropicReduction } from '../server/trading-anthropic-reduction.mjs';
-import { readReductionRisk } from '../server/trading-reduction-plan.mjs';
+import { readReductionRisk, reductionTestQuantities } from '../server/trading-reduction-plan.mjs';
 import { subtract } from '../server/trading-execution-plan.mjs';
 import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
 
@@ -362,7 +362,7 @@ test('persistently unreflected final fills exhaust the durable retry budget with
   assert.equal(f.state.job.status, 'completed');
 });
 
-test('unexpected post-fill positions or modes pause, while a confirmed remainder does not pin future monitoring', async t => {
+test('unexpected post-fill modes pause, a changed remainder is confirmed on spaced reads, and a confirmed remainder does not pin future monitoring', async t => {
   for (const change of ['quantity', 'mode', 'after-confirmation']) await t.test(change, async t => {
     const f = await fixture(t); f.enable({ batchCount: 1 }); await f.reduction.tick(); await f.execution.tick();
     await f.finishBatch(); await f.reduction.tick();
@@ -376,9 +376,26 @@ test('unexpected post-fill positions or modes pause, while a confirmed remainder
     await f.reduction.tick();
     if (change === 'after-confirmation') {
       assert.equal(f.jobs.length, 2); assert.equal(f.state.job.legs[1].quantity, '7');
+    } else if (change === 'quantity') {
+      // ADL, a partial liquidation or a manual change between rounds: keep the
+      // protection armed, confirm the same remainder on spaced reads, then size
+      // the next round from it. Nothing is sent while it is being confirmed.
+      assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true);
+      assert.match(f.state.state.reason, /持仓 24 与上一轮减仓后的预期 21 不一致；等待再次读取确认（1\/3）/);
+      assert.equal(f.state.notice, null);
+      for (const step of [2, 3]) {
+        await f.wait(30_000);
+        for (const account of Object.values(f.accounts)) account.positions[0].risk.at = stamp(TIME + (step - 1) * 30_000);
+        await f.reduction.tick(); assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+      }
+      assert.equal(f.state.state.previousJobId, null); assert.equal(f.state.config.enabled, true);
+      assert.match(f.state.state.reason, /已改按当前持仓继续监测/); assert.match(f.state.notice.message, /已改按当前持仓继续监测/);
+      await f.reduction.tick(); await f.execution.tick();
+      assert.equal(f.jobs.length, 2); assert.equal(f.state.job.legs[1].quantity, '7');
     } else {
       assert.equal(f.state.state.phase, 'review'); assert.equal(f.state.config.enabled, false);
       assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+      assert.match(f.state.notice.message, /规则已停用/);
     }
   });
 });
@@ -830,4 +847,126 @@ test('stopping or reaching the task deadline overrides a post-fill position wait
     assert.equal(f.jobs[0].status, stop ? 'stopped' : 'paused'); assert.match(f.jobs[0].reason, stop ? /用户停止/ : /执行时间已到/);
     assert.equal(f.creates.length, 2);
   });
+});
+
+const freshRisk = (f, at) => { for (const account of Object.values(f.accounts)) for (const position of account.positions) position.risk.at = stamp(at); };
+
+test('a venue that explicitly reports no liquidation price keeps the rule armed; an absent price is still unknown risk', async t => {
+  const f = await fixture(t); f.enable();
+  for (const account of Object.values(f.accounts)) Object.assign(account.positions[0].risk, { liquidationPrice: null, noLiquidation: true });
+  for (let round = 0; round < 4; round++) {
+    freshRisk(f, TIME + round * 30_000); await f.reduction.tick();
+    assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true);
+    assert.equal(f.state.state.failures, 0); assert.equal(f.state.state.reason, null);
+    await f.wait(30_000);
+  }
+  assert.equal(f.state.live.met, false); assert.equal(f.jobs.length, 0);
+  assert.deepEqual(f.state.live.legs.map(leg => [leg.distancePercent, leg.noLiquidation]), [[null, true], [null, true]]);
+  // The other leg approaching liquidation still triggers both legs.
+  Object.assign(f.accounts.binance.positions[0].risk, { liquidationPrice: '96', noLiquidation: false }); freshRisk(f, TIME + 120_000);
+  await f.reduction.tick(); assert.equal(f.jobs.length, 1); assert.equal(f.state.state.phase, 'reducing');
+
+  const g = await fixture(t); g.enable();
+  g.accounts.okx.positions[0].risk.liquidationPrice = null;
+  await g.reduction.tick();
+  assert.equal(g.state.state.failures, 1); assert.match(g.state.state.reason, /缺少有效的标记价、强平价/);
+  assert.equal(g.jobs.length, 0);
+});
+
+test('a snapshot that briefly omits a position is retried within the failure budget; a persistent one disarms with a notice', async t => {
+  const f = await fixture(t); f.enable();
+  const saved = f.accounts.okx.positions; f.accounts.okx.positions = [];
+  await f.reduction.tick();
+  assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true); assert.equal(f.state.state.failures, 1);
+  assert.match(f.state.state.reason, /没有唯一可确认的持仓/); assert.equal(f.state.notice, null);
+  await f.wait(30_000); f.accounts.okx.positions = saved; freshRisk(f, TIME + 30_000);
+  await f.reduction.tick(); assert.equal(f.jobs.length, 1, 'the restored position triggers as usual');
+
+  const g = await fixture(t); g.enable({ thresholdPercent: '1' }); g.accounts.okx.positions = [];
+  for (let round = 0; round < 3; round++) { freshRisk(g, TIME + round * 30_000); await g.reduction.tick(); await g.wait(30_000); }
+  assert.equal(g.state.state.phase, 'review'); assert.equal(g.state.config.enabled, false);
+  assert.match(g.state.notice.message, /没有唯一可确认的持仓.*规则已停用/); assert.equal(g.state.notice.seq, 1);
+});
+
+test('a met trigger held by the owner\'s orders raises one notice per distinct reason', async t => {
+  const f = await fixture(t); f.enable();
+  f.accounts.binance.openOrders = [{ id: 'owner-sl', symbol: SYMBOL }];
+  await f.reduction.tick();
+  assert.match(f.state.state.reason, /^已达到减仓阈值，但.*存在本任务之外的活动委托.*规则保持启用$/);
+  assert.equal(f.state.notice.seq, 1); assert.equal(f.state.notice.message, f.state.state.reason);
+  await f.wait(30_000); freshRisk(f, TIME + 30_000); await f.reduction.tick();
+  assert.equal(f.state.notice.seq, 1, 'the same held reason is not repeated'); assert.equal(f.jobs.length, 0);
+});
+
+test('a manual test sends each venue\'s minimum close once without touching the rule, and keeps its result', async t => {
+  const f = await fixture(t); f.enable({ thresholdPercent: '1' }); await f.reduction.tick();
+  assert.equal(f.state.live.met, false);
+  // The test does not need risk prices: its trigger is simulated.
+  f.accounts.okx.positions[0].risk.liquidationPrice = null;
+  await assert.rejects(f.reduction.test({ revision: f.state.revision }), /确认/);
+  await assert.rejects(f.reduction.test({ revision: f.state.revision - 1, confirmLive: true }), /已变化/);
+  const accepted = await f.reduction.test({ revision: f.state.revision, confirmLive: true });
+  assert.equal(accepted.test.error, null); assert.equal(accepted.test.job.batchCount, 1);
+  assert.deepEqual(accepted.test.job.legs.map(leg => [leg.exchange, leg.quantity]), [['binance', '0.1'], ['okx', '1']]);
+  assert.equal(accepted.state.phase, 'armed'); assert.equal(accepted.config.enabled, true); assert.equal(accepted.state.jobId, null);
+  await assert.rejects(f.reduction.test({ revision: f.state.revision, confirmLive: true }), /上一次测试尚未结束/);
+  assert.equal(f.state.test.jobId, accepted.test.jobId, 'a refused second click keeps the running test\'s record');
+  await f.execution.tick();
+  assert.deepEqual(f.creates.map(row => [row.exchange, row.spec.quantity, row.spec.reduceOnly, row.spec.orderType]), [['binance', '0.1', true, 'market'], ['okx', '1', true, 'market']]);
+  await f.finishBatch();
+  assert.equal(f.state.test.job.status, 'completed'); assert.deepEqual(f.state.test.job.legs.map(leg => leg.remainingQuantity), ['0', '0']);
+  assert.deepEqual([f.accounts.binance.positions[0].quantity, f.accounts.okx.positions[0].quantity], ['10', '30']);
+  assert.deepEqual(f.locks(), []);
+  // The rule keeps monitoring from the current positions; the test is not one of its rounds.
+  f.accounts.okx.positions[0].risk.liquidationPrice = '150';
+  await f.wait(30_000); freshRisk(f, TIME + 30_000); await f.reduction.tick();
+  assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.state.previousJobId, null); assert.equal(f.state.state.reason, null);
+  assert.equal(f.jobs.length, 1); assert.equal(f.creates.length, 2);
+  await f.restart(); assert.equal(f.state.test.job.status, 'completed', 'the result survives a restart');
+});
+
+test('a manual test that cannot send records why and leaves the rule untouched', async t => {
+  const f = await fixture(t); f.enable({ thresholdPercent: '1' }); await f.reduction.tick();
+  f.accounts.okx.openOrders = [{ id: 'owner-tp', symbol: SYMBOL }];
+  await assert.rejects(f.reduction.test({ revision: f.state.revision, confirmLive: true }), /存在本任务之外的活动委托/);
+  assert.match(f.state.test.error, /存在本任务之外的活动委托/); assert.equal(f.state.test.jobId, null);
+  f.accounts.okx.openOrders = []; f.accounts.okx.positions[0].quantity = '0.5';
+  await assert.rejects(f.reduction.test({ revision: f.state.revision, confirmLive: true }), /小于测试所需的最小数量 1/);
+  assert.equal(f.jobs.length, 0); assert.equal(f.creates.length, 0);
+  assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true);
+
+  const g = await fixture(t);
+  await assert.rejects(g.reduction.test({ revision: g.state.revision, confirmLive: true }), /请先保存自动减仓设置/);
+  g.enable({ batchCount: 1 }); await g.reduction.tick(); assert.equal(g.state.state.phase, 'reducing');
+  await assert.rejects(g.reduction.test({ revision: g.state.revision, confirmLive: true }), /自动减仓任务尚未结束/);
+  assert.equal(g.jobs.length, 1);
+});
+
+test('a rule held by an unfinished test task keeps waiting without failures and reports the stall once', async t => {
+  const f = await fixture(t); f.enable();
+  const accepted = await f.reduction.test({ revision: f.state.revision, confirmLive: true });
+  assert.equal(accepted.test.error, null);
+  for (let round = 0; round < 12; round++) {
+    freshRisk(f, TIME + round * 30_000); await f.reduction.tick();
+    assert.equal(f.state.state.phase, 'armed'); assert.equal(f.state.config.enabled, true); assert.equal(f.state.state.failures, 0);
+    assert.match(f.state.state.reason, /已有未结束任务/);
+    if (round < 10) assert.equal(f.state.notice, null, `no notice before five minutes (round ${round})`);
+    await f.wait(30_000);
+  }
+  assert.equal(f.state.notice.seq, 1, 'the stall is reported once');
+  assert.match(f.state.notice.message, /^自动减仓已连续 5 分钟无法执行：.*已有未结束任务/);
+  assert.equal(f.jobs.length, 1, 'only the test task exists while the rule waits');
+  assert.equal(f.state.test.jobId, accepted.test.jobId);
+});
+
+test('the test quantity is the venue minimum, raised to cover Hyperliquid\'s minimum order value', () => {
+  const at = stamp(TIME), market = (exchange, rule) => ({ symbol: 'io:ANTH', bid: '100', ask: '100.5', at, rule: {
+    tickSize: '0.01', quantityStep: '0.01', minQuantity: '0.01', maxQuantity: '1000', maxMarketQuantity: '1000', minNotional: '10', maxNotional: null, contractSize: '1',
+    ...(exchange === 'hyperliquid' ? { assetId: 120001, quoteAsset: 'USDC' } : {}), ...rule } });
+  const reading = side => ({ legs: [{ exchange: 'hyperliquid', symbol: 'io:ANTH', side, quantity: '5' }] });
+  const of = (side, rule = {}) => reductionTestQuantities(reading(side), new Map([['hyperliquid:io:ANTH', market('hyperliquid', rule)]]), TIME).get(`hyperliquid:io:ANTH:${side}`);
+  assert.equal(of('long'), '0.11', 'a long closes at the bid: 10.5 / 100 rounded up to the step');
+  assert.equal(of('short'), '0.11', 'a short closes at the ask: 10.5 / 100.5 rounded up');
+  assert.equal(of('long', { minNotional: '0', minQuantity: '0.03' }), '0.03');
+  assert.throws(() => of('long', { minQuantity: '6' }), /小于测试所需的最小数量 6/);
 });
