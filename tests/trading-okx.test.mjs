@@ -613,3 +613,28 @@ test('OKX chase legs without a limit still post at the same-side best price', as
   const sent = mutations(h.calls)[0].parameters;
   assert.deepEqual([sent.ordType, sent.px, sent.pxAmendType], ['post_only', '80', '0']);
 });
+
+test('OKX trade ledger reads pnl and signed fees from trade, liquidation and ADL bills only', async () => {
+  const h = harness({ readOnly: true, handler: call => {
+    if (!call.url.pathname.endsWith('/bills-archive')) return undefined;
+    assert.equal(call.parameters.subType, undefined);
+    if (call.parameters.instId !== 'CL-USDT-SWAP') return [];
+    return [
+      bill('CL-USDT-SWAP', '6', { type: '2', billId: '30', pnl: '5.5', fee: '-0.2' }),
+      bill('CL-USDT-SWAP', '173', { billId: '29' }),
+      bill('CL-USDT-SWAP', '160', { type: '6', billId: '28', pnl: '', fee: '0' }),
+      bill('CL-USDT-SWAP', '1', { type: '2', billId: '27', pnl: '0', fee: '-0.1' }),
+      bill('CL-USDT-SWAP', '101', { type: '5', billId: '26', pnl: '-3', fee: '-0.4' }),
+    ];
+  } });
+  const value = await h.client.trades(credentials, { start: NOW - DAY, end: NOW });
+  assert.equal(value.complete, true);
+  assert.deepEqual(value.events.map(row => [row.id, row.kind, row.amount]), [
+    ['okx:CLUSDT:BILL:26:fee', 'fee', '-0.4'], ['okx:CLUSDT:BILL:26:realized', 'realized', '-3'], ['okx:CLUSDT:BILL:27:fee', 'fee', '-0.1'],
+    ['okx:CLUSDT:BILL:30:fee', 'fee', '-0.2'], ['okx:CLUSDT:BILL:30:realized', 'realized', '5.5']]);
+  for (const invalid of [{ type: '10' }, { ccy: 'USDC' }, { ts: String(NOW) }]) {
+    const broken = harness({ readOnly: true, handler: call => call.url.pathname.endsWith('/bills-archive') ? [bill(call.parameters.instId, '1', { type: '2', ...invalid })] : undefined });
+    const result = await broken.client.trades(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, false); assert.deepEqual(result.coverage, []); assert.ok(result.error); assert.equal(result.diagnostic.operation, 'trades');
+  }
+});

@@ -26,8 +26,13 @@ function emptySnapshot(exchange) {
     positions: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
     hynix: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
     anthropic: { rows: [], fetchedAt: null, lastAttemptAt: null, error: null, diagnostic: null },
-    funding: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null, diagnostic: null } };
+    funding: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null, diagnostic: null },
+    trades: { events: [], coverage: [], fetchedAt: null, lastAttemptAt: null, requestedEnd: null, error: null, diagnostic: null } };
 }
+// Account ledgers read in 7-day windows with their own coverage: funding receipts,
+// and closing PnL plus trading fees. A failure in one never hides the other.
+const LEDGERS = Object.freeze({ funding: { method: 'funding', name: '资金费' }, trades: { method: 'trades', name: '平仓盈亏与手续费' } });
+const TRADE_KINDS = Object.freeze(['realized', 'fee']);
 function exchangeOf(exchange) {
   if (!EXCHANGES.includes(exchange)) throw new TradingError(404, '交易所不存在');
   return exchange;
@@ -99,13 +104,14 @@ function normalizePositions(result, exchange, now, symbols = SYMBOLS) {
   }
   return { rows, fetchedAt: iso(timeOf(result.fetchedAt)) };
 }
-function normalizeReceipts(events, exchange, start = 0, end = Infinity) {
+function normalizeReceipts(events, exchange, start = 0, end = Infinity, ledger = 'funding') {
   if (!Array.isArray(events) || events.length > MAX_FUNDING_EVENTS * 2) throw new Error('Invalid funding events');
   const result = new Map();
   for (const item of events) {
     const time = timeOf(item?.time);
     if (!item || item.exchange !== exchange || !SYMBOLS.includes(item.symbol) || item.currency !== 'USDT' || typeof item.id !== 'string' || !item.id || item.id.length > 250 || /[\u0000-\u001f]/.test(item.id) || time === null || time < start || time >= end) throw new Error('Invalid funding receipt');
-    const row = { id: item.id, exchange, symbol: item.symbol, time: iso(time), amount: decimal(item.amount), currency: 'USDT' };
+    if (ledger === 'trades' && !TRADE_KINDS.includes(item.kind)) throw new Error('Invalid trade kind');
+    const row = { id: item.id, exchange, symbol: item.symbol, time: iso(time), ...(ledger === 'trades' ? { kind: item.kind } : {}), amount: decimal(item.amount), currency: 'USDT' };
     const previous = result.get(row.id);
     if (previous && JSON.stringify(previous) !== JSON.stringify(row)) throw new Error('Conflicting funding receipt');
     result.set(row.id, row);
@@ -128,6 +134,18 @@ function parseSide(kind, value, exchange) {
     return { ...emptySnapshot(exchange)[kind], error: `本地${name}仓位缓存无效，请刷新重新读取` };
   }
 }
+function parseTrades(value, exchange) {
+  // Snapshots written before trade ledgers existed have no section; a damaged one never discards the funding ledger.
+  if (!value) return emptySnapshot(exchange).trades;
+  try {
+    const safeStamp = item => timeOf(item) === null ? null : iso(timeOf(item));
+    const diagnostic = normalizeTradingDiagnostic(value.diagnostic);
+    return { events: normalizeReceipts(value.events, exchange, 0, Infinity, 'trades'), coverage: mergeCoverage(value.coverage), fetchedAt: safeStamp(value.fetchedAt), lastAttemptAt: safeStamp(value.lastAttemptAt),
+      requestedEnd: Number.isSafeInteger(value.requestedEnd) ? value.requestedEnd : null, diagnostic, error: formatTradingDiagnostic(diagnostic) || (value.error ? '上次平仓盈亏与手续费读取未完成，请刷新重试' : null) };
+  } catch {
+    return { ...emptySnapshot(exchange).trades, error: '本地平仓盈亏缓存无效，请刷新重新读取' };
+  }
+}
 function parseSnapshot(row) {
   const fallback = emptySnapshot(row.exchange);
   if (!row.snapshot) return fallback;
@@ -139,11 +157,11 @@ function parseSnapshot(row) {
     const safeStamp = value => timeOf(value) === null ? null : iso(timeOf(value));
     const positionsDiagnostic = normalizeTradingDiagnostic(value.positions.diagnostic), fundingDiagnostic = normalizeTradingDiagnostic(value.funding.diagnostic);
     // Persist only application-owned diagnostics. Arbitrary disk strings never become API error text.
-    return { ...fallback, hynix: parseSide('hynix', value.hynix, row.exchange), anthropic: parseSide('anthropic', value.anthropic, row.exchange), positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
+    return { ...fallback, hynix: parseSide('hynix', value.hynix, row.exchange), anthropic: parseSide('anthropic', value.anthropic, row.exchange), trades: parseTrades(value.trades, row.exchange), positions: { ...positions, lastAttemptAt: safeStamp(value.positions.lastAttemptAt), diagnostic: positionsDiagnostic, error: formatTradingDiagnostic(positionsDiagnostic) || (value.positions.error ? '上次仓位读取失败，请刷新重试' : null) },
       funding: { events, coverage, fetchedAt: safeStamp(value.funding.fetchedAt), lastAttemptAt: safeStamp(value.funding.lastAttemptAt),
         requestedEnd: Number.isSafeInteger(value.funding.requestedEnd) ? value.funding.requestedEnd : null, diagnostic: fundingDiagnostic, error: formatTradingDiagnostic(fundingDiagnostic) || (value.funding.error ? '上次资金费读取未完成，请刷新重试' : null) } };
   } catch {
-    fallback.positions.error = fallback.hynix.error = fallback.anthropic.error = fallback.funding.error = '本地交易缓存无效，请刷新重新读取';
+    fallback.positions.error = fallback.hynix.error = fallback.anthropic.error = fallback.funding.error = fallback.trades.error = '本地交易缓存无效，请刷新重新读取';
     return fallback;
   }
 }
@@ -151,6 +169,10 @@ function readState(connected, data, now, staleMs) {
   if (!connected) return 'unconfigured';
   if (!data.fetchedAt) return data.error ? 'error' : 'loading';
   return data.error || now - timeOf(data.fetchedAt) > staleMs ? 'stale' : 'live';
+}
+function tradesStatus(connected, trades, now) {
+  return { state: readState(connected, trades, now, FUNDING_STALE), fetchedAt: trades.fetchedAt, error: trades.error,
+    coverageEnd: trades.coverage.length ? iso(trades.coverage.at(-1).end) : null };
 }
 function sumOrUnknown(positions, field, signed = false) {
   if (positions.some(row => row[field] === null)) return null;
@@ -184,8 +206,8 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   const storedRows = stmt.prepare('SELECT * FROM trading_accounts ORDER BY exchange').all();
   const cache = new Map(storedRows.map(row => [row.exchange, parseSnapshot(row)]));
   const hash = value => createHash('sha256').update(value || '').digest('hex');
-  const fundingHash = funding => hash(JSON.stringify([funding.fetchedAt, funding.requestedEnd, funding.events, funding.coverage]));
-  const snapshotHashes = new Map(EXCHANGES.map(exchange => [exchange, fundingHash(cache.get(exchange).funding)]));
+  const ledgerHash = snapshot => hash(JSON.stringify(Object.keys(LEDGERS).map(kind => [snapshot[kind].fetchedAt, snapshot[kind].requestedEnd, snapshot[kind].events, snapshot[kind].coverage])));
+  const snapshotHashes = new Map(EXCHANGES.map(exchange => [exchange, ledgerHash(cache.get(exchange))]));
   // Performance: Track serialized snapshots to avoid redundant serialization
   const serializedCache = new Map(storedRows.map(row => [row.exchange, row.snapshot]));
   const pnl = createTradingPnl(db, stmt);
@@ -197,7 +219,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   let views = new Map(), viewsDirty = false, viewTimer = null;
   let viewError = null, viewRetryAt = 0, viewRetryDelay = 750;
   let closed = false;
-  let fundingBatchEnd = Math.max(0, ...EXCHANGES.map(exchange => cache.get(exchange).funding.requestedEnd || 0));
+  let fundingBatchEnd = Math.max(0, ...EXCHANGES.flatMap(exchange => Object.keys(LEDGERS).map(kind => cache.get(exchange)[kind].requestedEnd || 0)));
   function write(exchange, revision, change) {
     if (closed || rowFor(exchange).revision !== revision) return false;
     const previous = cache.get(exchange);
@@ -211,8 +233,9 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     if (!stmt.prepare('UPDATE trading_accounts SET snapshot=? WHERE exchange=? AND revision=?').run(serialized, exchange, revision).changes) return false;
     cache.set(exchange, next);
     serializedCache.set(exchange, serialized); // Update serialized cache
-    if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage || previous.funding.requestedEnd !== next.funding.requestedEnd) snapshotHashes.set(exchange, fundingHash(next.funding));
-    if (previous.funding.events !== next.funding.events || previous.funding.coverage !== next.funding.coverage) invalidateViews();
+    const ledgerChanged = Object.keys(LEDGERS).some(kind => previous[kind].events !== next[kind].events || previous[kind].coverage !== next[kind].coverage);
+    if (ledgerChanged || Object.keys(LEDGERS).some(kind => previous[kind].requestedEnd !== next[kind].requestedEnd)) snapshotHashes.set(exchange, ledgerHash(next));
+    if (ledgerChanged) invalidateViews();
     return true;
   }
   async function deadline(controller, timeoutMs, work) {
@@ -233,7 +256,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   }
   function watch(row, kind, credentials, accountMode) {
     const client = clients.get(row.exchange), key = `${row.exchange}:${kind}`;
-    if (kind === 'funding' || typeof client.watchPositions !== 'function') return null;
+    if (Object.hasOwn(LEDGERS, kind) || typeof client.watchPositions !== 'function') return null;
     if (watchers.get(key)?.revision === row.revision) return watchers.get(key);
     watchers.get(key)?.unsubscribe();
     const watcher = { revision: row.revision, version: 0, unsubscribe: () => {} };
@@ -255,44 +278,45 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
   function run(exchange, kind, { force = false, end = now() } = {}) {
     if (closed) return Promise.resolve();
     const row = rowFor(exchange), key = `${exchange}:${kind}`;
-    if (!row.credentials || kind === 'anthropic' && !ANTHROPIC_EXCHANGES.includes(exchange)) return Promise.resolve();
+    const ledger = Object.hasOwn(LEDGERS, kind) ? LEDGERS[kind] : null;
+    if (!row.credentials || kind === 'anthropic' && !ANTHROPIC_EXCHANGES.includes(exchange) || ledger && typeof clients.get(exchange)[ledger.method] !== 'function') return Promise.resolve();
     if (jobs.has(key)) return jobs.get(key).promise;
     const previous = cache.get(exchange)[kind];
-    const newFundingBatch = kind === 'funding' && (previous.requestedEnd || 0) < end;
-    const cooldown = force || newFundingBatch ? 5000 : kind === 'funding' ? FUNDING_INTERVAL : POSITION_INTERVAL;
+    const newFundingBatch = !!ledger && (previous.requestedEnd || 0) < end;
+    const cooldown = force || newFundingBatch ? 5000 : ledger ? FUNDING_INTERVAL : POSITION_INTERVAL;
     if (previous.lastAttemptAt && now() - timeOf(previous.lastAttemptAt) < cooldown) return Promise.resolve();
     const controller = new AbortController();
-    const start = kind === 'funding' ? fundingStart(previous, end) : null;
-    const saveFunding = (result, progress = false) => {
+    const start = ledger ? fundingStart(previous, end) : null;
+    const saveLedger = (result, progress = false) => {
       if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
       if (timeOf(result?.fetchedAt) === null || timeOf(result.fetchedAt) > now() + 60000 || typeof result.complete !== 'boolean' || !Array.isArray(result.coverage)) throw new Error('Invalid funding response');
-      const added = normalizeReceipts(result.events, exchange, start, end), incomingCoverage = mergeCoverage(result.coverage);
+      const added = normalizeReceipts(result.events, exchange, start, end, kind), incomingCoverage = mergeCoverage(result.coverage);
       if (incomingCoverage.some(item => item.start < start || item.end > end) || result.complete && !covered(incomingCoverage, start, end)) throw new Error('Invalid funding coverage');
       const diagnostic = progress || result.complete ? null : normalizeTradingDiagnostic(result.diagnostic);
       write(exchange, row.revision, snapshot => {
-        const events = normalizeReceipts([...snapshot.funding.events.filter(item => timeOf(item.time) >= end - 31 * DAY), ...added], exchange);
-        const coverage = mergeCoverage([...snapshot.funding.coverage, ...incomingCoverage]).filter(item => item.end > end - 31 * DAY).map(item => ({ start: Math.max(item.start, end - 31 * DAY), end: item.end }));
-        return { ...snapshot, funding: { ...snapshot.funding, events, coverage, fetchedAt: result.fetchedAt, diagnostic,
-          error: progress || result.complete ? null : formatTradingDiagnostic(diagnostic) || '资金费记录未取全，当前仅显示已获取记录，请刷新重试' } };
+        const events = normalizeReceipts([...snapshot[kind].events.filter(item => timeOf(item.time) >= end - 31 * DAY), ...added], exchange, 0, Infinity, kind);
+        const coverage = mergeCoverage([...snapshot[kind].coverage, ...incomingCoverage]).filter(item => item.end > end - 31 * DAY).map(item => ({ start: Math.max(item.start, end - 31 * DAY), end: item.end }));
+        return { ...snapshot, [kind]: { ...snapshot[kind], events, coverage, fetchedAt: result.fetchedAt, diagnostic,
+          error: progress || result.complete ? null : formatTradingDiagnostic(diagnostic) || `${ledger.name}记录未取全，当前仅显示已获取记录，请刷新重试` } };
       });
     };
-    write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], lastAttemptAt: iso(now()), ...(kind === 'funding' ? { requestedEnd: end } : {}) } }));
+    write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], lastAttemptAt: iso(now()), ...(ledger ? { requestedEnd: end } : {}) } }));
     const promise = (async () => {
       try {
         const credentials = privateCredentials(row), accountMode = accountModeOf(exchange, row.account_mode);
         const client = clients.get(exchange);
         const watcher = watch(row, kind, credentials, accountMode), streamVersion = watcher?.version;
         const result = await deadline(controller, taskTimeoutMs, signal => kind === 'positions' ? client.positions(credentials, { signal, accountMode })
-          : kind === 'hynix' ? client.hynixPositions(credentials, { signal, accountMode }) : kind === 'anthropic' ? client.anthropicPositions(credentials, { signal, accountMode }) : client.funding(credentials, { start, end, signal, accountMode, onProgress: result => saveFunding(result, true) }));
+          : kind === 'hynix' ? client.hynixPositions(credentials, { signal, accountMode }) : kind === 'anthropic' ? client.anthropicPositions(credentials, { signal, accountMode }) : client[ledger.method](credentials, { start, end, signal, accountMode, onProgress: result => saveLedger(result, true) }));
         if (controller.signal.aborted || closed || rowFor(exchange).revision !== row.revision) return;
-        if (kind === 'funding') saveFunding(result);
+        if (ledger) saveLedger(result);
         else if (!watcher || watcher.version === streamVersion) {
           const value = normalizePositions(result, exchange, now(), SIDE_MARKETS[kind]?.symbols ?? SYMBOLS);
           write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], ...value, error: null, diagnostic: null } }));
         }
       } catch (error) {
         if (closed || rowFor(exchange).revision !== row.revision || controller.signal.aborted && controller.signal.reason?.name !== 'TimeoutError') return;
-        const diagnostic = normalizeTradingDiagnostic(error?.diagnostic) || normalizeTradingDiagnostic({ version: 1, exchange, accountMode: row.account_mode, operation: kind === 'funding' ? 'funding' : 'positions', code: error?.name === 'TimeoutError' ? 'timeout' : 'upstream' });
+        const diagnostic = normalizeTradingDiagnostic(error?.diagnostic) || normalizeTradingDiagnostic({ version: 1, exchange, accountMode: row.account_mode, operation: ledger ? kind : 'positions', code: error?.name === 'TimeoutError' ? 'timeout' : 'upstream' });
         write(exchange, row.revision, snapshot => ({ ...snapshot, [kind]: { ...snapshot[kind], diagnostic, error: formatTradingDiagnostic(diagnostic) || safeError(error) } }));
       }
     })().finally(() => { if (jobs.get(key)?.promise === promise) jobs.delete(key); });
@@ -304,7 +328,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     const positions = Promise.allSettled(EXCHANGES.map(exchange => run(exchange, 'positions', { force, end: current }))).then(() => { if (!closed && recordPnl()) invalidateViews(); });
     // SK hynix reads run beside, never inside, the oil position batch that records PnL.
     const sides = EXCHANGES.flatMap(exchange => [run(exchange, 'hynix', { force }), run(exchange, 'anthropic', { force })]);
-    return Promise.allSettled([positions, ...sides, ...EXCHANGES.map(exchange => run(exchange, 'funding', { force, end: fundingBatchEnd }))]).then(result => { if (!closed) flushViews(); return result; });
+    return Promise.allSettled([positions, ...sides, ...EXCHANGES.flatMap(exchange => Object.keys(LEDGERS).map(kind => run(exchange, kind, { force, end: fundingBatchEnd })))]).then(result => { if (!closed) flushViews(); return result; });
   }
   function buildState(days = 7, pair = DEFAULT_TRADING_PAIR) {
     if (![7, 30].includes(days)) throw new TradingError(400, '资金费区间仅支持 7 天或 30 天');
@@ -321,7 +345,8 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
         funding: { state: fundingState, fetchedAt: snapshot.funding.fetchedAt, error: snapshot.funding.error,
           coverageStart: snapshot.funding.coverage.length ? iso(snapshot.funding.coverage[0].start) : null,
           coverageEnd: snapshot.funding.coverage.length ? iso(snapshot.funding.coverage.at(-1).end) : null,
-          complete: fundingState === 'live' && covered(snapshot.funding.coverage, start, end) } };
+          complete: fundingState === 'live' && covered(snapshot.funding.coverage, start, end) },
+        trades: tradesStatus(connected, snapshot.trades, current) };
     });
     const events = entries.filter(({ row }) => row.credentials).flatMap(({ snapshot }) => snapshot.funding.events).filter(item => timeOf(item.time) >= start && timeOf(item.time) < end).sort((a, b) => timeOf(b.time) - timeOf(a.time) || a.id.localeCompare(b.id));
     const complete = accounts.every(account => account.funding.complete);
@@ -438,7 +463,8 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       return { exchange: row.exchange, name: NAMES[row.exchange], accountMode: row.account_mode, connected, revision: row.revision, verifiedAt: row.verified_at,
         refreshing: [...jobs.keys()].some(key => key.startsWith(`${row.exchange}:`)),
         positions: { state: readState(connected, snapshot.positions, current, POSITION_STALE), fetchedAt: snapshot.positions.fetchedAt, error: snapshot.positions.error },
-        funding: { ...funding, state: fundingState, complete: funding.complete && fundingState === 'live' } };
+        funding: { ...funding, state: fundingState, complete: funding.complete && fundingState === 'live' },
+        trades: tradesStatus(connected, snapshot.trades, current) };
     });
     const legs = pair.flatMap(exchange => SYMBOLS.map(symbol => {
       const account = accounts.find(account => account.exchange === exchange), snapshot = cache.get(exchange);
@@ -468,7 +494,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     });
     const historical = saved.pnl, last = historical.latest;
     const expired = last && current - last.time > POSITION_STALE && (last.unrealizedPnl !== null || last.totalPnl !== null);
-    const latest = expired ? { time: current, unrealizedPnl: null, fundingPnl: null, totalPnl: null } : last;
+    const latest = expired ? { time: current, unrealizedPnl: null, fundingPnl: null, realizedPnl: null, feePnl: null, totalPnl: null } : last;
     const pages = Math.max(1, Math.ceil(events.length / PAGE_SIZE)), selected = Math.min(page ?? 0, pages - 1);
     return { mode: 'read-only', strategy: { id: 'oil-four-leg', name: '原油四腿资金费套利' }, generatedAt: saved.generatedAt,
       exchanges: pair, period: saved.period, accounts, legs, structure: structure(legs), hynix: { accounts: hynixAccounts, legs: hynixLegs },
@@ -505,11 +531,11 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       if (!saved.changes) throw new TradingError(409, '连接已被更新，本次验证结果未保存');
       cancel(exchange); cache.set(exchange, snapshot);
       serializedCache.set(exchange, serialized); // Update serialization cache
-      snapshotHashes.set(exchange, fundingHash(snapshot.funding));
+      snapshotHashes.set(exchange, ledgerHash(snapshot));
       recordPnl();
       resetViews();
       if (!fundingBatchEnd || now() - fundingBatchEnd >= FUNDING_INTERVAL) fundingBatchEnd = now();
-      void run(exchange, 'funding', { end: fundingBatchEnd }).catch(() => {});
+      for (const kind of Object.keys(LEDGERS)) void run(exchange, kind, { end: fundingBatchEnd }).catch(() => {});
       void run(exchange, 'hynix').catch(() => {});
       void run(exchange, 'anthropic').catch(() => {});
     } catch (error) {
@@ -525,7 +551,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     const emptySnap = emptySnapshot(exchange);
     cache.set(exchange, emptySnap);
     serializedCache.set(exchange, JSON.stringify(emptySnap)); // Update serialization cache
-    snapshotHashes.set(exchange, fundingHash(cache.get(exchange).funding)); resetViews();
+    snapshotHashes.set(exchange, ledgerHash(cache.get(exchange))); resetViews();
   }
   if (!restoreViews()) {
     viewsDirty = true;

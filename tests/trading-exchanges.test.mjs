@@ -738,3 +738,56 @@ test('field diagnostics accept only fixed metadata for Bybit funding format fail
   for (const extras of [{ reason: credentials.apiSecret, valueType: credentials.apiSecret }, { reason: { toString: 0 }, valueType: { toString: 0 } }]) assert.deepEqual(normalizeTradingDiagnostic({ ...base, field: 'funding', ...extras }), { ...base, field: 'funding' });
   assert.deepEqual(normalizeTradingDiagnostic({ ...base, ...fields, code: 'api' }), { ...base, code: 'api' });
 });
+
+test('Binance trade ledger reads one unfiltered income stream per oil symbol, counting rebates and skipping funding', async () => {
+  const { client, calls } = harness('binance', url => {
+    if (!url.pathname.endsWith('/income')) return undefined;
+    const symbol = url.searchParams.get('symbol'), time = NOW - 1000;
+    if (symbol !== 'CLUSDT') return [];
+    return [
+      income(symbol, time, { incomeType: 'REALIZED_PNL', income: '12.345678901234567891', tranId: '11' }),
+      income(symbol, time, { incomeType: 'COMMISSION', income: '-0.75', tranId: '12' }),
+      income(symbol, time, { incomeType: 'COMMISSION_REBATE', income: '0.05', tranId: '13' }),
+      income(symbol, time, { incomeType: 'FUNDING_FEE', income: '-3', tranId: '14' }),
+    ];
+  });
+  const result = await client.trades(credentials, { start: NOW - DAY, end: NOW });
+  assert.equal(result.complete, true); assert.deepEqual(result.coverage, [{ start: NOW - DAY, end: NOW }]);
+  assert.deepEqual(result.events.map(row => [row.id, row.kind, row.amount]).sort(), [
+    ['binance:CLUSDT:COMMISSION:12', 'fee', '-0.75'], ['binance:CLUSDT:COMMISSION_REBATE:13', 'fee', '0.05'], ['binance:CLUSDT:REALIZED_PNL:11', 'realized', '12.345678901234567891']]);
+  const requests = calls.filter(call => call.url.pathname.endsWith('/income'));
+  assert.deepEqual(requests.map(call => call.url.searchParams.get('symbol')).sort(), ['BZUSDT', 'CLUSDT']);
+  assert.ok(requests.every(call => !call.url.searchParams.has('incomeType')));
+});
+
+test('Binance BNB-paid commissions or unknown income types leave the trade ledger incomplete', async () => {
+  for (const override of [{ asset: 'BNB' }, { incomeType: 'STRATEGY_UMFUTURES_TRANSFER' }]) {
+    const { client } = harness('binance', url => url.pathname.endsWith('/income')
+      ? [income(url.searchParams.get('symbol'), NOW - 1000, { incomeType: 'COMMISSION', income: '-0.001', ...override })] : undefined);
+    const result = await client.trades(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(result.complete, false); assert.deepEqual(result.coverage, []); assert.ok(result.error);
+    if (override.asset) assert.match(result.error, /BNB/);
+    assert.equal(result.diagnostic.operation, 'trades');
+  }
+});
+
+test('Bybit trade ledger splits closing PnL and signed fees, skipping settlements and other contracts', async () => {
+  const fill = (symbol, extra = {}) => ({ symbol, type: 'TRADE', category: 'linear', funding: '0', fee: '0.06', cashFlow: '-4.5', change: '-4.56', currency: 'USDT', transactionTime: String(NOW - 1000), id: `${symbol}_fill`, ...extra });
+  const { client, calls } = harness('bybit', url => {
+    if (!url.pathname.endsWith('transaction-log')) return undefined;
+    assert.equal(url.searchParams.has('type'), false);
+    return url.searchParams.get('baseCoin') === 'CL'
+      ? { list: [fill('CLUSDT'), fill('CLUSDT', { id: 'open', cashFlow: '0', fee: '-0.01' }), settlement('CLUSDT', NOW - 2000), fill('CLUSDTPERP', { id: 'other' })], nextPageCursor: '' }
+      : { list: [], nextPageCursor: '' };
+  });
+  const result = await client.trades(credentials, { start: NOW - DAY, end: NOW });
+  assert.equal(result.complete, true);
+  assert.deepEqual(result.events.map(row => [row.id, row.kind, row.amount]), [
+    ['bybit:CLUSDT:CLUSDT_fill:fee', 'fee', '-0.06'], ['bybit:CLUSDT:CLUSDT_fill:realized', 'realized', '-4.5'], ['bybit:CLUSDT:open:fee', 'fee', '0.01']]);
+  assert.equal(calls.filter(call => call.url.pathname.endsWith('transaction-log')).length, 2);
+  for (const extra of [{ type: 'TRANSFER_IN' }, { currency: 'USDC' }, { cashFlow: 'x' }]) {
+    const broken = harness('bybit', url => url.pathname.endsWith('transaction-log') ? { list: [fill(url.searchParams.get('baseCoin') === 'CL' ? 'CLUSDT' : 'BZUSDT', extra)], nextPageCursor: '' } : undefined);
+    const value = await broken.client.trades(credentials, { start: NOW - DAY, end: NOW });
+    assert.equal(value.complete, false); assert.deepEqual(value.coverage, []); assert.ok(value.error);
+  }
+});

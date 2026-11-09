@@ -1,6 +1,6 @@
-const OPERATIONS = Object.freeze({ permissions: '只读权限检查', account: '账户检查', positions: '仓位读取', funding: '资金费读取' });
+const OPERATIONS = Object.freeze({ permissions: '只读权限检查', account: '账户检查', positions: '仓位读取', funding: '资金费读取', trades: '平仓盈亏与手续费读取' });
 const CODES = new Set(['upstream', 'transport', 'http', 'api', 'timeout', 'timestamp', 'response_limit', 'permissions', 'account_mode', 'credentials', 'invalid_data', 'pagination', 'page_limit', 'record_limit', 'duplicate', 'duplicate_conflict', 'window_range', 'currency', 'range']);
-const FIELDS = new Set(['result', 'list', 'record', 'symbol', 'transactionTime', 'type', 'category', 'funding', 'id', 'nextPageCursor']);
+const FIELDS = new Set(['result', 'list', 'record', 'symbol', 'transactionTime', 'type', 'category', 'funding', 'cashFlow', 'fee', 'id', 'nextPageCursor']);
 const VALUE_TYPES = Object.freeze({ missing: '缺失', null: '空值', string: '字符串', number: '数字', boolean: '布尔值', array: '数组', object: '对象' });
 const REASONS = Object.freeze({ format: '格式无效', empty: '为空', type: '类型不符', unexpected: '与请求不符', limit: '超过支持范围' });
 
@@ -13,7 +13,7 @@ export function normalizeTradingDiagnostic(value) {
   const result = { version: 1, exchange: value.exchange, operation: value.operation, accountMode: value.accountMode, code: value.code };
   if (Number.isInteger(value.httpStatus) && value.httpStatus >= 100 && value.httpStatus <= 599) result.httpStatus = value.httpStatus;
   if (Number.isSafeInteger(value.providerCode)) result.providerCode = value.providerCode;
-  if (value.exchange === 'bybit' && value.operation === 'funding' && value.code === 'invalid_data' && FIELDS.has(value.field)) {
+  if (value.exchange === 'bybit' && ['funding', 'trades'].includes(value.operation) && value.code === 'invalid_data' && FIELDS.has(value.field)) {
     result.field = value.field;
     if (typeof value.valueType === 'string' && Object.hasOwn(VALUE_TYPES, value.valueType)) result.valueType = value.valueType;
     if (typeof value.reason === 'string' && Object.hasOwn(REASONS, value.reason)) result.reason = value.reason;
@@ -27,6 +27,7 @@ export function formatTradingDiagnostic(value) {
   const { exchange, accountMode, operation, code, httpStatus, providerCode } = diagnostic;
   const name = exchange === 'binance' ? 'Binance' : exchange === 'okx' ? 'OKX' : 'Bybit';
   const label = exchange === 'binance' ? `${name} ${accountMode === 'portfolio-margin' ? '组合保证金' : '普通 U 本位'}${OPERATIONS[operation]}` : `${name} ${OPERATIONS[operation]}`;
+  const ledger = operation === 'trades' ? '平仓盈亏与手续费' : '资金费';
   const details = [];
   if (httpStatus !== undefined) details.push(`HTTP ${httpStatus}`);
   if (providerCode !== undefined) details.push(`${name} ${providerCode}`);
@@ -46,12 +47,12 @@ export function formatTradingDiagnostic(value) {
       : `${label}返回的数据不完整或格式无效`;
     case 'pagination': return `${label}分页未取得进展，当前结果不完整`;
     case 'page_limit': return `${label}达到请求或分页上限，当前结果不完整`;
-    case 'record_limit': return '资金费记录达到读取上限，当前结果不完整';
+    case 'record_limit': return `${ledger}记录达到读取上限，当前结果不完整`;
     case 'duplicate': return `${label}返回重复记录，无法确认持仓`;
-    case 'duplicate_conflict': return '资金费账本出现冲突记录，当前结果不完整';
-    case 'window_range': return '资金费记录超出请求时间范围，当前结果不完整';
-    case 'currency': return '原油资金费返回了非 USDT 币种，本次账本不完整';
-    case 'range': return '资金费读取仅支持最近 30 天内的有效时间范围';
+    case 'duplicate_conflict': return `${ledger}账本出现冲突记录，当前结果不完整`;
+    case 'window_range': return `${ledger}记录超出请求时间范围，当前结果不完整`;
+    case 'currency': return operation === 'trades' ? '原油平仓盈亏或手续费含非 USDT 币种（如 BNB 抵扣手续费），无法计入总盈亏' : '原油资金费返回了非 USDT 币种，本次账本不完整';
+    case 'range': return `${ledger}读取仅支持最近 30 天内的有效时间范围`;
     default: return `${label}失败，请检查连接与服务器时间`;
   }
 }

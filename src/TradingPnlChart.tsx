@@ -4,6 +4,7 @@ import type { TradingPnl, TradingPnlPoint } from './trading-types';
 const time = new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
 const compact = new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 2 });
 const exact = (value: string | null | undefined) => value == null ? '—' : value;
+const SETTLED_WINDOW = 15 * 60_000;
 const series = [{ key: 'totalPnl', label: '总盈亏', color: 'var(--accent)' }, { key: 'unrealizedPnl', label: '持仓浮盈亏', color: 'var(--text-secondary)' }] as const;
 
 export default memo(function TradingPnlChart({ pnl }: { pnl: TradingPnl | undefined }) {
@@ -34,11 +35,18 @@ export default memo(function TradingPnlChart({ pnl }: { pnl: TradingPnl | undefi
       drawing = true; return command;
     }).join(' ');
   }
-  const detail = (point: TradingPnlPoint | null | undefined) => <><span>总盈亏 <b>{exact(point?.totalPnl)}</b></span><span>持仓浮盈亏 <b>{exact(point?.unrealizedPnl)}</b></span><span>区间累计资金费 <b>{exact(point?.fundingPnl)}</b></span></>;
+  const detail = (point: TradingPnlPoint | null | undefined) => <><span>总盈亏 <b>{exact(point?.totalPnl)}</b></span><span>持仓浮盈亏 <b>{exact(point?.unrealizedPnl)}</b></span><span>区间已实现盈亏 <b>{exact(point?.realizedPnl)}</b></span><span>区间手续费 <b>{exact(point?.feePnl)}</b></span><span>区间累计资金费 <b>{exact(point?.fundingPnl)}</b></span></>;
+  // Ledgers sync every few minutes, so the newest live sample usually lacks a total.
+  // Show a recent complete sample instead, labelled with its own time; gaps,
+  // expired positions and lasting ledger failures still show no total.
+  const latest = pnl?.latest, recent = latest && latest.totalPnl === null && latest.unrealizedPnl !== null ? [...points].reverse().find(point => point.totalPnl !== null) : undefined;
+  const settled = recent && latest && latest.time - recent.time <= SETTLED_WINDOW ? recent : undefined;
+  const headline = settled ?? latest;
   return <figure className="trading-pnl-chart">
     <figcaption className="trading-pnl-legend">{series.map(item => <span key={item.key}><i style={{ background: item.color }} />{item.label}</span>)}<span>USDT · 北京时间</span></figcaption>
-    <p id={descriptionId} className="trading-caption">后台约每分钟记录一次。缺失或过期时断线；资金费未取全时仅显示浮盈亏。长区间保留峰谷，缺失区段不连线。</p>
-    <div className="trading-pnl-latest">{detail(pnl?.latest)}</div>
+    <p id={descriptionId} className="trading-caption">后台约每分钟记录一次。缺失或过期时断线；资金费或平仓账单未取全时仅显示浮盈亏。长区间保留峰谷，缺失区段不连线。</p>
+    <div className="trading-pnl-latest">{detail(headline)}</div>
+    {settled ? <p className="trading-caption">账单同步中，以上为 {time.format(settled.time)} 的完整数据（北京时间）；最新浮盈亏 {exact(latest?.unrealizedPnl)}。</p> : null}
     <div className="trading-pnl-plot" ref={container}>
       {values.length ? <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="四腿总盈亏与持仓浮盈亏曲线" aria-describedby={descriptionId}
         onPointerMove={event => {

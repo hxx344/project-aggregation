@@ -347,11 +347,12 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
     {data ? <div className="trading-tab" hidden={section !== 'pnl'}>
 
       <section className="trading-panel trading-pnl" aria-labelledby="trading-pnl-title">
-        <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">原油四腿总盈亏</h2><p>持仓浮盈亏＋区间累计已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
+        <div className="trading-panel-heading"><div><h2 id="trading-pnl-title">原油四腿总盈亏</h2><p>持仓浮盈亏＋区间已实现盈亏＋手续费（扣费为负）＋已结算资金费</p></div><div className="trading-range" role="group" aria-label="盈亏与资金费时间范围">{([7, 30] as const).map(value => <button key={value} aria-pressed={days === value} onClick={() => changeDays(value)}>近{value}天</button>)}</div></div>
         {days !== data.period.days ? <p className="trading-window-loading" role="status">{reading ? `正在读取近${days}天缓存；下方仍显示近${data.period.days}天的数据。` : `所选区间尚未取得，保留近${data.period.days}天的数据。`}</p> : null}
         <p className="trading-caption">资金费累计起点：{formatDate(data.period.start)}（北京时间）；每个采样点仅累计到该时刻。</p>
+        {selectedAccounts.filter(account => account.trades?.error).map(account => <p className="trading-warning" role="alert" key={account.exchange}><CircleAlert size={15} />{exchangeNames[account.exchange]}：{account.trades?.error}</p>)}
         <TradingPnlChart pnl={data.pnl} />
-        <p className="trading-footnote">仅统计这四腿的浮盈亏与资金费，不含平仓已实现盈亏及交易手续费；切换账户后重新开始记录。切换区间会改变资金费累计起点。</p>
+        <p className="trading-footnote">已实现盈亏、手续费与资金费都从区间起点累计，按账户内 CLUSDT / BZUSDT 的账单统计，可能包含同合约上的其他交易；持仓浮盈亏来自当前仓位。切换账户后重新开始记录，切换区间会改变累计起点。</p>
       </section>
 
       <section className="trading-panel trading-funding" aria-labelledby="trading-funding-title">

@@ -194,7 +194,7 @@
 .trading-pnl-legend{display:flex;flex-wrap:wrap;gap:12px 20px;font-size:12px;color:var(--text-tertiary);margin-bottom:9px}
 .trading-pnl-legend>span{display:flex;gap:6px;align-items:center}
 .trading-pnl-legend i{width:16px;height:3px}
-.trading-pnl-latest{display:grid;grid-template-columns:1.1fr 1fr 1fr;gap:16px;padding:14px 0}
+.trading-pnl-latest{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:16px;padding:14px 0}
 .trading-pnl-latest>span{font-size:12px;color:var(--text-tertiary);min-width:0}
 .trading-pnl-latest b{display:block;font-family:var(--font-mono);font-size:1.25rem;font-weight:600;color:var(--text-primary);font-variant-numeric:tabular-nums;margin-top:7px;overflow-wrap:anywhere}
 .trading-pnl-latest>span:first-child b{color:var(--accent)}

@@ -55,7 +55,7 @@ export function reducePnlPoints(points) {
   if (points.length <= 1200) return points;
   const width = Math.ceil(points.length / 180), result = [];
   for (let offset = 0; offset < points.length;) {
-    const mask = point => `${point.unrealizedPnl === null}:${point.fundingPnl === null}:${point.totalPnl === null}`;
+    const mask = point => `${point.unrealizedPnl === null}:${point.fundingPnl === null}:${point.realizedPnl === null}:${point.totalPnl === null}`;
     let end = offset + 1;
     while (end < points.length && end - offset < width && mask(points[end]) === mask(points[offset])) end++;
     const bucket = points.slice(offset, end);
@@ -113,17 +113,32 @@ export function createTradingPnl(db, stmt) {
     const connected = entries.every(({ row }) => !!row.credentials);
     const records = connected ? selectSamples.all(pair.pairKey, pair.revisionKey, start, current) : [];
     const first = connected ? selectFirstTime.get(pair.pairKey, pair.revisionKey).time : null;
-    const events = entries.flatMap(({ snapshot }) => snapshot.funding.events).filter(row => stamp(row.time) >= start).sort((a, b) => stamp(a.time) - stamp(b.time));
-    let eventIndex = 0, accumulated = '0';
-    const points = [], gap = time => ({ time, unrealizedPnl: null, fundingPnl: null, totalPnl: null });
+    const since = rows => rows.filter(row => stamp(row.time) >= start).sort((a, b) => stamp(a.time) - stamp(b.time));
+    const events = since(entries.flatMap(({ snapshot }) => snapshot.funding.events));
+    // Closing PnL and fees move value out of unrealized PnL into the account
+    // balance; without them a reduction would read as a loss.
+    // Each exchange's trades stop at its own position read time, so a fill between
+    // the two reads is never counted both as closing PnL and as unrealized PnL.
+    const trades = entries.map(({ snapshot }) => since(snapshot.trades?.events ?? [])), tradeIndex = trades.map(() => 0);
+    let eventIndex = 0, accumulated = '0', realized = '0', fees = '0';
+    const points = [], gap = time => ({ time, unrealizedPnl: null, fundingPnl: null, realizedPnl: null, feePnl: null, totalPnl: null });
+    const coveredAt = (ledger, time) => entries.every(({ snapshot }) => (ledger(snapshot)?.coverage ?? []).some(range => range.start <= start && range.end >= time));
     for (const row of records) {
       const previous = points.at(-1);
       if (previous && row.time - previous.time > PNL_INTERVAL * 2.5) points.push(gap(previous.time + PNL_INTERVAL));
       while (eventIndex < events.length && stamp(events[eventIndex].time) < row.time) accumulated = addDecimals([accumulated, events[eventIndex++].amount]);
-      const known = entries.every(({ snapshot }) => snapshot.funding.coverage.some(range => range.start <= start && range.end >= row.time));
+      for (const [index, rows] of trades.entries()) {
+        const cutoff = [row.first_at, row.second_at][index] ?? row.time;
+        while (tradeIndex[index] < rows.length && stamp(rows[tradeIndex[index]].time) < cutoff) {
+          const trade = rows[tradeIndex[index]++];
+          if (trade.kind === 'fee') fees = addDecimals([fees, trade.amount]); else realized = addDecimals([realized, trade.amount]);
+        }
+      }
+      const known = coveredAt(snapshot => snapshot.funding, row.time), tradesKnown = coveredAt(snapshot => snapshot.trades, row.time);
       const unrealizedPnl = row.unrealized_pnl === null ? null : decimal(row.unrealized_pnl);
-      const fundingPnl = known ? accumulated : null;
-      points.push({ time: row.time, unrealizedPnl, fundingPnl, totalPnl: unrealizedPnl !== null && fundingPnl !== null ? addDecimals([unrealizedPnl, fundingPnl]) : null });
+      const fundingPnl = known ? accumulated : null, realizedPnl = tradesKnown ? realized : null, feePnl = tradesKnown ? fees : null;
+      const parts = [unrealizedPnl, fundingPnl, realizedPnl, feePnl];
+      points.push({ time: row.time, unrealizedPnl, fundingPnl, realizedPnl, feePnl, totalPnl: parts.every(value => value !== null) ? addDecimals(parts) : null });
     }
     if (points.length && current - points.at(-1).time > MAX_AGE) points.push(gap(current));
     const latest = points.at(-1) ?? null;
