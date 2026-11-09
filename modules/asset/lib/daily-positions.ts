@@ -7,10 +7,11 @@ export type SnapshotPosition = Pick<Position, 'id' | 'symbol' | 'instrumentId' |
 export type SnapshotScope = { exchange: string; account: string; accountName: string; generation: string; scope: string; status: 'live' | 'stale'; fetchedAt: string; positions: SnapshotPosition[] };
 export type PositionsCapture = { capturedAt: string; scopes: SnapshotScope[] };
 
-export type ComboId = 'oil' | 'hynix';
+export type ComboId = 'oil' | 'hynix' | 'anthropic';
 export const COMBOS: { id: ComboId; label: string; bases: string[] }[] = [
   { id: 'oil', label: '原油套利', bases: ['CL', 'BZ'] },
   { id: 'hynix', label: '海力士套利', bases: ['SKHY', 'SKHX', 'SKHYNIX'] },
+  { id: 'anthropic', label: 'ANT 套利', bases: ['ANTHROPIC'] },
 ];
 export type PositionChange = {
   key: string; account: string; symbol: string; side: Position['side']; combo: ComboId | null;
@@ -112,7 +113,7 @@ export function comparePositions(input: CompareInput): { positions: PositionChan
   return { positions, readable };
 }
 
-/** Crude-oil and SK hynix arbitrage legs, and all other holdings as one total. Unknown stays unknown, never zero. */
+/** Arbitrage legs by underlying, and all other holdings as one total. Unknown stays unknown, never zero. */
 export function analyzePositions(input: Omit<CompareInput, 'current'> & { current: PositionsCapture | null | undefined }): PositionAnalysis | null {
   const { previous, current } = input;
   if (!current) return null;

@@ -184,6 +184,20 @@ async function seedAsset(dataDir) {
     { date: today, total: 12600 },
   ];
   const first = samples[0];
+  // Stored ANT snapshots exercise the real daily attribution API, including RH's missing cycle.
+  const holdings = (day, index) => {
+    const at = `${day}T07:00:00.000Z`;
+    const scope = (exchange, symbol, pnlCurrency, unrealizedPnl, cycle) => ({
+      exchange, account: 'default', accountName: exchange, generation: 'fixture', scope: 'perpetual', status: 'live', fetchedAt: at,
+      positions: [{ id: symbol, symbol, instrumentId: symbol, side: exchange === 'binance' ? 'long' : 'short', quantity: '1', quantityUnit: 'ANTHROPIC',
+        unrealizedPnl: String(unrealizedPnl), pnlCurrency, cycle }],
+    });
+    return { capturedAt: at, scopes: [
+      scope('binance', 'ANTHROPICUSDT', 'USDT', index * 10, { status: 'complete', since: `${first.date}T00:00:00.000Z`,
+        realizedPnl: '0', fees: '0', funding: String(index), net: String(index), currency: 'USDT', updatedAt: at }),
+      scope('rh-lighter', 'ANTHROPIC', 'USDG', -index * 4, null),
+    ] };
+  };
   const source = {
     source: '示例数据（非真实资产）', sheet: 'Browser fixture', startedAt: first.date,
     baselineId: 'E1', baselineDate: first.date, fx,
@@ -201,9 +215,12 @@ async function seedAsset(dataDir) {
     await database.batch([
       database.prepare('INSERT INTO assets(owner,id,data) VALUES(?,?,?)').bind('owner', 'row-2', JSON.stringify(asset(12600, today))),
       ...Object.entries(settings).map(([key, value]) => database.prepare('INSERT INTO settings(owner,key,value) VALUES(?,?,?)').bind('owner', key, value)),
-      ...samples.slice(1).map(sample => database.prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?)').bind('owner', sample.date, JSON.stringify({
+      ...samples.slice(1).map((sample, index) => database.prepare('INSERT INTO snapshots(owner,date,data) VALUES(?,?,?)').bind('owner', sample.date, JSON.stringify({
         id: `daily-${sample.date}`, ...sample, fx, cny: sample.total * fx, future: false,
-        difference: 0, withdrawn: 0, fxStatus, assets: [asset(sample.total, sample.date)],
+        difference: 0, withdrawn: 0, fxStatus, positions: holdings(sample.date, index),
+        assets: [{ ...asset(sample.total, sample.date), details: [
+          { coin: 'USDT', account: 'fixture', value: 0, price: 0.99 }, { coin: 'USDG', account: 'fixture', value: 0, price: 1 },
+        ] }],
       }))),
     ]);
   } finally { database.close(); }

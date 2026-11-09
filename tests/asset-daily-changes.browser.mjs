@@ -34,6 +34,7 @@ async (page) => {
       details: project === 'A' ? [{ label: 'USDⓈ-M 合约（折合 USDT） · USDT', previous: 60, current: 70, change: 10 }, { label: '资金账户（折合 USDT） · USDT', previous: 40, current: 38, change: -2 }] : [] })),
     positions: { compared: true, recorded: true, capturedAt: today + 'T07:00:00.000Z', previousCapturedAt: date(0, 0) + 'T07:00:00.000Z', groups: [
       { id: 'oil', label: '原油套利', change: 5.5, complete: true, legs: 2 }, { id: 'hynix', label: '海力士套利', change: -1.25, complete: false, legs: 2 },
+      { id: 'anthropic', label: 'ANT 套利', change: 6.89, complete: false, legs: 2 },
       { id: 'other', label: '其他持仓', change: null, complete: false, legs: 1 }] },
   }] };  await page.unrouteAll({ behavior: 'wait' });
   page.on('pageerror', onPageError);
@@ -115,6 +116,9 @@ async (page) => {
       else assert(text.includes('各来源无变化'), `day ${day.date} without change says so`);
     }
     assert((await summary.innerText()).includes(`${expected.length} 日`), 'summary shows the loaded day count');
+    const realGroups = (await items.first().getByRole('list', { name: '持仓影响' }).locator('li').allInnerTexts()).map(text => text.replace(/\s+/g, ''));
+    assert(realGroups.length === 4 && realGroups[2] === 'ANT套利+6.89部分' && realGroups[3] === '其他持仓+0.00', `stored ANT holdings are attributed by the real API: ${realGroups.join(' | ')}`);
+    assert((await details.innerText()).includes('当前不含 Hyperliquid'), 'ANT snapshot coverage is explicit');
     const first = items.nth(0).locator('.daily-change-head > span').last();
     assert((await first.getAttribute('class')).includes(expected[0].change > 0 ? 'performance-positive' : expected[0].change < 0 ? 'performance-negative' : 'performance-neutral'), 'change uses the signed tone');
     await details.scrollIntoViewIfNeeded();
@@ -129,7 +133,7 @@ async (page) => {
     assert(await day.locator(':scope > ul.daily-sources > li').count() === 3, 'only the top three sources show by default');
     assert((await day.locator(':scope > ul.daily-sources > li').allInnerTexts()).map(text => text.split('\n')[0])[0].startsWith('出金（加回）'), 'withdrawal add-back is ranked among sources by size');
     const groups = (await day.getByRole('list', { name: '持仓影响' }).locator('li').allInnerTexts()).map(text => text.replace(/\s+/g, ''));
-    assert(groups.length === 3 && groups[0] === '原油套利+5.50' && groups[1] === '海力士套利-1.25部分' && groups[2] === '其他持仓—', `three holding totals are visible without expanding: ${groups.join(' | ')}`);
+    assert(groups.length === 4 && groups[0] === '原油套利+5.50' && groups[1] === '海力士套利-1.25部分' && groups[2] === 'ANT套利+6.89部分' && groups[3] === '其他持仓—', `four holding totals are visible without expanding: ${groups.join(' | ')}`);
     const toggle = day.getByRole('button', { name: '展开明细' });
     assert(await toggle.getAttribute('aria-expanded') === 'false', 'expand control reports collapsed');
     await toggle.click();
@@ -137,7 +141,7 @@ async (page) => {
     const expandedText = await day.innerText();
     assert(expandedText.includes('100.00 → 108.00'), 'expanded sources show previous and current values');
     assert(expandedText.includes('USDⓈ-M 合约（折合 USDT） · USDT') && expandedText.includes('60.00 → 70.00'), 'exchange rows break down by account');
-    assert(!expandedText.includes('CLUSDT') && await day.getByRole('list', { name: '持仓影响' }).locator('li').count() === 3, 'expanding adds balance details but no per-position list');
+    assert(!expandedText.includes('CLUSDT') && await day.getByRole('list', { name: '持仓影响' }).locator('li').count() === 4, 'expanding adds balance details but no per-position list');
     await page.setViewportSize({ width: 390, height: 844 });
     await day.scrollIntoViewIfNeeded();
     await noPageOverflow('390 mobile expanded day');
@@ -145,7 +149,7 @@ async (page) => {
     await page.setViewportSize({ width: 1440, height: 1050 });
     await day.getByRole('button', { name: '收起' }).click();
     assert(await day.locator(':scope > ul.daily-sources > li').count() === 3, 'collapsing returns to the top three');
-    scenarios.push('crude-oil, SK hynix and other holding totals show by default; expanding lists all sources and account breakdown only; 390 expanded has no overflow');
+    scenarios.push('crude-oil, SK hynix, ANT and other holding totals show by default; real SQLite ANT attribution keeps RH partial; expanding lists all sources and account breakdown only; 390 expanded has no overflow');
     mode = 'real';
     await summary.click();
     await summary.click();

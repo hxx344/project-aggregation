@@ -48,7 +48,7 @@ export const DailyChanges = memo(function DailyChanges({ version }: { version: s
     <summary>每日波动 <span>（近 {DAILY_CHANGE_DAYS} 天{report ? ' · ' + days.length + ' 日' : ''}）</span>与来源</summary>
     <div className="performance-monthly-body">
       <p className="performance-note">逐日对比上一份已有快照，缺失日期不补造。来源为各资产行估值变化，展开可看交易所按账户、币种的分项；出金单列并加回，与“剔除出金影响”口径一致。入金未剔除，资产变化不等于投资收益。</p>
-      <p className="performance-note">持仓影响分原油套利、海力士套利和其他持仓三项，每项 = 两份快照间的浮盈亏变化 + 本轮已实现盈亏、手续费、资金费的变化，按快照内的稳定币价格折成 USD，是近似值。持仓随快照记录，此前的日期没有持仓数据；当天已平仓、本轮统计不可比或只有浮盈亏的仓位使该项标为“部分”，无法计算时显示“—”。</p>
+      <p className="performance-note">持仓影响分原油套利、海力士套利、ANT 套利和其他持仓四项，每项 = 两份快照间的浮盈亏变化 + 本轮已实现盈亏、手续费、资金费的变化，按快照内的稳定币价格折成 USD，是近似值。ANT 仅统计资产快照已记录的持仓，当前不含 Hyperliquid。持仓随快照记录，此前的日期没有持仓数据；当天已平仓、本轮统计不可比或只有浮盈亏的仓位使该项标为“部分”，无法计算时显示“—”。</p>
       {status?.error && <p className="error-text" role="alert">{status.error}{report && '，当前显示上次读取结果'} <button type="button" className="text-button" onClick={() => setAttempt(value => value + 1)}>重试</button></p>}
       {!report ? (loading ? <p className="help" role="status">读取每日波动…</p> : null)
         : !days.length ? <p className="help">近 {DAILY_CHANGE_DAYS} 天不足两份快照，暂无逐日变化。</p>

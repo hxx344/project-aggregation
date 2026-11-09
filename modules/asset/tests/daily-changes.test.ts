@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { calculateDailyChanges, readDailyChanges, type ChangeSnapshot } from '../lib/daily-changes.ts';
-import { comparePositions, type GroupId, type PositionAnalysis } from '../lib/daily-positions.ts';
+import { comboOf, comparePositions, type GroupId, type PositionAnalysis, type PositionsCapture } from '../lib/daily-positions.ts';
 import { openDatabase } from '../lib/sqlite.ts';
 import { readSnapshotHistory } from '../lib/snapshot-history.ts';
 
@@ -264,7 +264,7 @@ test('exchange rows break down by account and coin; lines without both sides of 
 const group = (positions: PositionAnalysis, id: GroupId) => positions.groups.find(item => item.id === id)!;
 const legs = (previous: ReturnType<typeof capture> | undefined, current: ReturnType<typeof capture>, rows = [binance(1010)]) => comparePositions({ previous, current, rows });
 
-test('holdings split into crude-oil, SK hynix and other totals in USD at the snapshot stablecoin price', () => {
+test('holdings split into crude-oil, SK hynix, ANT and other totals in USD at the snapshot stablecoin price', () => {
   const since = '2026-10-10T00:00:00.000Z';
   const previous = capture('2026-10-21T15:00:00.000Z', [
     leg('CLUSDT', 'long', '10', '10', { since, net: '1' }), leg('BZUSDT', 'short', '10', '-5', { since, net: '2' }),
@@ -279,7 +279,7 @@ test('holdings split into crude-oil, SK hynix and other totals in USD at the sna
   ] }).days;
   const positions = day.positions!;
   assert.equal(positions.compared, true);
-  assert.deepEqual(positions.groups.map(item => [item.id, item.label]), [['oil', '原油套利'], ['hynix', '海力士套利'], ['other', '其他持仓']]);
+  assert.deepEqual(positions.groups.map(item => [item.id, item.label]), [['oil', '原油套利'], ['hynix', '海力士套利'], ['anthropic', 'ANT 套利'], ['other', '其他持仓']]);
   const oil = group(positions, 'oil'), hynix = group(positions, 'hynix'), other = group(positions, 'other');
   assert.ok(Math.abs(oil.change! - 2.5 * 0.999) < 1e-9); assert.equal(oil.complete, true); assert.equal(oil.legs, 2);
   assert.ok(Math.abs(hynix.change! - 1.7 * 0.999) < 1e-9, 'opened after the previous capture counts its whole cycle; the closed leg is unknown');
@@ -366,4 +366,71 @@ test('a stalled cycle summary is not mixed with fresh unrealized PnL', () => {
   assert.equal(held.cashFlowChange, null); assert.equal(held.partial, true);
   const [day] = calculateDailyChanges({ ...base, snapshots: [snap('2026-10-21', [binance(1000)], { positions: previous }), snap('2026-10-22', [binance(1010)], { positions: current })] }).days;
   assert.equal(group(day.positions!, 'oil').complete, false);
+});
+
+test('ANT uses the Anthropic contract name, never the unrelated ANT token or a loose prefix', () => {
+  for (const symbol of ['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'ANTHROPIC']) {
+    assert.equal(comboOf({ symbol, instrumentId: symbol }), 'anthropic', symbol);
+    assert.equal(comboOf({ symbol: 'display-name', instrumentId: symbol }), 'anthropic', 'native instrument identity');
+  }
+  for (const symbol of ['ANT', 'ANTUSDT', 'ANT-USDT-SWAP', 'ANTHROPICXUSDT', 'XANTHROPICUSDT', 'xyz:ANT', 'io:ANTH']) {
+    assert.equal(comboOf({ symbol, instrumentId: symbol }), null, symbol);
+  }
+});
+
+test('stored ANT holdings move out of other and use each settlement currency price without changing daily asset totals', async () => {
+  const database = openDatabase(':memory:');
+  const since = '2026-10-10T00:00:00.000Z';
+  const holdings = (at: string, next: boolean): PositionsCapture => {
+    const result: PositionsCapture = capture(at, [
+      leg('ANTHROPICUSDT', 'long', '1', next ? '20' : '10', { since, net: next ? '3' : '2' }),
+      leg('ANTUSDT', 'long', '1', next ? '6' : '1', { since, net: '0' }),
+    ]);
+    result.scopes.push({ ...result.scopes[0], exchange: 'okx', scope: 'SWAP', positions: [
+      leg('ANTHROPIC-USDT-SWAP', 'short', '10', next ? '3' : '0', { since, net: next ? '-1' : '0', updatedAt: at }),
+    ] });
+    result.scopes.push({ ...result.scopes[0], exchange: 'rh-lighter', scope: 'perpetual', positions: [
+      { ...leg('ANTHROPIC', 'short', '1', next ? '-7' : '-5', null), pnlCurrency: 'USDG' },
+    ] });
+    return result;
+  };
+  try {
+    for (const [date, next] of [['2026-10-21', false], ['2026-10-22', true]] as const) {
+      await database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('owner', date, JSON.stringify({
+        id: 'daily-' + date, date, total: next ? 1010 : 1000, withdrawn: 0,
+        assets: [binance(next ? 1010 : 1000, [usdt(900, 0.99), { coin: 'USDG', account: 'RH', value: 100, price: 1.02 }])],
+        positions: holdings(date + 'T15:00:00.000Z', next),
+      })).run();
+    }
+    const [day] = (await readDailyChanges(database, 'owner', Date.parse('2026-10-23T04:00:00Z'))).days;
+    const ant = group(day.positions!, 'anthropic'), other = group(day.positions!, 'other');
+    assert.equal(ant.legs, 3);
+    assert.ok(Math.abs(ant.change! - ((10 + 1 + 3 - 1) * 0.99 - 2 * 1.02)) < 1e-9);
+    assert.equal(ant.complete, false, 'RH has no comparable cycle; its known unrealized change is retained as partial');
+    assert.equal(other.legs, 1, 'the unrelated ANT token stays in other; Anthropic legs are not counted twice');
+    assert.ok(Math.abs(other.change! - 5 * 0.99) < 1e-9);
+    assert.equal(other.complete, true);
+    assert.equal(day.change, 10, 'position attribution is not added to the asset total again');
+    assert.equal(day.unattributed, 0);
+  } finally { database.close(); }
+});
+
+test('ANT follows existing complete, partial and unknown rules for daily holdings', () => {
+  const since = '2026-10-10T00:00:00.000Z';
+  const previous = capture('2026-10-21T15:00:00.000Z', [leg('ANTHROPICUSDT', 'long', '1', '10', { since, net: '1' })]);
+  const current = capture('2026-10-22T15:00:00.000Z', [leg('ANTHROPICUSDT', 'long', '1', '15', { since, net: '3' })]);
+  const analyze = (before: PositionsCapture | undefined, after: PositionsCapture, rows = [binance(1010)]) => calculateDailyChanges({ ...base, snapshots: [
+    snap('2026-10-21', [binance(1000)], { positions: before }), snap('2026-10-22', rows, { positions: after }),
+  ] }).days[0].positions!;
+  const complete = group(analyze(previous, current), 'anthropic');
+  assert.ok(Math.abs(complete.change! - 7 * 0.999) < 1e-9); assert.equal(complete.complete, true);
+  const stale = { ...current, scopes: current.scopes.map(scope => ({ ...scope, status: 'stale' as const })) };
+  for (const result of [analyze(previous, stale), analyze(previous, current, [binance(1010, [])]),
+    analyze(previous, capture(current.capturedAt, [])),
+    analyze({ capturedAt: previous.capturedAt, scopes: [] }, { capturedAt: current.capturedAt, scopes: [] })]) {
+    assert.equal(group(result, 'anthropic').change, null); assert.equal(group(result, 'anthropic').complete, false);
+  }
+  const empty = group(analyze(capture(previous.capturedAt, []), capture(current.capturedAt, [])), 'anthropic');
+  assert.equal(empty.change, 0); assert.equal(empty.complete, true);
+  assert.deepEqual(analyze(undefined, current).groups, [], 'the first capture does not invent previous holdings');
 });
