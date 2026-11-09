@@ -549,6 +549,32 @@ test('ANT section shows per-share pair gaps and positions from the execution acc
   assert.equal(result.asOf, AT_NINE - 30_000);
 });
 
+test('ANT near-liquidation rows raise the digest only from live reads with the alert enabled', () => {
+  const near = antPosition('hyperliquid', 'xyz:ANT', 'long', '1', { distancePercent: '10.00' });
+  const disabled = antWatch([antSource('hyperliquid', [near])]); disabled.alerts.config.enabled = false;
+  const quiet = anthropicSection({ quotes: antQuotes(), watch: disabled });
+  assert.notEqual(quiet.level, 'alert');
+  assert.equal(quiet.metrics.find(item => item.key === 'positions').groups[0].rows[0].distance, '10.00% ⚠');
+  assert.equal(quiet.metrics.find(item => item.key === 'nearest').text, '10.00%（Hyperliquid xyz:ANT） · 预警线 20%（预警未开启）');
+  const old = anthropicSection({ quotes: antQuotes(), watch: antWatch([antSource('hyperliquid', [near], { state: 'error', error: '读取失败' })]) });
+  assert.equal(old.level, 'warn');
+  assert.equal(old.metrics.find(item => item.key === 'positions').groups[0].rows[0].distance, '10.00% ⚠（过期）');
+  const loading = anthropicSection({ quotes: antQuotes(), watch: antWatch([antSource('binance', [], { state: 'loading', fetchedAt: null })]) });
+  assert.equal(loading.metrics.find(item => item.key === 'count').text, '读取中');
+});
+
+test('ANT pairs take the better direction and skip broken books', () => {
+  // Binance per share 315 / 315.5 is dear; xyz:ANT 300 / 300.5 cheap, listed second so the pair is reversed.
+  const books = [antBook('binance', 'ANTHROPICUSDT', '4000.5', '4006.85'), antBook('hyperliquid', 'xyz:ANT', '300', '300.5'),
+    antBook('hyperliquid', 'io:ANTH', '5012', '5010'), antBook('okx', 'ANTHROPICUSDT', 'abc', '381'), { exchange: 'rh-lighter', symbol: 'ANTHROPIC', error: '交易所请求超时' }];
+  const result = anthropicSection({ quotes: antQuotes(books), watch: antWatch([]) });
+  const rows = result.metrics.find(item => item.key === 'spreads').groups[0].rows;
+  assert.deepEqual(rows[0], { long: 'HL xyz:ANT', short: 'Binance', gap: '+4.83%' });
+  assert.equal(rows.length, 1);
+  const lines = result.metrics.find(item => item.key === 'prices').lines;
+  assert.ok(lines.includes('HL io:ANTH：读取失败 盘口不完整') && lines.includes('OKX：读取失败 盘口不完整'));
+});
+
 test('ANT section keeps one half when the other read fails', () => {
   const noPositions = anthropicSection({ quotes: antQuotes(), watch: { error: true } });
   assert.equal(noPositions.level, 'warn');

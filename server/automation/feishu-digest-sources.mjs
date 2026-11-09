@@ -177,13 +177,16 @@ export function anthropicSection({ quotes, watch }) {
 
   if (watch.error) { issues.push('ANT 仓位读取失败'); raise('warn', '仓位读取失败'); }
   else {
-    const threshold = numeric(watch.alerts?.config?.thresholdPercent), connected = (watch.sources ?? []).filter(source => source.connected);
+    // Only an enabled 套利仓位 alert raises the digest; otherwise a near row is flagged in the table alone.
+    const threshold = numeric(watch.alerts?.config?.thresholdPercent), alertsOn = watch.alerts?.config?.enabled === true, connected = (watch.sources ?? []).filter(source => source.connected);
     for (const source of connected) {
       const venue = ANT_VENUES[source.exchange] ?? source.exchange, fetched = stamp(source.fetchedAt);
       if (source.state !== 'live') { issues.push(`${venue} 仓位：${source.error || (source.state === 'loading' ? '正在读取' : '数据过期')}`); if (source.state !== 'loading') raise('warn', '部分来源异常'); }
       if (fetched !== null && ['live', 'stale'].includes(source.state)) times.push(fetched);
     }
-    const positions = connected.flatMap(source => source.positions ?? []);
+    // Rows kept from a failed or stale read are shown as old and never raise the section on their own.
+    const positions = connected.flatMap(source => (source.positions ?? []).map(position => ({ ...position, old: source.state !== 'live' })));
+    const loading = connected.some(source => source.state === 'loading');
     // Venues settle in USDT or USDC, so unrealized PnL is totalled per venue and never across them.
     const pnl = new Map();
     let longShares = 0, shortShares = 0, nearest = null;
@@ -197,16 +200,16 @@ export function anthropicSection({ quotes, watch }) {
       const distance = position.riskUnknown ? null : numeric(position.distancePercent);
       const near = distance !== null && threshold !== null && distance <= threshold;
       if (distance !== null && (nearest === null || distance < nearest.distance)) nearest = { distance, label: `${venue} ${position.symbol}` };
-      if (near || position.alerting) { issues.push(`${venue} ${position.symbol} ${position.side === 'long' ? '多' : '空'}仓距强平 ${distance === null ? '未知' : `${distance.toFixed(2)}%`}${threshold === null ? '' : `（预警线 ${threshold}%）`}`); raise('alert', '接近强平'); }
+      if (alertsOn && !position.old && (near || position.alerting)) { issues.push(`${venue} ${position.symbol} ${position.side === 'long' ? '多' : '空'}仓距强平 ${distance === null ? '未知' : `${distance.toFixed(2)}%`}${threshold === null ? '' : `（预警线 ${threshold}%）`}`); raise('alert', '接近强平'); }
       const quantity = `${amount(position.quantity)}${position.quantityUnit ? ` ${position.quantityUnit}` : ''}${Number.isFinite(shares) ? `（≈${digits(shares)} 股）` : ''}`;
-      return { venue: clean(venue, 40), symbol: clean(position.symbol, 24), size: `${position.side === 'long' ? '多' : '空'} ${quantity}`, pnl: signed(position.unrealizedPnl), distance: distance === null ? '未知' : `${distance.toFixed(2)}%${near ? ' ⚠' : ''}` };
+      return { venue: clean(venue, 40), symbol: clean(position.symbol, 24), size: `${position.side === 'long' ? '多' : '空'} ${quantity}`, pnl: signed(position.unrealizedPnl), distance: `${distance === null ? '未知' : `${distance.toFixed(2)}%${near ? ' ⚠' : ''}`}${position.old ? '（过期）' : ''}` };
     });
     const sharesKnown = Number.isFinite(longShares) && Number.isFinite(shortShares);
-    metrics.push(metric('count', 'ANT 持仓笔数', connected.length ? `${positions.length}` : '未连接下单账户'));
+    metrics.push(metric('count', 'ANT 持仓笔数', !connected.length ? '未连接下单账户' : !positions.length && loading ? '读取中' : `${positions.length}`));
     if (positions.length) metrics.push(
       metric('shares', '多空股数（估算）', sharesKnown ? `多 ≈${digits(longShares)} · 空 ≈${digits(shortShares)} · 净 ${signed(longShares - shortShares)} 股` : MISSING),
       metric('pnl', '浮动盈亏（各交易所结算币）', [...pnl].map(([venue, { sum, missing }]) => `${clean(venue, 40)} ${missing && !sum ? MISSING : signed(sum)}${missing ? `（${missing} 笔未计入）` : ''}`).join(' · ')),
-      metric('nearest', '最近强平距离', nearest ? `${nearest.distance.toFixed(2)}%（${clean(nearest.label, 60)}）${threshold === null ? '' : ` · 预警线 ${threshold}%`}` : MISSING),
+      metric('nearest', '最近强平距离', nearest ? `${nearest.distance.toFixed(2)}%（${clean(nearest.label, 60)}）${threshold === null ? ' · 预警线未知' : ` · 预警线 ${threshold}%${alertsOn ? '' : '（预警未开启）'}`}` : MISSING),
       { key: 'positions', label: 'ANT 持仓明细', text: `${positions.length} 项`, groups: [{ title: `ANT 持仓（${positions.length} 笔）`, columns: ANT_POSITION_COLUMNS, rows }] });
   }
   return section(id, name, level, status, { asOf: times.length ? Math.min(...times) : null, issues, metrics });
