@@ -126,6 +126,11 @@ printf 'not-a-key\n' > "$release/.runtime-component-key"; key 41 | tr 4 x > "$ru
 key 41 > "$release/.runtime-component-key"; key 41 > "$running/.runtime-component-key"; expect_scope api 'keys restored'
 touch "$test_root/runtime-inactive"; expect_scope full 'runtime not running'; rm "$test_root/runtime-inactive"
 touch "$test_root/migration-pending"; expect_scope full 'module migration outstanding'; rm "$test_root/migration-pending"
+# The records decide first: a failing helper or records that already require a
+# full restart never reach the runtime probes.
+( install_decide() { return 1; }; runtime_stub() { touch "$test_root/probed"; return 1; }; expect_scope full 'failing helper' )
+( pending_activation_scope=full; runtime_stub() { touch "$test_root/probed"; return 1; }; expect_scope full 'unfinished full activation' )
+[[ ! -e "$test_root/probed" ]] || { echo 'The runtime was probed although the records required a full restart' >&2; exit 1; }
 # Dual-slot units (design doc api-dual-slot 6.2): the entry unit and a runtime
 # unit that wants it mark the layout; the slots move alone only from a settled
 # record and entry unit.

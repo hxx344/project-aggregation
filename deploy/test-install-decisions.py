@@ -207,6 +207,8 @@ class Records(unittest.TestCase):
                 (lambda: os.rename(self.app + '/.runtime-deployment', work + '/deployment'),
                  lambda: os.rename(work + '/deployment', self.app + '/.runtime-deployment'), 'no full activation recorded'),
                 (lambda: Path(work, 'service').write_text('changed\n'), lambda: Path(work, 'service').write_text('runtime\n'), 'runtime unit changed'),
+                (lambda: Path(arguments['unit_file']).write_text('edited\n'), lambda: Path(arguments['unit_file']).write_text('runtime\n'),
+                 'installed runtime unit edited'),
                 (lambda: arguments.update(deployment_key='j' * 64), lambda: arguments.update(deployment_key='k' * 64),
                  'environment, Node or installer changed'),
                 # "$(cat)" drops NUL bytes and trailing newlines.
@@ -222,6 +224,8 @@ class Records(unittest.TestCase):
                     (lambda: Path(work, 'entry.service').write_text('changed\n'), lambda: Path(work, 'entry.service').write_text('entry\n'),
                      'entry unit changed'),
                     (lambda: self.record('.api-cutover', '{}'), lambda: os.unlink(self.app + '/.api-cutover'), 'unresolved cutover'),
+                    # A dangling link counts as absent, as [[ -e ]] does.
+                    (lambda: os.symlink(self.root / 'missing', self.app + '/.api-cutover'), lambda: os.unlink(self.app + '/.api-cutover'), None),
                     (lambda: self.record('.api-slot', '{"slot":"c"}'),
                      lambda: self.record('.api-slot', json.dumps({'slot': 'a', 'release': arguments['old_release']})), 'invalid slot record'),
                 ]
@@ -315,6 +319,9 @@ class Records(unittest.TestCase):
             with self.subTest(unfinished):
                 self.record(unfinished, '')
                 self.assertEqual(unchanged(), 'deploy')
+                Path(self.app, unfinished).unlink()
+                os.symlink(self.root / 'missing', Path(self.app, unfinished))
+                self.assertEqual(unchanged(), 'verify')
                 Path(self.app, unfinished).unlink()
 
     def test_command_line(self):

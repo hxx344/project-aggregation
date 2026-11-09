@@ -3492,11 +3492,6 @@ prune_caches() {
   (( removed == 0 )) || log "已清理 $removed 项旧部署缓存或失败安装残留。"
   (( failed == 0 )) || { log "有 $failed 项旧缓存未能删除。"; return 1; }
 }
-# The Aero LP module (removed in #190) kept its signer key encrypted with the
-# data root's credentials.key in aero-lp/wallet.json. Nothing reads it any more,
-# yet its address may still hold funds or positions: name the file and the
-# manual checks on every successful run while it exists. Only its presence is
-# tested; the contents are never read and nothing is moved or deleted (#209).
 # The two runs that change nothing (install_decide unchanged-source and
 # unchanged-release decide on the records first; a failing helper deploys).
 # The same commit and deployment as the last successful run: skip everything.
@@ -3509,6 +3504,11 @@ unchanged_source() {
 unchanged_release() {
   [[ "$(install_decide unchanged-release "$APP_DIR" "$release" "$old_release" "$deployed_state" "$deployment_key")" == verify ]] && healthy
 }
+# The Aero LP module (removed in #190) kept its signer key encrypted with the
+# data root's credentials.key in aero-lp/wallet.json. Nothing reads it any more,
+# yet its address may still hold funds or positions: name the file and the
+# manual checks on every successful run while it exists. Only its presence is
+# tested; the contents are never read and nothing is moved or deleted (#209).
 retired_aero_lp_notice() {
   local directory="$DATA_PATH/aero-lp"
   [[ -e "$directory/wallet.json" || -L "$directory/wallet.json" ]] || return 0
