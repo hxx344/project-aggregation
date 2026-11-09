@@ -48,7 +48,7 @@ export function readReductionRisk(config, snapshots, now) {
     const at = typeof row.risk?.at === 'string' ? Date.parse(row.risk.at) : NaN;
     if (!Number.isFinite(at) || now - at > REDUCTION_RISK_MAX_AGE_MS || at - now > 1000) throw new ExecutionError(502, `${name} 强平风险快照已过期或时间无效，自动减仓未发送`);
     const raw = leg.side === 'long' ? mark - liquidation : liquidation - mark, distance = raw > 0n ? raw : 0n;
-    return { ...leg, quantity, distancePercent: fromUnits(distance * 100n * ONE / mark), met: distance * 100n * ONE <= units(config.thresholdPercent) * mark };
+    return { ...leg, quantity, riskAt: new Date(at).toISOString(), distancePercent: fromUnits(distance * 100n * ONE / mark), met: distance * 100n * ONE <= units(config.thresholdPercent) * mark };
   });
   return { checkedAt: new Date(now).toISOString(), legs, met: legs.some(leg => leg.met) };
 }

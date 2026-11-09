@@ -120,6 +120,23 @@ test('risk thresholds compare unrounded prices on either side and clamp already 
   assert.equal(risk('50', '99').met, true);
 });
 
+test('coverage evidence expires at the original risk or book deadline and reading it has no execution side effects', async t => {
+  const f = await fixture(t);
+  f.accounts.binance.positions[0].risk.at = stamp(TIME - 29_000);
+  f.hooks.market = (_exchange, market) => { market.at = stamp(TIME - 8000); };
+  f.enable({ thresholdPercent: '1' }); await f.reduction.tick();
+  assert.equal(f.state.live.validUntil, stamp(TIME + 1000), 'old risk expires before the still-valid book');
+  assert.equal(f.state.live.legs[0].riskAt, stamp(TIME - 29_000));
+  const before = f.db.prepare('SELECT * FROM execution_anthropic_reduction').get(), calls = f.calls.length;
+  for (let i = 0; i < 3; i++) assert.equal(f.reduction.protectionState().available, true);
+  assert.deepEqual(f.db.prepare('SELECT * FROM execution_anthropic_reduction').get(), before);
+  assert.equal(f.calls.length, calls); assert.equal(f.creates.length, 0);
+  f.advance(1001); assert.equal(f.reduction.protectionState().live.validUntil, stamp(TIME + 1000));
+  f.db.prepare("UPDATE execution_lease SET owner='other-process' WHERE id=1").run();
+  assert.equal(f.reduction.protectionState().available, false);
+  assert.deepEqual(f.db.prepare('SELECT * FROM execution_anthropic_reduction').get(), before);
+});
+
 test('the rule starts disabled and requires a confirmed, revision-bound live account', async t => {
   const f = await fixture(t);
   assert.equal(f.state.state.phase, 'disabled'); assert.equal(f.state.config, null);

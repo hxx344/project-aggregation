@@ -6,6 +6,8 @@ import type { AnthropicShares } from './trading-execution-types';
 import { contractKey, findContract, sharesPerUnit } from './trading-anthropic';
 import { amount, beijingTime, polarity } from './trading-format';
 import TradingAnthropicReduction from './TradingAnthropicReduction';
+import TradingPositionProtection from './TradingPositionProtection';
+import type { PositionProtection } from './trading-anthropic-protection-types';
 
 type Source = 'binance' | 'okx' | 'hyperliquid' | 'rh-lighter';
 type ReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
@@ -13,7 +15,7 @@ type Position = {
   /** account: Lighter RH account index; an L1 address can hold several accounts. */
   id: string; exchange: Source; symbol: string; account?: number; side: 'long' | 'short'; quantity: string; quantityUnit: string | null; contractSize?: string;
   entryPrice: string | null; markPrice: string | null; notional: string | null; unrealizedPnl: string | null; leverage: string | null;
-  marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; riskUnknown?: boolean; alerting: boolean;
+  marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; riskUnknown?: boolean; alerting: boolean; protection?: PositionProtection | null;
 };
 type SourceState = { exchange: Source; connected: boolean; address?: string | null; state: ReadState; fetchedAt: string | null; error: string | null; refreshing: boolean; positions: Position[] };
 type AlertConfig = { enabled: boolean; thresholdPercent: number; repeatMinutes: number };
@@ -45,36 +47,53 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
   const [notice, setNotice] = useState<string | null>(null);
   // Save and test failures stay until the next write; the polling read clears only its own error.
   const [writeError, setWriteError] = useState<string | null>(null);
+  const [offline, setOffline] = useState(!navigator.onLine), [protectionPending, setProtectionPending] = useState(false);
+  const [, setClock] = useState(0);
   const mounted = useRef(true), expires = useRef(onExpired), reading = useRef<AbortController | null>(null);
+  const generation = useRef(0), writing = useRef(false), reductionWriting = useRef(false), receivedAt = useRef(0), transportMs = useRef(0);
   expires.current = onExpired;
+  const accept = useCallback((value: WatchState, elapsed: number) => {
+    receivedAt.current = performance.now(); transportMs.current = Math.max(0, elapsed);
+    setData(value); setError(null); setProtectionPending(reductionWriting.current);
+  }, []);
 
   const load = useCallback(async () => {
-    if (reading.current) return;
-    const controller = new AbortController(); reading.current = controller;
+    if (reading.current || writing.current || reductionWriting.current || !navigator.onLine) return;
+    const controller = new AbortController(), version = generation.current, started = performance.now(); reading.current = controller;
     try {
       const value = await api<WatchState>(BASE, { signal: controller.signal, timeoutMs: 12_000 });
-      if (mounted.current) { setData(value); setError(null); }
+      if (mounted.current && !controller.signal.aborted && version === generation.current) accept(value, performance.now() - started);
     } catch (failure) {
-      if (!mounted.current || controller.signal.aborted) return;
+      if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
       if (failure instanceof ApiError && failure.status === 401) expires.current();
       else setError(failure instanceof Error ? failure.message : 'Anthropic 仓位读取失败');
     } finally { if (reading.current === controller) reading.current = null; }
-  }, []);
+  }, [accept]);
+  const reductionChanged = useCallback((pending: boolean) => {
+    reductionWriting.current = pending; generation.current++; reading.current?.abort(); reading.current = null;
+    setProtectionPending(true);
+    if (!pending) void load();
+  }, [load]);
   useEffect(() => {
     mounted.current = true;
     let timer: ReturnType<typeof setTimeout>;
     const poll = () => { void load(); timer = setTimeout(poll, document.hidden ? 60_000 : 10_000); };
-    const wake = () => { if (!document.hidden) { clearTimeout(timer); poll(); } };
+    const wake = () => { setOffline(!navigator.onLine); setClock(value => value + 1); if (!document.hidden) { clearTimeout(timer); poll(); } };
+    const disconnected = () => { setOffline(true); setProtectionPending(true); generation.current++; reading.current?.abort(); reading.current = null; };
+    const clock = setInterval(() => { if (!document.hidden) setClock(value => value + 1); }, 1000);
     poll();
     document.addEventListener('visibilitychange', wake);
-    return () => { mounted.current = false; clearTimeout(timer); reading.current?.abort(); document.removeEventListener('visibilitychange', wake); };
+    window.addEventListener('online', wake); window.addEventListener('offline', disconnected);
+    return () => { mounted.current = false; generation.current++; clearInterval(clock); clearTimeout(timer); reading.current?.abort(); reading.current = null; document.removeEventListener('visibilitychange', wake); window.removeEventListener('online', wake); window.removeEventListener('offline', disconnected); };
   }, [load]);
 
   const config = data?.alerts.config;
   const form = draft ?? (config ? { enabled: config.enabled, threshold: String(config.thresholdPercent), repeat: String(config.repeatMinutes) } : null);
   async function write(kind: 'save' | 'test' | 'robot' | 'clear', event?: FormEvent) {
     event?.preventDefault();
-    if (!form || busy) return;
+    if (!form || writing.current) return;
+    writing.current = true; generation.current++; reading.current?.abort(); reading.current = null; setProtectionPending(true);
+    const started = performance.now(), version = generation.current;
     setBusy(kind); setNotice(null); setWriteError(null);
     try {
       const value = kind === 'save'
@@ -83,7 +102,8 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         : kind === 'clear' ? await api<WatchState>(`${BASE}/alerts/channel/clear`, { method: 'POST', body: '{}', timeoutMs: 15_000 })
         : await api<WatchState>(`${BASE}/alerts/test`, { method: 'POST', body: '{}', timeoutMs: 20_000 });
       if (!mounted.current) return;
-      setData(value);
+      if (version === generation.current) accept(value, performance.now() - started);
+      else setProtectionPending(true);
       if (kind === 'save') setDraft(null);
       if (kind === 'robot') setRobot({ webhookUrl: '', signingSecret: '' });
       setNotice(kind === 'save' ? '预警设置已保存。' : kind === 'robot' ? '预警机器人已保存，建议发送一条测试确认。'
@@ -93,7 +113,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
       if (!mounted.current) return;
       if (failure instanceof ApiError && failure.status === 401) expires.current();
       else setWriteError(failure instanceof Error ? failure.message : '操作失败');
-    } finally { if (mounted.current) setBusy(null); }
+    } finally { writing.current = false; generation.current++; if (mounted.current) { setBusy(null); void load(); } }
   }
 
   const positions = data?.sources.flatMap(source => source.positions) ?? [];
@@ -102,6 +122,8 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
   const shortShares = estimates.filter(item => item.position.side === 'short').reduce((sum, item) => sum + (item.shares ?? NaN), 0);
   const threshold = config?.thresholdPercent ?? null;
   const dirty = !!draft && !!config && (draft.enabled !== config.enabled || Number(draft.threshold) !== config.thresholdPercent || Number(draft.repeat) !== config.repeatMinutes);
+  const serverNow = data ? Date.parse(data.generatedAt) + transportMs.current + Math.max(0, performance.now() - receivedAt.current) : NaN;
+  const protectionUnavailable = !!error || offline || protectionPending;
 
   return <section className="trading-panel trading-positions trading-anthropic-positions" aria-labelledby="trading-anthropic-title">
     <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>Binance / OKX 用只读账户 · Hyperliquid / Lighter RH 用实盘连接的账户地址（公开接口）· 每 30 秒读取，强平距离按标记价计算</p></div></div>
@@ -112,7 +134,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         {source.error ? <p className="trading-warning">{source.error}</p> : null}
       </div>)}</div>
       {positions.length ? <div className="trading-position-scroll"><table className="trading-position-table" aria-label="Anthropic 仓位明细"><thead><tr>
-        <th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">数量<small>原生单位 · 估算股数</small></th><th scope="col">开仓均价</th><th scope="col">标记价格</th>
+        <th scope="col">合约 / 交易所</th><th scope="col">方向</th><th scope="col">数量<small>原生单位 · 估算股数</small></th><th scope="col">强平预警</th><th scope="col">自动减仓覆盖</th><th scope="col">开仓均价</th><th scope="col">标记价格</th>
         <th scope="col">名义价值</th><th scope="col">未实现盈亏</th><th scope="col">强平价</th><th scope="col">距强平</th><th scope="col">杠杆</th>
       </tr></thead><tbody>{estimates.map(({ position, shares: estimate }) => {
         const distance = position.distancePercent, near = distance !== null && threshold !== null && Number(distance) <= threshold;
@@ -121,6 +143,8 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
           <th scope="row" className="trading-leg-name"><strong>{position.symbol}</strong><span>{NAMES[position.exchange]}{position.account === undefined ? '' : ` · 账户 ${position.account}`}</span></th>
           <td data-label="方向"><span className={`trading-side ${position.side}`}>{position.side === 'long' ? '做多' : '做空'}</span></td>
           <td data-label="数量 · 估算股数">{amount(position.quantity)}{position.quantityUnit ? ` ${position.quantityUnit}` : ''}<small className="trading-anthropic-shares">{estimate === null ? '股数未知' : `≈ ${shareText(estimate)} 股`}</small></td>
+          <td data-label="强平预警"><TradingPositionProtection value={position.protection?.alert} kind="alert" now={serverNow} unavailable={protectionUnavailable} /></td>
+          <td data-label="自动减仓覆盖"><TradingPositionProtection value={position.protection?.reduction} kind="reduction" now={serverNow} unavailable={protectionUnavailable} /></td>
           <td data-label="开仓均价">{amount(position.entryPrice)}</td>
           <td data-label="标记价格">{amount(position.markPrice)}</td>
           <td data-label="名义价值">{amount(position.notional)}</td>
@@ -135,7 +159,8 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
         : '股数假设无效，暂不估算多空股数'}</strong></div> : null}
 
     </>}
-    <TradingAnthropicReduction shares={shares} onExpired={onExpired} />
+    <p className="trading-protection-note">覆盖按账户、原生合约和方向核对。预警仅发送提醒；减仓是否发送仍由最新风险与执行检查决定。检查时间为北京时间。</p>
+    <TradingAnthropicReduction shares={shares} onExpired={onExpired} onStateChange={reductionChanged} />
     {data ? <>
       <div className="trading-anthropic-alerts">
         <h3><BellRing size={16} />强平预警 · 飞书</h3>

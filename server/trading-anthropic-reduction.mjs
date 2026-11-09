@@ -11,7 +11,7 @@ class ChangedError extends ExecutionError {}
 export function createAnthropicReduction({ db, execution, admit = operation => operation(), readMaintenance = () => false, now = Date.now, intervalMs = 15_000, log = console } = {}) {
   db.exec('CREATE TABLE IF NOT EXISTS execution_anthropic_reduction (id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL, json TEXT NOT NULL)');
   db.prepare('INSERT OR IGNORE INTO execution_anthropic_reduction(id,revision,json) VALUES (1,0,?)').run(JSON.stringify({ config: null, accounts: null, state: initialState() }));
-  let closed = false, ticking = null, live = null;
+  let closed = false, ticking = null, live = null, checkedAt = null;
   function record() {
     const row = db.prepare('SELECT revision,json FROM execution_anthropic_reduction WHERE id=1').get();
     try {
@@ -43,10 +43,11 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
     const current = accountBindings(value.config);
     for (const [exchange, binding] of Object.entries(current)) if (value.accounts?.[exchange]?.revision !== binding.revision || value.accounts?.[exchange]?.identity !== binding.identity) throw new ExecutionError(409, `${exchange} 实盘连接已变化，自动减仓已停用；请重新核验并启用`);
   }
-  function state() {
-    const value = record();
+  function stateOf(value) {
     return { generatedAt: iso(now()), revision: value.revision, config: value.config, state: value.state, live, connections: connections(), maintenance: !!readMaintenance(), job: associated(value) ?? (value.state.lastJobId ? execution.jobView(value.state.lastJobId) : null) };
   }
+  const state = () => stateOf(record());
+  const protectionState = () => { const value = record(); return { ...stateOf(value), bindings: value.accounts, checkedAt, available: execution.coverageAvailable(), locked: !!value.config && !!execution.lockOwner(value.config.legs) }; };
   function save(body) {
     exactKeys(body, ['revision', 'config', 'confirmLive']);
     const config = normalizeReductionConfig(body.config);
@@ -66,7 +67,7 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
         reason: config.enabled ? '等待核验当前持仓、减仓数量和分批限制；核验通过后才可触发' : null } };
       event(next, config.enabled ? `已绑定当前实盘账户；${next.state.reason}；每轮完成后继续监测，达到阈值时按剩余持仓再次减仓` : '设置已保存，自动减仓未启用'); write(next);
     });
-    live = null; return state();
+    live = null; checkedAt = null; return state();
   }
   function disable(body) {
     exactKeys(body, ['revision']);
@@ -119,6 +120,7 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
         event(latest, `任一腿距强平 ≤ ${latest.config.thresholdPercent}%，触发双边总计 ${latest.config.reducePercent}% 分批市价减仓`);
         write(latest); live = reading;
       } }));
+      checkedAt = iso(now());
       if (!result.jobId) {
         immediate(db, () => {
           check(); live = result.live;
@@ -140,6 +142,7 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
         if (closed || !execution.leading()) return;
         value = record();
         if (value.revision !== revision || !value.config?.enabled || value.state.jobId) return;
+        checkedAt = iso(now());
         // A trigger held by the owner's orders keeps its risk reading visible.
         live = error instanceof ExternalOrdersError && error.reading ? error.reading : null;
         const message = error instanceof ExecutionError ? error.message : '自动减仓读取或记录失败，本轮没有新建任务';
@@ -175,5 +178,5 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
   const timer = intervalMs > 0 ? setInterval(() => void tick(), intervalMs) : null;
   timer?.unref?.();
   function stop() { closed = true; clearInterval(timer); }
-  return { state, save, disable, tick, stop, async close() { stop(); await ticking; } };
+  return { state, protectionState, save, disable, tick, stop, async close() { stop(); await ticking; } };
 }

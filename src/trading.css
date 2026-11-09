@@ -221,6 +221,12 @@
 .trading-anthropic-alerting{color:var(--error);font-weight:600}
 .trading-position-table tr.trading-anthropic-near{background:var(--error-soft)}
 .trading-anthropic-empty{padding:14px 16px;font-size:.75rem;color:var(--text-tertiary)}
+.trading-position-protection{display:flex;flex-direction:column;gap:4px;min-width:150px;max-width:240px;white-space:normal;line-height:1.5;text-align:left;font-family:system-ui,"Microsoft YaHei UI",sans-serif;font-size:.6875rem}
+.trading-position-protection strong{font-size:.75rem;color:var(--text-secondary)}
+.trading-position-protection span,.trading-position-protection small{color:var(--text-tertiary);overflow-wrap:anywhere}
+.trading-position-protection.ready strong{color:var(--emerald)}
+.trading-position-protection.blocked strong,.trading-position-protection.stale strong{color:var(--warning)}
+.trading-protection-note{margin:10px 16px;font-size:.6875rem;line-height:1.7;color:var(--text-tertiary)}
 .trading-anthropic-alerts{display:flex;flex-direction:column;gap:10px;margin:6px 16px 4px;padding:12px 14px;border:1px solid var(--surface-4);border-radius:var(--radius-md);font-size:.75rem;color:var(--text-secondary)}
 .trading-anthropic-alerts h3{display:flex;align-items:center;gap:7px;font-size:.8125rem;font-weight:650;color:var(--text-primary)}
 .trading-anthropic-alerts p{line-height:1.7;overflow-wrap:anywhere}

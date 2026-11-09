@@ -43,7 +43,7 @@ function configOf(form: Draft): AnthropicReductionConfig {
 const sameShares = (first: AnthropicShares, second: AnthropicShares) => first.outstanding === second.outstanding && first.diluted === second.diluted;
 const contractLabel = (leg: { exchange: string; symbol: string }) => findContract(`${leg.exchange}:${leg.symbol}`)?.label ?? `${leg.exchange} ${leg.symbol}`;
 
-export default function TradingAnthropicReduction({ shares, onExpired }: { shares: AnthropicShares; onExpired: () => void }) {
+export default function TradingAnthropicReduction({ shares, onExpired, onStateChange }: { shares: AnthropicShares; onExpired: () => void; onStateChange?: (pending: boolean) => void }) {
   const [data, setData] = useState<AnthropicReductionState | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [readError, setReadError] = useState<string | null>(null), [writeError, setWriteError] = useState<string | null>(null);
@@ -90,6 +90,7 @@ export default function TradingAnthropicReduction({ shares, onExpired }: { share
     if (!data || !form || writing.current) return;
     if (kind === 'save' && (validation || executing || form.enabled && (!confirmedLive || !connectionsReady || data.maintenance || readError))) { setWriteError(validation ?? '请先核对实盘连接、执行状态并确认启用。'); return; }
     writing.current = true; generation.current++; reading.current?.abort(); reading.current = null;
+    onStateChange?.(true);
     setBusy(kind); setWriteError(null); setNotice(null);
     try {
       const value = await api<AnthropicReductionState>(kind === 'save' ? BASE : `${BASE}/disable`, { method: kind === 'save' ? 'PUT' : 'POST',
@@ -103,6 +104,7 @@ export default function TradingAnthropicReduction({ shares, onExpired }: { share
       else setWriteError(failure instanceof Error ? failure.message : '自动减仓操作失败');
     } finally {
       generation.current++; writing.current = false;
+      if (mounted.current) onStateChange?.(false);
       if (mounted.current) { setBusy(null); setConfirmed(null); void load(); }
     }
   }

@@ -6,6 +6,7 @@ import { ExchangeResponseError, readJsonResponse } from './exchange-transport/re
 import { postCard, validateChannel } from './automation/feishu-digest-core.mjs';
 import { decimal } from './trading-decimal.mjs';
 import { EXECUTION_VENUE_SYMBOLS, TRADING_NAMES } from './trading-markets.mjs';
+import { positionProtection } from './trading-anthropic-protection.mjs';
 
 // Anthropic arbitrage positions and their liquidation watch. Read only: the
 // Binance/OKX legs come from the read-only accounts (trading.anthropic()), the
@@ -172,7 +173,7 @@ export function alertCard(events, { title, threshold, at, test = false }) {
       { tag: 'note', elements: [{ tag: 'plain_text', content: `距强平 = 标记价到强平价的距离 ÷ 标记价；阈值 ${threshold}%。数据来自工作台最新读取，时间为北京时间。` }] }] };
 }
 
-export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, encrypt, decrypt, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
+export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtection = () => null, feishu, encrypt, decrypt, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
   const directory = path.join(dataDir, 'anthropic-watch');
   const configPath = path.join(directory, 'config.json'), statePath = path.join(directory, 'state.json'), channelPath = path.join(directory, 'channel.json');
   // The own robot's webhook is a credential like the digest's: encrypted at rest, decrypted only to send, never returned.
@@ -275,7 +276,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
     const walletState = w => !w.address ? 'unconfigured' : !w.fetchedAt ? w.error ? 'error' : 'loading' : w.error || current - timeOf(w.fetchedAt) > LIVE_MS ? 'stale' : 'live';
     const list = [...cex.map(item => ({ exchange: item.exchange, connected: item.connected,
       state: item.state === 'live' && item.positions.some(row => Object.hasOwn(row, 'riskFetchedAt') && (timeOf(row.riskFetchedAt) === null || current - timeOf(row.riskFetchedAt) > LIVE_MS)) ? 'stale' : item.state,
-      fetchedAt: item.fetchedAt, error: item.error, refreshing: !!item.refreshing,
+      fetchedAt: item.fetchedAt, error: item.error, refreshing: !!item.refreshing, accountIdentity: item.accountIdentity ?? null,
       positions: item.positions.map(row => ({ ...row, quantityUnit: row.quantityUnit ?? null, marginMode: row.marginMode ?? null, marginUsed: null })) })),
     ...WALLETS.map(exchange => { const w = wallets[exchange];
       return { exchange, connected: !!w.address, address: w.address, state: walletState(w), fetchedAt: w.fetchedAt, error: w.error, refreshing: !!polling, positions: w.rows }; })];
@@ -371,11 +372,20 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, feishu, en
 
   function state() {
     const list = sources(), channel = robot();
-    return { schema: 1, generatedAt: iso(now()), sources: list.map(source => ({ ...source, positions: source.positions.map(row => {
-      const distance = liquidationDistance(row);
-      return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), riskUnknown: missingMark(row), alerting: Object.hasOwn(alerts.active, row.id) };
-    }) })), alerts: { config: { ...config }, channel: { configured: channel.configured, source: channel.source, host: channel.host, error: channel.error }, history: structuredClone(history), error: loadError ?? stateError ?? lastError,
-      staleAfterSeconds: STALE_ALERT_MS / 1000, hysteresisPercent: HYSTERESIS } };
+    const alertState = { config: { ...config }, channel: { configured: channel.configured, source: channel.source, host: channel.host, error: channel.error }, history: structuredClone(history), error: loadError ?? stateError ?? lastError,
+      staleAfterSeconds: STALE_ALERT_MS / 1000, hysteresisPercent: HYSTERESIS };
+    let reduction = null;
+    try { reduction = readProtection(); } catch { /* A broken rule must not hide the positions. */ }
+    return { schema: 1, generatedAt: iso(now()), sources: list.map(source => {
+      const { accountIdentity: _privateAccountIdentity, ...publicSource } = source;
+      return { ...publicSource, positions: source.positions.map(row => {
+        const distance = liquidationDistance(row);
+        let protection;
+        try { protection = positionProtection({ source, position: row, alerts: alertState, reduction, now: now(), staleMs: LIVE_MS }); }
+        catch { protection = null; }
+        return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), riskUnknown: missingMark(row), alerting: Object.hasOwn(alerts.active, row.id), protection };
+      }) };
+    }), alerts: alertState };
   }
 
   return {

@@ -557,6 +557,8 @@ test('OKX read-only Anthropic positions read only ANTHROPIC-USDT-SWAP with its l
   const h = harness({ readOnly: true, handler: call => call.url.pathname.endsWith('/instruments') ? [rule(call.parameters.instId, { ctValCcy: 'ANTHROPIC', ctVal: '1', tickSz: '0.01', lotSz: '0.01', minSz: '0.01' })]
     : call.url.pathname.endsWith('/positions') ? [position('ANTHROPIC-USDT-SWAP', { pos: '-30', markPx: '183.5', liqPx: '260.1', upl: '-12' })] : undefined });
   const result = await h.client.anthropicPositions(credentials);
+  assert.match(result.accountIdentity, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(result).includes(h.state.config.uid), false, 'the read-only result does not contain the original UID');
   assert.deepEqual(result.positions.map(row => [row.symbol, row.instrumentId, row.side, row.quantity, row.liquidationPrice]), [['ANTHROPICUSDT', 'ANTHROPIC-USDT-SWAP', 'short', '30', '260.1']]);
   assert.deepEqual([...new Set(h.calls.filter(call => call.url.pathname.endsWith('/positions')).map(call => call.parameters.instId))], ['ANTHROPIC-USDT-SWAP']);
   h.state.config.perm = 'read_only,trade';

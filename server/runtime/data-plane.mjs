@@ -146,6 +146,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
   // Anthropic legs: read-only Binance/OKX accounts plus the live Hyperliquid connection's public positions.
   const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, encrypt, decrypt, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0, readCex: () => trading.anthropic(),
+    readProtection: () => anthropicReduction.protectionState(),
     readAddress: exchange => { const row = execution.state().connections.find(item => item.exchange === exchange); return row?.connected && typeof row.identity === 'string' ? row.identity.toLowerCase() : null; } });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },

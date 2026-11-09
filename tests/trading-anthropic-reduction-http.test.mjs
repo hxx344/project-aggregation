@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createApp } from '../server/app.mjs';
 import { subtract } from '../server/trading-execution-plan.mjs';
 import { ExecutionExchangeError } from '../server/trading-execution-exchanges.mjs';
+import { createHash } from 'node:crypto';
 
 const TIME = Date.UTC(2026, 10, 7, 3), SYMBOL = 'ANTHROPICUSDT';
 const PASSWORD = 'anthropic-reduction-http-fixture';
@@ -16,13 +17,13 @@ const config = (overrides = {}) => ({ enabled: false,
   shares: { outstanding: '3', diluted: '4' }, thresholdPercent: '5', reducePercent: '50', batchCount: 1, batchIntervalMs: 1000, timeoutMs: 60_000, ...overrides });
 const credentials = exchange => ({ accountMode: exchange === 'okx' ? 'cross' : 'standard', apiKey: `fixture_${exchange}_key`, apiSecret: `fixture_${exchange}_secret`, ...(exchange === 'okx' ? { passphrase: 'fixture_passphrase' } : {}) });
 
-async function fixture(t, { timers = false } = {}) {
+async function fixture(t, { timers = false, withPositions = false } = {}) {
   if (timers) t.mock.timers.enable({ apis: ['setInterval'] });
   const dataDir = await mkdtemp(path.join(tmpdir(), 'hub-reduction-http-'));
   let session = null, serial = 0;
   const calls = [], readOnlyCalls = [], records = new Map();
   const accounts = Object.fromEntries(['binance', 'okx'].map((exchange, index) => [exchange, {
-    identity: `fixture-${exchange}`, modes: { [SYMBOL]: 'hedge' }, openOrders: [], strategies: [],
+    identity: withPositions ? String(41 + index) : `fixture-${exchange}`, modes: { [SYMBOL]: 'hedge' }, openOrders: [], strategies: [],
     positions: [{ symbol: SYMBOL, side: index ? 'short' : 'long', quantity: index ? '30' : '10',
       risk: { markPrice: '100', liquidationPrice: index ? '150' : '95', at: new Date(TIME).toISOString() } }],
   }]));
@@ -48,8 +49,10 @@ async function fixture(t, { timers = false } = {}) {
       Object.assign(records.get(spec.id), { status: 'terminal', terminal: true, childrenSettled: true });
     },
   });
-  const tradingClientFactory = exchange => Object.fromEntries(['verify', 'positions', 'funding'].map(method => [method, async (_secret, options) => {
+  const tradingClientFactory = exchange => Object.fromEntries(['verify', 'positions', 'funding', 'anthropicPositions'].map(method => [method, async (_secret, options) => {
     readOnlyCalls.push({ exchange, method });
+    if (withPositions && method === 'anthropicPositions') return { fetchedAt: new Date(TIME).toISOString(), accountIdentity: exchange === 'okx' ? createHash('sha256').update(`okx:${accounts.okx.identity}`).digest('hex') : null,
+      positions: accounts[exchange].positions.map(row => ({ ...row, exchange, mode: 'hedge', marginMode: 'cross', contractSize: '1', markPrice: row.risk.markPrice, liquidationPrice: row.risk.liquidationPrice })) };
     return method === 'funding' ? { fetchedAt: new Date(TIME).toISOString(), events: [], coverage: [{ start: options.start, end: options.end }], complete: true, error: null }
       : { fetchedAt: new Date(TIME).toISOString(), positions: [] };
   }]));
@@ -118,6 +121,26 @@ test('reduction HTTP reads and writes require a session; writes require same Ori
   assert.equal(result.status, 200); assert.equal(result.headers.get('cache-control'), 'no-store');
   assert.equal(result.data.state.phase, 'disabled'); assert.equal(result.data.config, null);
   assert.equal(f.calls.length, 0); assert.equal(f.readOnlyCalls.length, 0);
+});
+
+test('position coverage HTTP reads keep account proofs private and never read exchanges, enable rules or create jobs', async t => {
+  const f = await fixture(t, { withPositions: true }), route = '/api/trading/anthropic';
+  assert.equal((await f.request(route)).status, 401);
+  await f.login(); await f.connect(); await f.connect('/api/trading');
+  await f.save({ enabled: true }, { confirmLive: true });
+  const before = { rules: f.rows('SELECT * FROM execution_anthropic_reduction'), jobs: f.rows('SELECT * FROM execution_jobs'), orders: f.rows('SELECT * FROM execution_orders') };
+  const calls = f.calls.length, reads = f.readOnlyCalls.length;
+  for (let i = 0; i < 3; i++) {
+    const response = await f.request(route); assert.equal(response.status, 200);
+    const positions = response.data.sources.flatMap(source => source.positions);
+    assert.equal(positions.length, 2);
+    assert.equal(positions.find(row => row.exchange === 'binance').protection.reduction.state, 'unknown');
+    assert.equal(positions.find(row => row.exchange === 'okx').protection.reduction.state, 'blocked');
+    assert.match(positions.find(row => row.exchange === 'okx').protection.reduction.reason, /等待核验/);
+    assert.doesNotMatch(JSON.stringify(response.data), /"(?:identity|accountIdentity|bindings|credentials|apiKey|apiSecret)":/);
+  }
+  assert.equal(f.calls.length, calls); assert.equal(f.readOnlyCalls.length, reads); assert.equal(f.creates.length, 0);
+  assert.deepEqual({ rules: f.rows('SELECT * FROM execution_anthropic_reduction'), jobs: f.rows('SELECT * FROM execution_jobs'), orders: f.rows('SELECT * FROM execution_orders') }, before);
 });
 
 test('HTTP rejects invalid parameters and injected account risk without altering the durable revision', async t => {

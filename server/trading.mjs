@@ -102,7 +102,7 @@ function normalizePositions(result, exchange, now, symbols = SYMBOLS) {
       if (positions.some(row => row.mode === 'one-way') && positions.length > 1) throw new Error('Conflicting position modes');
     }
   }
-  return { rows, fetchedAt: iso(timeOf(result.fetchedAt)) };
+  return { rows, fetchedAt: iso(timeOf(result.fetchedAt)), accountIdentity: exchange === 'okx' && /^[a-f0-9]{64}$/.test(result.accountIdentity ?? '') ? result.accountIdentity : null };
 }
 function normalizeReceipts(events, exchange, start = 0, end = Infinity, ledger = 'funding') {
   if (!Array.isArray(events) || events.length > MAX_FUNDING_EVENTS * 2) throw new Error('Invalid funding events');
@@ -126,7 +126,7 @@ function parseSide(kind, value, exchange) {
   if (!value) return emptySnapshot(exchange)[kind];
   const { symbols, name } = SIDE_MARKETS[kind];
   try {
-    const positions = value.fetchedAt ? normalizePositions({ positions: value.rows, fetchedAt: value.fetchedAt }, exchange, Date.now(), symbols) : { rows: [], fetchedAt: null };
+    const positions = value.fetchedAt ? normalizePositions({ positions: value.rows, fetchedAt: value.fetchedAt, accountIdentity: value.accountIdentity }, exchange, Date.now(), symbols) : { rows: [], fetchedAt: null };
     const diagnostic = normalizeTradingDiagnostic(value.diagnostic);
     return { ...positions, lastAttemptAt: timeOf(value.lastAttemptAt) === null ? null : iso(timeOf(value.lastAttemptAt)), diagnostic,
       error: formatTradingDiagnostic(diagnostic) || (value.error ? `上次${name}仓位读取失败，请刷新重试` : null) };
@@ -566,7 +566,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
     return ANTHROPIC_EXCHANGES.map(exchange => {
       const row = rowFor(exchange), snapshot = cache.get(exchange).anthropic, connected = !!row.credentials;
       return { exchange, connected, state: readState(connected, snapshot, current, POSITION_STALE), fetchedAt: snapshot.fetchedAt, error: snapshot.error,
-        refreshing: jobs.has(`${exchange}:anthropic`), positions: connected ? snapshot.rows : [] };
+        refreshing: jobs.has(`${exchange}:anthropic`), positions: connected ? snapshot.rows : [], accountIdentity: connected ? snapshot.accountIdentity ?? null : null };
     });
   }
   return { state, refresh, connect, disconnect, anthropic,

@@ -116,7 +116,7 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
       }
     }
     checkAbort(signal);
-    return { fetchedAt: fetchedAt(), positions };
+    return { fetchedAt: fetchedAt(), positions, accountIdentity: createHash('sha256').update(`okx:${snapshot.identity}`).digest('hex') };
   }
   function receipt(row, { symbol, subType, start, end }) {
     requireObject(row);

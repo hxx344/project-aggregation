@@ -11,7 +11,7 @@ import { EXECUTION_CALL_TIMEOUT_MS, FINAL_EXECUTION as FINAL, UNFINISHED_EXECUTI
 import { immediate } from './control/schema.mjs';
 import { isSqliteBusy } from './sqlite-writes.mjs';
 import { evaluateRule, boundsFor, SPREADS } from './trading-auto.mjs';
-import { normalizeReductionConfig, readReductionRisk, reductionQuantities, reductionIntent, checkReductionDuration } from './trading-reduction-plan.mjs';
+import { REDUCTION_RISK_MAX_AGE_MS, normalizeReductionConfig, readReductionRisk, reductionQuantities, reductionIntent, checkReductionDuration } from './trading-reduction-plan.mjs';
 
 const iso = time => new Date(time).toISOString();
 const ACTIVE = new Set(['queued', 'running', 'stopping']);
@@ -782,6 +782,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     // Quantity and batch feasibility changes with the live position. Check it
     // on every monitoring round, before the liquidation trigger is reached.
     const quantities = reductionQuantities(config, reading, collected.markets, now());
+    // Display evidence only: the send path still performs its own fresh checks.
+    reading.validUntil = iso(Math.min(...reading.legs.flatMap(leg => [Date.parse(leg.riskAt) + REDUCTION_RISK_MAX_AGE_MS,
+      Date.parse(collected.markets.get(`${leg.exchange}:${leg.symbol}`).at) + QUOTE_MAX_AGE])));
     const intent = normalizeIntent(reductionIntent(config, quantities));
     let built;
     try { built = buildPlan(intent, collected.snapshots, collected.markets, collected.connections, now()); }
@@ -861,6 +864,12 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     }
   }
   function leading() { try { requireLease(); return !closing; } catch { return false; } }
+  // A diagnostic GET must not invoke requireLease()/lostLease(), which can
+  // retire local execution state. This value authorizes no write operation.
+  function coverageAvailable() {
+    const row = stmt.prepare('SELECT owner,expires FROM execution_lease WHERE id=1').get();
+    return !closed && !closing && !retired && leader && row?.owner === owner && row.expires > now();
+  }
   function validateInspection(order, value, { explicit = false, cancelRecovery = false } = {}) {
     const reducedOriginal = cancelRecovery && order.exchange === 'okx' && order.remoteId && order.spec.reduceOnly && value && compareDecimals(value.quantity, '0') > 0 && compareDecimals(value.quantity, order.spec.quantity) <= 0;
     if (!value || typeof value.id !== 'string' || !value.id || (order.remoteId && value.id !== order.remoteId) || value.symbol !== order.spec.symbol || value.side !== order.spec.side || value.reduceOnly !== order.spec.reduceOnly || (value.positionSide !== null && value.positionSide !== order.spec.positionSide) || value.kind !== order.kind || !reducedOriginal && compareDecimals(value.quantity, order.spec.quantity) !== 0) throw new ExecutionError(409, '委托身份或数量与本任务不一致，禁止认领或补单');
@@ -1670,7 +1679,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, coverageAvailable, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       for (const controller of historyControllers) controller.abort();

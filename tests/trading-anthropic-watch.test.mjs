@@ -9,7 +9,7 @@ const ADDRESS = '0x' + 'a'.repeat(40);
 const quiet = { warn() {} };
 const hlPosition = (coin, szi, liquidationPx, positionValue = '1000') => ({ type: 'oneWay', position: { coin, szi, entryPx: '100', positionValue, unrealizedPnl: '0', liquidationPx, leverage: { type: 'isolated', value: 3 }, marginUsed: '333' } });
 
-function harness({ cex = [], configured = true } = {}) {
+function harness({ cex = [], configured = true, readProtection = () => null } = {}) {
   const dataDir = mkdtempSync(path.join(tmpdir(), 'anthropic-watch-'));
   let time = Date.parse('2026-11-06T00:00:00Z');
   const books = { io: [], xyz: [] }, posts = [], cards = [], requests = [], ownPosts = [], rhRequests = [];
@@ -33,7 +33,7 @@ function harness({ cex = [], configured = true } = {}) {
   };
   const source = { value: cex };
   const create = () => {
-    const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: exchange => exchange === 'hyperliquid' ? address : exchange === 'rh-lighter' ? rhAddress : null, feishu, encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed), log: quiet, fetcher, now: () => time, intervalMs: 0 });
+    const watch = createAnthropicWatch({ dataDir, readCex: () => source.value, readAddress: exchange => exchange === 'hyperliquid' ? address : exchange === 'rh-lighter' ? rhAddress : null, readProtection, feishu, encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed), log: quiet, fetcher, now: () => time, intervalMs: 0 });
     watch.initialize(); return watch;
   };
   const h = { digest: configured, books, posts, cards, ownPosts, requests, source, dataDir, advance: ms => { time += ms; }, now: () => time, fail: error => { postFailure = error; },
@@ -58,6 +58,19 @@ test('distance to liquidation is measured from the mark against the position sid
   assert.equal(liquidationDistance({ side: 'short', markPrice: '100', liquidationPrice: '110' }), 10);
   assert.ok(liquidationDistance({ side: 'short', markPrice: '100', liquidationPrice: '95' }) < 0);
   assert.equal(liquidationDistance({ side: 'long', markPrice: '100', liquidationPrice: null }), null);
+});
+
+test('a failed protection projection preserves positions and alert evidence without disclosing the account proof', () => {
+  const h = harness({ readProtection: () => { throw new Error('unreadable rule'); } });
+  try {
+    h.source.value = [{ exchange: 'okx', connected: true, state: 'live', fetchedAt: new Date(h.now()).toISOString(), error: null, accountIdentity: 'a'.repeat(64),
+      positions: [{ id: 'okx:fixture', exchange: 'okx', symbol: 'ANTHROPICUSDT', side: 'long', quantity: '10', markPrice: '100', liquidationPrice: '50' }] }];
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    const state = h.watch.state(), row = state.sources[0].positions[0];
+    assert.equal(row.quantity, '10'); assert.equal(row.protection.alert.state, 'ready'); assert.equal(row.protection.reduction.state, 'unknown');
+    assert.equal(JSON.stringify(state).includes('a'.repeat(64)), false); assert.equal(JSON.stringify(state).includes('accountIdentity'), false);
+    assert.equal(h.requests.length + h.rhRequests.length + h.posts.length + h.ownPosts.length, 0);
+  } finally { h.cleanup(); }
 });
 
 test('alert config is bounded and enabling needs the Feishu robot', () => {
