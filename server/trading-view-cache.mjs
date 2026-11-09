@@ -1,7 +1,7 @@
 import { decimal } from './trading-decimal.mjs';
 import { normalizeTradingPair, DEFAULT_TRADING_PAIR } from './trading-markets.mjs';
 
-export const TRADING_VIEW_VERSION = 2;
+export const TRADING_VIEW_VERSION = 3;
 const DAY = 86_400_000;
 const integer = (value, maximum = Number.MAX_SAFE_INTEGER) => {
   if (!Number.isSafeInteger(value) || value < 0 || value > maximum) throw new Error('Invalid view integer');
@@ -55,7 +55,7 @@ export function unpackTradingView(serialized, days, current, pair = DEFAULT_TRAD
   const point = row => {
     const time = integer(row.time);
     if (time < Date.parse(start) || time > pnlEnd) throw new Error('Invalid PnL point');
-    return { time, unrealizedPnl: money(row.unrealizedPnl), fundingPnl: money(row.fundingPnl), totalPnl: money(row.totalPnl) };
+    return { time, unrealizedPnl: money(row.unrealizedPnl), fundingPnl: money(row.fundingPnl), realizedPnl: money(row.realizedPnl), feePnl: money(row.feePnl), totalPnl: money(row.totalPnl) };
   };
   const points = source.points.map(point);
   if (points.some((row, index) => index > 0 && row.time <= points[index - 1].time)) throw new Error('Unordered PnL points');

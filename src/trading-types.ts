@@ -33,6 +33,8 @@ export type TradingAccount = {
   positions: { state: TradingReadState; fetchedAt: string | null; error: string | null };
   funding: { state: TradingReadState; fetchedAt: string | null; error: string | null;
     coverageStart: string | null; coverageEnd: string | null; complete: boolean };
+  /** Closing PnL and trading fee ledger; absent from servers released before it existed. */
+  trades?: { state: TradingReadState; fetchedAt: string | null; error: string | null; coverageEnd: string | null };
 };
 export type TradingLeg = {
   id: string; exchange: TradingExchange; symbol: OilSymbol; name: string;
@@ -50,7 +52,11 @@ export type TradingHynix = {
   accounts: { exchange: TradingExchange; state: TradingReadState; fetchedAt: string | null; error: string | null }[];
   legs: TradingHynixLeg[];
 };
-export type TradingPnlPoint = { time: number; unrealizedPnl: string | null; fundingPnl: string | null; totalPnl: string | null };
+export type TradingPnlPoint = {
+  time: number; unrealizedPnl: string | null; fundingPnl: string | null;
+  /** Cumulative closing PnL and signed trading fees since the interval start; absent from older servers. */
+  realizedPnl?: string | null; feePnl?: string | null; totalPnl: string | null;
+};
 export type TradingPnl = {
   currency: 'USDT'; intervalMs: number; cumulativeStart: number; end: number; recordingStartedAt: number | null;
   pointCount: number; points: TradingPnlPoint[]; latest: TradingPnlPoint | null;

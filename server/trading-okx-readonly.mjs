@@ -131,10 +131,26 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
     if (subType === '173' && compareDecimals(value, '0') > 0 || subType === '174' && compareDecimals(value, '0') < 0) fail();
     return { id: `okx:${symbol}:FUNDING_FEE:${id(row.billId)}`, exchange: 'okx', symbol, time: iso(time), amount: value, currency: 'USDT' };
   }
+  // Closing PnL and fees from swap bills: trade (2), liquidation (5), ADL (9)
+  // and block trade (14) carry pnl and a signed fee. Funding (8) belongs to the
+  // funding ledger and isolated margin moves (6) are not PnL; others are refused.
+  function trade(row, { symbol, start, end }) {
+    requireObject(row);
+    if (row.instId !== instrumentId(symbol) || row.instType !== 'SWAP') fail();
+    if (row.ccy !== 'USDT') fail('currency');
+    const time = milliseconds(row.ts);
+    if (time < start || time >= end) fail('window_range');
+    if (row.type === '8' || row.type === '6') return [];
+    if (!['2', '5', '9', '14'].includes(row.type)) fail();
+    const billId = id(row.billId), at = iso(time);
+    return [{ id: `okx:${symbol}:BILL:${billId}:realized`, exchange: 'okx', symbol, time: at, kind: 'realized', amount: amount(row.pnl), currency: 'USDT' },
+      { id: `okx:${symbol}:BILL:${billId}:fee`, exchange: 'okx', symbol, time: at, kind: 'fee', amount: amount(row.fee), currency: 'USDT' }]
+      .filter(event => compareDecimals(event.amount, '0') !== 0);
+  }
   async function fundingPage(credentials, { symbol, subType, start, end, after, limit = 100, signal, budget }) {
     if (budget && ++budget.requests > MAX_REQUESTS) fail('page_limit');
     return list(await protocol.request('bills', credentials, {
-      instType: 'SWAP', instId: instrumentId(symbol), ccy: 'USDT', ctType: 'linear', subType,
+      instType: 'SWAP', instId: instrumentId(symbol), ccy: 'USDT', ctType: 'linear', ...(subType ? { subType } : {}),
       begin: String(start), end: String(end - 1), limit: String(limit), ...(after ? { after } : {}),
     }, { signal }), limit);
   }
@@ -221,5 +237,56 @@ export function createOkxTradingClient({ ErrorClass, ...options } = {}) {
     checkAbort(signal);
     return snapshot(failure === null);
   }
-  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding });
+  async function trades(credentials, { start, end, signal, accountMode, onProgress } = {}) {
+    try {
+      modeOf(accountMode); checkAbort(signal);
+      if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start
+        || end - start > 30 * DAY || end > protocol.clock() + 1000 || start < protocol.clock() - 31 * DAY) fail('range');
+    } catch (error) { throw convert(error, 'trades'); }
+    const events = new Map(), coverage = [], budget = { requests: 0 };
+    let failure = null;
+    function snapshot(complete) {
+      return { fetchedAt: fetchedAt(), events: [...events.values()].map(row => ({ ...row })).sort((a, b) => a.time.localeCompare(b.time) || a.id.localeCompare(b.id)),
+        coverage: coverage.map(window => ({ ...window })), complete, error: failure?.message ?? null, diagnostic: failure?.diagnostic ?? null };
+    }
+    try {
+      await permissions(credentials, signal, budget);
+      for (let startWindow = start; startWindow < end; startWindow += 7 * DAY) {
+        const endWindow = Math.min(startWindow + 7 * DAY, end);
+        for (const symbol of OKX_SYMBOLS) {
+          let after = null;
+          const cursors = new Set();
+          while (true) {
+            const rows = await fundingPage(credentials, { symbol, start: startWindow, end: endWindow, after, signal, budget });
+            let previous = after;
+            for (const row of rows) {
+              const values = trade(row, { symbol, start: startWindow, end: endWindow });
+              const billId = id(row.billId);
+              if (previous !== null && BigInt(billId) >= BigInt(previous)) fail('pagination');
+              previous = billId;
+              for (const value of values) {
+                const found = events.get(value.id);
+                if (found && JSON.stringify(found) !== JSON.stringify(value)) fail('duplicate_conflict');
+                if (!found && events.size >= MAX_EVENTS) fail('record_limit');
+                events.set(value.id, value);
+              }
+            }
+            if (rows.length < 100) break;
+            after = id(rows.at(-1).billId);
+            if (cursors.has(after)) fail('pagination');
+            cursors.add(after);
+          }
+        }
+        coverage.push({ start: startWindow, end: endWindow });
+        checkAbort(signal);
+        if (onProgress) { await onProgress(snapshot(false)); checkAbort(signal); }
+      }
+    } catch (error) {
+      if (signal?.aborted || error?.code === 'aborted' || error?.name === 'AbortError') throw new DOMException('读取已取消', 'AbortError');
+      failure = convert(error, 'trades');
+    }
+    checkAbort(signal);
+    return snapshot(failure === null);
+  }
+  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding, trades });
 }

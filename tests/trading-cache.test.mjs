@@ -124,7 +124,7 @@ test('position expiry removes the structure conclusion and appends one missing l
   assert.equal(aged.structure.message, '等待两所最新仓位，暂不判断四腿结构');
   assert.equal(aged.funding.complete, true, 'funding has its separate freshness threshold');
   assert.equal(aged.pnl.status, 'incomplete');
-  assert.deepEqual(aged.pnl.latest, { time: Date.parse(time) + 75_001, unrealizedPnl: null, fundingPnl: null, totalPnl: null });
+  assert.deepEqual(aged.pnl.latest, { time: Date.parse(time) + 75_001, unrealizedPnl: null, fundingPnl: null, realizedPnl: null, feePnl: null, totalPnl: null });
   assert.equal(aged.pnl.points.length, 2);
   assert.deepEqual(aged.pnl.points[0], entry.data.pnl.points[0]);
   assert.equal(ageTradingData(entry, Date.parse(time) + 120_000).pnl.points.length, 2, 'repeated aging never accumulates synthetic samples');

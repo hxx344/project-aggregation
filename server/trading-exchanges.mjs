@@ -24,12 +24,15 @@ const ENDPOINTS = Object.freeze({
     funding: ['https://fapi.binance.com', '/fapi/v1/income'],
     portfolioPositions: ['https://papi.binance.com', '/papi/v1/um/positionRisk'],
     portfolioFunding: ['https://papi.binance.com', '/papi/v1/um/income'],
+    trades: ['https://fapi.binance.com', '/fapi/v1/income'],
+    portfolioTrades: ['https://papi.binance.com', '/papi/v1/um/income'],
   }),
   bybit: Object.freeze({
     permissions: ['https://api.bybit.com', '/v5/user/query-api'],
     account: ['https://api.bybit.com', '/v5/account/info'],
     positions: ['https://api.bybit.com', '/v5/position/list'],
     funding: ['https://api.bybit.com', '/v5/account/transaction-log'],
+    trades: ['https://api.bybit.com', '/v5/account/transaction-log'],
   }),
 });
 
@@ -189,6 +192,41 @@ function normalizeReceipt(exchange, row, { symbol, start, end }) {
   return { id: `${exchange}:${row.symbol}:${binance ? 'FUNDING_FEE:' : ''}${identifier}`, exchange, symbol: row.symbol, time: new Date(time).toISOString(), amount: value, currency: 'USDT' };
 }
 
+// Closing PnL and trading fees for the oil legs. Binance books each as its own
+// income row; Bybit and OKX carry both on one trade row. Fees are signed cash
+// flows (charged fees negative, rebates positive). Funding stays in its own ledger.
+// Binance is read unfiltered so rebates count and an unknown type is refused.
+const BINANCE_TRADE_TYPES = Object.freeze({ REALIZED_PNL: 'realized', COMMISSION: 'fee', INSURANCE_CLEAR: 'fee', COMMISSION_REBATE: 'fee', API_REBATE: 'fee' });
+const BYBIT_TRADE_TYPES = new Set(['TRADE', 'LIQUIDATION', 'ADL']);
+function normalizeTrades(exchange, row, { symbol, start, end }) {
+  const binance = exchange === 'binance';
+  if (!object(row)) throw invalidData(binance ? undefined : 'record', row, 'type');
+  if (typeof row.symbol !== 'string' || !/^[A-Z0-9_-]{1,80}$/.test(row.symbol)) throw invalidData(binance ? undefined : 'symbol', row.symbol);
+  const time = binance ? timestamp(row.time) : receiptField('transactionTime', row.transactionTime, timestamp);
+  if (time < start || time >= end) throw new TradingExchangeError('平仓盈亏与手续费记录超出请求时间范围，当前结果不完整', 'window_range');
+  if (!binance && !SYMBOLS.includes(row.symbol)) return [];
+  if (row.symbol !== symbol) throw invalidData(binance ? undefined : 'symbol', row.symbol, 'unexpected');
+  const at = new Date(time).toISOString();
+  if (binance) {
+    if (row.incomeType === 'FUNDING_FEE') return [];
+    const kind = BINANCE_TRADE_TYPES[row.incomeType];
+    if (!kind) throw invalidData();
+    if (row.asset !== 'USDT') throw new TradingExchangeError('原油平仓盈亏或手续费含非 USDT 币种，无法计入总盈亏', 'currency');
+    return [{ id: `binance:${row.symbol}:${row.incomeType}:${rowId(row.tranId)}`, exchange, symbol: row.symbol, time: at, kind, amount: amount(row.income), currency: 'USDT' }];
+  }
+  if (row.category !== 'linear') throw invalidData('category', row.category, 'unexpected');
+  if (row.currency !== 'USDT') throw new TradingExchangeError('原油平仓盈亏或手续费含非 USDT 币种，无法计入总盈亏', 'currency');
+  // Settlements are the funding ledger's rows; every other type must be a known fill.
+  if (row.type === 'SETTLEMENT') return [];
+  if (!BYBIT_TRADE_TYPES.has(row.type)) throw invalidData('type', row.type, 'unexpected');
+  const identifier = receiptField('id', row.id, bybitReceiptId);
+  // cashFlow is the realized closing PnL; fee is positive when charged.
+  const realized = receiptField('cashFlow', row.cashFlow, bybitFundingAmount), fee = receiptField('fee', row.fee, bybitFundingAmount);
+  return [{ id: `bybit:${row.symbol}:${identifier}:realized`, exchange, symbol: row.symbol, time: at, kind: 'realized', amount: realized, currency: 'USDT' },
+    { id: `bybit:${row.symbol}:${identifier}:fee`, exchange, symbol: row.symbol, time: at, kind: 'fee', amount: negateDecimal(fee), currency: 'USDT' }]
+    .filter(event => compareDecimals(event.amount, '0') !== 0);
+}
+
 export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now = Date.now, timeoutMs = 12_000, WebSocketImpl = globalThis.WebSocket, binanceClock, binanceStreams } = {}) {
   if (exchange === 'okx') return createOkxTradingClient({ fetchImpl, now, timeoutMs, ErrorClass: TradingExchangeError });
   if (!Object.hasOwn(ENDPOINTS, exchange)) throw new TradingExchangeError('不支持的交易所', 'exchange');
@@ -227,7 +265,7 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     if (!object(credentials) || typeof credentials.apiKey !== 'string' || !/^[\x21-\x7e]{1,512}$/.test(credentials.apiKey) || typeof credentials.apiSecret !== 'string' || !credentials.apiSecret.trim() || credentials.apiSecret.length > 1024 || /[\r\n\0]/.test(credentials.apiSecret)) throw errorFor(operation, accountMode, 'credentials');
     if (budget && ++budget.requests > MAX_REQUESTS) throw errorFor(operation, accountMode, 'page_limit');
     const endpoint = exchange === 'binance' && accountMode === 'portfolio-margin'
-      ? ({ positions: 'portfolioPositions', funding: 'portfolioFunding' }[operation] ?? operation) : operation;
+      ? ({ positions: 'portfolioPositions', funding: 'portfolioFunding', trades: 'portfolioTrades' }[operation] ?? operation) : operation;
     const [host, path] = ENDPOINTS[exchange][endpoint];
     function upstreamError(status, data) {
       const code = exchange === 'binance' ? data?.code : data?.retCode;
@@ -652,5 +690,70 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
     for (const session of sessions.values()) { session.listeners.clear(); suspend(session); }
     sessions.clear(); streams?.close?.(); signingClock?.forget();
   }
-  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding, ...(exchange === 'binance' ? { watchPositions, close } : {}) });
+  async function trades(credentials, { start, end, signal, accountMode: requestedMode, onProgress } = {}) {
+    const accountMode = modeOf(requestedMode);
+    checkAbort(signal);
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end <= start || end - start > 30 * DAY || end > clock() + 1000 || start < clock() - 31 * DAY) throw errorFor('trades', accountMode, 'range');
+    const events = new Map(), coverage = [], budget = { requests: 0 };
+    function collect(row, symbol, windowStart, windowEnd) {
+      for (const event of normalizeTrades(exchange, row, { symbol, start: windowStart, end: windowEnd })) {
+        const previous = events.get(event.id);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(event)) throw new TradingExchangeError('平仓盈亏与手续费账本出现冲突记录，当前结果不完整', 'duplicate_conflict');
+        if (!previous && events.size >= MAX_FUNDING_EVENTS) throw new TradingExchangeError('平仓盈亏与手续费记录达到读取上限，当前结果不完整', 'record_limit');
+        events.set(event.id, event);
+      }
+    }
+    function snapshot(complete, diagnostic = null) {
+      return { fetchedAt: fetchedAt(), events: [...events.values()].map(row => ({ ...row })).sort((a, b) => a.time.localeCompare(b.time) || a.id.localeCompare(b.id)),
+        coverage: coverage.map(window => ({ ...window })), complete, error: formatTradingDiagnostic(diagnostic), diagnostic };
+    }
+    let diagnostic = null;
+    try {
+      await permissions(credentials, signal, budget, accountMode);
+      for (let windowStart = start; windowStart < end; windowStart += 7 * DAY) {
+        const windowEnd = Math.min(windowStart + 7 * DAY, end);
+        const timeParams = { startTime: String(windowStart), endTime: String(windowEnd - 1) };
+        for (const symbol of SYMBOLS) {
+          if (exchange === 'binance') {
+            const pages = new Set();
+            for (let page = 1; ; page++) {
+              const rows = await request('trades', credentials, { symbol, ...timeParams, page: String(page), limit: '1000' }, signal, budget, accountMode);
+              if (!Array.isArray(rows) || rows.length > 1000) throw invalidData();
+              const fingerprint = JSON.stringify(rows);
+              if (rows.length && pages.has(fingerprint)) throw new TradingExchangeError('平仓盈亏与手续费分页未取得进展，当前结果不完整', 'pagination');
+              if (rows.length) pages.add(fingerprint);
+              for (const row of rows) collect(row, symbol, windowStart, windowEnd);
+              if (rows.length < 1000) break;
+            }
+          } else {
+            let cursor = '';
+            const cursors = new Set(), pages = new Set();
+            do {
+              const data = await request('trades', credentials, { accountType: 'UNIFIED', category: 'linear', baseCoin: BYBIT_BASE_COINS[symbol], currency: 'USDT', ...timeParams, limit: '50', ...(cursor ? { cursor } : {}) }, signal, budget, accountMode);
+              const rows = fundingList(data, 50);
+              const fingerprint = JSON.stringify(rows);
+              if (rows.length && pages.has(fingerprint)) throw new TradingExchangeError('平仓盈亏与手续费分页未取得进展，当前结果不完整', 'pagination');
+              if (rows.length) pages.add(fingerprint);
+              for (const row of rows) collect(row, symbol, windowStart, windowEnd);
+              cursor = cursorOf(data, true);
+              if (cursor) {
+                if (cursors.has(cursor) || rows.length === 0) throw new TradingExchangeError('平仓盈亏与手续费分页未取得进展，当前结果不完整', 'pagination');
+                cursors.add(cursor);
+              }
+            } while (cursor);
+          }
+        }
+        coverage.push({ start: windowStart, end: windowEnd });
+        checkAbort(signal);
+        if (onProgress) { await onProgress(snapshot(false)); checkAbort(signal); }
+      }
+    } catch (cause) {
+      if (signal?.aborted || cause?.name === 'AbortError') throw abortError();
+      diagnostic = normalizeTradingDiagnostic(withDiagnostic(cause, 'trades', accountMode).diagnostic) ?? diagnosticFor('trades', accountMode, 'upstream');
+    }
+    checkAbort(signal);
+    return snapshot(diagnostic === null, diagnostic);
+  }
+
+  return Object.freeze({ verify, positions, hynixPositions, anthropicPositions, funding, trades, ...(exchange === 'binance' ? { watchPositions, close } : {}) });
 }

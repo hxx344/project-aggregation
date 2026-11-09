@@ -33,10 +33,10 @@ async function fixture(t, overrides = {}) {
     okx: [position('okx', 'CLUSDT', 'short', { marginMode: 'cross', contractSize: '0.1' }), position('okx', 'BZUSDT', 'long', { marginMode: 'cross', contractSize: '0.01' })],
   };
   const hynixRows = { binance: [], bybit: [], okx: [] }, anthropicRows = { binance: [], okx: [] };
-  const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'hynixPositions', 'anthropicPositions', 'funding'].map(method => [method, async (secret, options) => {
+  const clientFactory = exchange => Object.fromEntries(['verify', 'positions', 'hynixPositions', 'anthropicPositions', 'funding', 'trades'].map(method => [method, async (secret, options) => {
     calls.push({ exchange, method, secret, ...options });
     if (handlers[exchange][method]) return handlers[exchange][method](secret, options);
-    return method === 'funding'
+    return method === 'funding' || method === 'trades'
       ? { fetchedAt: stamp(clock), events: [], coverage: [{ start: options.start, end: options.end }], complete: true, error: null }
       : { fetchedAt: stamp(clock), positions: method === 'hynixPositions' ? hynixRows[exchange] : method === 'anthropicPositions' ? anthropicRows[exchange] : rows[exchange] };
   }]));
@@ -228,7 +228,7 @@ test('portfolio margin mode persists across restart and governs every verificati
   assert.deepEqual(f.stored('binance'), previous);
   assert.equal(f.app.trading.state().accounts[0].accountMode, 'portfolio-margin');
   f.advance(6000); await f.app.trading.refresh({ force: true });
-  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['anthropicPositions', 'funding', 'hynixPositions', 'positions', 'verify']);
+  assert.deepEqual([...new Set(f.calls.map(row => row.method))].sort(), ['anthropicPositions', 'funding', 'hynixPositions', 'positions', 'trades', 'verify']);
   assert.ok(f.calls.every(row => row.accountMode === 'portfolio-margin'));
 });
 
@@ -630,6 +630,27 @@ test('PnL records real snapshots, keeps decimal precision, recalculates late fun
   assert.equal(seven.pointCount, 2);
   assert.equal(seven.points[0].totalPnl, '0.100000000000000001');
   await f.reopen(); assert.deepEqual(f.app.trading.state().pnl, seven);
+});
+
+test('closing PnL and fees join the total, and a failed trade ledger leaves funding intact', async t => {
+  const f = await fixture(t), original = f.now;
+  f.rows.binance[0].unrealizedPnl = '1'; f.rows.binance[1].unrealizedPnl = '0';
+  f.rows.bybit[0].unrealizedPnl = '0'; f.rows.bybit[1].unrealizedPnl = '0';
+  const trade = (id, kind, amount) => ({ ...receipt('binance', id, amount, original - 1000), kind });
+  f.handlers.binance.trades = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events: [trade('close', 'realized', '7.5'), trade('fee', 'fee', '-0.25')], coverage: [{ start, end }], complete: true });
+  f.handlers.bybit.trades = async () => ({ fetchedAt: stamp(f.now), events: [], coverage: [], complete: false, error: 'x',
+    diagnostic: { version: 1, exchange: 'bybit', operation: 'trades', accountMode: 'unified', code: 'currency' } });
+  await f.connect('binance'); await f.connect('bybit');
+  let state = f.app.trading.state();
+  const bybit = state.accounts.find(account => account.exchange === 'bybit');
+  assert.match(bybit.trades.error, /非 USDT/); assert.equal(bybit.funding.complete, true);
+  assert.equal(state.pnl.latest.fundingPnl, '0'); assert.equal(state.pnl.latest.realizedPnl, null); assert.equal(state.pnl.latest.totalPnl, null);
+  f.handlers.bybit.trades = async (_secret, { start, end }) => ({ fetchedAt: stamp(f.now), events: [], coverage: [{ start, end }], complete: true });
+  f.advance(6000); await f.app.trading.refresh({ force: true });
+  state = f.app.trading.state();
+  assert.equal(state.accounts.find(account => account.exchange === 'bybit').trades.error, null);
+  assert.deepEqual([state.pnl.points[0].realizedPnl, state.pnl.points[0].feePnl, state.pnl.points[0].totalPnl], ['7.5', '-0.25', '8.25']);
+  await f.reopen(); assert.deepEqual(f.app.trading.state().pnl.points, state.pnl.points);
 });
 
 test('PnL distinguishes confirmed empty positions, missing fields, stale sources, downtime and new account revisions', async t => {

@@ -6,7 +6,7 @@ import { createTradingPnl, reducePnlPoints } from '../server/trading-pnl.mjs';
 test('normal thirty-second refresh jitter keeps minute samples without synthetic gaps', () => {
   const db = new DatabaseSync(':memory:'), pnl = createTradingPnl(db);
   const base = Date.UTC(2026, 9, 7);
-  const entries = ['binance', 'bybit'].map(exchange => ({ row: { exchange, credentials: 'fixture', revision: 1 }, snapshot: { positions: { rows: [], error: null }, funding: { events: [], coverage: [{ start: base - 100000, end: base + 200000 }] } } }));
+  const entries = ['binance', 'bybit'].map(exchange => ({ row: { exchange, credentials: 'fixture', revision: 1 }, snapshot: { positions: { rows: [], error: null }, funding: { events: [], coverage: [{ start: base - 100000, end: base + 200000 }] }, trades: { events: [], coverage: [{ start: base - 100000, end: base + 200000 }] } } }));
   try {
     for (const offset of [200, 30200, 60100, 90300, 120050]) {
       for (const entry of entries) entry.snapshot.positions.fetchedAt = new Date(base + offset).toISOString();

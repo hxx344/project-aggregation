@@ -126,7 +126,7 @@ export function ageTradingData(entry: TradingCacheEntry, now: number, unavailabl
   const complete = data.funding.complete && selectedAccounts.length === 2 && selectedAccounts.every(account => account.funding.complete);
   const last = data.pnl?.latest;
   const expiredPnl = last && (unavailable || entry.failed || now - last.time > 75_000) && (last.unrealizedPnl !== null || last.totalPnl !== null);
-  const gap = expiredPnl ? { time: Math.max(now, last.time + 1), unrealizedPnl: null, fundingPnl: null, totalPnl: null } : null;
+  const gap = expiredPnl ? { time: Math.max(now, last.time + 1), unrealizedPnl: null, fundingPnl: null, realizedPnl: null, feePnl: null, totalPnl: null } : null;
   return {
     ...data, accounts, legs, ...(hynix ? { hynix } : {}),
     structure: selectedAccounts.length !== 2 || selectedAccounts.some(account => account.positions.state !== 'live') || legs.some(leg => leg.state !== 'live')

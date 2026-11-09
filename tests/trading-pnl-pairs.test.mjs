@@ -15,6 +15,7 @@ const entry = (exchange, amount, { revision = 1, time = BASE, funding = '0' } = 
   snapshot: {
     positions: { fetchedAt: iso(time), error: null, rows: [{ unrealizedPnl: amount }] },
     funding: { events: [{ time: iso(BASE - 1000), amount: funding }], coverage: [{ start: BASE - DAY, end: BASE + 40 * DAY }] },
+    trades: { events: [], coverage: [{ start: BASE - DAY, end: BASE + 40 * DAY }] },
   },
 });
 const advance = (entries, time) => {
@@ -212,4 +213,60 @@ test('pair samples preserve the 75-second freshness and 45-second source skew bo
       assert.equal(state.latest.unrealizedPnl, good ? '5' : null, `source ages ${ages.join(', ')}`);
     } finally { db.close(); }
   }
+});
+
+test('a reduction keeps total PnL continuous by adding closing PnL and fees, and an unread trade ledger hides only the total', () => {
+  const db = new DatabaseSync(':memory:'), pnl = createTradingPnl(db);
+  try {
+    const binance = entry('binance', '100', { funding: '1' }), bybit = entry('bybit', '-20', { funding: '2' });
+    const sources = [binance, bybit];
+    pnl.record(sources, BASE);
+    // Binance closes most of its leg: 80 of unrealized PnL becomes closing PnL, minus 0.5 and 0.25 fees.
+    binance.snapshot.positions.rows = [{ unrealizedPnl: '20' }];
+    binance.snapshot.trades.events = [
+      { time: iso(BASE + 30000), kind: 'realized', amount: '80' },
+      { time: iso(BASE + 30000), kind: 'fee', amount: '-0.5' },
+      { time: iso(BASE - 2 * DAY), kind: 'realized', amount: '999' },
+    ];
+    bybit.snapshot.trades.events = [{ time: iso(BASE + 40000), kind: 'fee', amount: '-0.25' }];
+    advance(sources, BASE + 60000);
+    pnl.record(sources, BASE + 60000);
+    const state = pnl.read(sources, BASE - DAY, BASE + 60000);
+    const pick = point => [point.unrealizedPnl, point.realizedPnl, point.feePnl, point.fundingPnl, point.totalPnl];
+    assert.deepEqual(pick(state.points[0]), ['80', '0', '0', '3', '83']);
+    assert.deepEqual(pick(state.latest), ['0', '80', '-0.75', '3', '82.25']);
+    assert.equal(state.status, 'ready');
+
+    // Trade coverage that stops before the newest sample leaves its total unknown but keeps unrealized PnL.
+    bybit.snapshot.trades.coverage = [{ start: BASE - DAY, end: BASE + 30000 }];
+    const partial = pnl.read(sources, BASE - DAY, BASE + 60000);
+    assert.deepEqual(pick(partial.points[0]), ['80', '0', '0', '3', '83']);
+    assert.deepEqual(pick(partial.latest), ['0', null, null, '3', null]);
+    assert.equal(partial.status, 'incomplete');
+    delete bybit.snapshot.trades;
+    assert.equal(pnl.read(sources, BASE - DAY, BASE + 60000).points[0].totalPnl, null);
+  } finally { db.close(); }
+});
+
+test('closing PnL is cut at each exchange\'s own position read time, so a fill between the two reads is not counted twice', () => {
+  const db = new DatabaseSync(':memory:'), pnl = createTradingPnl(db);
+  try {
+    const binance = entry('binance', '10'), bybit = entry('bybit', '50');
+    const sources = [binance, bybit];
+    pnl.record(sources, BASE);
+    // Bybit's positions are read first, still holding the leg; it is closed 15 seconds later,
+    // before Binance's read sets the sample time.
+    bybit.snapshot.positions.fetchedAt = iso(BASE + 30000);
+    binance.snapshot.positions.fetchedAt = iso(BASE + 60000);
+    bybit.snapshot.trades.events = [{ time: iso(BASE + 45000), kind: 'realized', amount: '50' }];
+    pnl.record(sources, BASE + 60000);
+    let state = pnl.read(sources, BASE - DAY, BASE + 60000);
+    assert.deepEqual([state.latest.time, state.latest.unrealizedPnl, state.latest.realizedPnl, state.latest.totalPnl], [BASE + 60000, '60', '0', '60']);
+    // The next sample sees the closed Bybit leg and picks up its closing PnL.
+    bybit.snapshot.positions.rows = [];
+    advance(sources, BASE + 120000);
+    pnl.record(sources, BASE + 120000);
+    state = pnl.read(sources, BASE - DAY, BASE + 120000);
+    assert.deepEqual([state.latest.unrealizedPnl, state.latest.realizedPnl, state.latest.totalPnl], ['10', '50', '60']);
+  } finally { db.close(); }
 });
