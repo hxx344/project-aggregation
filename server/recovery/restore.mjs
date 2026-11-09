@@ -6,7 +6,7 @@ import { parseEnv } from 'node:util';
 import { authenticate, canonical, decryptFile, fileHash, hash, keys, verify } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
 import { registryTransaction, setMeta } from './backup.mjs';
-import { ASTER_CA, ASTER_ENV, budget, category, checkpointEvidence, CONTROL, databaseEvidence, identity, MODULES, readLockedRegistry, readRegistry, REGISTRY, safePath, safeRelative, syncDirectory, syncTreeDirectories, tables, within, writeJson } from './inventory.mjs';
+import { ASTER_CA, ASTER_ENV, budget, category, checkpointEvidence, CONTROL, databaseEvidence, identity, MODULES, readLockedRegistry, readRegistry, REGISTRY, safePath, safeRelative, syncDirectory, syncTreeDirectories, tables, uniqueEntryPaths, within, writeJson } from './inventory.mjs';
 import { validateCredentials } from './credentials.mjs';
 import { REQUIRED_MATERIAL } from './data-catalog.mjs';
 
@@ -27,12 +27,11 @@ function loadJson(filename, max = 8 * 1024 * 1024) { safePath(filename); if (fs.
 function manifestBody(document, dataKey, secretsKey, limits) {
   const body = verify(document, dataKey, secretsKey);
   if (body.schemaVersion !== 1 || body.protocol !== 'cold-checkpoint-v1' || !['backup', 'handoff'].includes(body.kind) || !/^[a-f0-9-]{36}$/.test(body.checkpointId ?? '') || canonical(body.modules) !== canonical(MODULES) || !Array.isArray(body.entries) || body.entries.length > limits.maxFiles) throw new Error('RECOVERY_SCHEMA_UNSUPPORTED');
-  const seen = new Set();
+  const seen = uniqueEntryPaths(body.entries);
   for (const entry of body.entries) {
-    safeRelative(entry.path); limits.add(entry.size);
-    if (seen.has(entry.path.toLowerCase()) || !/^[a-f0-9]{64}$/.test(entry.sha256 ?? '') || !/^[a-f0-9]{64}$/.test(entry.payloadSha256 ?? '') || !['data','secrets'].includes(entry.category) || entry.category !== category(entry.path) || (/\.(?:sqlite|sqlite3|db)$/i.test(entry.path) && !entry.database)) throw new Error('RECOVERY_MANIFEST_INVALID');
+    limits.add(entry.size);
+    if (!/^[a-f0-9]{64}$/.test(entry.sha256 ?? '') || !/^[a-f0-9]{64}$/.test(entry.payloadSha256 ?? '') || !['data','secrets'].includes(entry.category) || entry.category !== category(entry.path) || (/\.(?:sqlite|sqlite3|db)$/i.test(entry.path) && !entry.database)) throw new Error('RECOVERY_MANIFEST_INVALID');
     if (entry.path === CONTROL || entry.path === '.runtime.lock' || entry.path === '.api.lock' || entry.path.startsWith('.recovery-stage-') || (entry.path.startsWith('_recovery/') && entry.path !== '_recovery/root.env')) throw new Error('RECOVERY_UNSAFE_PATH');
-    seen.add(entry.path.toLowerCase());
   }
   for (const required of REQUIRED_MATERIAL) if (!seen.has(required)) throw new Error('RECOVERY_REQUIRED_MATERIAL_MISSING');
   validateBindings(body);

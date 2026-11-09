@@ -14,7 +14,7 @@ import { createLiveRuntime } from '../modules/crossex/server/live-runtime.mjs';
 import { acquireRecoveryLocks, acquireRuntimeLock } from '../server/recovery/lifecycle-lock.mjs';
 import { createBackup } from '../server/recovery/backup.mjs';
 import { restoreBackup, admitHandoff } from '../server/recovery/restore.mjs';
-import { authenticate, decryptFile } from '../server/recovery/crypto.mjs';
+import { authenticate, canonical, decryptFile, encryptFile, fileHash, hash } from '../server/recovery/crypto.mjs';
 import { MODULES, openSourceDatabase, readLockedRegistry, readRegistry } from '../server/recovery/inventory.mjs';
 import { openNotificationStore } from '../modules/monitor/server/notification-store.mjs';
 import { openStore as openHynixAlertStore } from '../modules/monitor/server/alert-store.mjs';
@@ -71,6 +71,90 @@ async function setup(t, { pending = false } = {}) {
   return { root, source, sourceLock, backupOptions, dataKey, secretsKey, hub, config, restore, takeLock, writers, closeHub() { hub.close(); databases.splice(databases.indexOf(hub),1); } };
 }
 
+function authoritySnapshot(source) {
+  const db = openSourceDatabase(path.join(source, 'execution-control.sqlite'));
+  try {
+    return {
+      recovery: db.prepare("SELECT * FROM aw_meta WHERE key IN ('recovery_state','recovery_handoff') ORDER BY key").all(),
+      owners: db.prepare('SELECT * FROM aw_owners ORDER BY owner_id').all(),
+      accounts: db.prepare('SELECT * FROM aw_accounts ORDER BY account_key').all(),
+    };
+  } finally { db.close(); }
+}
+
+for (const kind of ['backup', 'handoff']) {
+  test(`${kind} rejects final manifest path collisions before publication or retirement`, async t => {
+    const cases = [
+      { name: 'synthetic root environment', files: ['_recovery/ROOT.env'], content: 'FIXTURE=original\n', rootEnvironment: { relativeName: 'root.env', content: Buffer.from('FIXTURE=external\n') } },
+      { name: 'synthetic Aster environment', files: ['modules/aster/.ENV'], content: 'ASTER_ALLOW_LIVE=1\n', aster: true },
+      { name: 'nested unknown files', files: ['modules/monitor/nested/deeper/Review.json', 'modules/monitor/nested/deeper/review.json'], content: '{"preserved":true}', posix: true },
+    ];
+    for (const scenario of cases) await t.test(scenario.name, { skip: scenario.posix && process.platform === 'win32' ? 'requires a case-sensitive filesystem in Linux CI' : false }, async t => {
+      const f = await setup(t);
+      if (scenario.aster) fs.unlinkSync(path.join(f.source, 'modules/aster/.env'));
+      for (const relative of scenario.files) {
+        const filename = path.join(f.source, relative);
+        fs.mkdirSync(path.dirname(filename), { recursive: true, mode: 0o700 });
+        fs.writeFileSync(filename, scenario.content, { flag: 'wx', mode: 0o600 });
+      }
+      // A stopped writer can leave an active owner and lease on disk. Neither
+      // row may be retired as a side effect of rejecting this checkpoint.
+      const db = new DatabaseSync(path.join(f.source, 'execution-control.sqlite'));
+      const owner = db.prepare('SELECT owner_id FROM aw_owners LIMIT 1').get().owner_id;
+      db.prepare("UPDATE aw_owners SET status='active' WHERE owner_id=?").run(owner);
+      db.prepare('INSERT INTO aw_accounts VALUES (?,?,?,?,?,?,?)').run('fixture-account', 'binance', 'mainnet', 'hub', owner, 7, 123456);
+      db.close();
+      const before = authoritySnapshot(f.source);
+      const options = { ...f.backupOptions, kind, ...(scenario.rootEnvironment ? { rootEnvironment: scenario.rootEnvironment } : {}),
+        ...(scenario.aster ? { environment: { ASTER_CAPACITY_RELAY_CA_FILE: path.join(f.source, 'modules/aster/cert.pem') } } : {}) };
+      await assert.rejects(createBackup(options), /RECOVERY_MANIFEST_INVALID/);
+      assert.deepEqual(authoritySnapshot(f.source), before);
+      assert.equal(readRegistry(f.source).state.state, 'normal');
+      assert.equal(readRegistry(f.source).handoff, null);
+      assert.equal(fs.existsSync(f.backupOptions.destination), false);
+      assert.deepEqual(fs.readdirSync(f.root).filter(name => name.includes('.incomplete-')), []);
+      for (const relative of scenario.files) assert.equal(fs.readFileSync(path.join(f.source, relative), 'utf8'), scenario.content);
+    });
+  });
+}
+
+async function addLegacyCollision(f) {
+  const filename = path.join(f.backupOptions.destination, 'manifest.json');
+  const document = JSON.parse(fs.readFileSync(filename));
+  const original = document.body.entries.find(entry => entry.path === 'modules/monitor/nested/deeper/state.json');
+  const entry = { ...original, path: 'modules/monitor/nested/deeper/STATE.json' };
+  const payload = path.join(f.backupOptions.destination, entry.category, document.body.entries.length + '.gcm');
+  await encryptFile(path.join(f.source, original.path), payload, f.secretsKey, document.body.checkpointId, entry, () => {});
+  entry.payloadSha256 = await fileHash(payload);
+  document.body.entries.push(entry);
+  const legacy = authenticate(document.body, f.dataKey, f.secretsKey);
+  fs.writeFileSync(filename, JSON.stringify(legacy));
+  return legacy;
+}
+
+test('restore still rejects an authenticated legacy collision archive before writing recovery state', async t => {
+  const f = await setup(t); await createBackup(f.backupOptions); await addLegacyCollision(f);
+  await assert.rejects(f.restore('legacy-collision'), /RECOVERY_MANIFEST_INVALID/);
+  assert.deepEqual(fs.readdirSync(path.join(f.root, 'legacy-collision')).filter(name => !['.runtime.lock', '.api.lock'].includes(name)), []);
+});
+
+test('resuming a legacy collision handoff preserves its sealed payload and retired source without publishing', async t => {
+  const f = await setup(t); await createBackup({ ...f.backupOptions, kind: 'handoff' });
+  const legacy = await addLegacyCollision(f), record = readRegistry(f.source).handoff;
+  record.manifestHash = hash(canonical(legacy));
+  const db = new DatabaseSync(path.join(f.source, 'execution-control.sqlite'));
+  db.prepare("UPDATE aw_meta SET value=? WHERE key='recovery_handoff'").run(JSON.stringify(record)); db.close();
+  const pending = path.join(f.root, '.backup.incomplete-' + record.checkpointId);
+  fs.renameSync(f.backupOptions.destination, pending);
+  const before = authoritySnapshot(f.source), manifest = fs.readFileSync(path.join(pending, 'manifest.json'));
+  await assert.rejects(createBackup({ ...f.backupOptions, kind: 'handoff' }), /RECOVERY_MANIFEST_INVALID/);
+  assert.deepEqual(authoritySnapshot(f.source), before);
+  assert.equal(readRegistry(f.source).state.state, 'retired');
+  assert.equal(fs.existsSync(f.backupOptions.destination), false);
+  assert.deepEqual(fs.readFileSync(path.join(pending, 'manifest.json')), manifest);
+  for (const [index, entry] of legacy.body.entries.entries()) assert.equal(await fileHash(path.join(pending, entry.category, index + '.gcm')), entry.payloadSha256);
+});
+
 test('cold encrypted backup covers nested modules and WAL; restoration revokes sessions, preserves UNKNOWN and quarantines new authority', async t => {
   const f = await setup(t, { pending: true }); const before = readRegistry(f.source); assert.ok(fs.statSync(path.join(f.source,'hub.sqlite-wal')).size > 0);
   await createBackup({ ...f.backupOptions, rootEnvironment: { content: Buffer.from('ROOT_SECRET=external-fixture\n'), relativeName: 'root.env' } });
@@ -101,7 +185,9 @@ test('archive traversal, same encryption keys, hardlinks, limits and forged lock
   await assert.rejects(createBackup({...f.backupOptions,secretsKey:f.dataKey}),/KEYS_INVALID/);
   await assert.rejects(createBackup({...f.backupOptions,lock:{assertHeld(){}}}),/RUNTIME_LOCK_LOST/);
   // The runtime lock alone does not prove that no API process is alive.
-  const empty = fs.mkdtempSync(path.join(f.root, 'runtime-only-')); fs.chmodSync(empty, 0o700); const runtimeOnly = await acquireRuntimeLock({ dataDir: empty });
+  const empty = fs.mkdtempSync(path.join(f.root, 'runtime-only-')); fs.chmodSync(empty, 0o700);
+  if (process.platform === 'win32') { const secured = spawnSync(process.env.PYTHON || 'python', ['-I', fileURLToPath(new URL('./test_lifecycle_lock.py', import.meta.url)), '--secure-dir', empty]); assert.equal(secured.status, 0, secured.stderr?.toString()); }
+  const runtimeOnly = await acquireRuntimeLock({ dataDir: empty });
   try { await assert.rejects(createBackup({...f.backupOptions,dataDir:empty,lock:runtimeOnly}),/RUNTIME_LOCK_LOST/); } finally { await runtimeOnly.close(); }
   await assert.rejects(createBackup({...f.backupOptions,maxBytes:32}),/LIMIT_EXCEEDED/);
   await assert.rejects(createBackup({...f.backupOptions,destination:path.join(f.source,'nested')}),/OVERLAP/);

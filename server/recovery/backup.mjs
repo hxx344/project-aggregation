@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync, backup } from 'node:sqlite';
 import { authenticate, canonical, encryptFile, fileHash, hash, keys, verify } from './crypto.mjs';
 import { assertLifecycleLock } from './lifecycle-lock.mjs';
-import { ASTER_ENV, budget, category, MODULES, checkpointEvidence, checkpointSourceDatabase, databaseEvidence, discoverPathBindings, identity, inventory, openLockedSourceDatabase, tables, readLockedRegistry, readRegistry, REGISTRY, safePath, syncDirectory, within, writeJson } from './inventory.mjs';
+import { ASTER_ENV, budget, category, MODULES, checkpointEvidence, checkpointSourceDatabase, databaseEvidence, discoverPathBindings, identity, inventory, openLockedSourceDatabase, tables, readLockedRegistry, readRegistry, REGISTRY, safePath, syncDirectory, uniqueEntryPaths, within, writeJson } from './inventory.mjs';
 import { checkCredentialMaterial, validateCredentials } from './credentials.mjs';
 
 export function registryTransaction(dataDir, action) {
@@ -38,6 +38,7 @@ export async function createBackup(options) {
     if (fs.statSync(manifestFile).size > 8 * 1024 * 1024) throw new Error('RECOVERY_MANIFEST_INVALID');
     const document = JSON.parse(fs.readFileSync(manifestFile, 'utf8')); const body = verify(document, dataKey, secretsKey);
     if (hash(canonical(document)) !== record.manifestHash || body.checkpointId !== record.checkpointId || body.handoffId !== record.handoffId || !Array.isArray(body.entries) || body.entries.length > limits.maxFiles) throw new Error('RECOVERY_HANDOFF_SOURCE_MISMATCH');
+    uniqueEntryPaths(body.entries);
     for (let i = 0; i < body.entries.length; i++) { const entry = body.entries[i]; limits.add(entry.size); if (!['data','secrets'].includes(entry.category) || await fileHash(safePath(path.join(directory, entry.category, i + '.gcm')), limits.check) !== entry.payloadSha256) throw new Error('RECOVERY_HASH_MISMATCH'); }
     limits.check(); if (directory === pending) { fs.renameSync(pending, target); syncDirectory(path.dirname(target)); }
     return { checkpointId: body.checkpointId, handoffId: body.handoffId, kind, destination: target, files: body.entries.length, bytes: body.entries.reduce((n,e) => n + e.size, 0), sourceState: 'retired', resumed: true, restorable: null, unresolvedDependencyCount: 0, unresolvedDependencies: [] };
@@ -102,6 +103,7 @@ export async function createBackup(options) {
       await encryptFile(staged, payload, secretsKey, checkpointId, entry, limits.check); entry.payloadSha256 = await fileHash(payload, limits.check); fs.rmSync(staged); entries.push(entry);
     }
     limits.check();
+    uniqueEntryPaths(entries);
     const body = { schemaVersion: 1, protocol: 'cold-checkpoint-v1', checkpointId, kind, ...(handoffId ? { handoffId } : {}), sourceAuthorityId: registry.state.authorityId, registryId: registry.registryId, sourceIdentity: registry.identity, sourceMarker: registry.marker, commit, startedAt, completedAt: new Date().toISOString(), modules: MODULES, safety, pathBindings: dependencies.pathBindings, unresolvedDependencies: dependencies.unresolvedDependencies, entries };
     const manifest = authenticate(body, dataKey, secretsKey);
     fs.rmSync(plain, { recursive: true });

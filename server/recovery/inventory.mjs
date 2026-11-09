@@ -17,6 +17,17 @@ export function safeRelative(value) {
   if (typeof value !== 'string' || !value || value.length > 1024 || value.includes('\\') || value.includes(':') || /[\x00-\x1f\x7f]/.test(value) || value.split('/').some(p => !p || p === '.' || p === '..' || /[. ]$/.test(p) || /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(p)) || path.isAbsolute(value)) throw new Error('RECOVERY_UNSAFE_PATH');
   return value;
 }
+// Schema 1 restore treats complete entry paths as case-insensitive. Producers
+// must check the final set, including synthesized entries, before sealing it.
+export function uniqueEntryPaths(entries) {
+  const seen = new Set();
+  for (const entry of entries) {
+    const key = safeRelative(entry.path).toLowerCase();
+    if (seen.has(key)) throw new Error('RECOVERY_MANIFEST_INVALID');
+    seen.add(key);
+  }
+  return seen;
+}
 export function safePath(filename, { missing = false, directory = false } = {}) {
   const full = path.resolve(filename); let current = path.parse(full).root;
   if (/^(?:\\\\|\/\/)/.test(full) || (process.platform === 'win32' && full.slice(2).includes(':'))) throw new Error('RECOVERY_UNSAFE_PATH');

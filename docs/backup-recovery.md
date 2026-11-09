@@ -62,7 +62,7 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 | --- | --- |
 | 已知模块目录下未声明的新文件（含新 SQLite、层级不同的同名文件） | 归 `secrets`，照常备份与恢复。前提与其它文件相同：名字命中排除规则（锁、WAL/SHM、临时文件等）的不备份；SQLite 须通过完整性检查（`RECOVERY_DATABASE_INTEGRITY`）；`.json` 恢复时须是合法 JSON（`RECOVERY_JSON_INVALID`） |
 | `modules/` 下未知模块目录 | 备份拒绝（`RECOVERY_UNKNOWN_MODULE`） |
-| 只有大小写不同的两条路径并存 | 备份成功，恢复拒绝（`RECOVERY_MANIFEST_INVALID`）；备份时尚未拦截，待修复项见[演进计划 E6](evolution-plan.md#e6-模块数据声明s6) |
+| 完整清单中有两条仅大小写不同的路径（含合成环境条目） | 备份与交接在封存清单、发布归档及退役源端前拒绝（`RECOVERY_MANIFEST_INVALID`），不改写原文件或退役保护状态；恢复仍拒绝旧碰撞包 |
 | 共享保护库或其 `.required` 标记缺失或改名 | 备份与交接失败（`RECOVERY_FAILED`，读取注册表时即中止）；恢复拒绝（`RECOVERY_REQUIRED_MATERIAL_MISSING`） |
 | `hub.sqlite` 或 `credentials.key` 缺失或改名 | 备份与恢复都拒绝（`RECOVERY_REQUIRED_MATERIAL_MISSING`） |
 | `modules/crossex/crossex.sqlite` 或 `modules/aster/trading.sqlite3` 缺失或改名 | 普通备份成功（新名字归 `secrets`），交接和恢复在检查点证据阶段拒绝（`RECOVERY_CHECKPOINT_LIMIT_OR_INVALID`） |
@@ -74,6 +74,8 @@ inventory 递归覆盖实际数据根，并保留模块目录中的未知普通�
 | 清单条目类别与当前声明不同 | `RECOVERY_MANIFEST_INVALID` |
 
 路径的类别属于备份清单 schema 1 的一部分：恢复要求每个条目的类别等于当前声明给出的类别，因此新增、删除或改动任何 `data` 路径都会使包含该路径的旧备份无法恢复（反向同理）。当前支持范围是 manifest schema 1 及其固定的类别集合，`tests/recovery-data-catalog.test.mjs` 锁定该集合；调整类别必须先引入新的清单版本，并让旧版本备份继续按 schema 1 的类别校验。两类分别使用独立密钥进行 AES-256-GCM 加密，manifest 同时用两把密钥认证，关联固定发布提交、检查点、文件明文与密文摘要、大小和分类。成功制作只表示归档完成；返回 `restorable: null` 不等于已完成独立恢复验收。
+
+诊断已有碰撞包时，可离线读取其 `manifest.json` 的 `body.entries[].path`，按 JavaScript `toLowerCase()` 对完整路径分组，检查同组是否有多条记录；不要输出或上传密钥及密文内容。单独读取 JSON 不证明认证有效，正式恢复仍先用两把密钥验证清单。不要编辑清单、丢弃或改名归档条目来绕过拒绝，文件路径也参与密文认证。旧交接若已封存并退役，恢复发布同样拒绝碰撞，但保留唯一 sealed 载荷和 retired 状态；不得删除保护库或手动改回 normal。原源尚为 normal 时，由管理员核清重复文件用途后再处理源数据，并重新制作、独立验收备份。
 
 排除的可再生材料包括 `.runtime.lock`、`.api.lock`、模块进程锁、socket、临时文件、已被数据库快照吸收的 WAL/SHM 和旧恢复控制文件。符号链接、硬链接、特殊文件、不安全权限及路径越界直接拒绝，不会通过改名为排除项而放过。
 

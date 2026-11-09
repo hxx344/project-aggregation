@@ -1084,6 +1084,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **同轮整包补充：** 真实五模块 CI 在根行为测试无失败后发现，从未创建任务的 Greeks 不落 `engine_state.json`。备份本来没有该固定文件时，允许恢复到 quarantine 并保留缺证，不合成空日志；handoff/admit 仍拒绝。已列入 manifest 的材料丢失、现有 JSON 或 schema 损坏继续拒绝。验证使用实际发布包演练和 [缺证/丢密文回归](tests/recovery-backup.test.mjs)，不能为了让新安装夹具通过而将所有缺文件都解释为新库。
 
+**完整清单路径补充（#274，2026-11-09）：** 基线 `98db5da` 的备份生成器逐项纳入大小写不同的路径，而恢复按完整路径的小写值去重；合成根环境和 ASTER 环境条目也可能形成碰撞。交接因此可能先退役源端，恢复才拒绝。生成端须在全部合成条目追加后、认证封存和退役之前，复用恢复端的路径集合检查；历史已封存包恢复发布也先检查，拒绝后保留 retired 与唯一载荷，不自动解锁。不能只在目录遍历中去重，也不能把全部恢复条件强加给允许保存未决事实的普通备份。`tests/recovery-backup.test.mjs` 覆盖普通备份/交接的真实嵌套文件与合成路径碰撞、原文件和 authority/owner/fence/lease 不变、旧认证包拒绝及旧 sealed 恢复发布保护；Windows 原生已复现合成碰撞和恢复发布的旧行为，真实双文件大小写敏感场景由非 WSL Linux CI 验证。事件沿用 `recovery-manifest-casefold-collision`，未确认生产事故，不推进历史复盘检查点。
+
 ### L064：托管发送才要求持久原批次，未托管路径保持原契约
 
 **适用条件：** 同一发送入口同时服务已启用的共享账户写入器与尚未启用的旧路径，例如 Aster 配对 [发送](modules/aster/trading/pair_execution.py) `_dispatch`。
