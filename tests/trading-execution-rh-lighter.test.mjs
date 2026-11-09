@@ -159,7 +159,7 @@ test('native Lighter position identity gates risk-reduction planning and never r
       assert.ok(result.jobId);
       assert.equal(result.live.met, true);
       assert.deepEqual(result.live.legs.find(leg => leg.exchange === 'rh-lighter'), {
-        exchange: 'rh-lighter', symbol: 'ANTHROPIC', side: 'long', quantity: '10', distancePercent: '5', met: true,
+        exchange: 'rh-lighter', symbol: 'ANTHROPIC', side: 'long', quantity: '10', riskAt: new Date(f.time).toISOString(), distancePercent: '5', met: true,
       });
       const job = JSON.parse(f.db.prepare('SELECT json FROM execution_jobs WHERE id=?').get(result.jobId).json);
       assert.equal(job.plan.legs.find(leg => leg.exchange === 'rh-lighter').quantity, '5');
