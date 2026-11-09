@@ -203,6 +203,7 @@ jobs:
       - name: Check release download, integrity, extraction and cache boundaries
         run: |
           python3 deploy/test-release.py -v
+          python3 deploy/test-install-decisions.py -v
           python3 deploy/test-source-fetch.py -v
           sudo python3 deploy/test-release-download.py -v
           sudo python3 deploy/test-release-mirror.py -v

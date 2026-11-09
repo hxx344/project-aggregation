@@ -136,10 +136,10 @@ for bad in '' '{' '[]' '{"slot":"c","release":"/x"}' '{"slot":"a","release":"x"}
   if read_slot_record >/dev/null 2>&1; then echo "Accepted the slot record $bad" >&2; exit 1; fi
 done
 rm "$APP_DIR/.api-slot"; if read_slot_record >/dev/null; then echo 'Accepted a missing slot record' >&2; exit 1; fi
-write_cutover a b "$release" draining; [[ "$(read_cutover)" == "a b $release draining" ]]
+write_cutover a b "$release" draining; [[ "$(install_decide cutover-record "$APP_DIR/.api-cutover")" == "a b $release draining" ]]
 for bad in '{"from":"a","to":"a","release":"/x","phase":"candidate"}' '{"from":"a","to":"b","release":"/x","phase":"done"}' '{"from":"a","to":"b","phase":"candidate"}'; do
   printf '%s' "$bad" > "$APP_DIR/.api-cutover"
-  if read_cutover >/dev/null 2>&1; then echo "Accepted the cutover $bad" >&2; exit 1; fi
+  if install_decide cutover-record "$APP_DIR/.api-cutover" >/dev/null 2>&1; then echo "Accepted the cutover $bad" >&2; exit 1; fi
 done
 rm "$APP_DIR/.api-cutover"
 cp "$UNIT_FILE" "$test_root/unit.saved"; cp "$APP_DIR/.runtime-deployment" "$test_root/deployment.saved"

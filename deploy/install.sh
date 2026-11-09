@@ -1271,6 +1271,188 @@ CI_EXTRACT_PY
 log() { printf '[project-aggregation] %s\n' "$*"; }
 fail() { log "错误：$*" >&2; return 1; }
 hash() { sha256sum | cut -d ' ' -f 1; }
+# BEGIN INSTALL DECISIONS -- keep the heredoc identical to deploy/install-decisions.py
+# Decisions on the installer's own records (docs/evolution-plan.md E4); see that file.
+install_decide() {
+  python3 -I - "$@" <<'INSTALL_DECISIONS_PY'
+"""Decisions of deploy/install.sh on its own activation records (docs/evolution-plan.md E4).
+
+install.sh embeds this file verbatim as the heredoc of install_decide, so it
+arrives and is verified with the installer itself: a first install has it, and
+an update runs the target version's copy, never one an older installer left.
+deploy/test-install-decisions.py checks that the embedded copy is identical.
+
+Each command reads only the installer's records and release markers under the
+installation directory, and prints its decision on one line. The shell keeps
+every system call, link and record write. Exit status 1 means an absent or
+invalid record, as the shell functions it replaced returned; 2 a usage error.
+"""
+import json
+import os
+import re
+import sys
+
+SLOTS = ('a', 'b')
+PHASES = ('candidate', 'switching', 'draining')
+INTENTS = ('forward', 'rollback', 'legacy')
+SCOPES = ('full', 'api')
+ABSOLUTE = re.compile(r'/\S+')
+RELEASE_NAME = re.compile(r'[a-f0-9]{12}-[a-f0-9]{16}')
+
+
+class Invalid(Exception):
+    """An absent or malformed record."""
+
+
+def load_json(path):
+    try:
+        with open(path, encoding='utf-8') as stream:
+            return json.load(stream)
+    except (OSError, ValueError) as error:
+        raise Invalid(path) from error
+
+
+def slot_record(path):
+    """(slot, release) of .api-slot."""
+    if not os.path.isfile(path):
+        raise Invalid(path)
+    value = load_json(path)
+    if not isinstance(value, dict) or value.get('slot') not in SLOTS or not isinstance(value.get('release'), str) or \
+            not ABSOLUTE.fullmatch(value['release']):
+        raise Invalid(path)
+    return value['slot'], value['release']
+
+
+def cutover_record(path):
+    """from, to, release, phase and, from journals that carry them, intent and previous of .api-cutover."""
+    value = load_json(path)
+    if not isinstance(value, dict) or {value.get('from'), value.get('to')} != set(SLOTS) or \
+            not isinstance(value.get('release'), str) or not ABSOLUTE.fullmatch(value['release']) or \
+            value.get('phase') not in PHASES:
+        raise Invalid(path)
+    record = {key: value[key] for key in ('from', 'to', 'release', 'phase')}
+    if 'intent' in value or 'previous' in value:
+        if value.get('intent') not in INTENTS or not isinstance(value.get('previous'), str) or \
+                not re.fullmatch(r'-|/\S+', value['previous']):
+            raise Invalid(path)
+        record.update(intent=value['intent'], previous=value['previous'])
+    return record
+
+
+def cutover_resolution(cutover, recorded):
+    """What happens to a cutover an earlier run left behind (design doc api-dual-slot 3.5).
+
+    It continues when the slot record already names its target, or when it is
+    a rollback, which is journaled before its target is probed or moved. Any
+    other switch never committed, so its candidate slot stops. Journals from
+    before the intent field cannot tell a forward switch from a rollback: they
+    are legacy and keep the previous pointer as it is.
+    """
+    intent = cutover.get('intent', 'legacy')
+    resume = recorded == (cutover['to'], cutover['release']) or intent == 'rollback'
+    fields = ['resume' if resume else 'abandon', cutover['to'], cutover['release'], cutover['phase'], intent]
+    if 'previous' in cutover:
+        fields.append(cutover['previous'])
+    return fields
+
+
+def read_fields(path):
+    """The fields `read -r` assigns from the first line of a file, or None where it fails.
+
+    read fails on a file that cannot be opened or that ends before a newline,
+    drops NUL bytes, and separates fields by runs of spaces and tabs.
+    """
+    try:
+        with open(path, 'rb') as stream:
+            line = stream.readline()
+    except OSError:
+        return None
+    if not line.endswith(b'\n'):
+        return None
+    line = line[:-1].replace(b'\0', b'').decode('utf-8', 'surrogateescape')
+    return [field for field in re.split(r'[ \t]+', line) if field]
+
+
+def managed_release(path, app_dir):
+    """A release directory this installer created."""
+    return path.startswith(app_dir + '/releases/') and RELEASE_NAME.fullmatch(path.rsplit('/', 1)[-1]) is not None and \
+        os.path.isdir(path) and not os.path.islink(path) and os.path.isfile(path + '/.managed-release')
+
+
+def pending_previous(app_dir, release, old_release):
+    """How .pending-previous "<target> <previous|-> <scope>" applies to this run.
+
+    Full and single-API activations write it before they move current and
+    remove it once their bookkeeping is durable. none: there is no record.
+    resume: current already is this run's release, so this run finishes the
+    interrupted activation with its scope and rollback release. inherit: this
+    run replaces the unfinished release; the record is its only rollback
+    pointer, and a rollback of this run writes it back (#191). ignore: the
+    record names another release.
+    """
+    path = app_dir + '/.pending-previous'
+    if not os.path.exists(path):
+        return ['none']
+    fields = read_fields(path)
+    if fields is None or len(fields) != 3 or fields[2] not in SCOPES:
+        raise Invalid(path)
+    target, previous, scope = fields
+    if not managed_release(target, app_dir) or (previous != '-' and not managed_release(previous, app_dir)):
+        raise Invalid(path)
+    if target == release and old_release == release:
+        return ['resume', previous, scope]
+    if target == old_release:
+        return ['inherit', target, previous, scope]
+    return ['ignore']
+
+
+def first_install_resume(app_dir, old_release):
+    """resume when a first install stopped after it moved current (#185), keep otherwise.
+
+    Only that install's own record "<current> -" is left: no run ever
+    succeeded (.deployed-state is written only by one and never removed), no
+    environment snapshot or previous release exists and no cutover started.
+    """
+    pending = app_dir + '/.pending-previous'
+    if not old_release or os.path.exists(app_dir + '/.last-successful.env') or os.path.exists(app_dir + '/.deployed-state') or \
+            not os.path.isfile(pending) or os.path.islink(app_dir + '/previous') or os.path.exists(app_dir + '/.api-cutover'):
+        return ['keep']
+    fields = read_fields(pending)
+    # As before, the scope is not checked; a fourth field is.
+    if fields is None or len(fields) > 3 or fields[:2] != [old_release, '-']:
+        return ['keep']
+    return ['resume']
+
+
+def cutover_fields(path):
+    return list(cutover_record(path).values())
+
+
+COMMANDS = {
+    'slot-record': (1, lambda path: list(slot_record(path))),
+    'cutover-record': (1, cutover_fields),
+    'cutover-resolution': (2, lambda cutover, slot: cutover_resolution(cutover_record(cutover), slot_record(slot))),
+    'pending-previous': (3, pending_previous),
+    'first-install-resume': (2, first_install_resume),
+}
+
+
+def main(argv):
+    if not argv or argv[0] not in COMMANDS or len(argv) - 1 != COMMANDS[argv[0]][0]:
+        print(f'usage: install_decide {"|".join(COMMANDS)} ARGUMENTS', file=sys.stderr)
+        return 2
+    try:
+        print(*COMMANDS[argv[0]][1](*argv[1:]))
+    except Invalid:
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+INSTALL_DECISIONS_PY
+}
+# END INSTALL DECISIONS
 node_supported() {
   "$1" -e 'const [a,b] = process.versions.node.split(".").map(Number); process.exit(a === 24 && b >= 15 ? 0 : 1)' >/dev/null 2>&1
 }
@@ -2691,43 +2873,11 @@ target_layout() {
   fi
 }
 # "slot release" of a valid .api-slot; fails without one.
-read_slot_record() {
-  [[ -f "$APP_DIR/.api-slot" ]] || return 1
-  python3 -I - "$APP_DIR/.api-slot" <<'SLOT_RECORD_PY'
-import json, re, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as stream:
-        value = json.load(stream)
-except (OSError, ValueError):
-    sys.exit(1)
-if not isinstance(value, dict) or value.get('slot') not in ('a', 'b') or not isinstance(value.get('release'), str) or not re.fullmatch(r'/\S+', value['release']):
-    sys.exit(1)
-print(value['slot'], value['release'])
-SLOT_RECORD_PY
-}
+read_slot_record() { [[ -f "$APP_DIR/.api-slot" ]] && install_decide slot-record "$APP_DIR/.api-slot"; }
 write_slot_record() { atomic_record "$APP_DIR/.api-slot" "{\"slot\":\"$1\",\"release\":\"$2\"}"; }
-# "from to release phase [intent previous]" of .api-cutover. The optional
-# fields retain the direction and the rollback pointer before the switch.
-read_cutover() {
-  python3 -I - "$APP_DIR/.api-cutover" <<'CUTOVER_PY'
-import json, re, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as stream:
-        value = json.load(stream)
-except (OSError, ValueError):
-    sys.exit(1)
-if not isinstance(value, dict) or {value.get('from'), value.get('to')} != {'a', 'b'} or not isinstance(value.get('release'), str) or \
-        not re.fullmatch(r'/\S+', value['release']) or value.get('phase') not in ('candidate', 'switching', 'draining'):
-    sys.exit(1)
-fields = [value[key] for key in ('from', 'to', 'release', 'phase')]
-if 'intent' in value or 'previous' in value:
-    if value.get('intent') not in ('forward', 'rollback', 'legacy') or not isinstance(value.get('previous'), str) or \
-            not re.fullmatch(r'-|/\S+', value['previous']):
-        sys.exit(1)
-    fields.extend((value['intent'], value['previous']))
-print(*fields)
-CUTOVER_PY
-}
+# .api-cutover carries from, to, release and phase; intent and previous retain
+# the direction and the rollback pointer before the switch (install_decide
+# cutover-record reads it).
 write_cutover() {
   local context=
   if [[ -n "${5:-}" ]]; then context=",\"intent\":\"$5\",\"previous\":\"$6\""; fi
@@ -2869,15 +3019,14 @@ api_cutover_rollback() {
 # A cutover an earlier run left behind (design doc 3.5): forward when the
 # record already names its target, otherwise back to the recorded slot.
 resolve_cutover() {
-  local cutover recorded from to target phase intent previous
+  local decision action to target phase intent previous
   resumed_cutover_release=
   [[ -e "$APP_DIR/.api-cutover" ]] || return 0
-  cutover=$(read_cutover) && recorded=$(read_slot_record) || return 1
-  read -r from to target phase intent previous <<< "$cutover"
-  # Old journals cannot distinguish a forward switch from a rollback. Keep
-  # the existing previous rather than guessing from a possibly failed source.
-  intent=${intent:-legacy}
-  if [[ "$recorded" == "$to $target" || "$intent" == rollback ]]; then
+  # Fails on an invalid journal or slot record. A legacy journal has no
+  # previous, and api_cutover then keeps the existing previous pointer.
+  decision=$(install_decide cutover-resolution "$APP_DIR/.api-cutover" "$APP_DIR/.api-slot") || return 1
+  read -r action to target phase intent previous <<< "$decision"
+  if [[ "$action" == resume ]]; then
     log "上次的 API 槽切换（$phase，$intent）继续完成。"
     if systemctl is-active --quiet "$(slot_unit "$to")"; then
       api_cutover "$to" "$target" 3 "$intent" "$previous" || return 1
@@ -3035,20 +3184,18 @@ activation_scope() {
 # recover that identity after an interruption. A failed activation drops the
 # record it wrote itself (drop_pending_previous).
 restore_pending_previous() {
-  local target previous scope extra
+  local decision action previous scope
   pending_activation_scope=
-  [[ -e "$APP_DIR/.pending-previous" ]] || return 0
-  read -r target previous scope extra < "$APP_DIR/.pending-previous" || return 1
-  [[ -z "$extra" && ( "$scope" == full || "$scope" == api ) ]] || return 1
-  managed_release "$target" >/dev/null || return 1
-  [[ "$previous" == - ]] || managed_release "$previous" >/dev/null || return 1
-  if [[ "$target" == "$release" && "$old_release" == "$release" ]]; then
+  # Fails on an invalid record (install_decide pending-previous).
+  decision=$(install_decide pending-previous "$APP_DIR" "$release" "$old_release") || return 1
+  read -r action previous scope <<< "$decision"
+  if [[ "$action" == resume ]]; then
     previous_release=${previous#-}
     pending_activation_scope=$scope
-  elif [[ "$target" == "$old_release" ]]; then
+  elif [[ "$action" == inherit ]]; then
     # Another release replaces the unfinished one and overwrites the record.
     # A rollback returns to the unfinished release, which still needs it (#191).
-    inherited_pending_previous="$target $previous $scope"
+    inherited_pending_previous=${decision#inherit }
   fi
 }
 # After a rollback restored current to where this run found it. A record this
@@ -3072,12 +3219,10 @@ drop_pending_previous() {
 # then removes the candidate's current link and units (the release directory
 # stays) like any failed first install (#185).
 resume_interrupted_first_install() {
-  local target previous scope extra
-  # .deployed-state is written only by a successful run and never removed.
-  [[ -n "$old_release" && ! -e "$APP_DIR/.last-successful.env" && ! -e "$APP_DIR/.deployed-state" &&
-     -f "$APP_DIR/.pending-previous" && ! -L "$APP_DIR/previous" && ! -e "$APP_DIR/.api-cutover" ]] || return 0
-  read -r target previous scope extra < "$APP_DIR/.pending-previous" || return 0
-  [[ "$target" == "$old_release" && "$previous" == - && -z "$extra" ]] || return 0
+  local decision
+  # Nothing has changed yet: a helper failure ends the run before any service does.
+  decision=$(install_decide first-install-resume "$APP_DIR" "$old_release") || { fail '无法判断上次首次安装是否中断；尚未改变服务。'; return 1; }
+  [[ "$decision" == resume ]] || return 0
   log '上次首次安装在切换版本后、保存配置快照前中断；按首次安装重试，失败时移除未完成版本的 current 链接和服务单元，版本目录、配置与数据保留。'
   first_install_candidate=$old_release
   old_release= previous_release=
