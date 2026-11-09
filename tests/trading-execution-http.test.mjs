@@ -142,7 +142,7 @@ test('automatic rule routes require a session, same Origin and CSRF, and saving 
   const config = { name: '', market: 'oil', exchange: 'binance', direction: 'short', openThreshold: '4', closeThreshold: '2', equalSize: '1', orderType: 'chase',
     confirmSamples: 3, maxOpensPerDay: 3, batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300_000 };
   const mutations = [[`${AUTO}/rules`, 'POST'], [`${AUTO}/rules/${rule}`, 'PUT'], [`${AUTO}/rules/${rule}`, 'DELETE'],
-    [`${AUTO}/rules/${rule}/enable`, 'POST'], [`${AUTO}/rules/${rule}/disable`, 'POST'], [`${AUTO}/rules/${rule}/reset`, 'POST']];
+    [`${AUTO}/rules/${rule}/enable`, 'POST'], [`${AUTO}/rules/${rule}/disable`, 'POST'], [`${AUTO}/rules/${rule}/reset`, 'POST'], [`${AUTO}/rules/${rule}/observe`, 'POST'], [`${AUTO}/rules/${rule}/live`, 'POST']];
   for (const [route, method] of [[AUTO, 'GET'], ...mutations]) assert.equal((await f.request(route, { method, ...(method === 'GET' ? {} : { body: {} }) })).status, 401);
   await f.login();
   for (const [route, method] of mutations) {
@@ -165,6 +165,13 @@ test('automatic rule routes require a session, same Origin and CSRF, and saving 
   assert.equal(removed.status, 200); assert.deepEqual(removed.data.rules, []);
   const state = await f.request(AUTO);
   assert.equal(state.status, 200); assert.equal(state.headers.get('cache-control'), 'no-store'); assert.equal(state.data.maintenance, false);
+  const observed = await f.request(`${AUTO}/rules`, { method: 'POST', body: { config, mode: 'observe', observing: true } });
+  assert.equal(observed.status, 201);
+  const o = observed.data.rules[0]; assert.equal(o.mode, 'observe'); assert.equal(o.enabled, false); assert.equal(o.observing, true);
+  assert.equal((await f.request(`${AUTO}/rules/${o.id}/enable`, { method: 'POST', body: { revision: o.revision, confirmLive: true } })).status, 409);
+  assert.equal((await f.request(`${AUTO}/rules/${o.id}/live`, { method: 'POST', body: { revision: o.revision } })).status, 400);
+  const converted = await f.request(`${AUTO}/rules/${o.id}/live`, { method: 'POST', body: { revision: o.revision, confirmLive: true } });
+  assert.equal(converted.status, 200); assert.equal(converted.data.rules[0].mode, 'live'); assert.equal(converted.data.rules[0].observing, false);
   assert.equal(f.calls.length, 0);
 });
 test('logout while an automatic rule body is still arriving saves nothing', async t => {
@@ -183,6 +190,7 @@ test('logout while an automatic rule body is still arriving saves nothing', asyn
   assert.equal(await status, 401);
   assert.equal(f.rows('SELECT * FROM execution_auto_rules').length, 0);
 });
+
 test('OKX execution connection requires a Passphrase, persists isolated mode and hides all credentials', async t => {
   const f = await fixture(t); await f.login();
   const live = { ...credentials('okx_exec'), passphrase: 'private_http_okx_passphrase' };

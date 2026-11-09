@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { decimal, compareDecimals } from './trading-decimal.mjs';
 import { ExecutionError, WaitError, exactKeys, normalizeIntent, units, fromUnits, QUOTE_MAX_AGE, MAX_BATCHES } from './trading-execution-plan.mjs';
 import { TRADING_EXCHANGES, TRADING_NAMES, EXECUTION_MARKETS } from './trading-markets.mjs';
@@ -113,7 +113,7 @@ export function evaluateRule(config, action, quotes, now) {
   const premiumPrice = sell ? premium.bid : premium.ask, basePrice = sell ? base.ask : base.bid;
   const limit = action === 'open' ? config.openThreshold : config.closeThreshold;
   const sign = compareSpread(spread, premiumPrice, basePrice, limit);
-  return { value: displaySpread(spread, premiumPrice, basePrice), met: sell ? sign >= 0 : sign <= 0, side: sell ? 'sell' : 'buy', sample: `${premium.at}|${base.at}`, at: [premium.at, base.at].sort()[0] };
+  return { value: displaySpread(spread, premiumPrice, basePrice), met: sell ? sign >= 0 : sign <= 0, side: sell ? 'sell' : 'buy', sample: `${premium.at}|${base.at}`, at: [premium.at, base.at].sort()[0], inputs: { premiumAt: premium.at, baseAt: base.at } };
 }
 const divCeil = (a, b) => (a + b - 1n) / b;
 const floorTick = (value, tick) => value - value % tick;
@@ -152,10 +152,14 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
   db.exec('CREATE TABLE IF NOT EXISTS execution_auto_rules (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, enabled INTEGER NOT NULL, created_at TEXT NOT NULL, config TEXT NOT NULL, state TEXT NOT NULL)');
   // Consecutive hits and the last reading are kept in memory only: after a
   // restart a rule must see its condition again on fresh books.
-  const live = new Map();
+  const live = new Map(), observed = new Map(), freshAfter = new Map();
   let closed = false, ticking = null;
   const day = () => dayFormat.format(now());
-  const parse = row => row && { id: row.id, revision: row.revision, enabled: !!row.enabled, createdAt: row.created_at, config: JSON.parse(row.config), state: JSON.parse(row.state) };
+  const parse = row => {
+    if (!row) return null;
+    const state = JSON.parse(row.state), mode = state.mode === 'observe' ? 'observe' : 'live';
+    return { id: row.id, revision: row.revision, enabled: mode === 'live' && !!row.enabled, mode, observing: mode === 'observe' && state.observing === true, createdAt: row.created_at, config: JSON.parse(row.config), state };
+  };
   const rows = () => stmt.prepare('SELECT * FROM execution_auto_rules ORDER BY created_at, rowid').all().map(parse);
   const ruleFor = id => { const rule = parse(stmt.prepare('SELECT * FROM execution_auto_rules WHERE id=?').get(id)); if (!rule) throw new ExecutionError(404, '自动规则不存在'); return rule; };
   const opensToday = state => state.opens?.day === day() ? state.opens.count : 0;
@@ -165,6 +169,20 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
   const disable = (id, state) => stmt.prepare('UPDATE execution_auto_rules SET enabled=0,revision=revision+1,state=? WHERE id=?').run(JSON.stringify(state), id);
   const transaction = operation => immediate(db, operation);
   const title = config => config.name || `${TRADING_NAMES[config.exchange]} ${EXECUTION_MARKETS[config.market].name}${config.direction === 'short' ? '做空' : '做多'}价差`;
+  const observationEvent = (state, message, fields = {}) => {
+    state.observation = { events: [...(state.observation?.events ?? []), { time: iso(now()), message, ...fields }].slice(-MAX_EVENTS) };
+  };
+  // Memory-only counters cannot survive a restart. Persist the reason, never the hits.
+  for (const rule of rows()) if (rule.mode === 'observe') {
+    freshAfter.set(rule.id, now());
+    if (rule.observing) { observationEvent(rule.state, '服务重启，连续次数已清零，等待新盘口', { kind: 'reset' }); saveState(rule.id, rule.state); }
+  }
+
+  function exposureSnapshot() {
+    const rules = rows().map(rule => ({ id: rule.id, title: title(rule.config), revision: rule.revision, enabled: rule.enabled, mode: rule.mode, observing: rule.observing, config: rule.config,
+      state: { phase: rule.state.phase, jobId: rule.state.jobId, held: rule.state.held, account: rule.state.account ?? null } }));
+    return { version: createHash('sha256').update(JSON.stringify(rules)).digest('hex'), rules };
+  }
 
   function liveView(reading) {
     const stale = !reading.note && reading.at && now() - Date.parse(reading.at) > QUOTE_MAX_AGE;
@@ -173,24 +191,30 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
   }
   function publicRule(rule) {
     const reading = live.get(rule.id);
-    return { id: rule.id, revision: rule.revision, enabled: rule.enabled, createdAt: rule.createdAt, title: title(rule.config), config: rule.config,
+    const observation = observed.get(rule.id);
+    return { id: rule.id, revision: rule.revision, enabled: rule.enabled, mode: rule.mode, observing: rule.observing, createdAt: rule.createdAt, title: title(rule.config), config: rule.config,
       spread: { label: SPREADS[rule.config.market].label, unit: SPREADS[rule.config.market].unit },
       state: { phase: rule.state.phase, jobId: rule.state.jobId, held: rule.state.held, opensToday: opensToday(rule.state), failures: rule.state.failures, retryAt: rule.state.retryAt, reason: rule.state.reason, events: rule.state.events },
-      live: reading ? liveView(reading) : null };
+      live: reading ? liveView(reading) : null,
+      observation: { open: observation?.open ? liveView(observation.open) : null, close: observation?.close ? liveView(observation.close) : null, note: observation?.note ?? null, events: rule.state.observation?.events ?? [] } };
   }
-  function view() { return { generatedAt: iso(now()), maintenance: !!readMaintenance(), rules: rows().map(publicRule) }; }
+  function view() { return { generatedAt: iso(now()), exposureVersion: exposureSnapshot().version, maintenance: !!readMaintenance(), rules: rows().map(publicRule) }; }
   function checkRevision(rule, revision) { if (!Number.isSafeInteger(revision) || rule.revision !== revision) throw new ExecutionError(409, '规则已被更新，请刷新后重试'); }
   function checkLive(body) { if (body.confirmLive !== true) throw new ExecutionError(400, '启用前请确认规则会自动实盘下单'); }
 
   function create(body) {
-    exactKeys(body, ['config', 'enabled', 'confirmLive']);
-    const config = normalizeRuleConfig(body.config), enabled = body.enabled === true;
+    exactKeys(body, ['config', 'enabled', 'confirmLive', 'mode', 'observing']);
+    const config = normalizeRuleConfig(body.config), enabled = body.enabled === true, mode = body.mode ?? 'live';
+    if (!['live', 'observe'].includes(mode) || body.observing !== undefined && typeof body.observing !== 'boolean') throw new ExecutionError(400, '规则模式无效');
+    if (mode === 'observe' && enabled || mode === 'live' && body.observing) throw new ExecutionError(400, '观察状态与实盘启用不能混用');
     if (body.enabled !== undefined && typeof body.enabled !== 'boolean') throw new ExecutionError(400, '启用状态无效');
     if (enabled) checkLive(body);
     return transaction(() => {
       if (rows().length >= MAX_RULES) throw new ExecutionError(409, `最多保存 ${MAX_RULES} 条自动规则`);
-      const state = emptyState(); event(state, enabled ? '规则已创建并启用' : '规则已创建，尚未启用');
-      stmt.prepare('INSERT INTO execution_auto_rules(id,revision,enabled,created_at,config,state) VALUES (?,?,?,?,?,?)').run(randomUUID(), 0, enabled ? 1 : 0, iso(now()), JSON.stringify(config), JSON.stringify(state));
+      const state = { ...emptyState(), mode, observing: mode === 'observe' && body.observing === true }, id = randomUUID();
+      event(state, enabled ? '规则已创建并启用' : '规则已创建，尚未启用实盘');
+      if (mode === 'observe') { observationEvent(state, state.observing ? '开始只观察，等待新盘口' : '观察规则已保存，尚未开始', { kind: 'reset' }); freshAfter.set(id, now()); }
+      stmt.prepare('INSERT INTO execution_auto_rules(id,revision,enabled,created_at,config,state) VALUES (?,?,?,?,?,?)').run(id, 0, enabled ? 1 : 0, iso(now()), JSON.stringify(config), JSON.stringify(state));
       return view();
     });
   }
@@ -202,24 +226,36 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
       if (['opening', 'closing'].includes(rule.state.phase)) throw new ExecutionError(409, '自动任务执行中，结束后再修改规则');
       if (rule.state.phase !== 'idle' && ['market', 'exchange', 'direction'].some(key => config[key] !== rule.config[key])) throw new ExecutionError(409, '规则持有仓位或待核对时，不能更改品种、交易所或方向');
       const state = { ...rule.state, failures: 0, retryAt: null }; event(state, '规则参数已更新');
+      if (rule.mode === 'observe') observationEvent(state, '规则参数已修改，连续次数已清零，等待新盘口', { kind: 'reset' });
       stmt.prepare('UPDATE execution_auto_rules SET revision=revision+1,config=?,state=? WHERE id=?').run(JSON.stringify(config), JSON.stringify(state), id);
       live.delete(id);
+      observed.delete(id); freshAfter.set(id, now());
       return view();
     });
   }
   function act(id, action, body) {
-    if (action === 'enable') exactKeys(body, ['revision', 'confirmLive']);
+    if (action === 'enable' || action === 'live') exactKeys(body, ['revision', 'confirmLive']);
     else if (action === 'reset') exactKeys(body, ['revision', 'acknowledge']);
     else exactKeys(body, ['revision']);
     return transaction(() => {
       const rule = ruleFor(id); checkRevision(rule, body.revision);
       const state = { ...rule.state };
-      if (action === 'enable') {
+      if (action === 'enable' || action === 'live') {
         checkLive(body);
+        if (rule.mode === 'observe' && action !== 'live') throw new ExecutionError(409, '观察规则须单独确认转为实盘');
+        if (action === 'live' && (rule.mode !== 'observe' || state.phase !== 'idle' || state.held || state.jobId)) throw new ExecutionError(409, '只有无持仓和任务的观察规则可以转为实盘');
         if (rule.state.phase === 'review') throw new ExecutionError(409, '上次自动任务未正常结束，请先核对仓位并重置规则');
-        Object.assign(state, { failures: 0, retryAt: null, reason: null }); event(state, '规则已启用');
+        Object.assign(state, { failures: 0, retryAt: null, reason: null, mode: 'live', observing: false }); event(state, action === 'live' ? '已单独确认转入实盘；观察计数作废，等待新盘口重新判断' : '规则已启用');
+        if (action === 'live') observationEvent(state, '已转为实盘，观察停止且连续次数清零', { kind: 'reset' });
         stmt.prepare('UPDATE execution_auto_rules SET revision=revision+1,enabled=1,state=? WHERE id=?').run(JSON.stringify(state), id);
+      } else if (action === 'observe') {
+        if (rule.enabled || state.phase !== 'idle' || state.held || state.jobId) throw new ExecutionError(409, '请先停用实盘并处理持仓及任务，再开始观察');
+        Object.assign(state, { mode: 'observe', observing: true });
+        observationEvent(state, '开始只观察，连续次数已清零，等待新盘口', { kind: 'reset' });
+        stmt.prepare('UPDATE execution_auto_rules SET revision=revision+1,enabled=0,state=? WHERE id=?').run(JSON.stringify(state), id);
       } else if (action === 'disable') {
+        state.observing = false;
+        if (rule.mode === 'observe') observationEvent(state, '观察已停止，连续次数已清零', { kind: 'reset' });
         event(state, ['opening', 'closing'].includes(state.phase) ? '规则已停用；执行中的任务继续，可在执行进度中停止' : '规则已停用');
         stmt.prepare('UPDATE execution_auto_rules SET revision=revision+1,enabled=0,state=? WHERE id=?').run(JSON.stringify(state), id);
       } else if (action === 'reset') {
@@ -235,6 +271,7 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
         stmt.prepare('UPDATE execution_auto_rules SET revision=revision+1,enabled=0,state=? WHERE id=?').run(JSON.stringify(state), id);
       } else throw new ExecutionError(404, '自动规则操作不存在');
       live.delete(id);
+      observed.delete(id); freshAfter.set(id, now());
       return view();
     });
   }
@@ -243,7 +280,7 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
     return transaction(() => {
       const rule = ruleFor(id); checkRevision(rule, body.revision);
       if (rule.state.phase !== 'idle') throw new ExecutionError(409, '规则持有仓位、执行中或待核对，不能删除；请先处理后重置');
-      stmt.prepare('DELETE FROM execution_auto_rules WHERE id=?').run(id); live.delete(id);
+      stmt.prepare('DELETE FROM execution_auto_rules WHERE id=?').run(id); live.delete(id); observed.delete(id); freshAfter.delete(id);
       return view();
     });
   }
@@ -305,14 +342,16 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
   async function trigger(rule, action, reading) {
     const trigger = `${SPREADS[rule.config.market].label} 可成交价差 ${reading.value.toFixed(4)}${SPREADS[rule.config.market].unit === '%' ? '%' : ''}，${action === 'open' ? '开仓' : '平仓'}阈值 ${action === 'open' ? rule.config.openThreshold : rule.config.closeThreshold}，连续 ${rule.config.confirmSamples} 次满足`;
     try {
+      const eligible = ruleFor(rule.id);
+      if (closed || readMaintenance() || eligible.mode !== 'live' || !eligible.enabled || eligible.revision !== rule.revision) throw new SkippedError('规则或运行状态已变化，本次未触发');
       const accounts = action === 'close' ? { [rule.config.exchange]: rule.state.account.revision } : null;
       await admit(() => execution.startAutomatic(intentFor(rule.config, action, rule.state.held), { auto: { ruleId: rule.id, action, trigger, guard: rule.config }, accounts, check: books => {
         const fresh = evaluateRule(rule.config, action, books, now());
         if (fresh.error || !fresh.met) throw new ThresholdMovedError(fresh.error ? `下单前复核盘口：${fresh.error}` : '下单前复核盘口：可成交价差已不满足阈值');
       }, commit: jobId => {
-        if (closed) throw new SkippedError('服务正在停止，本次未触发');
+        if (closed || readMaintenance()) throw new SkippedError('服务停止或更新中，本次未触发');
         const current = ruleFor(rule.id);
-        if (current.revision !== rule.revision || !current.enabled || current.state.phase !== rule.state.phase) throw new SkippedError('规则已变化，本次未触发');
+        if (current.revision !== rule.revision || current.mode !== 'live' || !current.enabled || current.state.phase !== rule.state.phase) throw new SkippedError('规则已变化，本次未触发');
         if (action === 'open' && opensToday(current.state) >= current.config.maxOpensPerDay) throw new ExecutionError(409, '今日开仓次数已达上限');
         const state = { ...current.state, phase: action === 'open' ? 'opening' : 'closing', jobId, failures: 0, retryAt: null, reason: null,
           ...(action === 'open' ? { opens: { day: day(), count: opensToday(current.state) + 1 } } : {}) };
@@ -372,28 +411,71 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
     }
     const reading = evaluateRule(rule.config, action, quotes, now());
     if (reading.error) { note(rule.id, { hits: 0, met: false, value: null, note: reading.error }); return; }
+    if (Date.parse(reading.at) <= (freshAfter.get(rule.id) ?? -Infinity)) { note(rule.id, { hits: 0, met: false, value: null, note: '规则已变化，等待两腿新盘口' }); return; }
     const previous = live.get(rule.id);
     // A cached quote read counts once: hits need distinct book updates.
     const hits = !reading.met ? 0 : previous?.sample === reading.sample ? previous.hits : (previous?.met ? previous.hits : 0) + 1;
     live.set(rule.id, { hits, value: reading.value, met: reading.met, side: reading.side, at: reading.at, sample: reading.sample, note: null });
     if (reading.met && hits >= rule.config.confirmSamples) await trigger(rule, action, reading);
   }
+  function resetObservation(rule, message) {
+    const current = parse(stmt.prepare('SELECT * FROM execution_auto_rules WHERE id=?').get(rule.id));
+    if (!current || current.mode !== 'observe' || !current.observing || current.revision !== rule.revision) return;
+    const previous = observed.get(rule.id);
+    observed.set(rule.id, { note: message }); freshAfter.set(rule.id, now());
+    if (previous?.note === message) return;
+    observationEvent(current.state, `${message}；连续次数清零`, { kind: 'reset' }); saveState(rule.id, current.state);
+  }
+  function observe(rule, quotes) {
+    const readings = Object.fromEntries(['open', 'close'].map(action => [action, evaluateRule(rule.config, action, quotes, now())]));
+    const error = readings.open.error || readings.close.error;
+    if (error) { resetObservation(rule, error); return; }
+    if (Date.parse(readings.open.at) <= (freshAfter.get(rule.id) ?? -Infinity)) {
+      observed.set(rule.id, { note: '等待开始或重置后的两腿新盘口' }); return;
+    }
+    const previous = observed.get(rule.id);
+    if (previous?.open?.at && now() - Date.parse(previous.open.at) > QUOTE_MAX_AGE) {
+      resetObservation(rule, '盘口更新间隔超过 10 秒'); return;
+    }
+    const next = { note: null }, state = { ...rule.state }; let recorded = false;
+    for (const action of ['open', 'close']) {
+      const reading = readings[action], old = previous?.[action];
+      const hits = !reading.met ? 0 : old?.sample === reading.sample ? old.hits : (old?.met ? old.hits : 0) + 1;
+      // One event per continuous qualifying streak, not an invented trading cycle.
+      const signaled = reading.met && (old?.signaled || hits >= rule.config.confirmSamples);
+      next[action] = { ...reading, hits, signaled, note: null };
+      if (signaled && !old?.signaled) {
+        observationEvent(state, `${action === 'open' ? '开仓' : '平仓'}条件本会触发；仅记录信号，未下单`, { kind: 'signal', action, value: reading.value, hits, inputs: reading.inputs, revision: rule.revision, threshold: action === 'open' ? rule.config.openThreshold : rule.config.closeThreshold }); recorded = true;
+      }
+    }
+    observed.set(rule.id, next);
+    if (recorded) saveState(rule.id, state);
+  }
   async function runTick() {
     if (closed) return;
-    if (!execution.leading()) { live.clear(); return; }
+    if (!execution.leading()) { live.clear(); for (const rule of rows()) if (rule.observing) resetObservation(rule, '执行服务所有权未就绪，暂停观察'); return; }
     for (const rule of rows()) if (['opening', 'closing'].includes(rule.state.phase)) { try { follow(rule); } catch (error) { log?.warn?.({ err: error, type: 'execution-auto' }, '自动规则任务状态核对失败'); } }
-    const armed = rows().filter(rule => rule.enabled && ['idle', 'holding'].includes(rule.state.phase));
+    const armed = rows().filter(rule => rule.observing || rule.enabled && ['idle', 'holding'].includes(rule.state.phase));
     for (const id of live.keys()) if (!armed.some(rule => rule.id === id)) live.delete(id);
     if (!armed.length) return;
     // Maintenance outranks every trigger: nothing new is sent while an update is pending.
-    if (readMaintenance()) { for (const rule of armed) note(rule.id, { hits: 0, met: false, note: '系统更新中，暂停自动触发' }); return; }
+    const blocked = message => { for (const rule of armed) if (rule.observing) resetObservation(rule, message); else note(rule.id, { hits: 0, met: false, note: message }); };
+    if (readMaintenance()) { blocked('系统更新中，暂停判断'); return; }
     let quotes;
-    try { quotes = await execution.quotes(); } catch { for (const rule of armed) note(rule.id, { hits: 0, met: false, note: '盘口读取失败' }); return; }
+    try { quotes = await execution.quotes(); } catch { blocked('盘口读取失败'); return; }
+    if (closed) return;
+    if (readMaintenance() || !execution.leading()) { blocked('运行状态已变化，暂停判断'); return; }
     // One rule at a time, each re-read: an earlier trigger may have taken a lock or changed state.
-    for (const { id } of armed) {
+    for (const { id, revision } of armed) {
       if (closed) return;
+      // A preceding live rule may have awaited private evidence while the
+      // service entered maintenance or lost leadership. Observation obeys the
+      // same current boundary even though it never reaches execution commit.
+      if (readMaintenance() || !execution.leading()) { blocked('运行状态已变化，暂停判断'); return; }
       const rule = parse(stmt.prepare('SELECT * FROM execution_auto_rules WHERE id=?').get(id));
-      if (rule?.enabled && ['idle', 'holding'].includes(rule.state.phase)) await evaluate(rule, quotes);
+      if (!rule || rule.revision !== revision) continue;
+      if (rule.observing) observe(rule, quotes);
+      else if (rule.enabled && rule.mode === 'live' && ['idle', 'holding'].includes(rule.state.phase)) await evaluate(rule, quotes);
     }
   }
   function tick() {
@@ -405,5 +487,5 @@ export function createTradingAuto({ db, execution, admit = operation => operatio
   timer?.unref?.();
   // stop() is synchronous so shutdown can refuse new triggers before any service is awaited.
   function stop() { closed = true; clearInterval(timer); }
-  return { state: view, create, update, act, remove, tick, stop, async close() { stop(); await ticking; } };
+  return { state: view, exposureSnapshot, create, update, act, remove, tick, stop, async close() { stop(); await ticking; } };
 }

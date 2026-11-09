@@ -458,7 +458,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         throw new HttpError(405, '自动减仓接口不支持此操作');
       }
       if (pathname === '/api/trading/execution/auto/rules' && method === 'POST') return reply(201, executionAuto.create(await signedBody()));
-      const autoRule = pathname.match(/^\/api\/trading\/execution\/auto\/rules\/([0-9a-f-]{36})(?:\/(enable|disable|reset))?$/);
+      const autoRule = pathname.match(/^\/api\/trading\/execution\/auto\/rules\/([0-9a-f-]{36})(?:\/(enable|disable|reset|observe|live))?$/);
       if (autoRule && !autoRule[2] && method === 'PUT') return reply(200, executionAuto.update(autoRule[1], await signedBody()));
       if (autoRule && !autoRule[2] && method === 'DELETE') return reply(200, executionAuto.remove(autoRule[1], await signedBody()));
       if (autoRule && autoRule[2] && method === 'POST') return reply(200, executionAuto.act(autoRule[1], autoRule[2], await signedBody()));

@@ -70,6 +70,147 @@ async function fixture(t, { maintenance = false, start = baseTime, guarded = fal
 }
 const enable = f => f.auto.create({ config: config(), enabled: true, confirmLive: true });
 
+test('observation records distinct condition signals without tasks, leases, locks, private reads or exchange writes', async t => {
+  const f = await fixture(t, { guarded: true });
+  let privateReads = 0;
+  f.hooks.account = () => { privateReads++; };
+  f.auto.create({ config: config(), mode: 'observe', observing: true });
+  const protectedRows = () => f.writer.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'aw_%' ORDER BY name").all().map(({ name }) => [name, f.writer.db.prepare(`SELECT * FROM ${name}`).all()]);
+  const before = protectedRows(), locks = f.locks();
+  const observeTick = async () => { f.advance(3000); await f.auto.tick(); };
+  await observeTick();
+  assert.equal(f.rule.observation.open.hits, 1);
+  await f.auto.tick();
+  assert.equal(f.rule.observation.open.hits, 1, 'cached book counts once');
+  await observeTick(); await observeTick();
+  const events = f.rule.observation.events.filter(row => row.kind === 'signal');
+  assert.equal(events.length, 1, 'one signal per continuous streak');
+  assert.equal(events[0].action, 'open'); assert.equal(events[0].hits, 2);
+  assert.equal(events[0].inputs.premiumAt, events[0].inputs.baseAt);
+  assert.equal(f.rule.enabled, false); assert.equal(f.rule.observing, true);
+  assert.equal(f.rule.state.held, null); assert.equal(f.rule.state.opensToday, 0);
+  assert.equal(f.db.prepare('SELECT enabled FROM execution_auto_rules').get().enabled, 0, 'old reader sees a disabled rule');
+  assert.equal(privateReads, 0); assert.equal(f.records.size, 0); assert.equal(f.jobs.length, 0);
+  assert.deepEqual(f.locks(), locks); assert.deepEqual(protectedRows(), before);
+});
+
+test('observation resets on maintenance, stale books, updates, stop and restart, retaining bounded evidence', async t => {
+  const f = await fixture(t);
+  f.auto.create({ config: config(), mode: 'observe', observing: true });
+  await f.step(); assert.equal(f.rule.observation.open.hits, 1);
+  f.flags.maintenance = true; await f.auto.tick();
+  assert.equal(f.rule.observation.open, null); assert.match(f.rule.observation.note, /更新/);
+  f.flags.maintenance = false; await f.auto.tick();
+  assert.equal(f.rule.observation.open, null, 'same pre-maintenance books cannot count');
+  await f.step(); assert.equal(f.rule.observation.open.hits, 1);
+  f.auto.update(f.rule.id, { revision: f.rule.revision, config: config({ name: '观察' }) });
+  assert.equal(f.rule.observation.open, null); await f.auto.tick(); assert.equal(f.rule.observation.open, null);
+  await f.step(); assert.equal(f.rule.observation.open.hits, 1);
+  const originalQuotes = f.execution.quotes;
+  f.execution.quotes = async () => quotes({ 'binance:BZUSDT': ['75', '75.01'], 'binance:CLUSDT': ['70', '70.01'] }, f.time - 10_001);
+  await f.auto.tick(); assert.match(f.rule.observation.note, /过期/); assert.equal(f.rule.observation.open, null);
+  f.execution.quotes = originalQuotes;
+  await f.step(); assert.equal(f.rule.observation.open.hits, 1);
+  f.auto.act(f.rule.id, 'disable', { revision: f.rule.revision });
+  assert.equal(f.rule.observing, false); assert.equal(f.rule.observation.open, null);
+  await f.step(); assert.equal(f.rule.observation.open, null);
+  f.auto.act(f.rule.id, 'observe', { revision: f.rule.revision });
+  await f.step(); assert.equal(f.rule.observation.open.hits, 1);
+  await f.auto.close();
+  const restart = createTradingAuto({ db: f.db, execution: f.execution, now: () => f.time, intervalMs: 0 });
+  t.after(() => restart.close());
+  assert.equal(restart.state().rules[0].observation.open, null);
+  assert.match(restart.state().rules[0].observation.events.at(-1).message, /重启/);
+  await restart.tick(); assert.equal(restart.state().rules[0].observation.open, null);
+  f.advance(3000); await restart.tick(); assert.equal(restart.state().rules[0].observation.open.hits, 1);
+  for (let i = 0; i < 40; i++) { const r = restart.state().rules[0]; restart.act(r.id, i % 2 ? 'observe' : 'disable', { revision: r.revision }); }
+  assert.equal(restart.state().rules[0].observation.events.length, 30);
+  assert.equal(f.jobs.length, 0); assert.equal(f.records.size, 0);
+});
+
+test('observation to live requires a distinct confirmation and new books, never historical hit counts', async t => {
+  const f = await fixture(t);
+  f.auto.create({ config: config(), mode: 'observe', observing: true });
+  await f.step(); await f.step(); assert.equal(f.rule.observation.open.hits, 2);
+  assert.throws(() => f.auto.act(f.rule.id, 'enable', { revision: f.rule.revision, confirmLive: true }), /单独确认/);
+  assert.throws(() => f.auto.act(f.rule.id, 'live', { revision: f.rule.revision }), /确认/);
+  f.auto.act(f.rule.id, 'live', { revision: f.rule.revision, confirmLive: true });
+  assert.equal(f.rule.mode, 'live'); assert.equal(f.rule.observing, false); assert.equal(f.rule.enabled, true);
+  await f.auto.tick(); assert.equal(f.jobs.length, 0); assert.equal(f.rule.live.hits, 0);
+  await f.step(); assert.equal(f.rule.live.hits, 1); assert.equal(f.jobs.length, 0);
+  await f.step(); assert.equal(f.jobs.length, 1);
+  assert.throws(() => f.auto.act(f.rule.id, 'observe', { revision: f.rule.revision }), /先停用/);
+  f.auto.act(f.rule.id, 'disable', { revision: f.rule.revision });
+  assert.throws(() => f.auto.act(f.rule.id, 'observe', { revision: f.rule.revision }), /处理持仓及任务/);
+  assert.throws(() => f.auto.create({ config: config(), mode: 'observe', enabled: true, confirmLive: true }), /不能混用/);
+});
+
+test('a quote read started in observation cannot arm a live rule or count after a configuration change', async t => {
+  for (const action of ['live', 'update']) {
+    const f = await fixture(t);
+    f.auto.create({ config: config({ confirmSamples: 1 }), mode: 'observe', observing: true });
+    f.hooks.market = () => {
+      f.hooks.market = null;
+      if (action === 'live') f.auto.act(f.rule.id, 'live', { revision: f.rule.revision, confirmLive: true });
+      else f.auto.update(f.rule.id, { revision: f.rule.revision, config: config({ name: 'new', confirmSamples: 1 }) });
+    };
+    await f.step();
+    assert.equal(f.jobs.length, 0); assert.equal(f.rule.live, null); assert.equal(f.rule.observation.open, null);
+    assert.deepEqual(f.locks(), []);
+    await f.step();
+    assert.equal(f.jobs.length, action === 'live' ? 1 : 0);
+  }
+});
+
+test('observation follows independent open and close signals and resets across a missing interval or leadership', async t => {
+  const f = await fixture(t);
+  f.auto.create({ config: config(), mode: 'observe', observing: true });
+  await f.step(); await f.step();
+  f.prices.BZUSDT = ['71', '71.01'];
+  await f.step(); await f.step();
+  assert.deepEqual(f.rule.observation.events.filter(row => row.kind === 'signal').map(row => row.action), ['open', 'close']);
+  assert.equal(f.rule.state.phase, 'idle'); assert.equal(f.rule.state.held, null);
+  f.advance(11_000); await f.execution.tick(); await f.auto.tick();
+  assert.match(f.rule.observation.note, /间隔超过/); assert.equal(f.rule.observation.close, null);
+  await f.step(); assert.equal(f.rule.observation.close.hits, 1);
+  const leading = f.execution.leading; f.execution.leading = () => false;
+  await f.auto.tick(); assert.match(f.rule.observation.note, /所有权/);
+  f.execution.leading = leading;
+  await f.auto.tick(); assert.equal(f.rule.observation.close, null);
+  await f.step(); assert.equal(f.rule.observation.close.hits, 1);
+  assert.equal(f.jobs.length, 0);
+});
+
+test('maintenance or stop during an observation quote read discards the result', async t => {
+  for (const stop of [false, true]) {
+    const f = await fixture(t);
+    f.auto.create({ config: config({ confirmSamples: 1 }), mode: 'observe', observing: true });
+    f.hooks.market = () => { f.hooks.market = null; if (stop) f.auto.act(f.rule.id, 'disable', { revision: f.rule.revision }); else f.flags.maintenance = true; };
+    await f.step();
+    assert.equal(f.rule.observation.open, null);
+    assert.equal(f.rule.observation.events.filter(row => row.kind === 'signal').length, 0);
+    assert.equal(f.jobs.length, 0); assert.equal(f.records.size, 0);
+  }
+});
+
+test('observation behind an awaiting live rule rechecks maintenance and leadership', async t => {
+  for (const boundary of ['maintenance', 'leadership']) {
+    const f = await fixture(t);
+    f.auto.create({ config: config({ name: 'live-first', confirmSamples: 1 }), enabled: true, confirmLive: true });
+    f.auto.create({ config: config({ name: 'observe-next', confirmSamples: 1 }), mode: 'observe', observing: true });
+    f.hooks.account = () => {
+      f.hooks.account = null;
+      if (boundary === 'maintenance') f.flags.maintenance = true;
+      else f.execution.leading = () => false;
+    };
+    await f.step();
+    const observer = f.auto.state().rules.find(rule => rule.mode === 'observe');
+    assert.equal(observer.observation.events.filter(row => row.kind === 'signal').length, 0, boundary);
+    assert.equal(observer.observation.open, null); assert.match(observer.observation.note, /运行状态已变化/);
+    if (boundary === 'maintenance') { assert.equal(f.jobs.length, 0); assert.equal(f.records.size, 0); }
+  }
+});
+
 test('executable spread uses the trading side and compares exactly at the threshold', () => {
   const at = baseTime, books = quotes({ 'binance:BZUSDT': ['75', '75.01'], 'binance:CLUSDT': ['70.99', '71'] }, at);
   // Selling the oil spread: BZ bid − CL ask = 4.

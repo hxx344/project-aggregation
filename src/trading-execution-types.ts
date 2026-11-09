@@ -91,7 +91,7 @@ export type AutoRuleConfig = {
   confirmSamples: number; maxOpensPerDay: number; batchCount: number; batchIntervalMs: number; repriceIntervalMs: number; timeoutMs: number;
 };
 export type AutoRule = {
-  id: string; revision: number; enabled: boolean; createdAt: string; title: string; config: AutoRuleConfig;
+  id: string; revision: number; enabled: boolean; mode: 'live' | 'observe'; observing: boolean; createdAt: string; title: string; config: AutoRuleConfig;
   spread: { label: string; unit: string };
   state: {
     phase: AutoPhase; jobId: string | null; held: { exchange: TradingExchange; symbol: ExecutionSymbol; side: ExecutionSide; quantity: string }[] | null;
@@ -99,5 +99,6 @@ export type AutoRule = {
   };
   /** In-memory reading of the next action's executable spread; null until the rule is checked. */
   live: { hits: number; value: number | null; met: boolean; side: 'sell' | 'buy' | null; at: string | null; note: string | null } | null;
+  observation: { open: AutoRule['live']; close: AutoRule['live']; note: string | null; events: { time: string; message: string; kind: 'reset' | 'signal'; action?: 'open' | 'close'; value?: number; hits?: number; threshold?: string; revision?: number; inputs?: { premiumAt: string; baseAt: string } }[] };
 };
-export type AutoState = { generatedAt: string; maintenance: boolean; rules: AutoRule[] };
+export type AutoState = { generatedAt: string; exposureVersion: string; maintenance: boolean; rules: AutoRule[] };
