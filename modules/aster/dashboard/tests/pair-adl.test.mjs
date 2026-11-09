@@ -14,7 +14,7 @@ import {
   parsePairDraft,
   pairConfigurationChanges,
   pairConfigurationLock,
-  pairStartRecoveryBlock,
+  pairStartBlock,
   pairDeletionBlock,
   pairExecutionPhaseLabel,
 } from '../lib/pairs.ts';
@@ -83,7 +83,6 @@ test('legacy pair defaults and explicit disabled config round trip through saved
 
 const pairWith = (status, hold = true) => ({
   enabled: false,
-  ordinary: { enabled: false },
   margin: { enabled: true },
   state: {
     adl: {
@@ -97,18 +96,18 @@ test('active and blocked ADL prevent activation even in funds-only mode and prev
   for (const status of ['active', 'blocked']) {
     const pair = pairWith(status);
     assert.match(adlStartBlock(pair), /尚未完成/);
-    assert.match(pairStartRecoveryBlock(pair), /ADL/);
+    assert.match(pairStartBlock(pair), /ADL/);
     assert.match(pairConfigurationLock(pair), /ADL/);
-    assert.match(pairDeletionBlock(pair, 100), /ADL/);
+    assert.match(pairDeletionBlock(pair), /ADL/);
     assert.match(pairExecutionPhaseLabel(pair), /ADL/);
   }
 });
 test('completed hold permits manual activation but holds configuration and deletion until released', () => {
   const pair = pairWith('completed');
   assert.equal(adlStartBlock(pair), '');
-  assert.equal(pairStartRecoveryBlock(pair), '');
+  assert.equal(pairStartBlock(pair), '');
   assert.match(adlConfigurationLock(pair), /ADL/);
-  assert.match(pairDeletionBlock(pair, 100), /ADL/);
+  assert.match(pairDeletionBlock(pair), /ADL/);
   assert.match(pairExecutionPhaseLabel(pair), /保持暂停/);
   assert.equal(adlConfigurationLock(pairWith('completed', false)), '');
   assert.match(

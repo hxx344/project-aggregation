@@ -3,7 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import importlib.util
 import os
-import json
 import time
 from pathlib import Path
 import tempfile
@@ -272,51 +271,6 @@ class AccountWriterTests(unittest.TestCase):
         self.assert_leg_stays_unknown({"code": -1001, "msg": "Internal error; unable to process your request."},
             lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."}))
 
-    def pair_repair_after_coded_leg(self, query):
-        """Managed pair: LONG filled, SHORT got HTTP 400 -4164; then repair LONG."""
-        pair = self.pair()
-        state = self.terminal_pair(pair)
-        pending = state["pending"]
-        operation = "aster:pair-orders:" + pending["id"] + ":long-original:short-original"
-        pending["writer_dispatches"] = [{"operationId": operation, "clientOrderIds": ["long-original", "short-original"]}]
-        for leg in pending["legs"]:
-            leg.update(submit_evidence_version=2, submit_evidence={"kind": "receipt"})
-        pending["legs"][1].update(receipt=None, submit_error="Aster 拒绝请求（代码 -4164）：min notional",
-                                  submit_evidence={"kind": "exchange_error", "code": -4164, "http_status": 400})
-        self.store.put("pair_runtime:gold", state)
-        self.order_query = query
-        repair = {"key": "long", "order": Executor.order("XAUUSD1", "LONG", "SELL", 1, "long-repair"), "receipt": None}
-        self.extra_orders["long-repair"] = repair["order"]
-        writer, trader = self.engine.account_writer, PairTrader(self.engine)
-        with writer.accounts(["long", "short"]) as ticket:
-            writer.registry.prepare(ticket, operation, {"orders": [leg["order"] for leg in pending["legs"]]})
-            terminal = trader._query(pair, state, self.engine.brokers)
-            pending["repairs"].append(repair)
-            trader._dispatch(pair, state, self.engine.brokers, [repair], reconciliation=True)
-            unresolved = writer.registry.unresolved(ticket)
-        return terminal, state, repair, unresolved
-
-    def test_managed_pair_clean_absence_settles_original_so_repair_is_sent(self):
-        terminal, state, repair, unresolved = self.pair_repair_after_coded_leg(
-            lambda cid: httpx.Response(400, json={"code": -2013, "msg": "Order does not exist."}))
-        self.assertTrue(terminal)
-        receipt = state["pending"]["legs"][1]["receipt"]
-        self.assertEqual((receipt["status"], receipt["reject_code"], receipt["query_absent"]), ("REJECTED", -4164, True))
-        self.assertEqual(repair["receipt"]["status"], "FILLED")
-        self.assertIn(("long", "POST", "/fapi/v3/order"), self.requests)
-        self.assertEqual(unresolved, [])
-
-    def test_managed_pair_refused_repair_admission_records_no_send(self):
-        terminal, state, repair, unresolved = self.pair_repair_after_coded_leg(lambda cid: httpx.Response(503, json={}))
-        self.assertFalse(terminal)
-        self.assertIsNone(state["pending"]["legs"][1]["receipt"])
-        self.assertEqual((repair["receipt"]["status"], repair["receipt"]["local_not_sent"]), ("REJECTED", True))
-        self.assertEqual(repair["submit_evidence"]["kind"], "request_not_sent")
-        self.assertEqual(len(unresolved), 1)
-        self.assertNotIn(("long", "POST", "/fapi/v3/order"), self.requests)
-        self.assertFalse(any("long-repair" in dispatch["clientOrderIds"] for dispatch in state["pending"]["writer_dispatches"]),
-                         "a refused admission must not use up the bounded dispatch list")
-
     def restart_writer(self):
         self.engine.account_writer.close()
         writer = ManagedWriter(self.engine)
@@ -332,7 +286,6 @@ class AccountWriterTests(unittest.TestCase):
             member["enabled"] = False
             self.store.save_account(member)
         value = validate_pair({"id": "gold", "name": "gold", "long_account_id": "long", "short_account_id": "short",
-            "ordinary": {"enabled": True},
             "margin": {"enabled": margin, "master_env_prefix": "ASTER_MASTER" if margin else ""}})
         return self.store.save_pair(value, create=True)
 
@@ -361,28 +314,9 @@ class AccountWriterTests(unittest.TestCase):
         restarted = self.restart_writer()
         with restarted.accounts(["long", "short"]) as ticket:
             self.assertEqual(restarted.registry.unresolved(ticket), [])
-            self.assertTrue(PairTrader(self.engine)._query(pair, self.store.get("pair_runtime:gold"), self.engine.brokers))
+        # Settling the shared operation leaves the legacy batch itself for manual review.
+        self.assertEqual(self.store.get("pair_runtime:gold")["pending"], state["pending"])
         self.assertTrue(all(method == "GET" and path != "/fapi/v3/order" for _, method, path in self.requests))
-
-    def test_manual_recovery_fresh_queries_have_complete_account_context(self):
-        pair = self.pair()
-        state = self.terminal_pair(pair)
-        for leg in state["pending"]["legs"]:
-            leg["receipt"] = None
-        self.store.put("pair_runtime:gold", state)
-        writer = self.engine.account_writer
-        with writer.accounts(["long", "short"]) as ticket:
-            writer.registry.import_unknown(ticket, "aster:legacy:pair_runtime:gold:crash-pair-original", {"original": "frozen"})
-        def original_id_reads(trader, current_pair, current, brokers, **kwargs):
-            self.assertEqual(len(writer.current.get()["claims"]), 2)
-            for aid in ("long", "short"):
-                brokers[aid].query("XAUUSD1", aid + "-original")
-            raise TradingError("stop after strict original queries")
-        with patch.object(PairTrader, "_recover", original_id_reads):
-            self.engine.pairs.check_recovery("gold")
-        with writer.accounts(["long", "short"]) as ticket:
-            self.assertEqual(writer.registry.unresolved(ticket), [])
-        self.assertFalse(any(method != "GET" for _, method, _ in self.requests))
 
     def test_crash_after_durable_single_account_batch_receipts_settles_original_and_legacy(self):
         writer = self.engine.account_writer
@@ -440,49 +374,31 @@ class AccountWriterTests(unittest.TestCase):
                 self.assertEqual(restarted.registry.unresolved(ticket), [])
         self.assertFalse(any(method != "GET" for _, method, _ in self.requests))
 
-    def test_real_two_repair_dispatch_recovers_its_persisted_parent_after_finish_crash(self):
+    def test_persisted_two_repair_dispatch_settles_its_parent_after_restart(self):
         pair = self.pair()
         state = self.terminal_pair(pair)
         repairs = []
         for aid, side, direction in (("long", "LONG", "SELL"), ("short", "SHORT", "BUY")):
             order = Executor.order("XAUUSD1", side, direction, 1, "repair-" + aid + "-original")
             self.extra_orders[order["newClientOrderId"]] = order
-            repairs.append({"key": aid, "order": order, "receipt": None, "dispatch": "prepared"})
+            receipt = {**order, "clientOrderId": order["newClientOrderId"], "orderId": "remote-" + order["newClientOrderId"],
+                       "origQty": "1", "executedQty": "1", "avgPrice": "100", "status": "FILLED"}
+            repairs.append({"key": aid, "order": order, "receipt": receipt, "dispatch": "sending"})
+        expected = "aster:pair-orders:crash-pair-original:repair-long-original:repair-short-original"
         state["pending"]["repairs"] = repairs
-        self.store.put("pair_runtime:gold", state)
+        state["pending"]["writer_dispatches"] = [{"operationId": expected,
+            "clientOrderIds": ["repair-long-original", "repair-short-original"]}]
         writer = self.engine.account_writer
-        class FinishCrash(RuntimeError):
-            pass
+        # A legacy version stopped after the durable terminal receipts and before the shared finish.
         with writer.accounts(["long", "short"]) as ticket:
-            with patch.object(writer.registry, "finish", side_effect=FinishCrash("after durable terminal, before shared finish")):
-                with self.assertRaises(FinishCrash):
-                    PairTrader(self.engine)._dispatch(pair, state, self.engine.brokers, repairs, reconciliation=True)
-            saved = self.store.get("pair_runtime:gold")["pending"]
-            expected = "aster:pair-orders:crash-pair-original:repair-long-original:repair-short-original"
-            self.assertEqual(saved["writer_dispatches"], [{"operationId": expected,
-                "clientOrderIds": ["repair-long-original", "repair-short-original"]}])
-            self.assertTrue(all(leg["receipt"]["status"] == "FILLED" for leg in saved["repairs"]))
+            writer.registry.prepare(ticket, expected, {"orders": [repair["order"] for repair in repairs]})
+            self.store.put("pair_runtime:gold", state)
             self.assertEqual([row["operationId"] for row in writer.registry.unresolved(ticket)], [expected])
-        writes = sum(method != "GET" for _, method, _ in self.requests)
-        self.assertEqual(writes, 2)
         restarted = self.restart_writer()
         with restarted.accounts(["long", "short"]) as ticket:
             self.assertEqual(restarted.registry.unresolved(ticket), [])
-        self.assertEqual(sum(method != "GET" for _, method, _ in self.requests), writes)
-
-    def test_managed_dispatch_without_original_batch_id_still_rejects_before_transport(self):
-        pair = self.pair()
-        state = self.terminal_pair(pair)
-        state["pending"].pop("id")
-        writer = self.engine.account_writer
-        before = list(self.requests)
-        with writer.accounts(["long", "short"]) as ticket:
-            with self.assertRaisesRegex(TradingError, "原批次"):
-                PairTrader(self.engine)._dispatch(pair, state, self.engine.brokers, state["pending"]["legs"])
-            self.assertEqual(writer.registry.unresolved(ticket), [])
-        self.assertEqual(self.requests, before)
-        self.assertNotIn("writer_dispatches", state["pending"])
-
+        self.assertFalse(any(method != "GET" for _, method, _ in self.requests))
+        self.assertEqual(self.store.get("pair_runtime:gold")["pending"], state["pending"])
 
 if __name__ == "__main__":
     unittest.main()

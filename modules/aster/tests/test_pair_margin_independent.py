@@ -25,8 +25,8 @@ class PairMarginCreationTests(TestCase):
         second.state["leverages"]["XAUUSD1"] = 10
         first.save()
         second.save()
-        config = integration.pair_config(ordinary={"enabled": False}, margin={"enabled": True})
-        with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("no strategy evidence")):
+        config = integration.pair_config(margin={"enabled": True})
+        with patch.object(self.engine, "capacities", side_effect=AssertionError("no strategy evidence")):
             pair = self.engine.pairs.create(config)
             self.assertEqual(pair["symbol"], "XAUUSD1")
             self.assertTrue(self.engine.pairs.enable("gold", True)["enabled"])
@@ -36,18 +36,22 @@ class PairMarginCreationTests(TestCase):
         self.assertEqual(first.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
         self.assertEqual(first.state["orders"], {})
 
-    def test_ordinary_creation_allows_other_symbol_holdings(self):
+    def test_creation_rejects_ordinary_and_allows_other_symbol_holdings(self):
         self.f.broker.state["positions"]["SPCXUSD1:SHORT"].update(qty="1", entry="724.185")
         self.f.broker.save()
-        pair = self.engine.pairs.create(integration.pair_config(id="ordinary",
-            ordinary={"enabled": True}, margin={"enabled": True}))
+        with self.assertRaisesRegex(TradingError, "配对组创建字段无效"):
+            self.engine.pairs.create(integration.pair_config(id="ordinary",
+                ordinary={"enabled": True}, margin={"enabled": True}))
+        self.assertEqual(self.f.store.pairs(), [])
+        pair = self.engine.pairs.create(integration.pair_config(id="funds", margin={"enabled": True}))
         self.assertFalse(pair["enabled"])
+        self.assertFalse(pair["ordinary"]["enabled"])
         self.assertEqual(self.f.broker.state["positions"]["SPCXUSD1:SHORT"]["qty"], "1")
         self.engine.pairs.delete(pair["id"])
         self.assertEqual(self.f.store.pairs(), [])
 
     def test_new_group_keeps_exclusive_ownership_and_legacy_recovery_guard(self):
-        config = integration.pair_config(ordinary={"enabled": False}, margin={"enabled": True})
+        config = integration.pair_config(margin={"enabled": True})
         self.f.store.save_intent({"id": "pending", "account_id": "test", "status": "pending", "kind": "leverage"})
         with self.assertRaisesRegex(TradingError, "未完成"):
             self.engine.pairs.create(config)
@@ -61,7 +65,6 @@ class PairMarginIndependentTests(TestCase):
 
     def setUp(self):
         live.PairMarginLifelineLiveTests.setUp(self)
-        self.pair["ordinary"]["enabled"] = False
         self.pair["enabled"] = False
         self.pair = self.store.save_pair(self.pair)
         # Exchange response generation has its own quote source. Public market
@@ -84,16 +87,6 @@ class PairMarginIndependentTests(TestCase):
                     qty=qty, entry=wire(paper.market.book(symbol).mark))
             paper.state["leverages"]["XAUUSD1"] = 5 if side == "long" else 20
             paper.save()
-
-    def complete_strategy_orders(self):
-        # Strategy starts retain an independent, complete account-order read.
-        originals = {side: broker.api.call for side, broker in self.brokers.items()}
-        stack = ExitStack()
-        for side, broker in self.brokers.items():
-            def call(method, path, *args, side=side, **kwargs):
-                return [] if path == "/fapi/v3/openOrders" else originals[side](method, path, *args, **kwargs)
-            stack.enter_context(patch.object(broker.api, "call", side_effect=call))
-        return stack
 
     def display_responses(self, rows, asset_fields=None):
         # The funds fixture supplies balances; inventory can contain any market
@@ -297,16 +290,12 @@ class PairMarginIndependentTests(TestCase):
     def test_start_and_signed_transfer_ignore_positions_market_tiers_and_history(self):
         self.mixed_positions()
         old = {**runtime_default(), "symbol": "CLUSD1", "owned": {"LONG": "6", "SHORT": "7"},
-               "recovery_watch": {"batches": [{"id": "old", "symbol": "CLUSD1"}]},
                "attention": "旧策略待核对", "snapshots": {"long": {"timestamp": 1, "positions": ["historical"]}}}
         old["progress"]["baseline"] = deepcopy(old["owned"])
         self.store.put("pair_runtime:gold", old)
         with ExitStack() as stack:
-            for target, name in ((self.market, "book"), (self.engine, "capacities"),
-                                 (self.engine.pairs, "_read_members")):
+            for target, name in ((self.market, "book"), (self.engine, "capacities")):
                 stack.enter_context(patch.object(target, name, side_effect=AssertionError("strategy path")))
-            stack.enter_context(patch("trading.pair_recovery.require_archived_orders_clear",
-                                     side_effect=AssertionError("historical order query")))
             for broker in self.brokers.values():
                 broker.api.fail_brackets = True
                 stack.enter_context(patch.object(broker, "snapshot", side_effect=AssertionError("trade snapshot")))
@@ -314,8 +303,10 @@ class PairMarginIndependentTests(TestCase):
             state = self.tick()
         self.assertEqual(len(self.sent), 1, state)
         self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["status"], "acknowledged")
-        for field in ("symbol", "owned", "progress", "pending", "recovery_watch", "attention", "snapshots"):
+        for field in ("symbol", "owned", "progress", "pending", "snapshots"):
             self.assertEqual(state[field], old[field], field)
+        # No removed path can clear old-strategy attention, so a clean tick retires it.
+        self.assertNotIn("attention", state)
         self.assertEqual(set(state["margin_balances"]), {"long", "short"})
         self.assertTrue(all(row["timestamp"] > 1 for row in state["margin_balances"].values()))
         self.assertTrue(all(path in (live.ACCOUNT, live.INCOME)
@@ -326,36 +317,30 @@ class PairMarginIndependentTests(TestCase):
         self.assertEqual(len(self.sent), 1)
         self.assert_no_trades()
 
-    def test_start_preserves_pending_strategy_and_transfer_records(self):
+    def test_start_refuses_legacy_orders_and_preserves_strategy_and_transfer_records(self):
         identities = self.trader._members(self.pair)[2]
-        old = {**runtime_default(), "identities": identities,
-               "pending": {"id": "original-order", "kind": "ordinary", "phase": "open",
-                           "identities": identities, "symbol": "XAUUSD1"},
-               "recovery_watch": {"batches": [{"id": "archive"}]}}
         margin = {"pending": {"request_id": "original-transfer", "status": "unknown"}}
-        self.store.put("pair_runtime:gold", old)
-        self.store.put("pair_margin:gold", margin)
-        with patch.object(self.engine.pairs.recovery, "check", side_effect=AssertionError("must not adopt")):
-            state = self.start()
-        for field in ("pending", "owned", "progress", "recovery_watch"):
-            self.assertEqual(state[field], old[field])
-        self.assertEqual(self.store.get("pair_margin:gold"), margin)
+        legacy = {
+            "ordinary": {"pending": {"id": "original-order", "kind": "ordinary", "phase": "open",
+                                     "identities": identities, "symbol": "XAUUSD1"}},
+            "leverage": {"pending": {"id": "old-leverage", "kind": "leverage", "symbol": "XAUUSD1",
+                                     "identities": identities, "created_at": time.time(),
+                                     "before": {"LONG": "0", "SHORT": "0"}, "previous_leverage": 5,
+                                     "target_leverage": 10,
+                                     "results": {"long": {"unknown": True}, "short": {"unknown": True}}}},
+            "watch": {"recovery_watch": {"batches": [{"id": "archive"}]}},
+        }
+        for name, fields in legacy.items():
+            with self.subTest(name):
+                old = {**runtime_default(), "identities": identities, **fields}
+                self.store.put("pair_runtime:gold", old)
+                self.store.put("pair_margin:gold", margin)
+                with self.assertRaisesRegex(TradingError, "旧版本配对开仓"):
+                    self.start()
+                self.assertFalse(self.store.pair("gold")["enabled"])
+                self.assertEqual(self.store.get("pair_runtime:gold"), old)
+                self.assertEqual(self.store.get("pair_margin:gold"), margin)
         self.assertEqual(self.sent, [])
-        self.assert_no_trades()
-
-    def test_pending_leverage_keeps_recovery_without_repeating_write_or_blocking_funds(self):
-        identities = self.trader._members(self.pair)[2]
-        pending = {"id": "old-leverage", "kind": "leverage", "symbol": "XAUUSD1",
-                   "identities": identities, "created_at": time.time(),
-                   "before": {"LONG": "0", "SHORT": "0"}, "previous_leverage": 5,
-                   "target_leverage": 10, "results": {"long": {"unknown": True}, "short": {"unknown": True}}}
-        self.store.put("pair_runtime:gold", {**runtime_default(), "identities": identities, "pending": pending})
-        self.start()
-        state = self.tick()
-        self.assertEqual(state["pending"]["id"], pending["id"])
-        self.assertEqual(state["pending"]["results"], pending["results"])
-        self.assertEqual(state["pending"]["recovery_query_attempts"], 1)
-        self.assertEqual(len(self.sent), 1, state)
         self.assert_no_trades()
 
     def test_live_disabled_identity_change_pause_and_maintenance_block_transfers(self):
@@ -393,34 +378,13 @@ class PairMarginIndependentTests(TestCase):
         self.assertTrue(self.store.get("pair_runtime:gold")["new_history"])
         self.assertEqual(self.sent, [])
 
-    def test_ordinary_and_cycle_start_still_require_matching_selected_leverage(self):
-        self.mixed_positions()
-        for ordinary in (True,):
-            pair = self.store.pair("gold")
-            pair["ordinary"]["enabled"] = ordinary
-            self.pair = self.store.save_pair(pair)
-            with self.complete_strategy_orders():
-                with self.subTest(ordinary=ordinary), self.assertRaisesRegex(TradingError, "实际杠杆必须相同"):
-                    self.start()
-            self.assertFalse(self.store.pair("gold")["enabled"])
-        self.assert_no_trades()
-
-    def test_ordinary_and_cycle_start_preserve_other_positions_at_common_leverage(self):
-        self.mixed_positions()
-        for paper in self.paper.values():
-            paper.state["leverages"]["XAUUSD1"] = 5
-            paper.save()
+    def test_start_ignores_mismatched_leverages_and_preserves_all_positions(self):
+        self.mixed_positions()  # XAUUSD1 leverage is 5 on the long side and 20 on the short side.
         holdings = {side: deepcopy(paper.state["positions"]) for side, paper in self.paper.items()}
-        for ordinary in (True,):
-            with self.subTest(ordinary=ordinary):
-                pair = self.store.pair("gold")
-                pair["ordinary"]["enabled"] = ordinary
-                self.pair = self.store.save_pair(pair)
-                with self.complete_strategy_orders():
-                    state = self.start()
-                self.assertTrue(self.store.pair("gold")["enabled"])
-                self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
-                for side, paper in self.paper.items():
-                    self.assertEqual(paper.state["positions"], holdings[side])
-                self.engine.pairs.enable("gold", False)
+        state = self.start()
+        self.assertTrue(self.store.pair("gold")["enabled"])
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+        for side, paper in self.paper.items():
+            self.assertEqual(paper.state["positions"], holdings[side])
+        self.assertEqual([paper.state["leverages"]["XAUUSD1"] for paper in self.paper.values()], [5, 20])
         self.assert_no_trades()

@@ -1,15 +1,11 @@
-"""Exact pair plans with separate collateral budgets for the two subaccounts."""
-from fractions import Fraction
-import time
-
-from .plans import TradePlan
+"""Shared pair errors and runtime-symbol guards; pair opening was removed."""
 from .pair_legacy import require_no_legacy_cycle
-from .models import (TradingError, TIERS, dec,
-                     decimal_value, leverage_cap, opening_margin_limit,
-                     positive, wire)
+from .models import TradingError, positive
 
-from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, get_symbol_config, validate_symbol
+from .pair_symbols import DEFAULT_PAIR_SYMBOL, SUPPORTED_SYMBOLS, validate_symbol
 SIDES = (("long", "LONG"), ("short", "SHORT"))
+LEGACY_ORDERS_REASON = ("配对组仍有旧版本配对开仓留下的未完成批次或订单观察记录；当前版本已移除配对开仓，"
+                        "不再自动核对这些订单，请回退到旧版本完成核对后再操作")
 
 
 class PairPositionError(TradingError):
@@ -93,175 +89,8 @@ def require_runtime_symbols(pair, state, *, allow_legacy=False):
     return symbol
 
 
-def positions(snapshots, symbol, *, equal_leverage=True):
-    validate_symbol(symbol)
-    result = {}
-    for key, side in SIDES:
-        snapshot = snapshots[key]
-        snapshot.require_fresh()
-        snapshot.require_modes([symbol])
-        if not snapshot.can_trade or snapshot.open_orders:
-            raise PairPositionError("子账户没有交易权限或仍有外部挂单")
-        long, short = snapshot.pair(symbol)
-        result[side] = long if side == "LONG" else short
-    if equal_leverage and result["LONG"].leverage != result["SHORT"].leverage:
-        raise PairPositionError(f"两个子账户的 {symbol} 实际杠杆不一致（做多账户 {result['LONG'].leverage}x、做空账户 {result['SHORT'].leverage}x），停止新交易，请核对")
-    return result
-
-
-def require_quantities(snapshots, symbol, quantities, *, equal_leverage=True):
-    pair = positions(snapshots, symbol, equal_leverage=equal_leverage)
-    if any(pair[side].qty != positive(quantities[side], True) for _, side in SIDES):
-        raise PairPositionError("实际仓位与配对组账本不一致，停止新交易并等待核对")
-    return pair
-
-
-def current_cap(snapshot, symbol, leverage):
-    row = snapshot.current_leverage_caps.get(symbol)
-    if row is not None:
-        if len(row) != 2 or type(row[0]) is not int or row[0] != leverage:
-            raise TradingError("子账户可开额度与实际杠杆不匹配")
-        return Fraction(positive(row[1], True))
-    return Fraction(leverage_cap(snapshot.brackets.get(symbol, []), leverage))
-
-
-def resource_gate(pair, snapshots, book):
-    symbol = pair["symbol"]
-    held = positions(snapshots, symbol)
-    leverage = held["LONG"].leverage
-    policy = pair["ordinary"]
-    limit = Fraction(opening_margin_limit(policy, leverage))
-    mark = Fraction(positive(book.mark))
-    # Capture validated exact values once, rather than parsing them in each search step.
-    budgets = []
-    for key, side in SIDES:
-        snap = snapshots[key]
-        fee = Fraction(positive(snap.fees.get(symbol), True))
-        if fee > 1:
-            raise TradingError("子账户手续费率无效")
-        holdings = snap.pair(symbol)
-        # Existing opposite positions share this symbol's cap and respond to
-        # the same mark. Do not net their exposure or fund additions with an
-        # unconfirmed gain on the other direction.
-        loss = sum((max(Fraction(0), -Fraction(p.qty) * (mark - Fraction(p.mark)) *
-                       (1 if p.side == "LONG" else -1)) for p in holdings), Fraction(0))
-        valued = tuple((Fraction(p.qty), Fraction(p.mark), p.occupied_margin_exact) for p in holdings)
-        budgets.append((side, snap, valued, fee, loss, current_cap(snap, symbol, leverage)))
-
-    def allowed(qty, buy, sell, high_price):
-        for side, snap, valued, fee, loss, cap in budgets:
-            amount = buy if side == "LONG" else sell
-            high = max(high_price, *(old_mark for _, old_mark, _ in valued))
-            occupied_delta = sum((max(Fraction(0), old_qty * max(high_price, old_mark) / leverage - occupied)
-                                  for old_qty, old_mark, occupied in valued), Fraction(0))
-            gross = sum((old_qty * max(high_price, old_mark) for old_qty, old_mark, _ in valued), Fraction(0))
-            if gross + qty * high > cap:
-                return False
-            fill_loss = max(Fraction(0), buy - qty * mark) if side == "LONG" else max(Fraction(0), qty * mark - sell)
-            cost = amount * fee + fill_loss
-            equity = Fraction(snap.equity) - loss - cost
-            additional = qty * high / leverage
-            if (equity <= 0 or Fraction(snap.available) - loss < occupied_delta + additional + cost
-                    or snap.occupied_margin_exact + occupied_delta + additional > limit * equity):
-                return False
-        return True
-    return allowed
-
-
-def ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target):
-    """Use shared public capacity and each member's own holding limit."""
-    symbol = pair["symbol"]
-    if any(snapshots[key].pair(symbol)[1 if side == "LONG" else 0].qty for key, side in SIDES):
-        return f"{symbol} 存在非本组方向仓位，保留当前杠杆；自动升档会同时改变该仓位杠杆"
-    threshold = Fraction(dec(pair["ordinary"]["threshold"]))
-    if target not in capacities:
-        return "缺少公开额度数据"
-    capacity = Fraction(positive(capacities[target], True))
-    if capacity <= threshold:
-        return f"公开额度未严格超过 {wire(threshold)} USD1"
-    notionals = {side: Fraction(held[side].qty) * max(Fraction(held[side].mark), Fraction(book.mark))
-                 for _, side in SIDES}
-    # Both sides consume the same public quota; opposite positions never net.
-    gross = sum(notionals.values(), Fraction(0))
-    if capacity <= gross:
-        return f"公开额度 {wire(capacity)} USD1 未超过两账户现有持仓总价值 {wire(gross)} USD1，跳过升档"
-    blocked = ["做多账户" if key == "long" else "做空账户" for key, side in SIDES
-               if notionals[side] > Fraction(leverage_cap(snapshots[key].brackets.get(pair["symbol"], []), target))]
-    if blocked:
-        return "公开额度已满足，但" + "、".join(blocked) + "的现有持仓超过该档账户持仓上限"
-    return None
-
-
-def ordinary_leverage_reason(pair, snapshots, book, capacities, held):
-    """Describe upgrade blockers from the same inputs, without another API read."""
-    old, policy = held["LONG"].leverage, pair["ordinary"]
-    minimum = policy["min_open_leverage"]
-    state = (f"两账户当前均为 {old}x，低于普通开仓最低 {minimum}x" if old < minimum else
-             f"两账户当前均为 {old}x，不在普通开仓支持档位（5x、10x、20x）")
-    targets = [tier for tier in TIERS if tier > old and tier >= minimum]
-    if not targets:
-        return state + "；停止新增，程序不会自动降杠杆，请暂停配对组后核对实际杠杆设置"
-    details = []
-    for target in targets:
-        detail = (ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target)
-                  or "公开额度及账户持仓上限已满足，可申请自动升档")
-        details.append(f"{target}x：{detail}")
-    return state + "；" + "；".join(details) + "。程序会自动选择满足条件的更高档位，两账户升档确认后再检查开仓条件"
-
-
-def plan_ordinary(pair, snapshots, book, rule, capacities):
-    symbol = pair["symbol"]
-    if rule.symbol != symbol or rule.margin_asset != "USD1":
-        raise PairPositionError("普通开仓交易规则与配对组标的不一致")
-    held = positions(snapshots, symbol)
-    leverage, policy = held["LONG"].leverage, pair["ordinary"]
-    book.require_fresh()
-    if leverage not in TIERS or leverage < policy["min_open_leverage"]:
-        raise TradingError(ordinary_leverage_reason(pair, snapshots, book, capacities, held))
-    if held["LONG"].qty != held["SHORT"].qty:
-        raise PairPositionError("配对组已有数量不等，停止新增")
-    if book.spread_exact > Fraction(dec(policy["spread_limit"])):
-        raise TradingError(f"{symbol} 买一卖一价差超过普通开仓设置上限 {wire(Fraction(dec(policy['spread_limit'])) * 10000)} bp，等待价差回落")
-    capacity = Fraction(positive(capacities.get(leverage), True))
-    if capacity <= Fraction(dec(policy["threshold"])):
-        raise TradingError(f"当前 {leverage}x 公开可用额度未严格超过普通开仓门槛 {wire(policy['threshold'])} USD1，等待公开额度恢复")
-    bid, ask, mark = map(Fraction, (book.bid, book.ask, book.mark))
-    high = max(ask, mark)
-    upper = min(Fraction(rule.max_qty), Fraction(book.bid_qty), Fraction(book.ask_qty),
-                Fraction(dec(policy["order_notional"])) / high, capacity / (2 * high))
-    step = Fraction(positive(rule.step))
-    gate = resource_gate(pair, snapshots, book)
-    low, maximum = 0, int(upper // step)
-    while low < maximum:
-        mid = (low + maximum + 1) // 2
-        qty = mid * step
-        if gate(qty, qty * ask, qty * bid, high):
-            low = mid
-        else:
-            maximum = mid - 1
-    qty = low * step
-    minimum = max(rule.min_notional, dec(get_symbol_config(symbol)["min_notional"]))
-    if qty < Fraction(rule.min_qty) or qty * mark < minimum or not qty:
-        raise TradingError(f"按两账户各自余额、持仓上限、保证金占用、公开额度、盘口及配置的单批金额上限计算后，共同可开数量不足以满足最小下单量及按标记价计算的每边名义金额至少 {wire(minimum)} USD1，暂不新增")
-    return TradePlan("open", symbol, decimal_value(qty, exact=True), leverage,
-                     decimal_value(qty * ask, exact=True), decimal_value(qty * bid, exact=True),
-                     decimal_value(book.spread_exact * 10000), capacity_notional=decimal_value(2 * qty * high, exact=True))
-
-
-def ordinary_upgrade(pair, snapshots, book, capacities, *, runtime=None):
-    symbol = pair["symbol"]
-    held = positions(snapshots, symbol)
-    book.require_fresh()
-    old = held["LONG"].leverage
-    for target in TIERS:
-        if target <= old or target < pair["ordinary"]["min_open_leverage"]:
-            continue
-        cooldown = (runtime or {}).get("leverage_recovery_cooldown") or {}
-        if (cooldown.get("symbol") == symbol and cooldown.get("target") == target
-                and cooldown.get("identities") == (runtime or {}).get("identities")
-                and cooldown.get("ordinary") == pair["ordinary"]
-                and time.time() < cooldown.get("until", 0)):
-            continue
-        if ordinary_upgrade_blocker(pair, snapshots, book, capacities, held, target) is None:
-            return target
-    return None
+def require_no_legacy_orders(runtime):
+    """Old ordinary batches need the removed recovery path; never adopt them."""
+    if isinstance(runtime, dict) and (runtime.get("pending") is not None
+                                      or runtime.get("recovery_watch") is not None):
+        raise PairPositionError(LEGACY_ORDERS_REASON)

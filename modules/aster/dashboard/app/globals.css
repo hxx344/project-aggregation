@@ -1108,9 +1108,6 @@ td:last-child {
   font-size: 10px;
   line-height: 1.4;
 }
-.position-managed-direction {
-  color: var(--muted-foreground);
-}
 .pair-account-positions {
   min-width: 0;
 }
@@ -1778,33 +1775,6 @@ label input,
 .message {
   display: block;
 }
-.order-recovery-dialog {
-  max-height: calc(100dvh - 32px);
-  overflow-y: auto;
-}
-.order-recovery-dialog th,
-.order-recovery-dialog td {
-  height: auto;
-  padding: 12px 10px;
-}
-.pair-order-recovery-ack {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  cursor: pointer;
-}
-.pair-order-recovery-ack input {
-  flex-shrink: 0;
-  width: 18px;
-  height: 18px !important;
-  margin: 2px 0 0;
-  accent-color: var(--primary);
-}
-.pair-order-recovery-ack > span {
-  float: none;
-  color: var(--foreground);
-  font-size: inherit;
-}
 .reconcile-button {
   display: block;
   margin: 0 14px 18px;
@@ -2199,21 +2169,6 @@ label input,
 }
 .pair-notice-item + .pair-notice-item {
   margin-top: 12px;
-}
-.pair-order-diagnostics-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
-  gap: 12px;
-}
-.pair-order-diagnostic {
-  min-width: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--background);
-}
-.pair-order-diagnostic .small-note {
-  text-align: left;
 }
 .execution-live-state .pair-notice-time,
 .execution-live-state .pair-notice-scope {
@@ -2857,19 +2812,6 @@ h2 {
 .pair-account-positions .pair-positions-empty {
   padding: 4px 14px 14px;
   font-size: 12px;
-}
-.pair-positions-foot {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 16px;
-  padding: 8px 14px;
-  border-top: 1px solid var(--border);
-  font-size: 12px;
-}
-.pair-positions-foot p {
-  margin: 0;
-  font-size: 12px;
-  line-height: 1.6;
 }
 .pair-discs {
   display: grid;

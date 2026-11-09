@@ -55,10 +55,6 @@ class PairMarketSymbolsTests(TestCase):
         self.assertIn(SILVER, self.engine.capacity_market_symbols())
         self.assertIn(SILVER, self.engine.monitored_market_symbols())
 
-    def test_pair_ordinary_capacity_targets_use_selected_market_and_leverage(self):
-        self.pair()
-        self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts()), {SILVER: {5, 10, 20}})
-
     def test_pair_private_stream_follows_silver(self):
         self.pair(mode="live")
         broker = Mock(spec=LiveBroker)

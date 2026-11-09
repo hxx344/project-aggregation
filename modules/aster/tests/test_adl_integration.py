@@ -10,9 +10,10 @@ from tests.helpers import Fixture, account
 from tests.scheduler_fixtures import _Future, _Harness
 from trading.adl import AdlController
 from trading.engine import Engine
-from trading.exchange import ExchangeError, LiveBroker, RequestNotSent
+from trading.exchange import ExchangeError, LiveBroker
 from trading.models import TradingError
 from trading.pair_execution import PairTrader
+from trading.pair_planning import LEGACY_ORDERS_REASON, PairPositionError
 from tests.pair_legacy_fixtures import runtime_default
 from trading.pairing import validate_pair
 from trading.user_stream import PrivateAccountStream
@@ -20,8 +21,7 @@ from trading.user_stream import PrivateAccountStream
 
 def paired_config(**changes):
     return validate_pair({"id": "gold", "name": "黄金", "long_account_id": "test",
-                          "short_account_id": "second", "enabled": False,
-                          "ordinary": {"enabled": True}, **changes})
+                          "short_account_id": "second", "enabled": False, **changes})
 
 
 class AdlIntegrationTests(unittest.TestCase):
@@ -74,31 +74,13 @@ class AdlIntegrationTests(unittest.TestCase):
         self.engine.adl.tick.assert_called_once()
         self.engine.pairs.trader.tick.assert_not_called()
 
-    def test_adl_stops_strategy_and_recovery_while_funds_remain_independent(self):
+    def test_adl_stops_pair_while_funds_remain_independent(self):
         trader = PairTrader(self.engine)
         self.engine.adl.require_clear.side_effect = TradingError("ADL 等待核对")
         self.assertIn("ADL", trader.tick(self.pair)["reason"])
-        with self.assertRaisesRegex(TradingError, "ADL"):
-            trader._recover(self.pair, {"pending": {"id": "old"}}, {})
         with patch("trading.margin_balance.MarginBalancer.tick", return_value={"blocks_trading": False}) as balance:
             trader._balance(self.pair, {}, {}, {})
         balance.assert_called_once()
-        with self.assertRaisesRegex(RequestNotSent, "ADL"):
-            trader._config_guard(self.pair, {}, opening=False)
-
-    def test_each_prepared_leg_rechecks_adl_before_transport(self):
-        trader = PairTrader(self.engine)
-        trader._save = Mock()
-        self.engine.adl.require_clear.side_effect = TradingError("ADL 新事件")
-        leg = {"key": "long", "order": {"symbol": "XAUUSD1", "newClientOrderId": "old-order",
-                "side": "BUY", "positionSide": "LONG", "type": "MARKET", "quantity": "1"}}
-        state = {"symbol": "XAUUSD1", "identities": {},
-                 "pending": {"kind": "ordinary", "phase": "open", "symbol": "XAUUSD1", "legs": [leg]}}
-        broker = Mock()
-        trader._dispatch(self.pair, state, {"long": broker}, [leg])
-        broker.submit.assert_not_called()
-        self.assertEqual(leg["submit_evidence"]["kind"], "request_not_sent")
-        self.assertEqual(leg["receipt"]["executedQty"], "0")
 
     def test_adl_arriving_during_snapshot_read_skips_finally_balance(self):
         pair = deepcopy(self.pair)
@@ -119,43 +101,57 @@ class AdlIntegrationTests(unittest.TestCase):
         balance.assert_called_once()
         read.assert_called()
 
-    def test_management_and_recovery_cannot_clear_adl_hold(self):
+    def save_margin_pair(self):
+        pair = deepcopy(self.pair)
+        pair["margin"]["enabled"] = True
+        self.pair = self.f.store.save_pair(pair)
+        return self.pair
+
+    def test_management_cannot_clear_adl_hold(self):
         self.engine.adl.require_clear.side_effect = TradingError("ADL 保持暂停")
-        recovery = self.engine.pairs.recovery
-        with patch.object(recovery, "check", side_effect=AssertionError("old recovery ran")):
-            for action in (lambda: self.engine.pairs.configure("gold", {"name": "changed"}),
-                           lambda: self.engine.pairs.delete("gold"),
-                           lambda: self.engine.pairs.reconcile_flat("gold"),
-                           lambda: self.engine.pairs.preview_recovery("gold"),
-                           lambda: self.engine.pairs.check_recovery("gold"),
-                           lambda: self.engine.pairs.confirm_recovery("gold", "token"),
-                           lambda: self.engine.pairs.skip_recovery("gold", "batch"),
-                           lambda: self.engine.pairs.preview_baseline("gold"),
-                           lambda: self.engine.pairs.confirm_baseline("gold", "token")):
-                with self.assertRaisesRegex(TradingError, "ADL"):
-                    action()
+        for action in (lambda: self.engine.pairs.configure("gold", {"name": "changed"}),
+                       lambda: self.engine.pairs.delete("gold")):
+            with self.assertRaisesRegex(TradingError, "ADL"):
+                action()
         self.assertEqual(self.f.store.pair("gold"), self.pair)
 
-    def test_start_rejects_pending_adl_before_legacy_recovery_or_writes(self):
-        self.f.store.put("pair_runtime:gold", {"pending": {"kind": "ordinary", "phase": "open"}})
+    def test_start_requires_margin_before_adl_or_writes(self):
+        with self.assertRaisesRegex(TradingError, "请先开启保证金平衡"):
+            self.engine.pairs.enable("gold", True)
+        self.engine.adl.before_enable.assert_not_called()
+        self.engine.adl.after_enable.assert_not_called()
+        self.assertEqual(self.f.store.pair("gold"), self.pair)
+
+    def test_start_rejects_pending_adl_before_legacy_guard_or_writes(self):
+        self.save_margin_pair()
+        legacy = {"pending": {"kind": "ordinary", "phase": "open"}}
+        self.f.store.put("pair_runtime:gold", legacy)
         self.engine.adl.before_enable.side_effect = TradingError("ADL 尚未完成")
-        with patch.object(self.engine.pairs.recovery, "check", side_effect=AssertionError("old recovery ran")):
+        with patch("trading.margin_balance.MarginBalancer.verify_members", side_effect=AssertionError("funds read ran")):
             with self.assertRaisesRegex(TradingError, "ADL"):
                 self.engine.pairs.enable("gold", True)
+            self.engine.adl.before_enable.side_effect = None
+            with self.assertRaises(PairPositionError) as raised:
+                self.engine.pairs.enable("gold", True)
+        self.assertEqual(str(raised.exception), LEGACY_ORDERS_REASON)
         self.engine.adl.after_enable.assert_not_called()
         self.assertFalse(self.f.store.pair("gold")["enabled"])
+        self.assertEqual(self.f.store.get("pair_runtime:gold"), legacy)
 
-    def test_completed_hold_is_released_only_after_successful_strategy_activation(self):
+    def test_completed_hold_is_released_only_after_successful_funds_activation(self):
+        self.save_margin_pair()
         seen = []
         self.engine.adl.before_enable.side_effect = lambda pair: seen.append(("before", self.f.store.pair("gold")["enabled"]))
         self.engine.adl.after_enable.side_effect = lambda pair: seen.append(("after", self.f.store.pair("gold")["enabled"]))
-        saved = self.engine.pairs.enable("gold", True)
+        with patch("trading.margin_balance.MarginBalancer.verify_members"):
+            saved = self.engine.pairs.enable("gold", True)
         self.assertTrue(saved["enabled"])
         self.assertEqual(seen, [("before", False), ("after", True)])
         self.engine.adl.require_clear.assert_any_call("gold", allow_completed=True)
 
     def test_failed_start_does_not_release_completed_hold(self):
-        with patch.object(self.engine.pairs, "_read_members", side_effect=TradingError("snapshot failed")):
+        self.save_margin_pair()
+        with patch("trading.margin_balance.MarginBalancer.verify_members", side_effect=TradingError("snapshot failed")):
             with self.assertRaisesRegex(TradingError, "snapshot failed"):
                 self.engine.pairs.enable("gold", True)
         self.engine.adl.before_enable.assert_called_once()
@@ -163,10 +159,7 @@ class AdlIntegrationTests(unittest.TestCase):
         self.assertFalse(self.f.store.pair("gold")["enabled"])
 
     def test_margin_only_start_also_releases_hold_after_activation(self):
-        pair = deepcopy(self.pair)
-        pair["ordinary"]["enabled"] = False
-        pair["margin"]["enabled"] = True
-        self.f.store.save_pair(pair)
+        self.save_margin_pair()
         seen = []
         self.engine.adl.after_enable.side_effect = lambda pair: seen.append(self.f.store.pair("gold")["enabled"])
         with patch("trading.margin_balance.MarginBalancer.verify_members"):

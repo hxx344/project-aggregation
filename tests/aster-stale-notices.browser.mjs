@@ -20,12 +20,13 @@ async (page) => {
     const mode = modes[id], stamp = source => mode.stale.has(source) ? mode.stamp : now;
     return { id, name: names[id], long_account_id: `${id}-long`, short_account_id: `${id}-short`,
       symbol: 'XAUUSD1', enabled: true,
-      ordinary: { enabled: !mode.funds, threshold: '50000', order_notional: '100', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.1' },
-      margin: { enabled: Boolean(mode.funds), master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1',
+      ordinary: { enabled: false, threshold: '50000', order_notional: '100', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.1' },
+      margin: { enabled: true, master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1',
         max_transfer: '1000', buffer_ratio: '0.05', cooldown_seconds: 30 },
-      state: { phase: mode.execution ? 'reconciling' : 'monitoring', reason: mode.execution ? executionText : '',
-        updated_at: stamp('runtime'), snapshots: mode.funds ? {} : { long: snapshot(stamp('long')), short: snapshot(stamp('short')) },
-        margin_balances: mode.funds ? { long: snapshot(stamp('long')), short: snapshot(stamp('short')) } : undefined,
+      // Pairs only balance funds; legacy order records surface as an attention phase.
+      state: { phase: mode.execution ? 'attention' : 'monitoring', reason: mode.execution ? executionText : '',
+        updated_at: stamp('runtime'),
+        margin_balances: { long: snapshot(stamp('long')), short: snapshot(stamp('short')) },
         api_notice: mode.api ? { kind: 'budget', text: apiText } : null,
         pending: mode.execution ? { kind: 'ordinary', id: 'fixture-original-order' } : null,
         owned: { LONG: '0', SHORT: '0' } } };
@@ -69,9 +70,10 @@ async (page) => {
     const noticeItems = notices.locator('.pair-notice-item');
     const currentData = notices.locator('.pair-notice-item').filter({ hasText: '两侧数据未齐' })
       .filter({ hasText: '当前提示' });
-    const longSide = app.getByRole('region', { name: 'A 多仓账户风险', exact: true });
-    const shortSide = app.getByRole('region', { name: 'B 空仓账户风险', exact: true });
-    const runtime = app.getByRole('region', { name: '配对数量与执行进度', exact: true }).locator('.small-note').first();
+    // Pairs only balance funds: each side's freshness shows on its balance card.
+    const longSide = app.getByRole('region', { name: 'A 账户保证金', exact: true });
+    const shortSide = app.getByRole('region', { name: 'B 账户保证金', exact: true });
+    const runtime = app.getByRole('region', { name: '配对执行进度', exact: true }).locator('.small-note').first();
     const refresh = async () => {
       const response = page.waitForResponse(response => response.url().startsWith(`${moduleOrigin}/api/state`));
       await app.getByRole('button', { name: '刷新数据', exact: true }).click();
@@ -87,7 +89,7 @@ async (page) => {
       await app.getByRole('option', { name: `${names[id]} · XAUUSD1 · 执行已启用`, exact: true }).click();
       await page.waitForTimeout(60);
     };
-    const hasExpiry = async locator => /过期/.test(await locator.innerText());
+    const hasExpiry = async locator => /过期|等待余额检查/.test(await locator.innerText());
     const noCurrent = async message => assert(await currentData.count() === 0, message);
     assert(await noticeItems.count() === 0, 'fresh groups start with no current or past notices');
     assert(requests.some(req => req.method === 'POST' && req.url === `${origin}/api/projects/aster/launch`), 'real Hub launch was exercised');

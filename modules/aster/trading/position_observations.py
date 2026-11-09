@@ -138,8 +138,7 @@ def collect(engine):
         symbols = {pair["symbol"]} | {target["symbol"] for target in previous.values()
                     if (target.get("capture") or {}).get("scope") == scope}
         margin = pair.get("margin") or {}
-        interval = margin.get("check_interval_seconds", 5) if (margin.get("enabled")
-            and not (pair.get("ordinary") or {}).get("enabled")) else 30
+        interval = margin.get("check_interval_seconds", 5) if margin.get("enabled") else 30
         interval = min(3600, max(1, interval)) if finite_time(interval) else 30
         base = {"scope": scope, "bindings": bindings, "label": "配对组「" + pair["name"] + "」",
                 "configured_symbol": pair["symbol"], "activity": activity(engine.store, scope),

@@ -20,7 +20,7 @@ import {
   pairedSnapshotRefresh,
   visiblePositions,
 } from '@/lib/account-positions';
-import { pairMarginOnly, type Pair } from '@/lib/pairs';
+import type { Pair } from '@/lib/pairs';
 import { DEFAULT_PAIR_SYMBOL } from '@/lib/pair-symbols';
 import { DeleteAccountDialog } from '@/components/delete-account-dialog';
 import { marginLimitFromPercent } from '@/lib/policy';
@@ -64,11 +64,7 @@ export function AccountOverview({
     : '—';
   const positionStrategy: PositionStrategy | undefined =
     pair && direction
-      ? {
-          symbol: pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol,
-          direction,
-          marginOnly: pairMarginOnly(pair),
-        }
+      ? { symbol: pair.symbol ?? DEFAULT_PAIR_SYMBOL.symbol }
       : undefined;
   const ratio =
     snapshot?.ratio == null || pct(snapshot.ratio) === '—'

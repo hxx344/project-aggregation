@@ -1,6 +1,6 @@
 import type { Account } from './desk-types';
 import { accountSnapshotView } from './account-modes.ts';
-import { pairHasPending, pairMarginOnly, type Pair } from './pairs.ts';
+import { pairHasPending, type Pair } from './pairs.ts';
 import { pairScheduledMarginWait } from './pair-notices.ts';
 import { pairedSnapshotRefresh } from './account-positions.ts';
 
@@ -33,15 +33,10 @@ export function accountSummaryView(
           ? 'short'
           : undefined
       : undefined;
-  // Like the hub, an unresolved trading batch keeps the position snapshot;
-  // a legacy cycle reaches the funds view as an attention phase error. Unlike
-  // the hub, a paused margin-only pair keeps the funds view with its paused label.
-  const tradingPending = Boolean(
-    pair?.state?.pending && Object.keys(pair.state.pending).length,
-  );
-  const fundsOnly = Boolean(
-    side && pair && pairMarginOnly(pair) && !tradingPending,
-  );
+  // Pairs only balance funds. With balancing on, legacy order records or cycles
+  // reach the funds view as an attention phase error; a paused pair keeps its
+  // label. With balancing off nothing refreshes the pair balances.
+  const fundsOnly = Boolean(side && pair && pair.margin?.enabled === true);
   if (!fundsOnly) {
     return {
       fundsOnly,

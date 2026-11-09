@@ -5,12 +5,12 @@ import time
 from unittest import TestCase
 from unittest.mock import patch
 
-from tests import test_pair_trading as fixtures
-from tests import test_pair_budget as budget_fixtures
-from trading.exchange import AmbiguousOrder, ExchangeError, RequestNotSent
+from tests import pair_fixtures as fixtures
+from trading.exchange import RequestNotSent
 from trading.margin_balance import MarginBalancer
 from trading.models import dec
 from trading.pair_execution import PairTrader
+from trading.pair_planning import LEGACY_ORDERS_REASON
 
 
 class PairMarginLifelineTests(TestCase):
@@ -27,7 +27,6 @@ class PairMarginLifelineTests(TestCase):
         self.enable_margin()
 
     tick = fixtures.PairTradingTests.tick
-    expire = fixtures.PairTradingTests.expire
 
     def enable_margin(self):
         self.pair = self.store.pair("gold")
@@ -69,41 +68,36 @@ class PairMarginLifelineTests(TestCase):
                 self.assertEqual(dec(self.brokers["long"].state["wallet"]) +
                                  dec(self.brokers["short"].state["wallet"]), 50000)
                 self.wall += 5
+                # Funds-only pairs never reconcile positions or leverages.
                 state = self.tick()
-                self.assertEqual(state["phase"], "attention", state)
+                self.assertEqual(state["phase"], "monitoring", state)
+                self.assertNotIn("attention", state)
+                self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
                 self.assert_no_orders()
 
-    def test_funds_run_before_strategy_read_failure_and_keep_their_own_deadline(self):
+    def test_funds_keep_their_own_deadline(self):
         self.wallet("long", 26000)
         self.wallet("short", 24000)
-        original = self.trader._read
-
-        def read(brokers, symbol, **options):
-            if not options.get("margin"):
-                raise RequestNotSent("strategy data unavailable", retry_after=60)
-            self.assertTrue(options.get("margin"))
-            return original(brokers, symbol, **options)
-
-        with patch.object(self.trader, "_read", side_effect=read) as reads:
-            self.assertEqual(self.engine.pairs.tick("gold"), 2)
+        with patch.object(self.trader, "_read", wraps=self.trader._read) as reads:
+            # The scheduler sleeps exactly until the funds check deadline.
+            self.assertEqual(self.engine.pairs.tick("gold"), 5)
             state = self.store.get("pair_runtime:gold")
             self.assert_transferred(state)
             self.assertEqual(reads.call_count, 1)
             self.wall += 1
-            self.engine.pairs.tick("gold")
-            self.assertEqual(reads.call_count, 2)
+            self.assertEqual(self.engine.pairs.tick("gold"), 4)
+            self.assertEqual(reads.call_count, 1)  # Not due yet: no account read.
             self.wall += 4
             self.wallet("long", 26000)
             self.wallet("short", 24000)
             self.assertEqual(self.engine.pairs.tick("gold"), 5)
             self.assert_transferred(self.store.get("pair_runtime:gold"))
-            self.assertEqual(reads.call_count, 3)
+            self.assertEqual(reads.call_count, 2)
         self.assert_no_orders()
 
-    def test_market_retry_survives_restart_while_margin_keeps_checking(self):
+    def test_market_failure_never_reaches_funds_checks_across_restart(self):
         with patch.object(self.strategy_market, "book", side_effect=RequestNotSent("market backoff", retry_after=60)) as book:
             self.assertEqual(self.engine.pairs.tick("gold"), 5)
-            self.assertEqual(book.call_count, 1)
             self.wall += 5
             self.wallet("long", 26000)
             self.wallet("short", 24000)
@@ -112,14 +106,13 @@ class PairMarginLifelineTests(TestCase):
             self.engine.pairs.trader = self.trader
             self.assertEqual(self.engine.pairs.tick("gold"), 5)
             self.assert_transferred(self.store.get("pair_runtime:gold"))
-            self.assertEqual(book.call_count, 1)
             self.wall += 55
             self.engine.pairs.tick("gold")
-            self.assertEqual(book.call_count, 2)
+            book.assert_not_called()
         self.assert_no_orders()
 
     def test_margin_fallback_cannot_borrow_recovery_budget_or_poll_during_backoff(self):
-        budget_fixtures.PairBudgetTests.live_brokers(self)
+        fixtures.PairBudgetTests.live_brokers(self)
         self.budget.reserve(1500)
         before = self.budget.snapshot()["used"]
         state = self.tick()
@@ -133,13 +126,6 @@ class PairMarginLifelineTests(TestCase):
         self.assertTrue(all(not broker.api.calls for broker in self.brokers.values()))
         self.assertGreater(state["margin"]["retry_after"], 1)
         self.assertEqual(state["margin"]["api_notice"]["kind"], "budget")
-
-    def test_pair_revision_revokes_previous_trade_retry(self):
-        with patch.object(self.strategy_market, "book", side_effect=RequestNotSent("market backoff", retry_after=60)) as book:
-            self.tick()
-            self.pair = self.store.save_pair({**self.store.pair("gold"), "name": "new revision"})
-            self.tick()
-            self.assertEqual(book.call_count, 2)
 
     def test_account_modes_and_open_orders_do_not_block_transfers(self):
         original = self.trader._read
@@ -172,26 +158,24 @@ class PairMarginLifelineTests(TestCase):
                 self.assert_transferred(state)
                 self.assert_no_orders()
 
-    def test_unknown_orders_allow_transfer_without_repeated_orders(self):
-        with patch.object(self.brokers["long"], "submit", side_effect=AmbiguousOrder("unknown order")), \
-             patch.object(self.brokers["long"], "query", side_effect=ExchangeError("unknown order", code=-2013)):
-            pending = self.tick()["pending"]
-            self.assertIsNotNone(pending)
-            self.wallet("long", 26000)
-            self.wallet("short", 24000)
-            with patch.object(MarginBalancer, "_paper", wraps=MarginBalancer(self.engine)._paper) as transfers, \
-                 patch.object(self.brokers["short"], "submit", side_effect=AssertionError("no repeated order")):
-                for index in range(3):
-                    self.wall += 5 if index == 0 else 1
-                    state = self.tick()
-                    self.assertIsNotNone(state["pending"])
-                    self.assertEqual(state["pending"]["id"], pending["id"])
-                self.assertEqual(transfers.call_count, 1)
-            self.assertLess(dec(self.brokers["long"].state["wallet"]), 26000)
-            self.assertGreater(dec(self.brokers["short"].state["wallet"]), 24000)
-            self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["status"], "paper_confirmed")
+    def test_legacy_unknown_orders_allow_transfer_without_new_orders(self):
+        legacy = fixtures.seed_legacy_pending(self.store)
+        self.wallet("long", 26000)
+        self.wallet("short", 24000)
+        with patch.object(MarginBalancer, "_paper", wraps=MarginBalancer(self.engine)._paper) as transfers:
+            for index in range(3):
+                state = self.tick()
+                if index == 0:
+                    self.assert_transferred(state)
+                self.assertEqual(state["phase"], "attention", state)
+                self.assertEqual(state["reason"], LEGACY_ORDERS_REASON)
+                self.assertEqual(state["pending"], legacy["pending"])
+                self.wall += 1
+            self.assertEqual(transfers.call_count, 1)
+        self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"]["status"], "paper_confirmed")
+        self.assert_no_orders()
 
-    def test_paused_pair_blocks_funds_and_stale_strategy_identity_blocks_only_orders(self):
+    def test_paused_pair_blocks_funds_and_stale_runtime_identity_needs_attention(self):
         self.wallet("long", 26000)
         self.wallet("short", 24000)
         self.pair = self.store.save_pair({**self.pair, "enabled": False})
@@ -208,10 +192,13 @@ class PairMarginLifelineTests(TestCase):
         self.assert_no_orders()
 
     def test_margin_does_not_consult_or_adopt_archived_strategy_orders(self):
+        watch = {"batches": [{"id": "archived", "symbol": fixtures.SYMBOL, "legs": []}]}
+        self.store.put("pair_runtime:gold", {"recovery_watch": watch})
         self.wallet("long", 26000)
         self.wallet("short", 24000)
-        with patch("trading.pair_recovery.require_archived_orders_clear",
-                   side_effect=AssertionError("funds must not adopt archived strategy positions")) as history:
-            self.assert_transferred(self.tick())
-            history.assert_not_called()
+        state = self.tick()
+        self.assert_transferred(state)
+        self.assertEqual(state["phase"], "attention", state)
+        self.assertEqual(state["reason"], LEGACY_ORDERS_REASON)
+        self.assertEqual(state["recovery_watch"], watch)
         self.assert_no_orders()

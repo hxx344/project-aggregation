@@ -133,16 +133,7 @@ class PairMarginBudgetWaitTests(TestCase):
         self.assertIsNone(result["pending"])
         self.assertEqual(len(self.transfers), 1)
         self.assertFalse(any("order" in path.lower() for _, path, _, _ in self.requests))
-
-    def test_archived_order_guard_is_not_a_transfer_dependency(self):
-        self.store.put("pair_runtime:gold", {"recovery_watch": {"batches": [{"legs": [
-            {"key": "long"}, {"key": "short"}]}]}})
-        self.budget.reserve(1117)
-        with patch("trading.pair_recovery.require_archived_orders_clear",
-                side_effect=AssertionError("order recovery must not gate balance transfers")) as guard:
-            result = self.tick()
-        guard.assert_not_called()
-        self.assertEqual(result["status"], "acknowledged", result)
+        # A legacy order watch is neither queried nor a transfer dependency.
         self.assertEqual(sum(request[2] for request in self.requests), 30)
         self.assertEqual(self.budget.snapshot()["used"], 1147)
 

@@ -73,13 +73,11 @@ test('funds-only summary uses the selected member balance and does not borrow ol
   assert.deepEqual({ account, pair }, before);
 });
 
-test('standalone, unrelated, ordinary accounts retain the full snapshot and original warning', () => {
+test('standalone, unrelated or unbalanced pair accounts retain the full snapshot and original warning', () => {
   const { account, pair } = fixture();
   for (const binding of [
     undefined,
     { ...pair, long_account_id: 'c' },
-    { ...pair, ordinary: { enabled: true } },
-    { ...pair, ordinary: {} },
     { ...pair, margin: { enabled: false } },
   ]) {
     const view = accountSummaryView(account, binding, now);
@@ -206,7 +204,7 @@ test('invalid and future balance times never become healthy scheduled records', 
   }
 });
 
-test('an ordinary pair member keeps the eight-second pair snapshot rule, not the 60-second display cadence', () => {
+test('a member of a pair without balancing keeps the eight-second rule, not the 60-second display cadence', () => {
   const { account, pair } = fixture();
   Object.assign(account, {
     status: 'ok',
@@ -215,7 +213,6 @@ test('an ordinary pair member keeps the eight-second pair snapshot rule, not the
     snapshot_refresh: { interval_seconds: 60 },
     snapshot: { ...account.snapshot, timestamp: now - 20 },
   });
-  pair.ordinary.enabled = true;
   pair.margin.enabled = false;
   const view = accountSummaryView(account, pair, now);
   assert.equal(view.fundsOnly, false);
@@ -228,13 +225,12 @@ test('an ordinary pair member keeps the eight-second pair snapshot rule, not the
   assert.equal(accountSummaryView(account, undefined, now).warning, false);
 });
 
-test('a funds-only member with an unresolved trading batch keeps its position snapshot, matching the hub', () => {
+test('a funds-only member with legacy order records stays on the funds view with a warning', () => {
   const { account, pair } = fixture();
   pair.state.pending = { kind: 'leverage', id: 'batch' };
+  pair.state.phase = 'attention';
+  pair.state.reason = '旧版配对开仓留下的订单记录未处理';
   const view = accountSummaryView(account, pair, now);
-  assert.equal(view.fundsOnly, false);
-  assert.equal(view.snapshot, account.snapshot);
+  assert.equal(view.fundsOnly, true);
   assert.equal(view.warning, true);
-  pair.state.pending = {};
-  assert.equal(accountSummaryView(account, pair, now).fundsOnly, true);
 });

@@ -99,14 +99,15 @@ class ConfigurablePolicyAPITests(unittest.TestCase):
         for field, value in (("threshold", "+1000"), ("threshold", " 1e3 "), ("margin_limit", ".5")):
             with self.subTest(field=field, value=value):
                 self.assertEqual(self.update({field: value}).status_code, 200)
-        with self.assertRaisesRegex(TradingError, "普通十进制数"):
-            from trading.pairing import validate_pair
-            validate_pair({"id": "gold", "name": "gold", "long_account_id": "a", "short_account_id": "b",
-                           "ordinary": {"enabled": True, "threshold": "-0"}})
-        for value in ("1_000", "\uff11\uff10\uff10\uff10"):
-            with self.subTest(pair_threshold=value), self.assertRaisesRegex(TradingError, "普通十进制数"):
-                validate_pair({"id": "gold", "name": "gold", "long_account_id": "a", "short_account_id": "b",
-                               "ordinary": {"enabled": True, "threshold": value}})
+        # Pairs no longer trade: a stored legacy pair strategy, valid or not, is replaced by disabled defaults.
+        from trading.pair_symbols import get_symbol_config
+        from trading.pairing import legacy_ordinary, validate_pair
+        for value in ("-0", "1_000", "\uff11\uff10\uff10\uff10"):
+            with self.subTest(pair_threshold=value):
+                pair = validate_pair({"id": "gold", "name": "gold", "long_account_id": "a", "short_account_id": "b",
+                                      "ordinary": {"enabled": True, "threshold": value}})
+                self.assertEqual(pair["ordinary"], legacy_ordinary(get_symbol_config(pair["symbol"])))
+                self.assertIs(pair["ordinary"]["enabled"], False)
 
     def test_invalid_updates_are_atomic_and_do_not_persist_any_other_supplied_field(self):
         invalid = [{"min_open_leverage": value} for value in (None, True, False, 0, 1, 2, 4, 7, 125, 126, 5.0, 1.5, "5", [], {})]

@@ -185,9 +185,10 @@ class WorkspaceControl:
                 pending, watch = state.get("pending"), state.get("recovery_watch")
                 if owner not in pair_map:
                     if owner in deleted_pairs and pending is None and watch is None:
+                        # Deletion keeps positions in the accounts; leftover
+                        # ordinary-opening ownership has no recovery path.
                         if kind == "pair_runtime" and not any(dec(qty) for qty in
-                                list((state.get("owned") or {}).values()) +
-                                list((state.get("progress") or {}).get("quantities", {}).values())):
+                                (state.get("progress") or {}).get("quantities", {}).values()):
                             continue
                         if kind == "pair_margin" and state.get("status") not in {
                                 "submitting", "accepted", "acknowledged", "unknown"}:

@@ -32,8 +32,8 @@ class PairSymbolApiTests(unittest.TestCase):
     def login(self):
         self.assertEqual(self.client.post("/api/login", json={"password": "pair-symbol-test-password"}).status_code, 200)
 
-    def create_silver(self):
-        response = self.client.post("/api/pairs", json=pair_config(id="silver", symbol="XAGUSD1"))
+    def create_silver(self, **changes):
+        response = self.client.post("/api/pairs", json=pair_config(id="silver", symbol="XAGUSD1", **changes))
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()["pair"]
 
@@ -95,39 +95,14 @@ class PairSymbolApiTests(unittest.TestCase):
     def test_same_symbol_save_avoids_remote_reads_and_running_switch_is_rejected(self):
         self.login()
         self.create_silver()
-        with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("unexpected read")):
-            response = self.client.patch("/api/pairs/silver", json={"symbol": "XAGUSD1", "name": "白银新名称"})
+        with patch("trading.pair_execution.PairTrader._members", side_effect=AssertionError("unexpected read")):
+            response = self.client.patch("/api/pairs/silver", json={"symbol": "XAGUSD1", "name": "白银新名称",
+                                                                    "margin": {"enabled": True}})
             self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.client.post("/api/pairs/silver/enable").status_code, 200)
         response = self.client.patch("/api/pairs/silver", json={"symbol": "XAUUSD1"})
         self.assertEqual(response.status_code, 409, response.text)
         self.assertEqual(self.f.store.pair("silver")["symbol"], "XAGUSD1")
-
-    def test_silver_start_adopts_only_silver_positions_and_reconcile_clears_them(self):
-        self.login()
-        self.create_silver()
-        for aid, side, qty in (("test", "LONG", "2"), ("second", "SHORT", "3")):
-            broker = self.engine.broker(self.f.store.account(aid))
-            broker.state["positions"]["XAGUSD1:" + side].update(qty=qty, entry="30")
-            broker.save()
-        response = self.client.post("/api/pairs/silver/enable")
-        self.assertEqual(response.status_code, 200, response.text)
-        runtime = self.f.store.get("pair_runtime:silver")
-        self.assertEqual(runtime["owned"], {"LONG": "2", "SHORT": "3"})
-        self.assertIn("XAGUSD1", runtime["reason"])
-        for snapshot in runtime["snapshots"].values():
-            self.assertEqual(set(snapshot["account_capacity"]), {"XAGUSD1"})
-            self.assertTrue(all(position["symbol"] == "XAGUSD1" for position in snapshot["positions"]
-                                if float(position["qty"])))
-        self.client.post("/api/pairs/silver/pause")
-        self.assertEqual(self.client.post("/api/pairs/silver/reconcile-flat").status_code, 409)
-        for aid in ("test", "second"):
-            broker = self.engine.broker(self.f.store.account(aid))
-            for position in broker.state["positions"].values():
-                position.update(qty="0", entry="0")
-            broker.save()
-        self.assertEqual(self.client.post("/api/pairs/silver/reconcile-flat").status_code, 200)
-        self.assertEqual(self.f.store.get("pair_runtime:silver")["owned"], {"LONG": "0", "SHORT": "0"})
 
     def test_gold_holdings_allow_silver_binding_without_mutating_account_strategy(self):
         self.login()
@@ -146,7 +121,7 @@ class PairSymbolApiTests(unittest.TestCase):
                     stack.enter_context(patch.object(member, method, side_effect=AssertionError("binding must not trade")))
             stack.enter_context(patch("trading.margin_balance.MarginBalancer.tick",
                                      side_effect=AssertionError("binding must not transfer")))
-            silver = self.create_silver()
+            silver = self.create_silver(margin={"enabled": True})
             self.assertFalse(silver["enabled"])
             self.assertEqual(silver["symbol"], "XAGUSD1")
             response = self.client.post("/api/pairs/silver/enable")

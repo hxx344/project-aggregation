@@ -12,10 +12,10 @@ import {
 
 const emptyHistory = { activeKeys: [], entries: [] };
 const staleText =
-  '两侧数据未齐或已过期，当前数值仅作最近记录。 等待有效快照后才能新增开仓。';
+  '两侧数据未齐或已过期，当前数值仅作最近记录。 等待下一次余额检查。';
 const pausedStaleText =
-  '两侧数据未齐或已过期，当前数值仅作最近记录。 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。';
-const offlineText = '连接中断，保留最近记录。 等待有效快照后才能新增开仓。';
+  '两侧数据未齐或已过期，当前数值仅作最近记录。 启动时重新核验账户归属与余额。';
+const offlineText = '连接中断，保留最近记录。 等待下一次余额检查。';
 
 test('funds-only status uses balance freshness without inventing position snapshots', () => {
   const fixture = marginPair();
@@ -40,7 +40,7 @@ test('funds-only status uses balance freshness without inventing position snapsh
   assert.equal(pairScheduledMarginWait(fixture, 140), null);
 });
 
-test('funds-only pending recovery does not describe strategy matching as a start prerequisite', () => {
+test('legacy order records keep their reason and never offer a start', () => {
   const fixture = marginPair();
   fixture.enabled = false;
   fixture.state.pending = { kind: 'leverage', id: 'old' };
@@ -48,11 +48,11 @@ test('funds-only pending recovery does not describe strategy matching as a start
   const text = pairStatusNotices(fixture, 111)
     .map((notice) => notice.text)
     .join('\n');
-  assert.match(text, /可启动保证金管理/);
-  assert.doesNotMatch(text, /全部结束且账户检查通过后|完成后才能启动/);
+  assert.match(text, /旧请求仍在核对/);
+  assert.doesNotMatch(text, /可启动保证金管理|全部结束且账户检查通过后|底仓/);
 });
 
-test('paused unknown transfer explains reserved restart even when displayed snapshots are stale', () => {
+test('paused unknown transfer offers a funds restart without resending', () => {
   const fixture = pair(
     {
       margin: {
@@ -63,16 +63,15 @@ test('paused unknown transfer explains reserved restart even when displayed snap
         reason: '已读取新的保证金基线',
       },
     },
-    { enabled: false },
+    { enabled: false, margin: { enabled: true } },
   );
   const text = pairStatusNotices(fixture, 120)
     .map((notice) => notice.text)
     .join('\n');
-  assert.match(text, /可点击“启动配对组”/);
-  assert.match(text, /预留/);
+  assert.match(text, /可启动保证金管理；已有请求继续核对，不重复发送/);
   assert.doesNotMatch(
     text,
-    /完成后才能启动|结果未明时仍保持暂停|核验原单与补偿单/,
+    /完成后才能启动|结果未明时仍保持暂停|核验原单与补偿单|底仓/,
   );
 });
 
@@ -85,9 +84,9 @@ function pair(state = {}, options = {}) {
       phase: 'waiting',
       reason: '虚构条件尚未满足',
       updated_at: 100,
-      snapshots: {
-        long: { timestamp: 100, positions: [] },
-        short: { timestamp: 100, positions: [] },
+      margin_balances: {
+        long: { timestamp: 100 },
+        short: { timestamp: 100 },
       },
       ...state,
     },
@@ -162,8 +161,6 @@ test('scheduled margin waits retain source timestamps without recurring stale no
     assert.deepEqual(notices, []);
     history = recordPairNotices(history, notices, now);
     assert.deepEqual(history.entries, []);
-    assert.equal(fixture.state.snapshots.long.timestamp, 100);
-    assert.equal(fixture.state.snapshots.short.timestamp, 100);
     assert.equal(fixture.state.margin_balances.long.timestamp, 100);
     assert.equal(fixture.state.margin_balances.short.timestamp, 100);
   }
@@ -243,12 +240,6 @@ test('opening modes and incomplete or invalid schedules retain the existing fres
   const mutations = [
     (p) => {
       p.enabled = false;
-    },
-    (p) => {
-      p.ordinary.enabled = true;
-    },
-    (p) => {
-      delete p.ordinary;
     },
     (p) => {
       p.margin.enabled = false;
@@ -383,10 +374,14 @@ test('runtime and both snapshots must all be fresh before data notices disappear
   for (const fixture of [
     pair({ updated_at: 92 }),
     pair({ updated_at: undefined }),
-    pair({ snapshots: { long: null, short: { timestamp: 100 } } }),
-    pair({ snapshots: { long: { timestamp: 100 }, short: null } }),
-    pair({ snapshots: { long: { timestamp: 92 }, short: { timestamp: 100 } } }),
-    pair({ snapshots: { long: { timestamp: 100 }, short: { timestamp: 92 } } }),
+    pair({ margin_balances: { long: null, short: { timestamp: 100 } } }),
+    pair({ margin_balances: { long: { timestamp: 100 }, short: null } }),
+    pair({
+      margin_balances: { long: { timestamp: 92 }, short: { timestamp: 100 } },
+    }),
+    pair({
+      margin_balances: { long: { timestamp: 100 }, short: { timestamp: 92 } },
+    }),
     pair({ updated_at: 102 }),
     pair({ updated_at: NaN }),
     { id: 'no-runtime', enabled: true },
@@ -408,7 +403,7 @@ test('paused and offline notices preserve their complete existing explanations',
 test('pending execution and stale data remain two independent complete notices', () => {
   const notices = pairStatusNotices(
     pair({
-      phase: 'reconciling',
+      phase: 'attention',
       reason: '虚构订单回执待核对',
       pending: { id: 'demo-order' },
     }),
@@ -417,7 +412,7 @@ test('pending execution and stale data remain two independent complete notices',
   assert.equal(notices.length, 2);
   assert.equal(notices.find(({ kind }) => kind === 'data').text, staleText);
   const execution = notices.find(({ kind }) => kind === 'execution');
-  assert.equal(execution.text, '订单结果核对中 · 虚构订单回执待核对');
+  assert.equal(execution.text, '需要处理 · 虚构订单回执待核对');
   assert.ok(execution.key.includes(execution.text));
   assert.notEqual(
     execution.key,
@@ -425,62 +420,28 @@ test('pending execution and stale data remain two independent complete notices',
   );
 });
 
-test('paused unresolved orders or transfers explain the start block before adoption', () => {
+test('paused legacy order records never offer a start while transfers still can', () => {
   for (const pendingState of [
     { pending: { kind: 'ordinary', id: 'demo-order' } },
     { pending: { kind: 'cycle', phase: 'open', id: 'cycle-order' } },
     { pending: { kind: 'leverage', id: 'leverage-order' } },
-    { margin: { pending: { request_id: 'demo-transfer' } } },
+    { recovery_watch: { id: 'watch' } },
   ]) {
     const notices = pairStatusNotices(
-      pair({ phase: 'reconciling', ...pendingState }, { enabled: false }),
+      pair({ phase: 'attention', ...pendingState }, { enabled: false }),
       108,
     );
-    const data = notices.find(({ kind }) => kind === 'data');
-    assert.match(data.text, /仍有订单或划转待核对/);
-    assert.match(data.text, /完成后才能启动/);
-    assert.ok(!data.text.includes('再采纳实际仓位'));
+    assert.ok(notices.every(({ text }) => !text.includes('可启动保证金管理')));
+    assert.ok(notices.every(({ text }) => !text.includes('采纳')));
   }
-});
-
-test('paused ordinary opening offers automatic start checks and preserves balanced manual additions', () => {
-  const fixture = pair(
-    {
-      phase: 'reconciling',
-      pending: { kind: 'ordinary', phase: 'open', id: 'ordinary-order' },
-    },
-    { enabled: false },
-  );
-  for (const now of [100, 108]) {
-    const notices = pairStatusNotices(fixture, now);
-    const execution = notices.find(({ kind }) => kind === 'execution');
-    assert.match(execution.text, /启动时会自动核验原单与补偿单/);
-    assert.match(execution.text, /全部结束且账户检查通过/);
-    assert.match(execution.text, /保留实际平衡底仓，无需减回旧底仓/);
-    const data = notices.find(({ kind }) => kind === 'data');
-    if (data) {
-      assert.match(data.text, /可直接点击“启动配对组”自动核对/);
-      assert.match(data.text, /结果未明时仍保持暂停/);
-      assert.doesNotMatch(data.text, /完成后才能启动/);
-    }
-  }
-  const concurrentTransfer = pairStatusNotices(
-    {
-      ...fixture,
-      state: {
-        ...fixture.state,
-        margin: { pending: { request_id: 'transfer' } },
-      },
-    },
+  const transfer = pairStatusNotices(
+    pair(
+      { phase: 'paused', margin: { pending: { request_id: 'demo-transfer' } } },
+      { enabled: false, margin: { enabled: true } },
+    ),
     108,
   );
-  assert.match(
-    concurrentTransfer.find(({ kind }) => kind === 'data').text,
-    /完成后才能启动/,
-  );
-  assert.ok(
-    concurrentTransfer.every(({ text }) => !text.includes('启动时会自动核验')),
-  );
+  assert.ok(transfer.some(({ text }) => text.includes('可启动保证金管理')));
 });
 
 test('unknown order or transfer outcomes stay pending and use the available reason', () => {
@@ -506,35 +467,15 @@ test('unknown order or transfer outcomes stay pending and use the available reas
   );
   assert.deepEqual(withoutReason, []);
   for (const phase of ['waiting', 'error', 'attention']) {
-    assert.deepEqual(pairStatusNotices(pair({ phase, pending: {} }), 100), []);
+    assert.deepEqual(pairStatusNotices(pair({ phase, pending: null }), 100), []);
   }
 });
 
-test('routine order submission and leverage progress do not create notice history', () => {
-  for (const [phase, pending] of [
-    [
-      'submitting',
-      {
-        id: 'order-one',
-        kind: 'ordinary',
-        legs: [{ dispatch: 'sending', receipt: null }],
-      },
-    ],
-    ['leverage', { id: 'leverage-one', kind: 'leverage', results: {} }],
-  ]) {
-    const fixture = pair({ phase, reason: '系统正在提交请求', pending });
-    const history = recordPairNotices(
-      undefined,
-      pairStatusNotices(fixture, 100),
-      100,
-    );
-    assert.deepEqual(history, emptyHistory);
-    assert.equal(fixture.state.pending, pending);
-  }
+test('legacy order records without a reason create no execution notice', () => {
   for (const reason of [undefined, '', '   ']) {
     assert.deepEqual(
       pairStatusNotices(
-        pair({ phase: 'reconciling', reason, pending: { id: 'order-one' } }),
+        pair({ phase: 'attention', reason, pending: { id: 'order-one' } }),
         100,
       ),
       [],
@@ -542,8 +483,8 @@ test('routine order submission and leverage progress do not create notice histor
   }
 });
 
-test('concrete execution problems remain visible including errors during submission', () => {
-  for (const phase of ['unknown', 'attention', 'reconciling']) {
+test('concrete execution problems remain visible', () => {
+  for (const phase of ['unknown', 'attention']) {
     const notices = pairStatusNotices(
       pair({
         phase,
@@ -554,35 +495,6 @@ test('concrete execution problems remain visible including errors during submiss
     );
     assert.equal(notices.length, 1);
     assert.match(notices[0].text, /两侧实际杠杆不一致，账户查询失败/);
-    if (phase === 'reconciling')
-      assert.match(notices[0].text, /^杠杆设置确认中/);
-  }
-  for (const [phase, pending, reason] of [
-    [
-      'submitting',
-      {
-        id: 'order-one',
-        kind: 'ordinary',
-        legs: [{ error: '原订单查询失败' }],
-      },
-      '原订单查询失败',
-    ],
-    [
-      'leverage',
-      {
-        id: 'leverage-one',
-        kind: 'leverage',
-        results: { long: { unknown: true, reason: '杠杆请求结果未知' } },
-      },
-      '杠杆请求结果未知',
-    ],
-  ]) {
-    const notices = pairStatusNotices(
-      pair({ phase, reason: '系统正在提交请求', pending }),
-      100,
-    );
-    assert.equal(notices.length, 1);
-    assert.ok(notices[0].text.endsWith(reason));
   }
 });
 
@@ -643,7 +555,7 @@ test('a short stale interval remains readable with its original text after recov
       pair(
         {
           updated_at: 109,
-          snapshots: {
+          margin_balances: {
             long: { timestamp: 109 },
             short: { timestamp: 109 },
           },
@@ -865,10 +777,10 @@ test('different transfers and stages remain distinct and recurrence increments o
   assert.equal(history.entries[0].firstSeen, 102);
 });
 
-test('a pending order keeps its own reason when a transfer is also present', () => {
+test('a legacy order record keeps its own reason when a transfer is also present', () => {
   const notices = pairStatusNotices(
     pair({
-      phase: 'reconciling',
+      phase: 'attention',
       reason: '订单查询尚未完成',
       pending: { id: 'order-one' },
       margin: {
@@ -878,7 +790,7 @@ test('a pending order keeps its own reason when a transfer is also present', () 
     }),
     100,
   );
-  assert.equal(notices[0].text, '订单结果核对中 · 订单查询尚未完成');
+  assert.equal(notices[0].text, '需要处理 · 订单查询尚未完成');
   assert.ok(!notices[0].key.startsWith('execution:margin:'));
 });
 

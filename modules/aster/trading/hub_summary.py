@@ -1,5 +1,5 @@
 """Bounded, read-only portal summary from already published dashboard data."""
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 import math
 import time
 
@@ -67,7 +67,7 @@ class _Diagnostics:
         return result
 
 
-def _pair_diagnostics(pair, runtime, observation, accounts):
+def _pair_diagnostics(pair, runtime):
     result = []
     if not pair.get("enabled") and pair.get("pause_reason"):
         result.append(("action", _text(pair["pause_reason"], "配对组已自动暂停，需要人工核对")))
@@ -75,22 +75,9 @@ def _pair_diagnostics(pair, runtime, observation, accounts):
         return result or ([("fault", "配对运行记录缺失或无效")] if pair.get("enabled") else [])
     if runtime.get("attention") or runtime.get("phase") == "attention":
         result.append(("action", _text(runtime.get("attention") or runtime.get("reason"), "配对组需要人工核对")))
-    elif _pair_orders_unresolved(runtime):
-        result.append(("fault", "配对订单正在自动核对，等待原流程完成"))
-    watch = runtime.get("recovery_watch")
-    if watch is not None:
-        members = [pair["long_account_id"], pair["short_account_id"], pair["symbol"]]
-        configs = {side: {key: accounts.get(pair[side + "_account_id"], {}).get(key)
-                          for key in ("id", "env_prefix", "mode")} for side in ("long", "short")}
-        match = (isinstance(observation, dict) and observation.get("watch") == watch
-                 and observation.get("members") == members)
-        if match and observation.get("status") == "action":
-            result.append(("action", _text(observation.get("message"), "历史订单出现新异常，需要人工核对")))
-        elif (match and pair.get("enabled") and observation.get("accounts") == configs
-              and observation.get("status") == "failed"):
-            result.append(("fault", "历史订单自动检查失败，等待原流程重试"))
-        # A retained archive or an absent display cache is not a current fault.
-        # The existing execution guards still perform their own fresh checks.
+    elif runtime.get("pending") is not None or runtime.get("recovery_watch") is not None:
+        from .pair_planning import LEGACY_ORDERS_REASON
+        result.append(("action", LEGACY_ORDERS_REASON))
     return result
 
 
@@ -107,7 +94,6 @@ def _snapshot(now, *candidates):
 def _funds_only(pair, runtime):
     """Only an idle funds manager has no current position evidence to report."""
     if (not pair.get("enabled") or pair.get("margin", {}).get("enabled") is not True
-            or pair.get("ordinary", {}).get("enabled") is not False
             or not isinstance(runtime, dict) or runtime.get("pending") is not None):
         return False
     from .pair_legacy import has_legacy_cycle
@@ -139,82 +125,12 @@ def _funds_errors(runtime, journal):
     return list(dict.fromkeys(reasons))
 
 
-def _pair_orders_unresolved(runtime):
-    if runtime.get("attention") or runtime.get("phase") in ("attention", "reconciling", "repairing"):
-        return True
-    pending = runtime.get("pending")
-    if pending is None:
-        return False
-    if not isinstance(pending, dict):
-        return True
-    if pending.get("kind") == "leverage":
-        results = pending.get("results")
-        return (runtime.get("phase") != "leverage" or not isinstance(results, dict)
-                or any(not isinstance(row, dict) or row.get("unknown") for row in results.values()))
-    if (runtime.get("phase") != "submitting" or pending.get("kind") != "ordinary"
-            or pending.get("phase") not in ("open", "close")):
-        return True
-    legs, repairs = pending.get("legs"), pending.get("repairs")
-    if not isinstance(legs, list) or len(legs) != 2 or not isinstance(repairs, list) or repairs:
-        return True
-    for leg in legs:
-        if not isinstance(leg, dict):
-            return True
-        receipt = leg.get("receipt")
-        if receipt is None:
-            # Sending is normal; a returned error/evidence without a receipt
-            # proves uncertainty, even before phase becomes reconciling.
-            if leg.get("error") or leg.get("submit_error") or leg.get("submit_evidence"):
-                return True
-        elif not isinstance(receipt, dict) or receipt.get("status") not in (
-                "NEW", "PARTIALLY_FILLED", "PENDING_CANCEL", "FILLED", "CANCELED",
-                "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"):
-            return True
-    return False
-
-
-def _pair_volume(runtime, side, now, utc_date):
-    if not isinstance(runtime, dict) or not runtime:
-        return None, "配对运行记录缺失或无效"
-    stamp = _number(runtime.get("updated_at"))
-    if stamp is None or not 0 < stamp <= now:
-        return None, "配对成交统计缺少有效更新时间"
-    if now - stamp >= STALE_AFTER_SECONDS:
-        return None, f"配对成交统计已过期（超过 {STALE_AFTER_SECONDS} 秒）"
-    if _pair_orders_unresolved(runtime):
-        return None, "配对订单尚待核对，今日成交量暂不可用"
-    unknown = bool(runtime.get("volume_unknown"))
-    until = runtime.get("volume_unknown_until_utc")
-    if until is not None:
-        try:
-            if not isinstance(until, str) or date.fromisoformat(until).isoformat() != until:
-                raise ValueError
-            unknown = utc_date <= until
-        except ValueError:
-            return None, "配对成交统计未知日期无效"
-    if unknown:
-        return None, "配对今日成交量存在未知成交"
-    daily = runtime.get("daily_volume")
-    if not isinstance(daily, dict):
-        return None, "配对今日成交量缺失或无效"
-    # The ledger creates a day only after a batch is reconciled. In-flight
-    # normal batches do not invalidate the already confirmed daily total.
-    if utc_date not in daily:
-        return 0.0, None
-    row = daily[utc_date]
-    value = _number(row.get(side)) if isinstance(row, dict) else None
-    if value is None or value < 0:
-        return None, "配对今日成交量缺失或无效"
-    return value, None
-
-
 def hub_summary(engine, *, now=None, diagnostics=False):
     """Never start account reads, history calculations or report refresh workers."""
     now = time.time() if now is None else now
     diagnostic = _Diagnostics(diagnostics)
     with engine.store.read_snapshot() as reader:
         saved_accounts = reader.accounts()
-        account_lookup = {account["id"]: account for account in saved_accounts}
         all_pairs = reader.pairs()
         pairs = [pair for pair in all_pairs if pair.get("enabled")]
         paired, pair_for_account, runtimes = {}, {}, {}
@@ -236,12 +152,8 @@ def hub_summary(engine, *, now=None, diagnostics=False):
         accounts = {account["id"]: account for account in saved_accounts
                     if account.get("enabled") or account["id"] in paired}
     accounts = list(accounts.values())
-    observations = {}
-    if diagnostics:
-        with engine.pair_watch_diagnostic_lock:
-            observations = dict(engine.pair_watch_diagnostics)
     live = [account for account in accounts if account.get("mode") == "live"]
-    stamps, margins, volumes, reasons = [], [], [], []
+    stamps, margins, reasons = [], [], []
     required_margins, funds_errors, funds_accounts = [], [], []
 
     def account_diagnostic(account, area, kind, message):
@@ -277,8 +189,7 @@ def hub_summary(engine, *, now=None, diagnostics=False):
             for pair in all_pairs:
                 if pair.get("enabled") and pair["id"] not in live_pairs:
                     continue
-                observation = observations.get(pair["id"])
-                for kind, reason in _pair_diagnostics(pair, runtimes[pair["id"]], observation, account_lookup):
+                for kind, reason in _pair_diagnostics(pair, runtimes[pair["id"]]):
                     diagnostic.add(f"pair:{pair['id']}", kind, f"{_text(pair.get('name'), '配对组')}：{reason}")
         for account in live:
             aid = account["id"]
@@ -337,40 +248,24 @@ def hub_summary(engine, *, now=None, diagnostics=False):
                 reasons.append(message)
                 funds_errors.append(message)
                 diagnostic.add(f"pair:{pair['id']}", "fault", message)
-    utc_date = datetime.fromtimestamp(now, timezone.utc).date().isoformat()
-    for account in live:
-        if account["id"] not in paired:
-            continue
-        runtime, side = paired[account["id"]]
-        volume, reason = _pair_volume(runtime, side, now, utc_date)
-        volumes.append(volume)
-        if reason:
-            label = f"{_text(account.get('name'), '实盘账户')}（{_text(account['id'], '未知账户')}）"
-            reasons.append(f"{label}：{reason}")
-            pair = pair_for_account[account["id"]]
-            account_diagnostic(account, "report", "notice", f"{_text(pair.get('name'), '配对组')}：{reason}")
     oldest = min(stamps) if stamps and all(stamp is not None for stamp in stamps) else None
     updated_at = (datetime.fromtimestamp(oldest, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
                   if oldest is not None else None)
     partial = bool(error or not ready or funds_errors
-                   or any(value is None for value in [*stamps, *required_margins, *volumes]))
+                   or any(value is None for value in [*stamps, *required_margins]))
     offline = engine.shutdown.is_set() or (engine.thread is not None and not engine.thread.is_alive())
     health = "offline" if offline else "stale" if oldest is not None and now - oldest >= STALE_AFTER_SECONDS else "partial" if partial else "online"
     if offline:
         reasons.insert(0, "交易服务已停止")
         diagnostic.add("service:engine", "fault", reasons[0])
     message = _message("上游为演示模式；交易数据不计入资产汇总" if engine.demo
-                       else "交易服务已连接；保证金与成交量使用 USD1 口径" if health == "online"
-                       else "保证金与成交量使用 USD1 口径", reasons)
+                       else "交易服务已连接；保证金使用 USD1 口径" if health == "online"
+                       else "保证金使用 USD1 口径", reasons)
     metrics = [
         {"key": "accounts", "label": "启用账户", "value": len(accounts), "unit": "个"},
         {"key": "live_accounts", "label": "实盘账户", "value": len(live), "unit": "个"},
         {"key": "occupied_margin", "label": "实盘占用保证金", "value": _sum(margins), "unit": "USD1",
          **({"detail": "仅保证金模式不采集完整持仓；当前占用保证金汇总暂不可用，不按零计入"} if funds_accounts else {})},
-        {"key": "daily_volume", "label": "实盘今日成交量", "value": _sum(volumes), "unit": "USD1",
-         "detail": "上游 UTC 日口径；仅统计配对组已核对成交，单账户不统计；不计入资产汇总"
-                   if any(account["id"] not in paired for account in live)
-                   else "上游 UTC 日口径；配对仅统计已核对成交；不计入资产汇总"},
     ]
     data = {"updatedAt": updated_at,
             "health": {"state": health, "message": message, "staleAfterSeconds": STALE_AFTER_SECONDS}, "metrics": metrics}

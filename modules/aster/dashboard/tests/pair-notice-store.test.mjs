@@ -6,14 +6,13 @@ function pair(timestamp = 100, state = {}) {
   return {
     id: 'pair-a',
     enabled: true,
-    ordinary: { enabled: true },
     margin: { enabled: false },
     state: {
       phase: 'waiting',
       updated_at: timestamp,
-      snapshots: {
-        long: { timestamp, positions: [] },
-        short: { timestamp, positions: [] },
+      margin_balances: {
+        long: { timestamp },
+        short: { timestamp },
       },
       ...state,
     },

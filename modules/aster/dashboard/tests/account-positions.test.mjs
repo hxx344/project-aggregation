@@ -9,7 +9,6 @@ import {
   strategyPositionLabel,
   visiblePositions,
 } from '../lib/account-positions.ts';
-import { pairDeletionBlock, pairNetQuantity } from '../lib/pairs.ts';
 
 const position = (symbol, side, qty) => ({ symbol, side, qty });
 const snapshot = (timestamp, positions = []) => ({ timestamp, positions });
@@ -117,59 +116,16 @@ test('unknown numeric quantities stay visible instead of being reported as no ho
   assert.deepEqual(visiblePositions(snapshot(100, rows)), rows);
 });
 
-test('both sides of the configured symbol receive its marker, but only the assigned leg is owned', () => {
-  for (const direction of ['LONG', 'SHORT']) {
-    for (const side of ['LONG', 'SHORT', 'BOTH']) {
-      assert.deepEqual(
-        strategyPositionLabel(
-          position('XAGUSD1', side, '1'),
-          'XAGUSD1',
-          direction,
-        ),
-        {
-          symbolLabel: '当前策略币种',
-          directionLabel:
-            side === direction
-              ? direction === 'LONG'
-                ? '本组多仓'
-                : '本组空仓'
-              : null,
-        },
-      );
-      assert.deepEqual(
-        strategyPositionLabel(
-          position('XAUUSD1', side, '1'),
-          'XAGUSD1',
-          direction,
-        ),
-        { symbolLabel: null, directionLabel: null },
-      );
-    }
-  }
-});
-
-test('funds-only groups mark the configured symbol without claiming either trading direction', () => {
-  for (const direction of ['LONG', 'SHORT']) {
-    for (const side of ['LONG', 'SHORT']) {
-      assert.deepEqual(
-        strategyPositionLabel(
-          position('XAGUSD1', side, '1'),
-          'XAGUSD1',
-          direction,
-          true,
-        ),
-        { symbolLabel: '配置币种', directionLabel: null },
-      );
-      assert.deepEqual(
-        strategyPositionLabel(
-          position('XAUUSD1', side, '1'),
-          'XAGUSD1',
-          direction,
-          true,
-        ),
-        { symbolLabel: null, directionLabel: null },
-      );
-    }
+test('pair groups mark both sides of the configured symbol without claiming a trading direction', () => {
+  for (const side of ['LONG', 'SHORT', 'BOTH']) {
+    assert.equal(
+      strategyPositionLabel(position('XAGUSD1', side, '1'), 'XAGUSD1'),
+      '配置币种',
+    );
+    assert.equal(
+      strategyPositionLabel(position('XAUUSD1', side, '1'), 'XAGUSD1'),
+      null,
+    );
   }
 });
 
@@ -199,13 +155,10 @@ const fundsPair = (now, positions = {}) => ({
   symbol: 'XAUUSD1',
   long_account_id: 'a',
   short_account_id: 'b',
-  ordinary: { enabled: false },
   margin: { enabled: true, check_interval_seconds: 5 },
   state: {
     phase: 'monitoring',
     updated_at: now,
-    pending: null,
-    progress: { quantities: { LONG: '0', SHORT: '0' } },
     margin_balances: {
       long: { timestamp: now - 3 },
       short: { timestamp: now - 3 },
@@ -375,26 +328,24 @@ test('paused retained rows remain labelled and cannot hide display or connection
   assert.match(view.notice, /解析失败/);
 });
 
-test('a verified empty display replaces displayed holdings without changing deletion or net-quantity evidence', () => {
-  const complete = {
-    long: snapshot(100, [position('XAUUSD1', 'LONG', '2')]),
-    short: snapshot(100, [position('XAUUSD1', 'SHORT', '1')]),
-  };
+test('a verified empty display replaces displayed holdings without mutating the pair', () => {
   const empty = snapshot(101, []);
   const pair = fundsPair(101, { long: { snapshot: empty, checked_at: 101 } });
   pair.enabled = false;
-  pair.state.snapshots = complete;
   const before = structuredClone(pair);
-  const block = pairDeletionBlock(pair, 101);
-  const net = pairNetQuantity(pair.state.snapshots, pair.symbol);
-  const view = accountPositionsView({ pair, side: 'long', now: 101 });
+  const view = accountPositionsView({
+    account: {
+      id: 'a',
+      pair_id: 'pair',
+      snapshot: snapshot(100, [position('XAUUSD1', 'LONG', '2')]),
+    },
+    pair,
+    side: 'long',
+    now: 101,
+  });
   assert.equal(view.snapshot, empty);
   assert.deepEqual(view.positions, []);
   assert.match(view.emptyNotice, /清单为空/);
-  assert.match(block, /仓位减回/);
-  assert.equal(net, '1');
-  assert.equal(pairDeletionBlock(pair, 101), block);
-  assert.equal(pairNetQuantity(pair.state.snapshots, pair.symbol), net);
   assert.deepEqual(pair, before);
 });
 
@@ -420,11 +371,14 @@ test('nullable numeric cells remain unknown and tiny or invalid quantities do no
   );
 });
 
-test('ordinary pair positions use the eight-second pair snapshot rule', () => {
+test('a pair with a transfer pending verification uses the eight-second pair snapshot rule', () => {
+  const base = fundsPair(1000);
   const pair = {
-    ...fundsPair(1000),
-    ordinary: { enabled: true },
-    margin: { enabled: false, check_interval_seconds: 5 },
+    ...base,
+    state: {
+      ...base.state,
+      margin: { ...base.state.margin, status: 'unknown', pending: { request_id: 'r' } },
+    },
   };
   const account = {
     id: 'a',
@@ -438,10 +392,15 @@ test('ordinary pair positions use the eight-second pair snapshot rule', () => {
   assert.equal(accountPositionsView({ account: unpaired, now: 1000 }).warning, false);
 });
 
-test('a margin-only pair keeps its check interval only while nothing is pending', () => {
+test('a pair keeps its check interval only while nothing is pending', () => {
   const base = fundsPair(1000);
   const pair = { ...base, margin: { ...base.margin, check_interval_seconds: 60 } };
   assert.deepEqual(pairedSnapshotRefresh(undefined, pair), { interval_seconds: 60 });
-  const pending = { ...pair, state: { ...pair.state, pending: { batch: {} } } };
-  assert.equal(pairedSnapshotRefresh(undefined, pending), undefined);
+  for (const state of [
+    { pending: { batch: {} } },
+    { margin: { ...pair.state.margin, pending: { request_id: 'r' } } },
+  ]) {
+    const pending = { ...pair, state: { ...pair.state, ...state } };
+    assert.equal(pairedSnapshotRefresh(undefined, pending), undefined);
+  }
 });

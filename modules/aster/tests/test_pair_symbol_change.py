@@ -1,7 +1,6 @@
-"""Symbol edits adopt verified target holdings and preserve an atomic journal."""
-from contextlib import ExitStack, contextmanager, nullcontext
+"""Paused symbol edits rewrite configuration and a fresh runtime, without reads or adoption."""
+from contextlib import ExitStack, nullcontext
 from copy import deepcopy
-from dataclasses import replace
 import time
 import unittest
 from unittest.mock import patch
@@ -47,14 +46,18 @@ class PairSymbolChangeTests(unittest.TestCase):
         return self.engine.pairs.configure("gold", {"symbol": symbol, **changes})
 
     def after_reads(self, action):
-        original = self.engine.pairs._read_members
+        """Run ``action`` after the switch captured member identities, before its commit."""
+        original = PairTrader._members
 
-        def read(*args, **kwargs):
-            result = original(*args, **kwargs)
+        def members(trader, *args, **kwargs):
+            result = original(trader, *args, **kwargs)
             action(result)
             return result
 
-        return patch.object(self.engine.pairs, "_read_members", side_effect=read)
+        return patch.object(PairTrader, "_members", members)
+
+    def no_member_reads(self):
+        return patch.object(PairTrader, "_members", side_effect=AssertionError("unexpected read"))
 
     def assert_no_change(self, pair=None, runtime=None):
         self.assertEqual(self.f.store.pair("gold"), self.pair if pair is None else pair)
@@ -62,7 +65,7 @@ class PairSymbolChangeTests(unittest.TestCase):
         with self.f.store.connect() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM kv WHERE key LIKE 'pair_symbol_change:%'").fetchone()[0], 0)
 
-    def test_round_trip_preserves_settings_and_archives_original_journal(self):
+    def test_round_trip_preserves_settings_and_resets_runtime(self):
         self.original.update(last_batch={"symbol": GOLD, "id": "old"}, attention="old error",
                              retry_after=60, snapshots={"long": {"symbol": GOLD}})
         self.original["progress"].update(config={"symbol": GOLD}, completed_cycles=7)
@@ -70,10 +73,7 @@ class PairSymbolChangeTests(unittest.TestCase):
         margin = {"status": "complete", "pending": None, "cooldown_until": time.time() + 100,
                   "ledger": [{"id": "historical-transfer"}]}
         self.f.store.put("pair_margin:gold", margin)
-        self.engine.pairs.recovery.previews["gold"] = {"token": "old"}
-        self.engine.pairs.recovery.baseline_previews["gold"] = {"token": "old"}
         for symbol in (SILVER, GOLD):
-            before = self.f.store.get("pair_runtime:gold")
             pair = self.switch(symbol)
             self.assertFalse(pair["enabled"])
             for key in ("id", "long_account_id", "short_account_id", "ordinary", "margin"):
@@ -82,19 +82,17 @@ class PairSymbolChangeTests(unittest.TestCase):
             self.assertEqual(state["symbol"], symbol)
             self.assertEqual(state["phase"], "paused")
             self.assertEqual(state["snapshots"], {})
-            for key in ("last_batch", "attention", "retry_after"):
+            self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
+            for key in ("last_batch", "attention", "retry_after", "progress"):
                 self.assertNotIn(key, state)
-            archive = self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")
-            self.assertEqual(archive["runtime"], before)
             self.assertEqual(self.f.store.get("pair_margin:gold"), margin)
-        self.assertNotIn("gold", self.engine.pairs.recovery.previews)
-        self.assertNotIn("gold", self.engine.pairs.recovery.baseline_previews)
 
     def test_same_symbol_keeps_original_no_network_configuration_path(self):
         self.original["owned"]["LONG"] = "2"
         self.f.store.put("pair_runtime:gold", self.original)
-        with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("unexpected read")):
-            self.switch(GOLD, ordinary={"threshold": "12000"})
+        with self.no_member_reads():
+            pair = self.switch(GOLD, name="新的名称")
+        self.assertEqual(pair["name"], "新的名称")
         self.assertEqual(self.f.store.get("pair_runtime:gold"), self.original)
 
     def test_restart_retains_new_symbol_and_both_member_bindings(self):
@@ -112,17 +110,16 @@ class PairSymbolChangeTests(unittest.TestCase):
             broker.state["positions"][SILVER + ":" + side].update(qty=qty, entry="30")
             broker.save()
 
-    def test_manual_target_holdings_replace_old_symbol_quantity_without_trading(self):
+    def test_switch_drops_old_symbol_quantity_without_adopting_target_holdings(self):
         self.original.update(owned={"LONG": "99", "SHORT": "88"})
         self.original["progress"] = empty_progress(self.original["owned"], completed=5)
         self.f.store.put("pair_runtime:gold", self.original)
         self.set_target_positions()
         pair = self.switch()
         state = self.f.store.get("pair_runtime:gold")
-        self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
         self.assertEqual(state["phase"], "paused")
         self.assertFalse(pair["enabled"])
-        self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
         restarted = Engine(Store(self.f.store.path), market=self.f.market)
         self.assertEqual(restarted.store.get("pair_runtime:gold")["owned"], state["owned"])
         self.assertEqual(restarted.store.pair("gold")["symbol"], SILVER)
@@ -135,8 +132,7 @@ class PairSymbolChangeTests(unittest.TestCase):
             with self.subTest(change=change):
                 state = {**deepcopy(self.original), **change}
                 self.f.store.put("pair_runtime:gold", state)
-                with patch.object(self.engine.pairs, "_read_members", side_effect=AssertionError("unexpected read")), \
-                        self.assertRaises(TradingError):
+                with self.no_member_reads(), self.assertRaises(TradingError):
                     self.switch()
                 self.assert_no_change(runtime=state)
 
@@ -166,7 +162,7 @@ class PairSymbolChangeTests(unittest.TestCase):
             self.switch()
         self.assert_no_change()
 
-    def test_other_holdings_are_preserved_while_only_target_direction_is_adopted(self):
+    def test_switch_preserves_all_holdings_without_adopting_any(self):
         self.set_target_positions()
         broker = self.engine.broker(self.f.store.account("test"))
         for symbol, side in ((GOLD, "LONG"), (SILVER, "SHORT"), ("CLUSD1", "SHORT")):
@@ -178,19 +174,17 @@ class PairSymbolChangeTests(unittest.TestCase):
         state = self.f.store.get("pair_runtime:gold")
         self.assertEqual(pair["symbol"], SILVER)
         self.assertFalse(pair["enabled"])
-        self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
         self.assertEqual(broker.state["positions"], holdings)
-        self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
 
-    def test_failed_or_stale_snapshot_keeps_old_configuration_and_runtime(self):
-        broker = self.engine.broker(self.f.store.account("test"))
-        snapshot = broker.snapshot([SILVER])
-        for value in (ExchangeError("offline failure"), replace(snapshot, timestamp=time.time() - 20)):
-            with self.subTest(value=type(value).__name__):
-                options = {"side_effect": value} if isinstance(value, Exception) else {"return_value": value}
-                with patch.object(broker, "snapshot", **options), self.assertRaises(TradingError):
-                    self.switch()
-                self.assert_no_change()
+    def test_switch_never_reads_account_snapshots(self):
+        with ExitStack() as stack:
+            for aid in ("test", "second"):
+                broker = self.engine.broker(self.f.store.account(aid))
+                stack.enter_context(patch.object(broker, "snapshot", side_effect=ExchangeError("unexpected read")))
+            pair = self.switch()
+        self.assertEqual(pair["symbol"], SILVER)
+        self.assertEqual(self.f.store.get("pair_runtime:gold")["symbol"], SILVER)
 
     def test_store_compare_and_swap_retains_concurrent_changes(self):
         other = Store(self.f.store.path)
@@ -283,7 +277,7 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
                                    for row in api.responses[ACCOUNT]["positions"]]
 
     # The account payload test below covers holdings for live adapters.
-    def test_other_holdings_are_preserved_while_only_target_direction_is_adopted(self):
+    def test_switch_preserves_all_holdings_without_adopting_any(self):
         self.set_target_positions()
         api = self.live["test"].api
         rows = deepcopy(api.responses[ACCOUNT]["positions"])
@@ -298,26 +292,15 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
         state = self.f.store.get("pair_runtime:gold")
         self.assertEqual(pair["symbol"], SILVER)
         self.assertFalse(pair["enabled"])
-        self.assertEqual(state["owned"], {"LONG": "2", "SHORT": "3"})
+        self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
         self.assertEqual(api.responses[ACCOUNT]["positions"], holdings)
-        self.assertEqual(self.f.store.get(f"pair_symbol_change:gold:{pair['revision']}")["runtime"], self.original)
 
-    def test_full_account_orders_and_unreadable_orders_block(self):
-        for orders in ([{"symbol": "CLUSD1"}], {}, None, ExchangeError("orders unavailable")):
-            with self.subTest(orders=orders):
-                self.live["second"].api.responses[ORDERS] = orders
-                with self.assertRaises(TradingError):
-                    self.switch()
-                self.assert_no_change()
-
-    def test_symbol_change_checks_live_accounts_while_execution_is_disabled(self):
+    def test_symbol_change_makes_no_exchange_calls_while_execution_is_disabled(self):
         with patch.object(self.engine, "live_allowed", return_value=False):
             pair = self.switch()
         self.assertEqual(pair["symbol"], SILVER)
         for broker in self.live.values():
-            reads = [call for call in broker.api.calls if call[1] == ORDERS]
-            self.assertEqual(len(reads), 1)
-            self.assertFalse(reads[0][2])  # No symbol filter: inspect all orders.
+            self.assertEqual(broker.api.calls, [])
 
     def test_identity_change_or_same_real_account_blocks(self):
         for change in (lambda: self.live["test"].api.credentials.update(user="0x" + "3" * 40),
@@ -328,37 +311,7 @@ class PairSymbolLiveChangeTests(PairSymbolChangeTests):
             self.assert_no_change()
             self.live["test"].api.credentials = original
 
-    def test_broker_replacement_cannot_reuse_old_snapshot_authority(self):
+    def test_broker_replacement_cannot_reuse_old_connection(self):
         with self.after_reads(lambda _: self.engine.brokers.pop("test")), self.assertRaises(TradingError):
-            self.switch()
-        self.assert_no_change()
-
-    def test_snapshot_event_after_reads_cannot_authorize_commit(self):
-        with self.after_reads(lambda _: self.live["test"]._private_account_event("ACCOUNT_UPDATE")), \
-                self.assertRaises(TradingError):
-            self.switch()
-        self.assert_no_change()
-
-    def test_stale_snapshot_after_wait_for_database_writer_blocks(self):
-        original = self.f.store.connect
-        captured = []
-
-        @contextmanager
-        def connect():
-            with original() as db:
-                class Connection:
-                    def execute(inner, sql, *args):
-                        result = db.execute(sql, *args)
-                        if sql == "BEGIN IMMEDIATE":
-                            for snapshot in captured:
-                                snapshot.timestamp -= 20
-                        return result
-                yield Connection()
-
-        def capture(result):
-            captured.extend(result[0].values())
-
-        with self.after_reads(capture), patch.object(self.f.store, "connect", side_effect=connect), \
-                self.assertRaisesRegex(TradingError, "过期"):
             self.switch()
         self.assert_no_change()

@@ -12,15 +12,15 @@ from tests.account_fixtures import (ACCOUNT, BRACKET, ORDERS, RISK, SYMBOL,
 from tests.test_exchange_hardening import FixtureAPI
 from trading.engine import Engine
 from trading.exchange import LiveBroker
-from trading.models import TradingError, dec
+from trading.models import TradingError
 from trading.pairing import validate_pair
-from trading.paper import PAPER_BRACKETS, PaperBroker
+from trading.paper import PAPER_BRACKETS
 from trading.store import Store
 
 
 def pair_config(**changes):
     return {"id": "gold", "name": "黄金配对", "long_account_id": "test",
-            "short_account_id": "second", "ordinary": {"enabled": True}, **changes}
+            "short_account_id": "second", **changes}
 
 
 class PairIntegrationTests(unittest.TestCase):
@@ -54,19 +54,22 @@ class PairIntegrationTests(unittest.TestCase):
         member = next(row for row in state["accounts"] if row["id"] == "test")
         self.assertEqual(member["pair_direction"], "LONG")
 
-    def test_existing_selected_position_and_pending_legacy_intents_block_creation(self):
+    def test_pending_legacy_intents_block_creation_but_existing_positions_do_not(self):
         self.f.broker.state["positions"]["XAUUSD1:LONG"].update(qty="1", entry="4412")
         self.f.store.put("paper:test", self.f.broker.state)
-        with self.assertRaisesRegex(TradingError, "原有仓位|外部持仓"):
-            self.create()
-        self.assertIsNone(self.f.store.pair("gold"))
-        self.f.broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "0"
-        self.f.store.put("paper:test", self.f.broker.state)
-        self.f.store.save_intent({"id": "pending", "account_id": "test", "status": "pending", "kind": "leverage"})
+        intent = {"id": "pending", "account_id": "test", "status": "pending", "kind": "leverage"}
+        self.f.store.save_intent(intent)
         with self.assertRaisesRegex(TradingError, "未完成"):
             self.create()
+        self.assertIsNone(self.f.store.pair("gold"))
+        self.f.store.save_intent({**intent, "status": "complete"})
+        # Funds pairs neither adopt nor constrain positions on either member.
+        holdings = deepcopy(self.f.broker.state["positions"])
+        self.create()
+        self.assertEqual(self.f.store.pair_for_account("test")["id"], "gold")
+        self.assertEqual(self.engine.broker(self.f.store.account("test")).state["positions"], holdings)
 
-    def test_external_positions_survive_creation_flat_reconciliation_and_release(self):
+    def test_external_positions_survive_creation_and_release(self):
         brokers = {aid: self.engine.broker(self.f.store.account(aid)) for aid in ("test", "second")}
         for aid, symbol, side in (("test", "XAUUSD1", "SHORT"), ("test", "CLUSD1", "LONG"),
                                   ("second", "XAUUSD1", "LONG"), ("second", "SPCXUSD1", "SHORT")):
@@ -78,13 +81,10 @@ class PairIntegrationTests(unittest.TestCase):
         with patch("trading.paper.PaperBroker.submit", side_effect=AssertionError("read-only ownership checks")), \
                 patch("trading.paper.PaperBroker.set_leverage", side_effect=AssertionError("read-only ownership checks")):
             self.create()
+            # Leftover ownership from the removed ordinary strategy no longer has to be flat.
             self.f.store.put("pair_runtime:gold", {"owned": {"LONG": "1", "SHORT": "2"},
                 "pending": None, "progress": {"quantities": {"LONG": "0", "SHORT": "0"}, "completed_cycles": 3},
                 "daily_volume": {"2026-09-29": {"long": "100", "short": "200"}}})
-            self.engine.pairs.reconcile_flat("gold")
-            state = self.f.store.get("pair_runtime:gold")
-            self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
-            self.assertEqual(state["daily_volume"], {"2026-09-29": {"long": "100", "short": "200"}})
             self.engine.pairs.delete("gold")
         self.assertIsNone(self.f.store.pair("gold"))
         for aid, broker in brokers.items():
@@ -117,16 +117,19 @@ class PairIntegrationTests(unittest.TestCase):
             self.f.store.save_pair(pair)
         with self.assertRaisesRegex(TradingError, "方向固定"):
             self.engine.pairs.configure("gold", {"long_account_id": "third"})
-        configured = self.engine.pairs.configure("gold", {"ordinary": {"enabled": True}})
-        self.assertTrue(configured["ordinary"]["enabled"])
-        self.assertNotIn("cycle", configured)
+        with self.assertRaisesRegex(TradingError, "仅可修改"):
+            self.engine.pairs.configure("gold", {"ordinary": {"enabled": True}})
+        stored = self.f.store.pair("gold")
+        self.assertEqual(stored["revision"], updated["revision"])
+        self.assertFalse(stored["ordinary"]["enabled"])
+        self.assertNotIn("cycle", stored)
 
     def test_pending_and_unknown_transfer_block_changes_and_release(self):
         self.create()
         self.f.store.put("pair_runtime:gold", {"pending": {"id": "uncertain"}})
-        with self.assertRaisesRegex(TradingError, "核对订单"):
+        with self.assertRaisesRegex(TradingError, "旧版本配对开仓"):
             self.engine.pairs.configure("gold", {"name": "blocked"})
-        with self.assertRaises(TradingError):
+        with self.assertRaisesRegex(TradingError, "旧版本配对开仓"):
             self.engine.pairs.delete("gold")
         self.f.store.put("pair_runtime:gold", {"pending": None})
         self.f.store.put("pair_margin:gold", {"status": "unknown", "pending": {"id": "transfer"}})
@@ -138,7 +141,7 @@ class PairIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(TradingError, "历史记录"):
             self.create()
 
-    def test_pause_still_schedules_recovery_and_serializes_both_accounts(self):
+    def test_paused_legacy_pending_ticks_slowly_and_serializes_both_accounts(self):
         self.create()
         self.f.store.put("pair_runtime:gold", {"pending": {"id": "old"}})
         entered, release = threading.Event(), threading.Event()
@@ -168,34 +171,35 @@ class PairIntegrationTests(unittest.TestCase):
             second = pool.submit(self.engine.pairs.tick, "gold")
             time.sleep(.02)
             release.set()
-            self.assertEqual(first.result(), 1)
-            self.assertEqual(second.result(), 1)
+            # Legacy batches wait for a rollback; fast polling cannot resolve them.
+            self.assertEqual(first.result(), 30)
+            self.assertEqual(second.result(), 30)
         self.assertEqual(maximum, 1)
         self.assertEqual(calls, [False, False])
 
-    def test_group_capacity_and_monitoring_includes_xau_with_paused_members(self):
+    def test_group_monitoring_includes_xau_with_paused_members(self):
         pair = self.create()
         pair["enabled"] = True
         self.f.store.save_pair(pair)
-        self.assertEqual(self.engine.fast_capacity_targets(self.f.store.accounts())["XAUUSD1"], {5, 10, 20})
         self.assertIn("XAUUSD1", self.engine.required_monitoring_symbols())
         self.assertIsNotNone(self.engine.pairs.active_for_account("test"))
 
-    def test_group_polling_keeps_recovery_fast_and_idle_work_bounded(self):
+    def test_group_polling_keeps_transfers_fast_and_idle_work_bounded(self):
         pair = self.create()
         manager = self.engine.pairs
         self.assertEqual(manager.poll_interval(pair, {}), 30)
-        self.assertEqual(manager.poll_interval(pair, {"pending": {"id": "old"}}), 1)
-        self.assertEqual(manager.poll_interval(pair, {"progress": {"quantities": {"LONG": "1"}}}), 1)
+        self.assertEqual(manager.poll_interval(pair, {"pending": {"id": "old"}}), 30)
+        self.assertEqual(manager.poll_interval(pair, {"progress": {"quantities": {"LONG": "1"}}}), 30)
         self.f.store.put("pair_margin:gold", {"pending": {"id": "transfer"}})
         self.assertEqual(manager.poll_interval(pair, {}), 1)
         self.f.store.put("pair_margin:gold", {})
         pair = {**pair, "enabled": True}
-        self.assertEqual(manager.poll_interval(pair, {}), 2)
-        pair["ordinary"]["enabled"] = True
-        self.assertEqual(manager.poll_interval(pair, {}), 2)
-        pair["ordinary"]["enabled"] = False
         self.assertEqual(manager.poll_interval(pair, {}), 5)
+        pair["margin"] = {**pair["margin"], "check_interval_seconds": 2}
+        self.assertEqual(manager.poll_interval(pair, {}), 2)
+        # A rolled-back ordinary flag is ignored by the funds-only scheduler.
+        pair["ordinary"] = {**pair["ordinary"], "enabled": True}
+        self.assertEqual(manager.poll_interval(pair, {}), 2)
 
     def test_manager_respects_current_worker_retry_after(self):
         from unittest.mock import Mock
@@ -204,7 +208,7 @@ class PairIntegrationTests(unittest.TestCase):
         self.engine.pairs.trader.tick.return_value = {"pending": {"id": "old"}, "retry_after": 60}
         self.assertEqual(self.engine.pairs.tick("gold"), 60)
         self.engine.pairs.trader.tick.return_value = {"pending": {"id": "old"}}
-        self.assertEqual(self.engine.pairs.tick("gold"), 1)
+        self.assertEqual(self.engine.pairs.tick("gold"), 30)
 
     def test_states_preserves_margin_reason_and_newer_durable_pending(self):
         pair = self.create(margin={"enabled": True})
@@ -232,53 +236,6 @@ class PairIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(TradingError, "配对组"):
             self.f.store.save_intent({"id": "bad", "account_id": "test", "status": "pending", "kind": "pair"})
         self.assertIsNone(self.f.store.intent("test"))
-
-    def test_reconcile_flat_clears_only_verified_closed_owned_positions(self):
-        self.create()
-        self.f.store.put("pair_runtime:gold", {"owned": {"LONG": "1", "SHORT": "1"},
-            "progress": {"quantities": {"LONG": "0", "SHORT": "0"}, "completed_cycles": 9},
-            "pending": None, "attention": "外部已平仓", "daily_volume": {"2026-09-29": {"long": "100", "short": "100"}}})
-        history = {"kind": "ordinary", "quantity": "1", "completed": True}
-        self.f.store.put("pair_batch:old", history)
-        with patch.object(self.f.broker, "submit", side_effect=AssertionError("read-only recovery")):
-            self.engine.pairs.reconcile_flat("gold")
-        runtime = self.f.store.get("pair_runtime:gold")
-        self.assertEqual(runtime["owned"], {"LONG": "0", "SHORT": "0"})
-        self.assertEqual(runtime["phase"], "paused")
-        self.assertNotIn("attention", runtime)
-        self.assertIn("2026-09-29", runtime["daily_volume"])
-        self.assertEqual(self.f.store.get("pair_batch:old"), history)
-        # Empty accounts may already have withdrawn their cash; collateral is
-        # an opening prerequisite, not a condition for proving flat ownership.
-        for aid in ("test", "second"):
-            broker = self.engine.broker(self.f.store.account(aid))
-            broker.state["wallet"] = "0"
-            self.f.store.put("paper:" + aid, broker.state)
-        self.engine.pairs.reconcile_flat("gold")
-        self.engine.pairs.delete("gold")
-        self.assertIsNone(self.f.store.pair_for_account("test"))
-
-    def test_reconcile_flat_rejects_nonzero_positions_active_group_and_pending_writes(self):
-        pair = self.create()
-        self.f.store.put("pair_runtime:gold", {"owned": {"LONG": "1", "SHORT": "1"}})
-        self.f.broker.state["positions"]["XAUUSD1:LONG"].update(qty="1", entry="4412")
-        self.f.store.put("paper:test", self.f.broker.state)
-        with self.assertRaisesRegex(TradingError, "外部持仓"):
-            self.engine.pairs.reconcile_flat("gold")
-        self.assertEqual(self.f.store.get("pair_runtime:gold")["owned"]["LONG"], "1")
-        self.f.broker.state["positions"]["XAUUSD1:LONG"]["qty"] = "0"
-        self.f.store.put("paper:test", self.f.broker.state)
-        pair = self.f.store.save_pair({**pair, "enabled": True})
-        with self.assertRaisesRegex(TradingError, "暂停"):
-            self.engine.pairs.reconcile_flat("gold")
-        self.f.store.save_pair({**pair, "enabled": False})
-        self.f.store.put("pair_runtime:gold", {"pending": {"id": "order"}})
-        with self.assertRaisesRegex(TradingError, "核对订单"):
-            self.engine.pairs.reconcile_flat("gold")
-        self.f.store.put("pair_runtime:gold", {})
-        self.f.store.put("pair_margin:gold", {"pending": {"id": "transfer"}})
-        with self.assertRaisesRegex(TradingError, "划转"):
-            self.engine.pairs.reconcile_flat("gold")
 
 
 class PairSnapshotLifecycleTests(unittest.TestCase):
@@ -309,130 +266,41 @@ class PairSnapshotLifecycleTests(unittest.TestCase):
     def tearDown(self):
         self.assertTrue(all(call[0] == "GET" for broker in self.live.values() for call in broker.api.calls))
 
-    def revoke_after_reads(self):
-        original = self.engine.pairs._read_members
-
-        def read(*args, **kwargs):
-            result = original(*args, **kwargs)
-            self.live["test"]._private_account_event("ORDER_TRADE_UPDATE")
-            return result
-
-        return patch.object(self.engine.pairs, "_read_members", side_effect=read)
-
-    def test_create_rejects_account_event_during_either_open_orders_read(self):
-        for aid in self.live:
-            with self.subTest(account=aid):
-                broker = self.live[aid]
-                original = broker.api.call
-
-                def call(method, path, *args, **kwargs):
-                    value = original(method, path, *args, **kwargs)
-                    if path == ORDERS:
-                        broker._private_account_event("ACCOUNT_UPDATE")
-                    return value
-
-                with patch.object(broker.api, "call", side_effect=call), self.assertRaisesRegex(TradingError, "失效"):
-                    self.create()
-                self.assertIsNone(self.f.store.pair("gold"))
-                self.assertIsNone(self.f.store.pair_for_account(aid))
-
-    def test_create_rechecks_revocation_after_all_preparation(self):
-        with self.revoke_after_reads(), self.assertRaisesRegex(TradingError, "失效"):
-            self.create()
-        self.assertIsNone(self.f.store.pair("gold"))
-
-    def test_create_rechecks_first_snapshot_after_waiting_for_other_account(self):
-        first_read = threading.Event()
-        first, second = self.live["test"], self.live["second"]
-        first_call, second_call = first.api.call, second.api.call
-
-        def read_first(method, path, *args, **kwargs):
-            value = first_call(method, path, *args, **kwargs)
-            if path == ORDERS:
-                first_read.set()
-            return value
-
-        def read_second(method, path, *args, **kwargs):
-            value = second_call(method, path, *args, **kwargs)
-            if path == ORDERS:
-                self.assertTrue(first_read.wait(2))
-                first._private_account_event("ORDER_TRADE_UPDATE")
-            return value
-
-        with patch.object(first.api, "call", side_effect=read_first), \
-             patch.object(second.api, "call", side_effect=read_second), self.assertRaisesRegex(TradingError, "失效"):
-            self.create()
-        self.assertIsNone(self.f.store.pair("gold"))
-
-    def test_enable_rechecks_after_master_verification_without_clearing_attention(self):
-        self.create()
+    def test_enable_rechecks_identity_after_master_verification_without_clearing_attention(self):
+        self.create(margin={"enabled": True})
         runtime = {"attention": "仍需核对", "owned": {"LONG": "0", "SHORT": "0"}}
         self.f.store.put("pair_runtime:gold", runtime)
-        self.verify.side_effect = lambda pair: self.live["second"]._private_account_event("ACCOUNT_CONFIG_UPDATE")
-        with self.assertRaisesRegex(TradingError, "失效"):
+        # Funds-only start reads no positions; it rechecks member identity instead.
+        self.verify.side_effect = lambda pair: setattr(self.live["second"].api, "credentials",
+            {"user": "0x" + "3" * 40, "signer": "0x" + "3" * 39 + "f"})
+        with self.assertRaisesRegex(TradingError, "身份已变化"):
             self.engine.pairs.enable("gold", True)
         self.assertFalse(self.f.store.pair("gold")["enabled"])
         self.assertEqual(self.f.store.get("pair_runtime:gold"), runtime)
 
-    def test_delete_rechecks_revocation_before_releasing_members(self):
+    def test_delete_rechecks_identity_before_releasing_members(self):
         self.create()
-        with self.revoke_after_reads(), self.assertRaisesRegex(TradingError, "失效"):
+        from trading.pair_execution import PairTrader
+        original = PairTrader._members
+
+        def members(trader, *args, **kwargs):
+            result = original(trader, *args, **kwargs)
+            self.live["test"].api.credentials = {"user": "0x" + "3" * 40, "signer": "0x" + "3" * 39 + "f"}
+            return result
+
+        with patch.object(PairTrader, "_members", members), self.assertRaisesRegex(TradingError, "身份已变化"):
             self.engine.pairs.delete("gold")
         self.assertIsNotNone(self.f.store.pair("gold"))
         self.assertEqual(self.f.store.pair_for_account("test")["id"], "gold")
         self.assertIsNone(self.f.store.get("pair_deleted:gold"))
 
-    def test_reconcile_rechecks_revocation_before_clearing_owned(self):
+    def test_current_reads_allow_enable_pause_and_release(self):
         self.create()
-        runtime = {"attention": "外部平仓待核对", "owned": {"LONG": "1", "SHORT": "1"},
-                   "progress": {"quantities": {"LONG": "0", "SHORT": "0"}}}
-        self.f.store.put("pair_runtime:gold", runtime)
-        with self.revoke_after_reads(), self.assertRaisesRegex(TradingError, "失效"):
-            self.engine.pairs.reconcile_flat("gold")
-        self.assertEqual(self.f.store.get("pair_runtime:gold"), runtime)
-
-    def test_account_event_cannot_cross_final_guard_and_local_commit(self):
-        entered, finished = threading.Event(), threading.Event()
-        committed = []
-        broker = self.live["test"]
-        original_lock = broker._snapshot_lock
-
-        class ObservedLock:
-            def __enter__(inner):
-                if threading.current_thread().name == "pair-lifecycle-event":
-                    entered.set()
-                return original_lock.__enter__()
-
-            def __exit__(inner, *args):
-                return original_lock.__exit__(*args)
-
-        def event():
-            broker._private_account_event("ACCOUNT_UPDATE")
-            committed.append(self.f.store.pair("gold") is not None)
-            finished.set()
-
-        worker = threading.Thread(target=event, name="pair-lifecycle-event", daemon=True)
-        original_save = self.f.store.save_pair
-
-        def save(*args, **kwargs):
-            worker.start()
-            self.assertTrue(entered.wait(2))
-            self.assertFalse(finished.wait(.02))
-            return original_save(*args, **kwargs)
-
-        with patch.object(broker, "_snapshot_lock", ObservedLock()), patch.object(self.f.store, "save_pair", side_effect=save):
-            try:
-                self.create()
-            finally:
-                worker.join(timeout=2)
-        self.assertTrue(finished.is_set())
-        self.assertEqual(committed, [True])
-
-    def test_current_reads_allow_enable_reconcile_and_release(self):
-        self.create()
+        with self.assertRaisesRegex(TradingError, "请先开启保证金平衡"):
+            self.engine.pairs.enable("gold", True)
+        self.engine.pairs.configure("gold", {"margin": {"enabled": True}})
         self.engine.pairs.enable("gold", True)
         self.assertTrue(self.f.store.pair("gold")["enabled"])
         self.engine.pairs.enable("gold", False)
-        self.engine.pairs.reconcile_flat("gold")
         self.engine.pairs.delete("gold")
         self.assertIsNone(self.f.store.pair("gold"))

@@ -6,18 +6,13 @@ import {
   pairConfigurationLock,
   pairDataFresh,
   pairDeletionBlock,
-  pairDisplayBalances,
   pairDraft,
   pairExecutionPhaseLabel,
   pairHasPending,
-  pairMarginLimitFieldVisible,
   pairMarginStatus,
-  pairMarginOnly,
   pairMarginRunning,
-  pairNetQuantity,
   pairPhaseLabel,
-  pairSnapshotStatus,
-  pairStartRecoveryBlock,
+  pairStartBlock,
   pairTransferStatus,
   parsePairDraft,
 } from '../lib/pairs.ts';
@@ -42,27 +37,29 @@ test('margin runtime state stays independent from strategy activation and saved 
   assert.equal(pairMarginRunning(fixture), false);
 });
 
-test('funds-only activation keeps pending recovery separate from trading activation', () => {
+test('start requires margin balancing but never waits for a pending transfer', () => {
   const fixture = {
-    ordinary: { enabled: false },
+    enabled: false,
     margin: { enabled: true },
     state: {
-      pending: { kind: 'leverage' },
       margin: { status: 'unknown', pending: { request_id: 'original' } },
     },
   };
-  assert.equal(pairMarginOnly(fixture), true);
-  assert.equal(pairStartRecoveryBlock(fixture), '');
-  assert.match(pairConfigurationLock(fixture), /待核对/);
-  assert.match(pairDeletionBlock(fixture, 100), /等待确认/);
-  assert.match(
-    pairStartRecoveryBlock({ ...fixture, ordinary: { enabled: true } }),
-    /待核对/,
+  assert.equal(pairStartBlock(fixture), '');
+  assert.match(pairConfigurationLock(fixture), /划转结果待核对/);
+  assert.match(pairDeletionBlock(fixture), /划转结果待核实/);
+  assert.equal(
+    pairStartBlock({ ...fixture, margin: { enabled: false } }),
+    '请先开启保证金平衡，再启动配对组',
+  );
+  assert.equal(
+    pairStartBlock({ ...fixture, margin: {} }),
+    '请先开启保证金平衡，再启动配对组',
   );
 });
 
 test('transfer submission is distinct from order submission and margin checks need no pending transfer', () => {
-  assert.equal(pairPhaseLabel('submitting'), '并行提交两侧市价单');
+  assert.equal(pairPhaseLabel('submitting'), 'submitting');
   assert.equal(
     pairTransferStatus({ status: 'submitting' }),
     '划转请求提交中 · 等待回执',
@@ -75,30 +72,34 @@ test('transfer submission is distinct from order submission and margin checks ne
   assert.equal(pairHasPending({ state: { phase: 'margin_wait' } }), false);
 });
 
-test('leverage confirmation is distinct from order reconciliation without changing pending locks', () => {
-  for (const phase of ['leverage', 'reconciling']) {
-    const fixture = pair({
-      phase,
-      pending: { id: 'leverage-one', kind: 'leverage' },
-    });
-    assert.equal(pairExecutionPhaseLabel(fixture), '杠杆设置确认中');
+test('legacy order records stay pending and block start, edits and deletion', () => {
+  for (const legacy of [
+    { pending: { id: 'old-batch', kind: 'ordinary' } },
+    { recovery_watch: { batches: [{ id: 'old' }] } },
+    // The server refuses any non-null record, even an empty one.
+    { pending: {} },
+  ]) {
+    const fixture = pair({ phase: 'attention', ...legacy });
+    fixture.margin.enabled = true;
+    assert.equal(pairExecutionPhaseLabel(fixture), '需要处理');
     assert.equal(pairHasPending(fixture), true);
-    assert.ok(pairConfigurationLock(fixture));
-    assert.ok(pairStartRecoveryBlock(fixture));
-    assert.ok(pairDeletionBlock(fixture, 100));
+    assert.match(pairStartBlock(fixture), /旧版配对开仓.*暂不能启动/);
+    assert.match(pairConfigurationLock(fixture), /旧版配对开仓.*修改设置/);
+    assert.match(pairDeletionBlock(fixture), /旧版配对开仓.*暂不能删除/);
   }
-  assert.equal(
-    pairExecutionPhaseLabel(
-      pair({ phase: 'reconciling', pending: { kind: 'ordinary' } }),
-    ),
-    '订单结果核对中',
-  );
-  assert.equal(
-    pairExecutionPhaseLabel(
-      pair({ phase: 'attention', pending: { kind: 'leverage' } }),
-    ),
-    '需要处理',
-  );
+  for (const empty of [{ pending: null }, {}]) {
+    const fixture = pair(empty);
+    assert.equal(pairHasPending(fixture), false);
+    assert.equal(pairConfigurationLock(fixture), '');
+    assert.equal(pairDeletionBlock(fixture), '');
+  }
+});
+
+test('funds phases have labels and unknown phases stay visible', () => {
+  assert.equal(pairPhaseLabel('maintenance'), '工作台维护中');
+  assert.equal(pairPhaseLabel('recovering'), 'ADL 应急处理中');
+  assert.equal(pairPhaseLabel('reconciling'), 'reconciling');
+  assert.equal(pairPhaseLabel(), '等待状态');
 });
 
 const accounts = [
@@ -112,104 +113,62 @@ const draft = () => ({
   long_account_id: 'a',
   short_account_id: 'b',
 });
-const snapshot = (positions = [], timestamp = 100) => ({
-  positions,
-  timestamp,
-});
-const position = (side, qty, symbol = 'XAUUSD1') => ({ side, qty, symbol });
 const pair = (state = {}) => ({
   ...parsePairDraft(draft(), accounts, []),
   enabled: false,
-  state: { snapshots: { long: snapshot(), short: snapshot() }, ...state },
+  state,
 });
 
-test('funds-only displays never use retained trading balances, including partially missing reads', () => {
-  const fixture = pair();
-  fixture.margin.enabled = true;
-  fixture.state.snapshots.long.equity = '9000';
-  fixture.state.snapshots.short.available = '8000';
-  assert.equal(pairDisplayBalances(fixture), undefined);
-  fixture.state.margin_balances = { short: { equity: '100', timestamp: 100 } };
-  assert.equal(pairDisplayBalances(fixture).long, undefined);
-  assert.equal(pairDisplayBalances(fixture), fixture.state.margin_balances);
-  fixture.ordinary.enabled = true;
-  assert.equal(pairDisplayBalances(fixture), fixture.state.snapshots);
-});
-
-test('existing pairs with missing risk limits require explicit input while new pairs keep defaults', () => {
-  const fixture = pair();
-  delete fixture.ordinary.margin_limit;
-  const existing = pairDraft(fixture);
-  assert.equal(existing.margin_percent, '');
-  assert.throws(() => parsePairDraft(existing, accounts, []), /风险约束/);
-  assert.equal(
-    parsePairDraft({ ...existing, margin_percent: '60' }, accounts, []).ordinary
-      .margin_limit,
-    '0.6',
-  );
-  assert.equal(pairDraft().margin_percent, '50');
-  fixture.ordinary.margin_limit = '0.333000000000000001';
-  assert.equal(pairDraft(fixture).margin_percent, '33.3000000000000001');
-});
-
-test('margin-only pairs keep the risk field reachable while the stored limit is missing', () => {
-  const fixture = pair();
-  const monitor = { ...pairDraft(fixture), mode: 'monitor' };
-  assert.equal(pairMarginLimitFieldVisible(monitor, fixture), false);
-  assert.equal(pairMarginLimitFieldVisible(monitor), false);
-  delete fixture.ordinary.margin_limit;
-  const missing = { ...pairDraft(fixture), mode: 'monitor' };
-  assert.equal(pairMarginLimitFieldVisible(missing, fixture), true);
-  assert.equal(
-    pairMarginLimitFieldVisible({ ...missing, margin_percent: '6' }, fixture),
-    true,
-  );
-  assert.equal(
-    pairMarginLimitFieldVisible({ ...missing, mode: 'ordinary' }, fixture),
-    true,
-  );
-});
-
-test('pair requests preserve decimal strings and fixed roles without enabling the group', () => {
-  const config = parsePairDraft(
-    {
-      ...draft(),
-      mode: 'ordinary',
-      order_notional: '1000.000000001',
-      margin_percent: '50.00001',
-    },
-    accounts,
-    [],
-  );
+test('pair requests carry only funds settings and fixed roles without enabling the group', () => {
+  const config = parsePairDraft(draft(), accounts, []);
   assert.equal(config.symbol, 'XAUUSD1');
   assert.equal(config.long_account_id, 'a');
   assert.equal(config.short_account_id, 'b');
-  assert.equal(config.ordinary.order_notional, '1000.000000001');
-  assert.equal(config.ordinary.margin_limit, '0.5000001');
-  assert.equal(config.ordinary.enabled, true);
-  assert.equal(Object.hasOwn(config, 'cycle'), false);
-  assert.equal(Object.hasOwn(config, 'enabled'), false);
+  assert.deepEqual(Object.keys(config).sort(), [
+    'adl',
+    'id',
+    'long_account_id',
+    'margin',
+    'name',
+    'short_account_id',
+    'symbol',
+  ]);
   assert.equal(typeof config.margin.check_interval_seconds, 'number');
   assert.deepEqual(Object.keys(pairConfigurationChanges(config)).sort(), [
     'adl',
     'margin',
     'name',
-    'ordinary',
     'symbol',
   ]);
+  // A stored legacy ordinary section is ignored and never sent back.
+  const saved = { ...config, enabled: false, ordinary: { enabled: false } };
+  const edited = parsePairDraft(pairDraft(saved), accounts, [saved], saved.id);
+  assert.equal(Object.hasOwn(edited, 'ordinary'), false);
+  assert.equal(Object.hasOwn(pairDraft(saved), 'mode'), false);
 });
 
-test('trade mode is exclusive and monitor-only does not silently enable trading', () => {
-  for (const mode of ['monitor', 'ordinary']) {
-    const config = parsePairDraft({ ...draft(), mode }, accounts, []);
-    assert.equal(config.ordinary.enabled, mode === 'ordinary');
-    assert.equal(Object.hasOwn(config, 'cycle'), false);
-  }
-  for (const mode of ['cycle', '', 'unknown'])
-    assert.throws(
-      () => parsePairDraft({ ...draft(), mode }, accounts, []),
-      /请选择配对执行模式/,
-    );
+test('pair symbols must come from the catalog unless an edit keeps the saved symbol', () => {
+  const symbols = [{ symbol: 'XAGUSD1', display_name: '白银 XAGUSD1' }];
+  assert.equal(
+    parsePairDraft(
+      { ...draft(), symbol: 'XAGUSD1' },
+      accounts,
+      [],
+      undefined,
+      symbols,
+    ).symbol,
+    'XAGUSD1',
+  );
+  assert.throws(
+    () => parsePairDraft(draft(), accounts, [], undefined, symbols),
+    /目录中支持的配对标的/,
+  );
+  const saved = { ...pair(), symbol: 'XAUUSD1' };
+  assert.equal(
+    parsePairDraft(pairDraft(saved), accounts, [saved], saved.id, symbols)
+      .symbol,
+    'XAUUSD1',
+  );
 });
 
 test('membership rejects duplicates, mixed environments, occupied and running accounts', () => {
@@ -276,18 +235,6 @@ test('live automatic transfers need a master prefix and meaningful transfer boun
     /小于 100/,
   );
   assert.throws(
-    () => parsePairDraft({ ...draft(), order_notional: '499' }, accounts, []),
-    /500/,
-  );
-  assert.throws(
-    () => parsePairDraft({ ...draft(), spread_limit: '0' }, accounts, []),
-    /大于零/,
-  );
-  assert.throws(
-    () => parsePairDraft({ ...draft(), spread_limit: '0.001' }, accounts, []),
-    /不能超过/,
-  );
-  assert.throws(
     () =>
       parsePairDraft(
         { ...draft(), check_interval_seconds: '86401' },
@@ -331,7 +278,6 @@ test('zero balancing threshold survives an edit that only renames the group', ()
   assert.equal(renamed.name, '新组名称');
   assert.deepEqual(renamed.margin, saved.margin);
   assert.equal(renamed.margin.threshold, '0');
-  assert.deepEqual(renamed.ordinary, saved.ordinary);
 });
 
 test('balancing intervals and cooldowns match their separate server limits', () => {
@@ -392,13 +338,9 @@ test('transfer minimum and maximum compare exact decimals at both boundaries', (
   );
 });
 
-test('trading and balancing limits reject decimal overflow without Number rounding', () => {
+test('balancing limits reject decimal overflow without Number rounding', () => {
   for (const [field, value] of [
-    ['threshold', '1000000000.000000000000000001'],
     ['balance_threshold', '1000000000.000000000000000001'],
-    ['order_notional', '499.999999999999999999'],
-    ['order_notional', '1000000.000000000000000001'],
-    ['spread_limit', '0.000500000000000000000000000001'],
     ['buffer_percent', '100.000000000000000001'],
   ])
     assert.throws(() =>
@@ -408,25 +350,18 @@ test('trading and balancing limits reject decimal overflow without Number roundi
   const config = parsePairDraft(
     {
       ...draft(),
-      threshold: '1000000000',
       balance_threshold: '1000000000',
-      order_notional: '500',
-      spread_limit: '0.0005',
       buffer_percent: '99.999999999999999999',
     },
     accounts,
     [],
   );
-  assert.equal(config.ordinary.order_notional, '500');
-  assert.equal(config.ordinary.spread_limit, '0.0005');
-  assert.equal(config.margin.buffer_ratio, '0.99999999999999999999');
   assert.equal(
-    parsePairDraft({ ...draft(), order_notional: '1000000' }, accounts, [])
-      .ordinary.order_notional,
-    '1000000',
+    config.margin.balance_threshold ?? config.margin.threshold,
+    '1000000000',
   );
+  assert.equal(config.margin.buffer_ratio, '0.99999999999999999999');
   for (const [field, value] of [
-    ['threshold', '0'],
     ['balance_threshold', '0'],
     ['buffer_percent', '0'],
   ])
@@ -436,13 +371,7 @@ test('trading and balancing limits reject decimal overflow without Number roundi
 });
 
 test('pair amounts respect API string lengths while retaining supported precision', () => {
-  for (const field of [
-    'threshold',
-    'order_notional',
-    'balance_threshold',
-    'min_transfer',
-    'max_transfer',
-  ]) {
+  for (const field of ['balance_threshold', 'min_transfer', 'max_transfer']) {
     const forty = `1000.${'0'.repeat(35)}`;
     assert.doesNotThrow(() =>
       parsePairDraft({ ...draft(), [field]: forty }, accounts, []),
@@ -452,15 +381,19 @@ test('pair amounts respect API string lengths while retaining supported precisio
       /40 个字符/,
     );
   }
-  const spread = `0.0005${'0'.repeat(122)}`;
+  const buffer = `5.${'0'.repeat(126)}`;
   assert.equal(
-    parsePairDraft({ ...draft(), spread_limit: spread }, accounts, []).ordinary
-      .spread_limit,
-    spread,
+    parsePairDraft({ ...draft(), buffer_percent: buffer }, accounts, []).margin
+      .buffer_ratio,
+    '0.05',
   );
   assert.throws(
     () =>
-      parsePairDraft({ ...draft(), spread_limit: spread + '0' }, accounts, []),
+      parsePairDraft(
+        { ...draft(), buffer_percent: buffer + '0' },
+        accounts,
+        [],
+      ),
     /128 个字符/,
   );
 });
@@ -507,9 +440,9 @@ test('every live group requires an independent master prefix on create and edit 
     mode: 'live',
     env_prefix: `ASTER_${account.id.toUpperCase()}`,
   }));
-  for (const mode of ['monitor', 'ordinary']) {
+  {
     for (const currentId of [undefined, 'gold_pair']) {
-      const input = { ...draft(), mode, margin_enabled: false };
+      const input = { ...draft(), margin_enabled: false };
       assert.throws(
         () => parsePairDraft(input, live, [], currentId),
         /实盘配对组须填写独立主账户/,
@@ -599,309 +532,47 @@ test('snapshot freshness handles exact 8-second boundary, offline and invalid cl
     [100, NaN, false],
   ])
     assert.equal(pairDataFresh(time, now, offline), false);
-  assert.equal(pairSnapshotStatus(undefined, 100), '等待账户数据');
-  assert.match(pairSnapshotStatus(snapshot(), 108), /过期/);
-  assert.match(pairSnapshotStatus(snapshot(), 101, true), /连接中断/);
 });
 
-test('account display cadence cannot extend pair snapshot freshness or a cached deletion block', () => {
-  const occupied = pair({
-    snapshots: {
-      long: snapshot([position('LONG', '1')]),
-      short: snapshot(),
-    },
-  });
-  // Replay the proposed cadence argument: it is display metadata, not evidence
-  // that a pair snapshot remains current after the eight-second boundary.
-  for (const interval of [30, 60, Infinity]) {
-    assert.equal(pairDataFresh(100, 107.999, false, interval), true);
-    assert.match(
-      pairDeletionBlock(occupied, 107.999, false, interval),
-      /指定方向仓位/,
-    );
-    for (const now of [108, 120, 160]) {
-      assert.equal(pairDataFresh(100, now, false, interval), false);
-      assert.match(
-        pairSnapshotStatus(snapshot(), now, false, interval),
-        /过期/,
-      );
-      assert.equal(pairDeletionBlock(occupied, now, false, interval), '');
-    }
-    assert.match(pairDeletionBlock(occupied, 120, true, interval), /连接恢复/);
-  }
-});
-
-test('quantity difference stays exact and missing side never becomes zero', () => {
-  assert.equal(pairNetQuantity({ long: snapshot(), short: null }), null);
-  assert.equal(pairNetQuantity({ long: {}, short: snapshot() }), null);
-  assert.equal(
-    pairNetQuantity({
-      long: snapshot([position('LONG', '0.300000000000000001')]),
-      short: snapshot([position('SHORT', '-0.3')]),
-    }),
-    '0.000000000000000001',
-  );
-  assert.equal(
-    pairNetQuantity({
-      long: snapshot([position('LONG', '1'), position('SHORT', '0.1')]),
-      short: snapshot([position('SHORT', '1')]),
-    }),
-    '0',
-  );
-  assert.equal(
-    pairNetQuantity({
-      long: snapshot([position('LONG', '8', 'BTCUSDT')]),
-      short: snapshot(),
-    }),
-    null,
-  );
-  assert.equal(
-    pairNetQuantity({
-      long: snapshot([position('LONG', 'bad')]),
-      short: snapshot(),
-    }),
-    null,
-  );
-  assert.equal(pairNetQuantity({ long: snapshot(), short: snapshot() }), null);
-  assert.equal(
-    pairNetQuantity({
-      long: snapshot([position('LONG', '0')]),
-      short: snapshot([position('SHORT', '0')]),
-    }),
-    '0',
-  );
-});
-
-test('net quantity uses each assigned leg and ignores external positions in both accounts', () => {
-  const snapshots = {
-    long: snapshot([
-      position('LONG', '1.000000000000000001'),
-      position('SHORT', '20'),
-      position('LONG', '900', 'XAGUSD1'),
-    ]),
-    short: snapshot([
-      position('SHORT', '-1.1'),
-      position('LONG', '30'),
-      position('SHORT', '800', 'XAGUSD1'),
-    ]),
-  };
-  assert.equal(pairNetQuantity(snapshots), '-0.099999999999999999');
-  assert.equal(pairNetQuantity(snapshots, 'XAGUSD1'), '100');
-  snapshots.long.positions[1].qty = 'unknown';
-  snapshots.short.positions[1].qty = '1000';
-  assert.equal(pairNetQuantity(snapshots), '-0.099999999999999999');
-});
-
-test('missing, duplicate or malformed assigned legs keep net quantity unknown', () => {
-  for (const side of ['long', 'short']) {
-    const direction = side === 'long' ? 'LONG' : 'SHORT';
-    const opposite = side === 'long' ? 'SHORT' : 'LONG';
-    const missing = [
-      [],
-      [position(opposite, '0')],
-      [position(direction, '0', 'XAGUSD1')],
-      [position('BOTH', '0')],
-      [null],
-      [position(direction, '0'), position(direction, '0')],
-    ];
-    const invalid = [
-      'bad',
-      '',
-      'NaN',
-      'Infinity',
-      '1e-8',
-      undefined,
-      null,
-      0,
-      {},
-    ].map((qty) => [position(direction, qty)]);
-    for (const rows of [...missing, ...invalid]) {
-      const snapshots = {
-        long: snapshot([position('LONG', '0')]),
-        short: snapshot([position('SHORT', '0')]),
-      };
-      snapshots[side].positions = rows;
-      assert.equal(pairNetQuantity(snapshots), null);
-    }
-  }
-});
-
-test('unknown orders and transfers block edits/deletion without claiming completion', () => {
+test('unknown transfers block edits and deletion without claiming completion', () => {
   for (const state of [
-    { pending: { orders: [{ id: 'pending' }] } },
     { margin: { status: 'unknown' } },
     { margin: { pending: { request_id: 'r' } } },
   ]) {
     assert.equal(pairHasPending(pair(state)), true);
     assert.match(pairConfigurationLock(pair(state)), /待核对/);
-    assert.match(pairDeletionBlock(pair(state), 100), /等待确认/);
+    assert.match(pairDeletionBlock(pair(state)), /划转结果待核实/);
   }
-});
-
-test('ordinary baseline holdings do not lock unrelated configuration edits', () => {
+  for (const status of ['submitting', 'accepted', 'acknowledged'])
+    assert.match(
+      pairDeletionBlock(pair({ margin: { status } })),
+      /划转结果待核实/,
+    );
   assert.equal(
-    pairConfigurationLock(
-      pair({
-        owned: { LONG: '1', SHORT: '1' },
-        snapshots: {
-          long: snapshot([position('LONG', '1')]),
-          short: snapshot([position('SHORT', '1')]),
-        },
-      }),
-    ),
+    pairDeletionBlock(pair({ margin: { status: 'confirmed' } })),
     '',
   );
 });
 
-test('ordinary opening can request reconciliation at start without unlocking edits or deletion', () => {
-  const fixture = pair({
-    pending: {
-      id: 'unknown-original',
-      kind: 'ordinary',
-      phase: 'open',
-      legs: [{ receipt: null }],
-    },
-    snapshots: {
-      long: snapshot([position('LONG', '19.5')], 1),
-      short: snapshot([position('SHORT', '19.5')], 1),
+test('deletion keeps both accounts positions and only waits for pause, ADL and transfers', () => {
+  // Positions are never inspected: unbinding leaves both accounts as they are.
+  const holding = pair({
+    display_positions: {
+      long: {
+        snapshot: {
+          timestamp: 100,
+          positions: [{ symbol: 'XAUUSD1', side: 'LONG', qty: '5' }],
+        },
+      },
     },
   });
-  assert.equal(pairStartRecoveryBlock(fixture), '');
-  assert.equal(pairHasPending(fixture), true);
-  assert.match(pairConfigurationLock(fixture), /待核对/);
-  assert.match(pairDeletionBlock(fixture, 100), /等待确认/);
-  // UI values do not authorize adoption or require reducing larger holdings.
-  assert.equal(
-    pairStartRecoveryBlock(pair({ pending: fixture.state.pending })),
-    '',
-  );
-  assert.equal(pairStartRecoveryBlock(pair()), '');
-});
-
-test('other pending work still blocks start even alongside an ordinary opening', () => {
-  const ordinary = { id: 'batch', kind: 'ordinary', phase: 'open' };
-  for (const pending of [
-    { kind: 'cycle', phase: 'open' },
-    { kind: 'ordinary', phase: 'close' },
-    { kind: 'leverage' },
-    { id: 'unclassified' },
-  ])
-    assert.match(pairStartRecoveryBlock(pair({ pending })), /批次仍待核对/);
-  for (const margin of [
-    { pending: { request_id: 'transfer' } },
-    ...['submitting', 'accepted', 'acknowledged', 'unknown'].map((status) => ({
-      status,
-    })),
-  ])
-    assert.match(
-      pairStartRecoveryBlock(pair({ pending: ordinary, margin })),
-      /划转/,
-    );
-  assert.equal(
-    pairStartRecoveryBlock(pair({ margin: { status: 'confirmed' } })),
-    '',
-  );
-});
-
-test('unknown transfer with a verified new baseline allows start but retains edit and deletion locks', () => {
-  const margin = {
-    status: 'unknown',
-    pending: { request_id: 'original-transfer', status: 'unknown' },
-    blocks_trading: false,
-    trading_resume_allowed: true,
-  };
-  const fixture = pair({ margin });
-  assert.equal(pairStartRecoveryBlock(fixture), '');
-  assert.equal(pairHasPending(fixture), true);
-  assert.match(pairConfigurationLock(fixture), /待核对/);
-  assert.match(pairDeletionBlock(fixture, 100), /等待确认/);
-  assert.match(pairMarginStatus(margin), /交易/);
-  for (const changed of [
-    { trading_resume_allowed: false },
-    { trading_resume_allowed: undefined },
-    { blocks_trading: true },
-    { status: 'acknowledged' },
-  ])
-    assert.match(
-      pairStartRecoveryBlock(pair({ margin: { ...margin, ...changed } })),
-      /划转/,
-    );
+  assert.equal(pairDeletionBlock(holding), '');
+  assert.match(pairDeletionBlock({ ...pair(), enabled: true }), /暂停/);
+  assert.match(pairDeletionBlock(pair(), true), /连接恢复/);
   assert.match(
-    pairStartRecoveryBlock(pair({ margin, pending: { kind: 'cycle' } })),
-    /批次/,
-  );
-});
-
-test('deletion blocks known positions and defers missing/stale snapshots to the server fresh-read guard', () => {
-  assert.equal(pairDeletionBlock(pair(), 100), '');
-  assert.match(pairDeletionBlock({ ...pair(), enabled: true }, 100), /暂停/);
-  assert.equal(pairDeletionBlock(pair(), 108), '');
-  assert.equal(
     pairDeletionBlock(
-      pair({ snapshots: { long: snapshot(), short: null } }),
-      100,
+      pair({ adl: { configuration_locked: true, lock_reason: 'ADL 处理中' } }),
     ),
-    '',
+    /ADL/,
   );
-  assert.match(pairDeletionBlock(pair(), 100, true), /连接恢复/);
-  assert.equal(
-    pairDeletionBlock(
-      pair({
-        snapshots: {
-          long: snapshot(),
-          short: snapshot([position('LONG', '1', 'BTCUSDT')]),
-        },
-      }),
-      100,
-    ),
-    '',
-  );
-});
-
-test('deletion scopes fresh positions to assigned legs unless a historical watch remains', () => {
-  for (const symbol of ['XAUUSD1', 'XAGUSD1']) {
-    const snapshots = {
-      long: snapshot([
-        position('LONG', '0', symbol),
-        position('SHORT', '5', symbol),
-        position('LONG', '8', 'BTCUSDT'),
-      ]),
-      short: snapshot([
-        position('SHORT', '0', symbol),
-        position('LONG', '7', symbol),
-        position('SHORT', '9', 'BTCUSDT'),
-      ]),
-    };
-    const fixture = { ...pair({ snapshots }), symbol };
-    assert.equal(pairDeletionBlock(fixture, 100), '');
-    const watched = {
-      ...fixture,
-      state: { ...fixture.state, recovery_watch: { batches: [{ id: 'old' }] } },
-    };
-    assert.match(pairDeletionBlock(watched, 100), /所有仓位/);
-    assert.equal(pairDeletionBlock(watched, 108), '');
-    for (const side of ['long', 'short']) {
-      snapshots[side].positions[0].qty = '0.000000000000000001';
-      assert.match(pairDeletionBlock(fixture, 100), /指定方向仓位/);
-      snapshots[side].positions[0].qty = '0';
-    }
-  }
-});
-
-test('deletion preserves unknown-data checks for scoped holdings and the default symbol', () => {
-  for (const side of ['long', 'short']) {
-    const direction = side === 'long' ? 'LONG' : 'SHORT';
-    for (const positions of [undefined, {}, [position(direction, 'unknown')]]) {
-      const fixture = pair({
-        snapshots: {
-          long: snapshot(),
-          short: snapshot(),
-          [side]: { positions, timestamp: 100 },
-        },
-      });
-      delete fixture.symbol;
-      assert.match(pairDeletionBlock(fixture, 100), /指定方向仓位/);
-      assert.equal(pairDeletionBlock(fixture, 108), '');
-    }
-  }
 });
