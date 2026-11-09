@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createApp } from '../server/app.mjs';
 import { DIGEST_DEFAULTS, buildDigest, latestSlot, localClock, nextSlot, postCard, renderCard, validateChannel, validateDigestConfig } from '../server/automation/feishu-digest-core.mjs';
 import { createFeishuDigest } from '../server/automation/feishu-digest.mjs';
-import { collectSections, executionSection, fundingSection, positionsSection, projectSection, researchSection } from '../server/automation/feishu-digest-sources.mjs';
+import { anthropicSection, collectSections, executionSection, fundingSection, positionsSection, projectSection, researchSection } from '../server/automation/feishu-digest-sources.mjs';
 import { loadCredentialCipher } from '../server/runtime/credentials.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -508,18 +508,85 @@ test('funding, execution, Aero and research sections show their own state', () =
   assert.equal(researchSection({ enabled: true, state: 'running', stale: true, error: null, insights: null }).level, 'warn');
 });
 
+const NINE_ISO = new Date(AT_NINE).toISOString();
+const antBook = (exchange, symbol, bid, ask, at = NINE_ISO) => ({ exchange, symbol, bid, ask, at });
+const antQuotes = (books = [antBook('hyperliquid', 'io:ANTH', '5010', '5012'), antBook('hyperliquid', 'xyz:ANT', '305', '305.5'), antBook('binance', 'ANTHROPICUSDT', '3810', '3812'),
+  antBook('okx', 'ANTHROPICUSDT', '381', '381.2', new Date(AT_NINE - 30_000).toISOString()), { exchange: 'rh-lighter', symbol: 'ANTHROPIC', error: 'Lighter RH 请求受限' },
+  antBook('binance', 'CLUSDT', '60', '61')]) => ({ generatedAt: NINE_ISO, maxAgeMs: 10_000, books });
+const antPosition = (exchange, symbol, side, quantity, extra = {}) => ({ id: `${exchange}:${symbol}:${side}`, exchange, symbol, side, quantity, quantityUnit: null, notional: '1000', unrealizedPnl: '1', distancePercent: '50.00', riskUnknown: false, alerting: false, ...extra });
+const antWatch = (sources, thresholdPercent = 20) => ({ generatedAt: NINE_ISO, sources, alerts: { config: { enabled: true, thresholdPercent, repeatMinutes: 30 } } });
+const antSource = (exchange, positions, extra = {}) => ({ exchange, connected: true, state: 'live', fetchedAt: NINE_ISO, error: null, refreshing: false, positions, ...extra });
+
+test('ANT section shows per-share pair gaps and positions from the execution accounts', () => {
+  const watch = antWatch([
+    antSource('binance', [antPosition('binance', 'ANTHROPICUSDT', 'short', '10', { unrealizedPnl: '-5', distancePercent: '40.00' })]),
+    antSource('hyperliquid', [antPosition('hyperliquid', 'xyz:ANT', 'long', '127', { unrealizedPnl: '12.5', distancePercent: '15.00', quantityUnit: 'ANT' })]),
+    antSource('okx', [antPosition('okx', 'ANTHROPICUSDT', 'long', '10', { contractSize: '1', unrealizedPnl: null, quantityUnit: '张' })], { state: 'stale', error: 'OKX 仓位已过期' }),
+    { exchange: 'rh-lighter', connected: false, state: 'unconfigured', fetchedAt: null, error: null, refreshing: false, positions: [] }]);
+  const result = anthropicSection({ quotes: antQuotes(), watch });
+  assert.equal(result.id, 'hub:anthropic');
+  assert.equal(result.level, 'alert');
+  assert.equal(result.status, '接近强平');
+  const metric = key => result.metrics.find(item => item.key === key);
+  const [spreads] = metric('spreads').groups;
+  // Four live legs make six pairs; RH failed and the oil book is not an ANT contract.
+  assert.equal(spreads.rows.length, 6);
+  // io:ANTH ask 5012 / 16.7 = 300.12 per share is the cheapest; xyz:ANT bid 305 per share the dearest.
+  assert.deepEqual(spreads.rows[0], { long: 'HL io:ANTH', short: 'HL xyz:ANT', gap: '+1.63%' });
+  assert.ok(spreads.rows.some(row => row.long === 'OKX' || row.short === 'OKX') && spreads.rows.filter(row => row.long === 'OKX' || row.short === 'OKX').every(row => row.gap.endsWith('（过期）')));
+  const gaps = spreads.rows.map(row => Number.parseFloat(row.gap));
+  assert.deepEqual(gaps, [...gaps].sort((a, b) => b - a));
+  assert.deepEqual(metric('prices').lines, ['HL io:ANTH：300.00 / 300.12', 'HL xyz:ANT：305.00 / 305.50', 'Binance：300.00 / 300.16', 'OKX：300.00 / 300.16（过期）', 'Lighter RH：读取失败 Lighter RH 请求受限']);
+  // Binance 10 × 12.7 short; xyz 127 × 1 and OKX 10 contracts × 1.27 long.
+  assert.equal(metric('shares').text, '多 ≈139.7 · 空 ≈127 · 净 +12.7 股');
+  assert.equal(metric('pnl').text, 'Binance -5 · Hyperliquid +12.5 · OKX —（1 笔未计入）');
+  assert.equal(metric('nearest').text, '15.00%（Hyperliquid xyz:ANT） · 预警线 20%');
+  const [table] = metric('positions').groups;
+  assert.equal(table.rows.length, 3);
+  assert.deepEqual(table.rows[1], { venue: 'Hyperliquid', symbol: 'xyz:ANT', size: '多 127 ANT（≈127 股）', pnl: '+12.5', distance: '15.00% ⚠' });
+  assert.ok(result.issues.some(issue => issue.includes('OKX 仓位：OKX 仓位已过期')));
+  assert.ok(result.issues.some(issue => issue.includes('xyz:ANT 多仓距强平 15.00%（预警线 20%）')));
+  assert.equal(result.asOf, AT_NINE - 30_000);
+});
+
+test('ANT section keeps one half when the other read fails', () => {
+  const noPositions = anthropicSection({ quotes: antQuotes(), watch: { error: true } });
+  assert.equal(noPositions.level, 'warn');
+  assert.ok(noPositions.metrics.some(item => item.key === 'spreads' && item.groups[0].rows.length === 6));
+  assert.ok(!noPositions.metrics.some(item => item.key === 'count'));
+  const noQuotes = anthropicSection({ quotes: { error: true }, watch: antWatch([antSource('binance', [])]) });
+  assert.equal(noQuotes.status, '报价读取失败');
+  assert.equal(noQuotes.metrics.find(item => item.key === 'count').text, '0');
+  const allFailed = anthropicSection({ quotes: antQuotes([{ exchange: 'binance', symbol: 'ANTHROPICUSDT', error: '交易所请求超时' }]), watch: antWatch([]) });
+  assert.equal(allFailed.level, 'warn');
+  assert.equal(allFailed.metrics.find(item => item.key === 'count').text, '未连接下单账户');
+  const fresh = antQuotes([...antQuotes().books.filter(book => book.exchange !== 'okx' && book.exchange !== 'rh-lighter'), antBook('okx', 'ANTHROPICUSDT', '381', '381.2'), antBook('rh-lighter', 'ANTHROPIC', '5000', '5005')]);
+  const quiet = anthropicSection({ quotes: fresh, watch: antWatch([antSource('binance', [antPosition('binance', 'ANTHROPICUSDT', 'short', '1', { riskUnknown: true, distancePercent: null })])]) });
+  assert.equal(quiet.level, 'ok');
+  assert.equal(quiet.metrics.find(item => item.key === 'positions').groups[0].rows[0].distance, '未知');
+  assert.equal(quiet.metrics.find(item => item.key === 'nearest').text, '—');
+});
+
 test('one failing source costs only its own section', async () => {
   const sections = await collectSections({ log: silent, now: () => AT_NINE, overview: () => ({ projects: [project(), { ...project(), project: { id: 'link', name: 'Link', adapter: 'link', enabled: true } }] }),
     positions: async () => { throw new Error('secret upstream text'); }, funding: () => { throw new Error('boom'); }, execution: () => ({ connections: [], positions: [], jobs: [] }),
-    research: () => ({ enabled: false, state: 'stopped' }) });
-  assert.deepEqual(sections.map(item => item.id), ['hub:positions', 'hub:funding', 'hub:execution', 'hub:research', 'project:aster']);
+    research: () => ({ enabled: false, state: 'stopped' }), anthropic: { quotes: async () => { throw new Error('secret quote text'); }, positions: () => { throw new Error('secret watch text'); } } });
+  assert.deepEqual(sections.map(item => item.id), ['hub:positions', 'hub:anthropic', 'hub:funding', 'hub:execution', 'hub:research', 'project:aster']);
   assert.equal(sections[0].status, '读取失败');
-  assert.ok(!JSON.stringify(sections).includes('secret upstream text'));
+  assert.equal(sections[1].status, '读取失败');
+  assert.ok(!/secret (upstream|quote|watch) text/.test(JSON.stringify(sections)));
+  const half = await collectSections({ log: silent, now: () => AT_NINE, overview: () => ({ projects: [] }), positions: async () => ({ sources: [] }), funding: () => { throw new Error('boom'); },
+    execution: () => ({ connections: [], positions: [], jobs: [] }), research: () => ({ enabled: false, state: 'stopped' }),
+    anthropic: { quotes: async () => antQuotes(), positions: () => { throw new Error('secret watch text'); } } });
+  assert.equal(half[1].status, '仓位读取失败');
+  assert.ok(!JSON.stringify(half).includes('secret watch text'));
 });
 
 test('workbench routes require the session and never expose the webhook', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'feishu-digest-app-'));
-  const app = await createApp({ dataDir: directory, initialPassword: 'feishu-digest-fixture-password', refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0, baselineIntervalMs: 0, logger: silent, warmupEnabled: false });
+  const app = await createApp({ dataDir: directory, initialPassword: 'feishu-digest-fixture-password', refreshInterval: 0, assetSyncIntervalMs: 0, tradingRefreshIntervalMs: 0, executionIntervalMs: 0, baselineIntervalMs: 0, logger: silent, warmupEnabled: false,
+    // The ANT section reads execution quotes; a local book keeps this test off the exchanges.
+    executionClientFactory: () => ({ market: async symbol => ({ symbol, bid: '100', ask: '100.5', at: new Date().toISOString() }) }) });
   try {
     await new Promise(resolve => app.server.listen(0, '127.0.0.1', resolve));
     const origin = `http://127.0.0.1:${app.server.address().port}`, route = '/api/automation/feishu-digest';
@@ -545,6 +612,7 @@ test('workbench routes require the session and never expose the webhook', async 
     const preview = await (await request('/preview', 'POST', { config: defaults({ hideIdle: false }) })).json();
     assert.equal(preview.digest.level, 'ok');
     assert.ok(preview.catalog.some(item => item.id === 'hub:positions'));
+    assert.equal(preview.digest.sections.find(item => item.id === 'hub:anthropic')?.metrics.find(item => item.key === 'spreads')?.groups[0].rows.length, 10);
     assert.equal(preview.omitted, 0);
     assert.equal((await (await request('')).json()).config.title, '日报');
     assert.equal((await request('/preview', 'POST', { config: { enabled: true } })).status, 400);
