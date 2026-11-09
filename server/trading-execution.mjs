@@ -521,6 +521,56 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     const hard = errors.find(error => !(error instanceof RateLimitedReadError));
     throw hard ?? errors.reduce((latest, error) => error.retryAt > latest.retryAt ? error : latest);
   }
+  // Display-only evidence. Do not reuse collect()/collectMarkets(): those paths
+  // persist snapshots, bind account ownership, and require the writer lease.
+  // One bounded attempt per deduplicated account/book; no completed-result cache.
+  async function exposureEvidence(legs, { signal: outer, ruleIds = [] } = {}) {
+    const selected = [...new Map(legs.map(leg => [`${leg.exchange}:${leg.symbol}`, { exchange: leg.exchange, symbol: leg.symbol }])).values()];
+    if (selected.length > 12 || selected.some(leg => !['binance', 'bybit', 'okx'].includes(leg.exchange) || !['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'].includes(leg.symbol))) throw new ExecutionError(400, '敞口读取范围无效');
+    const exchanges = [...new Set(selected.map(leg => leg.exchange))];
+    const before = exchanges.map(exchange => accountRow(exchange));
+    const accountSignature = row => JSON.stringify([row.revision, !!row.credentials, row.identity, row.account_mode]);
+    const jobEvidence = job => {
+      const view = publicJob(job), all = orders(job.id);
+      return { ...view, accounts: (job.plan.connections ?? []).map(row => ({ exchange: row.exchange, revision: row.revision, identity: row.identity ?? null })),
+        legs: view.legs.map(leg => ({ ...leg, rule: job.totals.find(item => item.id === leg.id)?.rule ?? null,
+          unresolved: all.filter(order => order.legId === leg.id && !order.settled).map(order => ({ unknown: !!order.unknown, id: order.remoteId ?? null, kind: order.kind })) })) };
+    };
+    // No indexed-read recovery here: even a missing index must not cause a GET
+    // to recreate schema. SQLite may use its existing partial index normally.
+    const readJobs = () => stmt.prepare(`SELECT json FROM execution_jobs WHERE ${UNFINISHED_JOB} OR id IN (SELECT job_id FROM execution_orders WHERE ${UNSETTLED_ORDER}) ORDER BY rowid`).all().map(row => jobEvidence(JSON.parse(row.json)));
+    const jobs = readJobs(), startedAt = iso(now());
+    const accounts = [], markets = [];
+    await Promise.all([
+      ...before.map(async row => {
+        const symbols = selected.filter(leg => leg.exchange === row.exchange).map(leg => leg.symbol), at = iso(now());
+        try {
+          const ctx = context(row.exchange, row.revision);
+          const account = await call(async signal => {
+            const options = { accountMode: row.account_mode, signal, requireIdentity: true, symbols };
+            const verified = await ctx.client.verify(ctx.credentials, options);
+            const result = await ctx.client.account(ctx.credentials, options);
+            if (!verified.identity || !result.identity || verified.identity !== result.identity || row.identity && row.identity !== result.identity) throw new ExecutionError(409, '账户真实身份无法核验或已经改变');
+            return result;
+          }, outer);
+          accounts.push({ exchange: row.exchange, revision: row.revision, identity: account.identity, at, symbols, account });
+        } catch (error) { accounts.push({ exchange: row.exchange, revision: row.revision, at, symbols, error: safeError(error) }); }
+      }),
+      ...selected.map(async leg => {
+        try {
+          const value = await call(signal => clients.get(leg.exchange).market(leg.symbol, { signal }), outer);
+          markets.push({ ...leg, market: normalizeMarket(value, leg.symbol, now(), leg.exchange) });
+        } catch (error) { markets.push({ ...leg, error: safeError(error) }); }
+      }),
+    ]);
+    if (outer?.aborted) throw new ExecutionError(503, '敞口读取已取消');
+    const changed = before.filter(row => accountSignature(row) !== accountSignature(accountRow(row.exchange))).map(row => row.exchange);
+    const heldContracts = [...new Set(ruleIds)].slice(0, 12).flatMap(ruleId => {
+      const row = stmt.prepare("SELECT json FROM execution_jobs WHERE json_extract(json,'$.auto.ruleId')=? AND json_extract(json,'$.plan.action')='open' AND json_extract(json,'$.status')='completed' ORDER BY rowid DESC LIMIT 1").get(ruleId);
+      return row ? [jobEvidence(JSON.parse(row.json))] : [];
+    });
+    return { startedAt, finishedAt: iso(now()), accounts, markets, jobs, heldContracts, changed, jobsChanged: JSON.stringify(jobs) !== JSON.stringify(readJobs()) };
+  }
   async function collectMarkets(legs, validate = () => {}, outer) {
     const markets = new Map(), received = new Map();
     const checked = (leg, value, allowStale = false) => {
@@ -1679,7 +1729,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, coverageAvailable, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, exposureEvidence, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, coverageAvailable, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       for (const controller of historyControllers) controller.abort();

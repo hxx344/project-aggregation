@@ -21,6 +21,7 @@ import { moduleIds } from '../modules/catalog.mjs';
 import { readModuleCapabilities } from '../modules/capabilities.mjs';
 import { createBaseline, BASELINE_INTERVAL_MS, validateBaselineInterval } from '../observability.mjs';
 import { createAccountWriter } from '../execution/account-writer.mjs';
+import { createTradingAutoExposure } from '../trading-auto-exposure.mjs';
 import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
@@ -82,6 +83,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const executionEntries = createExecutionEntries({ db, log, readMaintenance: () => control.getSetting('updates-maintenance') === '1', refuse: () => { throw new UpdateError(409, EXECUTION_MAINTENANCE); } });
   // Automatic rules create jobs through the same maintenance entry as a manual start.
   const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
+  const autoExposure = createTradingAutoExposure({ execution, readRules: () => executionAuto.exposureSnapshot(), now: executionNow });
   const anthropicReduction = createAnthropicReduction({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 15_000 : 0, log });
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   // Overview subscribers; wants() lets an in-process subscriber skip the projection while nobody listens.
@@ -448,6 +450,12 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         return reply(200, data);
       }
       if (pathname === '/api/trading/execution/auto' && method === 'GET') return reply(200, executionAuto.state());
+      if (pathname === '/api/trading/execution/auto/exposure' && method === 'GET') {
+        if (url.search) throw new HttpError(400, '敞口预览不接受查询参数');
+        const data = await autoExposure.read({ signal });
+        if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
+        return reply(200, data);
+      }
       // A logout while the body was arriving must not save or enable a rule.
       const signedBody = async () => { const body = await bodyOf(); if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台'); return body; };
       if (pathname === '/api/trading/execution/anthropic-reduction' || pathname === '/api/trading/execution/anthropic-reduction/disable') {

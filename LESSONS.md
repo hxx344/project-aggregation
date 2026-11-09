@@ -341,6 +341,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **RH 仓位身份补充（#259，2026-11-08）：** 基线 `9351de4` 的 RH 执行适配器按 `market_id` 找到仓位后，把调用方 `symbol` 写入投影而未核对返回符号。编号与原生符号都属于已返回的身份字段，必须与已验证市场目录一致；官方 AccountPosition 要求 symbol 为字符串，缺失、畸形、大小写或空白变体均拒绝，不猜测别名。零仓位行也可能携带杠杆配置，不能跳过身份检查。[适配器回归](tests/trading-rh-lighter-execution.test.mjs) 和 [真实适配器到风险规划回归](tests/trading-execution-rh-lighter.test.mjs) 在修复前确认错误身份未被拒绝，修复后错误场景零任务、零锁、零发送。事件 `rh-position-market-symbol-consistency`，沿用 Issue ID；为离线矛盾响应验证，未确认线上错合约或损失。
 
+**自动规则敞口补充（#284，2026-11-09）：** 基于 `0243193` 的未发布实现，历史 held 虽按原生合约与乘数分组，名义额仍误用当前新合约盘口；新旧原生代码、单位或乘数不一致时，历史估值及盘口时间须保留未知。同轮独立审查还确认：单向模式的 `BOTH` 或缺失仓位方向不能按买入认领多头、卖出认领空头，买入可能是平空；未归属委托可在两个方向明细提示，但总量未知且不得重复相加。`tests/trading-auto-exposure.test.mjs` 覆盖旧合约估值隔离；BOTH/缺方向新回归修前错误返回 complete、修后两方向未知，明确 SHORT 负对照仍准确。事件分别为 `auto-exposure-historical-contract-price-20261109`、`auto-exposure-oneway-order-attribution-20261109`；均首次发布前修复，无真实交易。
+
 ### L021：子面板样式不能改变公共页面的宽度
 
 **适用条件：** 多个市场面板共用导航、行情卡片和居中容器，子面板按需加载并在切换后保留挂载。
@@ -1489,6 +1491,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **事件记录：** `feishu-save-stale-read-20261031`；引入日期 2026-10-30，离线复现日期 2026-10-31（Asia/Shanghai），线上发生日期未知；P1 逃逸缺陷。
 
 **离线恢复补充（#275，2026-11-09）：** 基于 `c042116` 的未发布仓位保护覆盖实现，在离线时仅用 `offline` 暂时遮住旧结论，联网事件先清该标记再发新 GET。独立浏览器探针确认：离线期间另一客户端停用规则，重连请求尚未返回时，原有效期内的状态从 unknown 回到 ready，回包后才变为 disabled。对因离线或操作变化已撤销的可用性结论，应保留独立失效标记，只由新响应成功清除；网络恢复只恢复读取资格。`tests/trading-anthropic-protection.browser.mjs` 挂起重连 GET，在修复前失败、修复后通过，旧检查时间保留且等待新证据；显示状态从未授权执行，原执行器仍独立核验账户、租约和风险。事件 `ant-protection-reconnect-unconfirmed-20261109`，P1 在首次发布前修复，未发生交易或线上事故，不推进历史复盘检查点。
+
+**跨组件敞口读取补充（#284，2026-11-09）：** `0243193` 后的未发布实现中，父组件保存开始时增加自身 GET 代次，子组件的敞口版本却只在写响应返回后更新。独立生产页面探针复现：服务端已保存 2 桶、写响应挂起，旧敞口响应随后把 1 桶显示出来。父组件提交开始即撤销传给子组件的可用版本，子组件清空结果并中止旧请求；明确失败恢复旧版本也不能复活已撤销结果。`tests/trading-auto-exposure-write-race.browser.mjs` 保留同一交错，修前 oldExposureShown=true、修后 false，保存仍在等待，恢复版本不自动读取。事件 `auto-exposure-pending-write-stale-read-20261109`；P1 在首次发布前修复。
 
 ### L090：防重复发送的持久化占用不能降为尽力记录
 

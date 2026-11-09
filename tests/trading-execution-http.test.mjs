@@ -191,6 +191,31 @@ test('logout while an automatic rule body is still arriving saves nothing', asyn
   assert.equal(f.rows('SELECT * FROM execution_auto_rules').length, 0);
 });
 
+test('exposure HTTP is authenticated, read only, uncached and revokes results after logout', async t => {
+  const f = await fixture(t), endpoint = `${PREFIX}/auto/exposure`;
+  assert.equal((await f.request(endpoint)).status, 401);
+  assert.equal((await f.request('/api/system/accounts')).status, 401);
+  await f.login(); await f.connect('bybit');
+  const config = { name: 'preview', market: 'oil', exchange: 'bybit', direction: 'short', openThreshold: '4', closeThreshold: '2', equalSize: '1', orderType: 'chase',
+    confirmSamples: 3, maxOpensPerDay: 3, batchCount: 1, batchIntervalMs: 1000, repriceIntervalMs: 5000, timeoutMs: 300_000 };
+  assert.equal((await f.request(`${PREFIX}/auto/rules`, { method: 'POST', body: { config, mode: 'observe', observing: true } })).status, 201);
+  const persisted = () => f.rows("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'execution_%' ORDER BY name").map(({ name }) => [name, f.rows(`SELECT * FROM ${name}`)]);
+  const before = persisted();
+  const response = await f.request(endpoint);
+  assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(response.data.rulesVersion, (await f.request(`${PREFIX}/auto`)).data.exposureVersion);
+  assert.equal(response.data.groups.length, 4);
+  assert.equal(response.data.groups.every(group => group.actual.quantity === '0'), true);
+  assert.deepEqual(persisted(), before); assert.equal(f.mutations.length, 0);
+  assert.equal((await f.request(endpoint + '?fresh=1')).status, 400);
+  assert.deepEqual(persisted(), before);
+  const gate = deferred(), entered = deferred();
+  f.handlers['bybit:account'] = async () => { entered.resolve(); await gate.promise; return structuredClone(f.accounts.bybit); };
+  const reading = f.request(endpoint); await entered.promise;
+  await f.request('/api/logout', { method: 'POST' }); gate.resolve();
+  assert.equal((await reading).status, 401);
+  assert.deepEqual(persisted(), before); assert.equal(f.mutations.length, 0);
+});
 test('OKX execution connection requires a Passphrase, persists isolated mode and hides all credentials', async t => {
   const f = await fixture(t); await f.login();
   const live = { ...credentials('okx_exec'), passphrase: 'private_http_okx_passphrase' };

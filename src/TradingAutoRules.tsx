@@ -5,6 +5,7 @@ import { api, ApiError } from './api';
 import type { TradingExchange } from './trading-types';
 import type { AutoDirection, AutoMarket, AutoPhase, AutoRule, AutoRuleConfig, AutoState, ExecutionOrderType } from './trading-execution-types';
 import './trading-execution.css';
+import TradingAutoExposure from './TradingAutoExposure';
 
 const BASE = '/api/trading/execution/auto';
 const EXCHANGES: Record<TradingExchange, string> = { binance: 'Binance', bybit: 'Bybit', okx: 'OKX' };
@@ -199,6 +200,7 @@ export default function TradingAutoRules({ onExpired }: { onExpired: () => void 
     {notice ? <p className="execution-message" role="status">{notice}</p> : null}
     {editor ? <RuleForm key={editor.key} initial={editor.rule ? formOf(editor.rule.config) : emptyForm()} editing={editor.rule} disabled={disabled} onSave={save} onCancel={() => setEditor(null)} /> : null}
     <div className="auto-rules">{state ? state.rules.length ? state.rules.map(rule => <RuleCard key={`${rule.id}:${rule.revision}:${evidenceValid}`} rule={rule} disabled={disabled || !evidenceValid} evidenceValid={evidenceValid} serverNow={serverNow} onAction={action} onEdit={edit} />) : <p className="execution-help">尚无自动规则。可以先只观察条件信号，再确认启用实盘。</p> : <p className="execution-help">正在读取自动规则…</p>}</div>
+    <TradingAutoExposure onExpired={onExpired} rulesVersion={evidenceValid && !busy ? state?.exposureVersion ?? '' : ''} />
     <p className="execution-help auto-panel-note">使用「价差下单」中「组合交易」的实盘账户连接与执行器，下单前同样核对账户、盘口、持仓和现有委托。任务未全部成交（暂停、停止或待核对）时规则自动停用，需人工核对后重置。服务重启会暂停执行中的任务，对应规则同样转为待核对。同一交易所与品种可以有多条规则，每条只平自己开的仓；它们的任务依次执行，同合约有未结束的任务时其他规则等待。单向持仓模式下，反方向的规则要等已有仓位平掉后才开仓。</p>
   </section>;
 }
