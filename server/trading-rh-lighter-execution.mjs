@@ -392,18 +392,24 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     return { ...result, rule: limits };
   }
 
-  async function verify(credentials, { signal } = {}) {
-    const k = keys(credentials);
-    const label = `${k.accountIndex}#${k.apiKeyIndex}`;
+  async function verifyOwner(k, signal) {
     const cached = identities.get(k.fingerprint);
-    if (cached && cached.until > now() && cached.address === k.address) return { identity: k.address, keyLabel: label };
-    const owned = await request('/api/v1/accountsByL1Address', { query: { l1_address: credentials.address }, signal }).catch(error => {
+    if (cached && cached.until > now() && cached.address === k.address) return;
+    const owned = await request('/api/v1/accountsByL1Address', { query: { l1_address: k.address }, signal }).catch(error => {
       if (error instanceof ErrorClass && error.code === 'upstream' && error.providerCode && error.providerCode !== 23000) fail('permissions', { detail: '该钱包地址在 Lighter RH 没有账户' });
       throw error;
     });
     if (!Array.isArray(owned.sub_accounts) || owned.sub_accounts.length > 1000) fail();
     const match = owned.sub_accounts.filter(row => object(row) && row.index === k.accountIndex);
     if (match.length !== 1 || typeof match[0].l1_address !== 'string' || match[0].l1_address.toLowerCase() !== k.address) fail('permissions', { detail: '账户索引不属于该钱包地址' });
+  }
+
+  async function verify(credentials, { signal } = {}) {
+    const k = keys(credentials);
+    const label = `${k.accountIndex}#${k.apiKeyIndex}`;
+    const cached = identities.get(k.fingerprint);
+    if (cached && cached.until > now() && cached.address === k.address) return { identity: k.address, keyLabel: label };
+    await verifyOwner(k, signal);
     // The server checks the token against the public key registered for this account and key index.
     const token = await tokenFor(k, signal);
     const data = await request('/api/v1/accountActiveOrders', { query: { account_index: String(k.accountIndex) }, token, signal });
@@ -417,7 +423,8 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     const receivedAt = new Date(now()).toISOString();
     if (!Array.isArray(data.accounts) || data.accounts.length !== 1 || !object(data.accounts[0])) fail();
     const row = data.accounts[0];
-    if (row.index !== k.accountIndex || typeof row.l1_address !== 'string' || row.l1_address.toLowerCase() !== k.address) fail('permissions', { detail: '账户索引不属于该钱包地址' });
+    if (row.index !== k.accountIndex || row.account_index !== undefined && row.account_index !== k.accountIndex
+      || typeof row.l1_address !== 'string' || row.l1_address.toLowerCase() !== k.address) fail('permissions', { detail: '账户索引不属于该钱包地址' });
     if (!Array.isArray(row.positions) || row.positions.length > MAX_ROWS) fail();
     return { row, receivedAt };
   }
@@ -430,6 +437,54 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     return { id: String(id), symbol, side: row.is_ask ? 'sell' : 'buy', positionSide: 'BOTH', quantity, filledQuantity, reduceOnly: row.reduce_only };
   }
 
+  function positionOf(row, symbol, marketId, receivedAt) {
+    const entries = row.positions.filter(entry => object(entry) && (entry.market_id === marketId || entry.symbol === symbol));
+    if (entries.length > 1) fail();
+    const entry = entries[0];
+    if (!entry) return { entry: null, position: null };
+    if (entry.symbol !== symbol || entry.market_id !== marketId) fail();
+    const quantity = amount(entry.position, { nonnegative: true });
+    if (quantity === '0') return { entry, position: null };
+    if (entry.sign !== 1 && entry.sign !== -1) fail();
+    return { entry, position: { symbol, side: entry.sign === 1 ? 'long' : 'short', quantity,
+      risk: { markPrice: markPrice(entry.position_value, quantity), liquidationPrice: liquidationPrice(entry.liquidation_price), at: receivedAt } } };
+  }
+
+  async function positionSnapshot(credentials, { signal, symbols } = {}) {
+    const k = keys(credentials), selected = executionSymbols(symbols, RH_LIGHTER_SYMBOLS);
+    if (!selected?.length) fail('input');
+    // Ownership is the same check as verify(), but observation never reads
+    // orders or caches fresh execution authorization from a public account read.
+    await verifyOwner(k, signal);
+    await tokenFor(k, signal);
+    const marketIds = await Promise.all(selected.map(symbol => marketIdOf(symbol, signal)));
+    const { row, receivedAt } = await accountRow(k, signal);
+    const optional = (value, constraints) => { try { return amount(value, constraints); } catch { return null; } };
+    const positions = [];
+    for (const [index, symbol] of selected.entries()) {
+      const { entry, position } = positionOf(row, symbol, marketIds[index], receivedAt);
+      if (!position) continue;
+      const { risk, ...size } = position;
+      const fraction = optional(entry.initial_margin_fraction, { positive: true });
+      const leverage = fraction === null ? null : Number(100n * SCALE / units(fraction));
+      const marginMode = entry.margin_mode === 0 ? 'cross' : entry.margin_mode === 1 ? 'isolated' : null;
+      const rawLiquidation = entry.liquidation_price;
+      // A positive calculated price can underflow to zero when truncated to
+      // the supported 18 decimals. Only an explicitly all-zero native value
+      // proves no liquidation price; underflow remains unknown risk.
+      const zeroLiquidation = typeof rawLiquidation === 'string' && rawLiquidation.length <= 100
+        && /^0+(?:\.0+)?$/.test(rawLiquidation)
+        && optional(rawLiquidation.replace(/^(\d+\.\d{18})\d+$/, '$1'), { nonnegative: true }) === '0';
+      positions.push({ ...size, quantityUnit: 'ANTHROPIC', entryPrice: optional(entry.avg_entry_price, { positive: true }), markPrice: risk.markPrice,
+        notional: optional(entry.position_value, { nonnegative: true }), unrealizedPnl: optional(entry.unrealized_pnl),
+        leverage: Number.isSafeInteger(leverage) && leverage >= 1 && leverage <= 100 ? String(leverage) : null, marginMode,
+        marginUsed: marginMode === 'isolated' ? optional(entry.allocated_margin, { nonnegative: true }) : null,
+        liquidationPrice: risk.liquidationPrice, liquidationKnown: risk.liquidationPrice !== null || zeroLiquidation, riskFetchedAt: risk.at });
+    }
+    checkAbort(signal); if (k.era !== generation) fail('aborted');
+    return { identity: k.address, accountIndex: k.accountIndex, fetchedAt: receivedAt, positions };
+  }
+
   async function account(credentials, { signal, symbols } = {}) {
     const k = keys(credentials);
     const selected = executionSymbols(symbols, RH_LIGHTER_SYMBOLS);
@@ -440,17 +495,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     const positions = [], openOrders = [], leverage = {};
     for (const [index, symbol] of selected.entries()) {
       const rule = selectedRules[index];
-      const entries = row.positions.filter(entry => object(entry) && entry.market_id === rule.assetId);
-      if (entries.length > 1) fail();
-      const entry = entries[0];
+      const { entry, position } = positionOf(row, symbol, rule.assetId, receivedAt);
       if (entry) {
-        if (entry.symbol !== symbol) fail();
-        const size = amount(entry.position, { nonnegative: true });
-        if (size !== '0') {
-          if (entry.sign !== 1 && entry.sign !== -1) fail();
-          positions.push({ symbol, side: entry.sign === 1 ? 'long' : 'short', quantity: size,
-            risk: { markPrice: markPrice(entry.position_value, size), liquidationPrice: liquidationPrice(entry.liquidation_price), at: receivedAt } });
-        }
+        if (position) positions.push(position);
         if (![0, 1].includes(entry.margin_mode)) fail();
         // initial_margin_fraction is a percentage; like defaultLeverage, the usable leverage rounds down.
         const value = Number(100n * SCALE / units(amount(entry.initial_margin_fraction, { positive: true })));
@@ -760,6 +807,6 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
   }
 
   const unsupported = async () => fail('input');
-  return { exchange: 'rh-lighter', verify, account, history, market, create, amend, inspect, stop, endedStrategies: unsupported, forget,
+  return { exchange: 'rh-lighter', verify, account, positionSnapshot, history, market, create, amend, inspect, stop, endedStrategies: unsupported, forget,
     close() { forget(); live.close(); } };
 }

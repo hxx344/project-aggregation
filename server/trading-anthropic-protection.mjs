@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { compareDecimals } from './trading-decimal.mjs';
 
 const time = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
@@ -11,20 +10,25 @@ function positionEvidence(source, position, now, staleMs) {
   const stamps = [time(source.fetchedAt), ...(Object.hasOwn(position, 'riskFetchedAt') ? [time(position.riskFetchedAt)] : [])];
   if (!source.connected || source.state !== 'live' || source.error || stamps.some(at => at === null || at > now + 1000 || now - at > staleMs)) return { reason: '仓位数据不可用或已过期，等待重新读取', until: null };
   if (!positive(position.markPrice)) return { reason: '缺少有效标记价', until: null };
+  if (position.liquidationKnown === false) return { reason: '强平价缺失或无效，无法确认强平风险', until: null };
   if (!positive(position.liquidationPrice)) return { reason: '缺少有效强平价', until: null };
   return { reason: null, until: Math.min(...stamps) + staleMs };
 }
 
 function accountMatch(source, position, connection) {
-  if (position.exchange === 'binance') return result('unknown', '配置包含该合约，但只读来源尚无账户 UID 证明');
+  const proof = source.executionBinding;
+  if (source.origin !== 'execution' || !proof || !Number.isSafeInteger(proof.revision)) return result('unknown', '仓位尚未取得下单单元的账户证明');
+  if (proof.revision !== connection.revision || proof.accountMode !== connection.accountMode) return result('unknown', '下单连接已变化，等待当前连接的仓位核验');
+  if (['binance', 'okx'].includes(position.exchange)) {
+    if (!/^[1-9][0-9]{0,39}$/.test(proof.identity ?? '') || !/^[1-9][0-9]{0,39}$/.test(connection.identity ?? '')) return result('unknown', '执行账户 UID 尚未核验');
+    if (proof.identity !== connection.identity) return result('unmatched', '规则绑定的是另一个账户');
+    if (position.exchange === 'binance' && !['standard', 'portfolio-margin'].includes(proof.accountMode)) return result('unknown', 'Binance 执行账户范围尚未核验');
+  }
   if (position.exchange === 'okx') {
-    if (typeof source.accountIdentity !== 'string' || !/^[a-f0-9]{64}$/.test(source.accountIdentity) || !/^[1-9][0-9]{0,39}$/.test(connection.identity ?? '')) return result('unknown', '配置包含该合约，账户归属待核验');
-    const expected = createHash('sha256').update(`okx:${connection.identity}`).digest('hex');
-    if (source.accountIdentity !== expected) return result('unmatched', '规则绑定的是另一个账户');
     if (!['cross', 'isolated'].includes(position.marginMode) || position.marginMode !== connection.accountMode) return result('unmatched', '仓位保证金范围与规则连接不一致');
   } else if (['hyperliquid', 'rh-lighter'].includes(position.exchange)) {
-    if (!wallet(source.address) || !wallet(connection.identity)) return result('unknown', '账户地址证据缺失');
-    if (wallet(source.address) !== wallet(connection.identity)) return result('unmatched', '规则绑定的是另一个钱包');
+    if (!wallet(proof.identity) || !wallet(connection.identity)) return result('unknown', '账户地址证据缺失');
+    if (wallet(proof.identity) !== wallet(connection.identity)) return result('unmatched', '规则绑定的是另一个钱包');
     if (position.exchange === 'rh-lighter') {
       // connect() produces this label from the verified account/key indexes.
       // It is never user-entered text and contains no signing material.
@@ -32,9 +36,9 @@ function accountMatch(source, position, connection) {
       const index = label ? Number(label[1]) : NaN;
       const keyIndex = label ? Number(label[2]) : NaN;
       if (!Number.isSafeInteger(index) || index < 1 || !Number.isInteger(keyIndex) || keyIndex < 4 || keyIndex > 254 || keyIndex === 157 || !Number.isSafeInteger(position.account)) return result('unknown', '子账户索引尚未核验');
-      if (position.account !== index) return result('unmatched', '该钱包下的另一子账户未被此规则覆盖');
+      if (proof.accountIndex !== index || position.account !== index) return result('unmatched', '该钱包下的另一子账户未被此规则覆盖');
     }
-  } else return result('unknown', '此来源尚无可用的账户证明');
+  } else if (position.exchange !== 'binance') return result('unknown', '此来源尚无可用的账户证明');
   return null;
 }
 
@@ -76,10 +80,18 @@ export function positionProtection({ source, position, alerts, reduction, now, s
   if (reduction.live?.warning) return status('blocked', reduction.live.warning);
   const until = time(reduction.live?.validUntil), checked = time(checkedAt);
   if (until === null || checked === null) return status('pending', '等待账户、数量和分批限制核验');
-  if (checked > now + 1000 || until <= now) return status('stale', '原风险或盘口证据已过期，等待下一次核验');
+  if (checked > now + 1000) return status('stale', '核验时间无效，等待重新核验');
   const legs = reduction.live.legs.filter(leg => sameLeg(leg, position));
   try {
     if (legs.length !== 1 || compareDecimals(legs[0].quantity, position.quantity) !== 0) return status('pending', '仓位数量与最近核验不一致，等待重新核对');
   } catch { return status('unknown', '持仓数量无法核对'); }
-  return status('ready', '最近核验通过；触发和发送前仍会重新检查', new Date(Math.min(until, evidence.until)).toISOString());
+  // Monitoring health is not executable market evidence. Keep the original
+  // quote deadline, and report the scheduler's separate bounded health window.
+  const monitorUntil = Math.min(time(reduction.monitorUntil) ?? 0, evidence.until);
+  if (until <= now) return monitorUntil > now
+    ? status('monitoring', '规则持续监测；上次行情已到期，下单前会重新核验', new Date(monitorUntil).toISOString())
+    : status('stale', '执行单元尚未更新核验结果，请查看自动减仓状态');
+  const protectedState = status('ready', '已关联下单账户，最近核验通过；发送前仍会重新检查', new Date(Math.min(until, evidence.until)).toISOString());
+  if (monitorUntil > now) protectedState.reduction.monitorUntil = new Date(monitorUntil).toISOString();
+  return protectedState;
 }

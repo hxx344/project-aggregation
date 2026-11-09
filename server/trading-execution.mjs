@@ -879,6 +879,44 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   const canRepeatRiskReduction = id => { const job = jobFor(id); return job.status === 'completed' && job.riskReduction?.ruleId === 'anthropic-reduction' && job.phase === 0; };
   const jobAccounts = id => (jobFor(id).plan.connections ?? []).map(row => ({ exchange: row.exchange, revision: row.revision, identity: row.identity ?? null }));
   const connectionOf = exchange => { const row = accountRow(exchange); return { revision: row.revision, connected: !!row.credentials }; };
+  const anthropicVenues = ['binance', 'okx', 'hyperliquid', 'rh-lighter'];
+  function anthropicPositionConnections() {
+    return anthropicVenues.map(exchange => {
+      const row = accountRow(exchange), index = exchange === 'rh-lighter' ? /^(\d{1,16})#\d{1,3}$/.exec(row.key_label ?? '') : null;
+      return { exchange, connected: !closed && !closing && !!row.credentials, revision: row.revision, identity: row.identity,
+        accountMode: row.account_mode, accountIndex: index && Number.isSafeInteger(Number(index[1])) ? Number(index[1]) : null };
+    });
+  }
+  // Observations use the exact execution connection but never acquire a lease,
+  // claim a writer ticket, read orders or alter the execution account snapshot.
+  async function readAnthropicPositions(exchange, binding, { signal } = {}) {
+    if (!anthropicVenues.includes(exchange)) throw new ExecutionError(400, '不支持此交易所的 ANT 仓位读取');
+    const refuse = (status, code, message) => Object.assign(new ExecutionError(status, message), { code });
+    const current = () => {
+      const row = anthropicPositionConnections().find(item => item.exchange === exchange);
+      if (signal?.aborted || !row?.connected || !validRevision(binding?.revision) || !binding.identity || row.revision !== binding.revision
+        || row.identity !== binding.identity || row.accountMode !== binding.accountMode || row.accountIndex !== binding.accountIndex)
+        throw refuse(409, 'position_binding_changed', '实盘连接已改变或尚未核验，等待读取当前账户仓位');
+    };
+    current();
+    const ctx = context(exchange, binding.revision);
+    if (typeof ctx.client.positionSnapshot !== 'function') throw refuse(503, 'unsupported_reader', '执行连接暂不支持只读仓位快照');
+    const symbols = EXECUTION_VENUE_SYMBOLS[exchange].filter(symbol => EXECUTION_MARKETS.anthropic.symbols.includes(symbol));
+    try {
+      const snapshot = await call(callSignal => ctx.client.positionSnapshot(ctx.credentials, { accountMode: ctx.row.account_mode, signal: callSignal, symbols }), signal);
+      current();
+      if (snapshot?.identity !== binding.identity || exchange === 'rh-lighter' && (snapshot.accountIndex !== binding.accountIndex || snapshot.accountIndex !== ctx.credentials.accountIndex))
+        throw refuse(409, 'position_identity', '仓位来源与当前实盘账户身份或子账户不一致');
+      return snapshot;
+    } catch (error) {
+      current();
+      if (error instanceof ExecutionError) throw error;
+      const failure = new ExecutionError(502, safeError(error));
+      if (['timeout', 'aborted', 'invalid_data'].includes(error?.code)) failure.code = error.code;
+      if (Number.isSafeInteger(error?.retryAt)) failure.retryAt = error.retryAt;
+      throw failure;
+    }
+  }
   // Narrow read-only bridge: credentials stay in the execution service and
   // history reads do not acquire a writer ticket or modify account snapshots.
   const historyControllers = new Set();
@@ -1729,7 +1767,7 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
   acquire();
   const heartbeat = intervalMs > 0 ? setInterval(() => { if (!closing) { try { acquire(); void tick(); } catch { /* Retry on the next pulse. */ } } }, intervalMs) : null;
   heartbeat?.unref();
-  return { state, quotes, exposureEvidence, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, historyConnections, readAnthropicHistory, leading, coverageAvailable, stop, reconcile, tick, initializeProtection,
+  return { state, quotes, exposureEvidence, connect, disconnect, preview, start, startAutomatic, startRiskReduction, canRepeatRiskReduction, lockOwner, jobView, jobAccounts, connectionOf, anthropicPositionConnections, readAnthropicPositions, historyConnections, readAnthropicHistory, leading, coverageAvailable, stop, reconcile, tick, initializeProtection,
     async close() {
       if (closed || closing) return; closing = true; clearInterval(heartbeat);
       for (const controller of historyControllers) controller.abort();

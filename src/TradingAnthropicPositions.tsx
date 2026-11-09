@@ -15,9 +15,9 @@ type Position = {
   /** account: Lighter RH account index; an L1 address can hold several accounts. */
   id: string; exchange: Source; symbol: string; account?: number; side: 'long' | 'short'; quantity: string; quantityUnit: string | null; contractSize?: string;
   entryPrice: string | null; markPrice: string | null; notional: string | null; unrealizedPnl: string | null; leverage: string | null;
-  marginMode: string | null; liquidationPrice: string | null; distancePercent: string | null; riskUnknown?: boolean; alerting: boolean; protection?: PositionProtection | null;
+  marginMode: string | null; liquidationPrice: string | null; liquidationKnown?: boolean; distancePercent: string | null; riskUnknown?: boolean; alerting: boolean; protection?: PositionProtection | null;
 };
-type SourceState = { exchange: Source; connected: boolean; address?: string | null; state: ReadState; fetchedAt: string | null; error: string | null; refreshing: boolean; positions: Position[] };
+type SourceState = { exchange: Source; connected: boolean; address?: string | null; accountMode?: string | null; accountIndex?: number | null; state: ReadState; fetchedAt: string | null; error: string | null; refreshing: boolean; positions: Position[] };
 type AlertConfig = { enabled: boolean; thresholdPercent: number; repeatMinutes: number };
 type HistoryEntry = { at: string; status: 'sent' | 'failed' | 'uncertain'; count: number; summary: string[]; error: string | null };
 type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { config: AlertConfig; channel: { configured: boolean; source: 'own' | 'digest' | null; host: string | null; error: string | null }; history: HistoryEntry[]; error: string | null; staleAfterSeconds: number; hysteresisPercent: number } };
@@ -25,7 +25,8 @@ type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { confi
 const BASE = '/api/trading/anthropic';
 const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' };
 const STATES: Record<ReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
-const UNCONNECTED: Record<Source, string> = { binance: '在「账户连接」标签连接 Binance 只读账户后显示。', okx: '在「账户连接」标签连接 OKX 只读账户后显示。', hyperliquid: '在「价差下单」标签的实盘账户连接中连接 Hyperliquid 后，按主账户地址读取。', 'rh-lighter': '在「价差下单」标签的实盘账户连接中连接 Lighter RH 后，按钱包地址读取其下全部账户。' };
+const SCOPES: Record<string, string> = { standard: '标准合约', 'portfolio-margin': '组合保证金', cross: '全仓', isolated: '逐仓', agent: '主账户', 'api-key': '指定子账户' };
+const UNCONNECTED: Record<Source, string> = { binance: '在「价差下单」连接 Binance 实盘账户后，自动读取同一账户仓位。', okx: '在「价差下单」连接 OKX 实盘账户后，自动读取同一账户仓位。', hyperliquid: '在「价差下单」连接 Hyperliquid 后，读取同一主账户仓位。', 'rh-lighter': '在「价差下单」连接 Lighter RH 后，仅读取该连接指定的子账户仓位。' };
 const HISTORY: Record<HistoryEntry['status'], string> = { sent: '已发送', failed: '发送失败', uncertain: '结果未知' };
 const formatDate = (value: string | null) => beijingTime(value);
 const shareText = (value: number) => value.toLocaleString('zh-CN', { maximumFractionDigits: value < 100 ? 2 : 0 });
@@ -126,11 +127,11 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
   const protectionUnavailable = !!error || offline || protectionPending;
 
   return <section className="trading-panel trading-positions trading-anthropic-positions" aria-labelledby="trading-anthropic-title">
-    <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>Binance / OKX 用只读账户 · Hyperliquid / Lighter RH 用实盘连接的账户地址（公开接口）· 每 30 秒读取，强平距离按标记价计算</p></div></div>
+    <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>四所统一使用「价差下单」的执行账户读取仓位 · Lighter RH 仅读取所连接子账户 · 每 30 秒只读刷新，强平距离按标记价计算</p></div></div>
     {!data ? <div className="trading-anthropic-loading" role="status">{error ? <span className="trading-warning">{error}</span> : <><LoaderCircle className="spin" size={20} /><span>正在读取 Anthropic 仓位…</span></>}</div> : <>
       <div className="trading-account-statuses">{data.sources.map(source => <div className="trading-account-status" key={source.exchange}>
         <div><strong>{NAMES[source.exchange]}</strong><span className={`trading-status ${source.state}`}><i aria-hidden="true" />{STATES[source.state]}</span>{source.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div>
-        <p>{source.connected ? <>仓位读取：{formatDate(source.fetchedAt)}{source.fetchedAt ? '（北京时间）' : ''}{source.address ? ` · ${source.address.slice(0, 6)}…${source.address.slice(-4)}` : ''}</> : UNCONNECTED[source.exchange]}</p>
+        <p>{source.connected ? <>仓位读取：{formatDate(source.fetchedAt)}{source.fetchedAt ? '（北京时间）' : ''}{source.accountMode ? ` · 下单账户 / ${SCOPES[source.accountMode] ?? source.accountMode}` : ''}{source.accountIndex == null ? '' : ` ${source.accountIndex}`}{source.address ? ` · ${source.address.slice(0, 6)}…${source.address.slice(-4)}` : ''}</> : UNCONNECTED[source.exchange]}</p>
         {source.error ? <p className="trading-warning">{source.error}</p> : null}
       </div>)}</div>
       {positions.length ? <div className="trading-position-scroll"><table className="trading-position-table" aria-label="Anthropic 仓位明细"><thead><tr>
@@ -150,7 +151,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
           <td data-label="名义价值">{amount(position.notional)}</td>
           <td data-label="未实现盈亏" className={polarity(position.unrealizedPnl)}>{amount(position.unrealizedPnl, true)}</td>
           <td data-label="强平价">{position.liquidationPrice === null ? <span className="trading-muted">未提供</span> : amount(position.liquidationPrice)}</td>
-          <td data-label="距强平" className={near ? 'trading-negative' : ''}>{riskUnknown ? <span className="trading-warning">标记价缺失，无法计算</span> : distance === null ? '—' : `${distance}%`}{position.alerting ? <small className="trading-anthropic-alerting">预警中</small> : null}</td>
+          <td data-label="距强平" className={near ? 'trading-negative' : ''}>{riskUnknown ? <span className="trading-warning">{position.liquidationKnown === false && Number(position.markPrice) > 0 ? '强平价缺失或无效，无法确认风险' : '标记价缺失，无法计算'}</span> : distance === null ? '—' : `${distance}%`}{position.alerting ? <small className="trading-anthropic-alerting">预警中</small> : null}</td>
           <td data-label="杠杆">{position.leverage ? `${amount(position.leverage)}×` : '—'}{position.marginMode ? ` ${position.marginMode === 'isolated' ? '逐仓' : position.marginMode === 'cross' ? '全仓' : position.marginMode}` : ''}</td>
         </tr>;
       })}</tbody></table></div> : <p className="trading-anthropic-empty">{data.sources.some(source => source.state === 'live') ? '已连接的账户当前没有 Anthropic 仓位。' : '尚无可确认的 Anthropic 仓位数据。'}</p>}

@@ -150,6 +150,38 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     const result = await permissionSnapshot(credentials, signal);
     return { identity: result.identity };
   });
+  function positionOf(row, symbol, config, receivedAt) {
+    const size = positionSize(row, symbol, config.positionMode);
+    return size && { symbol, ...size, ...(symbol === 'ANTHROPICUSDT'
+      ? { risk: { markPrice: riskPrice(row.markPx), liquidationPrice: riskPrice(row.liqPx), at: receivedAt } } : {}) };
+  }
+  const positionSnapshot = wrapped(async (credentials, { accountMode, signal, symbols } = {}) => {
+    modeOf(accountMode);
+    const selected = executionSymbols(symbols, ['ANTHROPICUSDT']);
+    if (!selected) fail('input');
+    const config = await permissionSnapshot(credentials, signal), symbol = selected[0];
+    const rows = list(await protocol.request('positions', credentials, { instType: 'SWAP', instId: instrumentId(symbol) }, { signal }), 20);
+    const fetchedAt = new Date(now()).toISOString();
+    const entries = rows.map(row => ({ row, position: positionOf(row, symbol, config, fetchedAt) })).filter(entry => entry.position);
+    // Read the native contract value, never assume that one contract is one
+    // share. A slow metadata response cannot refresh the position's timestamp.
+    const rule = entries.length ? await protocol.rule(symbol, signal) : null;
+    const optional = (value, constraints) => { try { return amount(value, constraints); } catch { return null; } };
+    const seen = new Set(), positions = entries.map(({ row, position }) => {
+      const key = `${row.mgnMode}:${row.posSide}`;
+      if (seen.has(key)) fail(); seen.add(key);
+      const { risk, ...size } = position;
+      return { ...size, quantityUnit: rule.quantityUnit, contractSize: rule.contractSize,
+        entryPrice: riskPrice(row.avgPx), markPrice: risk.markPrice,
+        notional: risk.markPrice === null ? null : multiply(position.quantity, rule.contractSize, risk.markPrice),
+        unrealizedPnl: optional(row.upl), leverage: optional(row.lever, { positive: true }), marginMode: row.mgnMode,
+        // OKX explicitly returns an empty string when no liquidation price is
+        // available. Missing, null or malformed values are unconfirmed risk.
+        liquidationPrice: risk.liquidationPrice, liquidationKnown: row.liqPx === '' || optional(row.liqPx, { nonnegative: true }) !== null, riskFetchedAt: risk.at };
+    });
+    checkAbort(signal);
+    return { identity: config.identity, fetchedAt, positions };
+  });
   const account = wrapped(async (credentials, { accountMode, signal, symbols } = {}) => {
     const mode = modeOf(accountMode), selected = executionSymbols(symbols, OKX_EXECUTION_SYMBOLS);
     if (!selected || selected.some(symbol => !OKX_EXECUTION_SYMBOLS.includes(symbol))) fail('input');
@@ -162,16 +194,15 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
       // before ordinary/algo order reads can delay this account result.
       const receivedAt = new Date(now()).toISOString();
       for (const row of rows) {
-        const size = positionSize(row, symbol, config.positionMode);
-        if (!size) continue;
+        const position = positionOf(row, symbol, config, receivedAt);
+        if (!position) continue;
         if (row.mgnMode !== mode) {
           const error = new OkxProtocolError('account_mode');
           error.message = `OKX ${symbol} 存在另一保证金模式的仓位，请先核对；系统不会切换模式或自动平仓`; throw error;
         }
         const key = `${symbol}:${row.posSide}`;
         if (seen.has(key)) fail(); seen.add(key);
-        positions.push({ symbol, ...size, ...(symbol === 'ANTHROPICUSDT'
-          ? { risk: { markPrice: riskPrice(row.markPx), liquidationPrice: riskPrice(row.liqPx), at: receivedAt } } : {}) });
+        positions.push(position);
       }
       const orders = await ordinaryOrders(credentials, symbol, mode, signal);
       for (const order of orders) if ((order.positionSide === 'BOTH') !== (config.positionMode === 'one-way')) fail('account_mode');
@@ -243,5 +274,5 @@ export function createOkxExecutionClient({ ErrorClass, ...options } = {}) {
     const rows = await protocol.request('stop', credentials, { instId: instrumentId(spec.symbol), ordId: current.id, clOrdId: spec.nativeClientId }, { signal, beforeMutation });
     ack(rows, { ...spec, id: current.id });
   });
-  return Object.freeze({ verify, account, market, create, amend, inspect, stop });
+  return Object.freeze({ verify, account, positionSnapshot, market, create, amend, inspect, stop });
 }

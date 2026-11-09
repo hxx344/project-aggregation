@@ -18,7 +18,7 @@ const config = (overrides = {}) => ({ enabled: false,
 const credentials = exchange => ({ accountMode: exchange === 'okx' ? 'cross' : 'standard', apiKey: `fixture_${exchange}_key`, apiSecret: `fixture_${exchange}_secret`, ...(exchange === 'okx' ? { passphrase: 'fixture_passphrase' } : {}) });
 
 async function fixture(t, { timers = false, withPositions = false } = {}) {
-  if (timers) t.mock.timers.enable({ apis: ['setInterval'] });
+  if (timers || withPositions) t.mock.timers.enable({ apis: ['setInterval'] });
   const dataDir = await mkdtemp(path.join(tmpdir(), 'hub-reduction-http-'));
   let session = null, serial = 0;
   const calls = [], readOnlyCalls = [], records = new Map();
@@ -30,6 +30,12 @@ async function fixture(t, { timers = false, withPositions = false } = {}) {
   const executionClientFactory = exchange => ({
     verify: async () => { calls.push({ exchange, method: 'verify' }); return { identity: accounts[exchange].identity }; },
     account: async () => { calls.push({ exchange, method: 'account' }); return structuredClone(accounts[exchange]); },
+    positionSnapshot: async () => {
+      calls.push({ exchange, method: 'positionSnapshot' });
+      return { identity: accounts[exchange].identity, fetchedAt: new Date(TIME).toISOString(), positions: accounts[exchange].positions.map(row => ({
+        symbol: row.symbol, side: row.side, quantity: row.quantity, quantityUnit: exchange === 'okx' ? '张' : 'ANTHROPIC', contractSize: '1',
+        markPrice: row.risk.markPrice, liquidationPrice: row.risk.liquidationPrice, riskFetchedAt: row.risk.at, marginMode: 'cross' })) };
+    },
     market: async symbol => ({ symbol, bid: '100', ask: '100.01', at: new Date(TIME).toISOString(), rule: {
       tickSize: '0.01', quantityStep: '0.1', minQuantity: '0.1', maxQuantity: '1000', maxMarketQuantity: '1000', minNotional: '5', maxNotional: null, contractSize: '1',
     } }),
@@ -51,13 +57,13 @@ async function fixture(t, { timers = false, withPositions = false } = {}) {
   });
   const tradingClientFactory = exchange => Object.fromEntries(['verify', 'positions', 'funding', 'anthropicPositions'].map(method => [method, async (_secret, options) => {
     readOnlyCalls.push({ exchange, method });
-    if (withPositions && method === 'anthropicPositions') return { fetchedAt: new Date(TIME).toISOString(), accountIdentity: exchange === 'okx' ? createHash('sha256').update(`okx:${accounts.okx.identity}`).digest('hex') : null,
-      positions: accounts[exchange].positions.map(row => ({ ...row, exchange, mode: 'hedge', marginMode: 'cross', contractSize: '1', markPrice: row.risk.markPrice, liquidationPrice: row.risk.liquidationPrice })) };
+    if (withPositions && method === 'anthropicPositions') return { fetchedAt: new Date(TIME).toISOString(), accountIdentity: exchange === 'okx' ? createHash('sha256').update('okx:999').digest('hex') : null,
+      positions: accounts[exchange].positions.map(row => ({ ...row, quantity: '999', exchange, mode: 'hedge', marginMode: 'cross', contractSize: '1', markPrice: row.risk.markPrice, liquidationPrice: row.risk.liquidationPrice })) };
     return method === 'funding' ? { fetchedAt: new Date(TIME).toISOString(), events: [], coverage: [{ start: options.start, end: options.end }], complete: true, error: null }
       : { fetchedAt: new Date(TIME).toISOString(), positions: [] };
   }]));
   const app = await createApp({ dataDir, initialPassword: PASSWORD, refreshInterval: 0, assetSyncIntervalMs: 0,
-    tradingRefreshIntervalMs: 0, executionIntervalMs: timers ? 1000 : 0, executionNow: () => TIME, tradingNow: () => TIME,
+    tradingRefreshIntervalMs: withPositions ? 30_000 : 0, executionIntervalMs: timers ? 1000 : 0, executionNow: () => TIME, tradingNow: () => TIME,
     executionClientFactory, tradingClientFactory, secureCookies: false, publicOrigin: '',
     summaryReader: async () => ({ updatedAt: new Date(TIME).toISOString(), metrics: [], message: 'fixture' }),
     assetSyncReader: async () => { throw new Error('Unexpected fixture asset read'); }, logger: () => {} });
@@ -65,7 +71,7 @@ async function fixture(t, { timers = false, withPositions = false } = {}) {
   const origin = `http://127.0.0.1:${app.server.address().port}`;
   t.after(async () => {
     await app.close();
-    if (timers) t.mock.timers.reset();
+    if (timers || withPositions) t.mock.timers.reset();
     const target = path.resolve(dataDir);
     assert.equal(path.dirname(target), path.resolve(tmpdir())); assert.ok(path.basename(target).startsWith('hub-reduction-http-'));
     await rm(target, { recursive: true, force: true });
@@ -124,20 +130,25 @@ test('reduction HTTP reads and writes require a session; writes require same Ori
 });
 
 test('position coverage HTTP reads keep account proofs private and never read exchanges, enable rules or create jobs', async t => {
-  const f = await fixture(t, { withPositions: true }), route = '/api/trading/anthropic';
+  const f = await fixture(t, { withPositions: true, timers: true }), route = '/api/trading/anthropic';
   assert.equal((await f.request(route)).status, 401);
-  await f.login(); await f.connect(); await f.connect('/api/trading');
-  await f.save({ enabled: true }, { confirmLive: true });
+  await f.login(); await f.connect();
+  await f.save({ enabled: true, thresholdPercent: '1' }, { confirmLive: true });
+  await f.pulse(); await f.pulse();
+  const executionOnly = await f.request(route);
+  assert.deepEqual(executionOnly.data.sources.flatMap(source => source.positions).map(row => row.quantity), ['10', '30'], 'execution connections alone supply the actual positions');
+  assert.equal(f.readOnlyCalls.length, 0);
+  await f.connect('/api/trading');
   const before = { rules: f.rows('SELECT * FROM execution_anthropic_reduction'), jobs: f.rows('SELECT * FROM execution_jobs'), orders: f.rows('SELECT * FROM execution_orders') };
   const calls = f.calls.length, reads = f.readOnlyCalls.length;
   for (let i = 0; i < 3; i++) {
     const response = await f.request(route); assert.equal(response.status, 200);
     const positions = response.data.sources.flatMap(source => source.positions);
     assert.equal(positions.length, 2);
-    assert.equal(positions.find(row => row.exchange === 'binance').protection.reduction.state, 'unknown');
-    assert.equal(positions.find(row => row.exchange === 'okx').protection.reduction.state, 'blocked');
-    assert.match(positions.find(row => row.exchange === 'okx').protection.reduction.reason, /等待核验/);
-    assert.doesNotMatch(JSON.stringify(response.data), /"(?:identity|accountIdentity|bindings|credentials|apiKey|apiSecret)":/);
+    assert.deepEqual(positions.map(row => row.quantity), ['10', '30'], 'another read-only account must not replace the execution positions');
+    assert.equal(positions.find(row => row.exchange === 'binance').protection.reduction.state, 'ready');
+    assert.equal(positions.find(row => row.exchange === 'okx').protection.reduction.state, 'ready');
+    assert.doesNotMatch(JSON.stringify(response.data), /"(?:identity|accountIdentity|bindings|executionBinding|connectionKey|credentials|apiKey|apiSecret)":/);
   }
   assert.equal(f.calls.length, calls); assert.equal(f.readOnlyCalls.length, reads); assert.equal(f.creates.length, 0);
   assert.deepEqual({ rules: f.rows('SELECT * FROM execution_anthropic_reduction'), jobs: f.rows('SELECT * FROM execution_jobs'), orders: f.rows('SELECT * FROM execution_orders') }, before);

@@ -1,6 +1,7 @@
 import { ExecutionError, WaitError, StaleMarketError, ExternalOrdersError, exactKeys } from './trading-execution-plan.mjs';
 import { normalizeReductionConfig } from './trading-reduction-plan.mjs';
 import { immediate } from './control/schema.mjs';
+import { EXECUTION_CALL_TIMEOUT_MS } from './control/execution-jobs.mjs';
 
 const FINAL = new Set(['completed', 'stopped']);
 const iso = time => new Date(time).toISOString();
@@ -47,7 +48,13 @@ export function createAnthropicReduction({ db, execution, admit = operation => o
     return { generatedAt: iso(now()), revision: value.revision, config: value.config, state: value.state, live, connections: connections(), maintenance: !!readMaintenance(), job: associated(value) ?? (value.state.lastJobId ? execution.jobView(value.state.lastJobId) : null) };
   }
   const state = () => stateOf(record());
-  const protectionState = () => { const value = record(); return { ...stateOf(value), bindings: value.accounts, checkedAt, available: execution.coverageAvailable(), locked: !!value.config && !!execution.lockOwner(value.config.legs) }; };
+  const protectionState = () => {
+    const value = record();
+    // This separate scheduler deadline never extends live.validUntil or
+    // authorizes an order; allow the next timer and its bounded read calls.
+    const monitorUntil = !closed && live && checkedAt ? iso(Date.parse(checkedAt) + Math.max(intervalMs, 15_000) + 2 * EXECUTION_CALL_TIMEOUT_MS) : null;
+    return { ...stateOf(value), bindings: value.accounts, checkedAt, monitorUntil, available: !closed && execution.coverageAvailable(), locked: !!value.config && !!execution.lockOwner(value.config.legs) };
+  };
   function save(body) {
     exactKeys(body, ['revision', 'config', 'confirmLive']);
     const config = normalizeReductionConfig(body.config);

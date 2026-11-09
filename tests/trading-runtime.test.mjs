@@ -280,15 +280,14 @@ test('four-leg structure follows observed positions, preserves both hedge sides 
   assert.equal(f.app.trading.state().legs[0].fetchedAt, empty.legs[0].fetchedAt);
 });
 
-test('Anthropic positions use the Binance and OKX read-only accounts, never Bybit, through the real entry', async t => {
+test('Anthropic watch never substitutes independent read-only accounts for execution connections through the real entry', async t => {
   const f = await fixture(t); await f.login();
   f.anthropicRows.okx = [position('okx', 'ANTHROPICUSDT', 'short', { quantity: '30', markPrice: '183.5', liquidationPrice: '220.2', notional: '5505', marginMode: 'cross', contractSize: '1' })];
   await f.connect('binance'); await f.connect('bybit'); await f.connect('okx', { ...credentials('okx'), passphrase: 'private_fixture_passphrase' });
   const { status, data } = await f.request('/api/trading/anthropic');
   assert.equal(status, 200);
-  assert.deepEqual(data.sources.map(source => [source.exchange, source.state]), [['binance', 'live'], ['okx', 'live'], ['hyperliquid', 'unconfigured'], ['rh-lighter', 'unconfigured']]);
-  const [leg] = data.sources[1].positions;
-  assert.deepEqual([leg.symbol, leg.side, leg.liquidationPrice, leg.distancePercent, leg.alerting], ['ANTHROPICUSDT', 'short', '220.2', '20.00', false]);
+  assert.deepEqual(data.sources.map(source => [source.exchange, source.state]), [['binance', 'unconfigured'], ['okx', 'unconfigured'], ['hyperliquid', 'unconfigured'], ['rh-lighter', 'unconfigured']]);
+  assert.ok(data.sources.every(source => !source.connected && source.positions.length === 0), 'without an execution connection, another read-only account cannot supply or authorize the ANT table');
   assert.ok(!f.calls.some(call => call.method === 'anthropicPositions' && call.exchange === 'bybit'));
   assert.ok(f.calls.filter(call => call.method === 'anthropicPositions').every(call => call.secret.apiKey.includes(call.exchange)));
   assert.equal((await f.request('/api/trading')).data.legs.every(leg => leg.symbol !== 'ANTHROPICUSDT'), true, 'outside the oil legs');

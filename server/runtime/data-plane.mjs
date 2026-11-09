@@ -12,6 +12,7 @@ import { createTradingExecution } from '../trading-execution.mjs';
 import { createTradingAuto } from '../trading-auto.mjs';
 import { createAnthropicWatch } from '../trading-anthropic-watch.mjs';
 import { createAnthropicReduction } from '../trading-anthropic-reduction.mjs';
+import { createExecutionPositionWatch } from '../trading-execution-position-watch.mjs';
 import { createAnthropicHistory } from '../trading-anthropic-history.mjs';
 import { createFillAttribution } from '../trading-fill-attribution.mjs';
 import { ExecutionError } from '../trading-execution-plan.mjs';
@@ -146,10 +147,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
     positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
-  // Anthropic legs: read-only Binance/OKX accounts plus the live Hyperliquid connection's public positions.
-  const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, encrypt, decrypt, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0, readCex: () => trading.anthropic(),
-    readProtection: () => anthropicReduction.protectionState(),
-    readAddress: exchange => { const row = execution.state().connections.find(item => item.exchange === exchange); return row?.connected && typeof row.identity === 'string' ? row.identity.toLowerCase() : null; } });
+  // All ANT observations use the same account and scope as the order unit.
+  const executionPositions = createExecutionPositionWatch({ readConnections: () => execution.anthropicPositionConnections(),
+    read: (exchange, binding, options) => execution.readAnthropicPositions(exchange, binding, options), now: executionNow });
+  const anthropicWatch = createAnthropicWatch({ dataDir, log, feishu: feishuDigest, encrypt, decrypt, intervalMs: tradingRefreshIntervalMs > 0 ? 30_000 : 0,
+    executionPositions, readProtection: () => anthropicReduction.protectionState(), now: executionNow });
   const assetFills = {
     invalidate: id => { for (const source of Object.values(assetFillsByMarket)) source.invalidate(id); },
     close: () => Promise.all(Object.values(assetFillsByMarket).map(source => source.close())),

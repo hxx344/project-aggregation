@@ -294,7 +294,7 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
     return { ...result, rule: { ...limits, tickSize: priceTick(bid, szDecimals) }, onlyIsolated, maxLeverage };
   }
 
-  function positionsOf(state, selected, coins, receivedAt) {
+  function positionsOf(state, selected, coins, receivedAt, display = false) {
     if (!object(state) || !Array.isArray(state.assetPositions) || state.assetPositions.length > MAX_ROWS) fail();
     const positions = [];
     for (const entry of state.assetPositions) {
@@ -308,10 +308,38 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
       if (size === '0') continue;
       const short = size.startsWith('-');
       const quantity = short ? size.slice(1) : size;
-      positions.push({ symbol: coin, side: short ? 'short' : 'long', quantity,
-        risk: { markPrice: markPrice(entry.position.positionValue, quantity), liquidationPrice: riskPrice(entry.position.liquidationPx), at: receivedAt } });
+      const p = entry.position, position = { symbol: coin, side: short ? 'short' : 'long', quantity };
+      const risk = { markPrice: markPrice(p.positionValue, quantity), liquidationPrice: riskPrice(p.liquidationPx), at: receivedAt };
+      if (display) {
+        const optional = (value, constraints) => { try { return amount(value, constraints); } catch { return null; } };
+        const leverage = object(p.leverage) && ['cross', 'isolated'].includes(p.leverage.type) ? p.leverage : null;
+        positions.push({ ...position, quantityUnit: coin === 'xyz:ANT' ? 'ANT' : 'ANTH', entryPrice: riskPrice(p.entryPx), markPrice: risk.markPrice,
+          notional: optional(p.positionValue, { nonnegative: true }), unrealizedPnl: optional(p.unrealizedPnl),
+          leverage: Number.isSafeInteger(leverage?.value) && leverage.value > 0 ? String(leverage.value) : null, marginMode: leverage?.type ?? null,
+          marginUsed: optional(p.marginUsed, { nonnegative: true }), liquidationPrice: risk.liquidationPrice,
+          // Only an explicit null (or a valid zero) is the venue's no-price
+          // value. Missing or malformed values must never clear an old alert.
+          liquidationKnown: p.liquidationPx === null || optional(p.liquidationPx, { nonnegative: true }) !== null, riskFetchedAt: risk.at });
+      } else positions.push({ ...position, risk });
     }
     return positions;
+  }
+
+  async function positionSnapshot(credentials, { signal, symbols } = {}) {
+    const selected = executionSymbols(symbols, HYPERLIQUID_SYMBOLS);
+    if (!selected?.length) fail('input');
+    const { identity } = await verify(credentials, { signal });
+    const dexes = [...new Set(selected.map(dexOf))];
+    const reads = await Promise.all(dexes.map(async dex => {
+      const state = await info({ type: 'clearinghouseState', user: identity, dex }, signal);
+      return { dex, state, receivedAt: new Date(milliseconds(now())).toISOString() };
+    }));
+    const coins = new Set(), positions = [];
+    for (const { dex, state, receivedAt } of reads) positions.push(...positionsOf(state, selected.filter(coin => dexOf(coin) === dex), coins, receivedAt, true));
+    checkAbort(signal);
+    // Both HIP-3 dexes retain their own risk receipt time; the shared snapshot
+    // expires with the oldest response, including an empty position response.
+    return { identity, fetchedAt: reads.map(read => read.receivedAt).sort()[0], positions };
   }
 
   function openOrdersOf(rows, selected) {
@@ -499,5 +527,5 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
   }
 
   const unsupported = async () => fail('input');
-  return { exchange: 'hyperliquid', verify, account, history, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported };
+  return { exchange: 'hyperliquid', verify, account, positionSnapshot, history, market, create, amend: unsupported, inspect, stop, endedStrategies: unsupported };
 }

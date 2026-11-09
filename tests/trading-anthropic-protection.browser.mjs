@@ -4,7 +4,7 @@ async (page) => {
   if (page.url() !== 'about:blank' && new URL(page.url()).origin !== origin) throw new Error('Coverage fixture requires isolated localhost:4193');
   const assert = (value, message) => { if (!value) throw new Error(message); };
   const iso = value => new Date(value).toISOString(), initial = Date.parse('2026-11-09T08:30:00Z');
-  let current = initial, failed = false, holdRead = null, revision = 1;
+  let current = initial, failed = false, holdRead = null, revision = 1, binanceConnected = true;
   const writes = [], errors = [], address = '0x' + 'a'.repeat(40);
   const updates = { enabled: false, checking: false, available: false, supported: false, modules: [], job: null, error: null };
   let alertConfig = { enabled: true, thresholdPercent: 20, repeatMinutes: 30 };
@@ -15,12 +15,13 @@ async (page) => {
     entryPrice: '100', markPrice: '101', notional: '1010', unrealizedPnl: '10', leverage: '3', marginMode: 'cross', liquidationPrice: '50', distancePercent: '50.50', alerting: false, ...extra });
   const watch = () => {
     const alert = alertConfig.enabled ? status('ready', '强平距离达到阈值时提醒', true) : status('disabled', '强平预警未启用');
-    const reduction = reductionConfig.enabled ? status('ready', '最近核验通过；触发和发送前仍会重新检查', true) : status('disabled', '规则未启用；仅保留配置');
+    const reduction = reductionConfig.enabled ? { ...status('ready', '已关联下单账户，最近核验通过；发送前仍会重新检查', true), monitorUntil: iso(current + 8000) } : status('disabled', '规则未启用；仅保留配置');
     const sources = [
-      { exchange: 'binance', positions: [position('binance', 'ANTHROPICUSDT', 'long', { protection: { alert, reduction: status('unknown', '配置包含该合约，但只读来源尚无账户 UID 证明') } })] },
-      { exchange: 'okx', positions: [position('okx', 'ANTHROPICUSDT', 'long', { liquidationPrice: null, quantityUnit: '张', contractSize: '1', protection: { alert: status('blocked', '缺少有效强平价'), reduction: status('blocked', '批次过多，至少一批数量小于合约步长') } })] },
+      { exchange: 'binance', connected: binanceConnected, accountMode: 'standard', positions: binanceConnected ? [position('binance', 'ANTHROPICUSDT', 'long', { protection: { alert, reduction } })] : [] },
+      { exchange: 'okx', accountMode: 'cross', positions: [position('okx', 'ANTHROPICUSDT', 'long', { liquidationPrice: null, liquidationKnown: false, riskUnknown: true, alerting: true, quantityUnit: '张', contractSize: '1', protection: { alert: status('blocked', '强平价缺失或无效，无法确认强平风险'), reduction: status('blocked', '批次过多，至少一批数量小于合约步长') } }),
+        position('okx', 'ANTHROPICUSDT', 'long', { id: 'okx:ANTHROPICUSDT:long:isolated', marginMode: 'isolated', protection: { alert, reduction: status('unmatched', '仓位保证金范围与规则连接不一致') } })] },
       { exchange: 'hyperliquid', address, positions: [position('hyperliquid', 'io:ANTH', 'long', { markPrice: null, riskUnknown: true, protection: { alert: status('blocked', '缺少有效标记价'), reduction: status('unconfigured', '没有包含该合约与方向的减仓规则') } })] },
-      { exchange: 'rh-lighter', address, positions: [11, 12].map(account => position('rh-lighter', 'ANTHROPIC', 'short', { id: `rh-lighter:ANTHROPIC:${account}:short`, account, protection: { alert, reduction: account === 11 ? reduction : status('unmatched', '该钱包下的另一子账户未被此规则覆盖') } })) },
+      { exchange: 'rh-lighter', accountMode: 'api-key', accountIndex: 11, positions: [position('rh-lighter', 'ANTHROPIC', 'short', { id: 'rh-lighter:ANTHROPIC:11:short', account: 11, protection: { alert, reduction } })] },
     ].map(source => ({ connected: true, state: 'live', fetchedAt: iso(current - 1000), error: null, refreshing: false, ...source }));
     return { generatedAt: iso(current), sources, alerts: { config: alertConfig, channel: { configured: true, source: 'digest', host: null, error: null }, history: [], error: null, staleAfterSeconds: 180, hysteresisPercent: 2 } };
   };
@@ -69,16 +70,23 @@ async (page) => {
     const target = section.locator('[data-position-id="rh-lighter:ANTHROPIC:11:short"]');
     const protectedCell = target.locator('[data-protection-kind="reduction"]');
     await protectedCell.getByText('最近核验通过', { exact: true }).waitFor();
-    assert(await section.locator('[data-position-id="rh-lighter:ANTHROPIC:12:short"]').getByText('未覆盖', { exact: true }).count() === 1, 'other subaccount stays uncovered');
+    assert(await section.locator('[data-position-id="rh-lighter:ANTHROPIC:12:short"]').count() === 0, 'another Lighter subaccount is not mixed into the execution position table');
+    assert(await section.locator('[data-position-id="okx:ANTHROPICUSDT:long:isolated"]').getByText('未覆盖', { exact: true }).count() === 1, 'another OKX margin scope remains visible and uncovered');
+    assert(await section.locator('[data-position-id="binance:ANTHROPICUSDT:long"] [data-protection-kind="reduction"]').getAttribute('data-protection-state') === 'ready', 'Binance uses the proven order account');
+    assert((await section.innerText()).includes('四所统一使用「价差下单」的执行账户') && (await section.innerText()).includes('下单账户 / 指定子账户 11'), 'the actual account source and subaccount are explicit');
     assert(await section.getByText('缺少有效标记价', { exact: true }).count() === 1, 'missing mark is explicit');
-    assert(await section.getByText('缺少有效强平价', { exact: true }).count() === 1, 'missing liquidation price is explicit');
+    assert(await section.getByText('强平价缺失或无效，无法确认强平风险', { exact: true }).count() === 1, 'unknown liquidation evidence is explicit');
+    assert(await section.getByText('强平价缺失或无效，无法确认风险', { exact: true }).count() === 1, 'unknown liquidation evidence is not mislabeled as a missing mark');
     assert(await section.getByText('批次过多，至少一批数量小于合约步长', { exact: true }).count() === 1, 'enabled but infeasible rule is blocked');
     assert(writes.length === 0, 'opening and reading do not mutate');
     await section.screenshot({ path: 'output/playwright/ant-protection-desktop.png' });
 
     await page.clock.fastForward(6000); await flush();
-    assert(await protectedCell.getAttribute('data-protection-state') === 'stale', 'local clock expires green evidence before next request');
-    current += 6000; await refresh();
+    assert(await protectedCell.getAttribute('data-protection-state') === 'monitoring', 'expired book evidence leaves a bounded monitoring state, not executable readiness');
+    assert((await protectedCell.innerText()).includes('下单前会重新核验'), 'monitoring is explicit about fresh send checks');
+    await page.clock.fastForward(3000); await flush();
+    assert(await protectedCell.getAttribute('data-protection-state') === 'stale', 'the separate monitoring deadline also expires without new evidence');
+    current += 9000; await refresh();
     assert(await protectedCell.getAttribute('data-protection-state') === 'ready', 'fresh evidence restores readiness');
     const previousTime = await protectedCell.locator('small').innerText();
     failed = true; await refresh();
@@ -111,12 +119,14 @@ async (page) => {
     await rule.getByRole('button', { name: '停用新触发', exact: true }).click();
     await protectedCell.getByText('未启用', { exact: true }).waitFor();
     assert(writes.length === 2, 'only the two explicitly clicked changes wrote anything');
+    binanceConnected = false; await refresh();
+    await section.getByText('在「价差下单」连接 Binance 实盘账户后，自动读取同一账户仓位。', { exact: true }).waitFor();
     await page.setViewportSize({ width: 390, height: 844 });
     await page.evaluate(() => window.scrollTo(0, 0));
     assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'mobile has no page-wide overflow');
     assert(await target.locator('[data-label="自动减仓覆盖"]').isVisible(), 'mobile cards retain coverage and reasons');
     await section.screenshot({ path: 'output/playwright/ant-protection-mobile.png' });
     assert(!errors.length, `no browser errors: ${errors.join('; ')}`);
-    return { passed: true, scenarios: 9, writes: writes.length };
+    return { passed: true, scenarios: 12, writes: writes.length };
   } finally { await page.context().setOffline(false); await page.unroute('**/*', handler); page.off('pageerror', onError); }
 }

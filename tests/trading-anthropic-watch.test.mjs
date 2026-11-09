@@ -1,13 +1,58 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAnthropicWatch, liquidationDistance, parseHyperliquidState, parseRhLighterAccounts, validateAlertConfig } from '../server/trading-anthropic-watch.mjs';
+import { createExecutionPositionWatch } from '../server/trading-execution-position-watch.mjs';
 
 const ADDRESS = '0x' + 'a'.repeat(40);
 const quiet = { warn() {} };
 const hlPosition = (coin, szi, liquidationPx, positionValue = '1000') => ({ type: 'oneWay', position: { coin, szi, entryPx: '100', positionValue, unrealizedPnl: '0', liquidationPx, leverage: { type: 'isolated', value: 3 }, marginUsed: '333' } });
+
+function executionHarness() {
+  const dataDir = mkdtempSync(path.join(tmpdir(), 'anthropic-execution-watch-'));
+  let current = Date.parse('2026-11-09T00:00:00Z');
+  const h = { dataDir, calls: [], legacyCalls: [], posts: [], failure: null, protection: null, snapshots: {},
+    connections: [
+      { exchange: 'binance', connected: true, revision: 1, identity: 'execution-uid-1', accountMode: 'standard' },
+      { exchange: 'rh-lighter', connected: true, revision: 1, identity: ADDRESS, accountMode: 'api-key', accountIndex: 27 },
+    ],
+    now: () => current, advance: ms => { current += ms; }, at: () => new Date(current).toISOString(),
+    rows: {
+      binance: [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '3', quantityUnit: 'ANTHROPIC', markPrice: '100', liquidationPrice: '110', marginMode: 'cross' }],
+      'rh-lighter': [{ symbol: 'ANTHROPIC', side: 'long', quantity: '4', quantityUnit: 'ANTHROPIC', markPrice: '100', liquidationPrice: '50', marginMode: 'cross' }],
+    },
+  };
+  const create = () => {
+    h.positions = createExecutionPositionWatch({ readConnections: () => h.connections, now: h.now, read: async (exchange, binding, options) => {
+      h.calls.push({ exchange, binding, signal: options.signal });
+      if (h.failure?.exchange === exchange) throw h.failure.error;
+      if (h.snapshots[exchange]) return h.snapshots[exchange](binding, options);
+      return { identity: binding.identity, ...(exchange === 'rh-lighter' ? { accountIndex: binding.accountIndex } : {}), fetchedAt: h.at(),
+        positions: (h.rows[exchange] ?? []).map(row => ({ riskFetchedAt: h.at(), ...row })) };
+    } });
+    const watch = createAnthropicWatch({ dataDir, executionPositions: h.positions, now: h.now, intervalMs: 0, log: quiet,
+      readCex: () => { h.legacyCalls.push('cex'); return [{ exchange: 'binance', state: 'live', positions: [{ id: 'old-account-position' }] }]; },
+      readAddress: () => { h.legacyCalls.push('address'); return ADDRESS; },
+      fetcher: async () => { h.legacyCalls.push('http'); throw new Error('unexpected public wallet request'); },
+      readProtection: () => h.protection,
+      feishu: { alertChannel: () => ({ configured: true, title: '执行账户预警' }), postAlert: async card => { h.posts.push(card.elements[0].text.content); } },
+      encrypt: value => ({ sealed: JSON.stringify(value) }), decrypt: value => JSON.parse(value.sealed),
+    });
+    watch.initialize(); return watch;
+  };
+  h.statePath = path.join(dataDir, 'anthropic-watch', 'state.json');
+  h.watch = create();
+  h.restart = async () => { await h.watch.close(); h.watch = create(); };
+  h.cleanup = async () => {
+    await h.watch.close();
+    assert.equal(path.dirname(path.resolve(dataDir)), path.resolve(tmpdir()));
+    assert.ok(path.basename(dataDir).startsWith('anthropic-execution-watch-'));
+    rmSync(dataDir, { recursive: true, force: true });
+  };
+  return h;
+}
 
 function harness({ cex = [], configured = true, readProtection = () => null } = {}) {
   const dataDir = mkdtempSync(path.join(tmpdir(), 'anthropic-watch-'));
@@ -44,6 +89,116 @@ function harness({ cex = [], configured = true, readProtection = () => null } = 
   h.watch = create();
   return h;
 }
+
+test('execution mode reads only execution accounts and keeps monitoring independent of reduction state', async () => {
+  const h = executionHarness();
+  try {
+    for (let count = 0; count < 10; count++) {
+      const state = h.watch.state();
+      assert.equal(state.sources.length, 4); assert.equal(state.sources[0].state, 'loading');
+    }
+    assert.equal(h.calls.length, 0); assert.equal(existsSync(h.statePath), false, 'GET does not initialize persisted source bindings');
+    await h.watch.poll();
+    assert.deepEqual(h.calls.map(call => call.exchange), ['binance', 'rh-lighter']);
+    assert.equal(h.posts.length, 0, 'positions refresh even while alerts are disabled');
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    for (const state of [{ available: false, locked: true }, { maintenance: true }, { config: { enabled: false } }]) {
+      h.protection = { ...state, config: { enabled: false, legs: [] } };
+      await h.watch.poll();
+      assert.equal(h.watch.state().sources[0].positions[0].protection.alert.state, 'ready');
+    }
+    assert.equal(h.posts.length, 1); assert.match(h.posts[0], /Binance ANTHROPICUSDT 做空：距强平 10.00%/);
+    assert.equal(h.watch.state().sources.find(source => source.exchange === 'rh-lighter').positions[0].account, 27);
+    assert.deepEqual(h.legacyCalls, []);
+    const publicJson = JSON.stringify(h.watch.state()), savedJson = readFileSync(h.statePath, 'utf8');
+    for (const privateField of ['executionBinding', 'connectionKey', 'execution-uid-1', ADDRESS, 'accountIdentity']) assert.equal(publicJson.includes(privateField), false, privateField);
+    assert.equal(savedJson.includes('execution-uid-1'), false); assert.equal(savedJson.includes(ADDRESS), false);
+    assert.equal(Object.hasOwn(JSON.parse(savedJson), 'positions'), false, 'positions are not persisted');
+  } finally { await h.cleanup(); }
+});
+
+test('unknown liquidation evidence from every execution venue retains warnings until an explicit recovery', async t => {
+  const modes = { binance: 'standard', okx: 'cross', hyperliquid: 'agent', 'rh-lighter': 'api-key' };
+  for (const exchange of Object.keys(modes)) await t.test(exchange, async () => {
+    const h = executionHarness(), symbol = exchange === 'hyperliquid' ? 'io:ANTH' : exchange === 'rh-lighter' ? 'ANTHROPIC' : 'ANTHROPICUSDT';
+    h.connections = [{ exchange, connected: true, revision: 1, identity: ['binance', 'okx'].includes(exchange) ? '42' : ADDRESS,
+      accountMode: modes[exchange], ...(exchange === 'rh-lighter' ? { accountIndex: 27 } : {}) }];
+    h.rows[exchange] = [{ symbol, side: 'short', quantity: '3', markPrice: '100', liquidationPrice: '110', liquidationKnown: true, marginMode: 'cross' }];
+    const row = () => h.watch.state().sources.find(source => source.exchange === exchange).positions[0];
+    try {
+      h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 }); await h.watch.poll();
+      assert.equal(h.posts.length, 1); assert.equal(row().alerting, true);
+      Object.assign(h.rows[exchange][0], { liquidationPrice: null, liquidationKnown: false });
+      h.advance(1000); await h.watch.poll();
+      assert.equal(row().alerting, true); assert.equal(row().riskUnknown, true); assert.equal(row().riskFetchedAt, h.at());
+      assert.equal(row().protection.alert.state, 'blocked'); assert.match(h.posts[1], /强平价缺失或无效.*保留预警/);
+      assert.doesNotMatch(h.posts[1], /🟢|解除预警/);
+      await h.restart(); h.advance(31 * 60_000); await h.watch.poll();
+      assert.equal(h.posts.length, 2); assert.equal(row().alerting, true);
+      h.rows[exchange][0].liquidationKnown = true; await h.watch.poll();
+      assert.equal(row().alerting, false); assert.equal(row().riskUnknown, false);
+      assert.match(h.posts[2], /不再提供强平价.*解除预警/);
+    } finally { await h.cleanup(); }
+  });
+});
+
+test('execution source failures preserve other sources and never fall back to read-only accounts', async () => {
+  const h = executionHarness();
+  try {
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    await h.watch.poll();
+    const before = h.watch.state().sources[0];
+    h.advance(1000); h.failure = { exchange: 'binance', error: new Error('apiSecret=do-not-disclose') };
+    await h.watch.poll();
+    const state = h.watch.state();
+    assert.equal(state.sources[0].state, 'stale'); assert.equal(state.sources[0].fetchedAt, before.fetchedAt);
+    assert.equal(state.sources[0].positions[0].alerting, true); assert.equal(h.posts.length, 1);
+    assert.equal(state.sources.find(source => source.exchange === 'rh-lighter').state, 'live');
+    assert.equal(JSON.stringify(state).includes('do-not-disclose'), false); assert.deepEqual(h.legacyCalls, []);
+  } finally { await h.cleanup(); }
+});
+
+test('switching execution accounts clears old alerts in poll without false gone or recovery and GET never writes', async () => {
+  const h = executionHarness();
+  try {
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    await h.watch.poll(); assert.equal(h.posts.length, 1);
+    const before = readFileSync(h.statePath, 'utf8');
+    h.connections[0] = { ...h.connections[0], revision: 2, identity: 'execution-uid-2' };
+    assert.deepEqual(h.watch.state().sources[0].positions, []);
+    h.rows.binance[0].liquidationPrice = '140';
+    await h.positions.refresh();
+    assert.equal(h.watch.state().sources[0].positions[0].alerting, false, 'same position id from a new account cannot inherit the old alert');
+    assert.equal(readFileSync(h.statePath, 'utf8'), before);
+    await h.watch.poll();
+    assert.equal(h.posts.length, 1, 'new safe account has no gone/recover notice for the old account');
+    assert.equal(Object.keys(JSON.parse(readFileSync(h.statePath, 'utf8')).alerts.active).length, 0);
+    assert.deepEqual(h.legacyCalls, []);
+  } finally { await h.cleanup(); }
+});
+
+test('execution restart retains matching alert claims but drops migrated or changed-account claims', async () => {
+  const h = executionHarness();
+  try {
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    await h.watch.poll(); assert.equal(h.posts.length, 1);
+    await h.restart();
+    assert.equal(h.watch.state().sources[0].state, 'loading', 'restart cannot restore a position snapshot');
+    assert.equal(h.watch.state().alerts.config.enabled, true);
+    await h.watch.poll(); assert.equal(h.posts.length, 1, 'same account retains its durable alert claim');
+    const saved = JSON.parse(readFileSync(h.statePath, 'utf8'));
+    delete saved.sourceBindings; saved.alerts.stale.binance = h.now() - 180_000;
+    writeFileSync(h.statePath, JSON.stringify(saved));
+    h.rows.binance = [];
+    await h.restart(); await h.watch.poll();
+    assert.equal(h.posts.length, 1, 'legacy unbound claims do not emit gone or recovered');
+    h.rows.binance = [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '3', markPrice: '100', liquidationPrice: '110', marginMode: 'cross' }];
+    await h.watch.poll(); assert.equal(h.posts.length, 2);
+    h.connections[0] = { ...h.connections[0], identity: 'new-after-restart', revision: 2 }; h.rows.binance = [];
+    await h.restart(); await h.watch.poll();
+    assert.equal(h.posts.length, 2, 'changed account after restart also cannot inherit alerts');
+  } finally { await h.cleanup(); }
+});
 
 test('Hyperliquid state keeps only the Anthropic coin of its dex and reads short size and liquidation price', () => {
   const rows = parseHyperliquidState({ assetPositions: [hlPosition('io:ANTH', '-10', '120'), hlPosition('xyz:ANT', '5', '50'), hlPosition('BTC', '1', '1')] }, 'io');

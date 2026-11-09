@@ -19,6 +19,9 @@ import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs
  *   account(credentials, options) -> { identity, modes, positions, openOrders, strategies }
  *     Anthropic positions also expose risk: { markPrice, liquidationPrice, at };
  *     prices are positive decimal strings or null, at is the local receipt time.
+ *   positionSnapshot(credentials, options) -> { identity, fetchedAt, positions }
+ *     Anthropic only, using the execution connection's exact account scope;
+ *     no order reads, user-stream startup or trading writes.
  *   market(symbol, { signal, withRule = true }) -> { symbol, bid, ask, at, rule }
  *     (withRule: false reads the book only, for display; rule is then absent)
  *   create(credentials, spec, options) -> { id, kind: 'order' | 'strategy' }
@@ -508,7 +511,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       if (typeof config.dualSidePosition !== 'boolean') fail('account_mode');
       let identity = null;
       if (options.requireIdentity) {
-        const revision = createHash('sha256').update(credentials.apiKey).update('\0').update(credentials.apiSecret).digest('hex');
+        const revision = createHash('sha256').update(mode).update('\0').update(credentials.apiKey).update('\0').update(credentials.apiSecret).digest('hex');
         if (identityEvidence?.revision === revision && clock() >= identityEvidence.at && clock() - identityEvidence.at < 60_000) identity = identityEvidence.identity;
         else {
           identityEvidence = null;
@@ -600,6 +603,47 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     return { identity: snapshot.identity };
   }
 
+  function binancePositions(rows, symbol, options, positionMode, receivedAt, display = false) {
+    const positions = [], seen = new Set();
+    const optional = (value, constraints) => { try { return amount(value, constraints); } catch { return null; } };
+    for (const row of rows) {
+      requireObject(row);
+      if (row.symbol !== symbol || options.accountMode === 'standard' && row.marginAsset !== 'USDT'
+        || Object.hasOwn(row, 'marginAsset') && row.marginAsset !== 'USDT') fail();
+      const positionSide = positionSideOf(row.positionSide);
+      if ((positionSide === 'BOTH') !== (positionMode === 'one-way') || seen.has(positionSide)) fail('account_mode');
+      seen.add(positionSide);
+      const signed = amount(row.positionAmt);
+      if (positionSide === 'LONG' && compareDecimals(signed, '0') < 0 || positionSide === 'SHORT' && compareDecimals(signed, '0') > 0) fail();
+      if (signed === '0') continue;
+      const position = { symbol, side: compareDecimals(signed, '0') > 0 ? 'long' : 'short', quantity: signed.startsWith('-') ? negateDecimal(signed) : signed };
+      // Display fields are optional. Missing risk prices never manufacture a
+      // zero or prevent the existing execution preflight from reading size.
+      const risk = { markPrice: optional(row.markPrice, { positive: true }), liquidationPrice: optional(row.liquidationPrice, { positive: true }), at: receivedAt };
+      if (display) {
+        const notional = optional(row.notional);
+        positions.push({ ...position, quantityUnit: 'ANTHROPIC', entryPrice: optional(row.entryPrice, { positive: true }), markPrice: risk.markPrice,
+          notional: notional?.startsWith('-') ? negateDecimal(notional) : notional, unrealizedPnl: optional(row.unRealizedProfit),
+          leverage: optional(row.leverage, { positive: true }), marginMode: ['cross', 'isolated'].includes(row.marginType) ? row.marginType : null,
+          liquidationPrice: risk.liquidationPrice, liquidationKnown: optional(row.liquidationPrice, { nonnegative: true }) !== null, riskFetchedAt: risk.at });
+      } else positions.push({ ...position, ...(symbol === 'ANTHROPICUSDT' ? { risk } : {}) });
+    }
+    return positions;
+  }
+
+  async function positionSnapshot(credentials, { accountMode, signal, symbols } = {}) {
+    const selected = executionSymbols(symbols, ['ANTHROPICUSDT']);
+    if (exchange !== 'binance' || !selected) fail('input');
+    const options = { accountMode: modeOf(accountMode), signal, requireIdentity: true };
+    const snapshot = await permissionSnapshot(credentials, options);
+    if (snapshot.identity === null) fail('permissions', { detail: 'Binance UID 尚未核验，无法关联执行账户仓位' });
+    const rows = array(await request('positions', credentials, { symbol: selected[0] }, options), 20);
+    const fetchedAt = new Date(clock()).toISOString();
+    const positions = binancePositions(rows, selected[0], options, snapshot.positionMode, fetchedAt, true);
+    checkAbort(signal);
+    return { identity: snapshot.identity, fetchedAt, positions };
+  }
+
   async function account(credentials, { accountMode, signal, requireIdentity = false, symbols } = {}) {
     const options = { accountMode: modeOf(accountMode), signal, requireIdentity }, selected = executionSymbols(symbols, SYMBOLS);
     if (!selected) fail('input');
@@ -611,25 +655,9 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     for (const symbol of selected) {
       if (exchange === 'binance') {
         modes[symbol] = snapshot.positionMode;
-        const rows = array(await request('positions', credentials, { symbol }, options), 20), seen = new Set();
+        const rows = array(await request('positions', credentials, { symbol }, options), 20);
         const receivedAt = new Date(clock()).toISOString();
-        for (const row of rows) {
-          requireObject(row);
-          if (row.symbol !== symbol || options.accountMode === 'standard' && row.marginAsset !== 'USDT'
-            || Object.hasOwn(row, 'marginAsset') && row.marginAsset !== 'USDT') fail();
-          const positionSide = positionSideOf(row.positionSide);
-          if ((positionSide === 'BOTH') !== (snapshot.positionMode === 'one-way') || seen.has(positionSide)) fail('account_mode');
-          seen.add(positionSide);
-          const signed = amount(row.positionAmt);
-          if (positionSide === 'LONG' && compareDecimals(signed, '0') < 0 || positionSide === 'SHORT' && compareDecimals(signed, '0') > 0) fail();
-          if (signed !== '0') {
-            // Optional risk fields must not turn an otherwise usable account
-            // snapshot into a manual-trading failure, nor invent zero prices.
-            const riskPrice = value => { try { return amount(value, { positive: true }); } catch { return null; } };
-            positions.push({ symbol, side: compareDecimals(signed, '0') > 0 ? 'long' : 'short', quantity: signed.startsWith('-') ? negateDecimal(signed) : signed,
-              ...(symbol === 'ANTHROPICUSDT' ? { risk: { markPrice: riskPrice(row.markPrice), liquidationPrice: riskPrice(row.liquidationPrice), at: receivedAt } } : {}) });
-          }
-        }
+        positions.push(...binancePositions(rows, symbol, options, snapshot.positionMode, receivedAt));
         for (const row of array(await request('openOrders', credentials, { symbol }, options))) {
           const order = parseBinanceOrder(row);
           if (order.symbol !== symbol || seenOrders.has(order.id)) fail();
@@ -966,6 +994,6 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     streamGeneration += 1; identityEvidence = null; recoveredBooks.clear(); recoveredOrders.clear(); requiredRest.clear(); orderEpochs.clear();
     streams?.forget(); binanceTime?.forget();
   }
-  return Object.freeze({ verify, account, endedStrategies, market, create, amend, inspect, stop, forget,
+  return Object.freeze({ verify, account, ...(exchange === 'binance' ? { positionSnapshot } : {}), endedStrategies, market, create, amend, inspect, stop, forget,
     close() { forget(); streams?.close(); } });
 }

@@ -8,11 +8,9 @@ import { decimal } from './trading-decimal.mjs';
 import { EXECUTION_VENUE_SYMBOLS, TRADING_NAMES } from './trading-markets.mjs';
 import { positionProtection } from './trading-anthropic-protection.mjs';
 
-// Anthropic arbitrage positions and their liquidation watch. Read only: the
-// Binance/OKX legs come from the read-only accounts (trading.anthropic()), the
-// Hyperliquid legs from the public info endpoint for the master address of the
-// live connection, the Lighter RH legs from the public account endpoint for the
-// L1 address of the live connection (every account under that address).
+// Production observes the four execution accounts through executionPositions.
+// The legacy read-only ledger/public-wallet readers remain for older callers;
+// an execution source failure never falls back to those unrelated accounts.
 // Alerts go through their own Feishu robot when one is saved, otherwise through
 // the Feishu digest's robot.
 // https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/perpetuals
@@ -48,6 +46,7 @@ const object = value => value !== null && typeof value === 'object' && !Array.is
 const iso = time => new Date(time).toISOString();
 const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
 const missingMark = row => !Number.isFinite(Number(row.markPrice)) || !(Number(row.markPrice) > 0);
+const unknownRisk = row => missingMark(row) || row.liquidationKnown === false;
 
 export function validateAlertConfig(value) {
   if (!object(value) || Object.keys(value).length !== 3 || !['enabled', 'thresholdPercent', 'repeatMinutes'].every(key => Object.hasOwn(value, key))) throw new Error('预警设置格式不正确');
@@ -158,7 +157,7 @@ function eventLine(event, threshold) {
   }
   if (event.type === 'recover') return event.distance === null ? `🟢 ${legName(event.row)}：交易所不再提供强平价（通常是保证金已充足），解除预警`
     : `🟢 ${legName(event.row)}：距强平已回到 ${event.distance.toFixed(2)}%，解除预警`;
-  if (event.type === 'unknown') return `⚠️ ${legName(event.row)}：标记价缺失，无法计算强平距离，保留预警`;
+  if (event.type === 'unknown') return `⚠️ ${legName(event.row)}：${missingMark(event.row) ? '标记价缺失，无法计算强平距离' : '强平价缺失或无效，无法确认强平风险'}，保留预警`;
   if (event.type === 'gone') return `⚠️ ${event.label}：仓位已不在账户中（可能已平仓或被强平），请到交易所核对`;
   if (event.type === 'stale') return `⚠️ ${TRADING_NAMES[event.source]}：仓位读取已中断${event.minutes ? ` ${event.minutes} 分钟` : ''}，暂时无法监控强平距离`;
   return `🟢 ${TRADING_NAMES[event.source]}：仓位读取已恢复`;
@@ -173,7 +172,7 @@ export function alertCard(events, { title, threshold, at, test = false }) {
       { tag: 'note', elements: [{ tag: 'plain_text', content: `距强平 = 标记价到强平价的距离 ÷ 标记价；阈值 ${threshold}%。数据来自工作台最新读取，时间为北京时间。` }] }] };
 }
 
-export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtection = () => null, feishu, encrypt, decrypt, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
+export function createAnthropicWatch({ dataDir, executionPositions = null, readCex, readAddress, readProtection = () => null, feishu, encrypt, decrypt, log = console, fetcher = fetch, now = Date.now, intervalMs = 30_000, timeoutMs = 10_000 } = {}) {
   const directory = path.join(dataDir, 'anthropic-watch');
   const configPath = path.join(directory, 'config.json'), statePath = path.join(directory, 'state.json'), channelPath = path.join(directory, 'channel.json');
   // The own robot's webhook is a credential like the digest's: encrypted at rest, decrypted only to send, never returned.
@@ -201,7 +200,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
   const NO_ROBOT = '请先保存预警机器人，或在「系统 → 飞书汇总」配置机器人';
   let config = { ...ANTHROPIC_ALERT_DEFAULTS }, loadError = null, stateError = null;
   // active: leg id → { sentAt, label, unknownSentAt? }; stale: source → sentAt. Both are claimed on disk before a send.
-  let alerts = { active: {}, stale: {} }, history = [], failedAt = 0, lastError = null;
+  let alerts = { active: {}, stale: {} }, sourceBindings = {}, history = [], failedAt = 0, lastError = null;
   const emptyWallet = address => ({ address, rows: [], fetchedAt: null, lastAttemptAt: null, error: null });
   const wallets = Object.fromEntries(WALLETS.map(exchange => [exchange, emptyWallet(null)]));
   let timer = null, first = null, closed = false, polling = null, sending = null, testing = false;
@@ -212,7 +211,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
   const controller = new AbortController();
 
   function persist(next = alerts) {
-    try { atomicJson(statePath, { alerts: next, history }); stateError = null; return true; }
+    try { atomicJson(statePath, { alerts: next, history, ...(executionPositions ? { sourceBindings } : {}) }); stateError = null; return true; }
     catch (error) { stateError = '预警状态无法保存，预警暂停发送，存储恢复后继续'; log.warn({ err: error, type: 'anthropic-watch' }, stateError); return false; }
   }
 
@@ -270,6 +269,10 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
   }
 
   function sources() {
+    if (executionPositions) {
+      try { return executionPositions.state(); }
+      catch { return SOURCES.map(exchange => ({ exchange, origin: 'execution', connected: false, state: 'error', fetchedAt: null, error: '执行账户仓位暂时无法读取', refreshing: false, positions: [] })); }
+    }
     const current = now();
     let cex = [];
     try { cex = readCex(); } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 只读仓位读取失败'); }
@@ -283,6 +286,23 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
     return SOURCES.map(exchange => list.find(item => item.exchange === exchange)).filter(Boolean);
   }
 
+  const sameAlertSource = source => !executionPositions || typeof source.connectionKey === 'string' && sourceBindings[source.exchange] === source.connectionKey;
+  function resetChangedSources(list) {
+    if (!executionPositions) return;
+    let changed = false;
+    for (const source of list) {
+      if (sameAlertSource(source)) continue;
+      const active = Object.fromEntries(Object.entries(alerts.active).filter(([id]) => !id.startsWith(`${source.exchange}:`)));
+      const { [source.exchange]: _oldStale, ...stale } = alerts.stale;
+      alerts = { active, stale };
+      delete notLiveSince[source.exchange];
+      if (typeof source.connectionKey === 'string' && /^[a-f0-9]{64}$/.test(source.connectionKey)) sourceBindings[source.exchange] = source.connectionKey;
+      else delete sourceBindings[source.exchange];
+      changed = true;
+    }
+    if (changed) persist();
+  }
+
   function evaluate(list) {
     const threshold = config.thresholdPercent, repeatMs = config.repeatMinutes * 60_000, current = now();
     const events = [], next = { active: { ...alerts.active }, stale: { ...alerts.stale } };
@@ -293,13 +313,13 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
       if (source.state === 'live') delete notLiveSince[source.exchange];
       else notLiveSince[source.exchange] ??= current;
       if (source.state === 'live') {
-        if (next.stale[source.exchange] && source.positions.every(row => !missingMark(row))) {
+        if (next.stale[source.exchange] && source.positions.every(row => !unknownRisk(row))) {
           events.push({ type: 'stale-recover', source: source.exchange }); delete next.stale[source.exchange];
         }
         for (const row of source.positions) {
           const distance = liquidationDistance(row), active = next.active[row.id];
           // Missing marks are unknown risk even when the venue also omits its liquidation price.
-          if (missingMark(row)) {
+          if (unknownRisk(row)) {
             if (active && !Object.hasOwn(active, 'unknownSentAt')) {
               events.push({ type: 'unknown', row }); next.active[row.id] = { ...active, unknownSentAt: current };
             }
@@ -354,11 +374,18 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
   async function poll() {
     if (closed || polling) return polling;
     polling = (async () => {
-      await Promise.all(WALLETS.map(readWallet));
+      if (executionPositions) {
+        resetChangedSources(sources());
+        await executionPositions.refresh(controller.signal);
+      } else await Promise.all(WALLETS.map(readWallet));
+      const list = sources();
+      // A connection may change while its prior request is in flight. This is
+      // background cleanup only; GET hides old alert flags without disk writes.
+      resetChangedSources(list);
       if (closed || sending || !config.enabled || loadError) return;
       const channel = robot();
       if (!channel.configured || failedAt && now() - failedAt < FAILURE_RETRY_MS) return;
-      const { events, next, clearedUnknown } = evaluate(sources());
+      const { events, next, clearedUnknown } = evaluate(list);
       if (!events.length) {
         // Valid marks inside the hysteresis band retain the warning but rearm a future unknown notice.
         if (clearedUnknown && persist(next)) alerts = next;
@@ -377,13 +404,13 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
     let reduction = null;
     try { reduction = readProtection(); } catch { /* A broken rule must not hide the positions. */ }
     return { schema: 1, generatedAt: iso(now()), sources: list.map(source => {
-      const { accountIdentity: _privateAccountIdentity, ...publicSource } = source;
+      const { accountIdentity: _privateAccountIdentity, executionBinding: _executionBinding, connectionKey: _connectionKey, identity: _privateIdentity, ...publicSource } = source;
       return { ...publicSource, positions: source.positions.map(row => {
         const distance = liquidationDistance(row);
         let protection;
         try { protection = positionProtection({ source, position: row, alerts: alertState, reduction, now: now(), staleMs: LIVE_MS }); }
         catch { protection = null; }
-        return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), riskUnknown: missingMark(row), alerting: Object.hasOwn(alerts.active, row.id), protection };
+        return { ...row, distancePercent: distance === null ? null : distance.toFixed(2), riskUnknown: unknownRisk(row), alerting: sameAlertSource(source) && Object.hasOwn(alerts.active, row.id), protection };
       }) };
     }), alerts: alertState };
   }
@@ -400,6 +427,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
         const saved = readBounded(statePath);
         if (saved && object(saved.alerts) && object(saved.alerts.active) && object(saved.alerts.stale)) alerts = { active: saved.alerts.active, stale: saved.alerts.stale };
         if (saved && Array.isArray(saved.history)) history = saved.history.slice(0, HISTORY_LIMIT);
+        if (executionPositions && object(saved?.sourceBindings)) sourceBindings = Object.fromEntries(Object.entries(saved.sourceBindings).filter(([exchange, key]) => SOURCES.includes(exchange) && typeof key === 'string' && /^[a-f0-9]{64}$/.test(key)));
       } catch (error) { log.warn({ err: error, type: 'anthropic-watch' }, 'Anthropic 预警状态无法读取，从空状态开始'); }
       try { if (existsSync(channelPath)) ownHost = new URL(readOwn().webhookUrl).hostname; }
       catch { ownHost = null; ownError = '已保存的预警机器人无法读取，请重新填写'; log.warn({ type: 'anthropic-watch' }, ownError); }
@@ -447,7 +475,7 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
       if (testing) throw new HttpError(409, '测试消息正在发送，请稍候');
       const lines = sources().flatMap(source => source.positions.map(row => {
         const distance = liquidationDistance(row);
-        return `${legName(row)}：${missingMark(row) ? '标记价缺失，无法计算强平距离' : `距强平 ${distance === null ? '未提供强平价' : `${distance.toFixed(2)}%`}`}`;
+        return `${legName(row)}：${unknownRisk(row) ? missingMark(row) ? '标记价缺失，无法计算强平距离' : '强平价缺失或无效，无法确认强平风险' : `距强平 ${distance === null ? '未提供强平价' : `${distance.toFixed(2)}%`}`}`;
       }));
       testing = true;
       try { await post(alertCard(lines.length ? lines : ['当前没有读取到 Anthropic 仓位。'], { title: channel.title, threshold: config.thresholdPercent, at: now(), test: true })); }
@@ -457,7 +485,8 @@ export function createAnthropicWatch({ dataDir, readCex, readAddress, readProtec
     },
     async close() {
       closed = true; clearInterval(timer); clearTimeout(first); controller.abort();
-      await polling?.catch(() => {});
+      const closing = executionPositions?.close();
+      await Promise.all([polling?.catch(() => {}), closing]);
     },
   };
 }
