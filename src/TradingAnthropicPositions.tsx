@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import { BellRing, CircleAlert, KeyRound, LoaderCircle, Send } from 'lucide-react';
 import { api, ApiError } from './api';
@@ -8,6 +8,8 @@ import { amount, beijingTime, polarity } from './trading-format';
 import TradingAnthropicReduction from './TradingAnthropicReduction';
 import TradingPositionProtection from './TradingPositionProtection';
 import type { PositionProtection } from './trading-anthropic-protection-types';
+import { oldestRead, worstState } from './trading-overview';
+import type { OverviewMarket } from './trading-overview';
 
 type Source = 'binance' | 'okx' | 'hyperliquid' | 'rh-lighter';
 type ReadState = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error';
@@ -39,7 +41,7 @@ function sharesOf(position: Position, shares: AnthropicShares) {
   return Number(position.quantity) * perUnit * (position.contractSize ? Number(position.contractSize) : 1);
 }
 
-export default function TradingAnthropicPositions({ shares, onExpired }: { shares: AnthropicShares; onExpired: () => void }) {
+export default function TradingAnthropicPositions({ shares, onExpired, onOverview }: { shares: AnthropicShares; onExpired: () => void; onOverview?: (market: OverviewMarket) => void }) {
   const [data, setData] = useState<WatchState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState<{ enabled: boolean; threshold: string; repeat: string } | null>(null);
@@ -117,7 +119,7 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
     } finally { writing.current = false; generation.current++; if (mounted.current) { setBusy(null); void load(); } }
   }
 
-  const positions = data?.sources.flatMap(source => source.positions) ?? [];
+  const positions = useMemo(() => data?.sources.flatMap(source => source.positions) ?? [], [data]);
   const estimates = positions.map(position => ({ position, shares: sharesOf(position, shares) }));
   const longShares = estimates.filter(item => item.position.side === 'long').reduce((sum, item) => sum + (item.shares ?? NaN), 0);
   const shortShares = estimates.filter(item => item.position.side === 'short').reduce((sum, item) => sum + (item.shares ?? NaN), 0);
@@ -125,6 +127,26 @@ export default function TradingAnthropicPositions({ shares, onExpired }: { share
   const dirty = !!draft && !!config && (draft.enabled !== config.enabled || Number(draft.threshold) !== config.thresholdPercent || Number(draft.repeat) !== config.repeatMinutes);
   const serverNow = data ? Date.parse(data.generatedAt) + transportMs.current + Math.max(0, performance.now() - receivedAt.current) : NaN;
   const protectionUnavailable = !!error || offline || protectionPending;
+  // The 价差下单 overview reuses this panel's polled read instead of starting a second one.
+  const overview = useMemo<OverviewMarket>(() => {
+    const sources = data?.sources ?? [], connected = sources.filter(source => source.connected);
+    const finite = Number.isFinite(longShares) && Number.isFinite(shortShares);
+    return {
+      id: 'anthropic', name: 'Anthropic', venues: connected.length ? connected.map(source => NAMES[source.exchange]).join(' · ') : '未连接下单账户',
+      state: data ? worstState(sources.map(source => source.state)) : error ? 'error' : 'loading',
+      fetchedAt: oldestRead(connected.map(source => source.fetchedAt)),
+      rows: positions.map(position => ({
+        id: position.id, exchange: `${NAMES[position.exchange]}${position.account === undefined ? '' : ` · 账户 ${position.account}`}`, symbol: position.symbol,
+        side: position.side, quantity: position.quantity, unit: position.quantityUnit ?? '', notional: position.notional, unrealizedPnl: position.unrealizedPnl,
+        distancePercent: (position.riskUnknown ?? position.markPrice === null) ? null : position.distancePercent,
+        near: position.distancePercent !== null && threshold !== null && Number(position.distancePercent) <= threshold,
+      })),
+      summary: finite ? `多 ≈ ${shareText(longShares)} 股 · 空 ≈ ${shareText(shortShares)} 股 · 差 ${shareText(Math.abs(longShares - shortShares))} 股` : '股数假设无效，暂不估算多空股数',
+      error: error ?? sources.find(source => source.error)?.error ?? null,
+      empty: !data ? error ? '读取失败，稍后自动重试。' : '正在读取…' : !connected.length ? '在下方「组合交易」连接实盘账户后显示。' : sources.some(source => source.state === 'live') ? '无持仓' : '暂无可确认的仓位数据',
+    };
+  }, [data, error, positions, longShares, shortShares, threshold]);
+  useEffect(() => { onOverview?.(overview); }, [overview, onOverview]);
 
   return <section className="trading-panel trading-positions trading-anthropic-positions" aria-labelledby="trading-anthropic-title">
     <div className="trading-panel-heading"><div><h2 id="trading-anthropic-title">Anthropic 套利仓位</h2><p>四所统一使用「价差下单」的执行账户读取仓位 · Lighter RH 仅读取所连接子账户 · 每 30 秒只读刷新，强平距离按标记价计算</p></div></div>

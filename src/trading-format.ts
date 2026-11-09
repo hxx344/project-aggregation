@@ -18,3 +18,14 @@ export function amount(value: string | null, signed = false) {
 }
 
 export const polarity = (value: string | null) => value === null || !/[1-9]/.test(value) ? '' : value.startsWith('-') ? 'trading-negative' : 'trading-positive';
+
+/** Decimal string rounded half-up to `digits` places for compact views; the exact value stays in the detailed tables. */
+export function roundedAmount(value: string | null, signed = false, digits = 2) {
+  if (value === null || !/^-?\d+(?:\.\d+)?$/.test(value)) return '—';
+  const negative = value.startsWith('-');
+  const [integer, fraction = ''] = value.replace(/^-/, '').split('.');
+  const scaled = BigInt(integer + fraction.padEnd(digits, '0').slice(0, digits)) + (Number(fraction[digits] ?? '0') >= 5 ? 1n : 0n);
+  const text = scaled.toString().padStart(digits + 1, '0');
+  const rounded = digits ? `${text.slice(0, -digits)}.${text.slice(-digits)}` : text;
+  return amount(negative ? `-${rounded}` : rounded, signed);
+}
