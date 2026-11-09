@@ -43,6 +43,9 @@ MAX_HISTORY_COMPARES = 4
 # for one refactor on 2026-10-24); page 2 keeps status and stays a few KB.
 COMPARE_STATUS_QUERY = 'per_page=1&page=2'
 DEPLOY_TAG = re.compile(r'deploy-([a-f0-9]{40})')
+# The REST API serves the same release files and redirects to the same storage
+# as github.com/.../releases/download, but through a separate front end.
+RELEASE_ASSET_PATH = re.compile(r'/repos/hxx344/[A-Za-z0-9._-]+/releases/assets/[1-9][0-9]*')
 # Release dates are shown to users in China; the server clock zone is irrelevant.
 DISPLAY_ZONE = timezone(timedelta(hours=8))
 RELEASE_CACHE_TTL = 30 * 60
@@ -148,10 +151,16 @@ class Network:
 
     def _request(self, url, maximum=MAX_JSON, method='GET', final_url=False):
         allowed_url(url)
-        api = urllib.parse.urlsplit(url).hostname == 'api.github.com'
+        parsed = urllib.parse.urlsplit(url)
+        api = parsed.hostname == 'api.github.com'
+        if api:
+            # The asset endpoint returns JSON metadata unless file bytes are requested.
+            accept = 'application/octet-stream' if RELEASE_ASSET_PATH.fullmatch(parsed.path) else 'application/vnd.github+json'
+        else:
+            accept = '*/*'
         request = urllib.request.Request(url, method=method, headers={
             'User-Agent': 'project-aggregation-stable-updater/1',
-            'Accept': 'application/vnd.github+json' if api else '*/*',
+            'Accept': accept,
             'Cache-Control': 'no-cache'})
         authenticated = False
         if api:
@@ -172,7 +181,7 @@ class Network:
                     raise
             except (OSError, TimeoutError, urllib.error.URLError):
                 if attempt == CONNECTION_ATTEMPTS:
-                    raise ReleaseError(f'无法连接{endpoint_name(url)}，请检查服务器网络', transient=True) from None
+                    raise ReleaseError(f'无法连接{endpoint_name(url)}，请检查服务器网络', transient=True, retryable=True) from None
             time.sleep(CONNECTION_RETRY_DELAY)
 
     def _open(self, request, maximum, method, final_url, authenticated):
@@ -212,6 +221,35 @@ class Network:
                                retryable=(error.code in (502, 503, 504) and deadline is None and
                                           headers.get('Retry-After') is None and
                                           headers.get('X-RateLimit-Remaining') != '0')) from None
+
+
+def once(function):
+    """Call function at most once; later callers get the same result or exception."""
+    lock, outcome = threading.Lock(), []
+
+    def call():
+        with lock:
+            if not outcome:
+                try:
+                    outcome.append((True, function()))
+                except Exception as error:
+                    outcome.append((False, error))
+            succeeded, value = outcome[0]
+        if succeeded:
+            return value
+        raise value
+    return call
+
+
+def release_asset(release, tag, name):
+    """Return the asset ID only when the metadata is this tag's and names the file once."""
+    if not isinstance(release, dict) or release.get('tag_name') != tag or not isinstance(release.get('assets'), list):
+        return None
+    matches = [asset for asset in release['assets'] if isinstance(asset, dict) and asset.get('name') == name]
+    if len(matches) != 1:
+        return None
+    asset = matches[0].get('id')
+    return asset if type(asset) is int and asset > 0 else None
 
 
 def decode_json(data):
@@ -334,6 +372,36 @@ class Releases:
     def download(module, tag, filename):
         return f'https://github.com/hxx344/{module.repository}/releases/download/{tag}/{filename}'
 
+    def fetch(self, module, tag, name, release, maximum=MAX_JSON, method='GET'):
+        """Read a release file, using the API asset endpoint once when the download front end fails.
+
+        `release` is the tag's metadata, or a callable returning it, read only on fallback.
+        """
+        try:
+            return self.network.request(self.download(module, tag, name), maximum, method)
+        except ReleaseError as error:
+            # Server wait instructions and permanent errors never consult another endpoint.
+            if not error.retryable:
+                raise
+            primary = error
+        try:
+            asset = release_asset(release() if callable(release) else release, tag, name)
+        except ReleaseError as error:
+            # An exhausted API quota must pause every check (L013), not read as the 504.
+            if error.retry_at is not None:
+                raise
+            raise primary from None
+        except Exception:
+            raise primary from None
+        if asset is None:
+            raise primary
+        try:
+            return self.network.request(self.api(module, f'releases/assets/{asset}'), maximum, method)
+        except ReleaseError as error:
+            if error.retry_at is not None:
+                raise
+            raise primary from None
+
     def latest_tag(self, module):
         base = f'https://github.com/hxx344/{module.repository}/releases/'
         target = self.network.redirect(base + 'latest')
@@ -367,13 +435,12 @@ class Releases:
         # manifest, eligibility or installer cache in this execution boundary.
         if release_id is not None or not self.cacheable:
             release = self.metadata(module, release_id)
-            manifest_bytes = self.network.request(self.download(module, release['tag_name'], 'release-manifest.json'))
+            manifest_bytes = self.fetch(module, release['tag_name'], 'release-manifest.json', release)
             return self._verified(module, release, manifest_bytes, fresh=True)
 
         key = (module.repository, self.arch)
         try:
             tag = self.latest_tag(module)
-            manifest_url = self.download(module, tag, 'release-manifest.json')
             cached = self._cached(self._releases, key)
             reusable = None
             if cached is not None:
@@ -384,21 +451,23 @@ class Releases:
                 # Probe the cached artifact while the manifest downloads; the
                 # probe only counts when the manifest bytes are unchanged.
                 item = reusable['manifest']['artifacts'][self.arch]
-                artifact = RELEASE_PROBES.submit(self.network.request, self.download(module, tag, item['file']), method='HEAD')
+                # Both fallbacks and a changed manifest share one metadata read per check.
+                tagged = once(lambda: self.metadata(module, tag=tag))
+                artifact = RELEASE_PROBES.submit(self.fetch, module, tag, item['file'], tagged, method='HEAD')
                 try:
-                    manifest_bytes = self.network.request(manifest_url)
+                    manifest_bytes = self.fetch(module, tag, 'release-manifest.json', tagged)
                 finally:
                     futures.wait([artifact])
                 if reusable['manifestHash'] == digest(manifest_bytes):
                     artifact.result()
                     return copy.deepcopy(reusable)
-                release = self.metadata(module, tag=tag)
+                release = tagged()
             else:
                 # Metadata does not depend on the manifest; manifest errors keep
                 # their original precedence because they are raised first.
                 metadata = RELEASE_PROBES.submit(self.metadata, module, tag=tag)
                 try:
-                    manifest_bytes = self.network.request(manifest_url)
+                    manifest_bytes = self.fetch(module, tag, 'release-manifest.json', metadata.result)
                 finally:
                     futures.wait([metadata])
                 release = metadata.result()
@@ -444,15 +513,14 @@ class Releases:
                 raise ValueError()
         except (ValueError, TypeError, KeyError, AttributeError):
             raise ReleaseError('正式版本缺少匹配本机的完整部署包') from None
-        artifact_url = self.download(module, tag, item['file'])
         if self.cacheable:
-            available = ARTIFACT_CHECKS.submit(self.network.request, artifact_url, method='HEAD')
+            available = ARTIFACT_CHECKS.submit(self.fetch, module, tag, item['file'], release, method='HEAD')
             try:
                 installer = self.installer(module, manifest['commit'], fresh=fresh)
             finally:
                 available.result()
         else:
-            self.network.request(artifact_url, method='HEAD')
+            self.fetch(module, tag, item['file'], release, method='HEAD')
             installer = self.installer(module, manifest['commit'], fresh=True)
         return {'releaseId': release['id'], 'commit': manifest['commit'], 'tag': tag,
                 'version': manifest['commit'][:12], 'publishedAt': release['published_at'],

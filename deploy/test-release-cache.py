@@ -1,5 +1,6 @@
 """Deterministic public-release discovery, cache and worker freshness tests."""
 from collections import Counter
+import copy
 from dataclasses import replace
 from email.message import Message
 from email.utils import formatdate
@@ -37,6 +38,8 @@ class FakeNetwork:
         self.calls = []
         self.values = {}
         self.failures = set()
+        # Download front-end outages: retryable 504s, as GitHub returned them on 2026-11-09.
+        self.unavailable = set()
         self.comparison = {'status': 'ahead'}
         for number, module in enumerate(modules, 1):
             self.values[module.repository] = {'module': module, 'latest': NEW, 'target': None, 'releases': {}}
@@ -50,9 +53,11 @@ class FakeNetwork:
                     'commit': commit, 'tag': 'deploy-' + commit, 'artifacts': artifacts}
         metadata = {'id': release_id, 'draft': False, 'prerelease': False,
                     'published_at': '2026-10-09T12:00:00Z', 'tag_name': 'deploy-' + commit,
-                    'assets': [{'name': 'release-manifest.json', 'state': 'uploaded', 'size': len(encoded(manifest))}] +
-                    [{'name': item['file'], 'state': 'uploaded', 'size': 12345, 'digest': 'sha256:' + item['sha256']}
-                     for item in artifacts.values()]}
+                    'assets': [{'id': release_id * 100, 'name': 'release-manifest.json', 'state': 'uploaded',
+                                'size': len(encoded(manifest))}] +
+                    [{'id': release_id * 100 + number, 'name': item['file'], 'state': 'uploaded', 'size': 12345,
+                      'digest': 'sha256:' + item['sha256']}
+                     for number, item in enumerate(artifacts.values(), 1)]}
         value = {'manifest': manifest, 'metadata': metadata, 'installer': INSTALLER}
         self.values[module.repository]['releases'][commit] = value
         return value
@@ -61,6 +66,8 @@ class FakeNetwork:
         self.calls.append((url, method))
         if (url, method) in self.failures:
             raise releases.ReleaseError('fixture network unavailable')
+        if (url, method) in self.unavailable:
+            raise releases.ReleaseError('GitHub 发布服务暂时不可用（HTTP 504）', transient=True, retryable=True)
 
     def redirect(self, url):
         self.record(url, 'HEAD')
@@ -95,6 +102,12 @@ class FakeNetwork:
             for commit, value in entry['releases'].items():
                 if url == base + 'releases/' + str(value['metadata']['id']):
                     return encoded(value['metadata'])
+                for asset in value['metadata']['assets']:
+                    if url == base + 'releases/assets/' + str(asset.get('id')):
+                        if asset['name'] == 'release-manifest.json':
+                            return encoded(value['manifest'])
+                        if method == 'HEAD':
+                            return b''
                 download = f'https://github.com/hxx344/{repository}/releases/download/deploy-{commit}/'
                 if url == download + 'release-manifest.json':
                     return encoded(value['manifest'])
@@ -109,6 +122,8 @@ class FakeNetwork:
         for url, method in self.calls:
             if '/compare/' in url:
                 result['compare'] += 1
+            elif '/releases/assets/' in url:
+                result['asset'] += 1
             elif url.startswith('https://api.github.com/'):
                 result['metadata'] += 1
             elif url.startswith('https://raw.githubusercontent.com/'):
@@ -575,6 +590,160 @@ class ReleaseCacheTests(unittest.TestCase):
         # The speculative probe of the old manifest cannot replace the new full validation.
         self.assertEqual(self.reader.read(self.module)['manifest']['node_version'], '24.15.0')
 
+    def asset_calls(self):
+        return [(url, method) for url, method in self.network.calls if '/releases/assets/' in url]
+
+    def front_end_down(self, commit=NEW):
+        """Fail the github.com download of the manifest and artifact; return their API asset requests."""
+        value = self.entry['releases'][commit]
+        tag, filename = 'deploy-' + commit, value['manifest']['artifacts']['linux-x64']['file']
+        self.network.unavailable.update({(self.reader.download(self.module, tag, 'release-manifest.json'), 'GET'),
+                                         (self.reader.download(self.module, tag, filename), 'HEAD')})
+        ids = {asset['name']: asset['id'] for asset in value['metadata']['assets']}
+        return [(self.reader.api(self.module, f'releases/assets/{ids["release-manifest.json"]}'), 'GET'),
+                (self.reader.api(self.module, f'releases/assets/{ids[filename]}'), 'HEAD')]
+
+    def test_download_front_end_outage_reads_the_same_files_through_the_api(self):
+        fallback = self.front_end_down()
+        result = self.reader.read(self.module)
+        self.assertEqual(result['commit'], NEW)
+        self.assertEqual(sorted(self.asset_calls()), sorted(fallback))
+        self.network.unavailable.clear()
+        self.assertEqual(self.reader.read(self.module), result)
+        # A cached release reads its tag metadata once, shared by both fallbacks, to locate the asset IDs.
+        self.front_end_down()
+        self.network.calls.clear()
+        self.assertEqual(self.reader.read(self.module), result)
+        self.assertEqual(sorted(self.asset_calls()), sorted(fallback))
+        self.assertEqual(self.network.counts(), {'discovery': 1, 'manifest': 1, 'artifact': 1, 'metadata': 1, 'asset': 2})
+        # A changed manifest reuses that read for its eligibility check.
+        self.value['manifest']['node_version'] = '24.15.0'
+        self.network.calls.clear()
+        self.assertEqual(self.reader.read(self.module)['manifest']['node_version'], '24.15.0')
+        self.assertEqual(self.network.counts()['metadata'], 1)
+        self.value['manifest'].pop('node_version')
+        self.network.unavailable.clear()
+        result = self.reader.read(self.module)
+        # The worker's fresh read of the approved release falls back the same way.
+        self.front_end_down()
+        self.network.calls.clear()
+        self.assertEqual(self.reader.read(self.module, self.value['metadata']['id']), result)
+        self.assertEqual(sorted(self.asset_calls()), sorted(fallback))
+        self.assertEqual(self.network.counts(), {'metadata': 1, 'manifest': 1, 'artifact': 1, 'asset': 2, 'installer': 1})
+
+    def test_permanent_errors_and_server_deadlines_never_consult_the_api_files(self):
+        manifest = self.reader.download(self.module, 'deploy-' + NEW, 'release-manifest.json')
+        original = self.network.request
+        for error in (releases.ReleaseError('GitHub 发布服务未找到正式版本或发布文件（HTTP 404）'),
+                      releases.ReleaseError('GitHub 发布服务请求频率受限（HTTP 429）', retry_at=1800000600, transient=True),
+                      releases.ReleaseError('GitHub 发布服务暂时不可用（HTTP 503）', retry_at=1800000120, transient=True)):
+            with self.subTest(error=str(error)):
+                def failing(url, *args, **kwargs):
+                    if url == manifest:
+                        raise error
+                    return original(url, *args, **kwargs)
+                with patch.object(self.network, 'request', side_effect=failing):
+                    with self.assertRaises(releases.ReleaseError) as caught:
+                        self.reader.read(self.module)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(self.asset_calls(), [])
+
+    def test_api_fallback_requires_one_matching_asset_of_the_same_tag(self):
+        self.front_end_down()
+        original = copy.deepcopy(self.value['metadata'])
+        changes = {'zero id': lambda assets, _: assets[0].update(id=0),
+                   'string id': lambda assets, _: assets[0].update(id='100'),
+                   'boolean id': lambda assets, _: assets[0].update(id=True),
+                   'missing id': lambda assets, _: assets[0].pop('id'),
+                   'duplicate name': lambda assets, _: assets.append(dict(assets[0], id=999)),
+                   'missing asset': lambda assets, _: assets.pop(0),
+                   'other tag': lambda _, metadata: metadata.update(tag_name='deploy-' + NEXT),
+                   'assets not a list': lambda _, metadata: metadata.update(assets={'release-manifest.json': {'id': 100}})}
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                self.value['metadata'] = copy.deepcopy(original)
+                change(self.value['metadata']['assets'], self.value['metadata'])
+                self.network.calls.clear()
+                with self.assertRaisesRegex(releases.ReleaseError, 'HTTP 504') as caught:
+                    self.reader.read(self.module)
+                self.assertTrue(caught.exception.transient)
+                self.assertEqual(self.asset_calls(), [])
+
+    def test_failed_api_fallback_reports_the_download_outage_unless_the_api_sets_a_deadline(self):
+        fallback = self.front_end_down()
+        self.network.failures.add(fallback[0])
+        with self.assertRaisesRegex(releases.ReleaseError, 'HTTP 504') as caught:
+            self.reader.read(self.module)
+        self.assertTrue(caught.exception.transient)
+        self.assertIsNone(caught.exception.retry_at)
+        self.network.failures.clear()
+        limited = releases.ReleaseError('GitHub API认证请求额度已用尽（HTTP 403）', retry_at=1800000600, transient=True)
+        original = self.network.request
+        def limited_api(url, *args, **kwargs):
+            if url == fallback[0][0]:
+                raise limited
+            return original(url, *args, **kwargs)
+        with patch.object(self.network, 'request', side_effect=limited_api):
+            with self.assertRaises(releases.ReleaseError) as caught:
+                self.reader.read(self.module)
+        self.assertIs(caught.exception, limited)
+
+    def test_metadata_failure_during_fallback_keeps_the_download_error(self):
+        self.front_end_down()
+        for failure in (releases.ReleaseError('metadata failed', transient=True), ValueError('unexpected')):
+            with self.subTest(failure=type(failure).__name__), patch.object(self.reader, 'metadata', side_effect=failure):
+                with self.assertRaisesRegex(releases.ReleaseError, 'HTTP 504'):
+                    self.reader.read(self.module)
+        self.assertEqual(self.asset_calls(), [])
+
+    def test_metadata_quota_deadline_during_fallback_is_reported_on_every_path(self):
+        self.front_end_down()
+        limited = releases.ReleaseError('GitHub API匿名请求额度已用尽（HTTP 403）', retry_at=1800000600, transient=True)
+        with patch.object(self.reader, 'metadata', side_effect=limited):
+            with self.assertRaises(releases.ReleaseError) as caught:
+                self.reader.read(self.module)
+        self.assertIs(caught.exception, limited)
+        self.network.unavailable.clear()
+        self.reader.read(self.module)
+        self.front_end_down()
+        with patch.object(self.reader, 'metadata', side_effect=limited) as metadata:
+            with self.assertRaises(releases.ReleaseError) as caught:
+                self.reader.read(self.module)
+        self.assertIs(caught.exception, limited)
+        self.assertEqual(metadata.call_count, 1)
+        self.assertEqual(self.asset_calls(), [])
+
+    def test_real_transport_reads_files_through_the_api_while_downloads_return_504(self):
+        download = f'https://github.com/hxx344/{self.module.repository}/releases/download/'
+        seen = []
+
+        def open_fixture(request, timeout):
+            url, method = request.full_url, request.get_method()
+            seen.append((url, method, request.get_header('Accept')))
+            if url.startswith(download):
+                raise urllib.error.HTTPError(url, 504, 'fixture gateway timeout', Message(), io.BytesIO())
+            response = unittest.mock.MagicMock()
+            response.__enter__.return_value = response
+            response.headers = {}
+            if url.endswith('/releases/latest'):
+                response.url = self.network.redirect(url)
+            else:
+                response.url = url
+                response.read.return_value = self.network.request(url, method=method)
+            return response
+
+        network = releases.Network()
+        network.opener = unittest.mock.Mock()
+        network.opener.open.side_effect = open_fixture
+        reader = releases.Releases(network, arch='linux-x64', clock=lambda: self.clock)
+        with patch.object(releases.time, 'sleep') as sleep:
+            self.assertEqual(reader.read(self.module)['commit'], NEW)
+        # Each download keeps its one immediate retry before the API serves the same file.
+        self.assertEqual(sorted(method for url, method, _ in seen if url.startswith(download)), ['GET', 'GET', 'HEAD', 'HEAD'])
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(sorted((method, accept) for url, method, accept in seen if '/releases/assets/' in url),
+                         [('GET', 'application/octet-stream'), ('HEAD', 'application/octet-stream')])
+
 
 class TransportTests(unittest.TestCase):
     def http_error(self, code, headers=None, url='https://api.github.com/repos/hxx344/project-aggregation/releases/latest', token=''):
@@ -620,6 +789,27 @@ class TransportTests(unittest.TestCase):
             with self.assertRaises(releases.ReleaseError):
                 network.request(url)
         self.assertEqual(provider.call_count, 3)
+
+    def test_api_asset_requests_ask_for_file_bytes_and_keep_api_credentials(self):
+        network = releases.Network(token_provider=lambda: GITHUB_TOKEN)
+        network.opener = unittest.mock.Mock()
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = {}
+        response.read.return_value = b'{}'
+        network.opener.open.return_value = response
+        api = 'https://api.github.com/repos/hxx344/project-aggregation/'
+        for url, accept in ((api + 'releases/assets/726380430', 'application/octet-stream'),
+                            (api + 'releases/assets/0', 'application/vnd.github+json'),
+                            (api + 'releases/assets/12/extra', 'application/vnd.github+json'),
+                            (api + 'releases/tags/deploy-' + NEW, 'application/vnd.github+json'),
+                            ('https://api.github.com/repos/other/project/releases/assets/1', 'application/vnd.github+json')):
+            with self.subTest(url=url):
+                response.url = url
+                network.request(url)
+                request = network.opener.open.call_args.args[0]
+                self.assertEqual(request.get_header('Accept'), accept)
+                self.assertEqual(request.get_header('Authorization'), 'Bearer ' + GITHUB_TOKEN)
 
     def test_environment_tokens_are_ignored_and_provider_errors_fail_closed(self):
         with patch.dict(os.environ, {'GITHUB_TOKEN': GITHUB_TOKEN, 'GH_TOKEN': GITHUB_TOKEN}):
@@ -714,6 +904,8 @@ class TransportTests(unittest.TestCase):
         self.assertIn('安装器源码服务', str(caught.exception))
         self.assertNotIn('private', str(caught.exception))
         self.assertTrue(caught.exception.transient)
+        # Another endpoint may serve the same release file at once; no server wait was given.
+        self.assertTrue(caught.exception.retryable)
         self.assertEqual(network.opener.open.call_count, releases.CONNECTION_ATTEMPTS)
         sleep.assert_called_once_with(releases.CONNECTION_RETRY_DELAY)
 

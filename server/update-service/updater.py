@@ -51,10 +51,15 @@ CHECK_MIN_INTERVAL = 10
 # faster than before.
 CHECK_FAILURE_MIN_INTERVAL = 60
 # Successful steady-state checks are mostly github.com requests; API use is
-# bounded by the release cache TTL, not by this interval.
+# bounded by the release cache TTL, not by this interval. While the github.com
+# download front end fails, each check also reads up to three API requests
+# (tag metadata and two release assets); an exhausted quota then sets the
+# server deadline that pauses all checks.
 AUTO_CHECK_INTERVAL = 60
 CHECK_RETRY_MAX_INTERVAL = 15 * 60
-# Longest sequential chain is about four probes of two 15s attempts each.
+# Longest sequential chain is about four probes of two 15s attempts each. An API
+# fallback after a download front-end failure adds one request to the manifest
+# and artifact probes; only when both endpoints are slow can it exceed this.
 CHECK_DEADLINE = 3 * 60
 # Release history is display-only and must not push a check past its deadline;
 # a slower read still fills the cache for the next check.

@@ -217,6 +217,8 @@
 
 **短暂 HTTP 故障补充（2026-11-05）：** 用户在正式版 `a78e57777f655bcb4de043d12a5feb55854626d9` 的系统更新中遇到“GitHub 发布服务暂时不可用（HTTP 504）”及约 4 分钟后重试。实际传输层夹具按 504→成功返回，旧实现只请求一次即失败，确认此前“任何 HTTP 状态都不重试”的策略会错失短暂故障恢复；未取得用户服务器日志，不能断言 504 来自 GitHub 内部还是网络链路。只读 GET/HEAD 的 502/503/504 现与连接异常共用最多两次尝试、一次 1 秒等待；`Retry-After` 指令存在（含畸形值）、额度为零或有效服务器期限时不即时重试，401/403/404/429 等也不重试。`retryable` 与仅控制缓存保留的 `transient` 分开，耗尽后仍返回最后错误；缓存、正式身份校验、调度退避及执行前重新核验保持原语义。[发布读取检查](deploy/test-release-cache.py) 覆盖 GET/HEAD/跳转、混合故障预算、远端等待和实际读取链的持续 504 不返回旧成功。事件 `updater-http-504-no-immediate-retry-20261105`；关联本条，不推进复盘检查点。
 
+**下载入口故障补充（2026-11-09）：** 用户正式版 `50cdcbcc4301` 的系统更新连续 10 次显示“GitHub 发布服务暂时不可用（HTTP 504）”，手动检查同样失败。服务器端逐项重放确认：只有 `github.com/hxx344/project-aggregation/releases/download/<tag>/release-manifest.json` 持续返回 504（响应带 `X-GitHub-Request-Id`，无 `Server`/`Via` 代理头），同一时刻 `releases/latest` 跳转、带 Token 的 API 与 `raw.githubusercontent.com` 均为 200；同一时刻 `api.github.com/repos/hxx344/project-aggregation/releases/assets/<id>`（`Accept: application/octet-stream`）5/5 返回 200。服务运行四天、代码与磁盘一致，新进程按服务方式重放同样失败，排除进程状态与代理。根因是发布文件只有 github.com 下载前端一个入口，单个前端故障会阻断检查与更新。以后做法：更新服务读取发布清单与部署包 HEAD（检查、缓存命中与执行前复核）时，github.com 入口返回可立即重试的失败（502/503/504 或连接失败，且无 `Retry-After`、额度为零或服务器期限）并耗尽原有重试后，按同一 tag 元数据中唯一同名、正整数 ID 的资产改走 API 文件接口一次，404/403/429 与服务器期限不回退；API 也失败时报告原下载错误，只有元数据或 API 给出等待期限时改报该期限，缓存命中路径的元数据只读一次以免放大匿名额度。安装器沿用自身下载器的可重试判定（408、429、全部 5xx 与连接中断），耗尽后按已发布、非预发布 tag 中唯一已上传资产改走 API 下载一次；API 每个分块都计一次匿名额度，所以只作回退，切换地址后已下载分块不续传，内容仍按官方清单校验 SHA256。[发布读取检查](deploy/test-release-cache.py) 覆盖冷读、缓存命中、执行前复核、真实传输 504、资产不匹配、元数据失败与 API 限流；[镜像与下载检查](deploy/test-release-mirror.py) 覆盖安装器下载回退。事件 `release-download-front-end-504-20261109`；关联本条，不推进复盘检查点。
+
 ### L014：在脱敏边界内保留上游错误的可诊断性
 
 **适用条件：** 交易所接口返回 HTTP 状态和结构化错误码，错误需要展示给用户。
