@@ -131,13 +131,23 @@ workspace_reuse_check() {
 isolated_package_check() {
   # Real restored workers may read stale notification configuration. A separate
   # network namespace allows their loopback/private IPC, with no outside route.
-  unshare --net -- bash -c 'ip link set dev lo up; exec runuser -u "$1" -- env GREEKS_PYTHON="$2" ASTER_PYTHON="$3" "$4" "$5" "$6"' \
-    recovery-drill "$SERVICE_USER" "$test_root/python/bin/python" "$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$1"
+  unshare --net -- bash -c 'ip link set dev lo up; exec runuser -u "$1" -- env GREEKS_PYTHON="$2" ASTER_PYTHON="$3" PACKAGE_TEST_EVIDENCE="$7" PACKAGE_TEST_SHA256="$8" DEPLOYMENT_TEST_COMMIT="$9" GITHUB_RUN_ID="${10}" GITHUB_RUN_ATTEMPT="${11}" GITHUB_JOB="${12}" "$4" "$5" "$6"' \
+    recovery-drill "$SERVICE_USER" "$test_root/python/bin/python" "$test_root/python-aster/bin/python" "$NODE_BIN" "$repository/deploy/test-package.mjs" "$1" "${2:-}" "${3:-}" "$commit" "${GITHUB_RUN_ID:-}" "${GITHUB_RUN_ATTEMPT:-}" "${GITHUB_JOB:-}"
 }
 workspace_archive_check() {
+  local archive package_sha evidence
+  local -a archives=("$repository/output/release/"*-linux-*.tar.gz)
+  ((${#archives[@]} == 1)) && [[ -f ${archives[0]} ]]
+  archive=${archives[0]}
+  package_sha=$(sha256sum "$archive" | cut -d ' ' -f 1)
+  evidence=${INSTALL_TEST_EVIDENCE_DIR:-$test_root/deployment-evidence}
+  [[ "$evidence" == /* && ! -L "$evidence" ]]
+  install -d -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$evidence"
   mkdir "$test_root/package"
-  tar -xzf "$repository/output/release/"*-linux-*.tar.gz -C "$test_root/package"
-  isolated_package_check "$test_root/package"
+  tar -xzf "$archive" -C "$test_root/package"
+  unshare --net -- bash -c 'ip link set dev lo up; exec runuser -u "$1" -- env ENTRY_TEST_RELEASE="$2" ENTRY_TEST_EVIDENCE="$3" PACKAGE_TEST_SHA256="$4" DEPLOYMENT_TEST_COMMIT="$5" GITHUB_RUN_ID="$6" GITHUB_RUN_ATTEMPT="$7" GITHUB_JOB="$8" "$9" --test --test-name-pattern="generated systemd units" "${10}"' \
+    generated-entry "$SERVICE_USER" "$test_root/package" "$evidence/generated-entries.json" "$package_sha" "$commit" "${GITHUB_RUN_ID:-}" "${GITHUB_RUN_ATTEMPT:-}" "${GITHUB_JOB:-}" "$NODE_BIN" "$repository/tests/entry-symlink.test.mjs"
+  isolated_package_check "$test_root/package" "$evidence/package-runtime.json" "$package_sha"
 }
 assert_shared_dependencies_unchanged() {
   local importer

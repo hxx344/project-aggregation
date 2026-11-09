@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -213,6 +213,9 @@ try {
 
     const { owner: holder, expires } = lease() ?? {};
     assert.ok(holder, 'the runtime holds the native execution lease');
+    let collectionBefore;
+    assert.ok(await until(async () => (collectionBefore = await checkedAt()) > 0, 60_000), 'a collection attempt is recorded before the API restart');
+    const runtimeInstance = JSON.parse(readFileSync(path.join(dataDir, 'run', 'runtime.json'), 'utf8')).instanceId;
     const killedAt = Date.now();
     process.kill(api, 'SIGKILL');
     assert.ok(await until(async () => children().some(pid => pid !== runtime && pid !== api) && (await request('/api/health')).status === 200, 60_000), 'the launcher restarted the API');
@@ -220,7 +223,8 @@ try {
     assert.equal(runtimePid(), runtime); assert.ok(alive(runtime), 'the runtime kept running');
     assert.deepEqual(await moduleRows(), rows, 'no module restarted with the API');
     // Each project is read at least every 30 s (data-plane refresh).
-    assert.ok(await until(async () => await checkedAt() > killedAt, 60_000), 'collection went on across the API restart');
+    let collectionAfter;
+    assert.ok(await until(async () => (collectionAfter = await checkedAt()) > killedAt, 60_000), 'collection went on across the API restart');
     assert.ok(await until(async () => lease()?.owner === holder && lease().expires > expires, 30_000), 'the lease holder renewed the native execution lease');
     assert.equal((await request('/api/projects')).status, 200, 'the session survived the API restart');
     // Portal grants are kept in hub.sqlite (M4-2): open pages go on across the API
@@ -230,6 +234,22 @@ try {
       assert.equal(page.status, 200, `${project}: a grant of the previous API`); assert.match(page.text, /<html/i);
     }
     assert.deepEqual(await moduleRows(), rows, 'the pages restarted no module');
+    if (process.env.PACKAGE_TEST_EVIDENCE) {
+      const commit = readFileSync(path.join(root, '.release-commit'), 'utf8').trim();
+      assert.equal(commit, process.env.DEPLOYMENT_TEST_COMMIT);
+      assert.match(process.env.PACKAGE_TEST_SHA256 || '', /^[a-f0-9]{64}$/);
+      assert.ok(collectionBefore > 0 && collectionAfter > collectionBefore);
+      const afterInstance = JSON.parse(readFileSync(path.join(dataDir, 'run', 'runtime.json'), 'utf8')).instanceId;
+      assert.equal(afterInstance, runtimeInstance);
+      const report = { schema: 1, layer: 'packaged-launcher-with-five-real-modules', commit, packageSha256: process.env.PACKAGE_TEST_SHA256,
+        runId: process.env.GITHUB_RUN_ID || null, runAttempt: process.env.GITHUB_RUN_ATTEMPT || null, job: process.env.GITHUB_JOB || null,
+        runtime: { beforePid: runtime, afterPid: runtimePid(), beforeInstance: runtimeInstance, afterInstance },
+        api: { beforePid: api, afterPid: children().find(pid => pid !== runtime) },
+        collection: { before: collectionBefore, interruptedAt: killedAt, after: collectionAfter },
+        modules: rows, executionLeaseRetained: true,
+        limitation: 'API-only crash/restart and periodic read attempts advance in an isolated network; not successful collection by every module, a real exchange feed or a systemd upgrade.' };
+      writeFileSync(process.env.PACKAGE_TEST_EVIDENCE, JSON.stringify(report, null, 2) + '\n', { flag: 'wx' });
+    }
     assert.equal((await request('/api/logout', { method: 'POST' })).status, 200);
     for (const { project, settings } of portal) assert.equal((await request('/', settings)).status, 401, `${project} after logout`);
 

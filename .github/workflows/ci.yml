@@ -90,7 +90,7 @@ jobs:
           module_cache="$RUNNER_TEMP/module-cache"
           mkdir -p "$module_cache"
           pip_cache="$(python -m pip cache dir)"
-          sudo env WORKSPACE_DISPOSABLE_CI=1 GITHUB_ACTIONS=true INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" INSTALL_TEST_MODULE_CACHE="$module_cache" INSTALL_TEST_MODULE_CACHE_EXPORT="${{ matrix.lane == 'package' && '1' || '0' }}" bash deploy/test-workspace.sh
+          sudo env WORKSPACE_DISPOSABLE_CI=1 GITHUB_ACTIONS=true GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" GITHUB_JOB="app-${{ matrix.lane }}" INSTALL_TEST_EVIDENCE_DIR="$RUNNER_TEMP/deployment-evidence" INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" INSTALL_TEST_MODULE_CACHE="$module_cache" INSTALL_TEST_MODULE_CACHE_EXPORT="${{ matrix.lane == 'package' && '1' || '0' }}" bash deploy/test-workspace.sh
           if [[ -f "$module_cache.updated" ]]; then echo "module-cache-updated=1" >> "$GITHUB_OUTPUT"; fi
       - name: Save rebuilt module builds for later runs
         if: steps.workspace.outputs.module-cache-updated == '1'
@@ -107,6 +107,13 @@ jobs:
           if-no-files-found: error
           # The runtime tarball is already gzip-compressed.
           compression-level: 0
+      - name: Keep the packaged entry and API-only continuity evidence
+        if: matrix.lane == 'package'
+        uses: actions/upload-artifact@v7
+        with:
+          name: deployment-evidence-x64
+          path: ${{ runner.temp }}/deployment-evidence/*.json
+          if-no-files-found: error
 
   build-tooling:
     name: Module selection and incremental type checks
