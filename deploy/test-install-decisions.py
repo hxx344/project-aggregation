@@ -121,6 +121,9 @@ class Records(unittest.TestCase):
         self.assertEqual(decide(release=target, old=''), ['ignore'])
         self.record('.pending-previous', f'\t{target}  -   api \nignored second line')
         self.assertEqual(decide(), ['resume', '-', 'api'])
+        # read drops NUL bytes.
+        self.record('.pending-previous', f'{target} -\0 full\n')
+        self.assertEqual(decide(), ['resume', '-', 'full'])
 
     def test_pending_previous_refuses_invalid_records(self):
         target, previous = self.release(A), self.release(B)

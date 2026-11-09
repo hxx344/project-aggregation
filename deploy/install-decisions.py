@@ -82,17 +82,17 @@ def cutover_resolution(cutover, recorded):
 def read_fields(path):
     """The fields `read -r` assigns from the first line of a file, or None where it fails.
 
-    read fails on a file that cannot be opened or that ends before a newline.
-    Its fields are separated by runs of spaces and tabs.
+    read fails on a file that cannot be opened or that ends before a newline,
+    drops NUL bytes, and separates fields by runs of spaces and tabs.
     """
     try:
         with open(path, 'rb') as stream:
-            data = stream.read()
+            line = stream.readline()
     except OSError:
         return None
-    if b'\n' not in data:
+    if not line.endswith(b'\n'):
         return None
-    line = data.split(b'\n', 1)[0].decode('utf-8', 'surrogateescape')
+    line = line[:-1].replace(b'\0', b'').decode('utf-8', 'surrogateescape')
     return [field for field in re.split(r'[ \t]+', line) if field]
 
 

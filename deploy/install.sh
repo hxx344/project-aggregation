@@ -1359,17 +1359,17 @@ def cutover_resolution(cutover, recorded):
 def read_fields(path):
     """The fields `read -r` assigns from the first line of a file, or None where it fails.
 
-    read fails on a file that cannot be opened or that ends before a newline.
-    Its fields are separated by runs of spaces and tabs.
+    read fails on a file that cannot be opened or that ends before a newline,
+    drops NUL bytes, and separates fields by runs of spaces and tabs.
     """
     try:
         with open(path, 'rb') as stream:
-            data = stream.read()
+            line = stream.readline()
     except OSError:
         return None
-    if b'\n' not in data:
+    if not line.endswith(b'\n'):
         return None
-    line = data.split(b'\n', 1)[0].decode('utf-8', 'surrogateescape')
+    line = line[:-1].replace(b'\0', b'').decode('utf-8', 'surrogateescape')
     return [field for field in re.split(r'[ \t]+', line) if field]
 
 
@@ -2873,7 +2873,7 @@ target_layout() {
   fi
 }
 # "slot release" of a valid .api-slot; fails without one.
-read_slot_record() { install_decide slot-record "$APP_DIR/.api-slot"; }
+read_slot_record() { [[ -f "$APP_DIR/.api-slot" ]] && install_decide slot-record "$APP_DIR/.api-slot"; }
 write_slot_record() { atomic_record "$APP_DIR/.api-slot" "{\"slot\":\"$1\",\"release\":\"$2\"}"; }
 # .api-cutover carries from, to, release and phase; intent and previous retain
 # the direction and the rollback pointer before the switch (install_decide
