@@ -79,11 +79,8 @@ async (page) => {
   const waitForText = text => page.getByText(text, { exact: false }).first().waitFor({ state: 'attached' });
   const tab = name => page.getByRole('tab', { name, exact: true }).click();
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=trade`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await waitForText('连接账户，查看四腿的真实仓位');
-  const [orderBox, positionsBox] = await Promise.all(['.trading-trade-main', '.trading-trade-positions'].map(selector => page.locator(selector).boundingBox()));
-  assert(positionsBox.x >= orderBox.x + orderBox.width && Math.abs(positionsBox.y - orderBox.y) < 2, 'wide 价差下单 places the arbitrage positions to the right of order entry');
-  await page.screenshot({ path: 'output/playwright/trading-trade-wide.png' });
   await page.getByText('连接两所并取得完整仓位后开始记录，历史浮盈亏无法回补。', { exact: true }).waitFor({ state: 'attached' });
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'empty fixture retains four defined legs');
   assert((await page.locator('.trading-funding-summary strong').allTextContents()).every(text => text === '—'), 'unconfigured funding must remain missing, never zero');
@@ -104,6 +101,16 @@ async (page) => {
   const pnlPath = await page.locator('[data-series="totalPnl"]').getAttribute('d');
   assert((pnlPath.match(/M/g) || []).length === 2, 'PnL path breaks at missing sample');
   assert((await page.locator('.trading-pnl-latest').innerText()).includes('32.123456789012345678'), 'exact PnL decimals survive rendering');
+  await tab('价差下单');
+  const overview = page.getByRole('region', { name: '持仓概览明细', exact: true });
+  await overview.locator('tbody[data-market="oil"] tr[data-position-id]').first().waitFor();
+  assert(await overview.locator('tbody[data-market="oil"] tr[data-position-id]').count() === 4, 'overview lists the four live oil legs');
+  assert((await overview.locator('tbody[data-market="oil"]').innerText()).includes('CLUSDT 与 BZUSDT 均为跨交易所反向持仓。'), 'overview keeps the cross-venue direction check');
+  const [spreadBox, overviewBox] = await Promise.all(['.spread-panel', '.trading-overview'].map(selector => page.locator(selector).boundingBox()));
+  assert(overviewBox.x >= spreadBox.x + spreadBox.width && Math.abs(overviewBox.y - spreadBox.y) < 2, 'wide 价差下单 shows the overview beside the live spread');
+  await page.screenshot({ path: 'output/playwright/trading-trade-overview.png' });
+  await page.getByRole('button', { name: '完整仓位', exact: true }).click();
+  assert(new URL(page.url()).searchParams.get('tradingSection') === 'legs', 'overview opens the full positions tab');
   await tab('盈亏资金费');
   const slider = page.getByRole('slider', { name: '选择盈亏采样时刻' });
   await slider.focus(); await page.keyboard.press('ArrowLeft');
@@ -150,7 +157,7 @@ async (page) => {
   const bybitCl = page.locator('[data-leg="bybit-CLUSDT"]');
   assert(await bybitCl.count() === 2, 'hedged contract must use two rows');
   assert((await bybitCl.locator('.trading-side').allTextContents()).sort().join('|') === '做多|做空', 'both actual sides shown');
-  await tab('价差下单');
+  await tab('套利仓位');
   await bybitCl.first().locator('summary').click();
   await bybitCl.first().getByText('2026/10/06 08:04:00', { exact: true }).waitFor();
 
@@ -200,7 +207,7 @@ async (page) => {
   assert(await page.locator('.trading-pnl-plot circle').count() === 2, 'single sample displays visible points');
   pnlMode = 'history';
   await refreshCache(); await waitForText('CLUSDT 与 BZUSDT 均为跨交易所反向持仓。');
-  await tab('价差下单');
+  await tab('套利仓位');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => window.scrollTo(0, 0));
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), '390px viewport has no page-wide horizontal overflow');

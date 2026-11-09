@@ -71,8 +71,6 @@ test('explicit URL and legacy links win over saved navigation; reversed pairs re
   assert.equal(readTradingPair('?tradingPair=unknown'), 'binance,bybit');
   assert.equal(readTradingDays('?tradingDays=7'), 7); assert.equal(readTradingSection('?tradingSection=positions'), 'positions');
   saveTradingSection('accounts'); assert.equal(readTradingSection('?tradingPair=binance,okx'), 'trade');
-  assert.equal(readTradingSection('?tradingSection=legs'), 'trade');
-  writePreference('workbench:trading-section:v1', 'legs'); assert.equal(readTradingSection(''), 'trade');
 });
 
 test('shares retain decimal strings and reject incomplete, inconsistent or oversized values', () => {

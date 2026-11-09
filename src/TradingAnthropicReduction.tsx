@@ -139,7 +139,7 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
         <div className="trading-anthropic-robot-actions"><button className="button primary" type="submit" disabled={!!busy || executing || !changed || !!validation || !!draft && draft.revision !== data.revision || form.enabled && (!confirmedLive || !connectionsReady || data.maintenance || !!readError)}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : null}{form.enabled ? '保存并启用自动减仓' : '保存减仓设置'}</button>
           {draft ? <button className="button secondary" type="button" disabled={!!busy} onClick={() => { setDraft(null); setConfirmed(null); setNotice(null); void load(); }}>放弃草稿并读取当前规则</button> : null}
           <button className="button secondary" type="button" disabled={!!busy || !data.config?.enabled} onClick={() => void write('disable')}>{busy === 'disable' ? <LoaderCircle size={15} className="spin" /> : null}停用新触发</button>
-          <button className="button secondary" type="button" onClick={() => document.getElementById('execution-title')?.closest('section')?.scrollIntoView({ block: 'start' })}>到组合交易核对执行</button></div>
+          <a className="button secondary" href="?view=trading&tradingSection=trade">到价差下单核对执行</a></div>
       </form>
       <p className="trading-anthropic-rule">停用只停止新触发，不撤销在途批次。停止当前任务请使用「价差下单」中的“停止并撤销余单”；已经成交的仓位保留。</p>
       {readError ? <p className="trading-warning" role="alert">{readError} · 当前显示上次读取结果，启用前需重新读取成功。</p> : null}

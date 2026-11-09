@@ -55,7 +55,7 @@ async (page) => {
   const section = page.locator('section.trading-anthropic-positions');
   const rows = section.locator('.trading-position-table tbody tr');
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=trade`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await section.getByRole('heading', { name: 'Anthropic 套利仓位', exact: true }).waitFor();
   await rows.first().waitFor();
   assert(await rows.count() === 4, 'one row per leg across Binance, OKX, Hyperliquid and Lighter RH');
@@ -70,6 +70,13 @@ async (page) => {
   assert(statuses[2].includes('0xabab…abab'), `Hyperliquid address is masked: ${statuses[2]}`);
   assert(statuses[3].includes('Lighter RH') && statuses[3].includes('0xcdcd…cdcd'), `Lighter RH address is masked: ${statuses[3]}`);
   assert((await section.locator('.trading-structure').innerText()).includes('多头 ≈ 481 股 · 空头 ≈ 391 股 · 差 89.98 股'), 'long and short shares are summed under the share assumption');
+  await page.getByRole('tab', { name: '价差下单', exact: true }).click();
+  const overview = page.locator('tbody[data-market="anthropic"]');
+  await overview.locator('tr[data-position-id]').first().waitFor();
+  assert(await overview.locator('tr[data-position-id]').count() === 4, 'the 价差下单 overview reuses the Anthropic read for all four legs');
+  assert(await overview.locator('tr[data-position-id] td.trading-overview-near').count() === 1 && (await overview.innerText()).includes('18.20%'), 'the overview flags the leg inside the alert threshold');
+  assert((await overview.innerText()).includes('差 89.98 股') && (await overview.innerText()).includes('数据已过期'), 'overview keeps the share gap and the stale OKX read');
+  await page.getByRole('tab', { name: '套利仓位', exact: true }).click();
 
   missingMarks = true;
   await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));

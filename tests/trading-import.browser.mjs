@@ -83,7 +83,7 @@ async (page) => {
     await page.evaluate(() => window.dispatchEvent(new Event('online'))); await response;
   };
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=trade`);
+  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
   await waitForText('等待两所最新仓位，暂不判断四腿结构');
   assert(metadataCount() === 0, 'other tabs do not load Asset metadata');
   await tab('账户连接');
