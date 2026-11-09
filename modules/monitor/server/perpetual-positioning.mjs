@@ -1,3 +1,5 @@
+import { perpetualContractSymbolPattern } from '../lib/perpetual-chart-state.ts';
+
 // Official public account ratios, sampled on demand by the caller. No timers,
 // global scans, top-trader substitutions, or synthetic position-size estimates.
 // Binance: https://developers.binance.com/docs/derivatives/usds-margined-futures/market-data/rest-api/Long-Short-Ratio
@@ -50,7 +52,7 @@ function sourceFor(quote) {
   if (['hyperliquid', 'lighter', 'rh-lighter', 'aster', 'entropy'].includes(exchange)) {
     return { source: null, reason: '当前未接入该 DEX 的官方多空账户比' };
   }
-  if (typeof symbol !== 'string' || !/^[A-Za-z0-9_.-]{1,80}$/.test(symbol)) {
+  if (typeof symbol !== 'string' || !perpetualContractSymbolPattern.test(symbol)) {
     return { source: null, reason: '合约代码格式无效，无法查询官方多空账户比' };
   }
   let path, params;

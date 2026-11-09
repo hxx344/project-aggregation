@@ -38,6 +38,13 @@ test('opportunity alert configuration starts disabled and validates bounded comp
   assert.throws(() => validatePerpetualAlertConfig({ enabled: true, rules: Array.from({ length: 21 }, (_, index) => rule({ id: `r${index}` })) }));
 });
 
+test('a Unicode directory base can be saved as an alert pair, while malformed bases stay rejected', () => {
+  // Ranked pairs pass the directory base through unchanged (for example 币安人生).
+  const unicode = rule({ base: '币安人生', longKey: 'binance:币安人生USDT', shortKey: 'gate:币安人生_USDT' });
+  assert.equal(validatePerpetualAlertConfig({ enabled: true, rules: [unicode] }).rules[0].base, '币安人生');
+  for (const base of ['币安 人生', 'BTC/USD', '-BTC', '', 'x'.repeat(101)]) assert.throws(() => validatePerpetualAlertConfig({ enabled: true, rules: [rule({ base })] }), /同一标的/);
+});
+
 test('alert evaluation excludes unavailable fees, mismatched identity, stale books and offline venues', () => {
   const valid = quotes();
   assert.equal(evaluatePerpetualAlertQuote(rule(), key => valid.get(key), NOW).hit, true);

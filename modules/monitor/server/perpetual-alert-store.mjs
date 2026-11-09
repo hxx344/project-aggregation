@@ -19,7 +19,7 @@ export async function openPerpetualAlertStore(directory) {
     }));
     loaded.history = loaded.history.filter(item => item && Number.isFinite(item.time) && item.time > 0 && Number.isFinite(item.netSpreadPercent)
       && ['sending', 'sent', 'failed'].includes(item.status)
-      && [['id', 64], ['ruleId', 64], ['name', 80], ['base', 80], ['longKey', 160], ['shortKey', 160], ['error', 200]].every(([key, length]) => typeof item[key] === 'string' && item[key].length <= length)).slice(0, 100);
+      && [['id', 64], ['ruleId', 64], ['name', 80], ['base', 100], ['longKey', 160], ['shortKey', 160], ['error', 200]].every(([key, length]) => typeof item[key] === 'string' && item[key].length <= length)).slice(0, 100);
     state = loaded;
   } catch (error) { if (error.code !== 'ENOENT') throw new Error('合约机会提醒状态无法读取，请修复或恢复 opportunity-alerts.json。', { cause: error }); }
   return {

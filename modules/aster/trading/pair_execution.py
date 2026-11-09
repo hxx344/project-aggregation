@@ -11,7 +11,7 @@ import math
 import time
 import uuid
 
-from .exchange import (AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent,
+from .exchange import (AmbiguousOrder, ExchangeError, LiveBroker, RequestNotSent, SendBasisExpired,
                        LeverageRejected, ORDER_REJECTION_CODES, api_wait_notice, definitive_order_error,
                        order_absent)
 from .exchange_messages import exchange_reason, MISSING_REJECT_REASON
@@ -602,7 +602,8 @@ class PairTrader:
             self._save(pair, state)
             self._recover(pair, state, brokers)
             return
-        self._dispatch(pair, state, brokers, legs, guards=guards, snapshots=snapshots, reconciliation=not opening)
+        self._dispatch(pair, state, brokers, legs, guards=guards, snapshots=snapshots, reconciliation=not opening,
+                       bases=snapshots)
         self._recover(pair, state, brokers)
 
     @staticmethod
@@ -626,8 +627,27 @@ class PairTrader:
                 evidence["retry_after"] = delay
         return evidence
 
+    @staticmethod
+    def _final_send_check(broker, basis):
+        """The single-account final HTTP check for one leg's own sizing read.
+
+        Persistence and shared admission run after the leg's lease check, so
+        the read's generation and TTL are checked again in the transport hook.
+        """
+        if basis is None or not isinstance(broker, LiveBroker):
+            return {}
+        generation = getattr(basis, "account_read_generation", None)
+        if type(generation) is not int:
+            raise RequestNotSent("下单依据缺少账户读取代次，本腿未发送，等待重新规划")
+        def require_fresh():
+            try:
+                basis.require_fresh()
+            except TradingError as exc:
+                raise SendBasisExpired(f"发送前复核：{exc}，本腿未发送，等待重新规划") from None
+        return {"basis_generation": generation, "before_send": require_fresh}
+
     def _dispatch(self, pair, state, brokers, legs, *, guards=None, snapshots=None,
-                  reconciliation=False, paired_guards=False):
+                  reconciliation=False, paired_guards=False, bases=None):
         require_runtime_symbols(pair, state)
         if any(leg.get("order", {}).get("symbol") != pair["symbol"] for leg in legs):
             raise PairPositionError("待发送订单标的与配对组不一致，停止交易并等待核对")
@@ -678,6 +698,7 @@ class PairTrader:
                         raise paired_error
                     if guards:
                         guards[leg["key"]]()
+                    final_check = self._final_send_check(broker, (bases or {}).get(leg["key"]))
                 except RequestNotSent:
                     raise
                 except TradingError as exc:
@@ -686,7 +707,7 @@ class PairTrader:
                     raise RequestNotSent(str(exc), retry_after=getattr(exc, "retry_after", 0)) from None
                 budget = getattr(broker, "reconciliation_budget", nullcontext)() if reconciliation else nullcontext()
                 with budget:
-                    result = (broker.submit([order], timeout=3) if isinstance(broker, LiveBroker)
+                    result = (broker.submit([order], timeout=3, **final_check) if isinstance(broker, LiveBroker)
                               else broker.submit([order]))
                 evidence = {"kind": "invalid"}
                 if not isinstance(result, list) or len(result) != 1:
@@ -1069,7 +1090,8 @@ class PairTrader:
         state.update(phase="repairing", reason="系统正在按本批记录的恢复目标继续减仓；不追加另一腿")
         self._save(pair, state)
         self._config_guard(pair, pending["identities"], opening=False)
-        self._dispatch(pair, state, brokers, repairs, guards=guards, reconciliation=True, paired_guards=True)
+        self._dispatch(pair, state, brokers, repairs, guards=guards, reconciliation=True, paired_guards=True,
+                       bases=snapshots)
         if all(leg.get("receipt", {}).get("local_not_sent") for leg in repairs if leg.get("receipt")) \
                 and all(leg.get("receipt") for leg in repairs):
             pending["repair_attempts"] -= 1

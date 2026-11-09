@@ -23,8 +23,10 @@ class OfflineAPI:
         self.calls = []
         self.hedge = True
 
-    def call(self, method, path, params=None, *, signed=False, weight=1, timeout=None):
+    def call(self, method, path, params=None, *, signed=False, weight=1, timeout=None, before_send=None):
         self.budget.reserve(weight)
+        if before_send is not None:
+            before_send()  # The real API runs it in the final transport hook.
         self.calls.append((method, path, self.budget._priority_flags()))
         if path == "/fapi/v3/order":
             if method == "POST":

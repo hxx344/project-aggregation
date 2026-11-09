@@ -250,3 +250,13 @@ test('Bitget 32-day backfill reads each page once and publishes only verified co
   assert.equal(partial.length, 2); assert.equal(partial.at(-1).coverage.from, NOW - 199 * HOUR);
   await assert.rejects(read(market('bitget'), { ...range, from: range.from - 1 }));
 });
+
+test('a Unicode Gate directory contract reads its funding history; other quote suffixes stay unsupported', async () => {
+  const symbol = '币安人生_USDT', calls = [];
+  const read = reader(async url => { calls.push(new URL(url)); return response([{ t: NOW / 1000, r: '0.0001' }]); });
+  assert.deepEqual(await read(market('gate', { symbol }), { from: NOW, to: NOW }), [{ time: NOW, rate: 0.0001 }]);
+  assert.equal(calls[0].searchParams.get('contract'), symbol);
+  await assert.rejects(read(market('gate', { symbol: '币安人生_USDC' }), RANGE), { code: 'UNSUPPORTED' });
+  for (const bad of ['币安人生 _USDT', '币安人生/_USDT']) await assert.rejects(read(market('gate', { symbol: bad }), RANGE));
+  assert.equal(calls.length, 1);
+});

@@ -1,5 +1,6 @@
 import { pairTakerFees, validFeePercent, takerFeeVenues } from '../lib/perpetual-fees.ts';
 import { quoteIsFresh, quotePriceTime } from '../lib/perpetual-spreads.ts';
+import { perpetualBasePattern } from '../lib/perpetual-chart-state.ts';
 
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const integer = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
@@ -13,7 +14,7 @@ export function validatePerpetualAlertConfig(input) {
   const rules = input.rules.map(rule => {
     if (!rule || typeof rule.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(rule.id) || ['__proto__', 'constructor', 'prototype'].includes(rule.id) || ids.has(rule.id) || typeof rule.name !== 'string' || !rule.name.trim() || rule.name.length > 80 || typeof rule.enabled !== 'boolean') throw failure('规则需要唯一编号、名称与观察开关。');
     ids.add(rule.id);
-    if (typeof rule.base !== 'string' || !/^[A-Z0-9:._-]{1,80}$/.test(rule.base) || [rule.longKey, rule.shortKey].some(key => typeof key !== 'string' || key.length > 160 || !/^[a-z0-9-]+:[^\s\u0000-\u001f]+$/.test(key)) || rule.longKey.split(':')[0] === rule.shortKey.split(':')[0]) throw failure('需选择同一标的、不同交易所的完整做多和做空合约。');
+    if (typeof rule.base !== 'string' || !perpetualBasePattern.test(rule.base) || [rule.longKey, rule.shortKey].some(key => typeof key !== 'string' || key.length > 160 || !/^[a-z0-9-]+:[^\s\u0000-\u001f]+$/.test(key)) || rule.longKey.split(':')[0] === rule.shortKey.split(':')[0]) throw failure('需选择同一标的、不同交易所的完整做多和做空合约。');
     if (!finite(rule.thresholdPercent) || rule.thresholdPercent < -100 || rule.thresholdPercent > 1000 || !integer(rule.durationSeconds, 1, 3600) || !integer(rule.windowSeconds, 5, 3600) || rule.durationSeconds > rule.windowSeconds || !finite(rule.minHitRatio) || rule.minHitRatio < 0 || rule.minHitRatio > 1 || !integer(rule.cooldownSeconds, 30, 86400) || !integer(rule.maxAgeSeconds, 1, 30)) throw failure('阈值 -100% 至 1000%；持续 1–3600 秒且不超过窗口；窗口 5–3600 秒；占比 0–100%；冷却 30–86400 秒；报价年龄 1–30 秒。');
     if (!rule.budget || !validFeePercent(rule.budget.slippagePercent) || !rule.budget.takerOverrides || typeof rule.budget.takerOverrides !== 'object' || Array.isArray(rule.budget.takerOverrides)) throw failure('手续费覆盖与滑点预算格式无效。');
     const takerOverrides = {};

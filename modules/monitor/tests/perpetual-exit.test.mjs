@@ -132,3 +132,22 @@ test('exit service rejects cross-settlement positions before fetching and can in
     const closing = await service.exit(input()); assert.equal(closing.complete, true); assert.match(closing.reasons.join(), /是否仍允许平仓/); assert.equal(calls, 2);
   } finally { service.stop(); limiter.stop(); }
 });
+
+test('a Unicode directory contract reaches depth and exit checks, while malformed codes stay rejected before network', async () => {
+  // Binance lists 币安人生USDT; the shared contract grammar must not turn it into a 400.
+  const symbol = '币安人生USDT', urls = [];
+  const limiter = createInspectionBudget({ spacingMs: 0 }), current = [quote('binance', { symbol, base: '币安人生' }), quote('bybit', { symbol, base: '币安人生', takerFeeRate: 0.00055, takerFeeAt: NOW, takerFeeSource: 'bybit-standard' })];
+  const service = createPerpetualExecutionService({ budget: limiter, clock: () => NOW, getQuote: (exchange, code) => current.find(row => row.exchange === exchange && row.symbol === code), fetchImpl: async url => {
+    urls.push(url); return response(url.includes('bybit') ? { result: { s: symbol, ts: NOW, b: [[110, 20]], a: [[111, 20]] } } : { E: NOW, bids: [[100, 20]], asks: [[101, 20]] });
+  } });
+  const legs = { long: { exchange: 'binance', symbol }, short: { exchange: 'bybit', symbol } };
+  try {
+    assert.equal((await service.depth({ ...legs, notional: 1000 })).complete, true);
+    const exit = await service.exit({ ...position(), ...legs, identity: perpetualExitIdentity(...current) }); assert.equal(exit.complete, true, JSON.stringify(exit.reasons));
+    assert.ok(urls.length === 2 && urls.every(url => url.includes(encodeURIComponent(symbol))));
+    for (const bad of ['币安人生 USDT', '币安人生/USDT', 'BTC?x=1', '-BTCUSDT', 'BTC\u0000USDT', 'x'.repeat(161)]) {
+      await assert.rejects(service.depth({ ...legs, long: { exchange: 'binance', symbol: bad }, notional: 1000 }), /有效/);
+    }
+    assert.equal(urls.length, 2);
+  } finally { service.stop(); limiter.stop(); }
+});

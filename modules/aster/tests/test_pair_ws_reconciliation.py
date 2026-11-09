@@ -35,8 +35,8 @@ class PairWsReconciliationTests(TestCase):
         for key, broker in self.brokers.items():
             original = broker.submit
 
-            def submit(orders, *, timeout=None, key=key, broker=broker, original=original):
-                receipt = original(orders, timeout=timeout)[0]
+            def submit(orders, *, timeout=None, key=key, broker=broker, original=original, **final):
+                receipt = original(orders, timeout=timeout, **final)[0]
                 order = orders[0]
                 if key != missing:
                     stamp = int(time.time() * 1000)
@@ -95,8 +95,8 @@ class PairWsReconciliationTests(TestCase):
             stack.enter_context(patch.object(self.trader, "_recover", return_value=None))
             for key, broker in self.brokers.items():
                 original = broker.submit
-                def submit(orders, *, timeout=None, key=key, original=original):
-                    receipts[key] = original(orders, timeout=timeout)[0]
+                def submit(orders, *, timeout=None, key=key, original=original, **final):
+                    receipts[key] = original(orders, timeout=timeout, **final)[0]
                     raise AmbiguousOrder("offline acknowledgement lost")
                 stack.enter_context(patch.object(broker, "submit", side_effect=submit))
             self.trader._start(self.pair, state, self.brokers, snapshots, guards, plan, kind="ordinary")

@@ -64,6 +64,21 @@ test('polling preserves the shared pending state across all trading controls', (
   for (const id of ['openTrade', 'closeTrade', 'rfqCreate']) assert.equal(element(id).disabled, true);
 });
 
+test('an unknown RFQ creation unlocks only when the server settles that new inquiry as not created', () => {
+  const {context, element} = dashboard();
+  const flow = vm.runInContext('tradeFlow', context);
+  flow.previousRfqLink = 'older-link';
+  context.setTradeLock('rfqCreateUnknown');
+  // The previous inquiry's own settled failure is not this creation's answer.
+  context.renderRfq({status: 'Failed', creation_failed: 'old refusal', rfq_link_id: 'older-link'});
+  assert.equal(flow.lock, 'rfqCreateUnknown');
+  context.renderRfq({status: 'CreationUnknown', rfq_link_id: 'new-link'});
+  assert.equal(flow.lock, 'rfqCreateUnknown');
+  context.renderRfq({status: 'Failed', creation_failed: '询价请求未发送：maintenance', rfq_link_id: 'new-link'});
+  assert.equal(flow.lock, null);
+  assert.match(element('rfqStatus').textContent, /^创建未生效 · 询价请求未发送/);
+});
+
 test('state failure disables both trading buttons even with confirmation', () => {
   const {context, element} = dashboard();
   context.window.__liveEnabled = true;
