@@ -69,7 +69,7 @@ async (page) => {
   // Navigation below uses the desktop sidebar, which is hidden at phone widths; a
   // reused session can still carry the 390px viewport left by trading.browser.mjs.
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
+  await page.goto(`${origin}/?view=trading&tradingSection=trade`);
   await page.locator('.trading-position-table').waitFor();
   await checkFresh();
   const initialReads = reads.length;

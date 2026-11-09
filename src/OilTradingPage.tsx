@@ -242,7 +242,7 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
   useEffect(() => { if (!busy) void load(); }, [busy, load]);
   // Asset metadata loads on the first visit to 账户连接; later visits keep the list until 刷新来源.
   useEffect(() => { if (section === 'accounts' && sources === null) void loadSources(); }, [section, loadSources]);
-  // The 账户连接 buttons sit in the 套利仓位 tab, which hides on switch; move focus and scroll to the connections heading.
+  // The 账户连接 buttons sit in the 价差下单 tab's position column, which hides on switch; move focus and scroll to the connections heading.
   useEffect(() => {
     if (section !== 'accounts' || !focusConnections.current) return;
     focusConnections.current = false;
@@ -305,30 +305,38 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
   const currentPage = data?.funding.pagination.page ?? 0;
   const pendingPage = !!data && (days !== data.period.days || page !== currentPage);
   const openConnections = () => { focusConnections.current = true; onSection('accounts'); };
-  const dataTab = section === 'legs' || section === 'pnl' || section === 'accounts';
-  const pairTab = section === 'legs' || section === 'pnl';
+  // 价差下单 carries the arbitrage positions in its right-hand column, so it reads the same cached data.
+  const tradeTab = section === 'trade';
+  const dataTab = tradeTab || section === 'pnl' || section === 'accounts';
+  const pairTab = section === 'pnl';
+  const refreshButton = <button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button>;
 
-  return <div className="trading-page" hidden={section === 'positions'}>
-    {pairTab || dataTab ? <div className="trading-toolbar">
-      {pairTab ? <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div> : <p className="trading-toolbar-note"><ShieldCheck size={15} />只读观察账户：读取原油、海力士与 Anthropic 的仓位和资金费账单，不能下单</p>}
-      {dataTab ? <button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button> : null}
-    </div> : null}
-    <div className="trading-tab" hidden={section !== 'trade'}>
-      <TradingSpread pair={pair} onPair={changePair} shares={shares} onShares={setShares} />
-      <TradingExecution pair={pair} onPair={changePair} onExpired={onExpired} shares={shares} onShares={setShares} />
-    </div>
-    <div className="trading-tab" hidden={section !== 'auto'}><TradingAutoRules onExpired={onExpired} /></div>
-    <div className="trading-tab" hidden={!dataTab}>
+  const dataNotices = <>
     {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
     {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}
     {notice ? <div className="trading-notice" role="status">{notice}</div> : null}
     {data ? <div className={`trading-notice trading-cache-status${oldCache || data.cache.error ? ' warning' : ''}`} role={data.cache.error ? 'alert' : 'status'}><span>{data.cache.error ? `${data.cache.error.message} 失败时间：${formatDate(data.cache.error.at)}（北京时间）。` : oldCache ? '当前显示旧缓存，等待更新。' : data.cache.rebuilding ? '后台正在更新缓存，当前显示上次数据。' : reading ? '已显示缓存，正在检查更新。' : '已显示缓存。'} 缓存生成：{formatDate(data.cache.builtAt)}{data.cache.builtAt ? '（北京时间）' : ''}</span></div> : null}
-    </div>
-    {!data && dataTab ? <div className="trading-initial" role="status">{reading ? <><LoaderCircle className="spin" size={22} /><span>正在读取交易账户状态…</span></> : <span>尚未获取交易数据</span>}</div> : null}
-    <div className="trading-tab" hidden={section !== 'legs'}>{data ? <>
+  </>;
+  const initialStatus = !data ? <div className="trading-initial" role="status">{reading ? <><LoaderCircle className="spin" size={22} /><span>正在读取交易账户状态…</span></> : <span>尚未获取交易数据</span>}</div> : null;
+
+  return <div className="trading-page" hidden={section === 'positions'}>
+    {dataTab && !tradeTab ? <div className="trading-toolbar">
+      {pairTab ? <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div> : <p className="trading-toolbar-note"><ShieldCheck size={15} />只读观察账户：读取原油、海力士与 Anthropic 的仓位和资金费账单，不能下单</p>}
+      {refreshButton}
+    </div> : null}
+    <div className="trading-tab trading-trade-layout" hidden={!tradeTab}>
+      <div className="trading-trade-main">
+        <TradingSpread pair={pair} onPair={changePair} shares={shares} onShares={setShares} />
+        <TradingExecution pair={pair} onPair={changePair} onExpired={onExpired} shares={shares} onShares={setShares} />
+      </div>
+      <div className="trading-trade-positions" role="region" aria-labelledby="trading-trade-positions-title">
+        <div className="trading-toolbar"><h2 id="trading-trade-positions-title">套利仓位</h2>{refreshButton}</div>
+        {tradeTab ? dataNotices : null}
+        {tradeTab ? initialStatus : null}
+        {data ? <>
       <section className="trading-panel trading-positions" aria-labelledby="trading-positions-title">
-        <div className="trading-panel-heading"><div><h2 id="trading-positions-title">原油四腿仓位</h2><p>按实际持仓显示方向 · OKX 数量为张，价格为 USDT/底层单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
+        <div className="trading-panel-heading"><div><h2 id="trading-positions-title">原油四腿仓位</h2><p>按左侧「对比交易所」读取 · 按实际持仓显示方向 · OKX 数量为张，价格为 USDT/底层单位</p></div><button className="button secondary" onClick={openConnections}><Link2 size={16} />账户连接</button></div>
         <div className="trading-account-statuses">{selectedAccounts.map(account => <div className="trading-account-status" key={account.exchange}><div><strong>{exchangeNames[account.exchange]}</strong><ReadStatus state={account.positions.state} />{account.refreshing ? <span className="trading-muted">后台同步中</span> : null}</div><p>仓位读取：{formatDate(account.positions.fetchedAt)}{account.positions.fetchedAt ? '（北京时间）' : ''}</p>{account.positions.error ? <p className="trading-warning">{account.positions.error}</p> : null}</div>)}</div>
         {!connected ? <div className="trading-connect-empty"><ShieldCheck size={27} /><h3>连接账户，查看四腿的真实仓位</h3><p>使用所选两家交易所的只读密钥。连接后，这里会显示持仓方向、名义价值和资金费账单。</p><button className="button primary" onClick={openConnections}>连接只读账户</button></div> : null}
         <div className={`trading-structure ${data.structure.state}`}><span>跨所方向</span><strong>{data.structure.message}</strong></div>
@@ -343,7 +351,12 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
         <PositionTable legs={data.hynix.legs} label="海力士仓位明细" />
         <p className="trading-footnote">仅显示仓位，不计入「盈亏资金费」中的原油总盈亏与资金费；ADR 与正股的数量不直接等同，请按名义价值核对对冲。</p>
       </section> : null}
-    </> : null}<TradingAnthropicPositions shares={shares} onExpired={onExpired} /></div>
+        </> : null}
+        <TradingAnthropicPositions shares={shares} onExpired={onExpired} />
+      </div>
+    </div>
+    <div className="trading-tab" hidden={section !== 'auto'}><TradingAutoRules onExpired={onExpired} /></div>
+    {dataTab && !tradeTab ? <>{dataNotices}{initialStatus}</> : null}
     {data ? <div className="trading-tab" hidden={section !== 'pnl'}>
 
       <section className="trading-panel trading-pnl" aria-labelledby="trading-pnl-title">

@@ -121,7 +121,6 @@ async (page) => {
     await execution.getByRole('group', { name: '品种', exact: true }).getByRole('button', { name: 'Anthropic', exact: true }).click();
     await execution.getByLabel('流通股 · 十亿股', { exact: true }).fill('13');
     await execution.getByLabel('完全稀释股 · 十亿股', { exact: true }).fill('17');
-    await page.getByRole('tab', { name: '套利仓位', exact: true }).click();
     await section.getByText('当前页面为 13B / 17B。', { exact: false }).waitFor();
     assert((await section.innerText()).includes('本规则股数快照：流通 12.7B · 完全稀释 16.7B'), 'page shares never silently mutate the armed rule snapshot');
     checks.push('immutable armed share snapshot');
@@ -158,7 +157,8 @@ async (page) => {
     assert(job.status === 'running', 'disable never pretends to stop the in-flight job');
     phase = 'review'; reason = '第 2 批结果待核对，后续批次已停止'; job.status = 'attention'; revision++; await refresh();
     await section.getByRole('alert').filter({ hasText: reason }).waitFor();
-    assert(await section.getByRole('link', { name: '到价差下单核对执行' }).getAttribute('href') === '?view=trading&tradingSection=trade', 'review links to the actual execution entry');
+    await section.getByRole('button', { name: '到组合交易核对执行', exact: true }).click();
+    assert(await page.getByRole('heading', { name: '组合交易', exact: true }).evaluate(node => { const top = node.getBoundingClientRect().top; return top >= 0 && top < innerHeight; }), 'review scrolls to the execution panel on the same page');
     phase = 'completed'; reason = null; job.status = 'completed'; revision++; await refresh();
     await section.getByText('已完成 · 新触发已关闭', { exact: true }).waitFor();
     assert(!(await enabled.isChecked()), 'completion respects explicit disable');

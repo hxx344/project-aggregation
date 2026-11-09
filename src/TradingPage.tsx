@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { ArrowLeftRight, Bot, ChartLine, Layers, Link2, LoaderCircle, Wallet } from 'lucide-react';
+import { ArrowLeftRight, Bot, ChartLine, Link2, LoaderCircle, Wallet } from 'lucide-react';
 import type { TradingCache } from './trading-cache';
 import { TRADING_SECTIONS } from './trading-sections';
 import { readTradingSection, saveTradingSection } from './trading-navigation';
@@ -16,7 +16,7 @@ function loadOilPage() {
 }
 function preloadOilPage() { loadOilPage().catch(() => {}); }
 const OilTradingPage = lazy(loadOilPage);
-const icons: Record<TradingSection, typeof Wallet> = { positions: Wallet, trade: ArrowLeftRight, legs: Layers, pnl: ChartLine, auto: Bot, accounts: Link2 };
+const icons: Record<TradingSection, typeof Wallet> = { positions: Wallet, trade: ArrowLeftRight, pnl: ChartLine, auto: Bot, accounts: Link2 };
 
 export default function TradingPage({ cache, onExpired, onProject, navigationSearch }: {
   cache: TradingCache; onExpired: () => void; onProject: (id: string) => void; navigationSearch: string;

@@ -79,8 +79,11 @@ async (page) => {
   const waitForText = text => page.getByText(text, { exact: false }).first().waitFor({ state: 'attached' });
   const tab = name => page.getByRole('tab', { name, exact: true }).click();
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
+  await page.goto(`${origin}/?view=trading&tradingSection=trade`);
   await waitForText('连接账户，查看四腿的真实仓位');
+  const [orderBox, positionsBox] = await Promise.all(['.trading-trade-main', '.trading-trade-positions'].map(selector => page.locator(selector).boundingBox()));
+  assert(positionsBox.x >= orderBox.x + orderBox.width && Math.abs(positionsBox.y - orderBox.y) < 2, 'wide 价差下单 places the arbitrage positions to the right of order entry');
+  await page.screenshot({ path: 'output/playwright/trading-trade-wide.png' });
   await page.getByText('连接两所并取得完整仓位后开始记录，历史浮盈亏无法回补。', { exact: true }).waitFor({ state: 'attached' });
   assert(await page.locator('.trading-position-table tbody tr').count() === 4, 'empty fixture retains four defined legs');
   assert((await page.locator('.trading-funding-summary strong').allTextContents()).every(text => text === '—'), 'unconfigured funding must remain missing, never zero');
@@ -147,7 +150,7 @@ async (page) => {
   const bybitCl = page.locator('[data-leg="bybit-CLUSDT"]');
   assert(await bybitCl.count() === 2, 'hedged contract must use two rows');
   assert((await bybitCl.locator('.trading-side').allTextContents()).sort().join('|') === '做多|做空', 'both actual sides shown');
-  await tab('套利仓位');
+  await tab('价差下单');
   await bybitCl.first().locator('summary').click();
   await bybitCl.first().getByText('2026/10/06 08:04:00', { exact: true }).waitFor();
 
@@ -197,7 +200,7 @@ async (page) => {
   assert(await page.locator('.trading-pnl-plot circle').count() === 2, 'single sample displays visible points');
   pnlMode = 'history';
   await refreshCache(); await waitForText('CLUSDT 与 BZUSDT 均为跨交易所反向持仓。');
-  await tab('套利仓位');
+  await tab('价差下单');
   await page.setViewportSize({ width: 390, height: 844 });
   await page.evaluate(() => window.scrollTo(0, 0));
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth + 1), '390px viewport has no page-wide horizontal overflow');
