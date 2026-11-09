@@ -18,6 +18,13 @@ on:
       - 'docs/**/*.rst'
       - '*.md'
 
+concurrency:
+  # A new push to a PR supersedes its older run. Every other event gets its own
+  # group: a shared group would drop queued main runs, and each main commit
+  # needs its own CI result to become a release candidate.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
