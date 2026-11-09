@@ -86,6 +86,8 @@ MAX_SIZE = 2 * 1024 * 1024 * 1024
 WORKERS = 4
 ATTEMPTS = 3
 SOCKET_TIMEOUT = 20
+RELEASE_LOOKUP_ATTEMPTS = 2
+MAX_RELEASE_METADATA = 1024 * 1024
 RANGE_DEADLINE = 180
 SINGLE_DEADLINE = 1800
 PROGRESS_UPDATE_INTERVAL = 0.5  # Update progress file every 500ms
@@ -596,9 +598,10 @@ def source_progress_stream(source, output):
 
 
 class Downloader:
-    def __init__(self, cache, url, expected, *, http_origin=None, timeout=None):
+    def __init__(self, cache, url, expected, *, http_origin=None, timeout=None, accept=None):
         require(re.fullmatch(r'[a-f0-9]{64}', expected) is not None, 'invalid archive SHA256')
         self.url, self.expected = download_url(url, http_origin), expected
+        self.accept = accept
         self.cache = secure_directory(cache)
         self.archive = self.cache / (expected + '.tar.gz')
         self.parts = self.cache / ('.' + expected + '.parts')
@@ -675,6 +678,8 @@ class Downloader:
     def request(self, start=None, end=None):
         self.check_cancel()
         headers = {'Accept-Encoding': 'identity', 'User-Agent': 'project-aggregation-installer'}
+        if self.accept:
+            headers['Accept'] = self.accept
         if start is not None:
             headers['Range'] = 'bytes=%d-%d' % (start, end)
         try:
@@ -1033,6 +1038,51 @@ class Downloader:
                 signal.signal(number, handler)
 
 
+def api_opener():
+    return urllib.request.build_opener(HTTPSRedirect())
+
+
+def github_release_asset(repository, tag, filename):
+    """Accept only the final upload of the exact published, pinned release asset."""
+    url = f'https://api.github.com/repos/{repository}/releases/tags/{tag}'
+    headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'project-aggregation-installer'}
+    for attempt in range(RELEASE_LOOKUP_ATTEMPTS):
+        last = attempt + 1 >= RELEASE_LOOKUP_ATTEMPTS
+        try:
+            with api_opener().open(urllib.request.Request(url, headers=headers), timeout=SOCKET_TIMEOUT) as response:
+                body = response.read(MAX_RELEASE_METADATA + 1)
+            break
+        except urllib.error.HTTPError as error:
+            code = error.code
+            error.close()
+            if last or not 500 <= code <= 599:
+                raise DownloadError('release lookup failed: HTTP %s' % code) from error
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            if (isinstance(error, ssl.SSLCertVerificationError) or
+                    isinstance(getattr(error, 'reason', None), ssl.SSLCertVerificationError)):
+                raise DownloadError('TLS certificate verification failed') from error
+            if last:
+                raise DownloadError('release lookup failed: %s' % error) from error
+        time.sleep(1)
+    require(len(body) <= MAX_RELEASE_METADATA, 'oversized release metadata')
+    try:
+        release = json.loads(body.decode('utf-8'))
+    except (UnicodeError, ValueError) as error:
+        raise DownloadError('invalid release metadata') from error
+    require(isinstance(release, dict) and release.get('tag_name') == tag and
+            release.get('draft') is False and release.get('prerelease') is False,
+            'release metadata does not match the published pinned tag')
+    assets = release.get('assets')
+    matches = [item for item in assets if isinstance(item, dict) and item.get('name') == filename] \
+        if isinstance(assets, list) else []
+    require(len(matches) == 1, 'release asset is missing or ambiguous')
+    asset = matches[0]
+    identifier, size = asset.get('id'), asset.get('size')
+    require(asset.get('state') == 'uploaded' and type(identifier) is int and identifier > 0 and
+            type(size) is int and 0 < size <= MAX_SIZE, 'release asset is not a complete upload')
+    return f'https://api.github.com/repos/{repository}/releases/assets/{identifier}'
+
+
 def release_download(cache, url, expected, *, config_path=None):
     """Only immutable archives use mirrors; discovery and executable sources stay official."""
     https_url(url)
@@ -1055,7 +1105,24 @@ def release_download(cache, url, expected, *, config_path=None):
             if config['priority'] == 'always':
                 raise
             print('[CI] 镜像下载或完整性校验失败，回退 GitHub 固定版本。', file=sys.stderr, flush=True)
-    return Downloader(cache, url, expected).run()
+    try:
+        return Downloader(cache, url, expected).run()
+    except Retryable as error:
+        if match is None:
+            raise
+        # Anonymous API calls are limited to 60 per IP per hour and every block request is one
+        # call (about 15 for a 113 MB archive), so the API file endpoint is only a fallback.
+        print('[CI] GitHub 下载入口暂时不可用，改用 GitHub API 文件接口下载同一固定版本；仍按官方清单验证 SHA256。',
+              file=sys.stderr, flush=True)
+        try:
+            asset_url = github_release_asset(*match.groups())
+            return Downloader(cache, asset_url, expected, accept='application/octet-stream').run()
+        except (Cancelled, LocalDownloadError):
+            raise
+        except DownloadError as fallback:
+            print('[CI] GitHub API 文件接口下载失败：%s；保留原始 GitHub 下载错误。' % fallback,
+                  file=sys.stderr, flush=True)
+        raise error
 
 
 if __name__ == '__main__':

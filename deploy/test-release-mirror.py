@@ -1,8 +1,11 @@
 """Exercise mirror selection in the actual embedded, integrity-checked downloader."""
 import contextlib
+import copy
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -22,6 +25,56 @@ Downloader = core.Downloader
 COMMIT = 'a' * 40
 SUFFIX = '/hxx344/project-aggregation/releases/download/deploy-' + COMMIT + '/fixture.tar.gz'
 ORIGIN = 'https://github.com' + SUFFIX
+TAG = 'deploy-' + COMMIT
+API_ASSET = 'https://api.github.com/repos/hxx344/project-aggregation/releases/assets/4242'
+TAG_PATH = '/repos/hxx344/project-aggregation/releases/tags/' + TAG
+
+
+class StatusFixture:
+    """Serve one fixed status/body and keep each request's headers for assertions."""
+    def __init__(self, status, body=b''):
+        self.status, self.body, self.requests = status, body, []
+        fixture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                fixture.requests.append((self.path, self.headers))
+                self.send_response(fixture.status)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(fixture.body)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(fixture.body)
+                self.close_connection = True
+
+        self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+
+class RecordingTransport(fixtures.FixtureTransport):
+    def __init__(self, port, seen):
+        super().__init__(port)
+        self.seen = seen
+
+    def https_open(self, request):
+        self.seen.append((request.full_url, request.get_header('Accept')))
+        return super().https_open(request)
 
 
 class MirrorDownloads(unittest.TestCase):
@@ -224,6 +277,181 @@ class MirrorDownloads(unittest.TestCase):
         with self.assertRaises(core.LocalDownloadError):
             core.read_mirror_config(other)
 
+
+class GitHubApiFallback(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='api-fallback-')
+        self.root = Path(self.temporary.name)
+        self.config = self.root / 'release-mirror.conf'
+        self.cache = self.root / 'cache'
+        self.payload = fixtures.data_bytes(180000)
+        self.expected = hashlib.sha256(self.payload).hexdigest()
+        self.output = io.StringIO()
+        self.redirect = contextlib.redirect_stderr(self.output)
+        self.redirect.__enter__()
+        self.attempts, self.seen = [], []
+
+    def tearDown(self):
+        self.redirect.__exit__(None, None, None)
+        self.temporary.cleanup()
+
+    def release(self):
+        return {'tag_name': TAG, 'draft': False, 'prerelease': False, 'assets': [
+            {'id': 7, 'name': 'release-manifest.json', 'state': 'uploaded', 'size': 512},
+            {'id': 4242, 'name': 'fixture.tar.gz', 'state': 'uploaded', 'size': len(self.payload)}]}
+
+    def metadata(self, release=None, status=200):
+        return StatusFixture(status, json.dumps(self.release() if release is None else release).encode())
+
+    def opener(self, port):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), core.HTTPSRedirect(),
+                                           RecordingTransport(port, self.seen))
+
+    def download(self, official, metadata, asset=None, *, url=ORIGIN, failures=None):
+        failures = failures or {}
+
+        def factory(cache, target, expected, **options):
+            self.attempts.append(target)
+            downloader = Downloader(cache, target, expected, **options)
+            downloader.pause_retry = lambda attempt: attempt + 1 < core.ATTEMPTS
+            if target in failures:
+                downloader.run = mock.Mock(side_effect=failures[target])
+            elif target == url:
+                downloader.opener = self.opener(official.port)
+            elif target == API_ASSET and asset is not None:
+                downloader.opener = self.opener(asset.port)
+            else:
+                raise AssertionError('unexpected download URL ' + target)
+            return downloader
+        with mock.patch.object(core, 'Downloader', side_effect=factory), \
+                mock.patch.object(core, 'api_opener', lambda: self.opener(metadata.port)):
+            return core.release_download(self.cache, url, self.expected, config_path=self.config)
+
+    def test_official_outage_downloads_the_pinned_asset_through_the_api(self):
+        for status in (503, 504):
+            with self.subTest(status=status), StatusFixture(status) as official, self.metadata() as metadata, \
+                    fixtures.Fixture(self.payload) as asset:
+                self.cache = self.root / f'outage-{status}'
+                self.attempts.clear()
+                self.seen.clear()
+                result = self.download(official, metadata, asset)
+                self.assertEqual(result.read_bytes(), self.payload)
+                self.assertEqual(self.attempts, [ORIGIN, API_ASSET])
+                self.assertEqual(len(official.requests), core.ATTEMPTS)
+                self.assertEqual([path for path, _ in metadata.requests], [TAG_PATH])
+                headers = metadata.requests[0][1]
+                self.assertEqual(headers['Accept'], 'application/vnd.github+json')
+                self.assertEqual(headers['User-Agent'], 'project-aggregation-installer')
+                api = [accept for target, accept in self.seen if target == API_ASSET]
+                self.assertTrue(asset.requests)
+                self.assertEqual(len(api), len(asset.requests))
+                self.assertEqual(set(api), {'application/octet-stream'})
+                self.assertIn('改用 GitHub API 文件接口', self.output.getvalue())
+
+    def test_mirror_fallback_then_official_outage_still_uses_the_api(self):
+        mirror = 'http://127.0.0.1:8090' + SUFFIX
+        self.config.write_text('RELEASE_MIRROR_URL=http://127.0.0.1:8090\nRELEASE_MIRROR_PRIORITY=fallback\n',
+                               encoding='utf-8')
+        self.config.chmod(0o600)
+        with StatusFixture(503) as official, self.metadata() as metadata, fixtures.Fixture(self.payload) as asset:
+            result = self.download(official, metadata, asset,
+                                   failures={mirror: core.DownloadError('download failed: HTTP 404')})
+            self.assertEqual(result.read_bytes(), self.payload)
+            self.assertEqual(self.attempts, [mirror, ORIGIN, API_ASSET])
+
+    def test_terminal_official_failures_never_query_the_api(self):
+        with StatusFixture(404) as official, self.metadata() as metadata:
+            with self.assertRaisesRegex(core.DownloadError, 'HTTP 404'):
+                self.download(official, metadata)
+            self.assertEqual(metadata.requests, [])
+            self.assertEqual(self.attempts, [ORIGIN])
+        with fixtures.Fixture(self.payload, 'bad_sha') as official, self.metadata() as metadata:
+            self.cache = self.root / 'bad-sha'
+            with self.assertRaisesRegex(core.DownloadError, 'SHA256 mismatch'):
+                self.download(official, metadata)
+            self.assertEqual(metadata.requests, [])
+            self.assertFalse((self.cache / (self.expected + '.tar.gz')).exists())
+
+    def test_unusable_release_metadata_keeps_the_original_error(self):
+        def change(path, value):
+            def apply(release):
+                target = release
+                for key in path[:-1]:
+                    target = target[key]
+                if value is KeyError:
+                    del target[path[-1]]
+                else:
+                    target[path[-1]] = value
+            return apply
+        cases = {
+            'tag': change(('tag_name',), 'deploy-' + 'b' * 40), 'draft': change(('draft',), True),
+            'prerelease': change(('prerelease',), True), 'draft-missing': change(('draft',), KeyError),
+            'asset-missing': change(('assets', 1, 'name'), 'other.tar.gz'),
+            'asset-duplicate': lambda release: release['assets'].append(copy.deepcopy(release['assets'][1])),
+            'assets-invalid': change(('assets',), {}), 'state': change(('assets', 1, 'state'), 'starter'),
+            'id-zero': change(('assets', 1, 'id'), 0), 'id-text': change(('assets', 1, 'id'), '4242'),
+            'id-bool': change(('assets', 1, 'id'), True), 'id-float': change(('assets', 1, 'id'), 4242.0),
+            'size-zero': change(('assets', 1, 'size'), 0), 'size-large': change(('assets', 1, 'size'), core.MAX_SIZE + 1),
+            'size-text': change(('assets', 1, 'size'), '180000'),
+        }
+        responses = []
+        for name, mutate in cases.items():
+            release = self.release()
+            mutate(release)
+            responses.append((name, json.dumps(release).encode(), 200, 1))
+        responses += [('json', b'not json', 200, 1), ('oversized', b' ' * (1024 * 1024 + 1), 200, 1),
+                      ('lookup-404', b'{}', 404, 1), ('lookup-503', b'{}', 503, 2)]
+        with StatusFixture(503) as official, StatusFixture(200) as metadata, fixtures.Fixture(self.payload) as asset:
+            for name, body, status, count in responses:
+                with self.subTest(case=name):
+                    metadata.status, metadata.body = status, body
+                    metadata.requests.clear()
+                    self.cache = self.root / name
+                    self.attempts.clear()
+                    self.output.seek(0)
+                    self.output.truncate()
+                    with self.assertRaisesRegex(core.Retryable, 'HTTP 503'):
+                        self.download(official, metadata, asset)
+                    self.assertEqual(self.attempts, [ORIGIN])
+                    self.assertEqual(len(metadata.requests), count)
+                    self.assertEqual(asset.requests, [])
+                    self.assertIn('GitHub API 文件接口下载失败', self.output.getvalue())
+
+    def test_api_asset_hash_mismatch_is_never_promoted(self):
+        with StatusFixture(503) as official, self.metadata() as metadata, \
+                fixtures.Fixture(self.payload, 'bad_sha') as asset:
+            with self.assertRaisesRegex(core.Retryable, 'HTTP 503'):
+                self.download(official, metadata, asset)
+            self.assertEqual(self.attempts, [ORIGIN, API_ASSET])
+            self.assertIn('SHA256 mismatch', self.output.getvalue())
+            self.assertFalse((self.cache / (self.expected + '.tar.gz')).exists())
+
+    def test_cancellation_local_and_os_errors_never_use_the_api(self):
+        with StatusFixture(503) as official, self.metadata() as metadata:
+            for error in (core.Cancelled('cancelled'), core.LocalDownloadError('unsafe cache'), OSError(28, 'disk full')):
+                with self.subTest(phase='official', error=type(error).__name__):
+                    self.attempts.clear()
+                    with self.assertRaises(type(error)):
+                        self.download(official, metadata, failures={ORIGIN: error})
+                    self.assertEqual(metadata.requests, [])
+                    self.assertEqual(self.attempts, [ORIGIN])
+            for error in (core.Cancelled('cancelled'), core.LocalDownloadError('unsafe cache')):
+                with self.subTest(phase='api', error=type(error).__name__):
+                    self.attempts.clear()
+                    with self.assertRaises(type(error)):
+                        self.download(official, metadata, failures={API_ASSET: error})
+                    self.assertEqual(self.attempts, [ORIGIN, API_ASSET])
+
+    def test_other_repositories_and_unpinned_urls_never_use_the_api(self):
+        for url in ('https://github.com/hxx344/other/releases/download/' + TAG + '/fixture.tar.gz',
+                    'https://github.com/hxx344/project-aggregation/releases/latest/download/fixture.tar.gz',
+                    'https://github.com/hxx344/project-aggregation/releases/download/v1.0.0/fixture.tar.gz'):
+            with self.subTest(url=url), StatusFixture(503) as official, self.metadata() as metadata:
+                self.attempts.clear()
+                with self.assertRaisesRegex(core.Retryable, 'HTTP 503'):
+                    self.download(official, metadata, url=url)
+                self.assertEqual(self.attempts, [url])
+                self.assertEqual(metadata.requests, [])
 
 if __name__ == '__main__':
     unittest.main()
