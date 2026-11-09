@@ -161,7 +161,7 @@ test('positioning unavailability explains the shared routing decision without cl
 
 test('positioning invalid symbols have a distinct reason and never reach the network', async () => {
   const mock = fixture([]);
-  for (const quote of [null, {}, { ...quotes.binance, symbol: '' }, { ...quotes.binance, symbol: 'BTC/USDT' }, { ...quotes.binance, symbol: 'A'.repeat(81) }, { ...quotes.binance, symbol: 123 }]) {
+  for (const quote of [null, {}, { ...quotes.binance, symbol: '' }, { ...quotes.binance, symbol: 'BTC/USDT' }, { ...quotes.binance, symbol: 'A'.repeat(161) }, { ...quotes.binance, symbol: 123 }]) {
     assert.match(positioningUnavailableReason(quote), /合约代码格式无效/);
     assert.equal(await fetchPositioning(quote, { ...mock, now }), null);
   }
@@ -192,4 +192,18 @@ test('transport/protocol errors reject, and cancellation reaches the one request
     calls++; signal.throwIfAborted();
   } }), { name: 'AbortError' });
   assert.equal(calls, 1);
+});
+
+test('a Unicode directory contract is queried with an encoded symbol; malformed codes are rejected without fetching', () => {
+  const quote = { exchange: 'binance', symbol: '币安人生USDT', base: '币安人生', quoteCurrency: 'USDT' };
+  assert.equal(positioningUnavailableReason(quote), null);
+  for (const symbol of ['币安人生 USDT', '币安人生/USDT', 'BTC&limit=500', '-BTCUSDT', 'x'.repeat(161)]) {
+    assert.match(positioningUnavailableReason({ ...quote, symbol }), /格式无效/);
+  }
+});
+
+test('the Unicode contract request carries the URL-encoded symbol', async () => {
+  const { calls, fetchImpl } = fixture([{ symbol: '币安人生USDT', longAccount: '0.6', shortAccount: '0.4', longShortRatio: '1.5', timestamp: ts }]);
+  await fetchPositioning({ exchange: 'binance', symbol: '币安人生USDT', base: '币安人生', quoteCurrency: 'USDT' }, { fetchImpl, now });
+  assert.equal(new URL(calls[0][0]).searchParams.get('symbol'), '币安人生USDT');
 });

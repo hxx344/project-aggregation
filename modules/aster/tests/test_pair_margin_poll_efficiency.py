@@ -53,13 +53,15 @@ class PairMarginPollEfficiencyTests(TestCase):
         for side, broker in self.brokers.items():
             original = broker.api.call
 
-            def call(method, path, params=None, *, signed=False, weight=1, timeout=None, side=side, original=original):
+            def call(method, path, params=None, *, signed=False, weight=1, timeout=None, before_send=None,
+                     side=side, original=original):
                 if path == INCOME:
                     api = self.brokers[side].api
                     api.budget.reserve(weight)
                     api.calls.append((method, path, api.budget._priority_flags()))
                     return deepcopy(self.income_rows[side])
-                return original(method, path, params, signed=signed, weight=weight, timeout=timeout)
+                return original(method, path, params, signed=signed, weight=weight, timeout=timeout,
+                                before_send=before_send)
 
             broker.api.call = call
 

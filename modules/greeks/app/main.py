@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 
-from .bybit import BybitError
+from .bybit import BybitError, BybitRejected
 from .config import get_settings
 from .engine import TradingEngine
 from .execution_activity import ACTIVE_EXECUTIONS, execution_dashboard
@@ -394,6 +394,9 @@ async def rfq_create(request: RfqCreateRequest):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except BybitRejected as exc:
+        # A definitive refusal: the engine already allows a new inquiry.
+        raise HTTPException(status_code=400, detail=f"Bybit 拒绝创建询价：{exc}") from exc
     except BybitError as exc:
         raise HTTPException(status_code=502, detail=f"Bybit error: {exc}") from exc
 

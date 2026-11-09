@@ -31,7 +31,7 @@ function validateMarket(market) {
     const currencies = ['binance', 'aster'].includes(market.exchange) ? ['USDT', 'USDC', 'USD1'] : market.exchange === 'entropy' ? ['USDC', 'USD'] : ['USDT', 'USDC'];
     if (!currencies.includes(market.quoteCurrency)) throw unsupported('该计价币的成交价历史接口尚未核实。');
   }
-  if (market.exchange === 'gate' && (market.quoteCurrency !== 'USDT' || !/^[A-Z0-9._]+_USDT$/.test(market.symbol))) throw unsupported('Gate 暂只接入 USDT 永续成交价历史。');
+  if (market.exchange === 'gate' && (market.quoteCurrency !== 'USDT' || !(perpetualContractSymbolPattern.test(market.symbol) && market.symbol.endsWith('_USDT')))) throw unsupported('Gate 暂只接入 USDT 永续成交价历史。');
   if (market.exchange === 'bitget' && market.productType !== undefined && market.productType !== `${market.quoteCurrency}-FUTURES`) throw Error('Bitget 产品类型不匹配');
   if (market.exchange === 'entropy' && !/^io:[A-Za-z0-9._-]+$/.test(market.symbol)) throw Error('Entropy 合约命名空间不匹配');
 }

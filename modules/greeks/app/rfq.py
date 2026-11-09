@@ -4,11 +4,17 @@ from datetime import datetime, timezone
 from math import isclose, isfinite
 from uuid import uuid4
 
+from .bybit import BybitRejected, BybitRequestNotSent
 from .models import Position, RfqCreateRequest, RfqExecuteRequest, RfqCancelRequest
 from .risk import leg_count, maximum_loss, strategy_mode as validate_mode, validate_structure
 
 
 RFQ_TERMINAL_STATUSES = {"Canceled", "Expired", "Filled", "Failed"}
+# A create request finishes within its 12-second HTTP timeout. An inquiry that
+# realtime and history both still miss this long after the persisted creation
+# time was never created; even if it existed, only this account could execute
+# its quotes, so it cannot change positions while the engine ignores it.
+RFQ_CREATION_CHECK_SECONDS = 120
 
 
 class RfqMixin:
@@ -100,7 +106,14 @@ class RfqMixin:
                           "status": "CreationUnknown", "counterparties": counterparties, "legs": legs,
                           "quotes": [], "created_at": datetime.now(timezone.utc).isoformat()}
         self._save_state()
-        result = await self.client.create_rfq(counterparties, legs, rfq_link_id, strategy_type)
+        try:
+            result = await self.client.create_rfq(counterparties, legs, rfq_link_id, strategy_type)
+        except BybitRejected as exc:
+            self._settle_rfq_creation(f"Bybit 拒绝创建询价（retCode {exc.ret_code}）：{exc}")
+            raise
+        except BybitRequestNotSent as exc:
+            self._settle_rfq_creation(f"询价请求未发送：{exc}")
+            raise
         if result.get("rfqLinkId") not in (None, "", rfq_link_id):
             raise ValueError("RFQ creation returned a different inquiry link; reconciliation required")
         if not isinstance(result.get("rfqId"), str) or not result["rfqId"]:
@@ -110,6 +123,24 @@ class RfqMixin:
         self._save_state()
         self.log("INFO", f"RFQ created: {self.rfq_state['rfq_id']}")
         return deepcopy(self.rfq_state)
+
+    def _settle_rfq_creation(self, reason: str) -> None:
+        """Record a creation that provably did not take effect; a new RFQ may follow."""
+        self.rfq_state.update({"status": "Failed", "creation_failed": reason, "execution_resolved": True,
+                               "updated_at": datetime.now(timezone.utc).isoformat()})
+        self._save_state()
+        self.log("WARNING", f"RFQ creation did not take effect: {reason}")
+
+    def _rfq_creation_expired(self, state: dict) -> bool:
+        if state.get("status") != "CreationUnknown" or state.get("rfq_id"):
+            return False
+        try:
+            created = datetime.fromisoformat(str(state.get("created_at")))
+        except ValueError:
+            return False
+        if created.tzinfo is None:
+            return False
+        return (datetime.now(timezone.utc) - created).total_seconds() >= RFQ_CREATION_CHECK_SECONDS
 
     async def refresh_rfq(self) -> dict:
         if self.lock.locked() or self._trade_admitting or getattr(self, "_rfq_refreshing", False):
@@ -169,6 +200,10 @@ class RfqMixin:
             if historical and historical.get("status") in RFQ_TERMINAL_STATUSES:
                 item = historical
         if item is None:
+            if self._rfq_creation_expired(snapshot):
+                # Bounded check window: both lookups by the original link, made
+                # well after the request ended, prove the creation did not land.
+                return {"creation_absent": True}, None
             if self._rfq_unresolved(snapshot):
                 raise ValueError("RFQ remains unknown in exchange realtime and history")
             return None, None
@@ -184,6 +219,19 @@ class RfqMixin:
 
     def _apply_rfq_observation(self, item: dict | None, quotes: list | None) -> dict:
         if item is None:
+            return deepcopy(self.rfq_state)
+        if item.get("creation_absent"):
+            if self.rfq_state.get("status") == "CreationUnknown" and not self.rfq_state.get("rfq_id"):
+                # Release the shared unknown write first: if that fails, the
+                # state stays unknown and the next refresh retries both steps.
+                # resolved_rfq is a silent no-op while protection is not ready;
+                # settling then would leave the shared row unknown with no
+                # later import to release it, blocking every account write.
+                writer = self.account_writer
+                if writer.enabled and not writer.ready:
+                    return deepcopy(self.rfq_state)
+                writer.resolved_rfq(self.rfq_state)
+                self._settle_rfq_creation(f"创建后 {RFQ_CREATION_CHECK_SECONDS} 秒内交易所实时与历史记录均查不到该询价，按未创建处理")
             return deepcopy(self.rfq_state)
         status = item["status"]
         # Terminal observations cannot regress when the exchange serves lagging data.

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
-from app.bybit import BybitClient, BybitError
+from app.bybit import BybitClient, BybitError, BybitRejected, BybitRequestNotSent
 from app.config import Settings
 from app.engine import TradingEngine
 from app.models import CloseRequest, OpenRequest, RfqCancelRequest, RfqCreateRequest, RfqExecuteRequest
@@ -107,6 +107,77 @@ class ReconciliationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.engine.rfq_state["rfq_id"], "recovered")
         self.engine.client.rfq_realtime.assert_awaited_once_with(rfq_link_id=state["rfq_link_id"])
         self.engine.client.create_rfq.assert_awaited_once()
+
+    async def test_definitive_creation_failures_release_rfq_for_a_new_inquiry(self):
+        self.engine.client.rfq_config = AsyncMock(return_value={"counterparties": ["desk"]})
+        failures = (BybitRejected("counterparty unavailable", 110302), BybitRequestNotSent("maintenance"))
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                self.engine.rfq_state = {}
+                self.engine.client.create_rfq = AsyncMock(side_effect=failure)
+                with self.assertRaises(type(failure)):
+                    await self.engine.create_rfq(RfqCreateRequest(quantity=0.01))
+                state = TradingEngine(self.settings).rfq_state
+                self.assertEqual(state["status"], "Failed")
+                self.assertTrue(state["creation_failed"])
+                self.assertFalse(self.engine._rfq_unresolved())
+                # Never polled: the creation is settled locally, not by lookups.
+                self.assertFalse(self.engine._rfq_needs_refresh(state))
+        self.engine.client.create_rfq = AsyncMock(return_value={"rfqId": "rfq-new", "status": "Active"})
+        created = await self.engine.create_rfq(RfqCreateRequest(quantity=0.01))
+        self.assertEqual(created["rfq_id"], "rfq-new")
+
+    async def test_unseen_creation_is_released_only_after_bounded_check_window(self):
+        self.engine.client.rfq_config = AsyncMock(return_value={"counterparties": ["desk"]})
+        self.engine.client.create_rfq = AsyncMock(side_effect=httpx.ReadTimeout("lost"))
+        with self.assertRaises(httpx.ReadTimeout):
+            await self.engine.create_rfq(RfqCreateRequest(quantity=0.01))
+        resolved = Mock()
+        self.engine.account_writer.resolved_rfq = resolved
+        await self.engine.reconcile_once()
+        self.assertEqual(self.engine.rfq_state["status"], "CreationUnknown")
+        self.assertIsNotNone(self.engine.reconciliation_health()["error"])
+        resolved.assert_not_called()
+        aged = datetime.now(timezone.utc) - timedelta(seconds=121)
+        self.engine.rfq_state["created_at"] = aged.isoformat()
+        await self.engine.reconcile_once()
+        self.assertEqual(self.engine.rfq_state["status"], "Failed")
+        self.assertIn("120 秒", self.engine.rfq_state["creation_failed"])
+        self.assertFalse(self.engine._rfq_unresolved())
+        resolved.assert_called_once()
+        self.engine.client.create_rfq.assert_awaited_once()
+
+    async def test_creation_window_waits_for_ready_account_protection_before_release(self):
+        # A not-ready writer silently skips the shared release; settling then
+        # would leave the shared unknown row with nothing left to import it.
+        self.engine.client.rfq_config = AsyncMock(return_value={"counterparties": ["desk"]})
+        self.engine.client.create_rfq = AsyncMock(side_effect=httpx.ReadTimeout("lost"))
+        with self.assertRaises(httpx.ReadTimeout):
+            await self.engine.create_rfq(RfqCreateRequest(quantity=0.01))
+        writer = self.engine.account_writer
+        resolved = Mock()
+        aged = datetime.now(timezone.utc) - timedelta(seconds=121)
+        self.engine.rfq_state["created_at"] = aged.isoformat()
+        with patch.object(writer, "enabled", True), patch.object(writer, "ready", False), \
+                patch.object(writer, "resolved_rfq", resolved):
+            await self.engine.reconcile_once()
+            self.assertEqual(self.engine.rfq_state["status"], "CreationUnknown")
+            self.assertTrue(self.engine._rfq_unresolved())
+            resolved.assert_not_called()
+            writer.ready = True
+            await self.engine.reconcile_once()
+        self.assertEqual(self.engine.rfq_state["status"], "Failed")
+        resolved.assert_called_once()
+
+    async def test_creation_window_never_releases_a_known_inquiry_or_other_unknown(self):
+        aged = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+        for state in ({"rfq_id": "rfq-1", "rfq_link_id": "link", "status": "CreationUnknown", "created_at": aged},
+                      {"rfq_id": "rfq-1", "status": "CancelUnknown", "created_at": aged}):
+            with self.subTest(status=state["status"]):
+                self.engine.rfq_state = dict(state)
+                await self.engine.reconcile_once()
+                self.assertEqual(self.engine.rfq_state["status"], state["status"])
+                self.assertTrue(self.engine._rfq_unresolved())
 
     async def test_wrong_identity_or_missing_history_never_releases_rfq(self):
         self.rfq()

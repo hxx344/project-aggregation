@@ -1,4 +1,5 @@
 import { createCexFundingHistoryReader } from '../lib/exchange-funding-cex.ts';
+import { perpetualContractSymbolPattern } from '../lib/perpetual-chart-state.ts';
 import { parseLighterFundingHistory } from '../lib/exchange-funding-service.ts';
 
 const HOUR = 3_600_000;
@@ -56,7 +57,7 @@ function validateMarket(market) {
   }
   if (market.exchange === 'gate') {
     // The connected Gate directory contains USDT linear contracts only.
-    if (market.quoteCurrency !== 'USDT' || !/^[A-Z0-9._]+_USDT$/.test(market.symbol)) throw unsupported('Gate 暂只支持已接入的 USDT 永续合约历史资金费。');
+    if (market.quoteCurrency !== 'USDT' || !(perpetualContractSymbolPattern.test(market.symbol) && market.symbol.endsWith('_USDT'))) throw unsupported('Gate 暂只支持已接入的 USDT 永续合约历史资金费。');
     return;
   }
   if (market.exchange === 'hyperliquid' || market.exchange === 'entropy') {

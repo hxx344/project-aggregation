@@ -1,6 +1,7 @@
 import { PerpetualWebSocket } from './perpetual-socket.mjs';
 import { quoteCurrencyFx } from '../lib/perpetual-fx.ts';
 import { pairTakerFees } from '../lib/perpetual-fees.ts';
+import { perpetualContractSymbolPattern } from '../lib/perpetual-chart-state.ts';
 import { calculatePerpetualExitPnl, perpetualContractIdentity, perpetualExitIdentity, validatePerpetualExitPosition } from '../lib/perpetual-exit.ts';
 
 // One-shot public depth inspection only: no full-market subscriptions or history.
@@ -358,7 +359,7 @@ export function createPerpetualExecutionService({ getQuote, getMarket = () => nu
   function selectLegs(input, closing = false) {
       const legs = ['long', 'short'].map(side => {
         const leg = input?.[side];
-        if (!leg || !IDS.has(leg.exchange) || typeof leg.symbol !== 'string' || !/^[A-Za-z0-9:_.-]{1,100}$/.test(leg.symbol)) throw failure('请选择有效的交易所与合约');
+        if (!leg || !IDS.has(leg.exchange) || typeof leg.symbol !== 'string' || !perpetualContractSymbolPattern.test(leg.symbol)) throw failure('请选择有效的交易所与合约');
         const quote = getQuote?.(leg.exchange, leg.symbol);
         if (!quote || quote.comparable === false) throw failure('合约不在当前可比较目录中');
         if (!closing && quote.delistingAt && quote.delistingAt <= clock()) throw failure('该合约已到下架时间');

@@ -63,3 +63,15 @@ test('unsupported venues, invalid metadata and aborted requests never fetch arbi
   await assert.rejects(read(market('binance'), RANGE, { signal: AbortSignal.abort() }));
   assert.equal(count, 0);
 });
+
+test('a Unicode Gate directory contract reads its price history; malformed codes never fetch', async () => {
+  const symbol = '币安人生_USDT', urls = [];
+  const read = createPerpetualPriceReader({ clock: () => NOW + HOUR / 2, requestSpacingMs: 0, fetchImpl: async input => {
+    const url = new URL(input); urls.push(url);
+    return { ok: true, json: async () => [{ t: (NOW - HOUR) / 1000, c: '1.23' }] };
+  } });
+  await read(market('gate', { symbol }), { from: NOW - HOUR, to: NOW });
+  assert.equal(urls[0].searchParams.get('contract'), symbol);
+  for (const bad of ['币安人生_USDC', '币安人生 _USDT']) await assert.rejects(read(market('gate', { symbol: bad }), RANGE));
+  assert.equal(urls.length, 1);
+});

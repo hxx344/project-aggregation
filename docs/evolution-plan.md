@@ -37,7 +37,8 @@
 | 事项 | 现状 | 退出条件 |
 | --- | --- | --- |
 | 浏览器夹具 | `trading-okx`、`trading-resume`、`hub-positions` 在 PR #249 时于 main 上失败，此后夹具文件未改动，本版未重跑；E3 第二批（2026-11-08）另发现 `aster-monitor-center`（断言"zero capacity and a missing tier: 5x capacity display"）与 `asset-performance`（等待页面元素超时）在单进程和分进程下同样失败，重建 ASTER 与 Asset 前端后仍失败，与进程拓扑无关 | 恢复通过，或记录无法修复的原因 |
-| ASTER 规划补单 | `trading/engine.py` 规划阶段仍 `book.require_fresh()`，行情持续中断时补偿以 10 秒退避等待且不转 attention；配对准入后不复核 BBO（PR #115 登记） | 决定是否在行情长时间中断时转人工；配对发送前是否复核 BBO |
+| ASTER 规划补单 | `trading/engine.py` 规划阶段仍 `book.require_fresh()`，行情持续中断时补偿以 10 秒退避等待且不转 attention；配对准入后不复核 BBO（PR #115 登记）。配对每腿的账户快照已在最终 HTTP 发送前复核代次与 8 秒时效（与单账户一致，`tests/test_pair_final_freshness.py`），BBO 仍只在准入时检查 | 决定是否在行情长时间中断时转人工；配对发送前是否复核 BBO |
+| Greeks 询价创建 | 交易所明确拒绝或请求未发出时立即释放；响应丢失时创建 120 秒后实时与历史均查不到才按未创建释放，写入保护未就绪时继续保持未知。`writer.prepare` 中 `claim`/registry 抛出的 `AccountWriterError`（非 ValueError）同样发生在 HTTP 之前，仍按未知处理，需等 120 秒窗口 | 确认 registry 失败不会留下已登记的意图后，再把这类错误映射为未发送 |
 | OKX 撤单 | 撤单前读单失败仍占撤单预算（PR #116 登记，修复可能造成忙等） | 有界且不忙等的读单失败处理 |
 | 流水线状态 | 未加 `--apply` 时 `activate` 返回 deferred 但不撤销上一提交的成功记录，`status` 可能显示“新提交 + activate ok”（仅显示误导，`inputKey` 含提交不会误命中缓存） | `deferred` 一律清除旧成功记录 |
 | 生产基线 | 服务器状态页（PR #144）与数据面卡顿卡片（PR #197）可读进程资源与 event-loop 延迟，尚未汇总 | 一周以上样本：RSS、event-loop p95、数据库/WAL 大小、摘要年龄、更新回执与恢复时长（需用户环境的脱敏数据） |
@@ -227,5 +228,5 @@ flowchart TD
 | 全仓安全深扫 | 技术演进 F 批次 | 改为按需：鉴权、凭据、交易执行边界的改动已按差异做安全审查；全仓深扫只在用户明确要求时执行 |
 | Asset 大持仓、Greeks 完整 JSON、ASTER 状态体积的规模基准 | 技术演进 D 批次 | 并入第 6 节进入条件，出现变慢证据再测 |
 | 回测账户级指标（统一资本、未实现盈亏） | 技术演进 C 批次 | 按需：原稿即为“若需要”；当前 `optbt/report.py` 的回撤与 Sharpe 按逐笔已平仓盈亏计算，需要账户级口径时再定义 |
-| 中文合约的非图表路径 | PR #109 待确认 | 按需：CrossEx 服务端合约代码、Monitor 的 `crossex-import.ts` 与 `hub-bridge.ts` 仍只接受 ASCII，CrossEx 服务端的合约代码正则本身也是 ASCII；有实际中文合约需求时再放开 |
+| 中文合约的非图表路径 | PR #109 待确认；Monitor 盘口校验、平仓测算、多空账户比、机会提醒规则及 Gate 成交价/资金费历史已改用 `perpetual-chart-state.ts` 的共享 Unicode 语法 | 按需：以下仍只接受 ASCII，均为有意限制：CrossEx 服务端合约代码与 Monitor 的 `crossex-import.ts`、`hub-bridge.ts`、`perpetual-opportunities-v2.mjs`、推送开关（CrossEx 配置只收英文）；`perpetual-opportunities.mjs` 的交易准入；`perpetual-fundamentals.mjs`、`perpetual-quality-service.mjs` 与 `monitor-services.mjs` 按 ASCII ticker 映射 CoinGecko；`perpetual-spot-transfer.mjs`、`perpetual-crossex-eligibility.ts`（CrossEx）；`modules/perpetual/kraken.mjs`（Kraken 自身代码格式）。有实际中文合约需求时再放开 |
 | 按演进项建立工作包、#71/#107 按原验收关闭 | 架构演进待决策第 4 项 | 已完成：#71、#107 均已关闭 |

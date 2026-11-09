@@ -7,13 +7,13 @@ const parameters = ['perpView', 'chartBase', 'chartLong', 'chartShort', 'chartDa
 // 币安人生USDT). Whitespace, controls, URL separators and other punctuation
 // stay rejected; the server reuses this grammar before its directory checks.
 export const perpetualContractSymbolPattern = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,159}$/u;
-const basePattern = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,99}$/u;
+export const perpetualBasePattern = /^[\p{L}\p{N}][\p{L}\p{N}._:-]{0,99}$/u;
 const keyPattern = /^[a-z][a-z0-9-]{0,39}:[\p{L}\p{N}][\p{L}\p{N}._:-]{0,118}$/u;
 
 export function validPerpetualChartSelection(value: unknown): value is PerpetualChartSelection {
   if (!value || typeof value !== 'object') return false;
   const pair = value as PerpetualChartSelection;
-  return typeof pair.base === 'string' && basePattern.test(pair.base)
+  return typeof pair.base === 'string' && perpetualBasePattern.test(pair.base)
     && typeof pair.longKey === 'string' && pair.longKey.length <= 160 && keyPattern.test(pair.longKey)
     && typeof pair.shortKey === 'string' && pair.shortKey.length <= 160 && keyPattern.test(pair.shortKey)
     && pair.longKey.split(':')[0] !== pair.shortKey.split(':')[0]

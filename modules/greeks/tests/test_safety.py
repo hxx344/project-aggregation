@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 from pydantic import ValidationError
 
+from app.bybit import BybitError, BybitRejected, BybitRequestNotSent
 from app.config import Settings
 from app.engine import TradingEngine
 from app.main import app
@@ -157,6 +158,18 @@ class SafetyTests(unittest.TestCase):
                     response = await client.post(path, json={"quantity": "Infinity"})
                     self.assertEqual(response.status_code, 422)
         asyncio.run(run())
+
+    def test_rfq_creation_maps_definitive_refusal_to_400_and_unknown_to_502(self):
+        # The page treats 5xx as an unknown creation and 400 as a closed attempt.
+        async def run(error):
+            with patch("app.main.engine.create_rfq", AsyncMock(side_effect=error)):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+                    return await client.post("/api/rfq/create", json={"quantity": 0.01})
+        rejected = asyncio.run(run(BybitRejected("no counterparty", 10001)))
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn("Bybit 拒绝创建询价", rejected.json()["detail"])
+        self.assertEqual(asyncio.run(run(BybitRequestNotSent("maintenance"))).status_code, 400)
+        self.assertEqual(asyncio.run(run(BybitError("gateway"))).status_code, 502)
 
     def test_strategy_ignores_missing_market_prices(self):
         bad_wing = self.engine.chain[0].model_copy(update={"symbol": "NO-QUOTE", "delta": 0.1, "mark_price": 0})

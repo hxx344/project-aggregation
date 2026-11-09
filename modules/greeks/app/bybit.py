@@ -21,6 +21,14 @@ class BybitRejected(BybitError):
         self.ret_code = ret_code
 
 
+class BybitRequestNotSent(BybitError, ValueError):
+    """A local check refused the write before any HTTP request left the process.
+
+    Still a ValueError, so callers that reported these checks as invalid
+    requests keep doing so; the request certainly never reached Bybit.
+    """
+
+
 # Only codes that prove a pre-execution refusal; anything else (server timeout/internal error,
 # duplicate request, orderLinkId already exists, order still processing, undocumented codes) stays unknown.
 REJECTED_COMMON_RET_CODES = frozenset({10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10017, 10018, 10024, 10027, 10029})
@@ -83,10 +91,13 @@ class BybitClient:
         # httpx preserves mapping insertion order when encoding query params;
         # sign the same order that is sent on the wire.
         query = str(httpx.QueryParams(params))
-        encoded_body = json.dumps(body, separators=(",", ":"), allow_nan=False) if method != "GET" else None
+        try:
+            encoded_body = json.dumps(body, separators=(",", ":"), allow_nan=False) if method != "GET" else None
+        except ValueError as exc:
+            raise BybitRequestNotSent(str(exc)) from exc
         if private:
             if not self.api_key or not self.api_secret:
-                raise BybitError("Bybit API credentials are not configured")
+                raise BybitRequestNotSent("Bybit API credentials are not configured")
             payload = query if method == "GET" else encoded_body
             sign_target = timestamp + self.api_key + str(self.recv_window) + payload
             signature = hmac.new(self.api_secret.encode(), sign_target.encode(), hashlib.sha256).hexdigest()
@@ -101,8 +112,12 @@ class BybitClient:
             request_kwargs["content"] = encoded_body
         writer = self.account_writer if private and method != "GET" and self.account_writer is not None and self.account_writer.enabled else None
         if private and method != "GET" and os.environ.get("WORKSPACE_MANAGED") == "1" and writer is None:
-            raise BybitError("Managed trading request has no account protection")
-        operation = writer.prepare(method, path, body) if writer is not None else None
+            raise BybitRequestNotSent("Managed trading request has no account protection")
+        try:
+            operation = writer.prepare(method, path, body) if writer is not None else None
+        except ValueError as exc:
+            # Admission refused locally (maintenance, identity, missing record).
+            raise BybitRequestNotSent(str(exc)) from exc
         token = self._writer_prepared.set(operation)
         if writer is not None and self._before_account_request not in client.event_hooks["request"]:
             client.event_hooks["request"].append(self._before_account_request)

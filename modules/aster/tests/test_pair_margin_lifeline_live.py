@@ -31,7 +31,9 @@ class _CollateralAPI(OfflineAPI):
         self.credentials = credentials
         self.fail_brackets = False
 
-    def call(self, method, path, params=None, *, signed=False, weight=1, timeout=None):
+    def call(self, method, path, params=None, *, signed=False, weight=1, timeout=None, before_send=None):
+        if before_send is not None:
+            before_send()  # The real API runs it in the final transport hook.
         if path == INCOME or path == BRACKET and self.fail_brackets:
             self.budget.reserve(weight)
             self.calls.append((method, path, self.budget._priority_flags()))

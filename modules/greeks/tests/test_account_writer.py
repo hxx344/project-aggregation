@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import httpx
 
 from app.account_writer import _digest
-from app.bybit import BybitClient, BybitError, BybitRejected
+from app.bybit import BybitClient, BybitError, BybitRejected, BybitRequestNotSent
 from app.config import Settings
 from app.engine import TradingEngine
 from app.models import TradePlanRequest, TradeTaskRequest
@@ -121,6 +121,14 @@ class AccountWriterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Exception):
             await restarted.client.place_limit_order("BTC-OPTION", "Buy", 1, 2, "original-link")
         self.assertEqual(sum(request.method == "POST" for request in self.requests), 1)
+
+    async def test_locally_refused_rfq_creation_is_proven_unsent(self):
+        # The RFQ engine releases a creation only on proven no-send.
+        self.uid = None
+        engine = await self.engine()
+        with self.assertRaises(BybitRequestNotSent):
+            await engine.client.create_rfq([], [], "rfq-link")
+        self.assertTrue(all(request.method == "GET" for request in self.requests))
 
     async def test_explicit_exchange_rejection_does_not_freeze_later_writes(self):
         engine = await self.engine()
