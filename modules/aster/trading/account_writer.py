@@ -280,6 +280,8 @@ class ManagedWriter:
             verified = [row["identity"] for row in self.connections.values() if row["identity"] is not None]
             if verified and (not hasattr(exc, "code") or exc.code == "OPERATION_CONFLICT"):
                 self.registry.freeze(verified, "legacy-conflict")
+        if self.ready:
+            self.settle_discarded()
 
     def _identities(self, ids):
         identities = []
@@ -614,6 +616,87 @@ class ManagedWriter:
                     self.settle_pair(pair, state)
                 elif key.startswith("pair_margin:") and pending and pending.get("status") == "acknowledged":
                     self.settle_transfer(pair, pending)
+
+    @staticmethod
+    def _discarded_operations(pair_id, item):
+        """Operation ids that earlier starts or sends recorded for a discarded batch."""
+        operations = set()
+        pending = item.get("pending")
+        batches = [pending] if isinstance(pending, dict) else []
+        watch = item.get("recovery_watch")
+        if isinstance(watch, dict) and isinstance(watch.get("batches"), list):
+            batches += watch["batches"]
+        for batch in batches:
+            if not isinstance(batch, dict):
+                continue
+            for identity in (batch.get("id"), batch.get("request_id")):
+                if isinstance(identity, str):
+                    operations.add("aster:legacy:pair_runtime:" + pair_id + ":" + identity)
+            if isinstance(batch.get("id"), str):
+                operations.add("aster:pair-leverage:" + batch["id"])
+            legs = [leg for field in ("legs", "repairs") if isinstance(batch.get(field), list)
+                    for leg in batch[field] if isinstance(leg, dict) and isinstance(leg.get("order"), dict)]
+            cids = [leg["order"].get("newClientOrderId") for leg in legs]
+            cids = [cid for cid in cids if isinstance(cid, str)]
+            for cid in cids:
+                operations.update(prefix + cid for prefix in ("aster:legacy:order:", "aster:order:POST:", "aster:order:DELETE:"))
+            originals = batch.get("legs") if isinstance(batch.get("legs"), list) else []
+            groups = [cids, [leg["order"].get("newClientOrderId") for leg in originals
+                             if isinstance(leg, dict) and isinstance(leg.get("order"), dict)]]
+            dispatches = batch.get("writer_dispatches")
+            for dispatch in dispatches if isinstance(dispatches, list) else []:
+                if isinstance(dispatch, dict) and isinstance(dispatch.get("clientOrderIds"), list):
+                    groups.append(dispatch["clientOrderIds"])
+                    if isinstance(dispatch.get("operationId"), str):
+                        operations.add(dispatch["operationId"])
+            for ids in groups:
+                if ids and all(isinstance(cid, str) for cid in ids):
+                    operations.add("aster:batchOrders:POST:" + digest(ids))
+                    if isinstance(batch.get("id"), str):
+                        operations.add("aster:pair-orders:" + batch["id"] + ":" + ":".join(ids))
+        return operations
+
+    def settle_discarded(self):
+        """Close shared unknown operations of pair batches discarded without reconciliation.
+
+        Runs after the writer is ready with an ordinary claim, so a conflict
+        never isolates the accounts. A failure leaves the archive unsettled for
+        the next start; the archive keeps both account ids so a later pair
+        deletion cannot strand it. ADL keeps querying its own frozen copies of
+        these orders; only the shared registry guard is released.
+        """
+        store = self.engine.store
+        try:
+            with store.connect() as db:
+                records = [(row[0], json.loads(row[1])) for row in db.execute(
+                    "SELECT key,data FROM kv WHERE key GLOB 'pair_discarded_orders:*'")]
+        except Exception:
+            return
+        for key, archive in records:
+            pair_id = key.split(":", 1)[1]
+            try:
+                if not isinstance(archive, list):
+                    continue
+                items = [item for item in archive if isinstance(item, dict) and not item.get("writer_settled")]
+                if not items:
+                    continue
+                pair = store.pair(pair_id) or {}
+                ids = sorted({value for item in items for value in (
+                    item.get("long_account_id") or pair.get("long_account_id"),
+                    item.get("short_account_id") or pair.get("short_account_id")) if isinstance(value, str)})
+                if not ids:
+                    continue
+                operations = set().union(*(self._discarded_operations(pair_id, item) for item in items))
+                with self.accounts(ids) as ticket:
+                    if ticket is not None:
+                        for row in self.registry.unresolved(ticket):
+                            if row["operationId"] in operations:
+                                self.registry.resolve(row["operationId"], ticket, outcome="confirmed")
+                for item in items:
+                    item["writer_settled"] = True
+                store.put(key, archive)
+            except Exception:
+                continue
 
     @staticmethod
     def _verified_receipt(order, row):

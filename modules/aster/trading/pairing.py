@@ -15,7 +15,7 @@ from .margin_balance import DEFAULT_MARGIN, validate_margin
 from .margin_control import adl_margin_start_allowed, margin_running, read_control, save_control
 from .models import AccountModeError, TradingError, positive, wire
 
-from .pair_planning import require_no_legacy_orders, require_runtime_symbols
+from .pair_planning import LEGACY_ORDERS_REASON, require_no_legacy_orders, require_runtime_symbols
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, get_symbol_config, validate_symbol
 from .account_writer import protected_pair_id
 # Pair ordinary opening was removed. Stored pairs keep this disabled object
@@ -405,6 +405,50 @@ class PairManager:
             state["adl"] = adl_status_view(self.engine, reader, pair, runtime)
             rows.append({**pair, "adl": validate_adl(pair.get("adl")), "state": state})
         return rows
+
+    def discard_legacy_orders(self):
+        """Drop removed-opening batches and order watches without reconciling them.
+
+        The removed recovery path was the only reader able to settle them, so
+        they would block the pair forever. The originals are archived under
+        pair_discarded_orders:<pair id>; the account writer later settles their
+        shared unknown operations from that archive.
+        """
+        from .store import dumps
+        now = time.time()
+        with self.store.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for key, data in db.execute("SELECT key,data FROM kv WHERE key GLOB 'pair_runtime:*'").fetchall():
+                runtime = json.loads(data)
+                if not isinstance(runtime, dict) or (runtime.get("pending") is None
+                                                     and runtime.get("recovery_watch") is None):
+                    continue
+                pair_id = key.split(":", 1)[1]
+                archive_key = "pair_discarded_orders:" + pair_id
+                row = db.execute("SELECT data FROM kv WHERE key=?", (archive_key,)).fetchone()
+                archive = json.loads(row[0]) if row else []
+                if not isinstance(archive, list):
+                    archive = [archive]
+                member = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
+                member = json.loads(member[0]) if member else {}
+                archive.append({"discarded_at": now, "pending": runtime.get("pending"),
+                                "recovery_watch": runtime.get("recovery_watch"), "writer_settled": False,
+                                "long_account_id": member.get("long_account_id"),
+                                "short_account_id": member.get("short_account_id")})
+                runtime["pending"] = None
+                runtime.pop("recovery_watch", None)
+                # Old in-flight phases would otherwise read as unresolved until the next tick.
+                if (runtime.get("attention") == LEGACY_ORDERS_REASON or runtime.get("reason") == LEGACY_ORDERS_REASON
+                        or runtime.get("phase") in ("submitting", "reconciling", "recovering")):
+                    if runtime.get("attention") == LEGACY_ORDERS_REASON:
+                        runtime.pop("attention")
+                    runtime.update(phase="waiting", reason="旧版本配对开仓遗留记录已丢弃，等待下一次检查")
+                runtime["updated_at"] = now
+                for name, value in ((key, runtime), (archive_key, archive)):
+                    db.execute("INSERT INTO kv VALUES (?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                               (name, dumps(value)))
+                db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
+                    (pair_id, "pair", "已丢弃旧版本配对开仓遗留的未完成批次与订单观察记录，未核对交易所订单；两侧持仓保持不变", now))
 
     def active_for_account(self, account_id):
         pair = self.store.pair_for_account(account_id)

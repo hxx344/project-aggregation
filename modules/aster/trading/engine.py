@@ -1771,6 +1771,7 @@ class Engine:
                 raise TradingError("交易服务正在停止或已停止，请重新创建执行器")
             self.process_lock.acquire()
             try:
+                self.pairs.discard_legacy_orders()
                 self.account_writer.initialize()
                 self.thread = threading.Thread(target=self.run, name="aster-engine", daemon=True)
                 self.thread.start()

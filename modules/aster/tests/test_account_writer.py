@@ -301,6 +301,37 @@ class AccountWriterTests(unittest.TestCase):
         return {"symbol": "XAUUSD1", "phase": "reconciling", "identities": identities,
             "owned": {"LONG": "0", "SHORT": "0"}, "progress": empty_progress(), "pending": pending, "daily_volume": {}}
 
+    def test_discarded_pair_batch_settles_shared_unknown_operations(self):
+        pair = self.pair()
+        state = self.terminal_pair(pair)
+        for leg in state["pending"]["legs"]:
+            leg["receipt"] = None
+        operation = "aster:pair-orders:" + state["pending"]["id"] + ":long-original:short-original"
+        writer = self.engine.account_writer
+        leverage = "aster:pair-leverage:" + state["pending"]["id"]
+        with writer.accounts(["long", "short"]) as ticket:
+            writer.registry.prepare(ticket, operation, {"orders": list(self.orders.values())})
+            writer.registry.import_unknown(ticket, leverage, {"leverage": 5})
+            self.store.put("pair_runtime:gold", state)
+        restarted = self.restart_writer()
+        with restarted.accounts(["long", "short"]) as ticket:
+            unresolved = [row["operationId"] for row in restarted.registry.unresolved(ticket)]
+            self.assertIn(operation, unresolved)
+            self.assertIn(leverage, unresolved)
+            self.assertGreater(len(restarted.registry.unresolved(ticket)), 1)
+        self.engine.pairs.discard_legacy_orders()
+        archive = self.store.get("pair_discarded_orders:gold")
+        self.assertEqual((archive[0]["long_account_id"], archive[0]["short_account_id"]), ("long", "short"))
+        # The archive, not the pair row, names the accounts to settle.
+        with self.store.connect() as db:
+            db.execute("DELETE FROM pair_members WHERE pair_id='gold'")
+            db.execute("DELETE FROM pairs WHERE id='gold'")
+        restarted = self.restart_writer()
+        with restarted.accounts(["long", "short"]) as ticket:
+            self.assertEqual(restarted.registry.unresolved(ticket), [])
+        self.assertIsNone(self.store.get("pair_runtime:gold")["pending"])
+        self.assertTrue(self.store.get("pair_discarded_orders:gold")[0]["writer_settled"])
+
     def test_crash_after_durable_pair_terminal_receipts_settles_parent_and_legacy(self):
         pair = self.pair()
         state = self.terminal_pair(pair)

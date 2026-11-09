@@ -300,8 +300,8 @@ export function pairDataFresh(
     now - timestamp < 8
   );
 }
-// Old ordinary batches or order watches are not resolved by this version;
-// the server refuses start, edits and deletion until an old version clears them.
+// Old ordinary batches or order watches are discarded unreconciled when the
+// server starts; until then it refuses start, edits and deletion.
 const LEGACY_ORDERS = '旧版配对开仓留下的订单记录未处理';
 export function pairLegacyOrders(pair: Pair): boolean {
   // Mirrors require_no_legacy_orders: any non-null record blocks changes.
