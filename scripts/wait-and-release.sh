@@ -18,7 +18,7 @@ while true; do
   elapsed=$(($(date +%s) - start_time))
 
   # 获取 CI run
-  ci_runs=$(gh run list --commit "$commit_sha" --workflow=ci.yml --json status,conclusion,databaseId --limit 1)
+  ci_runs=$(gh run list --commit "$commit_sha" --workflow=ci.yml --branch main --json status,conclusion,databaseId --limit 1)
 
   if [ "$(echo "$ci_runs" | jq length)" -eq 0 ]; then
     if [ $elapsed -gt 180 ]; then
