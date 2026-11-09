@@ -49,7 +49,7 @@ async (page) => {
   const section = page.locator('section.trading-hynix-positions');
   const oilRows = page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions) .trading-position-table tbody tr');
   await page.setViewportSize({ width: 1440, height: 1000 });
-  await page.goto(`${origin}/?view=trading&tradingSection=legs`);
+  await page.goto(`${origin}/?view=trading&tradingSection=trade`);
   await section.getByRole('heading', { name: '海力士仓位', exact: true }).waitFor();
   assert(await oilRows.count() === 4, 'oil table keeps exactly its four legs');
   assert(!(await page.locator('section.trading-positions:not(.trading-hynix-positions):not(.trading-anthropic-positions)').innerText()).includes('SKHY'), 'SK hynix rows never enter the oil table');

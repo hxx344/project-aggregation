@@ -75,7 +75,7 @@ async page => {
     check(await page.getByRole('tab', { name: '价差下单', exact: true }).getAttribute('aria-selected') === 'true', 'unqualified entry restores trading tab');
     check(await form.getByRole('button', { name: '平仓', exact: true }).getAttribute('aria-pressed') === 'true', 'close action survives a new visit');
     check(await form.getByRole('button', { name: '逐腿填写', exact: true }).getAttribute('aria-pressed') === 'true', 'sizing choice survives');
-    await page.getByRole('tab', { name: '套利仓位', exact: true }).click();
+    await page.getByRole('tab', { name: '盈亏资金费', exact: true }).click();
     await page.getByRole('group', { name: '交易所组合', exact: true }).waitFor();
     await page.goto(`${origin}/?view=trading&tradingSection=positions`);
     check(await page.getByRole('tab', { name: '全部仓位', exact: true }).getAttribute('aria-selected') === 'true', 'explicit section overrides saved selection');

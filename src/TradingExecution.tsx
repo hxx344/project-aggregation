@@ -122,7 +122,7 @@ const LighterConnectionForm = memo(function LighterConnectionForm({ connection, 
   return <form className="execution-connection" onSubmit={save} aria-label="Lighter RH 实盘账户连接">
     <div className="execution-connection-title"><h4>Lighter RH</h4><span className={`execution-badge ${connection.connected ? 'connected' : ''}`}>{connection.connected ? '已连接' : '未连接'}</span></div>
     {connection.connected ? <p className="execution-account-identity">API Key · 钱包 {connection.identity ?? '未返回'} · 账户#密钥索引 {connection.keyLabel ?? '未返回'}<small>验证时间：{date(connection.verifiedAt)}（北京时间）</small></p>
-      : <p className="execution-help">在 robinhoodchain.lighter.xyz 的 API Keys 页面为账户创建 API Key，填写钱包地址、账户索引、API Key 索引与 API 私钥（不是钱包私钥）。本系统只用它下单和撤单；请为本系统单独使用一个 API Key 索引，与其他程序共用会造成 nonce 冲突而被拒单。交易 ANTHROPIC（USDG 结算），按账户当前杠杆成交，本系统不修改杠杆。钱包地址同时用于「套利仓位」标签中 Anthropic 仓位与强平预警的读取。</p>}
+      : <p className="execution-help">在 robinhoodchain.lighter.xyz 的 API Keys 页面为账户创建 API Key，填写钱包地址、账户索引、API Key 索引与 API 私钥（不是钱包私钥）。本系统只用它下单和撤单；请为本系统单独使用一个 API Key 索引，与其他程序共用会造成 nonce 冲突而被拒单。交易 ANTHROPIC（USDG 结算），按账户当前杠杆成交，本系统不修改杠杆。钱包地址同时用于右侧「套利仓位」中 Anthropic 仓位与强平预警的读取。</p>}
     {connection.locked ? <p className="execution-warning">存在未结束或待核对的执行，完成对账前不能替换或断开连接。</p> : null}
     <fieldset disabled={locked}>
       <label>Lighter 钱包地址（L1）<input type="text" autoComplete="off" spellCheck={false} maxLength={42} placeholder="0x 开头 40 位十六进制" value={address} onChange={event => setAddress(event.target.value)} required /></label>
