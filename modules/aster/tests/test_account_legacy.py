@@ -185,7 +185,7 @@ class PairCreationLegacyTests(TestCase):
 
     def create(self):
         return self.engine.pairs.create({"id": "gold", "name": "黄金配对", "long_account_id": "test",
-                                         "short_account_id": "second", "ordinary": {"enabled": True}})
+                                         "short_account_id": "second"})
 
     def test_held_or_malformed_single_account_progress_blocks_pair_creation(self):
         for progress in ({"quantities": {"LONG": "0.001"}}, {"quantities": {"LONG": "bad"}},

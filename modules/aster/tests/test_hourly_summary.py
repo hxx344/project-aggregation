@@ -436,13 +436,11 @@ class MarginOnlyHourlySummaryTests(unittest.TestCase):
         self.assertNotIn("12,345.00", text)
 
     def test_trade_modes_pending_and_legacy_cycle_evidence_keep_trade_evidence(self):
-        for guard in ("ordinary", "margin_disabled", "pending", "legacy_attention", "long_holding", "short_holding"):
+        for guard in ("margin_disabled", "pending", "legacy_attention", "long_holding", "short_holding"):
             with self.subTest(guard=guard):
                 state = margin_only_state()
                 pair = state["pairs"][0]
-                if guard == "ordinary":
-                    pair[guard]["enabled"] = True
-                elif guard == "margin_disabled":
+                if guard == "margin_disabled":
                     pair["margin"]["enabled"] = False
                 elif guard == "pending":
                     pair["state"]["pending"] = {"id": "unfinished-order"}
@@ -455,6 +453,17 @@ class MarginOnlyHourlySummaryTests(unittest.TestCase):
                 self.assertIn("可用保证金\n1.00", text)
                 self.assertIn("持仓  多 91 / 空 92", text)
                 self.assertNotIn("资金余额", text)
+
+    def test_stored_legacy_ordinary_flag_no_longer_selects_trade_evidence(self):
+        # Pairs cannot place ordinary orders any more; an old enabled flag must not hide current funds.
+        state = margin_only_state()
+        state["pairs"][0]["ordinary"]["enabled"] = True
+        text = rendered(state)
+        self.assertIn("实盘合计浮盈亏 · USD1\n9.25", text)
+        self.assertIn("可用保证金\n812.34", text)
+        self.assertIn("资金余额 15 秒前 · 定时检查", text)
+        self.assertNotIn("-1,997.00", text)
+        self.assertNotIn("可用保证金\n1.00", text)
 
 
 if __name__ == "__main__":

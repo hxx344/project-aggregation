@@ -5,9 +5,10 @@ import time
 from unittest import TestCase
 from unittest.mock import patch
 
-from tests import test_pair_budget as fixtures
+from tests import pair_fixtures as fixtures
 from trading.margin_balance import MarginBalancer
 from trading.models import dec
+from trading.pair_planning import LEGACY_ORDERS_REASON
 from tests.pair_legacy_fixtures import runtime_default
 
 
@@ -30,7 +31,6 @@ class PairMarginPollEfficiencyTests(TestCase):
         for side in self.brokers:
             self.store.save_account({**self.store.account(side), "mode": "live"})
         self.engine.live_allowed = lambda account: True
-        self.pair["ordinary"]["enabled"] = True
         self.pair["margin"].update(enabled=True, master_env_prefix="ASTER_MASTER")
         self.pair = self.store.save_pair(self.pair)
         self.engine.capacities = lambda symbol: {5: dec(0), 10: dec(0), 20: dec(0)}
@@ -113,7 +113,8 @@ class PairMarginPollEfficiencyTests(TestCase):
             state = self.tick()
             self.assertEqual(state["margin"]["status"], "skipped" if index == 0 else "paused")
             self.assertEqual(state["margin"]["blocks_trading"], index == 0)
-            self.assertEqual(state["phase"], "margin_wait" if index == 0 else "paused")
+            # A paused pair reports its pause; the skip stays in its margin view.
+            self.assertEqual(state["phase"], "paused")
             self.advance(5)
         self.assertEqual(len(self.calls(ACCOUNT)), 2)
         self.assertEqual(self.calls(INCOME), [])
@@ -125,25 +126,27 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertEqual(journal["last_transfer"]["status"], "skipped")
         self.assertNotIn("confirmed_at", journal["last_transfer"])
 
-    def test_reconciliation_completion_ends_turn_and_next_turn_reads_both_accounts(self):
-        self.tick()  # Seed an ordinary negative observation that must be discarded.
+    def test_reconciliation_completion_ends_turn_and_next_due_check_reads_both_accounts(self):
+        self.tick()
         before = len(self.calls(ACCOUNT))
         record = self.pending()
         for side, sign in (("long", -1), ("short", 1)):
             self.income_rows[side] = [{"incomeType": "SUBUSER_ASSET_TRANSFER", "asset": "USD1",
                 "income": str(10 * sign), "tranId": "123", "time": int(record["created_at"] * 1000)}]
-        with patch.object(self.trader, "_start", side_effect=AssertionError("no orders on reconciliation turn")):
-            state = self.tick()
+        state = self.tick()
         self.assertEqual(state["margin"]["status"], "confirmed")
         self.assertTrue(state["margin"]["blocks_trading"])
         self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
         self.assertEqual(len(self.calls(ACCOUNT)), before)
         self.assertEqual(len(self.calls(INCOME)), 2)
+        self.tick()  # The next balance check waits for its interval.
+        self.assertEqual(len(self.calls(ACCOUNT)), before)
+        self.advance(5)
         self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), before + 2)
         self.assert_read_only()
 
-    def test_acknowledged_reads_each_account_once_then_requires_another_trading_read(self):
+    def test_acknowledged_reads_each_account_once_then_waits_for_next_balance_check(self):
         self.pending("acknowledged")
         state = self.tick()
         self.assertEqual(state["margin"]["status"], "acknowledged")
@@ -151,12 +154,13 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertEqual(self.calls(INCOME), [])
         self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
         self.tick()
+        self.assertEqual(len(self.calls(ACCOUNT)), 2)
+        self.advance(5)
+        self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), 4)
         self.assert_read_only()
 
     def monitor_wait(self, *, cooldown=False):
-        self.pair["ordinary"]["enabled"] = False
-        self.pair = self.store.save_pair(self.pair)
         self.store.put("pair_margin:gold", {
             "cooldown_until" if cooldown else "next_check_at": self.wall + 120})
         self.assertEqual(self.tick()["phase"], "monitoring")
@@ -227,16 +231,24 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertFalse(state["margin"]["blocks_trading"])
         self.assert_read_only()
 
-    def test_only_trading_enable_requires_position_read_during_funds_wait(self):
+    def test_account_events_and_config_changes_do_not_read_during_funds_wait(self):
         self.monitor_wait()
-        self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
-        self.tick()
+        for event in ("ACCOUNT_UPDATE", "ACCOUNT_CONFIG_UPDATE"):
+            self.brokers["long"]._private_account_event(event)
+            self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), 0)
         self.pair = self.store.save_pair({**self.pair, "name": "updated monitoring"})
         self.tick()
+        self.assertEqual(self.calls(), [])
+
+    def test_account_event_does_not_postpone_existing_margin_deadline(self):
+        self.monitor_wait()
+        self.store.put("pair_margin:gold", {"next_check_at": self.wall + 5})
+        self.advance(4)
+        self.brokers["long"]._private_account_event("ACCOUNT_UPDATE")
+        self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), 0)
-        self.pair["ordinary"]["enabled"] = True
-        self.pair = self.store.save_pair(self.pair)
+        self.advance(2)
         self.tick()
         self.assertEqual(len(self.calls(ACCOUNT)), 2)
         self.assert_read_only()
@@ -261,8 +273,6 @@ class PairMarginPollEfficiencyTests(TestCase):
         self.assertEqual(self.calls(), [])
 
     def test_event_after_balance_read_revokes_transfer_authority(self):
-        self.pair["ordinary"]["enabled"] = False
-        self.pair = self.store.save_pair(self.pair)
         self.store.put("pair_margin:gold", {})
         publish = self.trader._publish_balances
 
@@ -291,15 +301,17 @@ class PairMarginPollEfficiencyTests(TestCase):
                 self.assertIn("无效", state["reason"])
         self.assertEqual(self.calls(), [])
 
-    def test_pending_transfer_keeps_its_read_only_priority_with_orders_and_holdings(self):
+    def test_pending_transfer_keeps_its_read_only_priority_with_legacy_orders(self):
         self.pending(wait=5)
         _, _, identities = self.trader._members(self.pair)
         state = runtime_default()
         state["pending"] = {"identities": identities}
         self.store.put("pair_runtime:gold", state)
-        with patch.object(self.trader, "_recover") as recover:
-            result = self.tick()
-        recover.assert_called_once()
+        result = self.tick()
+        # Old order batches stop the pair for review; the transfer is still tracked.
+        self.assertEqual(result["phase"], "attention")
+        self.assertEqual(result["reason"], LEGACY_ORDERS_REASON)
+        self.assertEqual(result["pending"], state["pending"])
         self.assertEqual(result["margin"]["status"], "accepted")
         self.assertTrue(result["margin"]["blocks_trading"])
         self.assertEqual(self.calls(), [])

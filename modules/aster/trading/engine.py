@@ -145,8 +145,6 @@ class Engine:
         self.deleted_accounts = set()
         self.markets, self.views, self.rotation = {}, {}, {}
         self.display_snapshots = {}
-        self.pair_watch_diagnostics = {}
-        self.pair_watch_diagnostic_lock = threading.Lock()
         self.account_work = {}
         self._adl_wakes = set()
         from .adl import AdlController
@@ -394,8 +392,8 @@ class Engine:
             else:
                 work.priority_levels.pop(intent["symbol"], None)
 
-    def fast_capacity_targets(self, accounts, pairs=None):
-        """Share one capacity feed across ordinary accounts and pairs."""
+    def fast_capacity_targets(self, accounts):
+        """Share one capacity feed across ordinary single accounts."""
         targets = {}
         for account in accounts:
             if (not account["enabled"] or not self.live_allowed(account)
@@ -403,21 +401,6 @@ class Engine:
                 continue
             for symbol in ordinary_add_symbols(account):
                 targets.setdefault(symbol, set()).add(5)
-        owners = {account["id"]: account for account in accounts}
-        for pair in self.store.pairs() if pairs is None else pairs:
-            if not pair["enabled"]:
-                continue
-            symbol = pair.get("symbol", "XAUUSD1")
-            runtime = self.store.get("pair_runtime:" + pair["id"]) or {}
-            # The durable intent precedes dispatch and survives unknown results,
-            # repairs and restarts. Only this consumer yields its fast feed.
-            if runtime.get("pending"):
-                continue
-            members = [owners.get(pair[key]) for key in ("long_account_id", "short_account_id")]
-            if any(member is None or not self.live_allowed(member) for member in members):
-                continue
-            if pair["ordinary"]["enabled"]:
-                targets.setdefault(symbol, set()).update(leverage_candidates(pair["ordinary"]["min_open_leverage"]))
         return targets
 
     def capacity_interval(self, symbol):
@@ -563,16 +546,6 @@ class Engine:
             if accounts is None:
                 accounts = self.store.accounts()
             interval = self.capacity_interval(symbol)
-            pairs = self.store.pairs()
-            if pairs:
-                # A worker may have been queued before a pair persisted its
-                # intent. Recheck before HTTP; never cancel an in-flight sample.
-                accounts = self.store.accounts()
-                targets = self.fast_capacity_targets(accounts, pairs).get(symbol, set())
-                if not targets:
-                    interval = max(interval, CAPACITY_POLL_INTERVAL)
-                    if time.monotonic() - self.capacity_sample_started.get(symbol, -math.inf) < interval:
-                        return interval
             self.capacity_sample_started[symbol] = time.monotonic()
             full = time.monotonic() - self.capacity_full_checked.get(symbol, -math.inf) >= CAPACITY_POLL_INTERVAL
             tiers = set(TIERS) | targets if full or not targets else targets
@@ -1640,7 +1613,7 @@ class Engine:
                                         self.account_work.pop(aid, None)
                             account_generation = generation
                             accounts_due = time.monotonic() + ACCOUNT_LIST_INTERVAL
-                        targets = self.fast_capacity_targets(saved_accounts, saved_pairs)
+                        targets = self.fast_capacity_targets(saved_accounts)
                         capacity_symbols = self.capacity_market_symbols(saved_accounts)
                         intervals, brackets_interval, poll_enabled = self.capacity_poll_schedule(targets, capacity_symbols)
                         with self.lock:

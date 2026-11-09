@@ -12,7 +12,7 @@ async (page) => {
   const pair = { id: 'gold', name: 'ADL 浏览器隔离配对', long_account_id: 'a', short_account_id: 'b', symbol: 'XAUUSD1',
     enabled: false, revision: 1,
     ordinary: { enabled: false, threshold: '10000', order_notional: '1000', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.0005' },
-    margin: { enabled: false, master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1', max_transfer: '1000', buffer_ratio: '0.05', cooldown_seconds: 30 },
+    margin: { enabled: true, master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1', max_transfer: '1000', buffer_ratio: '0.05', cooldown_seconds: 30 },
     state: { phase: 'paused', reason: '浏览器隔离测试，策略已暂停', snapshots: {}, pending: null,
       adl: { monitoring: { status: 'waiting', reason: '等待两侧账户首次完成 ADL 历史补查', checked_at: null },
         incident: null, report_available: false, pending_event: false, configuration_locked: false, lock_reason: '' } } };

@@ -1,32 +1,24 @@
-"""Unknown-transfer skipping and legacy pending protection with offline brokers."""
+"""Unknown-transfer reservation and skipping for a funds-only pair with offline brokers."""
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
-from dataclasses import replace
-from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
 from tests import test_pair_margin_poll_efficiency as fixtures
 from trading.exchange import ExchangeError
 from trading.margin_balance import MarginBalancer
-from trading.models import TradingError, dec, wire
-from tests.pair_legacy_fixtures import empty_progress, runtime_default
+from trading.models import TradingError
 
 
 SYMBOL = "XAUUSD1"
-ORDER = "/fapi/v3/order"
 
 
 class PairMarginResumeExecutionTests(TestCase):
+    setUp = fixtures.PairMarginPollEfficiencyTests.setUp
     live_brokers = fixtures.PairMarginPollEfficiencyTests.live_brokers
     pending = fixtures.PairMarginPollEfficiencyTests.pending
     calls = fixtures.PairMarginPollEfficiencyTests.calls
     tick = fixtures.PairMarginPollEfficiencyTests.tick
-
-    def setUp(self):
-        fixtures.PairMarginPollEfficiencyTests.setUp(self)
-        # Only the current tier has capacity: no unrelated leverage upgrade.
-        self.engine.capacities = lambda symbol: {5: dec(1000000), 10: dec(0), 20: dec(0)}
 
     def unknown(self, amount="20000", *, ready=True):
         # Model an existing baseline during its bounded retry window. Due
@@ -44,66 +36,40 @@ class PairMarginResumeExecutionTests(TestCase):
 
     def assert_original_transfer_retained(self, original):
         self.assertEqual(self.store.get("pair_margin:gold")["pending"], original)
-        self.assertTrue(all(path == ORDER for _, path, _ in self.posts()))
+        self.assertEqual(self.posts(), [])
 
     def assert_flat(self):
         for broker in self.paper.values():
             self.assertTrue(all(not row.qty for row in broker.snapshot([SYMBOL]).positions))
 
-    def baseline(self):
-        owned = {"LONG": "0.01", "SHORT": "0.01"}
-        for side, broker in self.paper.items():
-            broker.state["positions"][SYMBOL + ":" + side.upper()].update(
-                qty=owned[side.upper()], entry=wire(self.market.book(SYMBOL).mark))
-            broker.save()
-        self.store.put("pair_runtime:gold", {**runtime_default(), "owned": owned,
-                                            "progress": empty_progress(owned)})
-        return owned
-
-    def assert_baseline(self, owned):
-        for side, index in (("long", 0), ("short", 1)):
-            actual = self.paper[side].snapshot([SYMBOL]).pair(SYMBOL)[index].qty
-            self.assertEqual(actual, dec(owned[side.upper()]))
-
-    def test_unknown_debit_reservation_prevents_opening_when_cash_is_insufficient(self):
+    def test_unknown_debit_in_retry_window_is_reserved_and_never_resent(self):
         original = self.unknown("24990")
         state = self.tick()
+        self.assertEqual(state["phase"], "monitoring", state)
         self.assertFalse(state["margin"]["blocks_trading"], state)
         self.assertIsNone(state["pending"])
         self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
-        self.assertIn("暂不新增", state["reason"])
-        self.assertEqual(self.posts(), [])
+        self.assertIn("预留 24990 USD1", state["reason"])
+        self.assertIn("不重发原请求", state["reason"])
         self.assert_flat()
         self.assert_original_transfer_retained(original)
 
-    def assert_opened_pair(self, state):
-        self.assertIsNone(state["pending"], state)
-        self.assertTrue(state["last_batch"]["completed"], state)
-        self.assertGreater(dec(state["owned"]["LONG"]), 0)
-        self.assertEqual(state["owned"]["LONG"], state["owned"]["SHORT"])
-        self.assertEqual(len(self.posts()), 2)
-        for side, broker in self.paper.items():
-            receipts = list(broker.state["orders"].values())
-            self.assertEqual(len(receipts), 1)
-            self.assertEqual(receipts[0]["status"], "FILLED")
-            self.assertEqual(receipts[0]["side"], "BUY" if side == "long" else "SELL")
-        self.assert_baseline(state["owned"])
-
-    def test_balance_preparation_error_still_allows_real_paired_opening(self):
+    def test_balance_preparation_error_waits_without_blocking_or_sending(self):
         self.paper["long"].state["wallet"] = "30000"
         self.paper["long"].save()
         with patch.object(MarginBalancer, "_live", side_effect=ExchangeError(
                 "offline balance preparation unavailable")) as preparation:
             state = self.tick()
         preparation.assert_called_once()
-        self.assert_opened_pair(state)
+        self.assertEqual(state["phase"], "monitoring", state)
         self.assertFalse(state["margin"]["blocks_trading"])
         journal = self.store.get("pair_margin:gold")
         self.assertIsNone(journal.get("pending"))
         self.assertTrue(journal["retry_without_blocking"])
-        self.assertTrue(all(path == ORDER for _, path, _ in self.posts()))
+        self.assertEqual(self.posts(), [])
+        self.assert_flat()
 
-    def test_unknown_without_baseline_is_skipped_after_fresh_reads_and_really_opens(self):
+    def test_unknown_without_baseline_is_skipped_after_fresh_reads_and_never_replayed(self):
         original = self.unknown(ready=False)
         self.store.put("pair_margin:gold", {"pending": original, "next_check_at": 0})
         with ExitStack() as stack:
@@ -114,7 +80,6 @@ class PairMarginResumeExecutionTests(TestCase):
             state = self.tick()
             self.assertEqual(state["phase"], "margin_wait", state)
             self.assertEqual(self.posts(), [])
-            self.assert_flat()
             self.assertTrue(all(read.call_count == 1 for read in baseline_reads))
             self.assertTrue(all(read.call_args.args == () and read.call_args.kwargs == {} for read in baseline_reads))
             journal = self.store.get("pair_margin:gold")
@@ -124,81 +89,18 @@ class PairMarginResumeExecutionTests(TestCase):
             self.assertEqual(journal["last_transfer"]["skipped_at"], self.wall)
             self.assertTrue(state["margin"]["blocks_trading"])
             state = self.tick()
-            self.assert_opened_pair(state)
+            self.assertEqual(state["phase"], "monitoring", state)
+            self.assertFalse(state["margin"]["blocks_trading"])
             transfer.assert_not_called()
             self.assertTrue(all(read.call_count == 1 for read in baseline_reads))
         self.assertIsNone(self.store.get("pair_margin:gold")["pending"])
         self.assertEqual(self.store.get("pair_margin:gold")["last_transfer"], journal["last_transfer"])
-        self.assertTrue(all(path == ORDER for _, path, _ in self.posts()))
+        self.assertEqual(self.posts(), [])
+        self.assert_flat()
 
-    def test_postfill_reserved_margin_violation_reduces_only_this_batch(self):
-        owned = self.baseline()
-        original = self.unknown()
-        submit = self.brokers["long"].submit
-        raw_after_fill = []
-
-        def lose_cash_after_fill(orders, **kwargs):
-            receipt = submit(orders, **kwargs)
-            if orders[0]["side"] == "BUY":
-                self.paper["long"].state["wallet"] = "20100"
-                self.paper["long"].save()
-                raw_after_fill.append(self.paper["long"].snapshot([SYMBOL]))
-            return receipt
-
-        with patch.object(self.brokers["long"], "submit", side_effect=lose_cash_after_fill):
-            state = self.tick()
-        self.assertEqual(len(raw_after_fill), 1, state)
-        self.assertFalse(raw_after_fill[0].margin_exceeds(dec("0.5")))
-        self.assertEqual(state["phase"], "repairing", state)
-        self.assertIn("成交后子账户保证金超限", state["pending"]["last_error"])
-        self.assertEqual(len(state["pending"]["repairs"]), 2)
-        state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assertFalse(state["last_batch"]["completed"])
-        batch = self.store.get("pair_batch:" + state["last_batch"]["id"])
-        for leg, repair in zip(batch["legs"], batch["repairs"]):
-            self.assertEqual(leg["key"], repair["key"])
-            self.assertEqual(leg["receipt"]["executedQty"], repair["order"]["quantity"])
-            self.assertNotEqual(leg["order"]["side"], repair["order"]["side"])
-        self.assertEqual(len(self.posts()), 4)
-        self.assertEqual(state["owned"], owned)
-        self.assert_baseline(owned)
-        self.assert_original_transfer_retained(original)
-
-    def test_balanced_partial_fills_with_unknown_transfer_reduce_without_adoption(self):
-        owned = self.baseline()
-        original = self.unknown()
-        # Thin execution liquidity only in the ledger; the real planner still
-        # sees the earlier full book, just as a market order can lose depth.
-        for broker in self.paper.values():
-            broker.market = SimpleNamespace(rules=self.market.rules,
-                book=lambda symbol: replace(self.market.book(symbol), bid_qty=dec("0.001"), ask_qty=dec("0.001")))
-        state = self.tick()
-        self.assertEqual(state["phase"], "repairing", state)
-        pending = state["pending"]
-        self.assertEqual([dec(leg["receipt"]["executedQty"]) for leg in pending["legs"]], [dec("0.001")] * 2)
-        self.assertTrue(all(leg["receipt"]["status"] != "FILLED" for leg in pending["legs"]))
-        self.assertEqual(len(pending["repairs"]), 2)
-        state = self.tick()
-        self.assertIsNone(state["pending"], state)
-        self.assertFalse(state["last_batch"]["completed"])
-        self.assertEqual(state["owned"], owned)
-        batch = self.store.get("pair_batch:" + state["last_batch"]["id"])
-        self.assertNotIn("position_review", batch)
-        self.assertNotIn("manual_position_reconciliation", batch)
-        self.assertTrue(all(dec(leg["order"]["quantity"]) == dec("0.001") for leg in batch["repairs"]))
-        self.assertEqual(len(self.posts()), 4)
-        self.assert_baseline(owned)
-        self.assert_original_transfer_retained(original)
-
-    def test_paused_enable_requires_baseline_and_does_not_unlock_configure_or_delete(self):
+    def test_paused_enable_starts_funds_but_unknown_still_locks_configure_and_delete(self):
         self.engine.pairs.enable("gold", False)
         original = self.unknown(ready=False)
-        with self.assertRaisesRegex(TradingError, "划转"):
-            self.engine.pairs.enable("gold", True)
-        self.assertFalse(self.store.pair("gold")["enabled"])
-        self.assert_original_transfer_retained(original)
-        original = self.unknown()
 
         class Master:
             def __init__(inner):
@@ -215,19 +117,8 @@ class PairMarginResumeExecutionTests(TestCase):
         def master_context(balancer, pair, members):
             yield Master(), self.master, self.children
 
-        for broker in self.brokers.values():
-            call = broker.api.call
-
-            def with_open_orders(method, path, params=None, *, signed=False, weight=1, timeout=None,
-                                 broker=broker, call=call):
-                if path == "/fapi/v3/openOrders":
-                    broker.api.budget.reserve(weight)
-                    broker.api.calls.append((method, path, broker.api.budget._priority_flags()))
-                    return []
-                return call(method, path, params, signed=signed, weight=weight, timeout=timeout)
-
-            broker.api.call = with_open_orders
         with patch.object(MarginBalancer, "_master", master_context):
+            # Starting funds management is how an unknown transfer gets resolved.
             enabled = self.engine.pairs.enable("gold", True)
             self.assertTrue(enabled["enabled"])
             self.engine.pairs.enable("gold", False)
@@ -237,6 +128,5 @@ class PairMarginResumeExecutionTests(TestCase):
                     action()
         self.assertEqual(self.store.pair("gold")["name"], self.pair["name"])
         self.assertFalse(self.store.pair("gold")["enabled"])
-        self.assertEqual(self.posts(), [])
         self.assert_flat()
         self.assert_original_transfer_retained(original)

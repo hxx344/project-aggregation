@@ -8,8 +8,8 @@ from urllib.parse import parse_qsl
 from eth_account import Account
 import httpx
 
-from tests import test_pair_trading as fixtures
-from tests.test_pair_budget import OfflineAPI
+from tests import pair_fixtures as fixtures
+from tests.pair_fixtures import OfflineAPI
 from trading.exchange import ExchangeError, LiveBroker, RateBudget
 from trading.margin_balance import TransferAPI
 from trading.models import dec, wire
@@ -73,7 +73,6 @@ class PairMarginLifelineLiveTests(TestCase):
             self.brokers[side] = LiveBroker({}, self.market, api=api)
         self.engine.brokers.update(self.brokers)
         self.engine.pairs.trader = self.trader
-        self.pair["ordinary"]["enabled"] = True
         self.pair["margin"].update(enabled=True, master_env_prefix="ASTER_MASTER")
         self.pair = self.store.save_pair(self.pair)
         self.sent = []
@@ -168,9 +167,11 @@ class PairMarginLifelineLiveTests(TestCase):
         self.paper["short"].state["leverages"][SYMBOL] = 10
         self.paper["short"].save()
         self.assert_transferred(self.tick())
+        # Funds-only pairs never compare leverages, so no attention follows.
         state = self.tick()
-        self.assertEqual(state["phase"], "attention", state)
-        self.assertIn("杠杆不一致", state["reason"])
+        self.assertEqual(state["phase"], "monitoring", state)
+        self.assertNotIn("attention", state)
+        self.assertEqual(self.paper["short"].state["leverages"][SYMBOL], 10)
         self.assertEqual(len(self.sent), 1)
         self.assert_no_trades()
 
@@ -179,17 +180,16 @@ class PairMarginLifelineLiveTests(TestCase):
         position.update(qty="0.001", entry=wire(self.market.book(SYMBOL).mark))
         self.paper["long"].save()
         self.assert_transferred(self.tick())
+        # Positions are neither adopted nor reconciled by a funds-only pair.
         state = self.tick()
-        self.assertEqual(state["phase"], "attention", state)
-        self.assertIn("账本不一致", state["reason"])
+        self.assertEqual(state["phase"], "monitoring", state)
+        self.assertNotIn("attention", state)
         self.assertEqual(state["owned"], {"LONG": "0", "SHORT": "0"})
         self.assertEqual(self.paper["long"].state["positions"][SYMBOL + ":LONG"]["qty"], "0.001")
         self.assertEqual(len(self.sent), 1)
         self.assert_no_trades()
 
-    def test_margin_only_transfer_uses_fresh_collateral_reads_and_confirms(self):
-        self.pair["ordinary"]["enabled"] = False
-        self.pair = self.store.save_pair(self.pair)
+    def test_margin_transfer_uses_fresh_collateral_reads_and_confirms(self):
         with ExitStack() as stack:
             reads = []
             for broker in self.brokers.values():
@@ -253,6 +253,9 @@ class PairMarginLifelineLiveTests(TestCase):
         self.assert_no_trades()
 
     def test_member_identity_after_real_signing_prevents_transfer_transport(self):
+        # A started pair has its identities recorded by enable().
+        self.store.put("pair_runtime:gold", {"identities": self.trader._members(self.pair)[2]})
+
         def change_identity():
             broker = self.brokers["short"]
             broker.api.credentials = {**broker.api.credentials, "user": "0x" + "e" * 40}
@@ -261,6 +264,7 @@ class PairMarginLifelineLiveTests(TestCase):
         self.assert_local_transfer_rejection(self.tick())
         state = self.tick()
         self.assertEqual(state["phase"], "attention", state)
+        self.assertIn("真实账户发生变化", state["reason"])
         self.assertEqual(len(self.signed), 1)
         self.assertEqual(self.sent, [])
         self.assert_no_trades()

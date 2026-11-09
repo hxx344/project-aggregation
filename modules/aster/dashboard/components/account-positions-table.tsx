@@ -15,11 +15,7 @@ import {
   strategyPositionLabel,
 } from '@/lib/account-positions';
 
-export type PositionStrategy = {
-  symbol: string;
-  direction: 'LONG' | 'SHORT';
-  marginOnly: boolean;
-};
+export type PositionStrategy = { symbol: string };
 
 export function AccountPositionsTable({
   positions,
@@ -50,13 +46,8 @@ export function AccountPositionsTable({
         </TableHeader>
         <TableBody>
           {positions.map((position) => {
-            const scope = strategy
-              ? strategyPositionLabel(
-                  position,
-                  strategy.symbol,
-                  strategy.direction,
-                  strategy.marginOnly,
-                )
+            const symbolLabel = strategy
+              ? strategyPositionLabel(position, strategy.symbol)
               : null;
             return (
               <TableRow
@@ -67,9 +58,9 @@ export function AccountPositionsTable({
                   <div className="position-market">
                     <strong>{position.symbol}</strong>
                     {stale ? <span className="stale-tag">旧</span> : null}
-                    {scope?.symbolLabel ? (
+                    {symbolLabel ? (
                       <span className="position-strategy-badge">
-                        {scope.symbolLabel}
+                        {symbolLabel}
                       </span>
                     ) : null}
                   </div>
@@ -86,11 +77,6 @@ export function AccountPositionsTable({
                       : position.side === 'SHORT'
                         ? '空仓'
                         : '方向未确认'}
-                    {scope?.directionLabel ? (
-                      <span className="position-managed-direction">
-                        · {scope.directionLabel}
-                      </span>
-                    ) : null}
                   </span>
                 </TableCell>
                 <TableCell className="number">

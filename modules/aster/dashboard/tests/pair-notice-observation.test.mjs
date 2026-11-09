@@ -14,14 +14,13 @@ function pair(state = {}, options = {}) {
   return {
     id: 'pair-a',
     enabled: true,
-    ordinary: { enabled: true },
     margin: { enabled: false },
     state: {
       phase: 'waiting',
       updated_at: 100,
-      snapshots: {
-        long: { timestamp: 100, positions: [] },
-        short: { timestamp: 100, positions: [] },
+      margin_balances: {
+        long: { timestamp: 100 },
+        short: { timestamp: 100 },
       },
       ...state,
     },
@@ -96,9 +95,9 @@ test('clearing past entries neither confirms nor restarts a pending warning', ()
 
 test('each side and runtime has its own timer even while the group warning is active', () => {
   const fixture = pair({
-    snapshots: {
-      long: { timestamp: 1, positions: [] },
-      short: { timestamp: 100, positions: [] },
+    margin_balances: {
+      long: { timestamp: 1 },
+      short: { timestamp: 100 },
     },
   });
   let state = observe(undefined, fixture, 0);
@@ -108,7 +107,7 @@ test('each side and runtime has its own timer even while the group warning is ac
   assert.equal(state.data.short.confirmed, false);
   assert.equal(state.data.runtime.confirmed, false);
   const both = structuredClone(fixture);
-  both.state.snapshots.short.timestamp = 1;
+  both.state.margin_balances.short.timestamp = 1;
   both.state.updated_at = 1;
   state = observe(state, both, 4);
   state = observe(state, both, 6.999);
@@ -138,7 +137,7 @@ test('offline and changing notice text preserve a continuous data anomaly', () =
 test('execution and API failures display immediately alongside an unconfirmed data warning', () => {
   const fixture = pair({
     updated_at: 1,
-    phase: 'reconciling',
+    phase: 'attention',
     pending: { kind: 'ordinary' },
     reason: '原订单读取失败',
     api_notice: { kind: 'rate_limit', text: '请求限流，等待恢复' },
@@ -153,7 +152,7 @@ test('execution and API failures display immediately alongside an unconfirmed da
 
 test('invalid clocks never hide new execution/API errors or keep recovered errors current', () => {
   const fixture = pair({
-    phase: 'reconciling',
+    phase: 'attention',
     pending: { kind: 'ordinary' },
     reason: '原订单读取失败',
     api_notice: { kind: 'rate_limit', text: '请求限流，等待恢复' },
@@ -232,7 +231,6 @@ test('margin-only balances use their own timestamps and planned waits reset stal
   const fixture = pair(
     {
       phase: 'monitoring',
-      snapshots: { long: { timestamp: 1 }, short: { timestamp: 1 } },
       margin_balances: { long: { timestamp: 100 }, short: { timestamp: 100 } },
       margin: {
         enabled: true,
@@ -242,7 +240,7 @@ test('margin-only balances use their own timestamps and planned waits reset stal
         next_check_at: 130,
       },
     },
-    { ordinary: { enabled: false }, margin: { enabled: true } },
+    { margin: { enabled: true } },
   );
   let state = observe(undefined, fixture, 0);
   state = observe(state, fixture, 3);
@@ -262,10 +260,11 @@ test('margin-only balances use their own timestamps and planned waits reset stal
   assert.equal(state.data.short.since, null);
 });
 
-test('missing funds evidence confirms data warnings despite fresh retained trading snapshots', () => {
+test('missing funds evidence confirms data warnings', () => {
   const fixture = pair(
     {
       phase: 'monitoring',
+      margin_balances: undefined,
       margin: {
         enabled: true,
         blocks_trading: false,
@@ -274,7 +273,7 @@ test('missing funds evidence confirms data warnings despite fresh retained tradi
         next_check_at: 130,
       },
     },
-    { ordinary: { enabled: false }, margin: { enabled: true } },
+    { margin: { enabled: true } },
   );
   let state = observe(undefined, fixture, 0);
   state = observe(state, fixture, 3);

@@ -9,7 +9,7 @@ async (page) => {
   const pair = {
     id: 'gold', name: 'ADL 保证金独立运行', long_account_id: 'a', short_account_id: 'b', symbol: 'XAUUSD1',
     enabled: false, revision: 1,
-    ordinary: { enabled: true, threshold: '10000', order_notional: '1000', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.0005' },
+    ordinary: { enabled: false, threshold: '10000', order_notional: '1000', min_open_leverage: 5, margin_limit: '0.5', spread_limit: '0.0005' },
     margin: { enabled: true, master_env_prefix: '', check_interval_seconds: 5, threshold: '10', min_transfer: '1', max_transfer: '1000', buffer_ratio: '0.05', cooldown_seconds: 30 },
     state: {
       phase: 'paused', reason: 'ADL 自动暂停策略', snapshots: {}, pending: null,

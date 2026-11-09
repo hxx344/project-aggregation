@@ -5,16 +5,16 @@ import type {
   PositionsSnapshot,
 } from './desk-types';
 import { accountSnapshotView } from './account-modes.ts';
-import { pairHasPending, pairMarginOnly, type Pair } from './pairs.ts';
+import { pairHasPending, type Pair } from './pairs.ts';
 import { pairScheduledMarginWait } from './pair-notices.ts';
 
-// L040: a paired member shows the pair runtime snapshot, whose validity stays
-// eight seconds. The single-account display cadence (at least 60 seconds for
-// paired members) must not stretch it; only a margin-only pair has its own
-// scheduled check, and only while nothing is pending. A member whose pair is
-// not loaded uses the strict rule.
+// L040: a member of a pair with margin balancing on follows the pair's
+// scheduled balance check while nothing is pending; otherwise the eight-second
+// validity applies. The
+// single-account display cadence (at least 60 seconds for paired members)
+// must not stretch it. A member whose pair is not loaded uses the strict rule.
 export function pairedSnapshotRefresh(account?: Account, pair?: Pair) {
-  if (pair && pairMarginOnly(pair) && !pairHasPending(pair))
+  if (pair && pair.margin?.enabled === true && !pairHasPending(pair))
     return { interval_seconds: Math.max(8, pair.margin.check_interval_seconds) };
   return pair || account?.pair_id ? undefined : account?.snapshot_refresh;
 }
@@ -81,7 +81,6 @@ export function accountPositionsView({
   const pairDisplay = side ? pair?.state?.display_positions?.[side] : undefined;
   const snapshot = latestPositionsSnapshot(
     account?.snapshot,
-    side ? pair?.state?.snapshots?.[side] : undefined,
     account?.display_positions?.snapshot,
     pairDisplay?.snapshot,
   );
@@ -100,7 +99,6 @@ export function accountPositionsView({
   const error =
     displayError ||
     (!fromDisplay && account?.status === 'error' ? account.reason : undefined);
-  const marginOnly = Boolean(pair && pairMarginOnly(pair));
   let view = accountSnapshotView(
     snapshot,
     now,
@@ -108,13 +106,10 @@ export function accountPositionsView({
     pairedSnapshotRefresh(account, pair),
     error,
   );
-  const scheduled =
-    pair && marginOnly
-      ? pairScheduledMarginWait(pair, now, Boolean(connectionError))
-      : null;
-  const paused = Boolean(
-    pair && marginOnly && !pair.enabled && !pairHasPending(pair),
-  );
+  const scheduled = pair
+    ? pairScheduledMarginWait(pair, now, Boolean(connectionError))
+    : null;
+  const paused = Boolean(pair && !pair.enabled && !pairHasPending(pair));
   if (
     snapshot &&
     view.elapsed !== null &&
@@ -144,7 +139,7 @@ export function accountPositionsView({
     ...view,
     snapshot,
     positions,
-    sourceNote: marginOnly
+    sourceNote: pair
       ? '仓位随保证金检查更新；暂停或冷却期间保留最近记录。'
       : '',
     fieldNotice: positions.some((position) =>
@@ -160,7 +155,7 @@ export function accountPositionsView({
     )
       ? '未提供的价格、杠杆或风险字段以“—”显示。'
       : '',
-    emptyNotice: marginOnly
+    emptyNotice: pair
       ? snapshot
         ? '最近读取的持仓清单为空；暂停或冷却期间保留该次记录。'
         : '尚未取得完整持仓清单，余额数据不能证明空仓。'
@@ -185,24 +180,10 @@ export function positionProfitClass(value: DisplayPosition['unrealized']) {
       : 'mint';
 }
 
+// A pair only balances funds, so no position is claimed by a direction.
 export function strategyPositionLabel(
-  position: Pick<DisplayPosition, 'symbol' | 'side'>,
+  position: Pick<DisplayPosition, 'symbol'>,
   symbol: string,
-  direction: 'LONG' | 'SHORT',
-  marginOnly = false,
-): { symbolLabel: string | null; directionLabel: string | null } {
-  const matchesSymbol = position.symbol === symbol;
-  return {
-    symbolLabel: matchesSymbol
-      ? marginOnly
-        ? '配置币种'
-        : '当前策略币种'
-      : null,
-    directionLabel:
-      matchesSymbol && !marginOnly && position.side === direction
-        ? direction === 'LONG'
-          ? '本组多仓'
-          : '本组空仓'
-        : null,
-  };
+): string | null {
+  return position.symbol === symbol ? '配置币种' : null;
 }

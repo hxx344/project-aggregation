@@ -14,7 +14,6 @@ from fastapi.testclient import TestClient
 import httpx
 
 from tests.helpers import account
-from tests.test_exchange_hardening import account_responses
 from trading.engine import Engine
 from trading.exchange import API, AmbiguousOrder, ExchangeError, LiveBroker, RateBudget, RequestNotSent
 from trading.execution import Executor
@@ -23,7 +22,7 @@ from trading.paper import DemoMarket
 from trading.margin_balance import MarginBalancer
 from trading.pair_execution import PairTrader
 from tests.pair_legacy_fixtures import runtime_default
-from trading.pair_recovery import require_archived_orders_clear
+from trading.pair_planning import LEGACY_ORDERS_REASON, PairPositionError, require_no_legacy_orders
 from trading.pairing import validate_pair
 from trading.server import create_app
 from trading.store import Store
@@ -372,6 +371,11 @@ class WorkspaceTests(unittest.TestCase):
         # Deletion proof never exempts a later orphaned active record.
         self.store.put("pair_runtime:gold", {**state, "pending": {"id": "orphan"}})
         self.assertTrue(self.engine.workspace.update_status()["busy"])
+        # Ownership left by the removed ordinary opening stays in the accounts.
+        self.store.put("pair_runtime:gold", {**state, "owned": {"LONG": "1", "SHORT": "2"}})
+        self.assertFalse(self.engine.workspace.update_status()["busy"])
+        self.store.put("pair_runtime:gold", {**state, "progress": {"quantities": {"LONG": "1", "SHORT": "0"}}})
+        self.assertTrue(self.engine.workspace.update_status()["busy"])
         self.store.put("pair_runtime:gold", state)
         self.store.put("post_fill_check:long", {"symbol": "XAUUSD1"})
         self.assertTrue(self.engine.workspace.update_status()["busy"])
@@ -580,11 +584,9 @@ class WorkspaceTests(unittest.TestCase):
                 self.assertTrue(all(request.method == "GET" for _, request in self.requests))
                 self.assertEqual(self.durable_state(), before)
 
-    def test_archived_watch_does_not_authorize_from_display_clear_cache(self):
+    def test_archived_watch_rechecks_open_orders_on_every_update_check(self):
         self.archived_pair()
-        self.engine.pair_watch_diagnostics["gold"] = {"status": "clear"}
         self.assertFalse(self.engine.workspace.update_status()["busy"])
-        self.assertEqual(self.engine.pair_watch_diagnostics["gold"]["status"], "clear")
         self.requests.clear()
         self.outcomes["long"] = self.archived_receipt(status="FILLED", quantity="0.2")
         self.inventories["long"] = [{"orderId": 1}]
@@ -632,8 +634,9 @@ class WorkspaceTests(unittest.TestCase):
         pair, _ = self.archived_pair()
         self.assertFalse(self.engine.workspace.update_status()["busy"])
         self.requests.clear()
-        with self.assertRaises(TradingError):
-            require_archived_orders_clear(self.engine, pair)
+        # Legacy pair orders are never re-verified here; they only block.
+        with self.assertRaisesRegex(PairPositionError, LEGACY_ORDERS_REASON):
+            require_no_legacy_orders(self.store.get("pair_runtime:gold"))
         self.assertEqual(self.requests, [])
         # A read-only caller still cannot combine two aliases of one real account.
         credentials = {**self.credentials["ASTER_SHORT"], "user": "long-user"}
@@ -717,35 +720,20 @@ class WorkspaceTests(unittest.TestCase):
         for side in ("long", "short"):
             self.connect_archived_member(restarted, side)
         self.assertEqual(reopened.get("pair_runtime:gold"), original)
-        self.assertEqual(restarted.pair_watch_diagnostics, {})
         self.assertFalse(restarted.workspace.update_status()["busy"])
         self.outcomes["long"] = self.archived_receipt(status="FILLED", quantity="0.2")
         self.assertFalse(restarted.workspace.update_status()["busy"])
         restarted.workspace.set_maintenance(False)
         pair = reopened.save_pair({**pair, "enabled": True})
-        for side in ("long", "short"):
-            responses = account_responses()
-            for path in ("/fapi/v3/accountWithJoinMargin", "/fapi/v3/positionRisk"):
-                rows = responses[path]["positions"] if path.endswith("accountWithJoinMargin") else responses[path]
-                for row in rows:
-                    row.update(positionAmt="0.2" if side == "long" and row["positionSide"] == "LONG" else "0",
-                               entryPrice="4412.015", leverage="5")
-                    if path.endswith("positionRisk"):
-                        row["markPrice"] = "4412.015"
-            responses["/fapi/v3/accountWithJoinMargin"]["assets"][0].update(
-                crossWalletBalance="10000", availableBalance="9000")
-            self.reality_responses[side] = responses
         self.requests.clear()
         with patch.dict(os.environ, {"ASTER_ALLOW_LIVE": "1"}):
-            with self.assertRaisesRegex(TradingError, "实际仓位仍不平衡"):
-                PairTrader(restarted)._config_guard(pair, original["identities"], opening=True)
-            # This is also the guard immediately before a margin transfer is journaled.
-            with self.assertRaisesRegex(TradingError, "实际仓位仍不平衡"):
-                require_archived_orders_clear(restarted, pair)
-        self.assertEqual(reopened.get("pair_runtime:gold"), original)
-        self.assertEqual(sum(request.url.path == "/fapi/v3/order" for _, request in self.requests), 4)
-        self.assertEqual(sum(request.url.path == "/fapi/v3/openOrders" for _, request in self.requests), 4)
-        self.assertTrue(all(request.method == "GET" for _, request in self.requests))
+            state = PairTrader(restarted).tick(pair)
+        # The removed recovery path never adopts the late fill: the pair only stops.
+        self.assertEqual(state["phase"], "attention")
+        self.assertEqual(state["reason"], LEGACY_ORDERS_REASON)
+        self.assertEqual(reopened.get("pair_runtime:gold")["recovery_watch"], original["recovery_watch"])
+        self.assertEqual(reopened.get("pair_runtime:gold")["owned"], original["owned"])
+        self.assertEqual(self.requests, [])
 
     def test_pair_and_margin_scheduling_do_not_mutate_enabled_configuration(self):
         for aid in ("long", "short"):
@@ -753,7 +741,7 @@ class WorkspaceTests(unittest.TestCase):
             value["enabled"] = False
             self.store.save_account(value)
         pair = self.store.save_pair(validate_pair({"id": "gold", "name": "Pair", "long_account_id": "long",
-            "short_account_id": "short", "enabled": True, "ordinary": {"enabled": True},
+            "short_account_id": "short", "enabled": True,
             "margin": {"enabled": True, "master_env_prefix": "ASTER_MASTER"}}), create=True)
         trader = PairTrader(self.engine)
         with patch.object(trader, "_read", side_effect=AssertionError("no new pair snapshot during maintenance")):
@@ -771,22 +759,16 @@ class WorkspaceTests(unittest.TestCase):
             value["enabled"] = False
             self.store.save_account(value)
         pair = self.store.save_pair(validate_pair({"id": "gold", "name": "Pair", "long_account_id": "long",
-            "short_account_id": "short", "enabled": True, "ordinary": {"enabled": True},
+            "short_account_id": "short", "enabled": True,
             "margin": {"enabled": True, "master_env_prefix": "ASTER_MASTER"}}), create=True)
         self.assertFalse(self.engine.workspace.update_status()["busy"])
         trader = PairTrader(self.engine)
-        with patch.object(trader, "_read", wraps=trader._read) as read:
-            state = trader.tick(pair, margin_result={"blocks_trading": False})
-            self.assertEqual(state["phase"], "maintenance")
-            self.assertEqual(set(state["snapshots"]), {"long", "short"})
-            # A second tick inside the idle observation interval reuses the read.
-            trader.tick(pair, margin_result={"blocks_trading": False})
-        read.assert_called_once()
-        self.store.put("pair_runtime:gold", {**self.store.get("pair_runtime:gold"), "snapshots": {}})
-        with patch.object(trader, "_read", side_effect=ExchangeError("Aster 网络连接失败")):
+        # The funds-only pair phase never reads positions; display balances come
+        # only from the margin balancer's own loader below.
+        with patch.object(trader, "_read", side_effect=AssertionError("pair tick must not read positions")):
             state = trader.tick(pair, margin_result={"blocks_trading": False})
         self.assertEqual(state["phase"], "maintenance")
-        self.assertIn("持仓读取失败", state["reason"])
+        self.assertEqual(self.store.get("pair_runtime:gold")["snapshots"], {})
         balancer = MarginBalancer(self.engine)
         loader = Mock(return_value=({}, {}))
         with patch.object(balancer, "_plan", side_effect=AssertionError("no new transfer plan during maintenance")):

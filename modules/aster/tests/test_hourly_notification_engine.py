@@ -17,6 +17,14 @@ from tests.test_hourly_summary import NOW, contents, margin_only_state
 WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/test-hourly-summary"
 
 
+def save_scheduled_pair(store):
+    """A running pair so the scheduler has a pair job to resume after startup."""
+    for aid in ("test", "second"):
+        store.save_account({**account(aid), "enabled": False})
+    return store.save_pair(validate_pair({"id": "gold", "name": "gold", "long_account_id": "test",
+                                          "short_account_id": "second", "enabled": True}), create=True)
+
+
 class HourlyNotificationEngineTests(unittest.TestCase):
     def setUp(self):
         self.now = 0.0
@@ -231,8 +239,7 @@ class StartupHourlyNotificationTests(unittest.TestCase):
 
     def run_scheduler(self, control, rules_effect, *, notify_effect=None):
         from tests.scheduler_fixtures import _Pool, _SchedulerEvent
-        from tests.test_pair_capacity_cadence import save_ordinary_pair
-        save_ordinary_pair(self.f.store)
+        save_scheduled_pair(self.f.store)
         self.iteration, self.failure, self.control = 0, None, control
         self.engine.scheduler_event = _SchedulerEvent(self)
         job_calls = []

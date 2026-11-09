@@ -75,7 +75,6 @@ function Desk({ desk }: { desk: ReturnType<typeof useTradingDesk> }) {
     accounts: state?.accounts ?? [],
     events: state?.events ?? [],
     busy,
-    ready: Boolean(state?.ready),
     now: serverNow,
     connectionError,
     error,

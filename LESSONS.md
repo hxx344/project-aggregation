@@ -533,9 +533,9 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 历史观察记录本身不代表当前未完成订单或统计不可用。汇总只在匹配的检查结果明确失败或发现活动回执时提示异常；重启丢失显示缓存、检查正常和单纯保留归档均不要求用户再次核查。配对成交量继续读取已核对账本，保留真实未决批次和 `volume_unknown` 的未知语义，不因旧观察记录永久阻塞，也不改写历史成交。
 
-**如何验证：** [标的切换测试](modules/aster/tests/test_pair_symbol_change.py) 覆盖目标标的非零、不等量手动底仓及原账本数量隔离；[历史观察切换测试](modules/aster/tests/test_pair_symbol_watch.py) 覆盖真实人工归档后切换、原标的查询、重启保留、迟到成交及查询竞态，确认切换不发送交易写入。
+**如何验证：** [标的切换测试](modules/aster/tests/test_pair_symbol_change.py) 覆盖目标标的非零、不等量手动底仓及原账本数量隔离；历史观察切换测试（`test_pair_symbol_watch.py`，已随配对普通开仓移除） 覆盖真实人工归档后切换、原标的查询、重启保留、迟到成交及查询竞态，确认切换不发送交易写入。
 
-[归档后底仓采纳](modules/aster/tests/test_pair_archived_baseline.py) 覆盖其他仓位存在时预览、确认及启动；[配对交易](modules/aster/tests/test_pair_trading.py) 覆盖单边拒单只减另一侧、超时后按同一编号查询不重发（原循环只减回本组新增量的用例已随配对循环移除，旧循环增量改为阻断待人工核对）；[仓位范围与风险](modules/aster/tests/test_pair_position_scope.py) 和 [升档检查](modules/aster/tests/test_pair_upgrade_capacity.py) 验证同标的总持仓上限、其他仓位占用、行情重估和发送前新增反向持仓不会触发杠杆写入。
+归档后底仓采纳（`test_pair_archived_baseline.py`，已随配对普通开仓移除） 覆盖其他仓位存在时预览、确认及启动；配对交易（`test_pair_trading.py`，已随配对普通开仓移除） 覆盖单边拒单只减另一侧、超时后按同一编号查询不重发（原循环只减回本组新增量的用例已随配对循环移除，旧循环增量改为阻断待人工核对）；仓位范围与风险（`test_pair_position_scope.py`，已随配对普通开仓移除） 和 升档检查（`test_pair_upgrade_capacity.py`，已随配对普通开仓移除） 验证同标的总持仓上限、其他仓位占用、行情重估和发送前新增反向持仓不会触发杠杆写入。
 
 展示层改动运行 [ASTER 汇总测试](modules/aster/tests/test_hub_summary.py) 与 [适配器测试](tests/adapters.test.mjs)，覆盖旧观察记录、重启无缓存、实际检查失败、迟到成交、已确认合计及 UTC 跨日；确认读取汇总不新增交易所查询、不修改持久状态。
 
@@ -575,7 +575,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **以后做法：** 按两侧 `qty × max(仓位标记价, 当前标记价)` 求和，不抵消多空、不使用保证金金额。目标公开额度须严格超过总名义持仓与配置门槛，各账户仍分别满足私有档位上限。候选选择、等待原因与发送前检查复用同一判断，最后账户快照刷新后再次检查。额度变化不能作为清除已发送且结果未知请求的依据。
 
-**如何验证：** [配对升档额度测试](modules/aster/tests/test_pair_upgrade_capacity.py) 覆盖低于、等于、精确略高于总持仓，双侧合计、价格变化、私有上限与发送前变化；确认跳过升档后仍可按当前档位评估开仓，并保留未知请求核对保护。[开仓提示测试](modules/aster/tests/test_opening_messages.py) 确认诊断与资格判断一致。
+**如何验证：** 配对升档额度测试（`test_pair_upgrade_capacity.py`，已随配对普通开仓移除） 覆盖低于、等于、精确略高于总持仓，双侧合计、价格变化、私有上限与发送前变化；确认跳过升档后仍可按当前档位评估开仓，并保留未知请求核对保护。[开仓提示测试](modules/aster/tests/test_opening_messages.py) 确认诊断与资格判断一致。
 
 **证据：** 本仓 `74fc675` 的 [配对规划](modules/aster/trading/pair_planning.py) 在 2026-10-15 原生 Windows 回归中复现：当前 10x、两侧各 `100 × 100 = 10000 USD1`、门槛 `10000 USD1`，目标 20x 公开额度为 `15000` 或 `20000 USD1` 时仍返回 20x。截图中的持续核对来自 [配对执行](modules/aster/trading/pair_execution.py)；截图本身不足以证明原请求已被明确拒绝。
 
@@ -643,13 +643,13 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 历史观察有限补证后由当前风险检查决定是否继续，不能把归档索引上限或已空仓后的解绑变成新的永久阻塞。解绑仍须在观察完成后读取完整空仓证据，并原子归档历史观察及解除账户归属。升档请求结束后按标的、目标、身份与配置设置冷却，冷却期间继续评估当前档位。自动暂停必须记录来源；无论正常回执完成还是按现实归档，仅解除同一请求造成、且未被用户操作或其他风险暂停覆盖的暂停。用户控制与清除恢复来源必须原子提交。成交结果仍未知时保留相应统计语义，不将估计金额写成真实成交。
 
-**如何验证：** [单账户有界恢复](modules/aster/tests/test_bounded_recovery.py)、[配对有界恢复](modules/aster/tests/test_pair_bounded_recovery.py)覆盖查询上限、观察窗口、重启、补偿、完整现实证据与事务竞态；[调度衔接](modules/aster/tests/test_recovery_engine.py)验证冷却后仍按当前档位交易及用户暂停优先；[历史划转出口](modules/aster/tests/test_pair_margin_bounded_recovery.py)覆盖流水一直不匹配、网络失败、预算等待、新余额失败与恢复，不发送第二次划转。相关恢复与成交账本测试按影响范围复用。
+**如何验证：** [单账户有界恢复](modules/aster/tests/test_bounded_recovery.py)、配对有界恢复（`test_pair_bounded_recovery.py`，已随配对普通开仓移除）覆盖查询上限、观察窗口、重启、补偿、完整现实证据与事务竞态；[调度衔接](modules/aster/tests/test_recovery_engine.py)验证冷却后仍按当前档位交易及用户暂停优先；[历史划转出口](modules/aster/tests/test_pair_margin_bounded_recovery.py)覆盖流水一直不匹配、网络失败、预算等待、新余额失败与恢复，不发送第二次划转。相关恢复与成交账本测试按影响范围复用。
 
 **证据：** 本仓 `8bce5ca` 的 [普通执行](modules/aster/trading/execution.py)、循环执行 `cycle_execution.py`、迁移执行 `migration_execution.py`（两者已随循环与仓位迁移功能移除，源码见该提交）在未知单超过 120 秒后仍保留 pending；[配对执行](modules/aster/trading/pair_execution.py)在原单查询失败时到不了仓位采纳；[保证金平衡](modules/aster/trading/margin_balance.py)的旧 `accepted` 状态无历史查询出口。2026-10-15 用户明确要求清理同类永久核对，本次根据源码和离线回归修复；120 秒是转入现实核验的等待窗口，不是订单未成交的证明。
 
 **事件记录：** `bounded-unknown-execution-recovery-20261015`；本次跨执行器的同类根因修复，不按文件或路径重复计数。
 
-**2026-10-17 补充证据：** 基线 `d135996` 的配对恢复虽然限制原单查询次数，观察期仍每约 3 秒读取两侧交易快照，现实核验失败后又按待处理调度反复读取。`_read_members` 强制刷新账户模式并另查两侧全账户挂单，冷读预估 `2 × (72 + 40) = 224` 权重，与用户截图中的准入需求相符。市价恢复移除全账户挂单查询与显示专用重复快照，失败期限持久化，自动、手动及重启共同遵守；最终持仓、模式与身份新鲜度不变。发送前 `_config_guard` 的失败也须归为结构化“未发送”，而实际 POST 的未知结果仍保留。固定差异 `4229052` 的离线时序复现另发现：活动回执若在原编号检查后、快照捕获新代次前到达，仅靠快照代次仍可提前结束批次；恢复须在快照后再次补读本地回执，并在原身份、快照锁和事务 CAS 保护下持久化，不能等缓存过期后丢失已知活动状态。对应 [恢复预算检查](modules/aster/tests/test_pair_recovery_budget.py)、[未知单观察检查](modules/aster/tests/test_pair_unknown_observation.py)、[晚到回执检查](modules/aster/tests/test_pair_late_receipt_recovery.py) 及发送证据检查；本地离线结果不表示已验证服务器现场。事件 `pair-recovery-weight-starvation-20261017`。
+**2026-10-17 补充证据：** 基线 `d135996` 的配对恢复虽然限制原单查询次数，观察期仍每约 3 秒读取两侧交易快照，现实核验失败后又按待处理调度反复读取。`_read_members` 强制刷新账户模式并另查两侧全账户挂单，冷读预估 `2 × (72 + 40) = 224` 权重，与用户截图中的准入需求相符。市价恢复移除全账户挂单查询与显示专用重复快照，失败期限持久化，自动、手动及重启共同遵守；最终持仓、模式与身份新鲜度不变。发送前 `_config_guard` 的失败也须归为结构化“未发送”，而实际 POST 的未知结果仍保留。固定差异 `4229052` 的离线时序复现另发现：活动回执若在原编号检查后、快照捕获新代次前到达，仅靠快照代次仍可提前结束批次；恢复须在快照后再次补读本地回执，并在原身份、快照锁和事务 CAS 保护下持久化，不能等缓存过期后丢失已知活动状态。对应 恢复预算检查（`test_pair_recovery_budget.py`，已随配对普通开仓移除）、未知单观察检查（`test_pair_unknown_observation.py`，已随配对普通开仓移除）、晚到回执检查（`test_pair_late_receipt_recovery.py`，已随配对普通开仓移除） 及发送证据检查；本地离线结果不表示已验证服务器现场。事件 `pair-recovery-weight-starvation-20261017`。
 
 **2026-10-28 补充：** `-2013`（查无订单）只有在原始错误码是确定性错误时才能证明未提交；`-1000`/`-1001`/`-1006`/`-1007` 与 408/5xx 等不确定提交即使查不到订单，也仍按有界恢复流程处理，见 L062 批量逐条判定。
 
@@ -705,7 +705,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `aster-transfer-strategy-coupling-20261015`；一次用户纠正及完整调用链修复，不推进主线复盘检查点。
 
-**2026-10-17 补充证据：** 基线 `d135996` 的 `PairManager.configure` 和 ADL 设置锁将任意未决订单／循环持仓视为全表单锁，连只关闭开仓策略也无法保存。新增暂停状态专用的“切换为仅保证金管理”操作，只改三个启用开关，完整保留订单、循环、历史观察和划转日志；普通设置锁与后续启动身份核验继续有效。[模式切换检查](modules/aster/tests/test_pair_margin_only_switch.py) 验证未知批次、未决划转、原循环减仓、ADL、鉴权及不可夹带参数，[工作台交互](tests/aster-margin-only.browser.mjs) 验证锁定、失败重试和保存后保持暂停。此为保证金独立入口的后续补漏，不增加独立事件计数。
+**2026-10-17 补充证据：** 基线 `d135996` 的 `PairManager.configure` 和 ADL 设置锁将任意未决订单／循环持仓视为全表单锁，连只关闭开仓策略也无法保存。新增暂停状态专用的“切换为仅保证金管理”操作，只改三个启用开关，完整保留订单、循环、历史观察和划转日志；普通设置锁与后续启动身份核验继续有效。模式切换检查（`test_pair_margin_only_switch.py`，已随配对普通开仓移除） 验证未知批次、未决划转、原循环减仓、ADL、鉴权及不可夹带参数，工作台交互（`aster-margin-only.browser.mjs`，已随配对普通开仓移除） 验证锁定、失败重试和保存后保持暂停。此为保证金独立入口的后续补漏，不增加独立事件计数。
 
 ### L042：旧配置的同值写入不能覆盖新模型的细分选择
 
@@ -908,15 +908,15 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `aster-adl-position-projection-20261016`；同一功能开发中的审查与连续修补，关联 L008、L031、L039、L040，不推进主线复盘检查点。
 
-**配对终态恢复补充（2026-10-21）：** 本仓 `dc87ff8` 让配对批次在一次持仓读取与终态回执不符后进入有界终态恢复，此后只能经 `adopt_unknown` 退出。测试普查发现 [test_pair_review](modules/aster/tests/test_pair_review.py) 一直未被 CI 运行，单独运行即复现：循环开仓成交后一次滞后读取，即使下一次读取已完整反映回执，批次也不再完成，120 秒后本批成交被采纳为底仓、不再平仓，下一循环叠加敞口。`e7894cd` 改为：终态恢复中数量与杠杆完全反映回执的读取走正常完成路径，否则仍有界退出且不发修复单；三次有界读取用尽后，在 120 秒完整核验到期时先按核验节奏读一次，节流在读取前落盘。独立审查第 2 轮还发现 ordinary 批次在恢复中修改 pending 后未落盘，`reconcile_positions` 的 CAS 每个 tick 冲突、状态永不前进；进入正常路径前先保存批次。以后让“滞后读取”进入有界路径时，同时确认后续反映成交的读取仍能完成批次，并检查本轮内存修改与任何 CAS 比较的落盘顺序。[终态恢复测试](modules/aster/tests/test_pair_review.py) 覆盖一次滞后、持续滞后、需修复单、滞后跨过有界读取、核验读取失败和 ordinary 单侧滞后，均做去掉守卫的变异验证。仍未解决的既有问题见 issue #20–#22（已在下方交付，历史归档部分转 #30）。事件 `aster-pair-terminal-recovery-lag-20261021`，不推进主线复盘检查点。
+**配对终态恢复补充（2026-10-21）：** 本仓 `dc87ff8` 让配对批次在一次持仓读取与终态回执不符后进入有界终态恢复，此后只能经 `adopt_unknown` 退出。测试普查发现 test_pair_review（`test_pair_review.py`，已随配对普通开仓移除） 一直未被 CI 运行，单独运行即复现：循环开仓成交后一次滞后读取，即使下一次读取已完整反映回执，批次也不再完成，120 秒后本批成交被采纳为底仓、不再平仓，下一循环叠加敞口。`e7894cd` 改为：终态恢复中数量与杠杆完全反映回执的读取走正常完成路径，否则仍有界退出且不发修复单；三次有界读取用尽后，在 120 秒完整核验到期时先按核验节奏读一次，节流在读取前落盘。独立审查第 2 轮还发现 ordinary 批次在恢复中修改 pending 后未落盘，`reconcile_positions` 的 CAS 每个 tick 冲突、状态永不前进；进入正常路径前先保存批次。以后让“滞后读取”进入有界路径时，同时确认后续反映成交的读取仍能完成批次，并检查本轮内存修改与任何 CAS 比较的落盘顺序。终态恢复测试（`test_pair_review.py`，已随配对普通开仓移除） 覆盖一次滞后、持续滞后、需修复单、滞后跨过有界读取、核验读取失败和 ordinary 单侧滞后，均做去掉守卫的变异验证。仍未解决的既有问题见 issue #20–#22（已在下方交付，历史归档部分转 #30）。事件 `aster-pair-terminal-recovery-lag-20261021`，不推进主线复盘检查点。
 
 **#20–#22 本次交付：** `076d1f3` 基线上的离线回归复现：普通配对两侧返回成交前底仓，不能仅凭数量相等认定人工回退。本次方向时间证据限定于当前 pending 批次：数量与杠杆完整反映原单及修复单回执时，沿用正常完成路径，不要求新增时间字段；采纳不同于该投影的现实仓位或人工回退前，才要求对应方向时间覆盖该批已知成交，缺失或滞后则保留 pending 和原因。Live 保留交易所原始 `updateTime`，包括零仓方向；Paper 仅在新成交时原子保存方向时间，不迁移旧账本、不补造读取时间。时间要求只适用于创建时带 `position_time_evidence` 的新批次；升级时已在途的旧批次（尤其旧 Paper 循环批次人工平回底仓）无法补得方向时间，沿用 HEAD 的采纳行为，否则人工核对、跳过和删除均被 pending 拒绝而没有出口。
 
-**完整核验与只减仓修复：** 120 秒完整核验统一进入 `adopt_unknown`，读取前以 CAS 保存节流，共享 30/60 秒失败退避、配额等待、原因和状态，保留 position_review 截止与时钟回拨处理。当前批次经历史观察守卫时，传递同一份快照及 guards；历史查询使租约失效则等待，不能再读一次并换掉原授权。终态恢复仅放开平仓部分成交和保证金超限的减仓：精确差额向下取整、不越过平衡点，超限最多撤回本批新增量，剩余平衡循环量继续保留在循环进度。已知成交减仓不因未决划转或非正权益被提前阻断；采纳底仓仍要求划转结清及风险准入。身份、模式、ADL、账户写入权、原编号查询、三次修复上限及发送前租约检查继续生效；修复量由两侧持仓差额算出，所以发出任何修复单前要先确认两侧租约仍有效。若只查下单侧，对侧加仓后仍会发出减仓单，反而扩大失衡。两侧检查放在并发发送之前，避免本侧修复成交撤销自身租约后挡住另一侧的修复单。验证入口为 [配对回归](modules/aster/tests/test_pair_review.py)、[完整核验](modules/aster/tests/test_pair_full_check.py)、[方向时间](modules/aster/tests/test_pair_position_timestamps.py) 和 [升级兼容](modules/aster/tests/test_pair_upgrade_compatibility.py)；后者使用 HEAD 格式旧压缩 watch 及无方向时间的 Live/Paper 持仓，覆盖开仓守卫、重新启动、底仓预览和删除。
+**完整核验与只减仓修复：** 120 秒完整核验统一进入 `adopt_unknown`，读取前以 CAS 保存节流，共享 30/60 秒失败退避、配额等待、原因和状态，保留 position_review 截止与时钟回拨处理。当前批次经历史观察守卫时，传递同一份快照及 guards；历史查询使租约失效则等待，不能再读一次并换掉原授权。终态恢复仅放开平仓部分成交和保证金超限的减仓：精确差额向下取整、不越过平衡点，超限最多撤回本批新增量，剩余平衡循环量继续保留在循环进度。已知成交减仓不因未决划转或非正权益被提前阻断；采纳底仓仍要求划转结清及风险准入。身份、模式、ADL、账户写入权、原编号查询、三次修复上限及发送前租约检查继续生效；修复量由两侧持仓差额算出，所以发出任何修复单前要先确认两侧租约仍有效。若只查下单侧，对侧加仓后仍会发出减仓单，反而扩大失衡。两侧检查放在并发发送之前，避免本侧修复成交撤销自身租约后挡住另一侧的修复单。验证入口为 配对回归（`test_pair_review.py`，已随配对普通开仓移除）、完整核验（`test_pair_full_check.py`，已随配对普通开仓移除）、方向时间（`test_pair_position_timestamps.py`，已随配对普通开仓移除） 和 升级兼容（`test_pair_upgrade_compatibility.py`，已随配对普通开仓移除）；后者使用 HEAD 格式旧压缩 watch 及无方向时间的 Live/Paper 持仓，覆盖开仓守卫、重新启动、底仓预览和删除。
 
 **本轮变异验证：** 移除完整核验中当前批次的时间守卫、反转减仓方向、令修复量多出一个步长、丢弃已有快照并重新读取，分别触发 8、1、1、2 次断言失败，均无测试执行错误；恢复原实现的六项对照通过。第五轮独立审查后补充：只查下单侧租约、不区分旧批次两处变异各被新测试捕获。单次读取测试同时验证原 guards 失效时保留 pending，变异须覆盖测试包装器预先导入的函数引用，避免实际仍调用原实现。
 
-**历史归档交付（#30，2026-11-05）：** 被挤出八批热索引的已知成交折叠进 `recovery_watch.history` 有界汇总（按账户、合约、方向记录退役成交计数与最新成交时间），压缩与 watch 写入同一 runtime 事务；旧数据首次读取时扫描观察与订单恢复记录迁移，按 watch 指纹缓存，热批次摘要变化即重新迁移。只有持仓方向带正的交易所更新时间且早于已知成交时才阻止采纳；时间缺失或为零、成交无时间、归档不完整（有退役标记却找不到材料记为 `unproven`）都不阻断，只留诊断，避免旧数据失去出口。滞后从本进程首次观察起按 `time.monotonic()` 计时，120 秒后放行并回到原数量核对：订单 `updateTime` 可能反映之后的 EXPIRED 而非成交，无限等待会卡死；也不能用本地墙钟减交易所时间判断到期，本地快 30 秒就会提前放行。按用户决定不设人工确认，删除配对不受该检查限制。审查还发现开仓守卫另读一份快照后仍用原快照发送：历史检查必须作用于规划、风险检查和发送实际使用的同一份快照及 guards，升杠杆覆盖刷新后的快照。验证入口为 [历史时间测试](modules/aster/tests/test_pair_history_times.py) 与 [同快照守卫测试](modules/aster/tests/test_pair_history_guards.py)。以上为同一事件 `aster-pair-terminal-recovery-lag-20261021` 的连续修补，不新增事件计数、不推进复盘检查点，也不描述为实盘验证。
+**历史归档交付（#30，2026-11-05）：** 被挤出八批热索引的已知成交折叠进 `recovery_watch.history` 有界汇总（按账户、合约、方向记录退役成交计数与最新成交时间），压缩与 watch 写入同一 runtime 事务；旧数据首次读取时扫描观察与订单恢复记录迁移，按 watch 指纹缓存，热批次摘要变化即重新迁移。只有持仓方向带正的交易所更新时间且早于已知成交时才阻止采纳；时间缺失或为零、成交无时间、归档不完整（有退役标记却找不到材料记为 `unproven`）都不阻断，只留诊断，避免旧数据失去出口。滞后从本进程首次观察起按 `time.monotonic()` 计时，120 秒后放行并回到原数量核对：订单 `updateTime` 可能反映之后的 EXPIRED 而非成交，无限等待会卡死；也不能用本地墙钟减交易所时间判断到期，本地快 30 秒就会提前放行。按用户决定不设人工确认，删除配对不受该检查限制。审查还发现开仓守卫另读一份快照后仍用原快照发送：历史检查必须作用于规划、风险检查和发送实际使用的同一份快照及 guards，升杠杆覆盖刷新后的快照。验证入口为 历史时间测试（`test_pair_history_times.py`，已随配对普通开仓移除） 与 同快照守卫测试（`test_pair_history_guards.py`，已随配对普通开仓移除）。以上为同一事件 `aster-pair-terminal-recovery-lag-20261021` 的连续修补，不新增事件计数、不推进复盘检查点，也不描述为实盘验证。
 
 **模拟行情时序补充（2026-11-05）：** 本次成本研究的提交前审查复现：Maker 代理成交发生在 t1000，t1301 收到来源时间 t700 的 Lighter 帧，原逻辑仅因其晚于旧缓存而用它完成延迟对冲。接收时间越过等待期限不能证明行情产生于该期限后；修复同时检查单调到达时间、相对到期点的来源时间下界及明确的时钟误差容差，不通过放宽全局 TTL 修复。250ms 是本模块当前容差，不是其它交易路径的默认规则。[核心回归](tests/binance-lighter-core.test.mjs) 覆盖迟到旧帧、容差边界、新帧与超时。事件 `cost-research-late-pretrade-book-20261105`；相对 `4bb440e` 的未发布实现，不推进复盘检查点。
 
@@ -1070,7 +1070,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **同类拒绝补全：** 实际 HTTPX 回归还复现 HTTP400/既有明确拒绝码 `-2019` 后私库 rejected、共享 UNKNOWN，下一轮无法发出。划转专用类型只沿用既有拒绝白名单和固定端点；单次已发送请求的明确拒绝也须先持久化原体回执再结算。不能将“已发送”直接等同“已接受”，也不能把多笔批次中一笔拒绝推广为全部拒绝；混合结果、`-1007` 和网络超时继续保留 UNKNOWN。此为同一逃逸路径的补全，不新增事件。
 
-**批量逐条判定（2026-10-28）：** 用户决定改变“混合结果整批保留 UNKNOWN”：整批未知会让已提交腿的单边暴露得不到修复。ASTER 批量回包逐条判定：明确成功回执算已提交，白名单码算拒单；非白名单且无订单编号的一条只把该条记为 unknown，其余照常结算。该条按原 clientOrderId 查询：查到算已提交；仅当原始码是确定性错误（负数，且不属于 `-1000`/`-1001`/`-1006`/`-1007` 未知、内部错误、超时类，非 408/5xx）且查询返回干净的 `-2013`（非含糊、无 retry_after、HTTP 400/404/无）时，才证明未提交并结算该写入操作；查询失败、429 或上述不确定原始码一律保持 unknown 并阻塞。配对路径补记 `query_absent` 后须在同一轮先写私库、再 `settle_pair` 结算共享操作，否则紧随的补偿单会被 `ACCOUNT_UNRESOLVED` 挡在 sending；共享准入拒绝时该批腿记为 `local_not_sent`，不得停在 sending。Greeks 同理只把 Bybit 执行前拒绝码（`10001`–`10010`、`10017`/`10018`/`10024`/`10027`/`10029`，以及按写端点登记的 `110xxx` 允许列表）当作拒单，`10000`/`10014`/`10016`、`110072`/`110079`、已废弃的 `110030` 与未登记码保持 unknown。**2026-10-29 补充（#79）：** 原先 `110000`–`110999` 整段放行，区间内未登记码（如 `110999`）会被结算成确定拒单并让建单跳过未知核对；现改为 [bybit.py](modules/greeks/app/bybit.py) 中按建单/改单/撤单/RFQ 端点分列、注明官方文档来源与核对日期的允许列表，不再用编号段或黑名单推断语义。[ASTER 保护测试](modules/aster/tests/test_account_writer.py)、[配对发送证据](modules/aster/tests/test_pair_submit_evidence.py)与 [Greeks 账户测试](modules/greeks/tests/test_account_writer.py)覆盖。此为设计调整，不新增事件。
+**批量逐条判定（2026-10-28）：** 用户决定改变“混合结果整批保留 UNKNOWN”：整批未知会让已提交腿的单边暴露得不到修复。ASTER 批量回包逐条判定：明确成功回执算已提交，白名单码算拒单；非白名单且无订单编号的一条只把该条记为 unknown，其余照常结算。该条按原 clientOrderId 查询：查到算已提交；仅当原始码是确定性错误（负数，且不属于 `-1000`/`-1001`/`-1006`/`-1007` 未知、内部错误、超时类，非 408/5xx）且查询返回干净的 `-2013`（非含糊、无 retry_after、HTTP 400/404/无）时，才证明未提交并结算该写入操作；查询失败、429 或上述不确定原始码一律保持 unknown 并阻塞。配对路径补记 `query_absent` 后须在同一轮先写私库、再 `settle_pair` 结算共享操作，否则紧随的补偿单会被 `ACCOUNT_UNRESOLVED` 挡在 sending；共享准入拒绝时该批腿记为 `local_not_sent`，不得停在 sending。Greeks 同理只把 Bybit 执行前拒绝码（`10001`–`10010`、`10017`/`10018`/`10024`/`10027`/`10029`，以及按写端点登记的 `110xxx` 允许列表）当作拒单，`10000`/`10014`/`10016`、`110072`/`110079`、已废弃的 `110030` 与未登记码保持 unknown。**2026-10-29 补充（#79）：** 原先 `110000`–`110999` 整段放行，区间内未登记码（如 `110999`）会被结算成确定拒单并让建单跳过未知核对；现改为 [bybit.py](modules/greeks/app/bybit.py) 中按建单/改单/撤单/RFQ 端点分列、注明官方文档来源与核对日期的允许列表，不再用编号段或黑名单推断语义。[ASTER 保护测试](modules/aster/tests/test_account_writer.py)、配对发送证据（`test_pair_submit_evidence.py`，已随配对普通开仓移除）与 [Greeks 账户测试](modules/greeks/tests/test_account_writer.py)覆盖。此为设计调整，不新增事件。
 
 **Greeks 改单逃逸（2026-10-27）：** 已发布 `519d2e8` 的改单身份仅由原订单与正文摘要组成，审查 `6ab243e` 实测价格 `2→3→2` 时第三个新意图误中 `ALREADY_SUBMITTED` 并进入撤单核对，属于 P1 逃逸。新意图须有先持久化的独立递增序号；参数再次相同不等于同一个意图重试。原单尚有 `sending/unknown` 时不能靠换号绕过，共享旧摘要 ID 及撤单/终态核对保持兼容。[Greeks 账户测试](modules/greeks/tests/test_account_writer.py) 覆盖真实追价、重启续号、遗留未决、同单并发及状态写失败零发送。事件 `greeks-amend-intent-reuse-20261027`；不推进复盘检查点。
 
@@ -1094,13 +1094,13 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 ### L064：托管发送才要求持久原批次，未托管路径保持原契约
 
-**适用条件：** 同一发送入口同时服务已启用的共享账户写入器与尚未启用的旧路径，例如 Aster 配对 [发送](modules/aster/trading/pair_execution.py) `_dispatch`。
+**适用条件：** 同一发送入口同时服务已启用的共享账户写入器与尚未启用的旧路径，例如 Aster 配对发送 `_dispatch`（`modules/aster/trading/pair_execution.py`，已随配对普通开仓移除）。
 
 **根因：** `519d2e8` 在 `writer.enabled` 为假时仍拼接 `pending["id"]`、写入 `writer_dispatches`，并进入 `writer.batch`。未托管 ADL 与配对发送的 pending 可以没有持久原批次编号，读取发生在 HTTP 之前。`56cdb9e` 的提交说明记录，`519d2e8` 的 Linux CI 在 ASTER 第二组 217 项中有 1 个 KeyError。
 
 **以后做法：** 账户写入器启用时，HTTP 前要求非空字符串形式的持久原批次标识，并把本次 `operationId` 与有序 `clientOrderIds` 写入发送分组；缺少原批次时，在准备共享操作和发送 HTTP 之前失败，且不留下 `writer_dispatches`。写入器未启用时保持原发送契约：不读取原批次编号、不写发送分组、不用共享 batch 上下文。启用判断之前，托管约束不能进入未托管路径。
 
-**如何验证：** [账户写入测试](modules/aster/tests/test_account_writer.py) `test_managed_dispatch_without_original_batch_id_still_rejects_before_transport` 覆盖托管缺原批次时零 HTTP、共享未决为空且不写分组。[预算路径](modules/aster/tests/test_pair_budget.py) `test_opening_cannot_spend_recovery_reserve` 与 [ADL 集成](modules/aster/tests/test_adl_integration.py) `test_each_prepared_leg_rechecks_adl_before_transport` 使用没有 `pending.id` 的未托管发送，应仍按原契约结束。本次日复盘未重跑这些测试。`56cdb9e` 的提交说明记录当时 Windows 上 `tests.test_adl_integration`、`tests.test_account_writer`、`tests.test_pair_submit_evidence` 为 51/51；该记录属于该提交，不是本轮复盘的执行结果。
+**如何验证：** 账户写入测试 `test_managed_dispatch_without_original_batch_id_still_rejects_before_transport`（`modules/aster/tests/test_account_writer.py`，已随配对普通开仓移除）覆盖托管缺原批次时零 HTTP、共享未决为空且不写分组。预算路径（`test_pair_budget.py`，已随配对普通开仓移除） `test_opening_cannot_spend_recovery_reserve` 与 ADL 集成 `test_each_prepared_leg_rechecks_adl_before_transport`（`modules/aster/tests/test_adl_integration.py`，已随配对普通开仓移除）使用没有 `pending.id` 的未托管发送，应仍按原契约结束。本次日复盘未重跑这些测试。`56cdb9e` 的提交说明记录当时 Windows 上 `tests.test_adl_integration`、`tests.test_account_writer`、`tests.test_pair_submit_evidence` 为 51/51；该记录属于该提交，不是本轮复盘的执行结果。
 
 **证据：** project-aggregation `56cdb9e84befc97511068c21e36dbefcf0a05166`。父提交 `519d2e8ec31f5e5962d464bc9bcf88425a03e18c` 的 [配对发送](modules/aster/trading/pair_execution.py) 在启用判断之外读取 `pending["id"]`；`56cdb9e` 将原批次校验和 `writer_dispatches` 收进 `writer.enabled`，未启用时用 `nullcontext` 代替 `writer.batch`。
 

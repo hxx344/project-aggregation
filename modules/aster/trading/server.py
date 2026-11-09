@@ -141,30 +141,6 @@ class RecoveryConfirmation(BaseModel):
     token: str = Field(pattern=r"^[a-f0-9]{32}$")
 
 
-class PairRecoveryConfirmation(RecoveryConfirmation):
-    acknowledge_unknown: Literal[True]
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_explicit_acknowledgement(cls, values):
-        if not isinstance(values, dict) or values.get("acknowledge_unknown") is not True:
-            raise ValueError("请明确确认未知订单归档")
-        return values
-
-
-class PairRecoverySkip(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    batch_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
-    acknowledge_skip: Literal[True]
-
-    @model_validator(mode="before")
-    @classmethod
-    def require_explicit_acknowledgement(cls, values):
-        if not isinstance(values, dict) or values.get("acknowledge_skip") is not True:
-            raise ValueError("请明确确认跳过本批持仓核对")
-        return values
-
-
 class NewAccount(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(pattern=r"^[a-z0-9_-]{1,32}$")
@@ -244,16 +220,6 @@ class PolicyEdit(BaseModel):
         return values
 
 
-class PairOrdinaryEdit(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-    enabled: bool | None = None
-    threshold: str | None = Field(default=None, max_length=40)
-    order_notional: str | None = Field(default=None, max_length=40)
-    min_open_leverage: StrictInt | None = None
-    margin_limit: str | None = Field(default=None, max_length=128)
-    spread_limit: str | None = Field(default=None, max_length=128)
-
-
 class PairMarginEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     enabled: bool | None = None
@@ -287,7 +253,6 @@ class NewPair(BaseModel):
     short_account_id: str = Field(min_length=1, max_length=32)
     symbol: PairSymbol = DEFAULT_PAIR_SYMBOL
     enabled: bool = False
-    ordinary: PairOrdinaryEdit | None = None
     margin: PairMarginEdit | None = None
     adl: PairAdlEdit | None = None
 
@@ -307,7 +272,6 @@ class PairEdit(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     name: str | None = Field(default=None, min_length=1, max_length=50)
     symbol: PairSymbol | None = None
-    ordinary: PairOrdinaryEdit | None = None
     margin: PairMarginEdit | None = None
     adl: PairAdlEdit | None = None
 
@@ -510,10 +474,6 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     def enable_pair(pair_id: str):
         return {"ok": True, "pair": engine.pairs.enable(pair_id, True)}
 
-    @app.post("/api/pairs/{pair_id}/margin-only", dependencies=write_dependencies)
-    def switch_pair_to_margin_only(pair_id: str, body: PairMarginOnly):
-        return {"ok": True, "pair": engine.pairs.switch_to_margin_only(pair_id)}
-
     @app.post("/api/pairs/{pair_id}/adl-margin-enable", dependencies=write_dependencies)
     def enable_pair_adl_margin(pair_id: str, body: PairMarginOnly):
         return {"ok": True, "pair": engine.pairs.enable_adl_margin(pair_id)}
@@ -522,38 +482,9 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
     def pause_pair(pair_id: str):
         return {"ok": True, "pair": engine.pairs.enable(pair_id, False)}
 
-    @app.post("/api/pairs/{pair_id}/recovery-preview", dependencies=write_dependencies)
-    def preview_pair_recovery(pair_id: str):
-        return engine.pairs.preview_recovery(pair_id)
-
-    @app.post("/api/pairs/{pair_id}/recovery-check", dependencies=write_dependencies)
-    def check_pair_recovery(pair_id: str):
-        return engine.pairs.check_recovery(pair_id)
-
-    @app.post("/api/pairs/{pair_id}/recovery-confirm", dependencies=write_dependencies)
-    def confirm_pair_recovery(pair_id: str, body: PairRecoveryConfirmation):
-        return engine.pairs.confirm_recovery(pair_id, body.token, body.acknowledge_unknown)
-
-    @app.post("/api/pairs/{pair_id}/recovery-skip", dependencies=write_dependencies)
-    def skip_pair_recovery(pair_id: str, body: PairRecoverySkip):
-        return engine.pairs.skip_recovery(pair_id, body.batch_id, body.acknowledge_skip)
-
-    @app.post("/api/pairs/{pair_id}/baseline-preview", dependencies=write_dependencies)
-    def preview_pair_baseline(pair_id: str):
-        return engine.pairs.preview_baseline(pair_id)
-
-    @app.post("/api/pairs/{pair_id}/baseline-confirm", dependencies=write_dependencies)
-    def confirm_pair_baseline(pair_id: str, body: PairRecoveryConfirmation):
-        return engine.pairs.confirm_baseline(pair_id, body.token, body.acknowledge_unknown)
-
     @app.delete("/api/pairs/{pair_id}", dependencies=write_dependencies)
     def delete_pair(pair_id: str):
         engine.pairs.delete(pair_id)
-        return {"ok": True}
-
-    @app.post("/api/pairs/{pair_id}/reconcile-flat", dependencies=write_dependencies)
-    def reconcile_pair_flat(pair_id: str):
-        engine.pairs.reconcile_flat(pair_id)
         return {"ok": True}
 
     @app.get("/api/monitoring", dependencies=[Depends(authenticated)])

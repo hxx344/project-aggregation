@@ -1,10 +1,9 @@
 import {
   pairDataFresh,
-  pairDisplayBalances,
   pairExecutionPhaseLabel,
   pairHasPending,
-  pairMarginOnly,
-  pairStartRecoveryBlock,
+  pairLegacyOrders,
+  pairStartBlock,
   pairTransferStatus,
   type PairApiNotice,
   type Pair,
@@ -53,35 +52,6 @@ function delayedSignal(
   if (previous?.confirmed) return previous;
   const since = clockReset ? observedAt : (previous?.since ?? observedAt);
   return { since, confirmed: observedAt - since >= PAIR_DATA_NOTICE_DELAY };
-}
-
-function pendingIssue(
-  pending: Record<string, unknown> | null | undefined,
-): string {
-  const record = (value: unknown): Record<string, unknown> | undefined =>
-    value && typeof value === 'object' && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : undefined;
-  const results = record(pending?.results);
-  const reasons =
-    pending?.kind === 'leverage'
-      ? Object.values(results ?? {}).map((value) => {
-          const result = record(value);
-          return result?.unknown || result?.rejected
-            ? result.reason
-            : undefined;
-        })
-      : [pending?.legs, pending?.repairs].flatMap((legs) =>
-          Array.isArray(legs) ? legs.map((leg) => record(leg)?.error) : [],
-        );
-  return [
-    ...new Set(
-      reasons.filter(
-        (reason): reason is string =>
-          typeof reason === 'string' && Boolean(reason.trim()),
-      ),
-    ),
-  ].join('；');
 }
 
 const acknowledgedWaitReasons = new Set([
@@ -133,7 +103,6 @@ export function pairScheduledMarginWait(
   // checks. This must never relax freshness checks used by trading controls.
   if (
     !pair.enabled ||
-    pair.ordinary?.enabled !== false ||
     pair.margin?.enabled !== true ||
     margin?.enabled !== true ||
     margin.blocks_trading !== false ||
@@ -189,42 +158,29 @@ export function pairStatusNotices(
     pair.state?.margin?.api_notice,
     pair.state?.margin?.reason,
   );
-  const marginOnly = pairMarginOnly(pair);
-  const snapshots = pairDisplayBalances(pair);
+  const balances = pair.state?.margin_balances;
   const canCheckAtStart =
-    !pair.enabled && pairHasPending(pair) && !pairStartRecoveryBlock(pair);
-  const canResumeTransfer =
-    canCheckAtStart && pair.state?.margin?.trading_resume_allowed === true;
+    !pair.enabled && pairHasPending(pair) && !pairStartBlock(pair);
   const fresh =
     pairDataFresh(pair.state?.updated_at, now, offline) &&
-    pairDataFresh(snapshots?.long?.timestamp, now, offline) &&
-    pairDataFresh(snapshots?.short?.timestamp, now, offline);
+    pairDataFresh(balances?.long?.timestamp, now, offline) &&
+    pairDataFresh(balances?.short?.timestamp, now, offline);
   if (!fresh && !pairScheduledMarginWait(pair, now, offline)) {
     add(
       'data',
       (offline
         ? '连接中断，保留最近记录。'
         : '两侧数据未齐或已过期，当前数值仅作最近记录。') +
-        (marginOnly
-          ? !pair.enabled && !offline
-            ? ' 启动时重新核验账户归属与余额。'
-            : ' 等待下一次余额检查。'
-          : !pair.enabled && !offline
-            ? pairHasPending(pair)
-              ? canCheckAtStart
-                ? canResumeTransfer
-                  ? ' 可点击“启动配对组”，服务会重新读取账户；未知划转继续保留，并预留转出金额。'
-                  : ' 可直接点击“启动配对组”自动核对，无需另点手动核对；结果未明时仍保持暂停。'
-                : ' 仍有订单或划转待核对，暂停不会结束核对；完成后才能启动。'
-              : ' 启动时服务会重新核验两侧账户、挂单及归属，再采纳实际仓位为底仓。'
-            : ' 等待有效快照后才能新增开仓。'),
+        (!pair.enabled && !offline
+          ? ' 启动时重新核验账户归属与余额。'
+          : ' 等待下一次余额检查。'),
     );
   }
   if (pairHasPending(pair)) {
-    const pendingOrder = pair.state?.pending;
     const transfer = pair.state?.margin?.pending;
+    // Legacy order records block the whole pair; their reason wins over a transfer stage.
     const trackedTransfer =
-      !(pendingOrder && Object.keys(pendingOrder).length) &&
+      !pairLegacyOrders(pair) &&
       transfer &&
       typeof transfer.request_id === 'string' &&
       transfer.request_id.trim() &&
@@ -233,15 +189,9 @@ export function pairStatusNotices(
       )
         ? transfer
         : null;
-    const issue = pendingIssue(pendingOrder);
-    const submitting =
-      Boolean(pendingOrder && Object.keys(pendingOrder).length) &&
-      ['submitting', 'leverage'].includes(pair.state?.phase ?? '');
     const reason =
-      (submitting ? issue : '') ||
       (trackedTransfer ? pair.state?.margin?.reason : undefined) ||
       pair.state?.reason ||
-      issue ||
       pair.pause_reason;
     const apiReason =
       reason === pairApiNotice?.text || reason === marginApiNotice?.text;
@@ -261,7 +211,6 @@ export function pairStatusNotices(
       typeof reason === 'string' &&
       Boolean(reason.trim()) &&
       !apiReason &&
-      (!submitting || Boolean(issue)) &&
       !routineTransfer;
     const label = trackedTransfer
       ? pairTransferStatus(trackedTransfer)
@@ -269,11 +218,7 @@ export function pairStatusNotices(
     const text =
       `${label}${reason && !apiReason ? ` · ${reason}` : ''}` +
       (canCheckAtStart
-        ? marginOnly
-          ? ' · 可启动保证金管理；已有请求继续核对，不重复发送，也不要求先匹配策略持仓。'
-          : canResumeTransfer
-            ? ' · 可重新启动；启动时重新核验账户，交易额外预留未知转出金额，原划转不重发。'
-            : ' · 启动时会自动核验原单与补偿单；全部结束且账户检查通过后，保留实际平衡底仓，无需减回旧底仓。'
+        ? ' · 可启动保证金管理；已有请求继续核对，不重复发送。'
         : '');
     if (showExecution && trackedTransfer) {
       // A retry countdown is still the same transfer and stage. Its current
@@ -375,13 +320,12 @@ export function observePairNotices(
   const history = previous?.history ?? { activeKeys: [], entries: [] };
   const raw = pairStatusNotices(pair, now, offline);
   const scheduled = Boolean(pairScheduledMarginWait(pair, now, offline));
-  const snapshots = pairDisplayBalances(pair);
+  const balances = pair.state?.margin_balances;
   const signals = {
     group: raw.some(({ kind }) => kind === 'data'),
-    long:
-      !scheduled && !pairDataFresh(snapshots?.long?.timestamp, now, offline),
+    long: !scheduled && !pairDataFresh(balances?.long?.timestamp, now, offline),
     short:
-      !scheduled && !pairDataFresh(snapshots?.short?.timestamp, now, offline),
+      !scheduled && !pairDataFresh(balances?.short?.timestamp, now, offline),
     runtime: !pairDataFresh(pair.state?.updated_at, now, offline),
   };
   const validClock =

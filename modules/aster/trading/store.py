@@ -339,7 +339,7 @@ class Store:
 
     def switch_pair_symbol(self, pair, runtime, *, expected_pair, expected_runtime,
                            expected_margin, accounts, check_current):
-        """Atomically adopt a verified target symbol, retaining its old journal."""
+        """Atomically change a paused pair's symbol, retaining its old journal."""
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
@@ -403,37 +403,6 @@ class Store:
                        (pair["id"], "pair", message, time.time()))
             return saved
 
-    def commit_pair_recovery(self, pair, runtime, *, expected_runtime, expected_margin,
-                             accounts, check_current, message, audit=None, batch=None):
-        """A reviewed local recovery is atomic with its unchanged paused ownership."""
-        with self.connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
-            if not row or without_cycle(json.loads(row[0])) != pair or pair.get("enabled") is not False:
-                raise TradingError("核对期间配对组状态已变化，请重新核对")
-            for key, expected in (("pair_runtime:" + pair["id"], expected_runtime),
-                                  ("pair_margin:" + pair["id"], expected_margin)):
-                row = db.execute("SELECT data FROM kv WHERE key=?", (key,)).fetchone()
-                if (json.loads(row[0]) if row else {}) != expected:
-                    raise TradingError("核对期间订单或划转记录已变化，请重新核对")
-            for account in accounts:
-                row = db.execute("SELECT data FROM accounts WHERE id=?", (account["id"],)).fetchone()
-                binding = db.execute("SELECT pair_id,direction FROM pair_members WHERE account_id=?", (account["id"],)).fetchone()
-                side = "LONG" if account["id"] == pair["long_account_id"] else "SHORT"
-                if not row or self.account_defaults(json.loads(row[0])) != account or not binding or tuple(binding) != (pair["id"], side):
-                    raise TradingError("核对期间子账户配置或绑定已变化，请重新核对")
-            check_current()
-            self._save_pair(db, pair)
-            if audit is not None:
-                db.execute("INSERT INTO kv(key,data) VALUES (?,?)", (
-                    "pair_order_recovery:" + pair["id"] + ":" + audit["pending"]["id"], dumps(audit)))
-            if batch is not None:
-                db.execute("INSERT INTO kv(key,data) VALUES (?,?)", ("pair_batch:" + batch["id"], dumps(batch)))
-            db.execute("INSERT INTO kv(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
-                       ("pair_runtime:" + pair["id"], dumps(runtime)))
-            db.execute("INSERT INTO events(account_id,kind,message,created_at) VALUES(?,?,?,?)",
-                       (pair["id"], "pair", message + "；本次核对未下单或划转", time.time()))
-
     def _save_pair(self, db, pair, *, create=False, allow_symbol_change=False):
         row = db.execute("SELECT data FROM pairs WHERE id=?", (pair["id"],)).fetchone()
         if create and row:
@@ -451,7 +420,7 @@ class Store:
             if MarginBalancer.unsettled_shared(json.loads(margin_row[0]) if margin_row else {}):
                 raise TradingError("保证金划转尚未完成共享结算，不能更换原主账户配置")
         if previous and previous["symbol"] != pair["symbol"] and not allow_symbol_change:
-            raise TradingError("交易标的只能通过暂停后的空仓核验切换")
+            raise TradingError("交易标的只能在配对组暂停后切换")
         members = [(pair["long_account_id"], "LONG"), (pair["short_account_id"], "SHORT")]
         if members[0][0] == members[1][0]:
             raise TradingError("配对组需要两个不同账户")
@@ -466,8 +435,10 @@ class Store:
                 raise TradingError("账户旧批次尚未完成，请先核对")
         revision = (previous or {}).get("revision", 0) + 1
         saved_pair = {**without_cycle(pair), "revision": revision}
-        # The previous release rejects ordinary and cycle together only when validating input.
-        disable = bool(pair.get("enabled") or (pair.get("ordinary") or {}).get("enabled")) or allow_symbol_change
+        if isinstance(saved_pair.get("ordinary"), dict):
+            # Pair opening was removed; any write keeps a rollback from resuming it.
+            saved_pair["ordinary"] = {**saved_pair["ordinary"], "enabled": False}
+        disable = bool(pair.get("enabled")) or allow_symbol_change
         cycle = rollback_cycle(previous, pair, disable=disable)
         db.execute("INSERT INTO pairs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data",
                    (pair["id"], dumps({**saved_pair, "cycle": cycle})))
@@ -477,7 +448,7 @@ class Store:
         return saved_pair
 
     def delete_pair(self, pair_id, *, expected_pair=None, expected_runtime=None, expected_margin=None,
-                    accounts=None, check_current=None, watch_evidence=None):
+                    accounts=None, check_current=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT data FROM pairs WHERE id=?", (pair_id,)).fetchone()
@@ -488,15 +459,12 @@ class Store:
                 raise TradingError("请先暂停配对组")
             runtime_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_runtime:" + pair_id,)).fetchone()
             runtime = json.loads(runtime_row[0]) if runtime_row else {}
-            if runtime.get("recovery_watch") is not None and (
-                    expected_pair is None or expected_runtime is None or expected_margin is None
-                    or accounts is None or check_current is None or watch_evidence is None):
-                raise TradingError("人工归档订单仍需跟踪，不能解除子账户绑定；请保留此配对组")
-            if runtime.get("pending"):
-                raise TradingError("配对组仍有未完成批次")
-            if any(dec(qty) for qty in (runtime.get("owned") or {}).values()) or any(
-                    dec(qty) for qty in (runtime.get("progress") or {}).get("quantities", {}).values()):
-                raise TradingError("配对组仍有记录持仓")
+            # Positions stay in the accounts. Old opening batches still need
+            # the removed recovery path and keep the binding.
+            if runtime.get("pending") is not None or runtime.get("recovery_watch") is not None:
+                raise TradingError("配对组仍有旧版本配对开仓的未完成批次或订单观察记录，不能解除绑定")
+            if any(dec(qty) for qty in (runtime.get("progress") or {}).get("quantities", {}).values()):
+                raise TradingError("配对组仍有旧版循环策略记录持仓")
             margin_row = db.execute("SELECT data FROM kv WHERE key=?", ("pair_margin:" + pair_id,)).fetchone()
             margin = json.loads(margin_row[0]) if margin_row else {}
             from .margin_balance import MarginBalancer
@@ -511,20 +479,8 @@ class Store:
                     side = "LONG" if account["id"] == pair["long_account_id"] else "SHORT"
                     if not row or self.account_defaults(json.loads(row[0])) != account or not binding or tuple(binding) != (pair_id, side):
                         raise TradingError("解除绑定期间子账户配置或归属已变化，请重新核对")
-                if watch_evidence is not None:
-                    prefix = "pair_watch_evidence:" + pair_id + ":"
-                    saved_evidence = {row[0]: json.loads(row[1]) for row in db.execute(
-                        "SELECT key,data FROM kv WHERE substr(key,1,?)=?", (len(prefix), prefix))}
-                    if saved_evidence != watch_evidence:
-                        raise TradingError("解除绑定期间历史观察证据已变化，请重新核对")
                 check_current()
             deleted_at = time.time()
-            if runtime.get("recovery_watch") is not None:
-                archive = {"watch": runtime["recovery_watch"], "evidence": watch_evidence,
-                           "identities": runtime.get("identities"), "flat_verified_at": deleted_at}
-                db.execute("INSERT INTO kv VALUES (?,?)", ("pair_deleted_watch:" + pair_id, dumps(archive)))
-                runtime.pop("recovery_watch")
-                db.execute("UPDATE kv SET data=? WHERE key=?", (dumps(runtime), "pair_runtime:" + pair_id))
             db.execute("DELETE FROM pair_members WHERE pair_id=?", (pair_id,))
             db.execute("DELETE FROM pairs WHERE id=?", (pair_id,))
             db.execute("DELETE FROM kv WHERE key=?", ("pair_margin_control:" + pair_id,))

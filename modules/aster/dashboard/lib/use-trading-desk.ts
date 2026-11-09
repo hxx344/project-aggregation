@@ -108,10 +108,7 @@ export function useTradingDesk() {
         resumePolling = false;
       }
       if (!r.ok) throw new Error(data.detail || '操作未完成');
-      if (
-        (url.startsWith('/api/accounts') || url.startsWith('/api/pairs')) &&
-        !url.endsWith('/recovery-preview')
-      )
+      if (url.startsWith('/api/accounts') || url.startsWith('/api/pairs'))
         hubBridge.current?.changed();
       if (url === '/api/logout') {
         clearSession();

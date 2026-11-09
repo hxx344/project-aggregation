@@ -102,7 +102,6 @@ def _pair_sources(pair, accounts):
     """Project display sources only; funds reads are never trading evidence."""
     state = _map(pair.get("state"))
     funds_only = (_map(pair.get("margin")).get("enabled") is True
-                  and _map(pair.get("ordinary")).get("enabled") is False
                   and state.get("pending") is None
                   and not has_legacy_cycle(state)
                   and state.get("attention") != LEGACY_CYCLE_REASON)
