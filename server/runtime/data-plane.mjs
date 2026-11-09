@@ -146,7 +146,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const assetFillsByMarket = Object.fromEntries(Object.keys(FILL_MARKETS).map(market => [market, createAssetFills({ market, listTargets: assetTargets, request: assetFillsRequest,
     cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
-    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state() }) });
+    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state(),
+    anthropic: { quotes: () => execution.quotes(), positions: () => anthropicWatch.state() } }) });
   // All ANT observations use the same account and scope as the order unit.
   const executionPositions = createExecutionPositionWatch({ readConnections: () => execution.anthropicPositionConnections(),
     read: (exchange, binding, options) => execution.readAnthropicPositions(exchange, binding, options), now: executionNow });

@@ -1,3 +1,5 @@
+import { sharesPerUnit } from '../trading-execution-plan.mjs';
+
 // Turns each module's existing read model into one digest section:
 // { id, name, level, status, asOf, metrics: [{ key, label, text, lines? }], issues }.
 // level: ok / notice / idle stay out of "needs attention"; warn / alert enter it.
@@ -114,6 +116,105 @@ export function researchSection(state) {
     metric('samples', '样本数', amount(insights?.leader?.samples))] });
 }
 
+// Same five contracts and share basis as 价差下单 (src/trading-anthropic.ts); the digest has no
+// per-browser share assumption, so it always converts with the page's default 12.7B / 16.7B.
+const ANT_SHARES = Object.freeze({ outstanding: '12.7', diluted: '16.7' });
+const ANT_CONTRACTS = Object.freeze([
+  { exchange: 'hyperliquid', symbol: 'io:ANTH', label: 'HL io:ANTH' }, { exchange: 'hyperliquid', symbol: 'xyz:ANT', label: 'HL xyz:ANT' },
+  { exchange: 'binance', symbol: 'ANTHROPICUSDT', label: 'Binance' }, { exchange: 'okx', symbol: 'ANTHROPICUSDT', label: 'OKX' }, { exchange: 'rh-lighter', symbol: 'ANTHROPIC', label: 'Lighter RH' }]);
+const ANT_VENUES = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' };
+const SPREAD_COLUMNS = [{ key: 'long', label: '做多' }, { key: 'short', label: '做空' }, { key: 'gap', label: '每股价差', align: 'right' }];
+const ANT_POSITION_COLUMNS = [{ key: 'venue', label: '交易所' }, { key: 'symbol', label: '合约' }, { key: 'size', label: '方向 · 数量', align: 'right' }, { key: 'pnl', label: '浮动盈亏', align: 'right' }, { key: 'distance', label: '距强平', align: 'right' }];
+const quotePrice = value => typeof value === 'string' && /^\d+(?:\.\d+)?$/.test(value) && Number(value) > 0 ? Number(value) : null;
+const perShareText = value => value === null ? MISSING : value.toFixed(2);
+const percentText = value => `${value > 0 ? '+' : ''}${value.toFixed(2)}%`;
+function shareUnit(exchange, symbol, contractSize) {
+  try { return Number(sharesPerUnit({ exchange, symbol }, ANT_SHARES, contractSize ?? '1')); } catch { return null; }
+}
+// One book per contract, read like the page's readBook: a leg older than maxAgeMs before the reply is stale.
+function antBook(quotes, contract) {
+  const row = quotes.books?.find(book => book.exchange === contract.exchange && book.symbol === contract.symbol);
+  if (!row) return { contract, error: '未取得盘口' };
+  if (row.error) return { contract, error: String(row.error) };
+  const bid = quotePrice(row.bid), ask = quotePrice(row.ask), at = stamp(row.at), generated = stamp(quotes.generatedAt), unit = shareUnit(contract.exchange, contract.symbol);
+  if (bid === null || ask === null || bid >= ask || at === null || generated === null || !unit) return { contract, error: '盘口不完整' };
+  return { contract, at, bid: bid / unit, ask: ask / unit, stale: generated - at > quotes.maxAgeMs };
+}
+// Each pair once in its better direction: buy the cheaper leg's ask, sell the dearer leg's bid, percent of the ask.
+function antPairs(books) {
+  const live = books.filter(book => !book.error), pairs = [];
+  live.forEach((first, index) => live.slice(index + 1).forEach(second => {
+    const forward = (second.bid - first.ask) / first.ask * 100, backward = (first.bid - second.ask) / second.ask * 100;
+    const [long, short, gap] = forward >= backward ? [first, second, forward] : [second, first, backward];
+    pairs.push({ long, short, gap, stale: long.stale || short.stale });
+  }));
+  return pairs.sort((a, b) => b.gap - a.gap);
+}
+/**
+ * ANT 套利: per-share prices and pairwise gaps from the execution quotes (same books as 价差下单),
+ * positions from the 套利仓位 watch. Either input may be `{ error }`; the other still shows.
+ */
+export function anthropicSection({ quotes, watch }) {
+  const id = 'hub:anthropic', name = 'ANT 套利', issues = [], times = [];
+  let level = 'ok', status = '正常';
+  const raise = (next, text) => { const rank = { ok: 0, notice: 1, warn: 2, alert: 3 }; if (rank[next] > rank[level]) { level = next; status = text; } };
+  const metrics = [];
+
+  if (quotes.error) { issues.push('ANT 报价读取失败'); raise('warn', '报价读取失败'); }
+  else {
+    const books = ANT_CONTRACTS.map(contract => antBook(quotes, contract)), failed = books.filter(book => book.error);
+    for (const book of books) if (!book.error) times.push(book.at);
+    if (failed.length === books.length) { issues.push('ANT 各交易所报价均读取失败'); raise('warn', '报价读取失败'); }
+    else if (failed.length) raise('notice', '部分报价缺失');
+    if (books.some(book => book.stale)) raise('notice', '部分报价过期');
+    const pairs = antPairs(books);
+    metrics.push({ key: 'prices', label: '每股价格（买 / 卖，按 127 亿 / 167 亿股折算）', text: `${books.length - failed.length} / ${books.length} 个合约`,
+      lines: books.map(book => book.error ? `${book.contract.label}：读取失败 ${clean(redacted(book.error), 60)}` : `${book.contract.label}：${perShareText(book.bid)} / ${perShareText(book.ask)}${book.stale ? '（过期）' : ''}`) });
+    metrics.push({ key: 'spreads', label: '两两价差', text: pairs.length ? `${pairs.length} 组` : '无',
+      groups: pairs.length ? [{ title: `ANT 每股可成交价差：买入做多腿卖一、卖出做空腿买一（${pairs.length} 组）`, columns: SPREAD_COLUMNS,
+        rows: pairs.map(pair => ({ long: pair.long.contract.label, short: pair.short.contract.label, gap: `${percentText(pair.gap)}${pair.stale ? '（过期）' : ''}` })) }] : [] });
+  }
+
+  if (watch.error) { issues.push('ANT 仓位读取失败'); raise('warn', '仓位读取失败'); }
+  else {
+    // Only an enabled 套利仓位 alert raises the digest; otherwise a near row is flagged in the table alone.
+    const threshold = numeric(watch.alerts?.config?.thresholdPercent), alertsOn = watch.alerts?.config?.enabled === true, connected = (watch.sources ?? []).filter(source => source.connected);
+    for (const source of connected) {
+      const venue = ANT_VENUES[source.exchange] ?? source.exchange, fetched = stamp(source.fetchedAt);
+      if (source.state !== 'live') { issues.push(`${venue} 仓位：${source.error || (source.state === 'loading' ? '正在读取' : '数据过期')}`); if (source.state !== 'loading') raise('warn', '部分来源异常'); }
+      if (fetched !== null && ['live', 'stale'].includes(source.state)) times.push(fetched);
+    }
+    // Rows kept from a failed or stale read are shown as old and never raise the section on their own.
+    const positions = connected.flatMap(source => (source.positions ?? []).map(position => ({ ...position, old: source.state !== 'live' })));
+    const loading = connected.some(source => source.state === 'loading');
+    // Venues settle in USDT or USDC, so unrealized PnL is totalled per venue and never across them.
+    const pnl = new Map();
+    let longShares = 0, shortShares = 0, nearest = null;
+    const rows = positions.map(position => {
+      const venue = `${ANT_VENUES[position.exchange] ?? position.exchange}${position.account === undefined ? '' : ` #${position.account}`}`;
+      const unit = shareUnit(position.exchange, position.symbol, position.contractSize), shares = unit === null ? NaN : Number(position.quantity) * unit;
+      if (position.side === 'long') longShares += shares; else shortShares += shares;
+      const unrealized = numeric(position.unrealizedPnl), venueName = ANT_VENUES[position.exchange] ?? position.exchange, total = pnl.get(venueName) ?? { sum: 0, missing: 0 };
+      if (unrealized === null) total.missing++; else total.sum += unrealized;
+      pnl.set(venueName, total);
+      const distance = position.riskUnknown ? null : numeric(position.distancePercent);
+      const near = distance !== null && threshold !== null && distance <= threshold;
+      if (distance !== null && (nearest === null || distance < nearest.distance)) nearest = { distance, label: `${venue} ${position.symbol}` };
+      if (alertsOn && !position.old && (near || position.alerting)) { issues.push(`${venue} ${position.symbol} ${position.side === 'long' ? '多' : '空'}仓距强平 ${distance === null ? '未知' : `${distance.toFixed(2)}%`}${threshold === null ? '' : `（预警线 ${threshold}%）`}`); raise('alert', '接近强平'); }
+      const quantity = `${amount(position.quantity)}${position.quantityUnit ? ` ${position.quantityUnit}` : ''}${Number.isFinite(shares) ? `（≈${digits(shares)} 股）` : ''}`;
+      return { venue: clean(venue, 40), symbol: clean(position.symbol, 24), size: `${position.side === 'long' ? '多' : '空'} ${quantity}`, pnl: signed(position.unrealizedPnl), distance: `${distance === null ? '未知' : `${distance.toFixed(2)}%${near ? ' ⚠' : ''}`}${position.old ? '（过期）' : ''}` };
+    });
+    const sharesKnown = Number.isFinite(longShares) && Number.isFinite(shortShares);
+    metrics.push(metric('count', 'ANT 持仓笔数', !connected.length ? '未连接下单账户' : !positions.length && loading ? '读取中' : `${positions.length}`));
+    if (positions.length) metrics.push(
+      metric('shares', '多空股数（估算）', sharesKnown ? `多 ≈${digits(longShares)} · 空 ≈${digits(shortShares)} · 净 ${signed(longShares - shortShares)} 股` : MISSING),
+      metric('pnl', '浮动盈亏（各交易所结算币）', [...pnl].map(([venue, { sum, missing }]) => `${clean(venue, 40)} ${missing && !sum ? MISSING : signed(sum)}${missing ? `（${missing} 笔未计入）` : ''}`).join(' · ')),
+      metric('nearest', '最近强平距离', nearest ? `${nearest.distance.toFixed(2)}%（${clean(nearest.label, 60)}）${threshold === null ? ' · 预警线未知' : ` · 预警线 ${threshold}%${alertsOn ? '' : '（预警未开启）'}`}` : MISSING),
+      { key: 'positions', label: 'ANT 持仓明细', text: `${positions.length} 项`, groups: [{ title: `ANT 持仓（${positions.length} 笔）`, columns: ANT_POSITION_COLUMNS, rows }] });
+  }
+  return section(id, name, level, status, { asOf: times.length ? Math.min(...times) : null, issues, metrics });
+}
+
 // A source that stays silent only loses its own section; the digest still goes out.
 function guarded(id, name, read, log) {
   let timer;
@@ -123,9 +224,18 @@ function guarded(id, name, read, log) {
     return section(id, name, 'warn', '读取失败', { issues: ['本次读取失败，请到工作台查看'] });
   }).finally(() => clearTimeout(timer));
 }
-export async function collectSections({ overview, positions, funding, execution, research, log = console, now = Date.now }) {
+const settle = async (read, part, log) => {
+  try { return await read(); } catch (error) { log.warn({ err: error, section: 'hub:anthropic', part, type: 'feishu-digest' }, '飞书汇总读取 ANT 数据失败'); return { error: true }; }
+};
+export async function collectSections({ overview, positions, funding, execution, research, anthropic = null, log = console, now = Date.now }) {
   const hub = await Promise.all([
     guarded('hub:positions', '交易所持仓', async () => positionsSection(await positions()), log),
+    // Quotes and positions fail separately, so one missing half never hides the other.
+    ...(anthropic ? [guarded('hub:anthropic', 'ANT 套利', async () => {
+      const [quotes, watch] = await Promise.all([settle(anthropic.quotes, 'quotes', log), settle(anthropic.positions, 'positions', log)]);
+      if (quotes.error && watch.error) throw new Error('anthropic_sources_failed');
+      return anthropicSection({ quotes, watch });
+    }, log)] : []),
     guarded('hub:funding', '原油四腿', () => fundingSection(funding()), log),
     guarded('hub:execution', '原生执行', () => executionSection(execution()), log),
     guarded('hub:research', 'Entropy / Lighter', () => researchSection(research()), log),
