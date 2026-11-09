@@ -452,4 +452,31 @@ unit.write_text(source, encoding='utf-8')
 PY
   done
 )
+# The two runs that change nothing: the records decide first (install_decide,
+# deploy/test-install-decisions.py), then the source dependencies and health.
+(
+  skip_root="$test_root/skip"
+  APP_DIR="$skip_root/app" old_release="$skip_root/app/releases/aaaaaaaaaaaa-0000000000000000"
+  release=$old_release commit=c deployment_key=k deployed_state='c k' PROJECT_DEPLOY_MODE=ci PROJECT_DEPLOY_TESTS=1
+  mkdir -p "$old_release/dist"; touch "$old_release/.managed-release" "$old_release/.install-ready"; printf x > "$old_release/dist/index.html"
+  probes=
+  healthy() { probes+=health,; [[ ! -f "$skip_root/unhealthy" ]]; }
+  source_runtime_dependencies_ready() { probes+="deps:$1,"; [[ ! -f "$skip_root/deps-missing" ]]; }
+  expect() {
+    local expected=$1 actual; shift; probes=
+    if "$@"; then actual=skip; else actual=deploy; fi
+    [[ "$actual:$probes" == "$expected" ]] || { echo "Expected $expected from $*, got $actual:$probes" >&2; exit 1; }
+  }
+  expect skip:health, unchanged_source
+  expect skip:health, unchanged_release
+  PROJECT_DEPLOY_MODE=source PROJECT_DEPLOY_TESTS=0; expect "skip:deps:$old_release,health," unchanged_source
+  touch "$skip_root/deps-missing"; expect "deploy:deps:$old_release," unchanged_source; rm "$skip_root/deps-missing"
+  touch "$skip_root/unhealthy"; expect "deploy:deps:$old_release,health," unchanged_source; expect deploy:health, unchanged_release
+  rm "$skip_root/unhealthy"
+  # Records that do not allow skipping never reach the probes.
+  deployed_state='c j'; expect deploy: unchanged_source; expect deploy: unchanged_release; deployed_state='c k'
+  # A failing helper deploys.
+  install_decide() { return 1; }
+  expect deploy: unchanged_source; expect deploy: unchanged_release
+)
 printf 'Installer helper and cache pruning checks passed.\n'
