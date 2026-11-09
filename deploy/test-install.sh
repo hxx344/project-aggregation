@@ -126,6 +126,11 @@ printf 'not-a-key\n' > "$release/.runtime-component-key"; key 41 | tr 4 x > "$ru
 key 41 > "$release/.runtime-component-key"; key 41 > "$running/.runtime-component-key"; expect_scope api 'keys restored'
 touch "$test_root/runtime-inactive"; expect_scope full 'runtime not running'; rm "$test_root/runtime-inactive"
 touch "$test_root/migration-pending"; expect_scope full 'module migration outstanding'; rm "$test_root/migration-pending"
+# The records decide first: a failing helper or records that already require a
+# full restart never reach the runtime probes.
+( install_decide() { return 1; }; runtime_stub() { touch "$test_root/probed"; return 1; }; expect_scope full 'failing helper' )
+( pending_activation_scope=full; runtime_stub() { touch "$test_root/probed"; return 1; }; expect_scope full 'unfinished full activation' )
+[[ ! -e "$test_root/probed" ]] || { echo 'The runtime was probed although the records required a full restart' >&2; exit 1; }
 # Dual-slot units (design doc api-dual-slot 6.2): the entry unit and a runtime
 # unit that wants it mark the layout; the slots move alone only from a settled
 # record and entry unit.
@@ -451,5 +456,32 @@ for forged in ('/bin/sh -c x ' + command, '/usr/local/bin/node --require /tmp/x.
 unit.write_text(source, encoding='utf-8')
 PY
   done
+)
+# The two runs that change nothing: the records decide first (install_decide,
+# deploy/test-install-decisions.py), then the source dependencies and health.
+(
+  skip_root="$test_root/skip"
+  APP_DIR="$skip_root/app" old_release="$skip_root/app/releases/aaaaaaaaaaaa-0000000000000000"
+  release=$old_release commit=c deployment_key=k deployed_state='c k' PROJECT_DEPLOY_MODE=ci PROJECT_DEPLOY_TESTS=1
+  mkdir -p "$old_release/dist"; touch "$old_release/.managed-release" "$old_release/.install-ready"; printf x > "$old_release/dist/index.html"
+  probes=
+  healthy() { probes+=health,; [[ ! -f "$skip_root/unhealthy" ]]; }
+  source_runtime_dependencies_ready() { probes+="deps:$1,"; [[ ! -f "$skip_root/deps-missing" ]]; }
+  expect() {
+    local expected=$1 actual; shift; probes=
+    if "$@"; then actual=skip; else actual=deploy; fi
+    [[ "$actual:$probes" == "$expected" ]] || { echo "Expected $expected from $*, got $actual:$probes" >&2; exit 1; }
+  }
+  expect skip:health, unchanged_source
+  expect skip:health, unchanged_release
+  PROJECT_DEPLOY_MODE=source PROJECT_DEPLOY_TESTS=0; expect "skip:deps:$old_release,health," unchanged_source
+  touch "$skip_root/deps-missing"; expect "deploy:deps:$old_release," unchanged_source; rm "$skip_root/deps-missing"
+  touch "$skip_root/unhealthy"; expect "deploy:deps:$old_release,health," unchanged_source; expect deploy:health, unchanged_release
+  rm "$skip_root/unhealthy"
+  # Records that do not allow skipping never reach the probes.
+  deployed_state='c j'; expect deploy: unchanged_source; expect deploy: unchanged_release; deployed_state='c k'
+  # A failing helper deploys.
+  install_decide() { return 1; }
+  expect deploy: unchanged_source; expect deploy: unchanged_release
 )
 printf 'Installer helper and cache pruning checks passed.\n'

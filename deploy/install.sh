@@ -1349,10 +1349,11 @@ arrives and is verified with the installer itself: a first install has it, and
 an update runs the target version's copy, never one an older installer left.
 deploy/test-install-decisions.py checks that the embedded copy is identical.
 
-Each command reads only the installer's records and release markers under the
-installation directory, and prints its decision on one line. The shell keeps
-every system call, link and record write. Exit status 1 means an absent or
-invalid record, as the shell functions it replaced returned; 2 a usage error.
+Each command reads only the installer's records, release markers and the unit
+files it wrote, and prints its decision on one line. The shell keeps every
+system call, probe of running services, link and record write, and calls a
+decision before the probes it used to precede. Exit status 1 means an absent
+or invalid record, as the shell functions it replaced returned; 2 a usage error.
 """
 import json
 import os
@@ -1363,12 +1364,19 @@ SLOTS = ('a', 'b')
 PHASES = ('candidate', 'switching', 'draining')
 INTENTS = ('forward', 'rollback', 'legacy')
 SCOPES = ('full', 'api')
+LAYOUTS = ('single', 'dual')
+MODES = ('source', 'ci')
 ABSOLUTE = re.compile(r'/\S+')
 RELEASE_NAME = re.compile(r'[a-f0-9]{12}-[a-f0-9]{16}')
+RUNTIME_KEY = re.compile(r'[a-f0-9]{64}')
 
 
 class Invalid(Exception):
     """An absent or malformed record."""
+
+
+class Usage(Exception):
+    """An argument outside the values the installer passes."""
 
 
 def load_json(path):
@@ -1491,6 +1499,110 @@ def first_install_resume(app_dir, old_release):
     return ['resume']
 
 
+def file_text(path):
+    """What "$(cat -- path)" yields: NUL bytes and trailing newlines dropped; None where cat fails."""
+    try:
+        with open(path, 'rb') as stream:
+            data = stream.read()
+    except OSError:
+        return None
+    return data.replace(b'\0', b'').rstrip(b'\n').decode('utf-8', 'surrogateescape')
+
+
+def same_file(first, second):
+    """cmp -s: both readable with the same bytes."""
+    try:
+        with open(first, 'rb') as one, open(second, 'rb') as other:
+            return one.read() == other.read()
+    except OSError:
+        return False
+
+
+def nonempty(path):
+    """[[ -s path ]]"""
+    try:
+        return os.stat(path).st_size > 0
+    except OSError:
+        return False
+
+
+def runtime_component_key(release):
+    """The runtime component key recorded in a release, or None."""
+    path = release + '/.runtime-component-key'
+    key = file_text(path) if os.path.isfile(path) else None
+    return key if key is not None and RUNTIME_KEY.fullmatch(key) else None
+
+
+def valid_slot_record(path):
+    try:
+        slot_record(path)
+    except Invalid:
+        return False
+    return True
+
+
+def activation_scope(pending_scope, old_release, release, layout, dual, app_dir, work_dir, unit_file, entry_unit_file, api_unit_file,
+                     deployment_key):
+    """full, or probe when the records allow restarting only the API (design doc 6.2).
+
+    An unfinished full activation keeps its scope. Otherwise the runtime unit
+    must be installed and unchanged, its last full activation recorded with
+    this deployment key, the API units settled in the target layout and the
+    candidate built with a runtime component key. dual tells whether the
+    dual-slot units are installed (dual_installed): one with the target layout
+    single is a change of layout, always full. probe leaves the running
+    runtime, its release (same-runtime) and the module migration to check.
+    """
+    if layout not in LAYOUTS or dual not in ('0', '1'):
+        raise Usage(layout, dual)
+    if pending_scope == 'full' or not old_release or not os.path.isfile(unit_file) or \
+            not os.path.isfile(app_dir + '/.runtime-deployment'):
+        return ['full']
+    if layout == 'dual':
+        settled = dual == '1' and same_file(work_dir + '/entry.service', entry_unit_file) and \
+            not os.path.exists(app_dir + '/.api-cutover') and valid_slot_record(app_dir + '/.api-slot')
+    else:
+        settled = os.path.isfile(api_unit_file) and dual == '0'
+    if not settled or not same_file(work_dir + '/service', unit_file) or \
+            file_text(app_dir + '/.runtime-deployment') != deployment_key or runtime_component_key(release) is None:
+        return ['full']
+    return ['probe']
+
+
+def same_runtime(release, running):
+    """same when the running runtime's release was built with the candidate's runtime component key."""
+    key = runtime_component_key(release)
+    return ['same' if key is not None and runtime_component_key(running) == key else 'different']
+
+
+def unchanged_source(mode, tests, app_dir, old_release, deployed_state, commit, deployment_key):
+    """verify when the last successful run deployed this commit with this deployment and left nothing unfinished.
+
+    Only a run that skips the tests can skip on these records: a source build
+    with tests checks the commit again. verify leaves the release's runtime
+    dependencies (source builds) and the service health to check; deploy
+    prepares the release.
+    """
+    if mode not in MODES or tests not in ('0', '1'):
+        raise Usage(mode, tests)
+    skip = (mode == 'ci' or tests == '0') and bool(old_release) and os.path.isfile(old_release + '/.install-ready') and \
+        nonempty(old_release + '/dist/index.html') and deployed_state == f'{commit} {deployment_key}' and \
+        not os.path.exists(app_dir + '/.api-cutover') and not os.path.exists(app_dir + '/.pending-previous')
+    return ['verify' if skip else 'deploy']
+
+
+def unchanged_release(app_dir, release, old_release, deployed_state, deployment_key):
+    """verify when the prepared release already runs with the recorded deployment and nothing is unfinished.
+
+    deployed_state is "<commit> <deployment key>"; another commit may have
+    produced the same release. verify leaves the service health to check.
+    """
+    recorded = deployed_state.split(' ', 1)[1] if ' ' in deployed_state else deployed_state
+    skip = release == old_release and recorded == deployment_key and \
+        not os.path.exists(app_dir + '/.api-cutover') and not os.path.exists(app_dir + '/.pending-previous')
+    return ['verify' if skip else 'deploy']
+
+
 def cutover_fields(path):
     return list(cutover_record(path).values())
 
@@ -1501,17 +1613,27 @@ COMMANDS = {
     'cutover-resolution': (2, lambda cutover, slot: cutover_resolution(cutover_record(cutover), slot_record(slot))),
     'pending-previous': (3, pending_previous),
     'first-install-resume': (2, first_install_resume),
+    'activation-scope': (11, activation_scope),
+    'same-runtime': (2, same_runtime),
+    'unchanged-source': (7, unchanged_source),
+    'unchanged-release': (5, unchanged_release),
 }
+
+
+def usage():
+    print(f'usage: install_decide {"|".join(COMMANDS)} ARGUMENTS', file=sys.stderr)
+    return 2
 
 
 def main(argv):
     if not argv or argv[0] not in COMMANDS or len(argv) - 1 != COMMANDS[argv[0]][0]:
-        print(f'usage: install_decide {"|".join(COMMANDS)} ARGUMENTS', file=sys.stderr)
-        return 2
+        return usage()
     try:
         print(*COMMANDS[argv[0]][1](*argv[1:]))
     except Invalid:
         return 1
+    except Usage:
+        return usage()
     return 0
 
 
@@ -3207,13 +3329,6 @@ runtime_deployment_key() {
   [[ "$slot_layout" != dual ]] || units+=("$work_dir/entry.service")
   { cat -- "${units[@]}" "$ENV_FILE"; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash
 }
-release_runtime_key() {
-  local key
-  [[ -f "$1/.runtime-component-key" ]] || return 1
-  key=$(cat -- "$1/.runtime-component-key") || return 1
-  [[ "$key" =~ ^[a-f0-9]{64}$ ]] || return 1
-  printf '%s' "$key"
-}
 # Committed covers every legacy module: a helper that would select more differs
 # and so changes the runtime component key.
 migration_settled() {
@@ -3222,25 +3337,17 @@ migration_settled() {
 # Prints api when the running runtime would restart into the same code with the
 # same unit and configuration, and no module migration is outstanding; full
 # otherwise (design doc 6.2). Shared code outside server/api counts as runtime.
-# The dual-slot units move only the slots, from a settled record (api-dual-slot
-# 6.2); a change of layout is always full.
-api_layout_settled() {
-  if [[ "$slot_layout" == dual ]]; then
-    dual_installed && cmp -s "$work_dir/entry.service" "$ENTRY_UNIT_FILE" && [[ ! -e "$APP_DIR/.api-cutover" ]] && read_slot_record >/dev/null
-  else
-    [[ -f "$API_UNIT_FILE" ]] && ! dual_installed
-  fi
-}
+# The records decide first (install_decide activation-scope: an unfinished
+# full activation, the units, the layout and the recorded deployment); only
+# then are the running runtime, its release and the migration probed. A
+# failing helper prints nothing, which counts as full.
 activation_scope() {
-  local running key
-  # A full activation may have moved current before stopping/restarting all
-  # units. Finish its original scope before treating it as an API-only update.
-  if [[ "$pending_activation_scope" == full ]]; then printf full; return; fi
-  if [[ -n "$old_release" && -f "$UNIT_FILE" && -f "$APP_DIR/.runtime-deployment" ]] && api_layout_settled &&
-     cmp -s "$work_dir/service" "$UNIT_FILE" && [[ "$(cat -- "$APP_DIR/.runtime-deployment")" == "$(runtime_deployment_key)" ]] &&
+  local running dual=0
+  if dual_installed; then dual=1; fi
+  if [[ "$(install_decide activation-scope "$pending_activation_scope" "$old_release" "$release" "$slot_layout" "$dual" "$APP_DIR" \
+           "$work_dir" "$UNIT_FILE" "$ENTRY_UNIT_FILE" "$API_UNIT_FILE" "$(runtime_deployment_key)")" == probe ]] &&
      systemctl is-active --quiet "$SERVICE" && running=$(live_runtime_release) &&
-     key=$(release_runtime_key "$release") && [[ "$(release_runtime_key "$running")" == "$key" ]] &&
-     migration_settled "$release"; then
+     [[ "$(install_decide same-runtime "$release" "$running")" == same ]] && migration_settled "$release"; then
     printf api
   else
     printf full
@@ -3452,6 +3559,18 @@ prune_caches() {
   (( removed == 0 )) || log "已清理 $removed 项旧部署缓存或失败安装残留。"
   (( failed == 0 )) || { log "有 $failed 项旧缓存未能删除。"; return 1; }
 }
+# The two runs that change nothing (install_decide unchanged-source and
+# unchanged-release decide on the records first; a failing helper deploys).
+# The same commit and deployment as the last successful run: skip everything.
+unchanged_source() {
+  [[ "$(install_decide unchanged-source "$PROJECT_DEPLOY_MODE" "$PROJECT_DEPLOY_TESTS" "$APP_DIR" "$old_release" "$deployed_state" \
+        "$commit" "$deployment_key")" == verify ]] &&
+    { [[ "$PROJECT_DEPLOY_MODE" != source ]] || source_runtime_dependencies_ready "$old_release"; } && healthy
+}
+# The prepared release already runs with this deployment: skip the switch and restart.
+unchanged_release() {
+  [[ "$(install_decide unchanged-release "$APP_DIR" "$release" "$old_release" "$deployed_state" "$deployment_key")" == verify ]] && healthy
+}
 # The Aero LP module (removed in #190) kept its signer key encrypted with the
 # data root's credentials.key in aero-lp/wallet.json. Nothing reads it any more,
 # yet its address may still hold funds or positions: name the file and the
@@ -3562,9 +3681,7 @@ main() {
   [[ "$CI_RELEASE_NODE_VERSION" == "$NODE_VERSION" ]] || fail '正式版本的 Node.js 基线与安装器不匹配，请获取最新版安装器。'
   deployed_state=
   [[ ! -f "$APP_DIR/.deployed-state" ]] || deployed_state=$(cat "$APP_DIR/.deployed-state")
-  if [[ ( "$PROJECT_DEPLOY_MODE" == ci || "$PROJECT_DEPLOY_TESTS" == 0 ) && -n "$old_release" && -f "$old_release/.install-ready" && -s "$old_release/dist/index.html" &&
-        "$deployed_state" == "$commit $deployment_key" && ! -e "$APP_DIR/.api-cutover" && ! -e "$APP_DIR/.pending-previous" ]] &&
-      { [[ "$PROJECT_DEPLOY_MODE" != source ]] || source_runtime_dependencies_ready "$old_release"; } && healthy; then
+  if unchanged_source; then
     remember_environment
     log "源提交 ${commit:0:12} 已检查、运行环境和配置未变化，服务健康；跳过下载、依赖、验证、构建和重启。"
     finish_update_service "$old_release"
@@ -3595,8 +3712,7 @@ main() {
   prepare_aster_runtime "$release"
   write_unit
   deployment_key=$({ cat "$ENV_FILE"; layout_units | xargs -d '\n' cat --; printf '%s\n%s' "$runtime_key" "$INSTALL_REVISION:$build_environment"; } | hash)
-  if [[ "$release" == "$old_release" && "${deployed_state#* }" == "$deployment_key" &&
-        ! -e "$APP_DIR/.api-cutover" && ! -e "$APP_DIR/.pending-previous" ]] && healthy; then
+  if unchanged_release; then
     atomic_record "$APP_DIR/.deployed-state" "$commit $deployment_key"
     remember_environment
     log "已检查源提交 ${commit:0:12}；运行产物 $(cat "$release/.source-sha") 保持不变，跳过版本切换和重启。"
