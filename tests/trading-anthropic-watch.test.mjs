@@ -758,3 +758,33 @@ test('Lighter RH legs are read for the connected L1 address, alert, and keep the
     assert.ok(h.watch.state().sources.find(source => source.exchange === 'hyperliquid'), 'Hyperliquid is still listed');
   } finally { await h.watch.close(); h.cleanup(); }
 });
+
+test('automatic-reduction notices are sent once through the alert robot, never replayed after a restart or a replaced rule record', async () => {
+  const protection = { notice: { seq: 2, at: '2026-11-06T00:00:00.000Z', message: '旧通知' } };
+  const h = harness({ readProtection: () => protection });
+  try {
+    h.watch.save({ enabled: true, thresholdPercent: 20, repeatMinutes: 30 });
+    await h.watch.poll();
+    assert.equal(h.posts.length, 0, 'the first poll records a baseline and replays nothing');
+    protection.notice = { seq: 3, at: '2026-11-06T00:01:00.000Z', message: 'okx ANTHROPICUSDT 所选方向没有唯一可确认的持仓；规则已停用，请核对后重新启用' };
+    await h.watch.poll(); await h.watch.poll();
+    assert.deepEqual(h.posts, ['⚠️ ANT 自动减仓：okx ANTHROPICUSDT 所选方向没有唯一可确认的持仓；规则已停用，请核对后重新启用']);
+    assert.equal(h.cards[0].header.template, 'red');
+    await h.restart(); await h.watch.poll();
+    assert.equal(h.posts.length, 1, 'a restart keeps the claimed notice number');
+
+    protection.notice = { seq: 4, at: '2026-11-06T00:02:00.000Z', message: '已达到减仓阈值，但存在其它委托' };
+    h.fail(new Error('飞书发送失败（19024）'));
+    await h.watch.poll(); h.fail(null);
+    assert.equal(h.posts.length, 1);
+    h.advance(60_000); await h.watch.poll();
+    assert.equal(h.posts.length, 2, 'a refused notice is sent on retry'); assert.match(h.posts[1], /存在其它委托/);
+
+    protection.notice = { seq: 1, at: '2026-11-06T00:03:00.000Z', message: '记录被替换后的通知' };
+    await h.watch.poll();
+    assert.equal(h.posts.length, 2, 'a lower number rebaselines instead of sending');
+    protection.notice = { seq: 2, at: '2026-11-06T00:04:00.000Z', message: '替换后的新通知' };
+    await h.watch.poll();
+    assert.equal(h.posts.length, 3); assert.match(h.posts[2], /替换后的新通知/);
+  } finally { h.cleanup(); }
+});

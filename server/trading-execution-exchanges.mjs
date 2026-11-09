@@ -17,7 +17,8 @@ import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs
  * createExecutionExchangeClient(exchange, { fetchImpl, now, timeoutMs }) exposes:
  *   verify(credentials, options) -> { identity: string | null }
  *   account(credentials, options) -> { identity, modes, positions, openOrders, strategies }
- *     Anthropic positions also expose risk: { markPrice, liquidationPrice, at };
+ *     Anthropic positions also expose risk: { markPrice, liquidationPrice, at, noLiquidation };
+ *     noLiquidation is true only when the venue explicitly reports no liquidation price.
  *     prices are positive decimal strings or null, at is the local receipt time.
  *   positionSnapshot(credentials, options) -> { identity, fetchedAt, positions }
  *     Anthropic only, using the execution connection's exact account scope;
@@ -620,6 +621,8 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       // Display fields are optional. Missing risk prices never manufacture a
       // zero or prevent the existing execution preflight from reading size.
       const risk = { markPrice: optional(row.markPrice, { positive: true }), liquidationPrice: optional(row.liquidationPrice, { positive: true }), at: receivedAt };
+      // Binance reports "0" when the position has no liquidation price; missing or malformed stays unknown.
+      risk.noLiquidation = risk.liquidationPrice === null && optional(row.liquidationPrice, { nonnegative: true }) !== null;
       if (display) {
         const notional = optional(row.notional);
         positions.push({ ...position, quantityUnit: 'ANTHROPIC', entryPrice: optional(row.entryPrice, { positive: true }), markPrice: risk.markPrice,

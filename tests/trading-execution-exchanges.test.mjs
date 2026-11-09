@@ -182,7 +182,7 @@ test('Binance Anthropic risk uses signed position responses and keeps receipt ti
     }, { now: () => time });
     const { positions } = await client.account(credentials, { accountMode, symbols: ['ANTHROPICUSDT'] });
     assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '2.5',
-      risk: { markPrice: '1600.1', liquidationPrice: '1800.25', at: new Date(NOW).toISOString() } }]);
+      risk: { markPrice: '1600.1', liquidationPrice: '1800.25', at: new Date(NOW).toISOString(), noLiquidation: false } }]);
     assert.equal(time, NOW + 12_000);
     assert.ok(calls.every(call => call.init.method === 'GET'));
     for (const call of calls) authenticatedSignature('binance', call);
@@ -199,7 +199,8 @@ test('Binance missing or invalid Anthropic risk prices stay null without rejecti
         ? [{ symbol: 'ANTHROPICUSDT', positionSide: 'BOTH', marginAsset: 'USDT', positionAmt: '2', markPrice: '100', liquidationPrice: '80', [field]: invalid }] : undefined);
       const { positions } = await client.account(credentials, { symbols: ['ANTHROPICUSDT'] });
       assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'long', quantity: '2',
-        risk: { markPrice: field === 'markPrice' ? null : '100', liquidationPrice: field === 'liquidationPrice' ? null : '80', at: new Date(NOW).toISOString() } }]);
+        risk: { markPrice: field === 'markPrice' ? null : '100', liquidationPrice: field === 'liquidationPrice' ? null : '80', at: new Date(NOW).toISOString(),
+          noLiquidation: field === 'liquidationPrice' && invalid === '0' } }]);
       assert.ok(calls.every(call => call.init.method === 'GET'));
     }
   }

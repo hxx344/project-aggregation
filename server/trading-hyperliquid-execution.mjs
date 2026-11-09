@@ -310,6 +310,8 @@ export function createHyperliquidExecutionClient({ ErrorClass, fetchImpl = globa
       const quantity = short ? size.slice(1) : size;
       const p = entry.position, position = { symbol: coin, side: short ? 'short' : 'long', quantity };
       const risk = { markPrice: markPrice(p.positionValue, quantity), liquidationPrice: riskPrice(p.liquidationPx), at: receivedAt };
+      // An explicit null or zero means the venue reports no liquidation price (the display path's liquidationKnown).
+      risk.noLiquidation = risk.liquidationPrice === null && (p.liquidationPx === null || typeof p.liquidationPx === 'string' && /^0+(?:\.0+)?$/.test(p.liquidationPx));
       if (display) {
         const optional = (value, constraints) => { try { return amount(value, constraints); } catch { return null; } };
         const leverage = object(p.leverage) && ['cross', 'isolated'].includes(p.leverage.type) ? p.leverage : null;

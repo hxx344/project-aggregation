@@ -447,7 +447,9 @@ export function createRhLighterExecutionClient({ ErrorClass, fetchImpl = globalT
     if (quantity === '0') return { entry, position: null };
     if (entry.sign !== 1 && entry.sign !== -1) fail();
     return { entry, position: { symbol, side: entry.sign === 1 ? 'long' : 'short', quantity,
-      risk: { markPrice: markPrice(entry.position_value, quantity), liquidationPrice: liquidationPrice(entry.liquidation_price), at: receivedAt } } };
+      risk: { markPrice: markPrice(entry.position_value, quantity), liquidationPrice: liquidationPrice(entry.liquidation_price), at: receivedAt,
+        // A zero liquidation price is the venue's explicit "no liquidation price"; absent or malformed stays unknown.
+        noLiquidation: liquidationPrice(entry.liquidation_price) === null && typeof entry.liquidation_price === 'string' && entry.liquidation_price.length <= 100 && /^0+(?:\.0+)?$/.test(entry.liquidation_price) } } };
   }
 
   async function positionSnapshot(credentials, { signal, symbols } = {}) {

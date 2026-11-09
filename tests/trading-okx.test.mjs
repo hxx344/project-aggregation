@@ -188,7 +188,7 @@ test('OKX Anthropic risk keeps local position receipt time despite signing clock
   } });
   const { positions } = await h.client.account(credentials, { symbols: ['ANTHROPICUSDT'] });
   assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'short', quantity: '30',
-    risk: { markPrice: '183.5', liquidationPrice: '260.1', at: new Date(NOW).toISOString() } }]);
+    risk: { markPrice: '183.5', liquidationPrice: '260.1', at: new Date(NOW).toISOString(), noLiquidation: false } }]);
   assert.equal(h.state.now, NOW + 12_000);
   assert.equal(h.calls.filter(call => call.url.pathname.endsWith('/time')).length, 1);
   const positionCall = h.calls.find(call => call.url.pathname.endsWith('/positions'));
@@ -206,7 +206,8 @@ test('OKX missing or malformed Anthropic prices stay null while valid manual pos
         ? [position(call.parameters.instId, { markPx: '100', liqPx: '80', [field]: invalid })] : undefined });
       const { positions } = await h.client.account(credentials, { symbols: ['ANTHROPICUSDT'] });
       assert.deepEqual(positions, [{ symbol: 'ANTHROPICUSDT', side: 'long', quantity: '20',
-        risk: { markPrice: field === 'markPx' ? null : '100', liquidationPrice: field === 'liqPx' ? null : '80', at: new Date(NOW).toISOString() } }]);
+        risk: { markPrice: field === 'markPx' ? null : '100', liquidationPrice: field === 'liqPx' ? null : '80', at: new Date(NOW).toISOString(),
+          noLiquidation: field === 'liqPx' && (invalid === '' || invalid === '0') } }]);
       assert.equal(mutations(h.calls).length, 0);
     }
   }

@@ -422,7 +422,7 @@ test('account reports positions, open orders and the account leverage of the sel
   } });
   assert.deepEqual(await h.client.account(credentials, { symbols: ['ANTHROPIC'] }), {
     identity: OWNER, modes: { ANTHROPIC: 'one-way' }, strategies: [],
-    positions: [{ symbol: 'ANTHROPIC', side: 'short', quantity: '1.5', risk: { markPrice: null, liquidationPrice: null, at: new Date(T0).toISOString() } }],
+    positions: [{ symbol: 'ANTHROPIC', side: 'short', quantity: '1.5', risk: { markPrice: null, liquidationPrice: null, at: new Date(T0).toISOString(), noLiquidation: false } }],
     openOrders: [
       { id: '77', symbol: 'ANTHROPIC', side: 'buy', positionSide: 'BOTH', quantity: '2', filledQuantity: '0.5', reduceOnly: true },
       { id: '281474976710700', symbol: 'ANTHROPIC', side: 'sell', positionSide: 'BOTH', quantity: '1', filledQuantity: '0', reduceOnly: false },
@@ -487,7 +487,7 @@ test('account risk uses the configured account index and exact notional over siz
   } });
   const { positions } = await h.client.account(credentials);
   assert.deepEqual(positions, [{ symbol: 'ANTHROPIC', side: 'short', quantity: '1.5',
-    risk: { markPrice: '400.1', liquidationPrice: '450.123456789012345678', at: new Date(T0).toISOString() } }]);
+    risk: { markPrice: '400.1', liquidationPrice: '450.123456789012345678', at: new Date(T0).toISOString(), noLiquidation: false } }]);
   assert.equal(h.time, T0 + 12_000);
   assert.deepEqual(Object.fromEntries(h.of('/api/v1/account')[0].query), { by: 'index', value: '12345' });
   assert.ok(h.of('/api/v1/account')[0].init.headers.Authorization);
@@ -502,7 +502,8 @@ test('account risk rejects malformed and unavailable prices without rejecting a 
       ] }] }) } });
       const { positions } = await h.client.account(credentials);
       assert.deepEqual(positions, [{ symbol: 'ANTHROPIC', side: 'long', quantity: '3',
-        risk: { markPrice: field === 'position_value' ? null : '0.333333333333333333', liquidationPrice: field === 'liquidation_price' ? null : '0.2', at: new Date(T0).toISOString() } }]);
+        risk: { markPrice: field === 'position_value' ? null : '0.333333333333333333', liquidationPrice: field === 'liquidation_price' ? null : '0.2', at: new Date(T0).toISOString(),
+          noLiquidation: field === 'liquidation_price' && invalid === '0' } }]);
       assert.equal(h.of(SEND).length, 0);
     }
   }

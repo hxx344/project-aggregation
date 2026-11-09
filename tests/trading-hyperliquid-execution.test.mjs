@@ -121,7 +121,7 @@ test('account reads positions, open orders and live leverage of the master addre
     activeAssetData: payload => ({ coin: payload.coin, leverage: { type: payload.coin === 'io:ANTH' ? 'isolated' : 'cross', value: 3 } }),
   } });
   const value = await client.account(credentials, { symbols: ['io:ANTH', 'xyz:ANT'] });
-  assert.deepEqual(value.positions, [{ symbol: 'io:ANTH', side: 'short', quantity: '1.25', risk: { markPrice: null, liquidationPrice: null, at: new Date(T0).toISOString() } }]);
+  assert.deepEqual(value.positions, [{ symbol: 'io:ANTH', side: 'short', quantity: '1.25', risk: { markPrice: null, liquidationPrice: null, at: new Date(T0).toISOString(), noLiquidation: false } }]);
   assert.deepEqual(value.openOrders, [{ id: '7', symbol: 'io:ANTH', side: 'buy', positionSide: 'BOTH', quantity: '2', filledQuantity: '1.5', reduceOnly: false }]);
   assert.deepEqual(value.leverage, { 'io:ANTH': { type: 'isolated', value: 3 }, 'xyz:ANT': { type: 'cross', value: 3 } });
   assert.deepEqual(value.modes, { 'io:ANTH': 'one-way', 'xyz:ANT': 'one-way' });
@@ -152,8 +152,8 @@ test('account risk derives exact marks for both HIP-3 legs and keeps each state 
   h.advance(7000); releaseOrders();
   const value = await pending;
   assert.deepEqual(value.positions.map(row => row.risk), [
-    { markPrice: '1600.1', liquidationPrice: '1800.1', at: new Date(T0).toISOString() },
-    { markPrice: '0.333333333333333333', liquidationPrice: '0.2', at: new Date(T0 + 7000).toISOString() },
+    { markPrice: '1600.1', liquidationPrice: '1800.1', at: new Date(T0).toISOString(), noLiquidation: false },
+    { markPrice: '0.333333333333333333', liquidationPrice: '0.2', at: new Date(T0 + 7000).toISOString(), noLiquidation: false },
   ]);
   assert.equal(h.exchanges.length, 0);
   assert.ok(h.calls.every(call => call.payload.user === MASTER));
@@ -168,7 +168,8 @@ test('account risk returns null for missing or malformed prices without losing a
       } });
       const { positions } = await h.client.account(credentials, { symbols: ['io:ANTH'] });
       assert.deepEqual(positions, [{ symbol: 'io:ANTH', side: 'short', quantity: '2',
-        risk: { markPrice: field === 'positionValue' ? null : '100', liquidationPrice: field === 'liquidationPx' ? null : '120', at: new Date(T0).toISOString() } }]);
+        risk: { markPrice: field === 'positionValue' ? null : '100', liquidationPrice: field === 'liquidationPx' ? null : '120', at: new Date(T0).toISOString(),
+          noLiquidation: field === 'liquidationPx' && (invalid === null || invalid === '0') } }]);
       assert.equal(h.exchanges.length, 0);
     }
   }

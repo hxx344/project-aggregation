@@ -40,6 +40,22 @@ function configOf(form: Draft): AnthropicReductionConfig {
     shares: { outstanding: form.shares.outstanding.trim(), diluted: form.shares.diluted.trim() }, thresholdPercent: form.threshold.trim(), reducePercent: form.percent.trim(),
     batchCount: Number(form.batches), batchIntervalMs: Math.round(Number(form.interval) * 1000), timeoutMs: Math.round(Number(form.timeout) * 1000) };
 }
+const FINAL_JOB = ['completed', 'stopped'];
+const seconds = (from: string, to: string) => { const value = (Date.parse(to) - Date.parse(from)) / 1000; return Number.isFinite(value) && value >= 0 ? value.toFixed(1) : null; };
+function TestResult({ test }: { test: NonNullable<AnthropicReductionState['test']> }) {
+  const job = test.job;
+  if (test.error || !job) return <div className="trading-anthropic-reduction-progress" role="status" aria-label="自动减仓测试结果"><strong>测试结果 · {test.error ? '未发送委托' : '待核对'}</strong><p>{test.error ?? '测试任务无法读取，请到「价差下单」核对执行进度。'}</p><p>测试时间：{beijingTime(test.startedAt)}（北京时间）</p></div>;
+  const done = FINAL_JOB.includes(job.status), filled = job.legs.every(leg => Number(leg.remainingQuantity) === 0);
+  const verdict = job.status === 'completed' && filled ? '通过 · 两条腿均已按最小数量成交' : !done && job.status !== 'paused' && job.status !== 'attention' ? '进行中' : job.status === 'attention' ? '未通过 · 委托结果待核对' : '未通过';
+  const elapsed = done ? seconds(test.startedAt, job.updatedAt) : null;
+  return <div className="trading-anthropic-reduction-progress" role="status" aria-label="自动减仓测试结果">
+    <strong>测试结果 · {verdict}</strong>
+    <p>开始：{beijingTime(test.startedAt)}（北京时间）{elapsed ? ` · 用时 ${elapsed} 秒` : ''}</p>
+    <ul>{job.legs.map(leg => <li key={leg.id}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 测试数量 {amount(leg.quantity)} · 已成交 {amount(leg.filledQuantity)} · 剩余 {amount(leg.remainingQuantity)} 原生单位</li>)}</ul>
+    {job.reason ? <p className="trading-warning">{job.reason}</p> : null}
+    <p>执行编号：{job.id}</p>
+  </div>;
+}
 const sameShares = (first: AnthropicShares, second: AnthropicShares) => first.outstanding === second.outstanding && first.diluted === second.diluted;
 const contractLabel = (leg: { exchange: string; symbol: string }) => findContract(`${leg.exchange}:${leg.symbol}`)?.label ?? `${leg.exchange} ${leg.symbol}`;
 
@@ -47,8 +63,8 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
   const [data, setData] = useState<AnthropicReductionState | null>(null);
   const [draft, setDraft] = useState<Draft | null>(null);
   const [readError, setReadError] = useState<string | null>(null), [writeError, setWriteError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null), [busy, setBusy] = useState<'save' | 'disable' | null>(null);
-  const [confirmed, setConfirmed] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null), [busy, setBusy] = useState<'save' | 'disable' | 'test' | null>(null);
+  const [confirmed, setConfirmed] = useState<string | null>(null), [testConfirmed, setTestConfirmed] = useState(false);
   const mounted = useRef(false), reading = useRef<AbortController | null>(null), generation = useRef(0), writing = useRef(false), lastRead = useRef(0), expires = useRef(onExpired);
   expires.current = onExpired;
   const load = useCallback(async () => {
@@ -80,24 +96,32 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
   const connectionStamp = JSON.stringify(data?.connections.map(connection => [connection.exchange, connection.revision, connection.connected, connection.locked]));
   const confirmStamp = JSON.stringify([form, connectionStamp, data?.revision]);
   const confirmedLive = confirmed === confirmStamp;
+  const testRunning = !!data?.test?.job && !FINAL_JOB.includes(data.test.job.status);
+  const savedReady = !!data?.config && data.config.legs.every(leg => data.connections.some(connection => connection.exchange === leg.exchange && connection.connected && !connection.locked));
+  const testBlocked = !data?.config ? '请先保存自动减仓设置。' : executing ? '自动减仓任务尚未结束。' : testRunning ? '上一次测试尚未结束。' : data.maintenance ? '系统正在维护。'
+    : data.state.previousJobId ? '上一轮减仓后的剩余持仓尚未核对，请稍后再测试。' : !savedReady ? '已保存的两条腿需要可用的实盘账户连接。' : null;
+  // A confirmation given before the test became blocked never carries over.
+  useEffect(() => { if (testBlocked) setTestConfirmed(false); }, [testBlocked]);
   const connectionsReady = !!form && form.contracts.every(key => data?.connections.some(connection => connection.exchange === findContract(key)?.exchange && connection.connected && !connection.locked));
   function edit(patch: Partial<Draft>) {
     if (!form) return;
     setDraft({ ...form, ...patch }); setConfirmed(null); setNotice(null);
   }
-  async function write(kind: 'save' | 'disable', event?: FormEvent) {
+  async function write(kind: 'save' | 'disable' | 'test', event?: FormEvent) {
     event?.preventDefault();
     if (!data || !form || writing.current) return;
+    if (kind === 'test' && (testBlocked || !testConfirmed)) { setWriteError(testBlocked ?? '请先确认发送测试委托。'); return; }
     if (kind === 'save' && (validation || executing || form.enabled && (!confirmedLive || !connectionsReady || data.maintenance || readError))) { setWriteError(validation ?? '请先核对实盘连接、执行状态并确认启用。'); return; }
     writing.current = true; generation.current++; reading.current?.abort(); reading.current = null;
     onStateChange?.(true);
     setBusy(kind); setWriteError(null); setNotice(null);
     try {
-      const value = await api<AnthropicReductionState>(kind === 'save' ? BASE : `${BASE}/disable`, { method: kind === 'save' ? 'PUT' : 'POST',
-        body: JSON.stringify(kind === 'save' ? { revision: form.revision, config: configOf(form), confirmLive: form.enabled && confirmedLive } : { revision: data.revision }), timeoutMs: 20000 });
+      const value = await api<AnthropicReductionState>(kind === 'save' ? BASE : `${BASE}/${kind}`, { method: kind === 'save' ? 'PUT' : 'POST',
+        body: JSON.stringify(kind === 'save' ? { revision: form.revision, config: configOf(form), confirmLive: form.enabled && confirmedLive } : kind === 'test' ? { revision: data.revision, confirmLive: true } : { revision: data.revision }), timeoutMs: kind === 'test' ? 45000 : 20000 });
       if (!mounted.current) return;
-      setData(value); setDraft(null); setReadError(null);
-      setNotice(kind === 'disable' ? '已停用新触发；在途批次不会撤销，请到「价差下单」查看或停止执行。' : value.config?.enabled ? '自动减仓已启用；达到条件后会发送实盘市价减仓委托。' : '自动减仓设置已保存，当前未启用。');
+      setData(value); setReadError(null);
+      if (kind !== 'test') setDraft(null);
+      setNotice(kind === 'test' ? '测试委托已受理；完成后结果显示在下方「测试结果」。' : kind === 'disable' ? '已停用新触发；在途批次不会撤销，请到「价差下单」查看或停止执行。' : value.config?.enabled ? '自动减仓已启用；达到条件后会发送实盘市价减仓委托。' : '自动减仓设置已保存，当前未启用。');
     } catch (failure) {
       if (!mounted.current) return;
       if (failure instanceof ApiError && failure.status === 401) expires.current();
@@ -105,7 +129,7 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
     } finally {
       generation.current++; writing.current = false;
       if (mounted.current) onStateChange?.(false);
-      if (mounted.current) { setBusy(null); setConfirmed(null); void load(); }
+      if (mounted.current) { setBusy(null); setConfirmed(null); setTestConfirmed(false); void load(); }
     }
   }
 
@@ -118,7 +142,7 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
       {data.maintenance ? <p className="trading-warning">当前处于维护状态，不能启用新触发。</p> : null}
       {executing ? <p className="trading-muted">当前减仓任务尚未结束；请先在「价差下单」核对执行，之后再修改规则。</p> : null}
       {data.live?.warning ? <p className="trading-warning" role="alert">{data.live.warning}</p> : null}
-      {data.live ? <div className="trading-anthropic-reduction-live"><p>最近风险检查：{beijingTime(data.live.checkedAt)}（北京时间） · {data.live.met ? '已达到触发阈值' : '未达到触发阈值'}</p><ul>{data.live.legs.map(leg => <li key={`${leg.exchange}:${leg.symbol}:${leg.side}`}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 持仓 {amount(leg.quantity)} 原生单位 · 距强平 {leg.distancePercent === null ? '未提供' : `${leg.distancePercent}%`}</li>)}</ul></div> : <p className="trading-muted">尚无自动减仓风险检查结果。两腿都需要有效、新鲜的强平价；缺少任一腿的数据时，不会自动发送委托。</p>}
+      {data.live ? <div className="trading-anthropic-reduction-live"><p>最近风险检查：{beijingTime(data.live.checkedAt)}（北京时间） · {data.live.met ? '已达到触发阈值' : '未达到触发阈值'}</p><ul>{data.live.legs.map(leg => <li key={`${leg.exchange}:${leg.symbol}:${leg.side}`}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 持仓 {amount(leg.quantity)} 原生单位 · 距强平 {leg.distancePercent !== null ? `${leg.distancePercent}%` : leg.noLiquidation ? '交易所未给出强平价（保证金充足），视为未达阈值' : '未提供'}</li>)}</ul></div> : <p className="trading-muted">尚无自动减仓风险检查结果。两腿都需要新鲜的强平风险数据；交易所明确不给强平价的腿视为未达阈值，其余数据缺失时不会自动发送委托。</p>}
       {data.job ? <div className="trading-anthropic-reduction-progress" aria-label="自动减仓执行进度"><strong>{data.job.status === 'completed' ? '上一轮已完成' : '执行进度'} · 第 {Math.min(data.job.batchIndex + 1, data.job.batchCount)} / {data.job.batchCount} 批</strong><ul>{data.job.legs.map(leg => <li key={leg.id}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 已成交 {amount(leg.filledQuantity)} / 目标 {amount(leg.quantity)} · 剩余 {amount(leg.remainingQuantity)} 原生单位</li>)}</ul><p>执行编号：{data.job.id}</p></div> : null}
       <form onSubmit={event => void write('save', event)} aria-label="ANT 自动减仓设置">
         <fieldset className="trading-anthropic-reduction-fields" disabled={!!busy || executing}>
@@ -141,6 +165,14 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
           <button className="button secondary" type="button" disabled={!!busy || !data.config?.enabled} onClick={() => void write('disable')}>{busy === 'disable' ? <LoaderCircle size={15} className="spin" /> : null}停用新触发</button>
           <button className="button secondary" type="button" onClick={() => document.getElementById('execution-title')?.closest('section')?.scrollIntoView({ block: 'start' })}>到组合交易核对执行</button></div>
       </form>
+      <section className="trading-anthropic-reduction-test" aria-labelledby="anthropic-reduction-test-title">
+        <h4 id="anthropic-reduction-test-title">实盘测试</h4>
+        <p className="trading-anthropic-rule">模拟达到触发阈值，按<strong>已保存</strong>的两条腿各发送一笔交易所允许的最小数量市价减仓委托（1 批，最长 120 秒；Hyperliquid 按最低下单金额的 1.05 倍取数量）。账户、持仓、委托和成交核对与自动减仓完全相同；不会改变规则的启用状态和轮次。测试会真实减少两腿持仓。</p>
+        {testBlocked ? <p className="trading-muted">{testBlocked}</p> : null}
+        <label className="trading-anthropic-reduction-toggle"><input type="checkbox" checked={testConfirmed} disabled={!!busy || !!testBlocked} onChange={event => setTestConfirmed(event.target.checked)} />我确认发送两条腿各一笔最小数量的实盘市价减仓委托</label>
+        <div className="trading-anthropic-robot-actions"><button className="button secondary" type="button" disabled={!!busy || !!testBlocked || !testConfirmed} onClick={() => void write('test')}>{busy === 'test' ? <LoaderCircle size={15} className="spin" /> : null}测试自动减仓（最小数量）</button></div>
+        {data.test ? <TestResult test={data.test} /> : null}
+      </section>
       <p className="trading-anthropic-rule">停用只停止新触发，不撤销在途批次。停止当前任务请使用「价差下单」中的“停止并撤销余单”；已经成交的仓位保留。</p>
       {readError ? <p className="trading-warning" role="alert">{readError} · 当前显示上次读取结果，启用前需重新读取成功。</p> : null}
       {writeError ? <p className="trading-warning" role="alert">{writeError}</p> : null}
