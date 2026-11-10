@@ -258,6 +258,17 @@ class WorkspaceControl:
         except Exception:
             raise UpdateEvidenceError("持久化恢复记录格式、账户身份或凭据无法核实") from None
 
+    def impact_status(self):
+        """Local display evidence only; no broker, account locks or maintenance changes."""
+        at = int(time.time() * 1000)
+        if not self.lock.acquire(blocking=False):
+            return {"busy": None, "requiresFinalCheck": True, "activeRequests": None, "observedAt": at}
+        try:
+            return {"busy": True if self.inflight else None, "requiresFinalCheck": True,
+                    "activeRequests": self.inflight, "observedAt": at}
+        finally:
+            self.lock.release()
+
     def update_status(self):
         result = {"busy": True, "maintenance": self.active}
         if not self.check_lock.acquire(blocking=False):

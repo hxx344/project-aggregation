@@ -13,6 +13,9 @@ export interface PerpetualAlertProgress {
 }
 export interface PerpetualAlertEvent {
   id: string; ruleId: string; name: string; time: number; status: 'sending' | 'sent' | 'failed';
+  deliveryStage?: 'generated' | 'sending' | 'confirmed' | 'failed' | 'unknown';
+  stages?: { status: string; at: number }[];
+  reviews?: { id: string; actor: string; at: number; note: string; source: string }[];
   base: string; longKey: string; shortKey: string; netSpreadPercent: number; error: string;
 }
 export interface PerpetualAlertView {

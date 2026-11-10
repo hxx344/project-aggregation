@@ -311,6 +311,12 @@ ${capNote}
     if (data?.auto) setNotice('已放弃这条调仓记录。');
   };
   return <form className="panel lp-section" onSubmit={(e) => void submit(e)} noValidate aria-label="自动调仓设置"><div className="panel-heading"><h2>自动调仓</h2><span className="muted">{auto.config.enabled ? auto.halted ? `已停用：${auto.halted.reason}` : '运行中' : '未开启'}</span></div>
+    {state?.notifications ? <fieldset><legend>状态通知订阅</legend><p className="as-muted">复用「飞书汇总」机器人；默认关闭。主动停用不视为异常；通知不会启动或恢复交易。{state.notifications.channelConfigured ? '' : ' 请先配置飞书汇总机器人。'}</p>
+      {(['interrupted', 'needs_review', 'recovered'] as const).map(kind => <label key={kind} className="as-check"><input type="checkbox" disabled={!!busy} checked={state.notifications!.config[kind]}
+        onChange={event => void call('notifications', '/notifications', 'PUT', { ...state.notifications!.config, [kind]: event.target.checked })} />{{ interrupted: '中断', needs_review: '需要核对', recovered: '观察恢复' }[kind]}</label>)}
+      {state.notifications.error ? <p role="alert">{state.notifications.error}</p> : null}
+      <details><summary>状态通知记录</summary>{state.notifications.history.length ? state.notifications.history.map(entry => <p key={entry.id}>{time(entry.at)} · {{ interrupted: '中断', needs_review: '需要核对', recovered: '观察恢复' }[entry.kind]} · {({ pending: '等待发送', sending: '发送中', confirmed: '渠道确认', unknown: '结果未知，不重发', failed: '明确失败', unsubscribed: '未订阅', superseded: '恢复依据已失效，未发送' } as Record<string, string>)[entry.status] ?? '未知'} · {entry.reason}{entry.error ? ` · ${entry.error}` : ''}</p>) : <p>暂无记录。</p>}</details>
+    </fieldset> : null}
     {notice ? <div className="lp-callout success" role="status">{notice}</div> : null}
     <fieldset disabled={!!busy}>
       <div className="lp-grid">

@@ -49,6 +49,8 @@ export type AeroSafeJob = {
 export type AeroSafeLedger = { at: number; hash: string; nonce: number; label: string; status: 'confirmed' | 'reverted' | 'dropped' | 'replaced'; block: number | null; gasUsed: string | null; fee: string | null };
 export type AeroSafeEvent = { at: number; event?: string; [key: string]: unknown };
 export type AeroSafeState = {
+  permissionHistory?: { error: string | null; reading: boolean; batches: { id: string; createdAt: number; chainId: number; safe: string; roles: string; transactions: number; reviews: { at: number; blockNumber: number; blockHash: string | null; transactionHash: string | null; receipt: string; status: string; note: string; coverage: string; checks: { label: string; ok: boolean; status: string }[]; operations: { index: number; to: string; method: string; target: string | null }[] }[] }[] };
+  notifications?: { config: { interrupted: boolean; needs_review: boolean; recovered: boolean }; channelConfigured: boolean; error: string | null; history: { id: string; kind: 'interrupted' | 'needs_review' | 'recovered'; at: number; status: string; attempts: number; reason: string; error: string | null }[] };
   schema: 1; configured: boolean; config: AeroSafeConfig | null; configError: string | null; defaults: { rpcUrl: string; slippageBps: number; autoSellRewards: boolean; minRewardSell: string };
   wallet: string | null; paused: boolean; pauseReason: string | null;
   pending: { hash: string; nonce: number; label: string; at: number; stale: boolean } | null;

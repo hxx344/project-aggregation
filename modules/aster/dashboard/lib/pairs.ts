@@ -70,6 +70,9 @@ export type Pair = {
     min_transfer: string;
     max_transfer: string;
     buffer_ratio: string;
+    absolute_reserve_enabled?: boolean;
+    long_reserve?: string;
+    short_reserve?: string;
     cooldown_seconds: number;
   };
   state?: {
@@ -103,6 +106,9 @@ export type PairDraft = {
   min_transfer: string;
   max_transfer: string;
   buffer_percent: string;
+  absolute_reserve_enabled: boolean;
+  long_reserve: string;
+  short_reserve: string;
   cooldown_seconds: string;
   adl_enabled: boolean;
   adl_batch_notional: string;
@@ -122,6 +128,9 @@ export function pairDraft(pair?: Pair): PairDraft {
     min_transfer: pair?.margin.min_transfer ?? '1',
     max_transfer: pair?.margin.max_transfer ?? '1000',
     buffer_percent: percentFromMarginLimit(pair?.margin.buffer_ratio ?? '0.05'),
+    absolute_reserve_enabled: pair?.margin.absolute_reserve_enabled ?? false,
+    long_reserve: pair?.margin.long_reserve ?? '0',
+    short_reserve: pair?.margin.short_reserve ?? '0',
     cooldown_seconds: String(pair?.margin.cooldown_seconds ?? 30),
     adl_enabled: pair?.adl?.enabled ?? true,
     adl_batch_notional: pair?.adl?.batch_notional ?? '1000',
@@ -247,6 +256,10 @@ export function parsePairDraft(
   if (compareAmounts(balanceThreshold, '1000000000') > 0)
     throw new Error('可用余额差额门槛不能超过 1000000000 USD1');
   const buffer = amount(draft.buffer_percent, '保留缓冲比例', true, 128);
+  const longReserve = amount(draft.long_reserve, 'A 侧绝对保留', true);
+  const shortReserve = amount(draft.short_reserve, 'B 侧绝对保留', true);
+  if ([longReserve, shortReserve].some(value => compareAmounts(value, '1000000000') > 0))
+    throw new Error('绝对保留金额不能超过 1000000000 USD1');
   if (compareAmounts(buffer, '100') >= 0)
     throw new Error('保留缓冲比例须小于 100%');
   return {
@@ -267,6 +280,9 @@ export function parsePairDraft(
       threshold: balanceThreshold,
       min_transfer: minTransfer,
       max_transfer: maxTransfer,
+      absolute_reserve_enabled: draft.absolute_reserve_enabled,
+      long_reserve: longReserve,
+      short_reserve: shortReserve,
       buffer_ratio:
         compareAmounts(buffer, '0') === 0
           ? '0'

@@ -17,6 +17,7 @@ function PerpetualAlerts({ active = true, defaultOpen = false, pair = null, budg
   const [open, setOpen] = useState(defaultOpen), [view, setView] = useState<PerpetualAlertView | null>(null);
   const [draft, setDraft] = useState<PerpetualAlertConfig>(initial), [dirty, setDirty] = useState(false), [busy, setBusy] = useState(false);
   const [revision, setRevision] = useState(0), [error, setError] = useState(''), [message, setMessage] = useState('');
+  const [reviewId, setReviewId] = useState(''), [reviewNote, setReviewNote] = useState(''), [reviewSource, setReviewSource] = useState('');
   const dirtyRef = useRef(false), busyRef = useRef(false), generation = useRef(0), latestRevision = useRef(0), mutation = useRef<AbortController | null>(null);
   const refresh = useRef<() => Promise<void>>(async () => {});
   function apply(result: PerpetualAlertView) { setView(result); setDraft(result.config); setRevision(result.revision); latestRevision.current = result.revision; dirtyRef.current = false; setDirty(false); }
@@ -72,6 +73,19 @@ function PerpetualAlerts({ active = true, defaultOpen = false, pair = null, budg
       budget: { slippagePercent: budget.slippagePercent, takerOverrides: { ...budget.takerOverrides } } };
     edit({ ...draft, rules: [...draft.rules, rule] });
   }
+  async function saveReview() {
+    if (busyRef.current) return;
+    busyRef.current = true; setBusy(true); generation.current++; setError('');
+    const controller = new AbortController(); mutation.current = controller;
+    try {
+      const response = await fetch('/api/monitors/perpetual/alerts/reviews', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: reviewId, note: reviewNote, source: reviewSource }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(8000)]) });
+      const result = await response.json() as PerpetualAlertView & { error?: string };
+      if (!response.ok) throw new Error(result.error || '核对说明保存失败');
+      if (!controller.signal.aborted) { setView(result); setReviewId(''); setMessage('人工核对已保存；渠道结果保持原样。'); }
+    } catch (cause) { if (!controller.signal.aborted) setError(cause instanceof Error ? cause.message : '保存失败'); }
+    finally { generation.current++; busyRef.current = false; if (!controller.signal.aborted) { setBusy(false); void refresh.current(); } }
+  }
   const connected = view?.available === true;
   return <section className="perp-opportunity-alerts" aria-label="合约组合持续条件提醒">
     <button type="button" className="perp-opportunity-heading" onClick={() => setOpen(!open)} aria-expanded={open} aria-controls="perp-opportunity-alerts-body"><span><Bell size={17}/><strong>机会提醒</strong><small>{view ? view.config.enabled ? '飞书已启用' : '飞书未启用' : '后台持续条件'}{dirty ? ' · 未保存' : ''}</small></span><ChevronDown size={16}/></button>
@@ -108,7 +122,15 @@ function PerpetualAlerts({ active = true, defaultOpen = false, pair = null, budg
       </form>
       <p className="perp-opportunity-note">飞书关闭时，已开启观察的规则仍累计持续时间与窗口占比。缺失费率不会视为零费率。扣预算价差是入场筛选，未计持有期资金费、退出价差或实际深度。</p>
       {message ? <p role="status" className="perp-opportunity-success">{message}</p> : null}
-      <details className="perp-opportunity-history"><summary>最近提醒记录（24 小时，最多 100 条）</summary>{view?.history.length ? view.history.map(item => <p key={item.id}><strong>{{ sending: '发送中或结果待确认', sent: '已发送', failed: '未发送成功' }[item.status]}</strong> · {time(item.time)} · {item.name} · {item.netSpreadPercent.toFixed(4)}%{item.error ? ` · ${item.error}` : ''}</p>) : <p>尚无提醒记录。</p>}</details>
+      <details className="perp-opportunity-history"><summary>最近提醒记录（24 小时，最多 100 条）</summary><p>人工核对不修改渠道 ACK，不重发消息；读取失败时投递结果未知。</p>{view?.history.length ? view.history.map(item => <div key={item.id}><p><strong>{item.deliveryStage ? ({ generated: '已生成', sending: '发送中', confirmed: '渠道确认', failed: '明确失败', unknown: '结果未知' }[item.deliveryStage]) : ({ sending: '发送中或结果待确认', sent: '渠道确认', failed: '未发送成功' }[item.status])}</strong> · {time(item.time)} · {item.name} · {item.netSpreadPercent.toFixed(4)}%{item.error ? ` · ${item.error}` : ''}</p>
+        {item.stages?.length ? <p>{item.stages.map(stage => `${({ generated: '已生成', sending: '发送中', confirmed: '渠道确认', failed: '明确失败', unknown: '结果未知' } as Record<string, string>)[stage.status] ?? stage.status} ${time(stage.at)}`).join(' → ')}</p> : null}
+        {item.reviews?.map(review => <p key={review.id}>人工核对 · {review.actor} · {time(review.at)}：{review.note}（来源：{review.source}）</p>)}
+        <button type="button" onClick={() => { setReviewId(item.id); setReviewNote(''); setReviewSource(''); }}>记录核对说明</button></div>) : <p>尚无提醒记录。</p>}
+        {reviewId ? <form onSubmit={event => { event.preventDefault(); void saveReview(); }}><p>投递：{reviewId}</p>
+          <label>核对说明<input required maxLength={500} value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></label>
+          <label>证据来源（勿填写凭据）<input required maxLength={200} value={reviewSource} onChange={event => setReviewSource(event.target.value)} /></label>
+          <button type="submit" disabled={busy}>保存核对说明</button></form> : null}
+      </details>
     </div> : null}
   </section>;
 }

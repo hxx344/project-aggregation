@@ -2,10 +2,10 @@
 export type DigestSchedule = { mode: 'times' | 'interval'; times: string[]; intervalMinutes: number; weekdays: number[]; timezone: string };
 export type DigestSectionSetting = { enabled: boolean; hidden: string[] };
 export type DigestConfig = { enabled: boolean; title: string; onlyOnAttention: boolean; hideIdle: boolean; showIssues: boolean; schedule: DigestSchedule; sections: Record<string, DigestSectionSetting> };
-export type DigestHistoryEntry = { at: string; kind: 'schedule' | 'manual'; status: 'sent' | 'skipped' | 'failed' | 'uncertain'; attention: number; error: string | null };
+export type DigestHistoryEntry = { id?: string; at: string; kind: 'schedule' | 'manual'; status: 'generated' | 'sending' | 'sent' | 'skipped' | 'failed' | 'uncertain'; attention: number; error: string | null; stages?: { at: string; status: string }[]; reviews?: { id: string; actor: string; at: string; note: string; source: string }[] };
 export type DigestSnapshot = {
   schema: 1; config: DigestConfig; channel: { configured: boolean; host: string | null; error: string | null }; sending: boolean;
-  nextAt: string | null; history: DigestHistoryEntry[]; loadError: string | null; serverNow: number; result?: DigestHistoryEntry | null;
+  nextAt: string | null; history: DigestHistoryEntry[]; loadError: string | null; reviewError?: string | null; serverNow: number; result?: DigestHistoryEntry | null;
 };
 export type DigestLevel = 'ok' | 'notice' | 'idle' | 'warn' | 'alert';
 export type DigestColumn = { key: string; label: string; align?: 'left' | 'right' };

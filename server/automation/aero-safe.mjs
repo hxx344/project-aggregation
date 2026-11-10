@@ -13,6 +13,8 @@ import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
 import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolRoom, readAutoState, roomFullText, roomShortText, strictAutoConfig, stuckReason } from './aero-auto.mjs';
 import { POOL_STATE_LABELS, addBlockedReason, policyOf, readPolicy, strictPoolPolicy, withPoolPolicy } from './aero-policy.mjs';
+import { createAeroNotifications } from './aero-notifications.mjs';
+import { freezePermissionBatch, permissionDigest, permissionReviewView, reviewPermissionBatch } from './aero-permission-review.mjs';
 
 const PRIVATE_KEY_PATTERN = /^(0x)?[0-9a-fA-F]{64}$/;
 const EVENT_LIMIT = 50;
@@ -254,12 +256,21 @@ function migratePoolPlan(saved) {
 
 // readPrices：行情扫描的 Base 代币美元价 { at, usd: { 小写地址: 美元价 } } 或 null，只用于按总资产比例核对单池上限。
 export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = () => false, readAdmission = () => true, readPrices = () => null, log = console, now = Date.now,
-  chain = executor, makeProvider = executor.provider, changeBudgetMs = CHANGE_BUDGET_MS } = {}) {
+  chain = executor, makeProvider = executor.provider, changeBudgetMs = CHANGE_BUDGET_MS, notificationChannel = () => null } = {}) {
   const directory = path.join(dataDir, 'aero-safe');
   const configPath = path.join(directory, 'config.json'), walletPath = path.join(directory, 'wallet.json');
   const pendingPath = path.join(directory, 'pending.json'), ledgerPath = path.join(directory, 'txs.jsonl'), mintedPath = path.join(directory, 'minted.json');
   const autoPath = path.join(directory, 'auto.json'), changesPath = path.join(directory, 'changes.json'), poolPlanPath = path.join(directory, 'pool-plan.json');
   const policyPath = path.join(directory, 'policy.json');
+  const notifications = createAeroNotifications({ directory, channel: notificationChannel, now });
+  const permissionHistoryPath = path.join(directory, 'permission-history.json');
+  let permissionHistory = [], permissionHistoryError = null, reviewingPermissions = false;
+  const matchingHistory = () => config ? permissionHistory.filter(batch => sameAddress(batch.safe, config.safe) && sameAddress(batch.roles, config.roles)) : [];
+  const savePermissionHistory = next => {
+    while (next.length > 1 && Buffer.byteLength(JSON.stringify(next)) > 2 * 1024 * 1024) next = next.slice(0, -1);
+    if (Buffer.byteLength(JSON.stringify(next)) > 2 * 1024 * 1024) throw new HttpError(400, '权限批次证据超过保存上限');
+    atomicJson(permissionHistoryPath, { schema: 1, batches: next }); permissionHistory = next;
+  };
   // 仓位策略：读不出时 corrupt 为原因，所有池子不能加仓、自动调仓不动，直到人工核对文件。
   let policy = { pools: {} };
   // 白名单待变更：待加池（可多个）与额度调整，合成一份 Safe 批次；批次生成时冻结，链上核对生效后并入配置，批次之后新加的变更继续保留。
@@ -270,6 +281,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   let configGeneration = 0;
   let config = null, configError = null, wallet = null, pending = null, job = null, snapshot = null, snapshotAt = null, snapshotError = null;
   let context = null, refreshing = null, closed = false, initialized = false, ledgerError = null, minted = [], burnSeen = new Map();
+  let notificationEpoch = 0, notificationRead = null;
   const events = [];
   let operation = Promise.resolve();
   const serial = (fn) => {
@@ -299,6 +311,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       job: job && structuredClone(job), chain: snapshot && structuredClone(snapshot), chainAt: snapshotAt, chainError: snapshotError, refreshing: Boolean(refreshing),
       events: structuredClone(events), ledger: ledger(), serverNow: now(),
       changes: changesView(),
+      notifications: notifications.view(),
+      permissionHistory: { error: permissionHistoryError, reading: reviewingPermissions,
+        batches: matchingHistory().map(batch => ({ id: batch.id, createdAt: batch.createdAt, chainId: batch.chainId, safe: batch.safe, roles: batch.roles, transactions: batch.transactions.length, reviews: batch.reviews.map(permissionReviewView) })) },
       policy: policyView(),
       auto: { config: { ...auto.config }, defaults: AUTO_DEFAULTS, error: autoError, halted: auto.halted && { ...auto.halted }, reopen: auto.reopen && { ...auto.reopen }, closing: auto.closing && { ...auto.closing }, stuck: stuckReason(auto),
         history: auto.history.slice(-10).reverse(), watch: structuredClone(autoWatch), note: autoNote, checkedAt: autoCheckedAt, intervalMs: AUTO_TICK_MS },
@@ -559,13 +574,19 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     for (const id of confirmed) seen.delete(id);
     burnSeen = seen;
     snapshot = serialize(value, ctx); snapshotAt = now(); snapshotError = null;
+    return { snapshot, at: snapshotAt };
   }
   function refresh() {
     if (refreshing) return refreshing;
+    const observation = { epoch: notificationEpoch, configuration: configGeneration, wallet };
     let timer;
     const budget = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`读取超过 ${REFRESH_BUDGET_MS / 1000} 秒`)), REFRESH_BUDGET_MS); timer.unref?.(); });
     refreshing = Promise.race([readChain(), budget])
-      .catch((error) => { snapshotError = error.message; context = null; })
+      .then(value => {
+        if (!closed && observation.epoch === notificationEpoch && observation.configuration === configGeneration && observation.wallet === wallet)
+          notificationRead = { ...observation, ...value };
+      })
+      .catch((error) => { snapshotError = error.message; context = null; notificationRead = null; })
       .finally(() => { clearTimeout(timer); refreshing = null; });
     return refreshing;
   }
@@ -690,7 +711,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   // ---- 自动调仓 ----
   // 返回是否写入成功。写不进去时停用：进度与次数统计只在内存里，重启会丢。
   function saveAuto() {
-    try { atomicJson(autoPath, autoFile(auto)); autoError = null; return true; } catch (error) {
+    try { atomicJson(autoPath, autoFile(auto)); autoError = null; observeNotifications(); return true; } catch (error) {
       log.warn?.({ type: 'aero-safe', err: error }, 'Aero 自动调仓记录写入失败');
       autoError = `自动调仓记录写入失败：${error.code ?? error.message}`;
       if (auto.config.enabled && !auto.halted) auto.halted = { at: now(), reason: autoError };
@@ -837,8 +858,11 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
   }
   // 每 30 秒一轮：读链 → 判定 → 需要时启动调仓任务。手动任务、未结清交易、维护与隔离恢复期间不动。
   async function autoTick() {
+    observeNotifications();
+    void notifications.tick({ allowRecovery: false }).catch(() => {});
     if (autoBusy || closed || !auto.config.enabled || auto.halted || stuckReason(auto)) return;
     autoBusy = true;
+    let refreshed = false;
     try {
       autoCheckedAt = now();
       if (!config || !wallet) { autoNote = '请先保存 Safe 配置并填写 bot 私钥'; return; }
@@ -846,6 +870,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (hold) { autoNote = hold; return; }
       if (job?.status === 'running') return;
       await refresh(); // 也会结清上一笔已签名交易
+      refreshed = true;
       if (pending) { autoNote = `等待上一笔交易（${pending.label}）结清`; return; }
       if (!snapshot || snapshotError) { autoNote = `链上读取失败：${snapshotError ?? '尚无数据'}`; return; }
       let prices = null;
@@ -862,7 +887,32 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       });
     } catch (error) {
       autoNote = `自动调仓检查失败：${error.message}`;
-    } finally { autoBusy = false; }
+    } finally {
+      autoBusy = false;
+      const healthy = observeNotifications(refreshed);
+      if (healthy) void notifications.tick({ allowRecovery: true }).catch(() => {});
+    }
+  }
+
+  function invalidateNotificationRecovery() {
+    notificationEpoch++; notificationRead = null;
+    try { notifications.invalidateRecovery(); } catch { /* A notification failure cannot modify trading configuration. */ }
+  }
+
+  function observeNotifications(afterRefresh = false) {
+    const read = notificationRead;
+    const healthy = Boolean(afterRefresh && read && read.epoch === notificationEpoch && read.configuration === configGeneration && read.wallet === wallet
+      && read.snapshot === snapshot && now() >= read.at && now() - read.at <= AUTO_TICK_MS
+      && config && wallet && snapshot && !snapshotError && !autoError && !auto.reopen && !auto.closing && !pending && !holdReason());
+    try {
+      notifications.observe({ binding: config ? [8453, config.safe.toLowerCase(), config.roles.toLowerCase()] : null,
+        running: job?.action === 'rebalance' && job?.status === 'running', observedAt: snapshotAt,
+        enabled: auto.config.enabled, halted: Boolean(auto.halted),
+        needsReview: Boolean(stuckReason(auto) || auto.halted && (auto.closing || auto.reopen)),
+        at: auto.halted?.at ?? auto.closing?.at ?? auto.reopen?.at ?? 0,
+        healthy });
+    } catch { /* Notification persistence cannot modify execution state. */ }
+    return healthy;
   }
 
   function saveMinted() {
@@ -891,6 +941,20 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (initialized) return;
       initialized = true;
       mkdirSync(directory, { recursive: true, mode: 0o700 });
+      notifications.initialize();
+      try {
+        const history = readBounded(permissionHistoryPath, 2 * 1024 * 1024 + 1024);
+        if (history && (history.schema !== 1 || !Array.isArray(history.batches) || history.batches.length > 10)) throw new Error('invalid');
+        permissionHistory = (history?.batches ?? []).map(batch => {
+          getAddress(batch.safe); getAddress(batch.roles); if (batch.bot) getAddress(batch.bot);
+          buildPermissions(batch.baseline); buildPermissions(batch.permissions);
+          if (batch.chainId !== 8453 || !Array.isArray(batch.transactions) || batch.transactions.length > 200 || batch.id !== permissionDigest(batch)
+            || !Array.isArray(batch.reviews) || batch.reviews.length > 5) throw new Error('invalid');
+          for (const transaction of batch.transactions) if (!sameAddress(transaction.to, batch.roles) || transaction.value !== '0' || !/^0x[0-9a-f]+$/i.test(transaction.data)) throw new Error('invalid');
+          for (const review of batch.reviews) if (review.batchId !== batch.id || !Array.isArray(review.checks) || review.checks.length > 200 || !Array.isArray(review.operations)) throw new Error('invalid');
+          return batch;
+        });
+      } catch { permissionHistoryError = '历史冻结批次读取失败，证据未知；保留原文件'; }
       try { const saved = readBounded(configPath, 256 * 1024); config = saved && strictAeroSafeConfig(saved); } catch (error) { configError = `已保存的配置无效：${error.message}`; config = null; }
       try { wallet = readBounded(walletPath, 16 * 1024)?.address ?? null; } catch { wallet = null; }
       // 待变更可随时重新加入：读不出或不完整时当作没有。上一版的单个加池计划转成待变更后删除。
@@ -935,9 +999,36 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       const stuck = stuckReason(auto);
       if (stuck && !autoCorrupt && !auto.halted) { auto.halted = { at: now(), reason: stuck }; saveAuto(); record({ event: 'auto_halted', error: stuck }); }
       autoTimer = setInterval(() => { void autoTick(); }, AUTO_TICK_MS); autoTimer.unref?.();
+      observeNotifications();
       if (config) void refresh();
     },
     // 保存自动调仓设置；重新启用会清除停用原因，若有待重开的币，下一轮先重开。
+    setNotifications: (value, authorize = () => {}, { deadline } = {}) => changeBudget('保存通知订阅', '未保存通知订阅', deadline).queued(() => {
+      authorize(); notifications.configure(value); observeNotifications(); return state();
+    }),
+    reviewBatch: async (input, authorize = () => {}, { deadline } = {}) => {
+      const budget = changeBudget('读取权限证据', '未保存核对结果', deadline);
+      const selected = await budget.queued(() => {
+        authorize();
+        if (permissionHistoryError) throw new HttpError(503, permissionHistoryError);
+        if (reviewingPermissions) throw new HttpError(409, '已有权限核对正在读取');
+        if (!input || Object.keys(input).some(key => !['id', 'blockNumber', 'transactionHash'].includes(key)) || typeof input.id !== 'string'
+          || !Number.isSafeInteger(input.blockNumber) || input.blockNumber < 1 || input.transactionHash && !/^0x[0-9a-f]{64}$/i.test(input.transactionHash)) throw new HttpError(400, '请填写冻结批次、固定区块高度和可选的交易哈希');
+        const batch = matchingHistory().find(item => item.id === input.id);
+        if (!batch) throw new HttpError(404, '当前 Safe 没有该冻结批次');
+        reviewingPermissions = true;
+        return { batch: structuredClone(batch), generation: configGeneration, rpcUrl: config.rpcUrl };
+      });
+      try {
+        const evidence = await budget.read(() => reviewPermissionBatch({ batch: selected.batch, rpc: makeProvider(selected.rpcUrl), blockNumber: input.blockNumber, transactionHash: input.transactionHash, now }), '固定区块权限与回执');
+        return await budget.queued(() => {
+          authorize();
+          if (configGeneration !== selected.generation) throw new HttpError(409, 'Safe 配置在读取期间变化，未保存结果');
+          savePermissionHistory(permissionHistory.map(batch => batch.id === selected.batch.id ? { ...batch, reviews: [evidence, ...batch.reviews].slice(0, 5) } : batch));
+          return state();
+        });
+      } finally { reviewingPermissions = false; }
+    },
     setAuto: (value, authorize = () => {}, { deadline } = {}) => changeBudget('保存自动调仓设置', '未保存设置', deadline).queued(() => {
       authorize();
       if (autoCorrupt) throw new HttpError(409, autoCorrupt);
@@ -952,7 +1043,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         throw new HttpError(500, '自动调仓设置保存失败，请检查数据目录权限后重试');
       }
       if (!next.enabled) { outSince = new Map(); autoWatch = []; autoNote = null; }
+      invalidateNotificationRecovery();
       record({ event: next.enabled ? 'auto_enabled' : 'auto_disabled' });
+      observeNotifications();
       if (next.enabled) setTimeout(() => { void autoTick(); }, 0).unref?.();
       return state();
     }),
@@ -996,6 +1089,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
       if (pending) throw new HttpError(409, '有已签名交易尚未结清，暂不能修改配置');
       const next = strictAeroSafeConfig(value);
       atomicJson(configPath, next); config = next; configGeneration += 1; configError = null; context = null; snapshot = null; snapshotAt = null; snapshotError = null;
+      invalidateNotificationRecovery();
       settleChanges();
       void refresh();
       return state();
@@ -1118,6 +1212,9 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         const batch = { createdAt, baseline: JSON.stringify(config.permissions), target: batchTarget(config), permissions: next.permissions, transactions: transactions.length,
           executeBefore: executeBefore === null ? null : executeBefore * 1000,
           pools: changes.pools.map((p) => p.name), allowances: changes.allowances.map((a) => ({ token: a.token, ...label(a) })) };
+        if (permissionHistoryError) throw new HttpError(503, permissionHistoryError);
+        const frozen = freezePermissionBatch({ safe: config.safe, roles: config.roles, bot: wallet, baseline: config.permissions, permissions: next.permissions, transactions, createdAt });
+        savePermissionHistory([frozen, ...permissionHistory.filter(item => item.id !== frozen.id)].slice(0, 10));
         saveChanges({ ...changes, batch });
         const names = batch.pools.length ? batch.pools.join('、') : '调整额度';
         // 额度那几笔的执行效果：本期已用、执行后本期剩余，以及重复执行或执行前 bot 再消耗时每次最多可再花的数量（单列给界面）。
@@ -1206,6 +1303,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         throw new HttpError(500, 'bot 私钥保存失败，原私钥未更换，请检查数据目录权限后重试');
       }
       wallet = next; context = null;
+      invalidateNotificationRecovery();
       if (config) void refresh();
       return state();
     }),
@@ -1217,7 +1315,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
         log.warn?.({ type: 'aero-safe', err: error }, 'Aero 实盘钱包清除失败');
         throw new HttpError(500, 'bot 私钥清除失败，请检查数据目录权限后重试');
       }
-      wallet = null; context = null; return state();
+      wallet = null; context = null; invalidateNotificationRecovery(); return state();
     }),
     preview: (params, authorize = () => {}, { deadline } = {}) => {
       const budget = changeBudget('预览', '未生成预览', deadline);
@@ -1281,6 +1379,7 @@ export function createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance = ()
     async close() {
       closed = true;
       clearInterval(autoTimer);
+      await notifications.close();
       await operation;
       try { await refreshing; } catch {}
     },
