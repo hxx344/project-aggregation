@@ -189,10 +189,12 @@ export type Action = 'open' | 'close';
 export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (action === 'open') === (side === 'long') ? 'buy' : 'sell';
 
 export interface LegIntent { venue: Venue; side: PositionSide; quantity: string; orderType: OrderType; limitPrice: string | null }
-export interface Intent { market: 'oil'; preset: 'cross-exchange'; symbol: string; action: Action; timeoutMs: number; legs: [LegIntent, LegIntent] }
+/** maxSlippageBps: how far either book may move against the preview before the lead is sent; null uses the executor default. */
+export interface Intent { market: 'oil'; preset: 'cross-exchange'; symbol: string; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent] }
+export const MAX_SLIPPAGE_BPS = 1_000;
 /** First execution slice: one oil contract, two venues, opposite sides. */
 export function parseIntent(value: unknown): Intent {
-  const raw = exactKeys(value, ['market', 'preset', 'symbol', 'action', 'timeoutMs', 'legs']);
+  const raw = exactKeys(value, ['market', 'preset', 'symbol', 'action', 'timeoutMs', 'legs'], ['maxSlippageBps']);
   oneOf(raw.market, ['oil'] as const, '品种');
   oneOf(raw.preset, ['cross-exchange'] as const, '交易预设');
   const symbol = oneOf(raw.symbol, OIL_SYMBOLS, '原油合约');
@@ -209,7 +211,8 @@ export function parseIntent(value: unknown): Intent {
   }) as [LegIntent, LegIntent];
   if (legs[0].venue === legs[1].venue) reject('same_venue', '跨所双腿须选择两个不同交易所');
   if (legs[0].side === legs[1].side) reject('same_side', '双腿方向必须相反');
-  return { market: 'oil', preset: 'cross-exchange', symbol, action, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), legs };
+  const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
+  return { market: 'oil', preset: 'cross-exchange', symbol, action, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), maxSlippageBps, legs };
 }
 
 /** Confirmation body; confirmLive in the prototype authorizes only the simulated transport. */

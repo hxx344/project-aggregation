@@ -273,7 +273,7 @@ test('C04 对冲腿账户读取持续失败：首腿敞口不无限等待，宽�
   h.advance(10_000); await h.ex.tick();
   const view = h.ex.jobView(jobId);
   assert.equal(view.status, 'attention');
-  assert.match(view.reason ?? '', /持续失败/);
+  assert.match(view.reason ?? '', /对冲腿持续无法发送（最后原因：账户读取/);
   assert.equal(view.locked, true);
   assert.equal(h.bybit.calls.place, 0);
 }));
@@ -320,7 +320,7 @@ async function waitFor(check: () => boolean, label: string): Promise<void> {
   throw new Error(`等待超时：${label}`);
 }
 
-test('C05/C06 发送中崩溃并被接管：新写者把发送中记为未知，核对原委托，不再发送新委托；旧实例写入被隔离', () => withHarness(async h => {
+test('C05/C06 发送中崩溃并被接管：新写者把发送中记为未知，核对原委托，首腿不再新发；首腿查到成交后补发对冲腿；旧实例写入被隔离', () => withHarness(async h => {
   bindAccounts(h.ex);
   h.binance.inject({ operation: 'place', mode: 'hang-after-apply' });
   const { jobId } = await previewAndConfirm(h);
@@ -338,9 +338,10 @@ test('C05/C06 发送中崩溃并被接管：新写者把发送中记为未知，
   assert.equal(opState(h, jobId, 0), 'unknown', '旧实例的迟到结果不得写回');
   const view = await settle(h, jobId);
   assert.equal(view.legs[0].operation?.state, 'filled');
-  assert.equal(view.status, 'attention');
-  assert.equal(h.bybit.calls.place, 0);
-  assert.equal(h.binance.calls.place, 1);
+  assert.equal(view.status, 'completed');
+  assert.equal(view.legs[1].operation?.quantity, '1');
+  assert.deepEqual([h.binance.calls.place, h.bybit.calls.place], [1, 1]);
+  assert.equal(h.bybit.position('BY2002', 'CLUSDT', 'short'), '1');
   h.binance.releaseHung();
 }, { budgets: { callTimeoutMs: 400 } }));
 

@@ -36,7 +36,7 @@ async function api(path, body) {
   return data;
 }
 function legsHtml(job) {
-  return job.legs.map(leg => { const op = leg.operation; return esc(leg.venue) + ' ' + esc(leg.side) + ' 计划 ' + esc(leg.plannedQuantity) + (op ? ' · ' + esc(op.state) + ' 成交 ' + esc(op.filledQuantity) + (op.averagePrice ? ' @ ' + esc(op.averagePrice) : '') + (op.note ? ' <span class="muted">' + esc(op.note) + '</span>' : '') : ' · 未发送'); }).join('<br>');
+  return job.legs.map(leg => { const op = leg.operation; return esc(leg.venue) + ' ' + esc(leg.side) + ' 计划 ' + esc(leg.plannedQuantity) + (leg.priceBound ? ' 界限 ' + esc(leg.priceBound) : '') + (op ? ' · ' + esc(op.state) + ' 累计成交 ' + esc(leg.filledQuantity) + (leg.attempts > 1 ? '（' + esc(leg.attempts) + ' 笔，末笔 ' + esc(op.filledQuantity) + '）' : '') + (op.averagePrice ? ' @ ' + esc(op.averagePrice) : '') + (op.note ? ' <span class="muted">' + esc(op.note) + '</span>' : '') : ' · 未发送'); }).join('<br>');
 }
 function jobRow(job) {
   const actions = (['accepted','running'].includes(job.status) && !job.stopRequested ? '<button data-stop="' + esc(job.id) + '">停止</button>' : '') + (job.status === 'attention' && job.locked ? '<button data-ack="' + esc(job.id) + '">已人工处理，释放合约</button>' : '');

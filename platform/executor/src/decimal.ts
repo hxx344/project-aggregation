@@ -47,6 +47,15 @@ export function isMultiple(value: string, step: string): boolean {
   const unit = units(step);
   return unit > 0n && units(value) % unit === 0n;
 }
+/** value × (10000 + bps) / 10000 rounded to a step toward the inside of the band: down when widening upward, up when widening downward. */
+export function bandEdge(value: string, bps: number, direction: 'up' | 'down', step: string): string {
+  if (!Number.isSafeInteger(bps) || bps < 0 || bps >= 10_000) throw new DecimalError('价格保护基点无效');
+  const unit = units(step), base = units(value);
+  if (unit <= 0n || base <= 0n) throw new DecimalError('价格保护只接受正价格和正步长');
+  const scaled = base * BigInt(direction === 'up' ? 10_000 + bps : 10_000 - bps), tick = unit * 10_000n;
+  const steps = direction === 'up' ? scaled / tick : (scaled + tick - 1n) / tick;
+  return fromUnits(steps * unit);
+}
 /** Largest multiple of step not above a nonnegative value. */
 export function floorToStep(value: string, step: string): string {
   const unit = units(step), scaled = units(value);

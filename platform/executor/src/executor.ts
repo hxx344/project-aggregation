@@ -2,13 +2,14 @@
 // database and only accepts simulated connectors, so it cannot take execution
 // rights over a real account (plan 1, 5.3, 8).
 import { createHash, randomUUID } from 'node:crypto';
-import { add, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
+import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseQuote, positionOf, reject,
+  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseQuote, positionOf, reject,
   type AccountBinding, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type OrderSide, type OrderType, type PositionSide, type Quote, type Venue,
 } from './contracts.ts';
 import { VenueError, parseOrderReport, type OrderReport, type OrderRequest, type VenueConnector } from './connector.ts';
 import type { Store } from './store.ts';
+import { ControlRefusal, MAX_OWNED_BUDGET_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /** Start values come from the legacy constants registered in plan 6.4; none of them is a met performance target. */
 export interface Budgets {
@@ -26,11 +27,22 @@ export interface Budgets {
   leaseTtlMs: number;
   /** How long an unresolvable unknown order, or a failing hedge account read, may last before a person takes over. */
   unresolvedGraceMs: number;
+  /** How far either book may move against the preview before the lead is sent; also the lead's IOC limit. */
+  maxSlippageBps: number;
+  /** Both legs' books must have been received within this window of each other (L100). */
+  pairQuoteWindowMs: number;
+  /** Hedge orders per job, counting the first; a definitive venue refusal stops earlier. */
+  hedgeAttempts: number;
+  /** Events, commands and consumed previews of finished jobs older than this are deleted; jobs and orders are kept. */
+  historyRetentionMs: number;
+  pruneIntervalMs: number;
+  pruneBatch: number;
 }
 export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
   previewTtlMs: 30_000, previewQuoteMaxAgeMs: 10_000, sendQuoteMaxAgeMs: 10_000, futureToleranceMs: 1_000, callTimeoutMs: 35_000,
   createObserveMs: 120_000, createArrivalMarginMs: 60_000, absentChecks: 2, absentSpacingMs: 5_000, cancelAttempts: 5, cancelRetryMs: 10_000, leaseTtlMs: 60_000,
-  unresolvedGraceMs: 60_000,
+  unresolvedGraceMs: 60_000, maxSlippageBps: 50, pairQuoteWindowMs: 1_500, hedgeAttempts: 5,
+  historyRetentionMs: 90 * 24 * 3_600_000, pruneIntervalMs: 3_600_000, pruneBatch: 500,
 });
 
 export class WriterLostError extends ContractError { constructor(message: string) { super(503, 'writer_lost', message); } }
@@ -62,6 +74,8 @@ export interface PlannedLeg {
   positionMode: 'one-way' | 'hedge';
   baseline: string;
   instrument: Instrument;
+  /** Worst acceptable book price for this leg's side, fixed at preview. The lead sends it as an IOC limit; the hedge only checks it before the lead goes out. Absent in rows written before it existed. */
+  priceBound?: string | null;
   quote: Pick<Quote, 'bid' | 'ask' | 'receivedAt' | 'connectionGeneration' | 'sequence'>;
 }
 export interface Preview {
@@ -93,6 +107,8 @@ export interface Operation {
   id: string;
   jobId: string;
   leg: 0 | 1;
+  /** 0 for the first order of a leg; hedge resumes count up. Absent in rows written before it existed means 0. */
+  attempt?: number;
   venue: Venue;
   clientOrderId: string;
   request: OrderRequest;
@@ -109,6 +125,12 @@ export interface Operation {
   positionMismatchAt: number | null;
   cancelSent: number;
   cancelRequestedAt: number | null;
+  /** Monotonic cancel sequence for shared-registry operation ids; unlike cancelSent it is never given back. Absent means 0. */
+  cancelSeq?: number;
+  /** Start of the latest query that still found this order resting. */
+  openCheckedFrom?: number | null;
+  /** First time the shared registry refused a cancel of this order. */
+  cancelBlockedAt?: number | null;
   note: string | null;
 }
 
@@ -118,16 +140,22 @@ export interface ExecutorOptions {
   environment?: Environment;
   now?: () => number;
   budgets?: Partial<Budgets>;
+  /** Shared account-writer registry; absent means this executor writes no shared state. */
+  control?: { writer: AccountWriterPort; environment: ControlEnvironment };
 }
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const exposure = (quantity: string, instrument: Instrument): string => mul(quantity, instrument.contractSize);
 const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '***';
-/** `pa1-` + 24 hex + `-` + leg index. */
-const CLIENT_ORDER_ID_LENGTH = 30;
+/** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
+const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {} }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions }: ExecutorOptions) {
   const budgets: Budgets = { ...DEFAULT_BUDGETS, ...overrides };
+  // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
+  if (!Number.isSafeInteger(budgets.hedgeAttempts) || budgets.hedgeAttempts < 1 || budgets.hedgeAttempts > 99) throw new ContractError(500, 'budget', 'hedgeAttempts 须为 1–99');
+  if (!Number.isSafeInteger(budgets.maxSlippageBps) || budgets.maxSlippageBps < 1 || budgets.maxSlippageBps > MAX_SLIPPAGE_BPS) throw new ContractError(500, 'budget', `maxSlippageBps 须为 1–${MAX_SLIPPAGE_BPS}`);
+  if (controlOptions && budgets.callTimeoutMs > MAX_OWNED_BUDGET_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求单次调用不超过 ${MAX_OWNED_BUDGET_MS} 毫秒`);
   const venues = new Map<Venue, VenueConnector>();
   for (const connector of connectors) {
     // The prototype must not be able to reach a real venue by configuration mistake.
@@ -141,6 +169,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   let ticking: Promise<void> | null = null;
   /** Operations whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
+  /** Operations whose cancel is running in this process. */
+  const cancelling = new Set<string>();
+  const control = controlOptions ? createAccountControl({ ...controlOptions, lost: (message: string): never => { retired = true; throw new WriterLostError(message); } }) : null;
 
   const connectorFor = (venue: Venue): VenueConnector => venues.get(venue) ?? reject('venue_unavailable', `${VENUE_NAMES[venue]} 连接器不可用`, 503);
   const event = (jobId: string | null, type: string, detail: Record<string, unknown> = {}) =>
@@ -160,7 +191,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   /** Takes or renews the single-writer lease. A lapsed lease is never revived by the same instance. */
   function acquire(): boolean {
     if (closed || retired) return false;
-    return store.tx(() => {
+    const renewed = store.tx(() => {
       const row = db.prepare('SELECT owner, generation, expires_at FROM writer WHERE id = 1').get() as { owner: string; generation: number; expires_at: number } | undefined;
       if (held) {
         if (!row || row.owner !== owner || row.generation !== generation || row.expires_at <= now()) { retired = true; return false; }
@@ -175,6 +206,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       recoverAfterTakeover();
       return true;
     });
+    if (renewed && control) { try { control.keepAlive(); } catch (error) { if (!(error instanceof WriterLostError)) throw error; } }
+    return renewed && !retired;
   }
 
   /**
@@ -189,7 +222,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     for (const job of unfinishedJobs()) {
       if (job.status === 'accepted' && !opsOf(job.id).length) finish(job, 'failed', '服务重启时任务尚未发送，已取消；请重新预览');
-      else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = '服务恢复：核对已发送委托，不再发送新委托'; saveJob(job); event(job.id, 'job-held', {}); }
+      else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = '服务恢复：核对已发送委托；首腿不再新发并撤销挂单，已成交部分按落盘进度补发对冲腿'; saveJob(job); event(job.id, 'job-held', {}); }
     }
   }
 
@@ -303,14 +336,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       return { binding, instrument, quote, snapshot };
     }));
     const at = now();
+    for (const { quote } of reads) checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
+    if (Math.abs(reads[0].quote.receivedAt - reads[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，请重新预览`, 409);
+    const slippageBps = intent.maxSlippageBps ?? budgets.maxSlippageBps;
     const legs = intent.legs.map((leg, index) => {
       const { binding, instrument, quote, snapshot } = reads[index];
-      checkQuoteFresh(quote, at, budgets.previewQuoteMaxAgeMs, budgets.futureToleranceMs);
+      const orderSide = orderSideOf(intent.action, leg.side);
+      const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
       const planned = { venue: leg.venue, symbol: intent.symbol, side: leg.side, quantity: leg.quantity, orderType: leg.orderType, limitPrice: leg.limitPrice };
       checkQuantity(planned, instrument, quote, intent.action);
+      // A marketable limit beyond the band would fill past the protection the plan promises (L100).
+      if (planned.limitPrice !== null && (orderSide === 'buy' ? cmp(planned.limitPrice, priceBound) > 0 : cmp(planned.limitPrice, priceBound) < 0)) reject('limit_beyond_bound', `${VENUE_NAMES[leg.venue]} ${intent.symbol} 限价 ${planned.limitPrice} 越过价格保护界限 ${priceBound}`, 409);
       const { baseline, positionMode } = checkLegAccount(planned, snapshot, intent.action);
       const result: PlannedLeg = {
-        ...planned, index: index as 0 | 1, orderSide: orderSideOf(intent.action, leg.side), reduceOnly: intent.action === 'close',
+        ...planned, index: index as 0 | 1, orderSide, reduceOnly: intent.action === 'close', priceBound,
         accountKey: accountKey(binding), accountId: binding.accountId, credentialVersion: binding.credentialVersion, accountMode: binding.accountMode, positionMode, baseline, instrument,
         quote: { bid: quote.bid, ask: quote.ask, receivedAt: quote.receivedAt, connectionGeneration: quote.connectionGeneration, sequence: quote.sequence },
       };
@@ -321,7 +360,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
     const value: Preview = {
       id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs,
-      notes: [`先发送 ${VENUE_NAMES[legs[0].venue]} 腿，成交确认后按其成交量发送 ${VENUE_NAMES[legs[1].venue]} 对冲腿。`, '模拟传输：不会访问任何真实交易所。'],
+      notes: [
+        `先发送 ${VENUE_NAMES[legs[0].venue]} 腿，成交确认后按其成交量发送 ${VENUE_NAMES[legs[1].venue]} 对冲腿。`,
+        legs[0].orderType === 'market'
+          ? `价格保护 ${slippageBps} 基点：首腿以 IOC 限价 ${legs[0].priceBound} 发送，未即时成交的部分由交易所撤销；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送。`
+          : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
+        '对冲腿按市价发送；首腿成交后，包括服务重启接管后，按已落盘成交量补发对冲腿，补发不设价格限制。',
+        '模拟传输：不会访问任何真实交易所。',
+      ],
     };
     write(() => {
       db.prepare('DELETE FROM previews WHERE expires_at < ? AND consumed_job IS NULL').run(now());
@@ -379,7 +425,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   function acknowledge(jobId: string, requestId: string, session: string): ReturnType<typeof jobView> {
     if (!UUID.test(requestId)) reject('request_id', '请求编号无效');
     const payload = digest({ kind: 'acknowledge', jobId });
-    return write(() => {
+    const view = write(() => {
       const existing = db.prepare('SELECT * FROM commands WHERE request_id = ?').get(requestId) as { digest: string; session: string } | undefined;
       if (existing) {
         if (existing.digest !== payload || existing.session !== session) reject('request_reused', '请求编号已用于其他内容', 409);
@@ -393,6 +439,32 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       event(jobId, 'attention-acknowledged', { requestId });
       return jobView(jobId);
     });
+    if (!control) return view;
+    releaseControl(jobId);
+    return jobView(jobId);
+  }
+  /**
+   * A person has taken over the job's exposure. Its writes still unresolved in the shared registry are
+   * released as possibly executed, so the account is writable again; local reconciliation goes on.
+   */
+  function releaseControl(jobId: string): void {
+    const mine = new Set(opsOf(jobId).map(op => op.clientOrderId));
+    try { if (!control?.anyPending()) return; } catch (error) { if (error instanceof WriterLostError) throw error; return; }
+    for (const leg of readJob(jobId).legs) {
+      // Writes on a principal that is no longer bound stay in the registry for manual recovery.
+      const row = accountFor(leg.venue);
+      if (!row || row.account_key !== leg.accountKey) continue;
+      const binding = bindingOf(row);
+      // A refusal here is retried by settleControl on every pass, which treats the acknowledgement as settling.
+      let pending: string[];
+      try { pending = control.pending(binding); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
+      for (const operationId of pending) {
+        const parsed = parseOperationId(operationId);
+        if (!parsed || !mine.has(parsed.clientOrderId)) continue;
+        try { control.resolve(binding, operationId, 'confirmed'); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
+        write(() => event(jobId, 'control-released', { operationId }));
+      }
+    }
   }
 
   /** Read-only market and position view. ANT is observable on Binance only and never executable here. */
@@ -404,7 +476,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   // ---- sending -----------------------------------------------------------------
-  const clientOrderIdFor = (job: Job, leg: 0 | 1): string => `pa1-${job.id.replace(/-/g, '').slice(0, 24)}-${leg}`;
+  const clientOrderIdFor = (job: Job, leg: 0 | 1, attempt: number): string => `pa1-${job.id.replace(/-/g, '').slice(0, 24)}-${leg}${attempt ? `r${attempt}` : ''}`;
+  const attemptOf = (op: Operation): number => op.attempt ?? 0;
+  const legOps = (jobId: string, index: 0 | 1): Operation[] => opsOf(jobId).filter(item => item.leg === index).sort((a, b) => attemptOf(a) - attemptOf(b));
   /** Page and API view of a preview: account principals are masked like everywhere else. */
   const publicPreview = (value: Preview) => ({
     ...value,
@@ -425,23 +499,42 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       return { leg, quote, snapshot };
     }));
     const at = now();
+    // A stale or broken book is a refusal; only two fresh books read too far apart are retried, like a failed read.
+    for (const { quote } of checks) checkQuoteFresh(quote, at, budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
+    if (Math.abs(checks[0].quote.receivedAt - checks[1].quote.receivedAt) > budgets.pairQuoteWindowMs) reject('quote_window', `两腿盘口接收时间相差超过 ${budgets.pairQuoteWindowMs} 毫秒，暂不发送`, 409);
     for (const { leg, quote, snapshot } of checks) {
-      checkQuoteFresh(quote, at, budgets.sendQuoteMaxAgeMs, budgets.futureToleranceMs);
+      const price = leg.orderSide === 'buy' ? quote.ask : quote.bid, bound = leg.priceBound ?? null;
+      if (bound !== null && (leg.orderSide === 'buy' ? cmp(price, bound) > 0 : cmp(price, bound) < 0)) reject('price_moved', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 盘口 ${price} 已越过价格保护界限 ${bound}，未发送`, 409);
       const { baseline, positionMode } = checkLegAccount(leg, snapshot, job.action);
       if (cmp(baseline, leg.baseline) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，请重新预览`, 409);
     }
+    // Both accounts: a lead whose hedge account cannot be written would leave an exposure nobody can close.
+    for (const leg of job.legs) admit(leg);
   }
-  /** The hedge reduces the lead's exposure: only the account basis that decides its quantity is required (L084). */
+  function admit(leg: PlannedLeg): void {
+    if (control) control.admit(bindingStillValid(leg), budgets.callTimeoutMs);
+  }
+  /**
+   * The hedge reduces the lead's exposure: only the account basis that decides its quantity is required (L084).
+   * A resumed hedge expects the preview baseline moved by the fills of this job's earlier hedge orders.
+   */
   async function guardHedge(job: Job): Promise<void> {
     const leg = job.legs[1], binding = bindingStillValid(leg), snapshot = await readAccount(binding, leg.symbol);
     const { baseline, positionMode } = checkLegAccount({ ...leg, quantity: '0' }, snapshot, job.action);
-    if (cmp(baseline, leg.baseline) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，对冲腿未发送`, 409);
+    if (cmp(baseline, expectedPosition(job, 1)) !== 0 || positionMode !== leg.positionMode) reject('position_changed', `${VENUE_NAMES[leg.venue]} ${leg.symbol} 持仓已变化，对冲腿未发送`, 409);
+    admit(leg);
   }
 
-  async function send(job: Job, index: 0 | 1, quantity: string): Promise<void> {
+  async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0): Promise<void> {
     const leg = job.legs[index];
-    const request: OrderRequest = { clientOrderId: clientOrderIdFor(job, index), symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity, type: leg.orderType, limitPrice: leg.limitPrice, reduceOnly: leg.reduceOnly };
-    const op: Operation = { id: randomUUID(), jobId: job.id, leg: index, venue: leg.venue, clientOrderId: request.clientOrderId, request, state: 'prepared', remoteId: null, filledQuantity: '0', averagePrice: null, venueStatus: null,
+    // A market lead goes out as an IOC limit at its preview bound, so the venue itself enforces the protection (L100).
+    const protectedLead = index === 0 && leg.orderType === 'market' && leg.priceBound != null;
+    const request: OrderRequest = {
+      clientOrderId: clientOrderIdFor(job, index, attempt), symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity,
+      type: protectedLead ? 'limit' : leg.orderType, limitPrice: protectedLead ? leg.priceBound as string : leg.limitPrice,
+      timeInForce: protectedLead || leg.orderType === 'market' ? 'ioc' : 'gtc', reduceOnly: leg.reduceOnly,
+    };
+    const op: Operation = { id: randomUUID(), jobId: job.id, leg: index, attempt, venue: leg.venue, clientOrderId: request.clientOrderId, request, state: 'prepared', remoteId: null, filledQuantity: '0', averagePrice: null, venueStatus: null,
       preparedAt: now(), sentAt: null, lastCheckedAt: null, absentChecks: 0, absentAt: null, positionMismatchAt: null, cancelSent: 0, cancelRequestedAt: null, note: null };
     inFlight.add(op.id);
     try { await sendPrepared(job, index, op, request); } finally { inFlight.delete(op.id); }
@@ -450,20 +543,35 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const leg = job.legs[index], quantity = request.quantity;
     const binding = write(() => {
       const current = readJob(job.id);
-      if (FINAL_JOB.has(current.status) || current.holdNewSends || stopRequested(job.id) || opsOf(job.id).some(item => item.leg === index)) reject('send_superseded', '任务状态已变化，本次不发送', 409);
+      // After a takeover only the hedge may still go out; any earlier order of the same leg must be settled and older.
+      const earlier = opsOf(job.id).filter(item => item.leg === index);
+      if (FINAL_JOB.has(current.status) || (index === 0 && current.holdNewSends) || stopRequested(job.id)
+        || earlier.some(item => attemptOf(item) >= attemptOf(op) || !SETTLED.has(item.state))) reject('send_superseded', '任务状态已变化，本次不发送', 409);
       const valid = bindingStillValid(leg);
       db.prepare('INSERT INTO operations(id, job_id, leg, venue, client_order_id, state, settled, version, json) VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?)').run(op.id, job.id, index, leg.venue, op.clientOrderId, op.state, JSON.stringify(op));
       if (current.status === 'accepted') { current.status = 'running'; saveJob(current); }
       event(job.id, 'operation-prepared', { op: op.id, leg: index, quantity });
       return valid;
     });
-    write(() => { Object.assign(op, { state: 'sending', sentAt: now() }); saveOp(op); });
+    // The shared operation is recorded after the local prepared row and before the sending mark, so either store alone proves transport was not called.
+    let registered: WriterOperation | null = null;
+    if (control) {
+      try { registered = control.prepareCreate(binding, job.id, request); }
+      catch (error) {
+        if (!(error instanceof ControlRefusal)) throw error;
+        write(() => { const current = readOp(op.id); Object.assign(current, { state: 'not-sent', note: error.message.slice(0, 200) }); saveOp(current); event(job.id, 'operation-sent', { op: op.id, state: current.state, filled: '0' }); });
+        return;
+      }
+    }
+    try { write(() => { Object.assign(op, { state: 'sending', sentAt: now() }); saveOp(op); }); }
+    catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
     let report: OrderReport | null = null, failure: unknown = null;
-    try { report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend: assertWriter })), request); }
+    const beforeSend = () => { assertWriter(); if (registered) control?.assertSend(registered, budgets.callTimeoutMs); };
+    try { report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend })), request); }
     catch (error) { failure = error; }
-    write(() => {
+    const settled = write(() => {
       const current = readOp(op.id);
-      if (current.state !== 'sending') return;
+      if (current.state !== 'sending') return null;
       if (report) applyReport(current, report);
       else if (failure instanceof VenueError && failure.kind === 'not-sent') Object.assign(current, { state: 'not-sent', note: failure.message.slice(0, 200) });
       else if (failure instanceof VenueError && failure.kind === 'rejected') Object.assign(current, { state: 'rejected', note: failure.message.slice(0, 200) });
@@ -471,7 +579,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       else Object.assign(current, { state: 'unknown', note: `结果未知：${failure instanceof Error ? failure.message.slice(0, 160) : '无回报'}` });
       saveOp(current);
       event(job.id, 'operation-sent', { op: op.id, state: current.state, filled: current.filledQuantity });
+      return current.state;
     });
+    // Released only after the local result is durable; anything left open is settled from local facts later.
+    if (registered && settled) control?.finish(registered, outcomeOf(settled));
+  }
+  function outcomeOf(state: OpState): WriteOutcome {
+    if (state === 'open' || state === 'filled' || state === 'canceled') return 'confirmed';
+    return state === 'rejected' || state === 'not-sent' || state === 'not-created' ? 'rejected' : 'unknown';
   }
 
   function applyReport(op: Operation, report: OrderReport): void {
@@ -482,6 +597,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   // ---- reconciliation ----------------------------------------------------------
+  /** The send starts at most a call timeout after the count; the venue then accepts the signed cancel until its validity ends. */
+  const cancelSettledAt = (op: Operation): number => (op.cancelRequestedAt ?? 0) + budgets.callTimeoutMs + connectorFor(op.venue).capabilities.requestValidityMs + budgets.createArrivalMarginMs;
   const createSettledAt = (op: Operation): number => (op.sentAt ?? op.preparedAt) + Math.max(budgets.createObserveMs, budgets.callTimeoutMs + budgets.createArrivalMarginMs, connectorFor(op.venue).capabilities.requestValidityMs + budgets.createArrivalMarginMs);
 
   /**
@@ -505,7 +622,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const leg = job.legs[op.leg], row = accountFor(leg.venue);
     // Reconciling on another principal could find nothing and wrongly conclude not-created.
     if (!row || row.account_key !== leg.accountKey) { write(() => { const current = readOp(op.id); current.note = '账户绑定已变化，暂停核对'; saveOp(current); }); return; }
-    const binding = bindingOf(row);
+    const binding = bindingOf(row), startedAt = now();
     let report: OrderReport | null;
     try { const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, op.request, { signal })); report = value === null ? null : parseOrderReport(value, op.request); }
     catch (error) {
@@ -520,7 +637,13 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     if (report) {
       const found = report;
-      write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, found); current.note = null; saveOp(current); event(job.id, 'operation-reconciled', { op: op.id, state: current.state }); });
+      write(() => {
+        const current = readOp(op.id);
+        if (SETTLED.has(current.state)) return;
+        applyReport(current, found); current.note = null;
+        if (current.state === 'open') current.openCheckedFrom = startedAt;
+        saveOp(current); event(job.id, 'operation-reconciled', { op: op.id, state: current.state });
+      });
       return;
     }
     if (op.state === 'open') { write(() => { const current = readOp(op.id); current.note = '交易所查无已确认的委托，保留待人工核对'; saveOp(current); }); return; }
@@ -565,18 +688,38 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   async function cancel(job: Job, op: Operation): Promise<void> {
     if (op.cancelSent >= budgets.cancelAttempts || (op.cancelRequestedAt !== null && now() - op.cancelRequestedAt < budgets.cancelRetryMs)) return;
     const leg = job.legs[op.leg], binding = bindingOf(accountFor(leg.venue) ?? reject('account_missing', '账户绑定缺失，保留待核对', 409));
-    // Counted before transport so a crash mid-request stays counted; only a provable not-sent gives it back.
-    write(() => { const current = readOp(op.id); current.cancelSent += 1; current.cancelRequestedAt = now(); saveOp(current); event(job.id, 'cancel-sent', { op: op.id, attempt: current.cancelSent }); });
-    try {
-      const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, op.request, { signal, beforeSend: assertWriter })), op.request);
-      write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
-    } catch (error) {
-      write(() => {
-        const current = readOp(op.id);
-        if (error instanceof VenueError && error.kind === 'not-sent') current.cancelSent -= 1;
-        current.note = `撤单未确认：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; saveOp(current);
-      });
+    const seq = (op.cancelSeq ?? 0) + 1;
+    // The shared operation comes first: a sequence above the local one then proves this cancel was never sent.
+    let registered: WriterOperation | null = null;
+    if (control) {
+      try { registered = control.prepareCancel(binding, job.id, op.request, seq); }
+      catch (error) {
+        if (!(error instanceof ControlRefusal)) throw error;
+        write(() => { const current = readOp(op.id); current.cancelBlockedAt ??= now(); current.note = `撤单未发送：${error.message.slice(0, 160)}`; saveOp(current); });
+        return;
+      }
     }
+    cancelling.add(op.id);
+    try {
+      // Counted before transport so a crash mid-request stays counted; only a provable not-sent gives it back.
+      try { write(() => { const current = readOp(op.id); current.cancelSent += 1; current.cancelSeq = seq; current.cancelRequestedAt = now(); current.cancelBlockedAt = null; saveOp(current); event(job.id, 'cancel-sent', { op: op.id, attempt: current.cancelSent }); }); }
+      catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
+      let outcome: WriteOutcome | null = null;
+      const beforeSend = () => { assertWriter(); if (registered) control?.assertSend(registered, budgets.callTimeoutMs); };
+      try {
+        const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, op.request, { signal, beforeSend })), op.request);
+        outcome = 'confirmed';
+        write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
+      } catch (error) {
+        outcome ??= error instanceof VenueError && (error.kind === 'not-sent' || error.kind === 'rejected') ? 'rejected' : 'unknown';
+        write(() => {
+          const current = readOp(op.id);
+          if (error instanceof VenueError && error.kind === 'not-sent') current.cancelSent -= 1;
+          current.note = `撤单未确认：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; saveOp(current);
+        });
+      }
+      if (registered) control?.finish(registered, outcome);
+    } finally { cancelling.delete(op.id); }
   }
 
   // ---- job progression ---------------------------------------------------------
@@ -591,6 +734,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; current.note = `核对失败：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; saveOp(current); });
       }
     }
+    // A write this pass settled must not read as an unresolved registry entry when the same pass resends.
+    settleControl();
     // The grace starts no earlier than this writer's takeover, so a long outage still gets full checks before escalation.
     const unresolved = opsOf(job.id).find(item => item.state === 'unknown' && now() >= Math.max(createSettledAt(item), heldSince) + budgets.unresolvedGraceMs);
     if (unresolved) {
@@ -607,7 +752,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (FINAL_JOB.has(job.status)) return;
     const exhausted = withdraw ? opsOf(job.id).find(item => item.state === 'open' && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null && now() - item.cancelRequestedAt >= budgets.cancelRetryMs) : undefined;
     if (exhausted) { write(() => finish(readJob(job.id), 'attention', `撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
-    const ops = opsOf(job.id), lead = ops.find(item => item.leg === 0), hedge = ops.find(item => item.leg === 1);
+    // A refusal caused by this order's own unknown cancel clears once that cancel's window has passed, so the grace counts from then;
+    // like every grace here it starts no earlier than this writer's takeover.
+    const blocked = withdraw ? opsOf(job.id).find(item => item.state === 'open' && item.cancelBlockedAt != null && now() >= Math.max(item.cancelBlockedAt, item.cancelRequestedAt === null ? 0 : cancelSettledAt(item), heldSince) + budgets.unresolvedGraceMs) : undefined;
+    if (blocked) { write(() => finish(readJob(job.id), 'attention', `撤单被账户写入登记阻止超过 ${budgets.unresolvedGraceMs} 毫秒（${(blocked.note ?? '').slice(0, 120)}），委托仍在挂单；需人工核对`)); return; }
+    const lead = legOps(job.id, 0)[0], hedges = legOps(job.id, 1);
     if (!lead) {
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
       if (job.holdNewSends) { write(() => finish(readJob(job.id), 'failed', '服务恢复后不再发送新委托')); return; }
@@ -615,31 +764,47 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       catch (error) {
         const reason = error instanceof Error ? error.message.slice(0, 200) : '发送前检查失败';
         // A failed read may clear before the deadline; any other refusal ends the job before anything is sent.
-        if (error instanceof ContractError && error.code === 'venue_read_failed' && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
+        const retry = error instanceof ContractError && (error.code === 'venue_read_failed' || error.code === 'quote_window') || error instanceof ControlRefusal && error.transient;
+        if (retry && now() < job.deadlineAt) { write(() => { const current = readJob(job.id); current.reason = reason; saveJob(current); }); return; }
         write(() => finish(readJob(job.id), 'failed', reason)); return;
       }
       await send(job, 0, job.legs[0].quantity);
       return;
     }
     if (!SETTLED.has(lead.state)) return;
-    const hedgeQuantity = hedgeQuantityFor(job, lead.filledQuantity);
-    if (!hedge && !isZero(lead.filledQuantity) && cmp(hedgeQuantity, job.legs[1].instrument.minQuantity) >= 0 && !job.holdNewSends && !stop) {
+    if (hedges.some(item => !SETTLED.has(item.state))) return;
+    // Resume from what is on disk (L095): hedge what the lead filled minus what earlier hedge orders filled.
+    const hedgeLeg = job.legs[1], hedged = add('0', ...hedges.map(item => item.filledQuantity));
+    const target = hedgeQuantityFor(job, lead.filledQuantity), gap = sub(target, hedged);
+    const remaining = cmp(gap, '0') > 0 ? floorToStep(gap, hedgeLeg.instrument.quantityStep) : '0';
+    const refused = hedges.at(-1)?.state === 'rejected';
+    if (!refused && !stop && cmp(remaining, hedgeLeg.instrument.minQuantity) >= 0) {
+      if (hedges.length >= budgets.hedgeAttempts) {
+        write(() => finish(readJob(job.id), 'attention', `对冲腿已发送 ${hedges.length} 次仍差 ${remaining}，不再补发；首腿敞口保留，需人工处理`));
+        return;
+      }
       try { await guardHedge(job); }
       catch (error) {
-        if (error instanceof ContractError && error.code === 'venue_read_failed') {
+        // A position that disagrees may be the venue lagging behind the last fill (L110); it must persist through the grace before a person is called.
+        const waiting = error instanceof ContractError && error.code === 'venue_read_failed' ? '账户读取' : error instanceof ControlRefusal && error.transient ? '账户写入登记'
+          : error instanceof ContractError && error.code === 'position_changed' ? '持仓核对' : null;
+        if (waiting) {
+          const message = error instanceof Error ? error.message : '未知';
           write(() => {
-            const current = readJob(job.id), since = current.hedgeWaitSince ?? now();
-            if (now() - since >= budgets.unresolvedGraceMs) { finish(current, 'attention', `对冲腿账户读取持续失败：${error.message.slice(0, 120)}；首腿敞口保留，需人工处理`); return; }
-            current.hedgeWaitSince = since; current.reason = `对冲腿等待账户读取：${error.message.slice(0, 160)}`; saveJob(current);
+            // A wait recorded by a previous writer restarts at the takeover, so a fresh process still gets the full grace.
+            const current = readJob(job.id), since = Math.max(current.hedgeWaitSince ?? now(), heldSince);
+            if (now() - since >= budgets.unresolvedGraceMs) { finish(current, 'attention', `对冲腿持续无法发送（最后原因：${waiting}，${message.slice(0, 120)}）；首腿敞口保留，需人工处理`); return; }
+            current.hedgeWaitSince = since; current.reason = `对冲腿等待${waiting}：${message.slice(0, 160)}`; saveJob(current);
           });
           return;
         }
         write(() => finish(readJob(job.id), 'attention', `对冲腿未发送：${error instanceof Error ? error.message.slice(0, 160) : '检查失败'}；首腿敞口保留，需人工处理`)); return;
       }
-      await send(job, 1, hedgeQuantity);
+      // Each wait is bounded on its own: an earlier wait that cleared must not shorten the next one.
+      if (job.hedgeWaitSince != null) write(() => { const current = readJob(job.id); current.hedgeWaitSince = null; saveJob(current); });
+      await send(job, 1, remaining, hedges.length);
       return;
     }
-    if (hedge && !SETTLED.has(hedge.state)) return;
     write(() => settleJob(readJob(job.id)));
   }
 
@@ -655,18 +820,96 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const ops = opsOf(job.id), filled = (index: 0 | 1) => add('0', ...ops.filter(item => item.leg === index).map(item => item.filledQuantity));
     const leadExposure = exposure(filled(0), job.legs[0].instrument), hedgeExposure = exposure(filled(1), job.legs[1].instrument);
     const lead = ops.find(item => item.leg === 0);
+    const refused = ops.filter(item => item.leg === 1).sort((a, b) => attemptOf(a) - attemptOf(b)).at(-1);
     if (isZero(leadExposure) && isZero(hedgeExposure)) {
       finish(job, stopRequested(job.id) ? 'stopped' : 'failed', `首腿未成交（${lead?.state ?? '未发送'}），未发送对冲腿`);
       return;
     }
     const gap = sub(leadExposure, hedgeExposure);
     if (isZero(gap)) { finish(job, 'completed', null); return; }
-    finish(job, 'attention', `两腿成交不平衡：${VENUE_NAMES[job.legs[0].venue]} ${filled(0)}，${VENUE_NAMES[job.legs[1].venue]} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
+    const why = refused?.state === 'rejected' ? `对冲腿被交易所拒绝（${(refused.note ?? '').slice(0, 80)}），不再补发；` : stopRequested(job.id) ? '已请求停止，不再补发对冲腿；' : '';
+    finish(job, 'attention', `${why}两腿成交不平衡：${VENUE_NAMES[job.legs[0].venue]} ${filled(0)}，${VENUE_NAMES[job.legs[1].venue]} ${filled(1)}，未对冲 ${gap} 桶；敞口保留，需人工处理`);
+  }
+
+  // ---- retention ---------------------------------------------------------------
+  // Only history of jobs that are over, have every order settled and need no one's attention is removed;
+  // an unknown order or an unacknowledged exposure keeps its evidence (plan 6.1).
+  const DONE_JOB = `SELECT id FROM jobs j WHERE j.final = 1 AND j.updated_at < ?
+    AND NOT (j.status = 'attention' AND json_extract(j.json, '$.acknowledgedAt') IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.job_id = j.id AND o.settled = 0)`;
+  let prunedAt = 0;
+  /** Deletes at most pruneBatch rows per table in one short transaction; returns what it removed. */
+  function prune(): { events: number; commands: number; previews: number } {
+    const cutoff = now() - budgets.historyRetentionMs, limit = budgets.pruneBatch;
+    return write(() => {
+      const events = Number(db.prepare(`DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at < ? AND (job_id IS NULL OR job_id IN (${DONE_JOB})) ORDER BY seq LIMIT ?)`).run(cutoff, cutoff, limit).changes);
+      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND job_id IN (${DONE_JOB}) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
+      const previews = Number(db.prepare(`DELETE FROM previews WHERE id IN (SELECT id FROM previews WHERE expires_at < ? AND (consumed_job IS NULL OR consumed_job IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
+      if (events + commands + previews) event(null, 'history-pruned', { events, commands, previews, before: cutoff });
+      return { events, commands, previews };
+    });
   }
 
   // ---- loop --------------------------------------------------------------------
+  /**
+   * Resolves this module's open shared operations from local facts, after a crash or a failed finish.
+   * Nothing is resolved while its write may still be in flight or the local evidence is missing.
+   */
+  function settleControl(): void {
+    if (!control) return;
+    try { if (!control.anyPending()) return; } catch (error) { if (error instanceof WriterLostError) throw error; return; }
+    for (const row of db.prepare('SELECT * FROM accounts WHERE environment = ?').all(environment) as unknown as AccountRow[]) {
+      const binding = bindingOf(row);
+      let pending: string[];
+      try { pending = control.pending(binding); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
+      for (const operationId of pending) {
+        // One entry that cannot be judged (a venue without a connector, say) must not stop the rest or the pass.
+        let outcome: ReturnType<typeof controlOutcome>;
+        try { outcome = controlOutcome(operationId); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
+        if (!outcome) continue;
+        try { control.resolve(binding, operationId, outcome); event(jobOfOperation(operationId), 'control-resolved', { operationId, outcome }); }
+        catch (error) { if (error instanceof WriterLostError) throw error; }
+      }
+    }
+  }
+  /** The job owning a registry entry, so its resolution shows in that job's history. */
+  function jobOfOperation(operationId: string): string | null {
+    const parsed = parseOperationId(operationId);
+    const row = parsed && db.prepare('SELECT job_id FROM operations WHERE client_order_id = ?').get(parsed.clientOrderId) as { job_id: string } | undefined;
+    return row?.job_id ?? null;
+  }
+  function controlOutcome(operationId: string): 'confirmed' | 'rejected' | null {
+    const parsed = parseOperationId(operationId);
+    const row = parsed && db.prepare('SELECT json FROM operations WHERE client_order_id = ?').get(parsed.clientOrderId) as { json: string } | undefined;
+    if (!parsed || !row) return null;
+    const op = JSON.parse(row.json) as Operation;
+    if (inFlight.has(op.id) || cancelling.has(op.id)) return null;
+    const proven = provenOutcome(parsed, op);
+    if (proven) return proven;
+    // A person who acknowledged the job owns its exposure; its writes are released as possibly executed (plan 6.1).
+    const job = readJob(op.jobId);
+    return job.status === 'attention' && job.acknowledgedAt != null ? 'confirmed' : null;
+  }
+  function provenOutcome(parsed: NonNullable<ReturnType<typeof parseOperationId>>, op: Operation): 'confirmed' | 'rejected' | null {
+    if (parsed.kind === 'create') {
+      // prepared never reached transport: the sending mark commits before any send.
+      if (op.state === 'prepared' || op.state === 'not-sent' || op.state === 'rejected' || op.state === 'not-created') return 'rejected';
+      return op.state === 'open' || op.state === 'filled' || op.state === 'canceled' ? 'confirmed' : null;
+    }
+    if (parsed.seq > (op.cancelSeq ?? 0)) return 'rejected';
+    // Once the order is over, a cancel of it can no longer change anything.
+    if (SETTLED.has(op.state)) return 'confirmed';
+    // Past the window in which the venue could still accept the signed cancel, an order seen resting afterwards proves it did nothing (L091).
+    return op.state === 'open' && op.cancelRequestedAt !== null && op.openCheckedFrom != null && op.openCheckedFrom >= cancelSettledAt(op) ? 'rejected' : null;
+  }
+
   async function runTick(): Promise<void> {
     if (!acquire()) return;
+    settleControl();
+    if (now() - prunedAt >= budgets.pruneIntervalMs) {
+      prunedAt = now();
+      try { prune(); } catch (error) { if (error instanceof WriterLostError) throw error; }
+    }
     for (const job of unfinishedJobs()) {
       try { await progress(job); }
       catch (error) {
@@ -684,6 +927,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (current.state === 'unknown' || current.state === 'open') await reconcile(job, current);
       } catch (error) { if (error instanceof WriterLostError) throw error; }
     }
+    // Again at the end, so a result reconciled in this pass releases its account before the next one.
+    settleControl();
   }
   /** One serialized pass over unfinished jobs. */
   function tick(): Promise<void> {
@@ -698,8 +943,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       id: job.id, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
       legs: job.legs.map(leg => {
-        const op = ops.find(item => item.leg === leg.index);
-        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId),
+        const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1);
+        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null,
+          attempts: mine.length, filledQuantity: add('0', ...mine.map(item => item.filledQuantity)),
           operation: op ? { clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId, note: op.note } : null };
       }),
       events,
@@ -712,6 +958,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     get retired() { return retired; },
     budgets,
     acquire,
+    prune,
     registerAccount,
     preview,
     publicPreview,

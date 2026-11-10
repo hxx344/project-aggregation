@@ -29,6 +29,14 @@ CREATE TABLE stop_requests (job_id TEXT PRIMARY KEY REFERENCES jobs(id), request
 CREATE TABLE events (seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, type TEXT NOT NULL, at INTEGER NOT NULL, json TEXT NOT NULL);
 CREATE INDEX events_job ON events(job_id, seq);
 `,
+}, {
+  version: 2,
+  name: 'history-retention',
+  sql: `
+CREATE INDEX events_at ON events(at);
+CREATE INDEX commands_accepted ON commands(accepted_at);
+CREATE INDEX previews_consumed ON previews(expires_at) WHERE consumed_job IS NOT NULL;
+`,
 }]);
 
 export const sqlHash = (sql: string): string => createHash('sha256').update(sql).digest('hex');
@@ -39,6 +47,7 @@ export class StoreError extends Error {
 }
 
 export const WAIT_BUCKETS_MS = [1, 10, 100, 1000, 5000] as const;
+export const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
 const SAMPLE_LIMIT = 20_000;
 export interface WriteStats { transactions: number; busy: number; waitBuckets: number[]; maxWaitMs: number; maxHoldMs: number; waits: number[]; holds: number[] }
 
@@ -61,7 +70,8 @@ export function openStore(file: string, { busyTimeoutMs = 5000 }: { busyTimeoutM
   try {
     const mode = (db.prepare('PRAGMA journal_mode=WAL').get() as { journal_mode: string }).journal_mode;
     if (mode !== 'wal') throw new StoreError('journal_mode', `数据库未能进入 WAL 模式：${mode}`);
-    db.exec(`PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${Math.trunc(busyTimeoutMs)};`);
+    // journal_size_limit truncates the WAL back to 64 MiB after a checkpoint; it does not cap a WAL a long reader keeps growing.
+    db.exec(`PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${Math.trunc(busyTimeoutMs)}; PRAGMA journal_size_limit=${WAL_SIZE_LIMIT_BYTES};`);
   } catch (error) { db.close(); throw error; }
 
   function tx<T>(operation: () => T): T {

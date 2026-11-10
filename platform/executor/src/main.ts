@@ -1,7 +1,8 @@
 // Independent entry point of the phase 1 executor prototype. It owns a separate
 // data directory, refuses the legacy workbench data directory and runs only
 // simulated venues on loopback (plan 1, 8).
-import { existsSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { openStore } from './store.ts';
@@ -32,6 +33,21 @@ export function assertDedicatedDataDir(dir: string): string {
     if (dirname(current) === current) break;
   }
   return path;
+}
+
+/**
+ * Writes the login link to <dir>/access-url and returns that path. The token never
+ * reaches stdout or logs; whoever can read the data directory can log in. The
+ * temporary file plus rename keeps a reader from seeing a half-written link.
+ */
+export function writeAccessUrl(dir: string, port: number, token: string): string {
+  const target = join(dir, 'access-url');
+  const temp = join(dir, `.access-url.${process.pid}.${randomBytes(4).toString('hex')}.tmp`);
+  try {
+    writeFileSync(temp, `http://127.0.0.1:${port}/login?token=${token}\n`, { mode: 0o600, flag: 'wx' });
+    renameSync(temp, target);
+  } catch (error) { rmSync(temp, { force: true }); throw error; }
+  return target;
 }
 
 async function main(): Promise<void> {
@@ -69,9 +85,13 @@ async function main(): Promise<void> {
     if (!stopping) { process.exitCode = 1; void shutdown(); }
   })();
 
-  const server = createExecutorServer({ executor });
+  const accessToken = randomBytes(32).toString('base64url');
+  const server = createExecutorServer({ executor, accessToken });
   server.on('error', error => { process.stderr.write(`HTTP 监听失败：${error.message}\n`); process.exitCode = 1; void shutdown(); });
-  server.listen(port, '127.0.0.1', () => process.stdout.write(`执行器原型（模拟传输）已启动：http://127.0.0.1:${port}/ 数据目录 ${dir}\n`));
+  server.listen(port, '127.0.0.1', () => {
+    try { process.stdout.write(`执行器原型（模拟传输）已启动，登录链接已写入 ${writeAccessUrl(dir, port, accessToken)}\n`); }
+    catch (error) { process.stderr.write(`写入登录链接失败：${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; void shutdown(); }
+  });
   async function shutdown(): Promise<void> {
     if (stopping) return;
     stopping = true;

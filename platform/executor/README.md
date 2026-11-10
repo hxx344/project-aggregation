@@ -1,4 +1,4 @@
-# 执行器原型（统一平台阶段 1）
+# 执行器原型（统一平台阶段 1–2）
 
 统一交易与资产平台阶段 1 的首切片：原油 CLUSDT 在 Binance 与 Bybit 之间的跨所双腿开平仓，覆盖预览、确认、执行、核对、停止、超时、重启接管与故障注入。方案见 `docs/unified-platform-plan.md` 与 `docs/unified-platform-phase0.md`，盘点与预算见 `docs/unified-platform-phase0-inventory.md`。
 
@@ -6,8 +6,9 @@
 
 - 只有进程内模拟场所，没有真实交易所传输；契约层拒绝任何非模拟传输或非模拟环境。
 - 独立入口、独立数据目录 `executor.sqlite`；拒绝含 `hub.sqlite`、`execution-control.sqlite`、`credentials.key` 或 `modules` 的目录，不读写工作台数据。
+- 共享写者登记（`execution-control.sqlite` 协议，实现为 `server/execution/account-writer.mjs`）只能通过 `createExecutor({ control })` 注入；入口 `main.ts` 不接入，测试只用临时目录里的登记库。模拟传输下只允许以 `testnet` 或 `demo` 身份登记，因为登记会把账户永久钉选给首个认领的模块。
 - 不在工作台发布包内（`deploy/package-release.py` 不打包 `platform/`），也不注册任何服务。
-- HTTP 只监听 `127.0.0.1`，校验 Host，会话 cookie 为 HttpOnly + SameSite=Strict，写请求需 `x-pa-executor: 1` 与 JSON 体，体积上限 16 KiB。
+- HTTP 只监听 `127.0.0.1`，校验 Host；启动时把本次进程有效的登录链接写入数据目录的 `access-url`（权限 0600），`GET /login?token=` 换取会话 cookie `pa_executor_session_<端口>`（HttpOnly + SameSite=Strict，按端口隔离），无会话的页面与接口返回 401；写请求需 `x-pa-executor: 1` 与 JSON 体，体积上限 16 KiB。
 - ANT（ANTHROPICUSDT）只读，且只有 Binance 可读。
 
 ## 运行
@@ -16,7 +17,7 @@
 
 ```powershell
 cd platform/executor
-node src/main.ts --data-dir D:\tmp\pa-executor --port 4710   # 打开 http://127.0.0.1:4710/
+node src/main.ts --data-dir D:\tmp\pa-executor --port 4710   # 打开数据目录 access-url 中的登录链接
 ..\..\node_modules\.bin\tsc -p tsconfig.json                  # 类型检查
 node --test test/*.test.ts                                     # 行为、恢复、故障注入与 HTTP 边界测试
 node scripts/measure.ts                                        # 混合负载测量；未达建议预算时退出码 2
@@ -25,8 +26,12 @@ node scripts/measure.ts                                        # 混合负载测
 ## 关键语义
 
 - 未知结果不重发：发送中断记为 `unknown`，按原客户订单号核对；过观察窗、间隔多次查无且账户无痕迹才判定 `not-created`。
-- 单写者租约带代次：租约过期后实例永久停止写入；新实例接管时把 `prepared` 记为 `not-sent`、`sending` 记为 `unknown`，未完成任务只核对并撤挂单，不再发送。正常关闭交还租约。
-- `attention`（敞口不平衡、对冲腿被拒、撤单用尽、委托过观察窗仍未知、对冲腿账户读取持续失败）保留合约锁并继续核对，人工确认后才释放。
+- 单写者租约带代次：租约过期后实例永久停止写入；新实例接管时把 `prepared` 记为 `not-sent`、`sending` 记为 `unknown`。接管后首腿不再新发并撤挂单；首腿已成交部分按落盘进度补发对冲腿（目标量减已对冲量，取整到步长，用新的客户订单号 `…-1r<n>`），仍经过账户绑定、数量与持仓守卫，价格偏离不阻断补发。正常关闭交还租约。
+- 对冲腿 IOC 部分成交也按差额补发，每任务最多 `hedgeAttempts`（5）笔；最后一笔被交易所明确拒绝或已请求停止时不补发。
+- 价格保护：预览按 `maxSlippageBps`（默认 50，可在意图中设 1–1000）算出首腿界限；发送前两腿盘口须新鲜、接收时间相差不超过 `pairQuoteWindowMs`，越过界限不发送；市价首腿以界限价 IOC 限价发送，由交易所执行保护。
+- 保留期：已结束、委托全部结清且无待确认人工项的任务，其事件、命令与已消费预览超过 90 天后分批删除；任务与委托记录保留。WAL 由 `journal_size_limit` 限制在 64 MiB。
+- 共享写者登记（注入时）：每个账户单独认领；建单与撤单先登记再发送，出站前复核所有权，本地结果落盘后再结清登记；同一账户有未核对的登记操作时不发送新委托；重启后按本地事实结清遗留登记（未发送的记为未执行，核对到委托的记为已确认，撤单在签名有效窗口过后仍见挂单才记为未执行）。所有权丢失、租约过期或登记库被替换时执行器整体停止写入。只运行不交易时不认领账户。
+- `attention`（敞口不平衡、对冲腿被拒、对冲补发用尽、撤单用尽或被登记阻止超时、委托过观察窗仍未知、对冲腿账户读取或登记持续失败）保留合约锁并继续核对，人工确认后才释放。
 - 预览要求两腿桶数完全相等；对冲量按首腿实际成交换算并向下取整到对冲所步长。
 - 入口执行循环连续失败 5 次或失去租约时交还租约并以非零码退出，由外部重启接管。
 - 数量与价格用精确十进制字符串，不经过浮点。
@@ -34,5 +39,8 @@ node scripts/measure.ts                                        # 混合负载测
 ## 已知限制
 
 - 本机测量（Windows，非目标服务器）中，单次写事务持锁最大值与事件循环阻塞 p99 未达建议预算，原因是主线程同步提交在 `synchronous=FULL` 下等待 fsync；写入线程或批量提交留到阶段 2 选型。数值见盘点文档第 8 节。
-- 未建模 Bybit 原生追价策略；未接入共享写者登记 `execution-control.sqlite`；事件与命令没有保留期限。
-- 没有价格保护（只校验盘口新鲜度）；会话 cookie 只防跨站请求，不是本地鉴权。接真实账户前须补齐，见盘点文档第 9 节。
+- 未建模 Bybit 原生追价策略（阶段 2 下一批）。
+- 共享写者登记的协议缺口：账户一经认领永久归属该模块，没有交接或解除隔离接口（账户被隔离后登记操作也无法结清，只能人工恢复）；`executor.sqlite` 不在工作台恢复清单内。接真实账户（阶段 4）前须有对应协议能力。见盘点文档第 9 节。
+- 登记结清只遍历当前绑定的账户：换绑后旧账户上的未决登记不会由本模块结清；登记库有未决操作时，结清会认领所有已绑定账户。
+- 登录令牌不是一次性的，进程运行期间可重复使用；Windows 上文件权限 0600/0700 不生效，已存在的数据目录不改权限。
+- 停止请求在首腿成交后也会阻止首笔对冲，任务转人工（保留敞口由人处理）；对冲腿不设价格上限（用户决定），极端行情下市价对冲可能远离预览价成交。

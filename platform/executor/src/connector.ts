@@ -35,6 +35,8 @@ export interface OrderRequest {
   quantity: string;
   type: OrderType;
   limitPrice: string | null;
+  /** ioc: whatever does not fill at once is canceled by the venue. Market orders are always ioc. Absent in rows written before it existed means gtc. */
+  timeInForce?: 'gtc' | 'ioc';
   reduceOnly: boolean;
 }
 

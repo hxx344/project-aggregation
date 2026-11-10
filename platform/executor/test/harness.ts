@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { openStore, type Store } from '../src/store.ts';
-import { createExecutor, type Budgets, type Executor } from '../src/executor.ts';
+import { createExecutor, type Budgets, type Executor, type ExecutorOptions } from '../src/executor.ts';
 import type { SimulatedVenue } from '../src/sim-venue.ts';
 import { SIM_BINDINGS, createSimulatedVenues } from '../src/simulation.ts';
 
@@ -29,7 +29,8 @@ export interface Harness {
 
 export const FAST: Partial<Budgets> = { callTimeoutMs: 50 };
 
-export function createHarness({ budgets = {} }: { budgets?: Partial<Budgets> } = {}): Harness {
+/** control is called once per executor instance, so each restart gets its own registry writer. */
+export function createHarness({ budgets = {}, control }: { budgets?: Partial<Budgets>; control?: (clock: { now: number }) => ExecutorOptions['control'] } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'pa-executor-'));
   const file = join(dir, 'executor.sqlite');
   const clock = { now: START };
@@ -39,7 +40,7 @@ export function createHarness({ budgets = {} }: { budgets?: Partial<Budgets> } =
   const make = (extra: Partial<Budgets> = {}) => {
     const store = openStore(file);
     stores.push(store);
-    return { store, ex: createExecutor({ store, connectors: [binance, bybit], now, budgets: { ...FAST, ...budgets, ...extra } }) };
+    return { store, ex: createExecutor({ store, connectors: [binance, bybit], now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock) }) };
   };
   const first = make();
   first.ex.acquire();

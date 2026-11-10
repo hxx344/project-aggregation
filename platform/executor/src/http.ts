@@ -1,25 +1,43 @@
 // Local HTTP surface for the minimal page. It binds to loopback only, checks
-// the Host header against DNS rebinding and requires the per-process session
-// cookie plus a custom header on every write, so another site cannot drive it.
+// the Host header against DNS rebinding, hands the session cookie out only in
+// exchange for the access token written to the data directory, and requires that
+// cookie plus a custom header on every write, so neither another site nor another
+// local process that merely reaches the port can drive it.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { ContractError, VENUES, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { PAGE } from './page.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
-const COOKIE = 'pa_executor_session';
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge))?$/i;
 
-export interface HttpOptions { executor: Executor; session?: string }
+const PAGE_HEADERS = {
+  'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
+  'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
+};
+const LOGIN_REQUIRED = '<!doctype html><meta charset="utf-8"><title>需要登录</title><p>请使用数据目录 access-url 中的登录链接打开。</p>';
 
-export function createExecutorServer({ executor, session = randomBytes(32).toString('base64url') }: HttpOptions): Server {
-  const expected = Buffer.from(session);
+/** Instances on different ports of one host share the browser cookie jar for 127.0.0.1, so the name carries the port. */
+export const sessionCookieName = (port: number): string => `pa_executor_session_${port}`;
+
+/** accessToken is exchanged once per browser at /login; session is the cookie value and the executor session id. */
+export interface HttpOptions { executor: Executor; accessToken: string; session?: string }
+
+// Hashing first gives equal-length inputs, so the comparison does not leak the token length either.
+const sameSecret = (given: string, expected: string): boolean =>
+  timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
+
+export function createExecutorServer({ executor, accessToken, session = randomBytes(32).toString('base64url') }: HttpOptions): Server {
+  if (!accessToken) throw new Error('需要访问令牌');
+  if (sameSecret(session, accessToken)) throw new Error('会话值不能与访问令牌相同');
+  // The name follows the port actually bound, which is only known once listening (port 0 in tests).
+  const cookieName = (request: IncomingMessage) => sessionCookieName(request.socket.localPort ?? 0);
   const authorized = (request: IncomingMessage): boolean => {
-    const value = (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${COOKIE}=`))?.slice(COOKIE.length + 1) ?? '';
-    const given = Buffer.from(value);
-    return given.length === expected.length && timingSafeEqual(given, expected);
+    const name = cookieName(request);
+    const value = (request.headers.cookie ?? '').split(';').map(part => part.trim()).find(part => part.startsWith(`${name}=`))?.slice(name.length + 1);
+    return value !== undefined && sameSecret(value, session);
   };
   const send = (response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) => {
     const payload = JSON.stringify(body);
@@ -43,17 +61,20 @@ export function createExecutorServer({ executor, session = randomBytes(32).toStr
   async function route(request: IncomingMessage, response: ServerResponse): Promise<void> {
     if (!LOOPBACK.test(request.headers.host ?? '')) return send(response, 421, { code: 'host', message: '只接受本机访问' });
     const url = new URL(request.url ?? '/', 'http://localhost');
+    if (request.method === 'GET' && url.pathname === '/login') {
+      if (!sameSecret(url.searchParams.get('token') ?? '', accessToken)) { response.writeHead(401, PAGE_HEADERS); response.end(LOGIN_REQUIRED); return; }
+      response.writeHead(303, { ...PAGE_HEADERS, location: '/', 'set-cookie': `${cookieName(request)}=${session}; HttpOnly; SameSite=Strict; Path=/` });
+      response.end();
+      return;
+    }
     if (request.method === 'GET' && url.pathname === '/') {
-      response.writeHead(200, {
-        'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY',
-        'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
-        'set-cookie': `${COOKIE}=${session}; HttpOnly; SameSite=Strict; Path=/`,
-      });
-      response.end(PAGE);
+      const ok = authorized(request);
+      response.writeHead(ok ? 200 : 401, PAGE_HEADERS);
+      response.end(ok ? PAGE : LOGIN_REQUIRED);
       return;
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
-    if (!authorized(request)) return send(response, 401, { code: 'session', message: '会话无效，请刷新页面' });
+    if (!authorized(request)) return send(response, 401, { code: 'session', message: '会话无效，请使用数据目录 access-url 中的登录链接重新打开' });
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
 
     if (request.method === 'GET' && url.pathname === '/api/state') {

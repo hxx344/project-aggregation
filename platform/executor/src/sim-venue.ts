@@ -156,8 +156,8 @@ export class SimulatedVenue implements VenueConnector {
       if (crosses) {
         const quantity = fault?.mode === 'partial' ? fault.filled ?? '0' : request.quantity;
         if (cmp(quantity, '0') > 0) this.fill(order, quantity, takerPrice);
-        if (request.type === 'market' && order.status !== 'filled') { order.status = 'canceled'; order.updatedAt = this.clock(); }
       }
+      if ((request.type === 'market' || request.timeInForce === 'ioc') && order.status !== 'filled') { order.status = 'canceled'; order.updatedAt = this.clock(); }
       return this.report(order);
     }, fault);
   }
