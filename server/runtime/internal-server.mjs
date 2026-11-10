@@ -30,6 +30,7 @@ export function createInternalHandler({ service, dataPlane = null, secret, logge
     ['POST', /^\/internal\/v1\/modules\/([a-z]+)\/restart$/, (_, id) => service.restartModule(id)],
     ...(dataPlane ? [
       ['GET', /^\/internal\/v1\/overview$/, () => dataPlane.overview()],
+      ['GET', /^\/internal\/v1\/agent-feed$/, () => dataPlane.agentFeed()],
       ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/changed$`), ({ body }, id) => { dataPlane.projectChanged(validateProjectId(id), validateChange(body)); return { accepted: true }; }],
       ['POST', new RegExp(`^/internal/v1/projects/${PROJECT}/asset-sync$`), async ({ body, signal }, id) => ({ status: await dataPlane.coordinateAssetSync(validateProjectId(id), validateRevision(body?.revision), { signal }) })],
       ['POST', /^\/internal\/v1\/api-stats$/, ({ body }) => { dataPlane.reportApiStats(validateApiStats(body)); return { accepted: true }; }],
