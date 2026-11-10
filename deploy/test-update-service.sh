@@ -214,7 +214,7 @@ mkdir -p "$APP_DIR/releases" "$APP_DIR/cache" "$source_dir/server/update-service
 cp "$case_root/release/server/update-service/"*.py "$source_dir/server/update-service/"
 cp "$repository/deploy/build-artifact-cache.py" "$source_dir/deploy/build-artifact-cache.py"
 mkdir -p "$source_dir/tools/entropy-lighter-lab"
-cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$source_dir/tools/entropy-lighter-lab/"
+cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,evidence.mjs,config.example.json} "$source_dir/tools/entropy-lighter-lab/"
 mkdir -p "$source_dir/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$source_dir/tools/aero-roles/"
 printf '{"name":"source-permission-fixture"}\n' > "$source_dir/package.json"

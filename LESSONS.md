@@ -187,6 +187,8 @@
 
 **事件记录：** `embedded-import-ignore-20261013`；本轮一次已核实事件。
 
+**发布白名单补充（2026-11-10）：** P2 批次 `be01451` 的研究 CLI 新增导入 `evidence.mjs`，本地完整工作树可运行，但源码安装器、CI 打包器与独立研究安装器各自的运行文件白名单遗漏该文件。[CI 42824071840](https://github.com/hxx344/project-aggregation/actions/runs/42824071840) 在固定源码发布与真实 systemd 首次启动中报 `ERR_MODULE_NOT_FOUND`，阻止候选发布。新增运行时依赖要同时核对所有实际交付白名单及隔离夹具，不能以源码目录存在或模块构建通过代替。验证复用 `deploy/test-release.py` 的真实固定 Git 提取后 CLI 启动，以及 `deploy/test-package-layout.py` 的发布树启动和缺文件拒绝；独立安装与 systemd 由 Linux CI 执行。事件 `research-runtime-publication-allowlist-20261110`，为合入 main 后、正式发布前由 CI 捕获的交付遗漏；不推进历史复盘检查点。
+
 ### L012：可选本机辅助探测默认关闭，除非用户环境确实运行该服务
 
 **适用条件：** 前端定期探测可选本机 helper（如本地路由/直连探测）且工作台常经 SSH 隧道访问。

@@ -19,7 +19,7 @@ MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
 # ASTER's dashboard is prebuilt static content served by its Python bridge.
 # Its vinext/React build graph must not become server runtime dependencies.
 IMPORTERS = ('.', 'modules/monitor', 'modules/asset', 'modules/crossex')
-LAB_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'config.example.json')
+LAB_RUNTIME_FILES = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'evidence.mjs', 'config.example.json')
 # Safe + Roles executor the runtime unit imports (server/automation/aero-safe.mjs); the CLI, fork test and docs stay out.
 AERO_ROLES_RUNTIME_FILES = ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs')
 EXCLUDED = {'node_modules', '.git', '.venv', '.venv-aster', '.vinext', '.wrangler', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',

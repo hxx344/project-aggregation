@@ -18,6 +18,7 @@ INSTALLER = ROOT / "deploy/install-entropy-lighter-lab.sh"
 TEXT = INSTALLER.read_text(encoding="utf-8")
 FILES = ("tools/entropy-lighter-lab/cli.mjs", "tools/entropy-lighter-lab/core.mjs",
          "tools/entropy-lighter-lab/feeds.mjs", "tools/entropy-lighter-lab/binance-scalper.mjs",
+         "tools/entropy-lighter-lab/evidence.mjs",
          "tools/entropy-lighter-lab/config.example.json",
          "deploy/install-entropy-lighter-lab.sh")
 REVISION = "a" * 40
@@ -182,21 +183,26 @@ url = next(value for value in sys.argv if value.startswith("https:"))
 target = Path(sys.argv[sys.argv.index("-o") + 1])
 revision = (base / "revision").read_text()
 if "/releases/latest/download/release-manifest.json" in url:
+    if (base / "fail-manifest").exists(): sys.exit(42)
     target.write_text(json.dumps(dict(schema=1, repository="hxx344/project-aggregation", commit=revision, tag="deploy-" + revision)))
 elif "raw.githubusercontent.com/" in url:
     name = url.split("/" + revision + "/", 1)[1]
+    if name.endswith("evidence.mjs") and (base / "fail-download").exists(): sys.exit(43)
     with (base / "downloads").open("a") as output: output.write(name + "\\n")
     shutil.copyfile(base / "source" / name, target)
 else: sys.exit(41)
 ''')
 
-    def run(self, remote=False, fail=None):
+    def run(self, remote=False, fail=None, source=None, revision=None):
         if fail:
             (self.base / ("fail-" + fail)).touch()
         try:
-            command = ["bash", str(self.source / FILES[-1])]
+            selected = source or self.source
+            command = ["bash", str(selected / FILES[-1])]
             if not remote:
-                command += ["--source", str(self.source)]
+                command += ["--source", str(selected)]
+            if revision:
+                command += ["--revision", revision]
             return subprocess.run(command, cwd=self.base, capture_output=True, text=True, timeout=60,
                                   env={**os.environ, "PATH": str(self.commands) + ":/usr/bin:/bin",
                                        "HARNESS_BASE": str(self.base), "HARNESS_PYTHON": sys.executable})
@@ -269,8 +275,60 @@ class InstallerTransactionTests(unittest.TestCase):
         self.assertNotEqual(self.h.run(remote=True).returncode, 0)
         self.assertEqual(self.h.current, old)
         (self.h.base / "revision").write_text(REVISION)
-        (self.h.root / "sources" / REVISION / FILES[0]).write_text("corrupt")
+        (self.h.root / "sources" / (REVISION + "-v2") / FILES[0]).write_text("corrupt")
         self.assertNotEqual(self.h.run(remote=True).returncode, 0)
+        self.assertEqual(self.h.current, old)
+
+    def test_legacy_six_file_handoff_retries_fixed_revision_and_reuses_complete_layout(self):
+        old = self.h.success()
+        (self.h.data / "research.jsonl").write_text("preserved\n")
+        config = (self.h.etc / "config.json").read_bytes()
+        legacy = self.h.root / "sources" / REVISION
+        legacy_files = tuple(name for name in FILES if not name.endswith("evidence.mjs"))
+        self.assertEqual(len(legacy_files), 6)
+        for name in legacy_files:
+            target = legacy / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(self.h.source / name, target)
+        digest = block("SOURCE_DIGEST")["source_digest"]
+        marker = digest(legacy, legacy_files)
+        (legacy / ".source-complete").write_text(marker)
+        # Reproduce the old bootstrap's exact handoff; the new recipe must
+        # retain that pinned commit even when latest cannot be looked up.
+        (self.h.base / "fail-manifest").touch()
+        result = self.h.run(source=legacy, revision=REVISION, fail="download")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.h.current, old)
+        upgraded = self.h.root / "sources" / (REVISION + "-v2")
+        self.assertFalse(upgraded.exists())
+        result = self.h.run(source=legacy, revision=REVISION)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((upgraded / ".source-complete").read_text().strip(), digest(upgraded, FILES))
+        downloads, validations = self.h.count("downloads"), self.h.count("validation")
+        result = self.h.run(source=legacy, revision=REVISION)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.h.count("downloads"), downloads)
+        self.assertEqual(self.h.count("validation"), validations)
+        self.assertEqual((legacy / ".source-complete").read_text(), marker)
+        self.assertFalse((legacy / "tools/entropy-lighter-lab/evidence.mjs").exists())
+        self.assertEqual((self.h.etc / "config.json").read_bytes(), config)
+        self.assertEqual((self.h.data / "research.jsonl").read_text(), "preserved\n")
+
+        # Explicit local sources remain offline; only the exact managed old
+        # cache path is eligible for the pinned compatibility download.
+        missing = self.h.source / "tools/entropy-lighter-lab/evidence.mjs"
+        content = missing.read_bytes()
+        missing.unlink()
+        try:
+            self.assertNotEqual(self.h.run(source=self.h.source, revision=REVISION).returncode, 0)
+        finally:
+            missing.write_bytes(content)
+        self.assertEqual(self.h.count("downloads"), downloads)
+        marker_file = legacy / ".source-complete"
+        marker_file.rename(legacy / ".source-complete.saved")
+        marker_file.symlink_to(legacy / ".source-complete.saved")
+        self.assertNotEqual(self.h.run(source=legacy, revision=REVISION).returncode, 0)
+        self.assertEqual(self.h.count("downloads"), downloads)
         self.assertEqual(self.h.current, old)
 
     def test_failed_check_does_not_switch_or_restart(self):
