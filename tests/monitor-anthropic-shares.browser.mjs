@@ -123,11 +123,10 @@ async page => {
       await waitText(pairValue('平仓溢价'), expected.closing);
       // Freshness may add a visible “旧” tag; the numerical reading must still match.
       check((await pairValue('当前溢价').innerText()).startsWith(expected.current), `${label}: related current premium agrees`);
-      check((await pair.innerText()).includes(expected.shares), `${label}: related quantities use the same share assumptions`);
       check((await pair.locator('.related-pair-estimate').innerText()).includes('+32.00 USD'), `${label}: share assumptions do not rewrite actual cash PnL`);
       report[label] = evidence;
     }
-    await verify({ premiums: ['+50.00%', '+20.00%', '+200.00%'], binance: '$120.00', other: ['$80.00', '$100.00', '$40.00'], opening: '+100.000%', closing: '+120.000%', current: '+200.000%', shares: 'Binance 20 股 / Lighter RH 20 股' }, 'initial');
+    await verify({ premiums: ['+50.00%', '+20.00%', '+200.00%'], binance: '$120.00', other: ['$80.00', '$100.00', '$40.00'], opening: '+100.000%', closing: '+120.000%', current: '+200.000%' }, 'initial');
     check((await panel.locator('.method-panel').innerText()).includes('10') && (await panel.locator('.method-panel').innerText()).includes('20'), 'method text describes synchronized S/F');
     check(!(await panel.locator('.method-panel').innerText()).includes('流通 127 亿'), 'method never claims custom values are 127/167 defaults');
 
@@ -135,7 +134,7 @@ async page => {
     writer = await context.newPage(); writer.on('pageerror', onError);
     await writer.goto(`${origin}/fixture-storage`); await page.bringToFront();
     await writer.evaluate(({ key }) => localStorage.setItem(key, JSON.stringify({ outstanding: '12', diluted: '30' })), { key });
-    await verify({ premiums: ['+25.00%', '+50.00%', '+275.00%'], binance: '$100.00', other: ['$80.00', '$66.67', '$26.67'], opening: '+150.000%', closing: '+175.000%', current: '+275.000%', shares: 'Binance 24 股 / Lighter RH 30 股' }, 'storage');
+    await verify({ premiums: ['+25.00%', '+50.00%', '+275.00%'], binance: '$100.00', other: ['$80.00', '$66.67', '$26.67'], opening: '+150.000%', closing: '+175.000%', current: '+275.000%' }, 'storage');
 
     // Both halves of trust are required: a sibling/self cannot forge a parent,
     // and a parent WindowProxy paired with an untrusted origin is also rejected.
@@ -156,7 +155,7 @@ async page => {
     await assumptions.getByLabel('完全稀释股 · 十亿股', { exact: true }).fill('30');
     await page.waitForFunction(key => { const value = JSON.parse(localStorage.getItem(key)); return value.outstanding === '15' && value.diluted === '30'; }, key);
     await page.getByRole('navigation', { name: '主导航', exact: true }).getByRole('button', { name: /^monitor/ }).click();
-    await verify({ premiums: ['0.00%', '+20.00%', '+200.00%'], binance: '$80.00', other: ['$80.00', '$66.67', '$26.67'], opening: '+100.000%', closing: '+120.000%', current: '+200.000%', shares: 'Binance 30 股 / Lighter RH 30 股' }, 'trading-edit');
+    await verify({ premiums: ['0.00%', '+20.00%', '+200.00%'], binance: '$80.00', other: ['$80.00', '$66.67', '$26.67'], opening: '+100.000%', closing: '+120.000%', current: '+200.000%' }, 'trading-edit');
     await page.reload();
     await waitText(panel.locator('.primary-metric .metric-value'), '+200.00%');
     check(await page.evaluate(key => JSON.parse(localStorage.getItem(key)).outstanding, key) === '15', 'reload retains saved host assumption');

@@ -378,7 +378,7 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 .hub-nav-slot .perp-workspace-nav button { min-height: 30px; padding: 4px 12px; border: 0; border-radius: 4px; font-size: 12px; background: transparent; }
 .hub-nav-slot .perp-workspace-nav button[aria-current=page] { background: var(--active-surface); color: var(--primary); }
 
-.monitor-detail { display: grid; grid-template-columns: minmax(0, 1fr) 312px; gap: 16px; align-items: start; margin: 0 20px 20px; min-width: 0; }
+.monitor-detail { display: grid; grid-template-columns: minmax(0, 1fr) clamp(380px, 32vw, 480px); gap: 16px; align-items: start; margin: 0 20px 20px; min-width: 0; }
 .monitor-detail[data-layout=wide] { grid-template-columns: minmax(0, 1fr); }
 .monitor-detail-main { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .monitor-detail-main > .hub-content[hidden] { display: none; }
@@ -474,7 +474,7 @@ main, .hub-tabs, .hub-intro, .hub-notifications, .hub-alert-settings { max-width
 
 @media (max-width: 1100px) {
   .monitor-detail { grid-template-columns: minmax(0, 1fr); }
-  .monitor-detail-side { position: static; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+  .monitor-detail-side { position: static; display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; }
   .hynix-chart-group .metrics.readout { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .hynix-chart-group .readout .metric:nth-child(3) { border-left: 0; }
   .hynix-chart-group .readout .metric:nth-child(n+3) { border-top: 1px solid var(--border); }

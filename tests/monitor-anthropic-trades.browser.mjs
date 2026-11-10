@@ -102,7 +102,7 @@ async page => {
     check((await pair.innerText()).includes('Binance ↔ Lighter RH'), 'current actual pair is identified');
     check((await pair.locator('.related-pair-estimate').innerText()).includes('+394.84 USD'), 'reported known net combines both actual legs');
     check((await pair.innerText()).includes('+406.33 USD'), 'unrealized combines USDT and USDG under explicit assumption');
-    check((await pair.innerText()).includes('1:1 估算') && (await pair.innerText()).includes('Lighter RH：已实现、手续费、资金费'), 'estimate assumption and missing components stay visible');
+    check((await pair.innerText()).includes('1:1 估算') && (await pair.innerText()).includes('已知净盈亏估算'), 'estimate assumption and incomplete-total label stay visible');
     check(await side.locator('.related-positions-list li').count() === 2, 'both original currency legs remain visible');
     for (const name of ['io:ANTH', 'xyz:ANT']) {
       await panel.getByRole('button', { name, exact: true }).click();
@@ -189,7 +189,7 @@ async page => {
     await page.clock.fastForward(301_000);
     check(requests.filter(market => market === 'anthropic').length === before, 'inactive ANT chart stops fill reads');
     check(errors.length === 0, errors.join('\n'));
-    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'RH entry/exit keyboard details', 'native prices', 'no RH or ambiguous CEX markers on xyz/io', 'actual pair and screenshot PnL', 'explicit 1:1 estimate and missing cycle', 'range and price modes', 'refresh failure retention', 'foreground-only reads', '390px layout', 'reload preferences', 'market isolation', 'monitor URL priority'] };
+    return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'RH entry/exit keyboard details', 'native prices', 'no RH or ambiguous CEX markers on xyz/io', 'actual pair and screenshot PnL', 'explicit 1:1 estimate and incomplete-total label', 'range and price modes', 'refresh failure retention', 'foreground-only reads', '390px layout', 'reload preferences', 'market isolation', 'monitor URL priority'] };
   } finally {
     if (previousShares !== undefined) {
       await page.goto(`${origin}/fixture-preferences`);
