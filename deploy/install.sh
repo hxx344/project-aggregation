@@ -2454,7 +2454,7 @@ prepare_application() {
   mkdir "$work_dir/publish"
   ci_update_progress extract
   # Re-extract runtime source as root; tests/builds cannot modify published code.
-  git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} | tar -x -C "$work_dir/publish"
+  git --git-dir="$APP_DIR/repository.git" archive "$commit" server package.json tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,evidence.mjs,config.example.json} tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} | tar -x -C "$work_dir/publish"
   build_artifact_cache restore "$built" "$build_key" "$work_dir/publish/dist"
   if (( has_modules )); then
     cp -a --reflink=auto "$embedded/modules" "$embedded/deploy" "$work_dir/publish/"

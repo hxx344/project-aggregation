@@ -24,7 +24,7 @@ unit=/etc/systemd/system/entropy-lighter-lab.service
 service=entropy-lighter-lab
 repository=hxx344/project-aggregation
 node_version=24.15.0
-files=(tools/entropy-lighter-lab/cli.mjs tools/entropy-lighter-lab/core.mjs tools/entropy-lighter-lab/feeds.mjs tools/entropy-lighter-lab/binance-scalper.mjs tools/entropy-lighter-lab/config.example.json deploy/install-entropy-lighter-lab.sh)
+files=(tools/entropy-lighter-lab/cli.mjs tools/entropy-lighter-lab/core.mjs tools/entropy-lighter-lab/feeds.mjs tools/entropy-lighter-lab/binance-scalper.mjs tools/entropy-lighter-lab/evidence.mjs tools/entropy-lighter-lab/config.example.json deploy/install-entropy-lighter-lab.sh)
 system_ready() {
   local tool
   for tool in python3 curl sha256sum flock systemctl systemd-run useradd runuser tar xz; do command -v "$tool" >/dev/null || return 1; done
@@ -124,7 +124,15 @@ print(source_digest(sys.argv[1], sys.argv[2:]))
 # END SOURCE_DIGEST
 PY
 }
+if [[ -n $source_revision && $source_dir == "$root/sources/$source_revision" ]]; then
+  # Older bootstraps downloaded only their own six-file whitelist before
+  # handing off this fixed revision. Do not adopt or mutate that old cache.
+  trusted "$source_dir/.source-complete"
+  printf '[entropy-lighter-lab] Refreshing legacy source layout at fixed commit %.12s.\n' "$source_revision"
+  source_dir=''
+fi
 if [[ -z $source_dir ]]; then
+  if [[ -z $source_revision ]]; then
   download "https://github.com/$repository/releases/latest/download/release-manifest.json" "$scratch/manifest.json" 1048576
   source_revision=$(python3 -I - "$scratch/manifest.json" "$repository" <<'PY'
 # BEGIN MANIFEST_COMMIT
@@ -140,7 +148,9 @@ print(manifest_commit(json.loads(Path(sys.argv[1]).read_text(encoding='utf-8')),
 # END MANIFEST_COMMIT
 PY
   )
-  source_dir="$root/sources/$source_revision"
+  fi
+  # Bump this layout when the downloaded runtime whitelist changes.
+  source_dir="$root/sources/$source_revision-v2"
   trusted "$source_dir/.source-complete"
   if [[ -f $source_dir/.source-complete ]]; then
     for name in "${files[@]}"; do trusted "$source_dir/$name"; done
@@ -148,7 +158,7 @@ PY
     printf '[entropy-lighter-lab] Stable source unchanged; download skipped.\n'
   else
     [[ ! -e $source_dir ]] || die 'Incomplete source cache; inspect it before retrying.'
-    printf '[entropy-lighter-lab] Downloading six allowlisted files from stable commit %.12s.\n' "$source_revision"
+    printf '[entropy-lighter-lab] Downloading %s allowlisted files from stable commit %.12s.\n' "${#files[@]}" "$source_revision"
     for name in "${files[@]}"; do
       mkdir -p "$scratch/source/$(dirname -- "$name")"
       download "https://raw.githubusercontent.com/$repository/$source_revision/$name" "$scratch/source/$name" 1048576

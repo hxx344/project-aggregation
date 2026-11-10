@@ -10,7 +10,7 @@ from trading.margin_balance import DEFAULT_MARGIN, MarginBalancer, validate_marg
 from trading.margin_archive import add_note, archive_view
 from trading.models import TradingError
 from trading.store import Store
-from test_pair_margin import snapshot
+from tests.test_pair_margin import snapshot
 
 
 class AbsoluteReserveTests(unittest.TestCase):
