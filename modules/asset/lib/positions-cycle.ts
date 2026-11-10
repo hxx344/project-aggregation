@@ -1,5 +1,5 @@
-import type { PositionCycle } from './positions-types.ts';
-import { decimal, POSITIONS_INVALID } from './positions-values.ts';
+import type { PositionCycle, CycleEvidenceRow } from './positions-types.ts';
+import { decimal, POSITIONS_INVALID } from './positions-decimal.ts';
 
 export const CYCLE_LOOKBACK_DAYS = 85;
 /** The replayed fills disagree with the exchange's own position, as opposed to malformed data. */
@@ -81,6 +81,7 @@ export type CycleInput = {
   /** True when the opening fill was found; false when the lookback ended first. */
   complete: boolean; openingFraction: string | null; since: number;
   fundingAttributable: boolean; notes: string[]; updatedAt: string;
+  excludedFills?: readonly CycleFill[];
 };
 
 /** `fills` hold only this cycle, newest first. Every replayed size must match the exchange's own. */
@@ -88,20 +89,27 @@ export function summarizeCycle(input: CycleInput): PositionCycle {
   const ordered = [...input.fills].reverse();
   let position = input.complete ? '0' : subtract(input.current, sum(ordered.map(delta)));
   let closed = '0', closeValue = '0';
-  const realized: string[] = [], fees: string[] = [], notes = [...input.notes];
+  const realized: string[] = [], fees: string[] = [], notes = [...input.notes], evidence: CycleEvidenceRow[] = [];
   let feesKnown = true;
   ordered.forEach((fill, index) => {
     const opening = index === 0 && input.openingFraction !== null;
+    let closingQuantity = '0';
     // The opening share is derived from the later fills so a truncated fraction cannot shift the replay.
     const after = opening ? subtract(input.current, sum(ordered.slice(1).map(delta))) : add(position, delta(fill));
     if (!opening && sign(position) !== 0 && sign(after) === sign(position) && compare(magnitude(after), magnitude(position)) < 0) {
       const amount = subtract(magnitude(position), magnitude(after));
+      closingQuantity = amount;
       closed = add(closed, amount); closeValue = add(closeValue, multiply(amount, fill.price));
     }
     if (fill.sizeAfter !== undefined && compare(fill.sizeAfter, after) !== 0) throw new Error(CYCLE_MISMATCH);
     if (!opening) realized.push(fill.realizedPnl);
     if (fill.feeCurrency !== input.currency) feesKnown = false;
     else fees.push(opening ? multiply(fill.fee, input.openingFraction!) : fill.fee);
+    evidence.push({ id: fill.id, time: new Date(fill.time).toISOString(), kind: 'fill', side: fill.side, closingQuantity, status: opening || fill.feeCurrency !== input.currency ? 'partial' : 'included',
+      quantity: opening ? magnitude(after) : fill.quantity, price: fill.price, fraction: opening ? input.openingFraction : null,
+      realizedPnl: opening ? null : fill.realizedPnl, fee: fill.feeCurrency === input.currency ? opening ? multiply(fill.fee, input.openingFraction!) : fill.fee : null,
+      feeCurrency: fill.feeCurrency, amount: null, currency: input.currency,
+      reason: [opening ? '翻仓只纳入本轮开仓份额的手续费，前轮已实现不纳入' : '', fill.feeCurrency !== input.currency ? '手续费币种不一致，费用不可合计' : ''].filter(Boolean).join('；') || null });
     position = after;
   });
   if (compare(position, input.current) !== 0) throw new Error(CYCLE_MISMATCH);
@@ -112,6 +120,15 @@ export function summarizeCycle(input: CycleInput): PositionCycle {
   const feeTotal = feesKnown ? sum(fees) : null;
   if (!feesKnown) notes.push('部分手续费以其他币种扣除，未计入');
   const funding = input.fundingAttributable ? sum(inCycle.filter(item => item.kind === 'funding').map(item => item.amount)) : null;
+  for (const item of input.cash) {
+    const included = item.time >= input.since && (item.kind !== 'funding' || input.fundingAttributable);
+    evidence.push({ id: item.id, time: new Date(item.time).toISOString(), kind: item.kind, side: null, closingQuantity: null, status: included ? 'included' : 'excluded',
+      quantity: null, price: null, fraction: null, realizedPnl: null, fee: null, feeCurrency: null,
+      amount: included ? item.amount : null, currency: item.currency,
+      reason: item.time < input.since ? '早于本轮起点' : !included ? '同合约反向持仓，资金费无法归属' : null });
+  }
+  for (const fill of input.excludedFills ?? []) evidence.push({ id: fill.id, time: new Date(fill.time).toISOString(), kind: 'fill', side: fill.side, closingQuantity: null, status: 'excluded',
+    quantity: null, price: null, fraction: null, realizedPnl: null, fee: null, feeCurrency: null, amount: null, currency: input.currency, reason: '早于本轮开仓成交' });
   if (!input.fundingAttributable) notes.push('同一合约另有反向持仓，资金费无法拆分');
   if (!input.complete) notes.push(`开仓早于 ${CYCLE_LOOKBACK_DAYS} 天前，仅统计最近 ${CYCLE_LOOKBACK_DAYS} 天`);
   return {
@@ -120,6 +137,8 @@ export function summarizeCycle(input: CycleInput): PositionCycle {
     realizedPnl, fees: feeTotal, funding,
     net: feeTotal !== null && funding !== null ? sum([realizedPnl, feeTotal, funding]) : null,
     currency: input.currency, note: notes.length ? notes.join('；') : null, updatedAt: input.updatedAt,
+    evidence: { version: 1, coverageStart: new Date(input.since).toISOString(), coverageEnd: input.updatedAt, openingFound: input.complete,
+      totalRows: evidence.length, truncated: evidence.length > 200, rows: evidence.slice(0, 200) },
   };
 }
 

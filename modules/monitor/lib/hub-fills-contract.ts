@@ -4,8 +4,10 @@ import { createHubRequester, HUB_REQUEST_ID, type RequestTimers } from './hub-re
 export const FILL_MARKETS = { oil: ['CL', 'BZ'], hynix: ['SKHY', 'SKHYNIX'], anthropic: ['ANTHROPIC', 'XYZANT', 'IOANTH'] } as const;
 export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillExecution = { jobId: string; phase: number; batch: number; comparisonLeg: 'rh' | 'xyz' | 'io'; cex: 'binance' | 'okx' };
+export const ATTRIBUTION_REASONS = { matched: '已按订单与账户证据关联', 'missing-order': '缺少原订单编号', 'direction-mismatch': '成交方向与任务不符', ambiguous: '本账户有多个候选任务，未关联', 'insufficient-evidence': '订单、合约或账户证据不足，未关联' } as const;
+export type FillAttribution = { reason: keyof typeof ATTRIBUTION_REASONS; updatedAt: string | null };
 export type HubFillItem = {
-  orderId?: string; execution?: FillExecution;
+  orderId?: string; execution?: FillExecution; attribution?: FillAttribution;
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
   symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
   quantity: string; quantityUnit: string; price: string; priceCurrency: string | null;
@@ -80,7 +82,14 @@ function parseItem(value: unknown, market: FillMarket): HubFillItem | null {
   const orderId = market === 'anthropic' && v.orderId !== undefined ? text(v.orderId, 200) : undefined;
   const execution = market === 'anthropic' && v.execution !== undefined ? parseExecution(v.execution, result.exchangeId, result.symbol) : undefined;
   if (market === 'anthropic' && (v.orderId !== undefined && !orderId || v.execution !== undefined && (!execution || !orderId))) return null;
-  return { ...result, ...(orderId ? { orderId } : {}), ...(execution ? { execution } : {}) } as HubFillItem;
+  let attribution: FillAttribution | undefined;
+  if (market === 'anthropic' && v.attribution !== undefined) {
+    const raw = record(v.attribution);
+    if (!raw || typeof raw.reason !== 'string' || !Object.hasOwn(ATTRIBUTION_REASONS, raw.reason) || optionalIso(raw.updatedAt) === undefined
+      || (raw.reason === 'matched') !== !!execution) return null;
+    attribution = { reason: raw.reason as FillAttribution['reason'], updatedAt: optionalIso(raw.updatedAt)! };
+  }
+  return { ...result, ...(orderId ? { orderId } : {}), ...(execution ? { execution } : {}), ...(attribution ? { attribution } : {}) } as HubFillItem;
 }
 function parseCoverage(value: unknown): FillCoverage | null {
   const v = record(value); if (!v) return null;

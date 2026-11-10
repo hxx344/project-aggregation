@@ -5,6 +5,7 @@ import { ArrowUpRight, ChevronDown, Link2 } from "lucide-react";
 import { hubOpenTrading, POSITIONS_TIMEOUT_MS, useHubHost, useHubPositions, type HubPositionItem, type HubPositionsView, type PositionsMarket } from "../lib/hub-bridge";
 import { pairedMarket, relatedSpreadPairs, type RealizedStatus, type SpreadPair, type UnpairedReason, type VenueSpreads } from "../lib/related-pairs";
 import type { SpreadMarket } from "../lib/exchange-quotes";
+import CycleEvidenceView from './cycle-evidence';
 import { relatedAnthropicPair, type AnthropicPairQuotes } from "../lib/related-position-totals";
 
 export type { VenueSpreads };
@@ -53,6 +54,7 @@ function CycleSummary({ item }: { item: HubPositionItem }) {
       {amount("已实现盈亏", cycle.realizedPnl)}{amount("手续费", cycle.fees)}{amount("资金费", cycle.funding)}{amount("净额", cycle.net)}
     </dl>
     {cycle.note ? <p className="related-cycle-note">{cycle.note}</p> : null}
+    {cycle.evidence ? <CycleEvidenceView key={`${item.key}:${cycle.since}:${cycle.updatedAt}`} evidence={cycle.evidence}/> : <p className="related-cycle-note">当前响应未附带本轮逐笔核对证据（来源未保留或已达到明细预算）。</p>}
   </div>;
 }
 

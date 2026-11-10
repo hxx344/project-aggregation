@@ -229,6 +229,9 @@ class PairMarginEdit(BaseModel):
     min_transfer: str | None = Field(default=None, max_length=40)
     max_transfer: str | None = Field(default=None, max_length=40)
     buffer_ratio: str | None = Field(default=None, max_length=128)
+    absolute_reserve_enabled: bool | None = None
+    long_reserve: str | None = Field(default=None, max_length=40)
+    short_reserve: str | None = Field(default=None, max_length=40)
     cooldown_seconds: StrictInt | None = None
 
 
@@ -436,6 +439,10 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
         def update_status():
             return engine.workspace.update_status()
 
+        @app.get("/__workspace/update-impact")
+        def update_impact():
+            return engine.workspace.impact_status()
+
     @app.get("/api/hub/summary", dependencies=[Depends(authenticated)])
     def summary(schema_version: int = Query(2, alias="schemaVersion", ge=2, le=2), diagnostics: bool = False):
         return hub_summary(engine, diagnostics=diagnostics)
@@ -461,6 +468,22 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
             if report is None:
                 raise HTTPException(404, "该配对组暂无 ADL 处理报告")
             return report
+
+    @app.get("/api/pairs/{pair_id}/margin-archive", dependencies=[Depends(authenticated)])
+    def pair_margin_archive(pair_id: str, before: str = Query("", max_length=100)):
+        from .margin_archive import archive_view
+        with engine.store.read_snapshot() as reader:
+            return archive_view(reader, pair_id, before=before)
+
+    class MarginReviewNote(BaseModel):
+        model_config = ConfigDict(extra="forbid", strict=True)
+        note: str = Field(min_length=1, max_length=500)
+        source: str = Field(min_length=1, max_length=200)
+
+    @app.post("/api/pairs/{pair_id}/margin-archive/{request_id}/notes", dependencies=write_dependencies)
+    def pair_margin_note(pair_id: str, request_id: str, body: MarginReviewNote):
+        from .margin_archive import add_note
+        return add_note(engine.store, pair_id, request_id, note=body.note, source=body.source)
 
     @app.post("/api/pairs", dependencies=write_dependencies)
     def create_pair(body: NewPair):

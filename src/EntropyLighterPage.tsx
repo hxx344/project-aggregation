@@ -6,6 +6,7 @@ import { api, ApiError } from './api';
 import type { LabConfig, LabQuote, LabReport, LabSnapshot, LabSpread, LabSymbol, LabTime } from './entropy-lighter-types';
 import EntropyLighterInsights from './EntropyLighterInsights';
 import EntropyBinanceScalper from './EntropyBinanceScalper';
+import EntropyEvidenceExport from './EntropyEvidenceExport';
 import './entropy-lighter.css';
 
 const ROOT = '/api/research/entropy-lighter';
@@ -244,6 +245,7 @@ export default function EntropyLighterPage({ onExpired }: { onExpired: () => voi
       <EntropyLighterInsights insights={reportAgeMs !== null && observation && serverNow !== null ? snapshot.insights : undefined} historical={historical} stopped={stopped} report={snapshot.report} reportAgeMs={reportAgeMs} serverNow={serverNow} />
       <SpreadChart report={snapshot.report} config={snapshot.report?.sessionConfig || snapshot.config} symbol={symbol} onSymbol={setSymbol} historical={historical} />
       <details className="el-technical"><summary>技术与模拟明细<span>盘口、成交模拟、连接诊断与参数设置</span></summary><div className="el-technical-content">
+        {snapshot.report?.session ? <EntropyEvidenceExport key={`${snapshot.report.session}:${symbol}`} session={snapshot.report.session} symbol={symbol} onExpired={onExpired} /> : null}
         <Quotes quotes={snapshot.report?.latestQuotes || []} reportAgeMs={reportAgeMs} silenceAfterMs={observation?.silenceAfterMs} historical={historical} />
         <PaperResults report={snapshot.report} />
         {draft ? <Configuration draft={draft} setDraft={changeDraft} disabled={!stopped || uncertain} dirty={dirty} busy={busy === 'save'} onSave={save} onReset={() => { setDraft(draftOf(snapshot.config)); dirtyRef.current = false; setDirty(false); setActionError(''); }} /> : null}

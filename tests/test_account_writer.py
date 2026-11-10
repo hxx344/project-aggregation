@@ -521,6 +521,14 @@ class AccountWriterTests(unittest.TestCase):
         current[0] -= 1
         self.error("CLOCK_ROLLBACK", lambda: rollback.assert_owned(rollback_ticket, 0))
 
+    def test_closed_writer_rejects_tickets_and_snapshots(self):
+        writer = self.writer()
+        ticket = self.ticket(writer)
+        writer.close()
+        self.error("WRITER_CLOSED", lambda: writer.assert_owned(ticket, 0))
+        self.error("WRITER_CLOSED", writer.snapshot)
+        writer.close()
+
     def test_unknown_recovery_ledger_and_forbidden_payload(self):
         writer = self.writer()
         ticket = self.ticket(writer)

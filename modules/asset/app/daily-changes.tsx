@@ -4,6 +4,7 @@ import { requestJson } from '@/lib/client-request';
 import { formatGain, formatReturnRate, performanceTone } from '@/lib/performance-metrics';
 import { DAILY_CHANGE_DAYS, type DailyChange, type DailyChangeReport } from '@/lib/daily-changes';
 import type { PositionAnalysis } from '@/lib/daily-positions';
+import CashFlowsPanel from './cash-flows-panel';
 
 const money = (value: number | null) => value === null ? '—' : value.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const gain = (value: number | null) => value === null ? '—' : formatGain(value);
@@ -47,6 +48,7 @@ export const DailyChanges = memo(function DailyChanges({ version }: { version: s
   return <details className="performance-monthly daily-changes" onToggle={event => setOpen(event.currentTarget.open)}>
     <summary>每日波动 <span>（近 {DAILY_CHANGE_DAYS} 天{report ? ' · ' + days.length + ' 日' : ''}）</span>与来源</summary>
     <div className="performance-monthly-body">
+      {open ? <CashFlowsPanel onSaved={() => setAttempt(value => value + 1)}/> : null}
       <p className="performance-note">逐日对比上一份已有快照，缺失日期不补造。来源为各资产行估值变化，展开可看交易所按账户、币种的分项；出金单列并加回，与“剔除出金影响”口径一致。入金未剔除，资产变化不等于投资收益。</p>
       <p className="performance-note">持仓影响分原油套利、海力士套利、ANT 套利和其他持仓四项，每项 = 两份快照间的浮盈亏变化 + 本轮已实现盈亏、手续费、资金费的变化，按快照内的稳定币价格折成 USD，是近似值。ANT 仅统计资产快照已记录的持仓，当前不含 Hyperliquid。持仓随快照记录，此前的日期没有持仓数据；当天已平仓、本轮统计不可比或只有浮盈亏的仓位使该项标为“部分”，无法计算时显示“—”。</p>
       {status?.error && <p className="error-text" role="alert">{status.error}{report && '，当前显示上次读取结果'} <button type="button" className="text-button" onClick={() => setAttempt(value => value + 1)}>重试</button></p>}
@@ -62,6 +64,12 @@ export const DailyChanges = memo(function DailyChanges({ version }: { version: s
               <span className={performanceTone(day.change)}>$ {formatGain(day.change)}<small>{formatReturnRate(rate)}</small></span>
             </div>
             {day.positions && <Holdings positions={day.positions}/>}
+            {day.attribution ? <details><summary>资金流与未解释差额</summary>
+              <p>已标注净外部资金流：{gain(day.attribution.cashFlows.knownNetUsd)} USD · 已知持仓贡献：{gain(day.attribution.knownPositionChange)} USD · 出金加回：{gain(day.withdrawnChange)} USD · 未解释差额：{gain(day.attribution.unexplained)} USD</p>
+              <p className="performance-note">{day.attribution.note}</p>
+              <p>待配对 {day.attribution.cashFlows.pending} 条 · 缺汇率 {day.attribution.cashFlows.missingRate} 条。{day.attribution.cashFlows.note}</p>
+              <ul>{day.attribution.cashFlows.rows.map(row => <li key={row.id}>{row.date} · {row.account} · {row.amount} {row.currency} · {row.reference} · v{row.revision}{row.note ? ` · ${row.note}` : ''}</li>)}</ul>
+            </details> : null}
             {all.length ? <ul className={isOpen ? 'daily-sources expanded' : 'daily-sources'}>{shown.map(item => <li key={item.key}>
               <span className="daily-source-label">{item.label}</span>
               {isOpen && <small>{item.detail}</small>}

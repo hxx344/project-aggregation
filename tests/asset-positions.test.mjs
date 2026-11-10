@@ -165,6 +165,11 @@ test('optional cycle summaries are allowlisted, absent for older Asset versions 
   const cycle = () => ({ status: 'complete', since: '2026-10-11T00:00:00.000Z', closedQuantity: '1', closePrice: '60300.5', realizedPnl: '12.000000000000000001', fees: '-0.3', funding: '-0.1', net: '11.600000000000000001', currency: 'USDT', note: null, updatedAt: '2026-10-11T23:00:00.000Z' });
   const raw = payload(); scope(raw).positions[0].cycle = { ...cycle(), secret: 'do-not-return' };
   assert.deepEqual(scope(normalizeAssetPositions(raw, NOW)).positions[0].cycle, cycle());
+  const evidence = { version: 1, coverageStart: cycle().since, coverageEnd: cycle().updatedAt, openingFound: true, totalRows: 1, truncated: false,
+    rows: [{ id: 'trade-1', time: cycle().since, kind: 'fill', status: 'included', quantity: '1', price: '60000', fraction: null, realizedPnl: '0', fee: '-0.3', feeCurrency: 'USDT', amount: null, currency: 'USDT', reason: null }] };
+  scope(raw).positions[0].cycle.evidence = { ...evidence, privateKey: 'do-not-return', rows: evidence.rows.map(row => ({ ...row, privateKey: 'do-not-return' })) };
+  assert.deepEqual(scope(normalizeAssetPositions(raw, NOW)).positions[0].cycle.evidence, evidence);
+  assert.equal(JSON.stringify(normalizeAssetPositions(raw, NOW)).includes('do-not-return'), false);
   assert.equal('cycle' in scope(normalizeAssetPositions(payload(), NOW)).positions[0], false);
   for (const bad of [{ ...cycle(), status: 'done' }, { ...cycle(), net: 12 }, { ...cycle(), note: 'x'.repeat(301) }, { ...cycle(), updatedAt: '2030-01-01T00:00:00.000Z' }, 'complete']) {
     const broken = payload(); scope(broken).positions[0].cycle = bad;

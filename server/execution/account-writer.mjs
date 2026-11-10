@@ -812,6 +812,47 @@ export class AccountWriter {
       return true;
     });
   }
+  /** Strictly read-only job export. Local order ids must come from the caller's persisted job,
+   * never a browser-supplied list. No registry repair, lease, owner or settlement mutation. */
+  executionEvidence(jobId, localIds) {
+    if (this.closed) fail('WRITER_CLOSED');
+    const uuid = value => typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+    if (!uuid(jobId) || !Array.isArray(localIds) || localIds.length > 4000 || localIds.some(id => !uuid(id))) throw new TypeError('Invalid execution evidence identity');
+    checkDiagnosticRegistry(this);
+    const prefix = `hub:${jobId}:`, candidateLimit = 4001, rows = [];
+    // Drive the primary-key index from each original order. Bound raw candidates before
+    // module/group filtering, so foreign/malformed suffixes cannot create an unbounded scan.
+    const fields = 'operation_id,module_id,state,created_at,updated_at,group_id,intent_action';
+    const exact = this.db.prepare(`SELECT ${fields} FROM aw_operations WHERE operation_id IN (?,?,?) ORDER BY operation_id LIMIT ?`);
+    const range = this.db.prepare(`SELECT ${fields} FROM aw_operations WHERE operation_id>=? AND operation_id<? ORDER BY operation_id LIMIT ?`);
+    let scannedCandidates = 0, ordersVisited = 0;
+    const collect = (candidates, validId) => {
+      for (const row of candidates) {
+        scannedCandidates++;
+        if (row.module_id === 'hub' && (row.group_id === null || row.group_id.startsWith(prefix)) && validId(row.operation_id)) rows.push(row);
+      }
+    };
+    for (const localId of new Set(localIds)) {
+      if (scannedCandidates >= candidateLimit) break;
+      ordersVisited++;
+      const ids = [`hub:create:${localId}`, `hub:legacy-amend:${localId}`, `hub:legacy-cancel:${localId}`];
+      collect(exact.all(...ids, candidateLimit - scannedCandidates), id => ids.includes(id));
+      for (const action of ['amend', 'cancel']) {
+        if (scannedCandidates >= candidateLimit) break;
+        const operationPrefix = `hub:${action}:${localId}:`;
+        collect(range.all(operationPrefix, operationPrefix + '\uffff', candidateLimit - scannedCandidates),
+          id => id.startsWith(operationPrefix) && /^\d{1,16}$/.test(id.slice(operationPrefix.length)));
+      }
+    }
+    // Only bounded candidates are sorted; no full-registry ORDER BY or correlated join.
+    rows.sort((left, right) => left.created_at - right.created_at || left.operation_id.localeCompare(right.operation_id));
+    checkDiagnosticRegistry(this);
+    return { available: true, truncated: scannedCandidates >= candidateLimit || rows.length > 4000,
+      candidateLimit, scannedCandidates, ordersVisited, attempts: rows.slice(0, 4000).map(row => ({
+      operationId: row.operation_id, state: row.state, createdAt: diagnosticTime(row.created_at), updatedAt: diagnosticTime(row.updated_at),
+      groupId: row.group_id, action: row.intent_action,
+    })) };
+  }
   snapshot({ includeDiagnostics = false, rowLimit = DIAGNOSTIC_ROW_LIMIT } = {}) {
     if (this.closed) fail('WRITER_CLOSED');
     try {

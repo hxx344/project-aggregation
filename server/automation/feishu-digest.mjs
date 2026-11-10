@@ -1,5 +1,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
+import { deliveryReview, publicDeliveryReviews } from './delivery-review.mjs';
 import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
 import { DIGEST_DEFAULTS, buildDigest, latestSlot, nextSlot, postCard, renderCard, validateChannel, validateDigestConfig } from './feishu-digest-core.mjs';
@@ -28,6 +30,8 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
   tickMs = 20000, retryMs = 60000, maxAttempts = 3 } = {}) {
   const directory = path.join(dataDir, 'feishu-digest');
   const configPath = path.join(directory, 'config.json'), channelPath = path.join(directory, 'channel.json'), statePath = path.join(directory, 'state.json');
+  const reviewPath = path.join(directory, 'reviews.json');
+  let reviews = {}, reviewError = null;
   let config = structuredClone(DIGEST_DEFAULTS), loadError = null, stateError = null, channelHost = null, channelError = null;
   let lastSlot = 0, history = [], retry = null, sending = null, controller = null, timer = null, closed = false, epoch = 0, previewRead = null;
   const minuteNow = () => Math.floor(now() / 60000);
@@ -45,8 +49,12 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
   }
   function record(entry) {
     // Quiet checks collapse into one row, so a frequent schedule cannot push failures out.
-    history = [entry, ...(entry.status === 'skipped' && history[0]?.status === 'skipped' ? history.slice(1) : history)].slice(0, HISTORY_LIMIT); persistState();
+    const retained = history.filter(item => item.id !== entry.id);
+    if (entry.status === 'skipped' && retained[0]?.status === 'skipped') retained.shift();
+    history = [entry, ...retained].slice(0, HISTORY_LIMIT);
+    const saved = persistState();
     if (entry.status === 'failed' || entry.status === 'uncertain') log.warn({ status: entry.status, kind: entry.kind, error: entry.error, type: 'feishu-digest' }, '飞书汇总发送失败');
+    return saved;
   }
   function readChannel() {
     const saved = readBounded(channelPath);
@@ -68,17 +76,25 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     const active = new AbortController(); controller = active;
     const stopped = new Promise(resolve => active.signal.addEventListener('abort', () => resolve(null), { once: true }));
     sending = (async () => {
-      const entry = { at: new Date(started).toISOString(), kind, status: 'sent', attention: 0, error: null };
+      const entry = { id: randomUUID(), at: new Date(started).toISOString(), kind, status: 'generated', attention: 0, error: null, stages: [{ status: 'generated', at: new Date(started).toISOString() }] };
+      const stage = status => { entry.status = status; entry.stages.push({ status, at: new Date(now()).toISOString() }); };
       try {
         const items = await Promise.race([readSections(), stopped]);
         // Cleared or shutting down before anything went out: there is nothing to record.
         if (active.signal.aborted) return null;
         const digest = buildDigest(items, current, now());
         entry.attention = digest.attention.length;
-        if (kind === 'schedule' && current.onlyOnAttention && !entry.attention) entry.status = 'skipped';
-        else await postCard(readChannel(), renderCard(digest, current).card, { fetcher, now: now(), signal: active.signal });
+        if (!record(entry)) throw new HttpError(503, '投递身份无法保存，未发送');
+        if (kind === 'schedule' && current.onlyOnAttention && !entry.attention) stage('skipped');
+        else {
+          const channel = readChannel(), card = renderCard(digest, current).card;
+          stage('sending');
+          if (!record(entry)) throw new HttpError(503, '投递占用无法保存，未发送');
+          await postCard(channel, card, { fetcher, now: now(), signal: active.signal });
+          stage('sent');
+        }
       } catch (error) {
-        entry.status = error.uncertain ? 'uncertain' : 'failed';
+        stage(error.uncertain ? 'uncertain' : 'failed');
         entry.error = error.message;
         if (kind === 'schedule' && !error.uncertain && attempt < maxAttempts && run === epoch) retry = { slot, attempt: attempt + 1, at: now() + retryMs };
       }
@@ -105,17 +121,30 @@ export function createFeishuDigest({ dataDir, encrypt, decrypt, readSections, lo
     const minute = minuteNow();
     const next = config.enabled && channelHost ? nextSlot(config.schedule, minute) : null;
     return { schema: 1, config: structuredClone(config), channel: { configured: !!channelHost, host: channelHost, error: channelError }, sending: !!sending,
-      nextAt: next === null ? null : new Date(next * 60000).toISOString(), history: structuredClone(history), loadError: loadError ?? stateError, serverNow: now() };
+      nextAt: next === null ? null : new Date(next * 60000).toISOString(), history: structuredClone(history.map(entry => ({ ...entry, reviews: publicDeliveryReviews(reviews[entry.id]) }))), reviewError, loadError: loadError ?? stateError, serverNow: now() };
   }
   return {
     state,
     tick,
+    reviewDelivery(input) {
+      const note = deliveryReview(input, now());
+      if (reviewError) throw new HttpError(503, reviewError);
+      if (!history.some(entry => entry.id === input.id)) throw new HttpError(404, '投递记录不存在或已超出保留范围');
+      const retained = new Set(history.map(entry => entry.id));
+      const next = Object.fromEntries(Object.entries(reviews).filter(([id]) => retained.has(id)));
+      next[input.id] = [...(next[input.id] ?? []).slice(-4), note];
+      atomicJson(reviewPath, next); reviews = next;
+      return state();
+    },
     initialize() {
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       try { const saved = readBounded(configPath); if (saved) config = validateDigestConfig(saved); }
       catch (error) { loadError = '已保存的汇总配置无法读取，已停用，保存后恢复'; config = structuredClone(DIGEST_DEFAULTS); log.warn({ err: error, type: 'feishu-digest' }, loadError); }
       try { const saved = readBounded(statePath); if (saved) { lastSlot = Number.isSafeInteger(saved.lastSlot) ? saved.lastSlot : minuteNow(); history = Array.isArray(saved.history) ? saved.history.slice(0, HISTORY_LIMIT) : []; } else lastSlot = minuteNow(); }
-      catch { lastSlot = minuteNow(); }
+      catch { lastSlot = minuteNow(); stateError = '发送记录读取失败，历史投递结果未知'; }
+      history = history.map((entry, index) => ({ ...entry, id: entry.id ?? createHash('sha256').update(JSON.stringify([entry, index])).digest('hex'),
+        ...(entry.status === 'sending' ? { status: 'uncertain', error: '进程重启前正在发送，渠道结果未知；不会重发此投递' } : {}) }));
+      try { reviews = readBounded(reviewPath) ?? {}; } catch { reviewError = '人工核对记录读取失败，证据状态未知'; }
       try { const channel = readChannel(); channelHost = hostOf(channel.webhookUrl); }
       catch (error) { if (!(error instanceof HttpError)) { channelError = '已保存的 Webhook 无法读取，请重新填写'; log.warn({ type: 'feishu-digest' }, channelError); } }
       if (tickMs > 0) { timer = setInterval(tick, tickMs); timer.unref?.(); }

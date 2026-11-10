@@ -17,6 +17,7 @@ fresh_case() {
   printf 'MODULES = ()\n' > "$case_root/release/server/update-service/registry.py"
   printf 'RELEASE = "stable"\n' > "$case_root/release/server/update-service/releases.py"
   printf 'def get_progress(*args): return None\n' > "$case_root/release/server/update-service/progress.py"
+  printf 'def snapshot(*args): return None\n' > "$case_root/release/server/update-service/diagnostics.py"
   printf 'EXTRA = True\n' > "$case_root/release/server/update-service/utility.py"
   printf 'not a runtime file\n' > "$case_root/release/server/update-service/README.txt"
   chmod 0644 "$case_root/release/.managed-release" "$case_root/release/server/update-service/"*

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -13,6 +14,124 @@ const quiet = { info() {}, warn() {}, error() {} };
 // A zombie (state Z) has exited; its parent has not reaped it yet.
 const alive = pid => { try { return !/^\S+ \(.*\) Z /s.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } };
 const until = async (predicate, ms = 5000) => { const end = Date.now() + ms; while (!predicate() && Date.now() < end) await delay(20); assert.ok(predicate()); };
+
+// Native deterministic failure injection: these PIDs never reach process.kill.
+function controlledWatch(t, { orphans = [], reportExit = true } = {}) {
+  const children = [], remaining = new Map(), records = [], signals = [];
+  let scanError = false;
+  const logger = Object.fromEntries(['info', 'warn', 'error'].map(level => [level, (fields, message) => records.push({ level, fields, message })]));
+  const watch = createDevWatch({ roots: [], logger, debounceMs: 1, stopMs: 5, residueGraceMs: 5, probeMs: 1,
+    spawnProcess(_command, _args, options) {
+      const child = Object.assign(new EventEmitter(), { pid: 40_000 + children.length, exitCode: null, signalCode: null, run: options.env[DEV_RUN_ENV] });
+      children.push(child);
+      return child;
+    },
+    signalProcess(pid, signal) {
+      signals.push({ pid, signal });
+      const child = children.find(value => value.pid === Math.abs(pid));
+      if (child && reportExit && child.exitCode === null && child.signalCode === null) {
+        child.signalCode = signal;
+        queueMicrotask(() => child.emit('exit', null, signal));
+      }
+    },
+    scan(_name, marker) {
+      if (typeof marker === 'function') return orphans;
+      if (scanError) throw new Error('controlled scan failure');
+      return remaining.get(marker) ?? [];
+    },
+  });
+  t.after(() => { scanError = false; return watch.close(); });
+  return { watch, children, remaining, records, signals, failScan(value) { scanError = value; } };
+}
+
+test('residue blocks every replacement until the original marker is clear', async t => {
+  const { watch, children, remaining, records } = controlledWatch(t);
+  await until(() => watch.starts === 1);
+  remaining.set(children[0].run, [90_001]);
+  watch.changed('blocked.mjs');
+  await until(() => records.some(row => row.message.startsWith('旧进程尚未清理完成')));
+  assert.equal(watch.starts, 1);
+  assert.deepEqual(records.find(row => row.message.startsWith('旧进程尚未清理完成')).fields.pids, [90_001]);
+  watch.changed('still-blocked.mjs');
+  await until(() => records.filter(row => row.message.startsWith('旧进程尚未清理完成')).length === 2);
+  assert.equal(watch.starts, 1, 'an exited parent does not discard its descendants');
+  remaining.delete(children[0].run);
+  watch.changed('clear.mjs');
+  await until(() => watch.starts === 2);
+  assert.deepEqual(await watch.close(), []);
+});
+
+test('failed orphan cleanup prevents the first start and remains retryable', async t => {
+  const orphans = [90_002];
+  const { watch, records } = controlledWatch(t, { orphans });
+  await until(() => records.some(row => row.message.startsWith('孤儿进程尚未清理完成')));
+  assert.equal(watch.starts, 0);
+  watch.changed('blocked.mjs');
+  await until(() => records.some(row => row.message.startsWith('旧进程尚未清理完成')));
+  assert.equal(watch.starts, 0);
+  orphans.length = 0;
+  watch.changed('clear.mjs');
+  await until(() => watch.starts === 1);
+  assert.deepEqual(await watch.close(), []);
+});
+
+test('an unexpected parent exit retains unclean descendants for the next change', async t => {
+  const { watch, children, remaining, records } = controlledWatch(t);
+  await until(() => watch.starts === 1);
+  const child = children[0];
+  remaining.set(child.run, [90_003]);
+  child.exitCode = 1;
+  child.emit('exit', 1, null);
+  await until(() => records.some(row => row.message === '残留进程未能结束'));
+  assert.equal(watch.pid, null);
+  watch.changed('after-crash.mjs');
+  await until(() => records.some(row => row.message.startsWith('旧进程尚未清理完成')));
+  assert.equal(watch.starts, 1);
+  remaining.delete(child.run);
+  watch.changed('clear.mjs');
+  await until(() => watch.starts === 2);
+});
+
+test('cleanup exceptions preserve identity and release the restart queue', async t => {
+  const { watch, children, remaining, records, failScan } = controlledWatch(t);
+  await until(() => watch.starts === 1);
+  remaining.set(children[0].run, [90_004]);
+  failScan(true);
+  watch.changed('scan-failed.mjs');
+  await until(() => records.some(row => row.message === '开发进程组操作失败'));
+  assert.equal(watch.starts, 1);
+  failScan(false);
+  watch.changed('retry.mjs');
+  await until(() => records.some(row => row.message.startsWith('旧进程尚未清理完成')));
+  assert.equal(watch.starts, 1);
+  remaining.delete(children[0].run);
+  watch.changed('clear.mjs');
+  await until(() => watch.starts === 2);
+});
+
+test('an unreported parent exit blocks replacement and close reports it within a bound', async t => {
+  const { watch, children, records, signals } = controlledWatch(t, { reportExit: false });
+  await until(() => watch.starts === 1);
+  watch.changed('unreported.mjs');
+  await until(() => records.some(row => row.message.startsWith('旧进程尚未清理完成')));
+  assert.equal(watch.starts, 1);
+  assert.equal(watch.pid, children[0].pid);
+  const begin = Date.now();
+  const closing = watch.close();
+  watch.forceStop();
+  assert.deepEqual(await closing, [children[0].pid]);
+  assert.ok(Date.now() - begin < 1000);
+  assert.ok(signals.some(row => row.pid === -children[0].pid && row.signal === 'SIGKILL'));
+});
+
+test('a failed cleanup scan cannot make close report an empty successful cleanup', async () => {
+  const failures = [];
+  const watch = createDevWatch({ roots: [], logger: { ...quiet, error: (fields, message) => failures.push({ fields, message }) },
+    scan: () => { throw new Error('controlled unavailable process scan'); } });
+  await until(() => failures.length > 0);
+  assert.equal(watch.starts, 0);
+  await assert.rejects(watch.close(), /controlled unavailable process scan/);
+});
 
 function setup(t, mode, options = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'dev-watch-'));

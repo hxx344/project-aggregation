@@ -1,7 +1,8 @@
 import type { Position } from './positions-types.ts';
 import { createHash } from 'node:crypto';
+import { decimal, POSITIONS_INVALID } from './positions-decimal.ts';
+export { decimal, POSITIONS_INVALID } from './positions-decimal.ts';
 
-export const POSITIONS_INVALID = '仓位数据不完整，已保留上次完整快照';
 export const POSITIONS_FAILED = '仓位读取失败，请检查连接、读取权限及服务器时间；已保留上次完整快照';
 export function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(POSITIONS_INVALID);
@@ -13,10 +14,6 @@ export function rows(value: unknown): Record<string, unknown>[] {
 }
 export function text(value: unknown): string {
   if (typeof value !== 'string' || !/^[\p{L}\p{N}_.:/ -]{1,160}$/u.test(value)) throw new Error(POSITIONS_INVALID);
-  return value;
-}
-export function decimal(value: unknown): string {
-  if (typeof value !== 'string' || value.length > 128 || !/^-?\d+(?:\.\d+)?$/.test(value)) throw new Error(POSITIONS_INVALID);
   return value;
 }
 export function optionalDecimal(value: unknown): string | null {

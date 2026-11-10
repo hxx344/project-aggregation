@@ -103,6 +103,8 @@
 
 **事件记录：** `legacy-chart-optimization-20261012`；历史复盘 2026-10-12（Seen 1×）；外仓证据和独立事件均待核实，暂不计入升级。
 
+**同步证据查询补充（2026-11-10）：** 基于 `a12e583` 的未发布 #334 实现，用相关 `json_each(localIds)` 子查询过滤每一条共享操作，再排序并 `LIMIT 4001`；输出有界但查询工作量仍随订单数与操作数相乘。独立 Windows SQLite 探针在 4,000 单、16,000 次操作下耗时约 19 秒，同步阻塞 runtime 并超过页面 12 秒读取期限。现从原单 ID 驱动主键精确/范围查询，累计扫描候选也有上限，保留 module/group/localId 与注册库核验；同输入约 40 毫秒且零数据库写入。检查见 [执行证据规模回归](tests/account-writer-execution-evidence.test.mjs)，不能仅凭最终 `LIMIT` 证明查询有界。事件 `execution-evidence-query-work-budget-20261110`；首次发布前审查发现，非实盘性能测量。
+
 ### L007：memo 优化先确认输入稳定性与必要更新
 
 **适用条件：** 用 `React.memo` 避免父组件无关更新导致重复渲染的组件边界。
@@ -803,6 +805,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **研究轮询补充（2026-11-05）：** 本次新增 Binance/Lighter 成本研究的提交前独立审查，以真实引擎生成 12 个情景各 20 轮成交记录，再经过工作台 HTTP 入口读取，正文达 4,830,897 字节，接受 gzip 的请求仍收到未压缩正文；前端每 5 秒读取且 10 秒超时。修复将常规状态限定为统计与在途任务，逐笔/曲线按当前会话与所选情景读取，完整导出保持原义，并只在该公开研究数据路由协商压缩。验证用 [工作台回归](tests/binance-lighter-workbench.test.mjs) 检查大报告下状态体积、单情景详情、gzip/q=0 与完整导出；[页面回归](tests/binance-lighter-cost.browser.mjs) 检查迟到详情不跨会话覆盖。事件 `cost-research-history-polling-20261105`；相对 `4bb440e` 的未发布实现，不是主线逃逸缺陷，不推进复盘检查点。
 
+**持仓核对明细补充（2026-11-10）：** 基于 `a12e583` 的未发布 #307 在每仓快照追加 200 条证据，50 仓的合法响应超过 Hub 原有 2 MiB 传输上限，导致整份持仓不可读；单行与类型检查均通过，只有真实 HTTP 规模探针暴露。现于 Asset 响应端按全部仓位共同约束证据行数、UTF-8 字节与整响应余量，不改缓存或原持仓汇总；截断保留总数并明确不能据当前片段复算完整净额。最终同类 50×200 夹具约 2.64 MB 降至 305 KB，50 仓仍完整。证据见 [响应预算](modules/asset/lib/positions-evidence.ts) 与本次 P2 交易资产审查记录；不把提高传输限额作为默认修复。事件 `position-evidence-response-budget-20261110`；首次发布前发现，未读取真实账户。
+
 ### L048：迟到的模块就绪消息仍需完成加载恢复
 
 **适用条件：** 工作台通过原生 iframe load 和模块消息共同判断就绪，并保留后台预加载页面。
@@ -1502,6 +1506,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **持仓合计重连补充（2026-11-10）：** 基于 `b03f6fa` 的未发布概览合计仅用 `offline` 撤回金额；联网事件先清此标记，旧合计在新 GET 回复前恢复。独立生产页面探针挂起重连读取，确认 `+3,537.74 → — → +3,537.74`，期间没有新响应或写入。合计现独立保留失效状态，仅成功接收新快照后恢复；[概览浏览器夹具](tests/trading-overview.browser.mjs) 覆盖断线、挂起重连及新响应恢复。事件 `overview-pnl-reconnect-unconfirmed-20261110`；首次发布前修复，不改变交易保护规则。
 
+**恢复通知补充（2026-11-10）：** 基于 `a12e583` 的未发布 #297 在清除停用后，复用中断之后、但已过一天的链上缓存判定“恢复”，且下一轮先通知再刷新；独立真实 manager 夹具确认本次 RPC 失败时仍已发送恢复。恢复类结论须绑定本次重新启用与配置/钱包代次之后的新鲜成功读取；旧在途读取、旧缓存及待发送恢复事件都须失效，发送也在本轮刷新后核对。验证见 [通知恢复回归](tests/aero-notification-recovery.test.mjs)，不发送真实通知或交易。事件 `aero-recovery-notification-stale-proof-20261110`；首次发布前审查发现。
+
 ### L090：防重复发送的持久化占用不能降为尽力记录
 
 **适用条件：** 通过发送前持久保存时间点或操作身份，承诺崩溃重启后不重复对外发送。
@@ -1883,6 +1889,34 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **如何验证：** [股数计算测试](modules/monitor/tests/anthropic-shares.test.mjs) 使用非默认 S/F 核对三腿、历史与趋势重算；[偏好测试](tests/trading-preferences.test.mjs) 和 [桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 覆盖未知/非法/重连/保存失败；[工作台浏览器夹具](tests/monitor-anthropic-shares.browser.mjs) 经实际 iframe 检查交易中心修改和跨标签同步。
 
 **证据与事件：** `anthropic-monitor-share-preferences-20261110`；2026-11-10 用户截图指出溢价应使用交易中心股数。基线 `a12e583` 的 `modules/monitor/modules/anthropic/market.mjs` 固定除以 12.7/16.7，`src/OilTradingPage.tsx` 则从 `workbench:anthropic-shares:v1` 读取可编辑值。本次为一次用户纠正，不推进提交复盘检查点。
+
+### L112：受私有 umask 约束的服务发布公共元数据时，显式设置专用目标权限
+
+**适用条件：** root 服务使用 `UMask=0077`，同时向固定、无秘密的公共状态目录发布供非 root 工作台读取的 JSON。
+
+**根因：** `mkdir(mode=0755)`、`open(mode=0644)` 仍受 umask 过滤，实际产生 0700/0600。交互式配置时可能正常，timer 下一次原子替换后却失去服务用户的读取权限。
+
+**以后做法：** 保留私有 umask。只在已校验 root 归属、父链和无链接的专用公开路径，通过打开的目录/文件描述符明确设置 0755/0644；不能放宽备份包、密钥或其他目录权限。公开状态只含既有白名单元数据。
+
+**如何验证：** [备份维护测试](tests/test_backup_maintenance.py) 在真实 Linux root 环境设置 umask 0077，连续发布两次，由非 root 身份实际读取 JSON，同时验证私有材料仍拒读。Windows 不代替这项权限验证，本条提交时对应 CI 尚待执行。
+
+**证据：** project-aggregation 基于 `a12e583` 的未发布 #280/#291；`server/recovery/maintenance.py` 的公开写入与生成服务 umask 可确定该 POSIX 结果，独立审查指出窗口外状态发布同样触发。修复限定固定公开目录和 FD 权限；未操作用户服务器。
+
+**事件记录：** `backup-public-status-private-umask-20261110`；首次发布前审查发现，非线上事故。
+
+### L113：追加备注须同时遵守持久状态的实际 UTF-8 总字节上限
+
+**适用条件：** 将有限条数、有限字符数的人工备注附加到原有有界告警或事件状态文件。
+
+**根因：** 每条字符数和记录条数合规，不代表整体文件可被重启读取器接受；中文 UTF-8 字节数及 JSON 开销会超过只按字符估算的预算。
+
+**以后做法：** 在实际统一保存点按序列化后的 UTF-8 字节核验，为不可丢失的原发送事实和状态增长保留空间。备注超限在改变内存和磁盘前明确拒绝，不能删原渠道回执或把失败保存当成功；读取与写入的硬上限保持一致。
+
+**如何验证：** [告警备注预算回归](modules/monitor/tests/perpetual-alert-review-budget.test.mjs) 用最大中文字段重复登记后重启真实 store，检查仍可读取、超限拒绝和原投递事实保留。
+
+**证据：** project-aggregation 基于 `a12e583` 的未发布 #330；独立 Windows store/service 探针提交 100×5 条合法备注，得到 1,126,093 字节文件，超过 1,000,000 字节读取上限而无法重开。修复统一预算并保留原状态余量，未发送外部通知。
+
+**事件记录：** `alert-review-total-byte-budget-20261110`；首次发布前审查发现，不推进历史复盘检查点。
 
 ## 已归档
 

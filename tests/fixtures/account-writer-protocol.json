@@ -39,6 +39,186 @@
     "WRITER_CLOSED": "Python 测试 peer 在 close 后退出，无法继续调用；两侧关闭后调用的行为由各自单元测试覆盖",
     "WRITER_RETIRED": "需要篡改注册库文件、标记或恢复状态，由 tests/account-writer.test.mjs 与 tests/test_account_writer.py 的故障场景覆盖"
   },
+  "coverageSchemaVersion": 1,
+  "regressionCoverage": {
+    "LEASE_EXPIRED": {
+      "limitations": "两侧分别注入时钟；不是同一次 Node/Python 互操作，也不证明真实进程调度时延。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "expired lease and backward clock retire instance; budget renews only still-valid lease",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_expiry_and_rollback_never_resurrect",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        },
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "heartbeat locked past the lease TTL retires with LEASE_EXPIRED once the registry is released",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_heartbeat_locked_past_lease_ttl_retires_with_lease_expired_after_release",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        }
+      ]
+    },
+    "CLOCK_ROLLBACK": {
+      "limitations": "各语言单元用例覆盖回拨后的退休保护；不模拟操作系统校时。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "expired lease and backward clock retire instance; budget renews only still-valid lease",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_expiry_and_rollback_never_resurrect",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        }
+      ]
+    },
+    "REGISTRY_REPLACED": {
+      "limitations": "两侧独立文件故障用例；不等同于所有恢复/部署路径覆盖。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "persistent required marker rejects registry disappearance and replacement before a new writer starts",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_missing_and_replaced_registry_never_restart_at_fence_one",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        }
+      ]
+    },
+    "REGISTRY_BUSY": {
+      "limitations": "真实 SQLite 竞争的单语言用例；续租短锁/过 TTL 另由下列实际 heartbeat 用例覆盖。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "busy registry rejects within bounded deadline and unsafe database paths fail closed",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_thread_sharing_and_busy_fail_closed",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        },
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "heartbeat retries a briefly locked registry instead of retiring the writer",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_heartbeat_retries_a_briefly_locked_registry_instead_of_retiring",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        }
+      ]
+    },
+    "OWNERSHIP_LOST": {
+      "limitations": "两侧分别验证接管后旧票据失效；此引用不声称跨语言组合已全部覆盖。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "alive PID cannot be replaced after TTL; dead takeover fences old results permanently",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_alive_dead_takeover_and_fence",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        }
+      ]
+    },
+    "WRITER_CLOSED": {
+      "limitations": "关闭后的旧票据与快照拒绝；Python协议peer关闭即退出，因此没有共享close后向量。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "closed writer rejects old tickets and snapshots while close remains idempotent",
+          "kind": "unit",
+          "languages": [
+            "node"
+          ]
+        },
+        {
+          "file": "tests/test_account_writer.py",
+          "id": "AccountWriterTests.test_closed_writer_rejects_tickets_and_snapshots",
+          "kind": "unit",
+          "languages": [
+            "python"
+          ]
+        }
+      ]
+    },
+    "ACCOUNT_PINNED": {
+      "limitations": "此用例确实启动 Python peer，与 Node 竞争同一 SQLite；其它 notVectored 条目未映射不等于缺少测试。",
+      "cases": [
+        {
+          "file": "tests/account-writer.test.mjs",
+          "id": "native Node and Python processes contend for the same SQLite account and retain permanent module pin",
+          "kind": "interop",
+          "languages": [
+            "node",
+            "python"
+          ]
+        }
+      ]
+    },
+    "INVALID_OPTIONS": {
+      "notApplicableTo": "shared-vector",
+      "limitations": "Node对象构造参数与Python位置参数契约不同；仅标共享调用向量不适用，不声称构造校验无需测试。",
+      "cases": []
+    }
+  },
   "shapes": {
     "bind": {
       "fields": {

@@ -17,6 +17,7 @@ import zipfile
 from bisect import bisect_right
 from datetime import datetime, timezone
 from pathlib import Path
+from .evidence import file_identity, MAX_FUNDING_EVENTS
 
 BASE = "https://data.binance.vision/data/futures/um/monthly"
 DEFAULT_DIR = os.environ.get("OPTBT_PERP_DATA", "~/data/binance")
@@ -71,15 +72,20 @@ def parse(text, kind):
 
 
 class BinancePerp:
-    def __init__(self, symbol="BTCUSDT", directory=DEFAULT_DIR):
+    def __init__(self, symbol="BTCUSDT", directory=DEFAULT_DIR, allow_download=True, evidence=False):
         self.folder = Path(directory).expanduser() / symbol
         self.symbol = symbol
+        self.allow_download, self.evidence = allow_download, evidence
+        self.source_identities = {}
+        self._raw_funding = {}
         self._prices = {}   # month -> {hour: price}, by the month of the candle's open
         self._funding = {}  # month -> (hours, prefix sums of what a 1 BTC long pays)
 
     def _rows(self, month, kind):
         path = self.folder / f"{kind}-{month_name(month)}.csv"
         if not path.exists():
+            if not self.allow_download:
+                raise PerpDataError(f'missing local {kind} file: {path.name}; preflight never downloads')
             name = f"{self.symbol}-1h-{month_name(month)}.zip" if kind == "klines" else f"{self.symbol}-fundingRate-{month_name(month)}.zip"
             url = f"{BASE}/klines/{self.symbol}/1h/{name}" if kind == "klines" else f"{BASE}/fundingRate/{self.symbol}/{name}"
             print(f"downloading {url}", file=sys.stderr)
@@ -89,8 +95,25 @@ class BinancePerp:
             with open(temporary, "w", newline="") as handle:
                 csv.writer(handle).writerows(rows)
             os.replace(temporary, path)
+        if self.evidence and str(path) not in self.source_identities:
+            self.source_identities[str(path)] = file_identity(path, kind=kind, units='USD close' if kind == 'klines' else 'fraction rate')
         with open(path, newline="") as handle:
-            return [(int(hour), float(value)) for hour, value in csv.reader(handle)]
+            result = [(int(hour), float(value)) for hour, value in csv.reader(handle)]
+        if self.evidence:
+            identity, stat = self.source_identities[str(path)], path.stat()
+            if (identity['size'], identity['mtimeNs']) != (stat.st_size, stat.st_mtime_ns):
+                raise PerpDataError(f'data changed during run: {path.name}')
+        return result
+
+    def _source(self, month, kind):
+        path = self.folder / f'{kind}-{month_name(month)}.csv'
+        identity = self.source_identities.get(str(path))
+        return {'fileId': identity['id'], 'file': path.name} if identity else None
+
+    def price_evidence(self, hour):
+        price = self.price(hour)
+        return {'hour': hour, 'sourceTime': hour * 3600, 'timeBasis': 'one_hour_candle_close', 'priceUsd': price,
+                'source': self._source(month_of_hour(hour - 1), 'klines')} if price is not None else None
 
     def price(self, hour):
         """Close of the candle ending at `hour`, i.e. the last price in (hour-1h, hour]; None if missing."""
@@ -102,7 +125,10 @@ class BinancePerp:
     def _month_funding(self, month):
         if month not in self._funding:
             hours, cumulative = [], [0.0]
-            for hour, rate in sorted(self._rows(month, "funding")):
+            rows = sorted(self._rows(month, "funding"))
+            if self.evidence:
+                self._raw_funding[month] = rows
+            for hour, rate in rows:
                 price = self.price(hour)
                 if price is None:
                     raise PerpDataError(f"{self.symbol} has no price at funding time {datetime.fromtimestamp(hour * 3600, timezone.utc):%Y-%m-%d %H:%M} UTC")
@@ -120,3 +146,18 @@ class BinancePerp:
             hours, cumulative = self._month_funding(month)
             total += cumulative[bisect_right(hours, upto)] - cumulative[bisect_right(hours, after)]
         return total
+
+    def funding_evidence(self, after, upto):
+        events = []
+        if upto <= after:
+            return events
+        for month in range(month_of_hour(after + 1), month_of_hour(upto) + 1):
+            self._month_funding(month)
+            for hour, rate in self._raw_funding.get(month, []):
+                if after < hour <= upto:
+                    if len(events) >= MAX_FUNDING_EVENTS:
+                        raise ValueError('funding evidence budget exceeded; narrow the run')
+                    price = self.price_evidence(hour)
+                    events.append({'hour': hour, 'rate': rate, 'source': self._source(month, 'funding'), 'price': price,
+                                   'oneBtcFundingUsd': rate * price['priceUsd']})
+        return events

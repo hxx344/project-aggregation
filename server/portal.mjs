@@ -9,6 +9,7 @@ import { cachePolicy } from './static-cache.mjs';
 import { prepareAssetCompression } from './portal-compression.mjs';
 import { moduleTransport } from './modules/transport.mjs';
 import { localPortOf } from './slot-protocol.mjs';
+import { HttpError } from './http-common.mjs';
 
 export const HUB_HOST = 'hub.localhost';
 export const PORTAL_COOKIE = 'hub_portal';
@@ -99,6 +100,7 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   if (!Number.isSafeInteger(authenticationTimeoutMs) || authenticationTimeoutMs < 1 || authenticationTimeoutMs > 2 ** 31 - 1) throw new TypeError('authenticationTimeoutMs must be a whole number of milliseconds from 1 to 2^31-1');
   // revoking: stored grants this process revoked whose row could not be deleted yet (busy database).
   const authGrants = new Map(); const revoking = new Set(); const active = new Set(); const syncFlights = new Map();
+  const instanceId = randomBytes(12).toString('hex');
   // draining: the API is closing; upgraded connections and event streams end, other requests finish.
   let closed = false, draining = false;
 
@@ -130,6 +132,39 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
     if (!grant.digest) return true;
     if (grant.auth) return authGrants.get(grant.digest) === grant;
     return !revoking.has(grant.digest) && !!store.grant(grant.digest);
+  }
+  // Management IDs are domain-separated hashes, never the bearer token or its
+  // stored authentication digest. Persistent IDs remain stable across API slots.
+  const managementId = grant => digest(`portal-management-v1\0${grant.sessionId}\0${grant.digest}`);
+  function managementGrants(sessionId) {
+    if (closed || draining || !isServing()) throw new HttpError(503, '当前实例暂不能管理模块授权');
+    if (!isSessionValid(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+    return [...store.sessionGrants(sessionId, now()), ...authGrants.values()].filter(grant => grant.sessionId === sessionId && validGrant(grant));
+  }
+  function listAccess(sessionId) {
+    const grants = managementGrants(sessionId);
+    return { schemaVersion: 1, observedAt: new Date(now()).toISOString(), instanceId, truncated: grants.length > 300,
+      externalScope: 'current-api-instance', grants: grants.slice(0, 300).map(grant => ({ id: managementId(grant), projectId: grant.projectId,
+        projectName: projectFor(grant.projectId)?.name ?? grant.projectId, scope: grant.auth ? 'instance' : 'persistent',
+        expiresAt: new Date(grant.expires).toISOString(), status: revoking.has(grant.digest) ? 'revoking' : 'active' })) };
+  }
+  function revokeAccess(sessionId, id) {
+    if (typeof id !== 'string' || !/^[a-f0-9]{64}$/.test(id)) throw new HttpError(400, '授权标识无效');
+    const grant = managementGrants(sessionId).find(row => managementId(row) === id);
+    if (!grant) throw new HttpError(404, '该授权已失效或不属于当前会话，请刷新列表');
+    if (grant.auth) {
+      authGrants.delete(grant.digest);
+      grant.revoked = true;
+      delete grant.auth;
+    } else {
+      let deleted;
+      try { deleted = store.withoutWaiting(() => store.revokeSessionGrant(grant.digest, sessionId)); }
+      catch { throw new HttpError(503, '授权撤销未完成，请稍后重试并核对结果'); }
+      if (!deleted) throw new HttpError(404, '该授权已失效，请刷新列表');
+      revoking.delete(grant.digest);
+    }
+    for (const stream of active) if (stream.grant.digest === grant.digest && stream.grant.sessionId === sessionId) { stream.destroy(); active.delete(stream); }
+    return { revoked: true, id };
   }
   // Fails closed: a stream whose grant cannot be checked is closed.
   const liveOrFailed = grant => { try { return liveGrant(grant); } catch { return false; } };
@@ -547,5 +582,5 @@ export function createPortal({ store, getProjects, getProjectRevision, isSession
   }
 
   function drain() { draining = true; for (const stream of active) if (stream.long) { stream.destroy(); active.delete(stream); } }
-  return { createLaunch, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.withoutWaiting(() => store.revokeGrants([...revoking])); } catch {} authGrants.clear(); revoking.clear(); for (const flight of syncFlights.values()) flight.controller.abort(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
+  return { createLaunch, listAccess, revokeAccess, handle, handleUpgrade, canonicalOrigin, projectHost: portalHost, drain, close() { closed = true; clearInterval(sweep); try { if (revoking.size) store.withoutWaiting(() => store.revokeGrants([...revoking])); } catch {} authGrants.clear(); revoking.clear(); for (const flight of syncFlights.values()) flight.controller.abort(); syncFlights.clear(); for (const stream of active) stream.destroy(); active.clear(); } };
 }

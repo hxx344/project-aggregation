@@ -1,17 +1,24 @@
 import { randomUUID } from 'node:crypto';
 import { initialPerpetualAlertState, validatePerpetualAlertConfig, evaluatePerpetualAlertQuote, createPerpetualConditionTracker } from './perpetual-alert-engine.mjs';
+import { boundedPerpetualAlertState } from './perpetual-alert-limits.mjs';
 
 const freshState = () => ({ armed: true, lastAttemptAt: null, lastSentAt: null });
 const emptyProgress = enabled => ({ state: enabled ? 'observing' : 'disabled', checkedAt: null, netSpreadPercent: null, continuousSeconds: 0, hitRatio: 0, coverage: 0, reason: enabled ? '等待下一次后台观察' : '观察已关闭', lastAttemptAt: null, lastSentAt: null });
 const day = 86_400_000;
+const publicReviews = value => Array.isArray(value) ? value.slice(-5).filter(item => item && typeof item.id === 'string' && Number.isFinite(item.at)
+  && typeof item.note === 'string' && item.note.length <= 500 && typeof item.source === 'string' && item.source.length <= 200)
+  .map(({ id, at, note, source }) => ({ id, at, actor: 'authenticated_admin', note, source })) : [];
 
 /** No market fetches: twenty saved pairs, one-second bounded observations, event-only writes. */
 export function createPerpetualAlertService({ store, getQuote, isVenueLive, notifications, clock = Date.now, marketHealthy = () => true } = {}) {
   let state = store?.get() ?? initialPerpetualAlertState(), queue = Promise.resolve(), deliveryTask = null, pendingWrite = null;
   let running = false, storageError = '', needsPersist = false, sendingRuleId = null;
   const trackers = new Map(), progress = new Map(), candidates = new Set();
+  // An interrupted sending row is evidence of uncertainty, never a reason to resend.
+  const interrupted = new Set(state.history.filter(item => item.status === 'sending').map(item => item.id));
   const persist = async () => {
-    pendingWrite = structuredClone(state);
+    pendingWrite = boundedPerpetualAlertState(state).state;
+    if (state.deliveryReviews !== undefined) state.deliveryReviews = pendingWrite.deliveryReviews;
     needsPersist = false;
     try { await store.save(pendingWrite); pendingWrite = null; storageError = ''; }
     catch { storageError = '机会提醒保存失败，暂停发送；请检查磁盘空间与目录权限。'; throw new Error(storageError); }
@@ -26,7 +33,9 @@ export function createPerpetualAlertService({ store, getQuote, isVenueLive, noti
   const view = () => ({ available: Boolean(store), generatedAt: clock(), revision: state.revision, config: structuredClone(state.config),
     webhookConfigured: notifications?.configured() ?? false, running, error: storageError || (!marketHealthy() ? '行情缓存保存失败，暂停提醒。' : ''),
     progress: Object.fromEntries(state.config.rules.map(rule => [rule.id, { ...(progress.get(rule.id) ?? emptyProgress(rule.enabled)), ...(state.ruleStates[rule.id] ? { lastAttemptAt: state.ruleStates[rule.id].lastAttemptAt, lastSentAt: state.ruleStates[rule.id].lastSentAt } : {}) }])),
-    history: structuredClone(state.history.filter(item => item.time <= clock() && item.time > clock() - day).slice(0, 100)),
+    history: structuredClone(state.history.filter(item => item.time <= clock() && item.time > clock() - day).slice(0, 100).map(item => ({ ...item,
+      deliveryStage: interrupted.has(item.id) || item.uncertain || /结果不确定/.test(item.error) ? 'unknown' : item.status === 'sent' ? 'confirmed' : item.status,
+      reviews: publicReviews(state.deliveryReviews?.[item.id]) }))),
   });
   const canSend = (rule, now) => {
     const condition = progress.get(rule.id), currentRule = state.config.rules.find(item => item.id === rule.id);
@@ -47,7 +56,7 @@ export function createPerpetualAlertService({ store, getQuote, isVenueLive, noti
           if (!rule || !saved?.armed || !notifications?.configured() || !canSend(rule, now) || saved.lastAttemptAt !== null && now - saved.lastAttemptAt < rule.cooldownSeconds * 1000) return null;
           const condition = progress.get(id), result = evaluatePerpetualAlertQuote(rule, getQuote, now, isVenueLive);
           saved.armed = false; saved.lastAttemptAt = now;
-          const event = { id: randomUUID(), ruleId: id, name: rule.name, time: now, status: 'sending', base: rule.base, longKey: rule.longKey, shortKey: rule.shortKey, netSpreadPercent: result.netSpreadPercent, error: '' };
+          const event = { id: randomUUID(), ruleId: id, name: rule.name, time: now, status: 'sending', base: rule.base, longKey: rule.longKey, shortKey: rule.shortKey, netSpreadPercent: result.netSpreadPercent, error: '', stages: [{ status: 'generated', at: now }, { status: 'sending', at: now }] };
           state.history.unshift(event); state.history = state.history.slice(0, 100);
           await persist();
           return { rule, now, condition, result, event, saved };
@@ -61,10 +70,12 @@ export function createPerpetualAlertService({ store, getQuote, isVenueLive, noti
           saved.lastSentAt = clock(); event.status = 'sent';
         } catch (error) {
           event.status = 'failed'; event.error = error?.uncertain ? '飞书投递结果不确定（可能已发出），不再重发；条件回落后再次达标才会提醒' : error instanceof Error ? error.message.slice(0, 200) : '提醒发送失败';
+          event.uncertain = error?.uncertain === true;
           // A definite non-delivery re-arms after the cooldown; an uncertain one is never resent.
           // A possibly posted message counts as sent for the cooldown.
           if (!error?.uncertain) saved.armed = true; else saved.lastSentAt = clock();
         }
+        event.stages.push({ status: event.uncertain ? 'unknown' : event.status === 'sent' ? 'confirmed' : 'failed', at: clock() });
         await serial(persist);
         sendingRuleId = null;
       }
@@ -95,6 +106,23 @@ export function createPerpetualAlertService({ store, getQuote, isVenueLive, noti
   }
   return {
     view, check, healthy: () => !storageError,
+    review(input) {
+      return serial(async () => {
+        if (!store) throw new Error('Linux 机会提醒后台未连接');
+        if (!input || Object.keys(input).some(key => !['id', 'note', 'source'].includes(key)) || typeof input.id !== 'string'
+          || typeof input.note !== 'string' || !input.note.trim() || input.note.length > 500
+          || typeof input.source !== 'string' || !input.source.trim() || input.source.length > 200) throw Object.assign(new Error('请填写核对说明（最多500字）和证据来源（最多200字）'), { status: 400 });
+        if (/(?:private.?key|secret|signature|authorization|password)\s*[:=]|\/bot\/v2\/hook\//i.test(`${input.note} ${input.source}`)) throw Object.assign(new Error('核对说明不可包含凭据或完整签名'), { status: 400 });
+        if (!state.history.some(item => item.id === input.id && item.time > clock() - day)) throw Object.assign(new Error('投递记录不存在或已超出保留范围'), { status: 404 });
+        const retained = new Set(state.history.map(item => item.id));
+        const reviews = Object.fromEntries(Object.entries(state.deliveryReviews ?? {}).filter(([id]) => retained.has(id)));
+        reviews[input.id] = [...(reviews[input.id] ?? []).slice(-4), { id: randomUUID(), actor: 'authenticated_admin', at: clock(), note: input.note.trim(), source: input.source.trim() }];
+        // Reject before changing the live state or pending write. Every later
+        // persistence path uses the same byte budget and retains channel facts.
+        state.deliveryReviews = boundedPerpetualAlertState({ ...state, deliveryReviews: reviews }).state.deliveryReviews;
+        await persist(); return view();
+      });
+    },
     update(input) {
       return serial(async () => {
         if (!store) throw new Error('Linux 机会提醒后台未连接');

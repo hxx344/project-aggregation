@@ -66,15 +66,22 @@ export function createFillAttribution({ db, stmt = createStatementCache(db) }) {
           const { accountIdentity, ...publicScope } = scope;
           const binding = source === nativeSource ? nativeBindings.find(row => row.exchange === exchange.id && row.connected && row.identity) : null;
           return { ...publicScope, fills: scope.fills.map(fill => {
-            const { execution: _untrusted, ...plain } = fill;
-            const matches = (candidates.get(key(exchange.id, fill.symbol, fill.orderId)) ?? []).filter(candidate => {
+            const { execution: _untrusted, attribution: _untrustedReason, ...plain } = fill;
+            const owned = (candidates.get(key(exchange.id, fill.symbol, fill.orderId)) ?? []).filter(candidate => {
               const { order } = candidate, proof = accountFor(candidate);
-              if (!proof || order.spec.side !== fill.side || (order.spec.positionSide === 'BOTH' ? 'net' : order.spec.positionSide?.toLowerCase()) !== fill.positionSide) return false;
+              if (!proof) return false;
               if (binding) return proof.identity === binding.identity && order.accountRevision === binding.revision;
               if (!['binance', 'okx'].includes(exchange.id) || accountIdentity !== digest(exchange.id, proof.identity)) return false;
               return exchange.id !== 'binance' || scope.id === (proof.accountMode === 'portfolio-margin' ? 'pm-um' : proof.accountMode === 'standard' ? 'um' : null);
             });
-            return matches.length === 1 ? { ...plain, execution: matches[0].association } : plain;
+            const matches = owned.filter(({ order }) => order.spec.side === fill.side
+              && (order.spec.positionSide === 'BOTH' ? 'net' : order.spec.positionSide?.toLowerCase()) === fill.positionSide);
+            // Only disclose a direction mismatch after account ownership is proven. Missing,
+            // foreign-account and wrong-contract candidates deliberately share one public reason.
+            const reason = !fill.orderId ? 'missing-order' : matches.length === 1 ? 'matched'
+              : matches.length > 1 ? 'ambiguous' : owned.length ? 'direction-mismatch' : 'insufficient-evidence';
+            const attribution = { reason, updatedAt: data.generatedAt ?? source.data.generatedAt ?? null };
+            return matches.length === 1 ? { ...plain, execution: matches[0].association, attribution } : { ...plain, attribution };
           }) };
         }),
       })) })),

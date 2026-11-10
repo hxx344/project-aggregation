@@ -147,6 +147,15 @@ test('pair requests carry only funds settings and fixed roles without enabling t
   assert.equal(Object.hasOwn(pairDraft(saved), 'mode'), false);
 });
 
+test('absolute USD1 reserves default off and retain independent exact side values across edits', () => {
+  const initial = pairDraft(); assert.equal(initial.absolute_reserve_enabled, false);
+  const configured = parsePairDraft({ ...draft(), absolute_reserve_enabled: true, long_reserve: '100.00000001', short_reserve: '200' }, accounts, []);
+  assert.equal(configured.margin.long_reserve, '100.00000001'); assert.equal(configured.margin.short_reserve, '200');
+  const edited = pairDraft(configured); assert.equal(edited.absolute_reserve_enabled, true);
+  assert.equal(parsePairDraft({ ...edited, absolute_reserve_enabled: false }, accounts, []).margin.long_reserve, '100.00000001');
+  for (const value of ['-1', 'NaN', '1000000000.00000001']) assert.throws(() => parsePairDraft({ ...draft(), long_reserve: value }, accounts, []));
+});
+
 test('pair symbols must come from the catalog unless an edit keeps the saved symbol', () => {
   const symbols = [{ symbol: 'XAGUSD1', display_name: '白银 XAGUSD1' }];
   assert.equal(

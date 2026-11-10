@@ -17,13 +17,14 @@ const markers = (fills, leg) => { const config = anthropicChartConfig(leg); retu
 const link = (overrides = {}) => ({ jobId: '11111111-1111-4111-8111-111111111111', phase: 0, batch: 0, comparisonLeg: 'rh', cex: 'binance', ...overrides });
 
 test('verified Binance task is routed to RH even while native history is unavailable, never to xyz or io', () => {
-  const item = cex({ orderId: '123', execution: link() });
+  const item = cex({ orderId: '123', execution: link(), attribution: { reason: 'matched', updatedAt: '2026-11-06T08:00:00.000Z' } });
   const [marker] = markers([item], 'rh');
   assert.match(marker.venueLabel, /Binance ↔ Lighter RH/); assert.equal(marker.value, 100); assert.equal(marker.event.spread, null);
   assert.equal(marker.event.time, Date.parse(item.time));
   for (const leg of ['xyz', 'io']) assert.deepEqual(markers([item], leg), []);
   const detail = tradeDetailLines(marker, String, anthropicChartConfig('rh').trade).join('\n');
   assert.match(detail, /工作台组合任务 11111111/); assert.match(detail, /订单 123/); assert.match(detail, /非双腿成交价差/);
+  assert.match(detail, /已按订单与账户证据关联/);
 });
 
 test('linked fills group only within the same task phase and batch; unrelated manual fills remain separate', () => {

@@ -30,6 +30,7 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
   const changes = state?.changes;
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [built, setBuilt] = useState<AeroSafeChangeBatch | null>(null);
+  const [reviewBatchId, setReviewBatchId] = useState(''), [reviewBlock, setReviewBlock] = useState(''), [reviewHash, setReviewHash] = useState('');
   const configured = state?.config?.permissions.allowances ?? [];
   const decimalsOf = (token: string) => state?.chain?.tokens.find((t) => same(t.address, token))?.decimals ?? null;
   const rows: Row[] = [
@@ -140,6 +141,23 @@ export function AeroSafeChanges({ safe }: { safe: AeroSafe }) {
         </div>
       </> : null}
       {pendingCount || batch ? <div className="as-form"><button type="button" className="button secondary" disabled={!!busy} onClick={() => { if (window.confirm('放弃全部待变更与已生成的批次？已在 Safe 执行的批次不会因此撤回。')) { setBuilt(null); void call('clearChanges', '/changes/clear', 'POST', {}); } }}><Trash2 size={15} />全部放弃</button></div> : null}
+      <details><summary>历史冻结批次 · 固定区块权限核对</summary>
+        <p className="as-muted">从本版本新生成的批次开始保存，最多10份，每份最多5次核对。只读链上权限及回执，不签名、不启用配置。未取得回执时不将本地配置相同视为已执行。</p>
+        {state.permissionHistory?.error ? <p role="alert">{state.permissionHistory.error}</p> : null}
+        {state.permissionHistory?.batches.length ? <>
+          <div className="as-form"><label>冻结批次<select value={reviewBatchId} onChange={event => setReviewBatchId(event.target.value)}><option value="">请选择批次</option>{state.permissionHistory.batches.map(item => <option key={item.id} value={item.id}>{when(item.createdAt)} · {item.id.slice(0, 12)} · {item.transactions}笔</option>)}</select></label>
+            <label>固定区块高度<input inputMode="numeric" value={reviewBlock} onChange={event => setReviewBlock(event.target.value)} placeholder={String(state.chain?.blockNumber ?? '')} /></label>
+            <label>Safe 执行交易哈希（可选）<input value={reviewHash} onChange={event => setReviewHash(event.target.value.trim())} /></label>
+            <button type="button" className="button secondary" disabled={!!busy || !reviewBatchId || !/^[1-9]\d*$/.test(reviewBlock) || !Number.isSafeInteger(Number(reviewBlock)) || !!reviewHash && !/^0x[0-9a-f]{64}$/i.test(reviewHash)}
+              onClick={() => void call('permissionReview', '/changes/review', 'POST', { id: reviewBatchId, blockNumber: Number(reviewBlock), transactionHash: reviewHash }, CHANGE_TIMEOUT_MS)}>读取并留存核对</button></div>
+          {state.permissionHistory.batches.map(item => <article key={item.id}><strong>批次 {item.id}</strong><p>链 {item.chainId} · Safe {item.safe} · Roles {item.roles}</p>
+            {item.reviews.length ? item.reviews.map((review, index) => <div key={`${review.at}:${index}`}><p>{when(review.at)} · 固定区块 {review.blockNumber} · {({ insufficient: '证据不足', not_executed: '未执行（交易明确失败）', effective: '已生效', partial: '部分生效', not_effective: '当前权限未生效' } as Record<string, string>)[review.status] ?? '未知'}</p>
+              <p>{review.note}</p><p>区块哈希 {review.blockHash ?? '未知'} · 交易 {review.transactionHash ?? '未提供'} · 回执 {review.receipt}</p>
+              <ul>{review.checks.map((check, checkIndex) => <li key={checkIndex}>{check.label}：{check.ok ? '符合' : '不符合'} · {check.status}</li>)}</ul>
+              <details><summary>原批次操作身份</summary>{review.operations.map(operation => <p key={operation.index}>{operation.index + 1}. {operation.method} · {operation.to} · {operation.target}</p>)}</details><p>{review.coverage}</p></div>) : <p>尚未取得链上核对证据。</p>}
+          </article>)}
+        </> : <p>尚无可核对的历史冻结批次。</p>}
+      </details>
     </div>
   </section>;
 }

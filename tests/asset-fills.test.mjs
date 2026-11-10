@@ -86,6 +86,25 @@ test('Bybit USDC native PERP codes and opaque trade identifiers survive normaliz
 });
 
 const target = (revision = 'a') => ({ project: { id: 'asset', name: 'Asset', adapter: 'asset', enabled: true, embedded: true, apiUrl: 'http://127.0.0.1' }, revision });
+
+test('evidence peek uses only existing data and never carries an old project revision', async t => {
+  let selected = [target()], clock = NOW, calls = 0;
+  const reader = createAssetFills({ listTargets: () => selected, now: () => clock, request: async () => { calls++; return { data: payload() }; } });
+  t.after(() => reader.close());
+  assert.equal(reader.peek().sources[0].data, null);
+  assert.equal(calls, 0);
+  await reader.state();
+  const before = calls;
+  assert.equal(scope(reader.peek().sources[0].data).fills.length, 1);
+  clock += ASSET_FILLS_STALE_MS + 1;
+  assert.equal(scope(reader.peek().sources[0].data).status, 'stale');
+  assert.equal(calls, before, 'expired evidence does not start a refresh');
+  selected = [target('new-credentials')];
+  assert.equal(reader.peek().sources[0].data, null);
+  assert.equal(calls, before);
+  selected = [];
+  assert.deepEqual(reader.peek().sources, []);
+});
 function fixture(t, options = {}) {
   let selected = [target()], clock = NOW, handler = async () => ({ data: payload() }), calls = 0;
   const reader = createAssetFills({ listTargets: () => selected, now: () => clock, request: async (_base, route, options) => {

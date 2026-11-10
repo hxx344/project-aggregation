@@ -14,9 +14,11 @@ test('verified ANT order attribution crosses both contracts, while malformed ide
   const item = scope(raw.sources[0].data).fills[0];
   item.orderId = '9007199254740999999';
   item.execution = { jobId: '11111111-1111-4111-8111-111111111111', phase: 1, batch: 2, comparisonLeg: 'rh', cex: 'binance' };
+  item.attribution = { reason: 'matched', updatedAt: STAMP };
   const mapped = () => fillsReply({ requestId: 'linked', market: 'anthropic' }, { status: 'ok', data: raw }, NOW);
   assert.deepEqual(parseFillsReply(mapped(), 'anthropic').items[0].execution, item.execution);
   assert.equal(parseFillsReply(mapped(), 'anthropic').items[0].orderId, item.orderId);
+  assert.deepEqual(parseFillsReply(mapped(), 'anthropic').items[0].attribution, item.attribution);
   for (const patch of [{ comparisonLeg: ['rh'] }, { batch: -1 }, { phase: 1.2 }, { cex: 'okx' }, { jobId: 'invalid' }]) {
     const valid = { ...item.execution }; Object.assign(item.execution, patch);
     assert.equal(mapped().status, 'unavailable'); item.execution = valid;

@@ -69,7 +69,15 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
     timer = setInterval(() => { if (recentlyRead()) background ??= state().catch(() => {}).finally(() => { background = null; }); }, backgroundIntervalMs);
     timer.unref?.();
   }
-  return { state: () => { foregroundAt = now(); return state(); }, invalidate, async close() {
+  // Evidence exports inspect already observed data without starting reads or
+  // extending background polling. Never return a previous credential revision.
+  function peek() {
+    return { generatedAt: new Date(now()).toISOString(), sources: closed ? [] : targets().map(target => {
+      const entry = entries.get(target.project.id);
+      return view(target, usable(target) && entry?.revision === target.revision ? entry : undefined);
+    }) };
+  }
+  return { state: () => { foregroundAt = now(); return state(); }, peek, invalidate, async close() {
     closed = true; clearInterval(timer);
     const pending = [...entries.values()].map(entry => entry.pending);
     for (const id of entries.keys()) invalidate(id);

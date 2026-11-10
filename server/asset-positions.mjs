@@ -1,4 +1,5 @@
 import { createAssetSnapshot } from './asset-snapshot.mjs';
+import { parseCycleEvidence } from './cycle-evidence.mjs';
 
 const PATH = '/api/hub/positions';
 const STATES = new Set(['unconfigured', 'loading', 'live', 'stale', 'error', 'unsupported']);
@@ -36,6 +37,10 @@ function cycle(value, now) {
     result.currency = value.currency === null ? null : label(value.currency, 20);
     result.note = value.note === null ? null : label(value.note, 300);
     result.updatedAt = timestamp(value.updatedAt, now);
+    if (value.evidence !== undefined) {
+      const evidence = parseCycleEvidence(value.evidence);
+      if (evidence) result.evidence = evidence;
+    }
     return result;
   } catch { return null; }
 }

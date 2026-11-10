@@ -4,6 +4,8 @@ import { ArrowRight, Check, ChevronRight, CircleAlert, Download, LoaderCircle, R
 import { api, ApiError } from './api';
 import type { UpdateDeployMode, UpdateJob, UpdateModule, UpdatePhase, UpdateState, UpdateProgressView } from './update-types';
 import { getUpdateProgress, getUpdateTimingSummary } from './update-progress';
+import UpdateDiagnostic from './UpdateDiagnostic';
+import UpdateImpact from './UpdateImpact';
 import './updates.css';
 
 const STREAM_TIMEOUT = 45_000;
@@ -500,6 +502,8 @@ export default function UpdateStatus({ onExpired, onOpen }: { onExpired: () => v
     {reloading ? <div className="update-message setup" role="status"><RefreshCw size={18} className="spin" /><p>更新已完成，正在刷新页面以载入新版本和重启后的模块连接。</p></div> : null}
     {downloadProgress ? <DownloadProgress progress={downloadProgress} /> : null}
     {snapshot?.job ? <JobProgress job={snapshot.job} modules={modules} ready={!!prepared} /> : null}
+    {snapshot?.job && unfinished(snapshot.job) ? <UpdateDiagnostic key={snapshot.job.id} jobId={snapshot.job.id} onExpired={onExpired} /> : null}
+    {review && !reviewInvalid ? <UpdateImpact key={`${review.planId}:${review.deployMode}:${review.phase}`} planId={review.planId} deployMode={review.deployMode} phase={review.phase} onExpired={onExpired} /> : null}
     {prepared && changes.length && !review && !updating && !uncertain ? <div className="update-message setup" role="status"><Check size={18} /><div><strong>新版本已准备好</strong><p>下载、依赖、验证和构建已在后台完成，交易一直照常运行。切换时交易模块会进入维护、核对停机状态后重启，通常在一分钟内恢复；请选择方便暂停交易的时机。</p>{snapshot?.expiresAt ? <p>请在 {dateTime(snapshot.expiresAt)} 前切换，之后需重新检查并准备。</p> : null}</div></div> : null}
     {snapshot?.enabled && !needsSetup && !review && !updating && !uncertain && !prepared ? <section className="update-mode" aria-labelledby="update-mode-title">
       <h3 id="update-mode-title">更新方式</h3>

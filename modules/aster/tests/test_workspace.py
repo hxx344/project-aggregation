@@ -32,6 +32,29 @@ SECRET = "workspace-test-private-secret"
 
 
 class WorkspaceTests(unittest.TestCase):
+    def test_update_impact_is_a_local_read_without_maintenance_or_broker_work(self):
+        workspace = self.engine.workspace
+        workspace.set_maintenance(False)
+        before = (workspace.active, workspace.reads_paused, workspace.generation, dict(workspace.display_due))
+        with patch.object(self.store, 'accounts', side_effect=AssertionError('impact must not inspect or refresh accounts')):
+            idle = workspace.impact_status()
+            self.assertIsNone(idle['busy'])
+            self.assertTrue(idle['requiresFinalCheck'])
+            self.assertEqual(idle['activeRequests'], 0)
+            with workspace.mutation():
+                active = workspace.impact_status()
+                self.assertTrue(active['busy'])
+                self.assertEqual(active['activeRequests'], 1)
+        self.assertFalse(workspace.active)
+        self.assertEqual(workspace.reads_paused, before[1])
+        self.assertEqual(workspace.display_due, before[3])
+        app = create_app(self.engine, start_engine=False, workspace_secret=SECRET)
+        with TestClient(app) as client:
+            self.assertEqual(client.get('/__workspace/update-impact').status_code, 403)
+            response = client.get('/__workspace/update-impact', headers={'x-workspace-key': SECRET})
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNone(response.json()['busy'])
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

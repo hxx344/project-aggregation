@@ -32,7 +32,7 @@ export function PairSettings({
   const field = <K extends keyof PairDraft>(key: K, value: PairDraft[K]) =>
     setDraft({ ...draft, [key]: value });
   const textField = (
-    key: Exclude<keyof PairDraft, 'margin_enabled' | 'adl_enabled'>,
+    key: Exclude<keyof PairDraft, 'margin_enabled' | 'adl_enabled' | 'absolute_reserve_enabled'>,
   ) => ({
     value: draft[key],
     onValueChange: (value: string) => setDraft({ ...draft, [key]: value }),
@@ -237,6 +237,13 @@ export function PairSettings({
           {...textField('check_interval_seconds')}
           disabled={locked}
         />
+        <label><input type="checkbox" checked={draft.absolute_reserve_enabled} disabled={locked}
+          onChange={event => field('absolute_reserve_enabled', event.target.checked)} />启用两侧绝对保留金额</label>
+        {draft.absolute_reserve_enabled ? <>
+          <ConfigurationField id={`${formId}-long-reserve`} label="A 多侧最低保留" unit="USD1" max="1000000000" {...textField('long_reserve')} disabled={locked} />
+          <ConfigurationField id={`${formId}-short-reserve`} label="B 空侧最低保留" unit="USD1" max="1000000000" {...textField('short_reserve')} disabled={locked} />
+          <small>各侧转出时，绝对保留与正权益比例保留取较大值；余额不足只阻止划转，不自动放宽。</small>
+        </> : null}
         <ConfigurationField
           id={`${formId}-pair-cooldown`}
           label="划转冷却时间"

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useSyncExternalStore } from 'react';
+import { parseCycleEvidence, type CycleEvidence } from '../../../server/cycle-evidence.mjs';
 import { readActivity } from './read-activity.ts';
 import { perpetualChartUrl } from './perpetual-chart-state.ts';
 import { createHubRequester } from './hub-requester.ts';
@@ -56,6 +57,7 @@ export function hubNavigate(projectId: HubProject, query: HubQuery) { const clea
 export type PositionsMarket = 'oil' | 'hynix' | 'anthropic' | 'perpetual';
 /** Realized results since the position last opened from zero; signed cash flows in `currency`, `net` null when a part is unknown. */
 export type HubPositionCycle = {
+  evidence?: CycleEvidence;
   status: 'loading' | 'complete' | 'partial' | 'unavailable'; since: string | null;
   closedQuantity: string | null; closePrice: string | null; realizedPnl: string | null; fees: string | null; funding: string | null; net: string | null;
   currency: string | null; note: string | null; updatedAt: string | null;
@@ -96,13 +98,15 @@ function positionCycle(value: unknown): HubPositionCycle | null | undefined {
   if (value === null) return null;
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const cycle = value as Record<string, unknown>;
+  const evidence = cycle.evidence === undefined ? undefined : parseCycleEvidence(cycle.evidence);
+  if (evidence === null) return undefined;
   const result = {
     status: typeof cycle.status === 'string' && CYCLE_STATES.has(cycle.status) ? cycle.status : undefined, since: optionalText(cycle.since, 40),
     closedQuantity: optionalText(cycle.closedQuantity, 64), closePrice: optionalText(cycle.closePrice, 64), realizedPnl: optionalText(cycle.realizedPnl, 64),
     fees: optionalText(cycle.fees, 64), funding: optionalText(cycle.funding, 64), net: optionalText(cycle.net, 64),
     currency: optionalText(cycle.currency, 20), note: optionalText(cycle.note, 300), updatedAt: optionalText(cycle.updatedAt, 40),
   };
-  return Object.values(result).some(field => field === undefined) ? undefined : result as HubPositionCycle;
+  return Object.values(result).some(field => field === undefined) ? undefined : { ...result, ...(evidence ? { evidence } : {}) } as HubPositionCycle;
 }
 function positionItem(value: unknown): HubPositionItem | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;

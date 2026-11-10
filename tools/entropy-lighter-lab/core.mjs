@@ -127,7 +127,7 @@ export class Recorder {
       this.bytes = 0;
       this.prune(now);
     } else if (now - this.lastPrune > 60000) this.prune(now);
-    const row = `${JSON.stringify({ ...event, session: this.session })}\n`;
+    const row = `${JSON.stringify({ ...event, recordedAt: now, session: this.session })}\n`;
     const bytes = Buffer.byteLength(row);
     if (bytes > 4 * 1024 * 1024) throw new Error('Record exceeds 4 MiB limit');
     if (this.totalBytes + bytes > this.config.maxDataMb * 1024 * 1024) {

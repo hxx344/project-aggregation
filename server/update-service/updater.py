@@ -28,6 +28,7 @@ import uuid
 from registry import BY_ID, MODULES, inventory, text_file, trusted
 from releases import Network, Releases, ReleaseError, digest, valid_github_token
 from progress import get_progress, get_stage_timings
+from diagnostics import snapshot as diagnostic_snapshot, observe_units
 
 
 STATE_DIR = Path('/var/lib/project-aggregation-updater')
@@ -273,8 +274,50 @@ class Coordinator:
             result['retryNotBefore'] = result['nextCheckNotBefore'] if result['failureCount'] else 0
         return result
 
-    def save(self, state):
+    def save(self, state, diagnostic_observation=None):
         write_json(self.directory / 'state.json', state)
+        self.save_job_diagnostic(state, observation=diagnostic_observation)
+
+    def save_job_diagnostic(self, state, plan=None, installed=None, observation=None):
+        # Optional evidence cannot change the authoritative update outcome.
+        job = state.get('job')
+        if not isinstance(job, dict) or not isinstance(job.get('id'), str) or not TOKEN.fullmatch(job['id']):
+            return
+        filename = self.jobs / job['id'] / 'diagnostic.json'
+        try:
+            trusted(filename.parent, directory=True)
+            previous = read_json(filename) if filename.exists() or filename.is_symlink() else None
+            value = diagnostic_snapshot(state, previous, plan, installed, observation)
+            if value != previous:
+                write_json(filename, value)
+        except (OSError, ValueError, TypeError, RecursionError):
+            pass
+
+    def diagnostic(self, job_id):
+        if not isinstance(job_id, str) or not TOKEN.fullmatch(job_id):
+            raise UpdateError(400, '更新任务标识无效')
+        with self.lock():
+            state = self.load()
+            try:
+                archived = read_json(self.jobs / job_id / 'diagnostic.json')
+            except (OSError, ValueError, RecursionError):
+                archived = None
+            if archived and (archived.get('schemaVersion') != 1 or archived.get('jobId') != job_id):
+                archived = None
+            current = state.get('job')
+            if current and current.get('id') == job_id:
+                value = diagnostic_snapshot(state, archived)
+            elif archived and isinstance(archived.get('job'), dict) and archived['job'].get('id') == job_id:
+                if (not isinstance(archived.get('versions'), list) or not isinstance(archived.get('observation'), dict)
+                        or not isinstance(archived['observation'].get('units'), list)
+                        or archived['job'].get('status') not in ('failed', 'interrupted')):
+                    raise UpdateError(404, '该更新任务的诊断不可用或已清理')
+                value = diagnostic_snapshot({'job': archived['job']}, archived)
+            else:
+                raise UpdateError(404, '该更新任务的诊断未保留或已清理')
+            if value['job']['status'] not in {'failed', 'interrupted'}:
+                raise UpdateError(409, '该任务尚未失败或中断')
+            return value
 
     def prune(self, state):
         """Called with the state lock held, after references have been saved."""
@@ -761,6 +804,7 @@ class Coordinator:
             state.update(jobPlanId=plan_id, job={'id': job_id, 'status': 'queued', 'deployMode': deploy_mode, 'scope': scope, 'phase': phase,
                          'startedAt': iso(self.clock()), 'finishedAt': None, 'activeModule': None, 'message': '已提交，正在准备正式版本更新',
                          'steps': [{'id': entry['id'], 'name': BY_ID[entry['id']].name, 'status': 'pending'} for entry in plan['entries']]})
+            self.save_job_diagnostic(state, plan=plan, installed=current)
             self.save(state)
             self.prune(state)
             try:
@@ -775,13 +819,13 @@ class Coordinator:
                 raise UpdateError(503, '更新服务未能启动') from None
             return self.public(state)
 
-    def progress(self, job_id, callback):
+    def progress(self, job_id, callback, observation=None):
         with self.lock():
             state = self.load()
             if not state['job'] or state['job']['id'] != job_id:
                 raise UpdateError(409, '更新任务身份已改变')
             callback(state, state['job'])
-            self.save(state)
+            self.save(state, diagnostic_observation=observation)
             if state['job']['status'] not in ACTIVE:
                 self.prune(state)
 
@@ -893,7 +937,7 @@ class Coordinator:
                     elif step['status'] == 'pending':
                         step.update(status='skipped', message='尚未执行')
                 state.update(planId=None, expiresAt=None)
-            self.progress(job_id, failed)
+            self.progress(job_id, failed, observation=observe_units(self.clock))
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -919,6 +963,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.connection.settimeout(5)
             if self.command == 'GET' and self.path == '/status':
                 self.answer(200, self.server.coordinator.status())
+                return
+            diagnostic_route = re.fullmatch(r'/diagnostics/([a-f0-9]{32})', self.path)
+            if self.command == 'GET' and diagnostic_route:
+                self.answer(200, self.server.coordinator.diagnostic(diagnostic_route[1]))
                 return
             if self.command != 'POST' or self.path not in ('/check', '/apply', '/token'):
                 raise UpdateError(404, '更新接口不存在')
