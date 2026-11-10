@@ -1,0 +1,13 @@
+{
+  "name": "@project-aggregation/executor",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "统一平台阶段 1 执行器原型：独立数据目录，仅模拟传输",
+  "scripts": {
+    "check": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.ts",
+    "start": "node src/main.ts",
+    "measure": "node scripts/measure.ts"
+  }
+}
