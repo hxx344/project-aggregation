@@ -8,17 +8,19 @@ import { fileURLToPath } from 'node:url';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { Lab, Recorder, atomicJson, automaticConfig, readPreviousReport, validateConfig } from './core.mjs';
 import { discover, startFeeds } from './feeds.mjs';
+import { exportEvidence } from './evidence.mjs';
 
 function argumentsFor(argv) {
   const [command = 'help', ...rest] = argv;
   const options = {};
   for (let i = 0; i < rest.length; i += 2) {
-    if (!['--config', '--data', '--duration'].includes(rest[i]) || rest[i + 1] === undefined || Object.hasOwn(options, rest[i])) throw new Error('Usage: cli.mjs {check|run|report} [--config FILE] [--data DIR] [--duration SECONDS]');
+    if (!['--config', '--data', '--duration', '--session', '--symbol', '--from', '--to', '--out'].includes(rest[i]) || rest[i + 1] === undefined || Object.hasOwn(options, rest[i])) throw new Error('Usage: cli.mjs {check|run|report|export} [--data DIR] [--session UUID --symbol SNDK --from EPOCH_MS --to EPOCH_MS --out NEW_DIR]');
     options[rest[i]] = rest[i + 1];
   }
   const duration = options['--duration'] === undefined ? null : Number(options['--duration']);
   if (duration !== null && (!Number.isFinite(duration) || duration < 1 || duration > 86400)) throw new Error('duration must be 1..86400 seconds');
-  return { command, configPath: resolve(options['--config'] || join(dirname(fileURLToPath(import.meta.url)), 'config.example.json')), data: resolve(options['--data'] || '.data-entropy-lighter'), duration };
+  return { command, configPath: resolve(options['--config'] || join(dirname(fileURLToPath(import.meta.url)), 'config.example.json')), data: resolve(options['--data'] || '.data-entropy-lighter'), duration,
+    selection: { session: options['--session'], symbol: options['--symbol'], from: options['--from'], to: options['--to'] }, out: options['--out'] };
 }
 
 // Earlier versions arbitrated with a run.claim directory and wrote owner.json after
@@ -424,11 +426,19 @@ async function main() {
     validateConfig(automaticConfig(JSON.parse(readFileSync(args.configPath, 'utf8'))));
     process.stdout.write('Configuration valid; public-data research/paper only.\n');
   } else if (args.command === 'run') await run(args);
-  else if (args.command === 'report') {
+  else if (args.command === 'export') {
+    if (!args.out) throw new Error('export requires --out NEW_DIR');
+    const result = await exportEvidence(args.data, args.selection);
+    const destination = resolve(args.out);
+    mkdirSync(destination, { mode: 0o700 }); // A fresh output directory never overwrites an earlier evidence bundle.
+    writeFileSync(join(destination, 'events.jsonl'), result.jsonl, { flag: 'wx', mode: 0o600 });
+    writeFileSync(join(destination, 'manifest.json'), `${JSON.stringify(result.manifest, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    process.stdout.write(`${JSON.stringify(result.manifest)}\n`);
+  } else if (args.command === 'report') {
     const report = readPreviousReport(args.data);
     if (!report) throw new Error('No report.json in data directory');
     process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  } else if (args.command === 'help') process.stdout.write('Usage: node cli.mjs {check|run|report} [--config FILE] [--data DIR] [--duration SECONDS]\n');
+  } else if (args.command === 'help') process.stdout.write('Usage: node cli.mjs {check|run|report|export} [--config FILE] [--data DIR] [--duration SECONDS]\nexport --session UUID --symbol SNDK|ANTH --from EPOCH_MS --to EPOCH_MS --out NEW_DIR\n');
   else throw new Error('Unknown command');
 }
 

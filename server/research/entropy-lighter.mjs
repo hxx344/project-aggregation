@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { atomicJson, automaticConfig, validateConfig } from '../../tools/entropy-lighter-lab/core.mjs';
 import { HttpError } from '../http-common.mjs';
 import { buildResearchInsights } from './entropy-lighter-insights.mjs';
+import { exportEvidence, validateEvidenceQuery } from '../../tools/entropy-lighter-lab/evidence.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const tool = path.join(root, 'tools/entropy-lighter-lab');
@@ -40,6 +41,7 @@ export function createEntropyLighterResearch({ dataDir, enabledByDefault = false
   let config = automaticConfig(defaults), configValid = true, enabled = enabledByDefault, child = null, closed = false, initialized = false;
   let failure = null, readFailure = null, retry = 0, retryTimer = null, generationStarted = 0;
   let operation = Promise.resolve();
+  let exporting = false;
   const cleared = () => { clearTimeout(retryTimer); retryTimer = null; };
   const serial = (fn) => {
     const next = operation.then(() => { if (closed) throw new HttpError(503, '研究服务正在关闭'); return fn(); });
@@ -132,6 +134,12 @@ export function createEntropyLighterResearch({ dataDir, enabledByDefault = false
   }
   return {
     state,
+    async exportEvidence(query) {
+      try { validateEvidenceQuery(query); } catch (error) { throw new HttpError(400, error.message); }
+      if (exporting) throw new HttpError(429, '另一份研究证据正在导出，请稍后重试');
+      exporting = true;
+      try { return await exportEvidence(directory, query); } finally { exporting = false; }
+    },
     async initialize() {
       if (initialized) return;
       initialized = true;

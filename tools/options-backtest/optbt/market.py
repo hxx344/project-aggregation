@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 
 from . import parquet
 from .engine import Quote
+from .evidence import file_identity, quote_evidence
 
 DEFAULT_DATA = os.environ.get("OPTBT_DATA", "~/data/options_hourly/BTC")
 # Parsed months are kept as .npy files next to the data and memory-mapped. A month's cache is
@@ -41,10 +42,12 @@ def encode(hour, expiry, strike, is_call):
 
 
 class ParquetMarket:
-    def __init__(self, directory=DEFAULT_DATA, cache_months=64, price_unit=None, iv_unit=None):
+    def __init__(self, directory=DEFAULT_DATA, cache_months=64, price_unit=None, iv_unit=None, read_only=False, perp_directory=None, evidence=False):
         """`price_unit` / `iv_unit` configure the units; a file declaring different ones is refused."""
         self.directory = Path(directory).expanduser()
         self.units = {"price": price_unit, "iv": iv_unit}
+        self.read_only, self.perp_directory, self.evidence = read_only, perp_directory, evidence
+        self.source_identities = {}
         self.files = {}
         for path in sorted(self.directory.glob("*.parquet")):
             match = re.fullmatch(r"(\d{4})-(\d{2})", path.stem)
@@ -64,7 +67,10 @@ class ParquetMarket:
     def _binance(self):
         if self._perp is None:
             from .binance import BinancePerp
-            self._perp = BinancePerp()  # months are downloaded when a position first needs them
+            options = {'allow_download': not self.read_only, 'evidence': self.evidence}
+            if self.perp_directory is not None:
+                options['directory'] = self.perp_directory
+            self._perp = BinancePerp(**options)  # preflight is explicitly offline
         return self._perp
 
     def perp(self, hour):
@@ -74,12 +80,25 @@ class ParquetMarket:
     def funding(self, after, upto):
         return self._binance().funding(after, upto)
 
+    def perp_evidence(self, hour):
+        return self._binance().price_evidence(hour)
+
+    def funding_evidence(self, after, upto):
+        return self._binance().funding_evidence(after, upto)
+
     def _month(self, month):
         if month in self._months:
             self._months.move_to_end(month)
             return self._months[month]
         path = self.files.get(month)
+        if path and self.evidence and str(path) not in self.source_identities:
+            units = {role: parquet.unit(path, role, self.units[role], SLIM_UNITS[role]) for role in SLIM_UNITS}
+            self.source_identities[str(path)] = file_identity(path, kind='option_quotes', units=units, dataSchema=DATA_SCHEMA)
         arrays = self._cached(path) if path else None
+        if path and self.evidence:
+            identity, stat = self.source_identities[str(path)], path.stat()
+            if (identity['size'], identity['mtimeNs']) != (stat.st_size, stat.st_mtime_ns):
+                raise ValueError(f'data changed during run: {path.name}')
         self._months[month] = arrays
         while len(self._months) > self.cache_months:
             self._months.popitem(last=False)
@@ -88,6 +107,8 @@ class ParquetMarket:
     def _cached(self, path):
         folder = path.parent / ".optbt-cache" / f"v{CACHE_VERSION}" / path.stem
         units = {role: parquet.unit(path, role, self.units[role], SLIM_UNITS[role]) for role in SLIM_UNITS}
+        if self.read_only:
+            return {name: values.astype('float32') if name in FLOAT32 else values for name, values in self._load(path, units).items()}
         stat = path.stat()
         stamp = f"{stat.st_size}:{stat.st_mtime_ns}:{CODE}:schema={DATA_SCHEMA}:price={units['price']}:iv={units['iv']}"
         try:
@@ -147,7 +168,13 @@ class ParquetMarket:
     def _sources(self, hour):
         # A label hour holds snapshots from (H-1h, H]; at a month boundary they span two files.
         months = dict.fromkeys((month_of(hour * 3600 - 1), month_of(hour * 3600)))
-        return [arrays for arrays in (self._month(month) for month in months) if arrays is not None]
+        return [(arrays, self.files[month]) for month in months if (arrays := self._month(month)) is not None]
+
+    def _source(self, path, hour):
+        if not self.evidence:
+            return None
+        return {'fileId': self.source_identities[str(path)]['id'], 'file': path.name, 'labelHour': hour,
+                'rowLocator': 'quote time + expiryHour + strike + isCall; latest snapshot in (H-1h,H]'}
 
     def span(self):
         if self._span is None:
@@ -160,24 +187,24 @@ class ParquetMarket:
     def chain(self, hour):
         low, high = encode(hour, hour, 0, 0), encode(hour + 1, hour + 1, 0, 0)
         quotes = {}
-        for arrays in self._sources(hour):
+        for arrays, path in self._sources(hour):
             start, stop = np.searchsorted(arrays["key"], [low, high])
             rows = zip(*(arrays[name][start:stop].tolist() for name in ("key", "strike") + COLUMNS))
             for key, strike, *values in rows:
                 if key not in quotes or values[0] > quotes[key].time:
                     expiry = hour + ((key >> (STRIKE_BITS + 1)) & ((1 << OFFSET_BITS) - 1))
-                    quotes[key] = Quote(expiry, float(strike), bool(key & 1), *values)
+                    quotes[key] = Quote(expiry, float(strike), bool(key & 1), *values, self._source(path, hour))
         return list(quotes.values())
 
     def quote(self, hour, expiry, strike, is_call):
         key = encode(hour, expiry, int(round(strike)), int(is_call))
         best = None
-        for arrays in self._sources(hour):
+        for arrays, path in self._sources(hour):
             index = int(np.searchsorted(arrays["key"], key))
             if index < arrays["key"].size and arrays["key"][index] == key:
                 values = [arrays[name][index].item() for name in COLUMNS]
                 if best is None or values[0] > best.time:
-                    best = Quote(expiry, float(arrays["strike"][index]), bool(is_call), *values)
+                    best = Quote(expiry, float(arrays["strike"][index]), bool(is_call), *values, self._source(path, hour))
         return best
 
     def settlement(self, expiry):
@@ -185,13 +212,23 @@ class ParquetMarket:
 
         Deribit settles on a 30-minute index TWAP before 08:00 UTC; the last hourly snapshot's
         underlying for that expiry is the closest available stand-in."""
+        value = self._settlement(expiry)
+        return value['priceUsd'] if value else None
+
+    def settlement_evidence(self, expiry):
+        return self._settlement(expiry)
+
+    def _settlement(self, expiry):
         for hour in (expiry, expiry - 1, expiry - 2):
             chain = self.chain(hour)
-            expiring = [q.forward for q in chain if q.expiry == expiry]
+            expiring = [q for q in chain if q.expiry == expiry]
             if expiring:
-                return median(expiring)
+                return {'priceUsd': median(q.forward for q in expiring), 'quoteHour': hour, 'method': 'expiring_contract_forward_median',
+                        'quotes': [quote_evidence(q) for q in expiring] if self.evidence else None}
             later = [q for q in chain if q.expiry > expiry]
             if later:
                 nearest = min(q.expiry for q in later)
-                return median(q.forward for q in later if q.expiry == nearest)
+                chosen = [q for q in later if q.expiry == nearest]
+                return {'priceUsd': median(q.forward for q in chosen), 'quoteHour': hour, 'method': 'nearest_later_expiry_forward_median',
+                        'quotes': [quote_evidence(q) for q in chosen] if self.evidence else None}
         return None

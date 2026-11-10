@@ -9,16 +9,31 @@ tools/options-backtest/bt examples                       # 列出示例策略
 tools/options-backtest/bt run iron_condor                # 实盘铁鹰：周五 21:00 UTC 开仓，周日到期
 tools/options-backtest/bt run iron_condor --set fill=cross --set exit.take_profit_pct=0.5
 tools/options-backtest/bt run trend_premium              # 顺势卖权：50 日均线上方卖看跌、下方卖看涨
+tools/options-backtest/bt preflight trend_premium --json # 只读检查策略依赖，不下载、不写行情缓存
 tools/options-backtest/bt sweep iron_condor --set legs.0.delta+legs.1.delta=0.3,0.35,0.4,0.45 --set fill=mid,cross
 tools/options-backtest/bt chain 2025-01-03T21 --dte 2    # 查看某小时的期权链，核对选腿
 ```
 
 - 首次运行时，`bt` 会在 `~/.local/share/options-backtest/venv` 建一个只装 numpy 和 pyarrow 的 venv。
 - 首次读取数据时，会把每个月解析成 `.npy` 缓存，约 20 秒、900 MB。之后单次回测约 2 秒。
-- `run` 在终端只打印约 6 行摘要。逐笔明细、汇总和实际使用的配置写到 `~/data/greeks/backtests/<name>/<UTC 时间>/` 下的 `trades.csv`、`summary.json`、`spec.json`。
+- `run` 在终端打印摘要。逐笔明细、汇总、实际配置和冻结证据写到 `~/data/greeks/backtests/<name>/<UTC 时间>/` 下；已有结果目录拒绝覆盖，可通过 `--out` 指定新目录。
 - 加 `--json` 时，摘要输出为一行 JSON。
 - `sweep` 对所有 `--set` 取值做笛卡尔积，打印排序后的对比表，完整结果写入 `sweep.csv`。
   - 用 `a+b=...` 可以让多个路径同时取同一个值，例如两条空头腿同时改 delta。
+
+## 只读预检与逐笔证据
+
+`bt preflight SPEC` 与 `run` 共用 spec、`--set`、价格单位和纯合约选择器；可指定 `--data`、`--perp-data`、`--price-unit btc|usd`、`--iv-unit fraction|percent`。输出 JSON 包含月文件、schema/单位、逐小时与选中合约缺口、趋势预热、永续收盘价、资金费文件及其全月事件所需价格、未知交割数据。发现缺口返回退出码 2，无已知缺口返回 0；不调用模拟器、不下载数据、不创建 `.optbt-cache` 或结果目录。`bt` 环境未准备好时直接拒绝预检，不借预检安装依赖。Windows 可在已安装依赖的环境中，从本工具目录运行 `python -B -m optbt preflight SPEC`。
+
+预检列出所有允许入场小时的保守依赖，并明确给出范围口径。真实 run 在入场 `end` 后仍可能等待退出价或交割，最坏会继续至最后数据小时，因此尾部上界使用真实引擎的 `last`；预检不会假称已预测实际持仓、止盈、止损或 `max_open` 路径。资金费 CSV 没有交易所完整时刻表，已有事件及价格可核对，但时刻表完整性仍标为未核验。`ready` 不表示策略盈利或源数据完整。
+
+`exitCoverage` 单独核对潜在入场组合的首个到期时刻和配置的提前退出时刻是否落在引擎可达数据范围内：即使最后两小时前的远期价能估算交割，也不能代替实际到期小时。必要退出在数据末尾之后时不就绪；有止盈/止损但尚未运行模拟时标为 `early_exit_unverified`，不声称必然无法提前退出。已配置且可达的定时退出会单独标为 `scheduled_exit_within_data`。
+
+单次 `run` 新增 `evidence.jsonl` 与 `evidence-manifest.json`。`trades.csv.evidence_id` 对应逐笔记录，清单冻结原 Parquet/永续/资金费文件 SHA256、文件大小、单位、实际 spec、模型和费用实现摘要、Python/依赖版本。每腿记录实际报价时刻、小时标签、文件身份、报价值、成交模型/价格、费用与现金流；交割保留近似价格来源，mark 回退、缺永续报价回退、最后远期价交割、未结算分别标明。未结算记录的净额为 `null`。
+
+复算公式为 `entryCreditUsd - entryFeesUsd + exitCashUsd - exitFeesUsd - paidFundingUsd`；资金费附原事件费率及当时永续价格。永续续持的开/平手续费豁免逐腿记录，并保留既有报表的两位小数与续持退款舍入顺序。证据包含本次实际使用的转换后浮点数，之后追加数据不会修改已输出结果；新数据重跑生成新目录和新文件身份。
+
+证据最多 10,000 个持仓、每个持仓 64 条腿、每笔 10,000 条资金费事件、整份 32 MiB；超出时明确失败并要求缩小范围，不发布截断成完整结果的证据。缺报价小时详情最多 1,024 个，超出计数单独保留。`sweep` 仍仅输出网格汇总，不生成逐笔证据。
 
 ## 策略配置（spec）
 

@@ -1,6 +1,7 @@
 """bt: BTC option backtests on raw hourly quotes.
 
   bt run SPEC [--set PATH=VALUE ...]          one backtest; SPEC = file, inline JSON or example name
+  bt preflight SPEC [--set PATH=VALUE ...]    offline strategy data/coverage inspection; no cache or download
   bt sweep SPEC --set PATH[+PATH]=V1,V2 ...   grid over every combination of the --set choices
   bt chain 2025-01-03T21 [--dte 2]            the option chain one hour sees (debugging leg choice)
   bt examples                                 list bundled example specs
@@ -29,9 +30,10 @@ def build(raw, sets):
     return specs.validate(raw)
 
 
-def market_for(args):
-    from .market import ParquetMarket
-    return ParquetMarket(args.data) if args.data else ParquetMarket()
+def market_for(args, evidence=False):
+    from .market import ParquetMarket, DEFAULT_DATA
+    return ParquetMarket(args.data or DEFAULT_DATA, price_unit=getattr(args, 'price_unit', None), iv_unit=getattr(args, 'iv_unit', None),
+                         perp_directory=getattr(args, 'perp_data', None), evidence=evidence)
 
 
 def out_dir(args, name):
@@ -41,21 +43,39 @@ def out_dir(args, name):
 
 
 def run_command(args):
+    from .evidence import RunEvidence
     raw = specs.load(args.spec)
     spec = build(raw, [(path, specs.parse_value(value)) for path, value in args.set])
-    market = market_for(args)
+    directory = out_dir(args, spec['name'])
+    if directory.exists():
+        raise FileExistsError(f'result folder already exists; use a fresh --out directory: {directory}')
+    market = market_for(args, evidence=True)
     started = time.monotonic()
-    trades, skipped, window = engine.run(spec, market)
+    evidence = RunEvidence(spec)
+    try:
+        trades, skipped, window = engine.run(spec, market, evidence=evidence)
+        bundle = evidence.bundle(trades, market)
+    finally:
+        market.close()
     summary = report.summarize(trades, skipped, window)
     summary["seconds"] = round(time.monotonic() - started, 1)
-    directory = out_dir(args, spec["name"])
-    report.write(directory, spec, trades, summary)
+    report.write(directory, spec, trades, summary, evidence=bundle)
     if args.json:
         print(json.dumps(summary, ensure_ascii=False))
     else:
         print("\n".join(report.text(spec, summary)))
-        print(f"files {directory}/{{trades.csv,summary.json,spec.json}}  ({summary['seconds']}s)")
+        print(f"files {directory}/{{trades.csv,summary.json,spec.json,evidence.jsonl,evidence-manifest.json}}  ({summary['seconds']}s)")
     return 0
+
+
+def preflight_command(args):
+    from .preflight import inspect
+    from .market import DEFAULT_DATA
+    from .binance import DEFAULT_DIR
+    spec = build(specs.load(args.spec), [(path, specs.parse_value(value)) for path, value in args.set])
+    result = inspect(spec, args.data or DEFAULT_DATA, args.perp_data or DEFAULT_DIR, args.price_unit, args.iv_unit)
+    print(json.dumps(result, ensure_ascii=False, indent=None if args.json else 2))
+    return 0 if result['ready'] else 2
 
 
 COLUMNS = [("trades", "trades", "{}"), ("win", "win_rate", "{:.1%}"), ("total", "total_pnl", "{:,.0f}"), ("mean", "mean_pnl", "{:,.1f}"),
@@ -130,13 +150,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="bt", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     pair = lambda text: tuple(text.split("=", 1)) if "=" in text else parser.error(f"--set expects PATH=VALUE, got {text!r}")
-    for name in ("run", "sweep"):
+    for name in ("run", "sweep", "preflight"):
         command = commands.add_parser(name)
         command.add_argument("spec")
         command.add_argument("--set", action="append", default=[], type=pair, metavar="PATH=VALUE")
         command.add_argument("--data", help="folder of YYYY-MM.parquet files (default $OPTBT_DATA or ~/data/options_hourly/BTC)")
-        command.add_argument("--out", help=f"result folder (default {RESULTS}/<name>/<utc time>)")
+        command.add_argument('--perp-data', help='existing Binance cache root (default $OPTBT_PERP_DATA or ~/data/binance)')
+        command.add_argument('--price-unit', choices=('btc', 'usd'))
+        command.add_argument('--iv-unit', choices=('fraction', 'percent'))
+        if name != 'preflight':
+            command.add_argument("--out", help=f"fresh result folder (default {RESULTS}/<name>/<utc time>)")
     commands.choices["run"].add_argument("--json", action="store_true", help="print the summary as one JSON line")
+    commands.choices['preflight'].add_argument('--json', action='store_true', help='print the inspection as one JSON line')
     commands.choices["sweep"].add_argument("--sort", default="total", help="column to sort by (default total)")
     commands.choices["sweep"].add_argument("--top", type=int, default=20)
     chain = commands.add_parser("chain")
@@ -150,6 +175,6 @@ def main(argv=None):
             for path in sorted(specs.EXAMPLES.glob("*.json")):
                 print(f"{path.stem}: {json.loads(path.read_text(encoding='utf-8')).get('description', '')}")
             return 0
-        return {"run": run_command, "sweep": sweep_command, "chain": chain_command}[args.command](args)
+        return {"run": run_command, "sweep": sweep_command, "chain": chain_command, 'preflight': preflight_command}[args.command](args)
     except specs.SpecError as exc:
         sys.exit(f"spec error: {exc}")
