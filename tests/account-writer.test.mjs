@@ -867,5 +867,5 @@ test('Python registry contract and failure scenarios run under the normal Node t
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 31 tests/);
+  assert.match(result.stderr, /Ran 32 tests/);
 });

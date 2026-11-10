@@ -53,7 +53,13 @@ test('real fills HTTP entry appends bounded native history asynchronously and re
     quantity: '1', quantityUnit: 'ANTHROPIC', price: '100', priceCurrency: 'USDG', fee: null, feeCurrency: null, realizedPnl: null, positionBefore: '0', positionAfter: '1' };
   const data = { accountId: '12345', fills: [fill], coverageStart: new Date(TIME - 1000).toISOString(), coverageEnd: new Date(TIME).toISOString(), truncated: false };
   release(data); await new Promise(resolve => setImmediate(resolve));
-  const live = await request(ROUTE); assert.equal(nativeScope(live).status, 'live'); assert.deepEqual(nativeScope(live).fills, [fill]);
+  const readStartedAt = Date.now(), live = await request(ROUTE);
+  assert.equal(nativeScope(live).status, 'live');
+  const attribution = nativeScope(live).fills[0]?.attribution;
+  assert.equal(attribution?.reason, 'missing-order');
+  const attributedAt = Date.parse(attribution.updatedAt);
+  assert.ok(attributedAt >= readStartedAt && attributedAt <= Date.now(), 'attribution timestamp belongs to this HTTP read');
+  assert.deepEqual(nativeScope(live).fills, [{ ...fill, attribution: { reason: 'missing-order', updatedAt: new Date(attributedAt).toISOString() } }]);
   assert.equal(JSON.stringify(live.data).includes(OWNER), false);
   for (let i = 0; i < 10; i += 1) { time += 30_000; await app.execution.tick(); }
   await request(ROUTE); assert.equal(reads, 2);
