@@ -473,7 +473,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     if (pathname === '/api/trading/positions') {
       if (method !== 'GET') throw new HttpError(405, '仓位接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '仓位接口不接受查询参数');
-      const data = await assetPositions.state();
+      const data = await assetPositions.state({ staleWhileRevalidate: true });
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
       return reply(200, data);
     }
@@ -574,7 +574,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     const project = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)\/(check|sync)$/);
     if (project && method === 'POST') {
       const id = project[1]; const row = rowFor(id);
-      if (project[2] === 'check') return reply(200, { snapshot: await check(id) });
+      if (project[2] === 'check') {
+        // Asset account edits notify the Hub through this check without changing its project revision.
+        assetPositions.invalidate(id);
+        return reply(200, { snapshot: await check(id) });
+      }
       const value = publicProject(row);
       if (value.adapter !== 'asset' || !value.enabled || !value.autoSync) throw new HttpError(400, '请先启用资产后台同步');
       void assetSync.run(id).catch(() => {}); return reply(202, { sync: assetSync.getStatus(id) });

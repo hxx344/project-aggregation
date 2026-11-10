@@ -96,13 +96,14 @@ export function normalizeAssetPositions(data, now = Date.now()) {
   return { schemaVersion: 1, generatedAt, exchanges };
 }
 
-export function ageAssetPositions(data, now = Date.now(), failed = false) {
+export function ageAssetPositions(data, now = Date.now(), failed = false, { refreshing = false } = {}) {
   if (!data) return null;
   return { ...data, exchanges: data.exchanges.map(exchange => ({ ...exchange, accounts: exchange.accounts.map(account => ({ ...account,
     scopes: account.scopes.map(scope => {
       const old = scope.fetchedAt !== null && now - Date.parse(scope.fetchedAt) > 90_000;
-      return scope.status === 'live' && (failed || old) ? { ...scope, status: 'stale', refreshing: false,
+      const current = scope.status === 'live' && (failed || old) ? { ...scope, status: 'stale', refreshing: false,
         error: failed ? 'Asset 来源暂不可用，保留上次仓位' : '仓位数据已过期，等待 Asset 更新' } : scope;
+      return refreshing && !['unconfigured', 'unsupported'].includes(scope.status) ? { ...current, refreshing: true } : current;
     }),
   })) })) };
 }

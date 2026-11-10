@@ -13,6 +13,12 @@ import { createOverviewDecoder, createStreamWatchdog } from './overview-feed';
 import { checkNotice, statusText } from './check-notice';
 import { groupLabels, ProjectIcon, Status } from './ProjectBadges';
 import { createTradingCache } from './trading-cache';
+import { warmTradingCache } from './trading-read';
+import { readTradingDays, readTradingPair } from './trading-preferences';
+import type { TradingState } from './trading-types';
+import { createPositionsCache } from './positions-cache';
+import { PositionsCacheContext } from './positions-cache-context';
+import type { TradingPositionsResponse } from './trading-positions-types';
 import { readTradingSection } from './trading-navigation';
 import type { Notice } from './check-notice';
 import type { NavigationQuery } from './hub-state';
@@ -79,6 +85,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
 export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [tradingCache] = useState(createTradingCache);
+  const [positionsCache] = useState(() => createPositionsCache(signal => api<TradingPositionsResponse>('/api/trading/positions', { signal, timeoutMs: 15_000 })));
   const [route, setRoute] = useState<Route>(readRoute);
   const [diagnosticOpened, setDiagnosticOpened] = useState(false);
   useEffect(() => { if (route.view === 'diagnostic') setDiagnosticOpened(true); }, [route.view]);
@@ -113,13 +120,34 @@ export default function App() {
   }, [menuOpen]);
 
   // 退出或会话过期时一并清掉 Aero 市场的本机缓存。
-  const expire = useCallback(() => { tradingCache.clear(); void clearAeroMarketCache(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
+  const expire = useCallback(() => { tradingCache.clear(); positionsCache.clear(); void clearAeroMarketCache(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache, positionsCache]);
   useEffect(() => {
     const controller = new AbortController();
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { if (controller.signal.aborted) return; setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (!controller.signal.aborted && e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
     return () => controller.abort();
   }, []);
-  const accept = useCallback((data: Overview) => { receivedAt.current = performance.now(); setOverview(data); setError(''); }, []);
+  const positionsSources = useRef<string | null>(null);
+  const accept = useCallback((data: Overview) => {
+    const sources = JSON.stringify(data.projects.filter(item => item.project.adapter === 'asset').map(item => item.project));
+    if (positionsSources.current !== null && positionsSources.current !== sources) positionsCache.invalidate();
+    positionsSources.current = sources;
+    receivedAt.current = performance.now(); setOverview(data); setError('');
+  }, [positionsCache]);
+  const tradingWarmed = useRef(false);
+  useEffect(() => {
+    if (!authenticated) { tradingWarmed.current = false; return; }
+    if (!overview || tradingWarmed.current) return;
+    // Only prefetch the user's last observation view; the default positions
+    // entry must not start arbitrage/execution reads that the user never opened.
+    const selected = readTradingSection(location.search);
+    if (!['legs', 'pnl', 'accounts'].includes(selected)) return;
+    const timer = setTimeout(() => {
+      if (document.hidden || !navigator.onLine) return;
+      tradingWarmed.current = true;
+      void warmTradingCache(tradingCache, api<TradingState>, { days: readTradingDays(location.search), pair: readTradingPair(location.search) }, expire);
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [authenticated, overview, tradingCache, expire]);
   const load = useCallback((signal?: AbortSignal, force = false) => {
     if (pendingLoad.current && !pendingLoad.current.signal.aborted && !force) return pendingLoad.current.promise;
     pendingLoad.current?.controller.abort();
@@ -177,15 +205,15 @@ export default function App() {
       }, 1000);
     };
     const visible = () => { if (document.hidden) connect(); else resume(); };
-    const offline = () => { tradingCache.markUnavailable(); clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
-    if (!navigator.onLine) tradingCache.markUnavailable();
+    const offline = () => { tradingCache.markUnavailable(); positionsCache.markUnavailable(); clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
+    if (!navigator.onLine) { tradingCache.markUnavailable(); positionsCache.markUnavailable(); }
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
     // This local timer only sends requests when the stream heartbeat has expired.
     const health = window.setInterval(() => { if (navigator.onLine && !document.hidden && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
     return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearTimeout(resumeTimer); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
-  }, [authenticated, accept, load, tradingCache]);
+  }, [authenticated, accept, load, tradingCache, positionsCache]);
   useEffect(() => {
     if (!overview || !authenticated) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -208,11 +236,17 @@ export default function App() {
     history.pushState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}`); setRoute(next); setMenuOpen(false); if (menuOpen) mobileMenuButton.current?.focus(); window.scrollTo(0, 0);
   };
   const changed = useCallback((id: string) => {
+    const asset = overview?.projects.some(item => item.project.id === id && item.project.adapter === 'asset');
+    if (asset) positionsCache.invalidate({ id, run: async signal => {
+      await api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal, timeoutMs: 10_000 });
+    } });
     if (refreshTimers.current.has(id)) return;
     refreshTimers.current.set(id, setTimeout(() => {
-      void api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal: AbortSignal.timeout(10_000) }).then(() => { if (!streamLive.current) void load(); }).catch(e => { if (e instanceof ApiError && e.status === 401) expire(); }).finally(() => refreshTimers.current.delete(id));
+      const checking = asset ? positionsCache.refresh().then(outcome => { if (outcome.status === 'unauthorized') expire(); })
+        : api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal: AbortSignal.timeout(10_000) });
+      void checking.then(() => { if (!streamLive.current) void load(); }).catch(e => { if (e instanceof ApiError && e.status === 401) expire(); }).finally(() => refreshTimers.current.delete(id));
     }, 500));
-  }, [load, expire]);
+  }, [load, expire, overview, positionsCache]);
   const check = async (project: Project) => {
     setNotice(null);
     setChecking(project.id);
@@ -225,7 +259,7 @@ export default function App() {
     catch (e) { setError(e instanceof Error ? e.message : '退出失败，请重试'); }
   };
   if (authenticated === null) return <div className="app-loading"><LoaderCircle className="spin" /><p>正在打开工作台</p></div>;
-  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); void clearAeroMarketCache(); setError(''); setAuthenticated(true); }} /></>;
+  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); positionsCache.clear(); void clearAeroMarketCache(); setError(''); setAuthenticated(true); }} /></>;
   const serverNow = overview ? Date.parse(overview.generatedAt) + performance.now() - receivedAt.current : Date.now();
   const snapshots = overview?.projects.map(snapshot => ageSnapshot(snapshot, serverNow)) || [];
   const selected = snapshots.find(s => s.project.id === route.id);
@@ -237,7 +271,7 @@ export default function App() {
   const monitorEntry = firstOf('monitoring'), assetEntry = firstOf('assets');
   const projectNav = (s: Snapshot) => <button key={s.project.id} className={`nav-item project-nav ${route.view === 'project' && route.id === s.project.id ? 'active' : ''}`} aria-current={route.view === 'project' && route.id === s.project.id ? 'page' : undefined} onPointerEnter={() => setPreloadId(s.project.id)} onFocus={() => setPreloadId(s.project.id)} onClick={() => navigate({ view: 'project', id: s.project.id })}><ProjectIcon category={s.project.category} size={17} /><span>{s.project.name}</span><span className={`nav-status ${s.project.adapter === 'link' ? 'unconfigured' : s.state}`} aria-label={s.project.adapter === 'link' ? '网页入口' : statusText[s.state]} /></button>;
   const viewNav = (view: Route['view'], label: string, icon: ReactNode, extra?: ReactNode) => <button className={`nav-item ${route.view === view ? 'active' : ''}`} aria-current={route.view === view ? 'page' : undefined} onClick={() => navigate({ view, id: '' })}>{icon}<span className="nav-text">{label}</span>{extra}</button>;
-  return <div className={`app-shell ${route.view === 'project' ? 'project-shell' : ''}`}>
+  return <PositionsCacheContext.Provider value={positionsCache}><div className={`app-shell ${route.view === 'project' ? 'project-shell' : ''}`}>
     <a href="#main-content" className="skip-link">跳到主要内容</a>
     {menuOpen ? <button className="nav-backdrop" aria-label="关闭导航" onClick={() => { setMenuOpen(false); mobileMenuButton.current?.focus(); }} /> : null}
     <aside ref={sidebar} className={`sidebar ${menuOpen ? 'open' : ''}`}><Brand /><nav aria-label="主导航">{viewNav('overview', '总览', <LayoutDashboard size={17} />, attentionCount ? <span className="nav-count" aria-hidden="true">{attentionCount}</span> : null)}
@@ -254,9 +288,9 @@ export default function App() {
       </main>
       {!menuOpen ? <nav className="mobile-tabbar" aria-label="快捷导航"><button className={route.view === 'overview' ? 'active' : ''} onClick={() => navigate({ view: 'overview', id: '' })}><LayoutDashboard size={19} />总览</button><button className={route.view === 'trading' ? 'active' : ''} onClick={() => navigate({ view: 'trading', id: '' })}><ArrowLeftRight size={19} />交易</button>{monitorEntry ? <button className={route.view === 'project' && route.id === monitorEntry.project.id ? 'active' : ''} onClick={() => navigate({ view: 'project', id: monitorEntry.project.id })}><Activity size={19} />监控</button> : null}{assetEntry ? <button className={route.view === 'project' && route.id === assetEntry.project.id ? 'active' : ''} onClick={() => navigate({ view: 'project', id: assetEntry.project.id })}><Wallet size={19} />资产</button> : null}<button aria-label="更多导航" onClick={() => setMenuOpen(true)}><Menu size={19} />更多</button></nav> : null}
     </div>
-    {editor ? <ProjectEditor key={editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { setEditor(null); setNotice({ title: message, tone: 'success' }); await load(); }} onExpired={expire} /> : null}
+    {editor ? <ProjectEditor key={editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { positionsCache.invalidate(); setEditor(null); setNotice({ title: message, tone: 'success' }); await load(); }} onExpired={expire} /> : null}
     {notice ? <div className={`toast ${notice.tone}`} role={notice.tone === 'warning' || notice.tone === 'error' ? 'alert' : 'status'}>{notice.tone === 'success' ? <Check size={18} /> : notice.tone === 'info' ? <Info size={18} /> : <CircleAlert size={18} />}<div className="toast-content"><strong>{notice.title}</strong>{notice.detail ? <p>{notice.detail}</p> : null}</div><button aria-label="关闭提示" onClick={() => setNotice(null)}><X size={16} /></button></div> : null}
-  </div>;
+  </div></PositionsCacheContext.Provider>;
 }
 
 function OverviewPage({ snapshots, now, onProject, onEdit, onManage, onPreload }: { now: number; onPreload: (id: string) => void; snapshots: Snapshot[]; onProject: (id: string) => void; onEdit: (p: Project) => void; onManage: () => void }) {

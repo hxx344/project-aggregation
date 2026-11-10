@@ -55,8 +55,8 @@ async function fixture(t) {
   });
   return { request, configure, calls, connect: () => configure({ apiUrl: assetOrigin, url: assetOrigin, password: assetPassword, autoSync: false }),
     reply: handler => { reply = handler; }, revoke: () => { loginCount++; },
-    hold: () => { const entered = deferred(), gate = deferred(); gates.push(gate);
-      reply = async (_req, res) => { entered.resolve(); await gate.promise; if (!res.destroyed) send(res, 200, body()); };
+    hold: (snapshot = body) => { const entered = deferred(), gate = deferred(); gates.push(gate);
+      reply = async (_req, res) => { entered.resolve(); await gate.promise; if (!res.destroyed) send(res, 200, snapshot()); };
       return { entered: entered.promise, release: gate.resolve };
     },
   };
@@ -86,12 +86,72 @@ test('old Asset versions get an upgrade message and session expiration is retrie
   assert.ok(!JSON.stringify(result.data).includes('upstream-secret'));
 });
 
+test('positions HTTP reads serve cached rows while a slow refresh is shared, then publish a confirmed empty result', async t => {
+  const f = await fixture(t); await f.connect();
+  const initial = body(), initialScope = initial.exchanges[0].accounts[0].scopes[0];
+  initialScope.positions.push({ id: 'BTCUSDT:long', symbol: 'BTCUSDT', instrumentId: 'BTCUSDT', side: 'long', quantity: '1', quantityUnit: 'BTC',
+    contractSize: null, entryPrice: '60000', markPrice: '61000', priceCurrency: 'USDT', notional: '61000', notionalCurrency: 'USDT',
+    unrealizedPnl: '1000', pnlCurrency: 'USDT', leverage: null, marginMode: null, liquidationPrice: null, sourceUpdatedAt: initialScope.fetchedAt });
+  f.reply(async (_req, res) => send(res, 200, initial));
+  const first = await f.request('/api/trading/positions');
+  const hold = f.hold(); let timer;
+  try {
+    const reads = Promise.all(Array.from({ length: 3 }, () => f.request('/api/trading/positions')));
+    const cached = await Promise.race([reads, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('positions HTTP route waited for its slow refresh')), 500); })]);
+    await hold.entered;
+    for (const result of cached) {
+      const source = result.data.sources[0], currentScope = source.data.exchanges[0].accounts[0].scopes[0];
+      assert.equal(result.response.status, 200);
+      assert.equal(source.checkedAt, first.data.sources[0].checkedAt);
+      assert.equal(currentScope.fetchedAt, initialScope.fetchedAt);
+      assert.equal(currentScope.refreshing, true); assert.equal(currentScope.positions.length, 1);
+    }
+    assert.equal(f.calls.filter(call => call.url === '/api/hub/positions').length, 2, 'concurrent UI consumers share the refresh');
+    f.reply(async (_req, res) => send(res, 200, body())); hold.release();
+    let current;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      current = (await f.request('/api/trading/positions')).data.sources[0].data.exchanges[0].accounts[0].scopes[0];
+      if (!current.positions.length) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.equal(current.status, 'live'); assert.deepEqual(current.positions, []);
+  } finally { clearTimeout(timer); hold.release(); }
+});
+
 test('disabling a source during a read removes it and discards the late payload', async t => {
   const f = await fixture(t); await f.connect();
   const hold = f.hold(), pending = f.request('/api/trading/positions'); await hold.entered;
   assert.equal((await f.configure({ enabled: false })).response.status, 200);
   hold.release(); const result = await pending;
   assert.deepEqual(result.data.sources, []);
+});
+
+test('checking an unchanged project drops positions from a removed Asset account before the next read', async t => {
+  const f = await fixture(t), connected = await f.connect();
+  assert.equal(typeof connected.data.project.revision, 'string');
+  const initial = body(), initialScope = initial.exchanges[0].accounts[0].scopes[0];
+  initialScope.positions.push({ id: 'BTCUSDT:long', symbol: 'BTCUSDT', instrumentId: 'BTCUSDT', side: 'long', quantity: '1', quantityUnit: 'BTC',
+    contractSize: null, entryPrice: '60000', markPrice: '61000', priceCurrency: 'USDT', notional: '61000', notionalCurrency: 'USDT',
+    unrealizedPnl: '1000', pnlCurrency: 'USDT', leverage: null, marginMode: null, liquidationPrice: null, sourceUpdatedAt: initialScope.fetchedAt });
+  f.reply(async (_req, res) => send(res, 200, initial));
+  const first = await f.request('/api/trading/positions');
+  assert.equal(first.data.sources[0].data.exchanges[0].accounts[0].scopes[0].positions.length, 1);
+  const removed = body(); removed.exchanges[0].accounts = [];
+  const hold = f.hold(() => removed);
+  try {
+    const checked = await f.request('/api/projects/asset/check', { method: 'POST', data: {} });
+    assert.equal(checked.response.status, 200);
+    assert.equal(checked.data.snapshot.project.revision, connected.data.project.revision, 'the Asset account change does not alter the Hub project revision');
+    let completed = false;
+    const pending = f.request('/api/trading/positions').then(result => { completed = true; return result; });
+    await hold.entered;
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(completed, false, 'the invalidated snapshot cannot be returned as live while the new account directory is pending');
+    hold.release(); const current = await pending;
+    assert.equal(current.response.status, 200); assert.equal(current.data.sources[0].status, 'ready');
+    assert.deepEqual(current.data.sources[0].data.exchanges[0].accounts, []);
+    assert.equal(f.calls.filter(call => call.url === '/api/hub/positions').length, 2);
+  } finally { hold.release(); }
 });
 
 test('logout while an Asset request is pending does not return account data', async t => {

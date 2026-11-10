@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } 
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
-import { readTradingCache } from './trading-read';
+import { readTradingPage } from './trading-read';
 import { ageTradingData, pairExchanges, tradingCacheNow } from './trading-cache';
 import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
@@ -188,26 +188,26 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
     if (!force && document.hidden && lastReadAt.current !== null && performance.now() - lastReadAt.current < 30_000) return Promise.resolve();
     if (force) cancelRead();
     const requestedPair = pairRef.current;
-    const request = cache.beginRead(requestedPair), controller = request.controller;
     const version = ++sequence.current;
     const requestedDays = daysRef.current;
     const requestedPage = pageRef.current;
+    const shared = readTradingPage(cache, api<TradingState>, requestedDays, requestedPage, requestedPair);
+    const request = shared.request, controller = request.controller;
     lastReadAt.current = performance.now();
     setReading(true);
     const promise = (async () => {
       try {
-        const next = await readTradingCache(api<TradingState>, `/api/trading?days=${requestedDays}&page=${requestedPage}&pair=${requestedPair}`, controller.signal);
-        if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
-        if (cache.accept(request, next)) {
+        const next = await shared.promise;
+        if (!mounted.current || version !== sequence.current || !next) return;
+        if (cache.get(next.period.days, next.funding.pagination.page, requestedPair)?.data === next) {
           setError('');
           if (requestedPair === pairRef.current && requestedDays === daysRef.current && requestedPage === pageRef.current && next.funding.pagination.page !== requestedPage) setPage(next.funding.pagination.page);
         }
       } catch (cause) {
         if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
         if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
-        else { cache.fail(request, requestedDays, requestedPage); setError(cause instanceof Error ? cause.message : '交易数据读取失败，请重试。'); }
+        else setError(cause instanceof Error ? cause.message : '交易数据读取失败，请重试。');
       } finally {
-        cache.finish(request);
         if (mounted.current && version === sequence.current) setReading(false);
         if (pending.current?.controller === controller) pending.current = null;
       }

@@ -7,9 +7,10 @@ import ModuleRecovery from './ModuleRecovery';
 import { ProjectIcon, Status } from './ProjectBadges';
 import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
-import { createPositionsSource, EXECUTION_LEG_MARKETS, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest, withExecutionLegs } from './hub-positions';
+import { createPositionsSource, EXECUTION_LEG_MARKETS, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsRequest } from './hub-positions';
 import { FILLS_CAPABILITIES, FILLS_CACHE_MS, FILLS_TIMEOUT_MS, fillsCacheMs, fillsReply, fillsRequest, type FillMarket } from './hub-fills';
 import { observeSharesChanges, readMonitorShares } from './trading-preferences';
+import { usePositionsCache } from './positions-cache-context';
 
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
@@ -40,8 +41,8 @@ export default function ProjectPage({ project, snapshot, now, active, background
   const moduleCapabilities = useRef<string[]>([]);
   // Advances whenever the iframe document may have changed, so late replies never reach a newer document.
   const documentGeneration = useRef(0);
-  const positions = useRef<ReturnType<typeof createPositionsSource> | null>(null);
-  const executionLegs = useRef<ReturnType<typeof createPositionsSource> | null>(null);
+  const positions = usePositionsCache();
+  const executionLegs = useRef<{ generation: number; source: ReturnType<typeof createPositionsSource> } | null>(null);
   const fills = useRef<Partial<Record<FillMarket, ReturnType<typeof createPositionsSource>>>>({});
   const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading });
   latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading };
@@ -83,14 +84,18 @@ export default function ProjectPage({ project, snapshot, now, active, background
       } else if (positionsBridge && connected.current && data.type === 'positions-request' && moduleCapabilities.current.includes('positions')) {
         const request = positionsRequest(data); if (!request) return;
         const generation = documentGeneration.current;
+        const readGeneration = positions.generation();
         // Background reads are only for the visible page; hidden pages get the cache or 'unavailable'.
         // A 401 here is a background helper failure: answer the module, never expire the hub session.
-        positions.current ??= createPositionsSource(signal => api('/api/trading/positions', { signal, timeoutMs: POSITIONS_TIMEOUT_MS }));
-        const legs = EXECUTION_LEG_MARKETS.includes(request.market) ? executionLegs.current ??= createPositionsSource(signal => api('/api/trading/anthropic', { signal, timeoutMs: POSITIONS_TIMEOUT_MS })) : null;
+        if (executionLegs.current && executionLegs.current.generation !== readGeneration) {
+          executionLegs.current.source.dispose(); executionLegs.current = null;
+        }
+        const legs = EXECUTION_LEG_MARKETS.includes(request.market)
+          ? (executionLegs.current ??= { generation: readGeneration, source: createPositionsSource(signal => api('/api/trading/anthropic', { signal, timeoutMs: POSITIONS_TIMEOUT_MS })) }).source : null;
         const allowNetwork = latest.current.active && document.visibilityState === 'visible';
-        void Promise.all([positions.current.read(allowNetwork), legs?.read(allowNetwork)]).then(([outcome, legOutcome]) => {
+        void Promise.all([positions.read(allowNetwork), legs?.read(allowNetwork)]).then(([outcome, legOutcome]) => {
           if (generation !== documentGeneration.current || !connected.current || !moduleCapabilities.current.includes('positions')) return;
-          post(positionsReply(request, legOutcome ? withExecutionLegs(outcome, legOutcome) : outcome, Date.now()));
+          post(positions.reply(request, legOutcome, readGeneration));
           // A foreground request this page refused means the module missed an activity change; resend it.
           if ([outcome, legOutcome].some(value => value?.status === 'unavailable' && value.reason === 'background')) synchronize();
         });
@@ -113,7 +118,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
     return () => { stopShares(); window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
   useEffect(synchronize, [active, backgroundUpdates, query, source]);
-  useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; executionLegs.current?.dispose(); executionLegs.current = null; for (const source of Object.values(fills.current)) source.dispose(); fills.current = {}; }, []);
+  useEffect(() => () => { documentGeneration.current++; executionLegs.current?.source.dispose(); executionLegs.current = null; for (const source of Object.values(fills.current)) source.dispose(); fills.current = {}; }, []);
 
   useEffect(() => {
     const pending = pendingTabs.current;

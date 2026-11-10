@@ -167,6 +167,12 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:3100:127.0.0.1:3100 user@server
 
 Monitor 关联交易经工作台持仓桥使用这份数据。Anthropic 市场另读 `GET /api/trading/anthropic` 中 Hyperliquid 实盘连接（主账户地址）的 `io:ANTH`、`xyz:ANT` 仓位，作为独立来源「套利交易实盘」并入，只取方向、数量（币数）、入场价、标记价与未实现盈亏，结算币种不标注；同一接口里 Binance/OKX 只读账户的腿与 Lighter RH（按实盘连接钱包地址读取）的腿都不并入，避免与 Asset 重复（Asset 按资产页填写的 L1 地址直接读取 Lighter RH 仓位）。该接口读取失败或格式无效时只把这一来源记为不可用，Asset 仓位照常返回；实盘未连接 Hyperliquid 时不算缺失；工作台关闭交易后台刷新时不读取 Hyperliquid，该来源一直是同步中，列表标为不完整。Monitor 按 `ANTHROPIC`、`IOANTH`、`XYZANT` 匹配，保留 HIP-3 前缀，不用单独的 `ANT`/`ANTH`。
 
+仓位 UI 读取在服务端已有当前来源版本的成功快照时立即返回，并在后台合并刷新；新增慢来源不阻塞已有来源，全部来源均无缓存时仍进行有界首次读取。飞书汇总等等待型读取保持原行为。后台刷新不更新快照的原始时间，失败保留旧值，成功空列表替换旧仓位。
+
+浏览器中全部仓位与 Monitor 持仓桥共用当前登录会话的一份快照和在途请求；切页保留数据，刷新失败或离线时标旧。全部仓位沿用前台 5 秒、隐藏 30 秒读取，持仓桥按原 20 秒窗口限制请求，不向 localStorage/sessionStorage 保存仓位。退出、重新登录、401、Asset 来源配置或目录变更通知清空快照并拒收旧在途结果。过期空快照不表示已确认无持仓。套利观察页复用自己的组合/区间/分页缓存；登录后仅对上次选中的观察分区延迟预热当前组合首页一次，与页面共享 GET，不读取账户导入或实盘执行状态。
+
+Asset 内部账户变更通知会先通过已有项目检查接口清除对应服务端仓位快照，浏览器等待该检查应答后才能重新读取；多个来源的失效检查合并，失败的检查留到下一轮重试，整轮检查与仓位读取共用 15 秒期限。关联交易等待补充来源完成后重新取当前缓存；期间清空、离线或会话失效时，不得发出先前捕获的有效仓位。
+
 Asset 响应为 `schemaVersion: 1`、`generatedAt`、`exchanges[]`。每个交易所有 `id/name/accounts[]`，每个账户有 `id/name/configured/revision/scopes[]`，每个产品范围有 `id/label/status/refreshing/fetchedAt/error/positions[]`。状态支持 `unconfigured/loading/live/stale/error/unsupported`。仓位明确 `instrumentId`、`side`、`quantity/quantityUnit`、`contractSize`、`entryPrice/markPrice/priceCurrency`、`notional/notionalCurrency`、`unrealizedPnl/pnlCurrency`、`leverage/marginMode/liquidationPrice` 和 `sourceUpdatedAt`；数值为十进制字符串，未知字段为 `null`。目录由 Asset 维护，工作台不硬编码交易所列表，也不调用旧密钥导出接口。
 
 工作台只保留经过字段校验的响应和受控错误消息，不透传上游原始对象、诊断或凭据。Asset 只在被读取时刷新交易所：每个范围最快 5 秒一次（Variational 每次启动 Python 进程，为 30 秒），全局最多 3 个并发。Binance 与 Aster 的公开交易对目录按进程缓存 10 分钟，持仓出现目录中没有的合约时立即重新拉取，拉取失败不缓存；确认 Key 只读的权限检查每次刷新都执行。后台读取会让已启用项目的 Asset 缓存保持有效，不再按 15 分钟无人读取回收。只有 `live` 的空列表表示已确认空仓；范围超过 90 秒未更新即过期，来源失败保留同一项目配置版本的旧快照并降级状态。项目配置改变、停用或删除立即中止旧请求并清除缓存，迟到响应不能恢复旧数据。`generatedAt` 与 `checkedAt` 不替代仓位实际读取时间。

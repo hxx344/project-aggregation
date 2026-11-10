@@ -94,6 +94,7 @@ export function positionItems(response: unknown, bases: readonly string[], now: 
           const positions = list(scope.positions);
           if ((scopeStatus === 'error' || scopeStatus === 'loading') && !positions.length) sourcesIncomplete = true;
           const stale = scopeStatus === 'stale' || scopeStatus === 'error' || sourceStatus === 'stale' || sourceStatus === 'unavailable' || old(fetchedAt, now);
+          if (stale && !positions.length && !['unconfigured', 'unsupported'].includes(scopeStatus)) sourcesIncomplete = true;
           for (const positionValue of positions) {
             const position = object(positionValue), symbol = text(position.symbol), instrumentId = text(position.instrumentId);
             const side = text(position.side);
