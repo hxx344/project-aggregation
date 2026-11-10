@@ -8,15 +8,19 @@ import { HttpError } from '../http-common.mjs';
 export const SCOPES = Object.freeze(['public', 'system']);
 export const MAX_TOKENS = 8;
 export const MAX_LABEL_LENGTH = 40;
-const KEY = 'agent-feed-tokens';
+export const TOKENS_KEY = 'agent-feed-tokens';
+const KEY = TOKENS_KEY;
 const RAW = /^paf_[A-Za-z0-9_-]{43}$/;
 const HASH = /^[0-9a-f]{64}$/;
 const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const digest = value => createHash('sha256').update(value).digest();
-const label = value => typeof value === 'string' && value.length > 0 && value.length <= MAX_LABEL_LENGTH && value === value.trim() && !/[\u0000-\u001f\u007f]/.test(value);
+const label = value => typeof value === 'string' && value.length > 0 && value.length <= MAX_LABEL_LENGTH && value === value.trim() && !/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069]/.test(value);
 const scopes = value => Array.isArray(value) && value.length > 0 && new Set(value).size === value.length && value.every(item => SCOPES.includes(item));
 const entry = value => value !== null && typeof value === 'object' && ID.test(value.id) && label(value.label) && scopes(value.scopes)
   && typeof value.hash === 'string' && HASH.test(value.hash) && typeof value.createdAt === 'string' && !Number.isNaN(Date.parse(value.createdAt));
+
+// Written when the password is reset: whoever could log in could also have made a token.
+export const NO_TOKENS = JSON.stringify({ schemaVersion: 1, tokens: [] });
 
 export function createAgentTokens({ getSetting, setSetting, now = Date.now }) {
   // Last use is kept per API instance and lost on restart: a read must not write the database.

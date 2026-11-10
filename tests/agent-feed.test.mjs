@@ -47,7 +47,7 @@ test('a token is shown once, stored only as a hash, and stops working when revok
 test('malformed tokens, bad input and the token limit are refused', () => {
   const tokens = createAgentTokens(settings());
   for (const value of [undefined, null, '', 'paf_short', `paf_${'a'.repeat(44)}`, `xyz_${'a'.repeat(43)}`, `paf_${'a'.repeat(43)}`]) assert.equal(tokens.verify(value), null);
-  for (const body of [null, {}, { label: '', scopes: ['public'] }, { label: ' x', scopes: ['public'] }, { label: 'x', scopes: [] }, { label: 'x', scopes: ['portfolio'] }, { label: 'x', scopes: ['public', 'public'] }, { label: 'a'.repeat(41), scopes: ['public'] }])
+  for (const body of [null, {}, { label: '', scopes: ['public'] }, { label: ' x', scopes: ['public'] }, { label: 'x', scopes: [] }, { label: 'x', scopes: ['portfolio'] }, { label: 'x', scopes: ['public', 'public'] }, { label: 'a'.repeat(41), scopes: ['public'] }, { label: 'a\u202eb', scopes: ['public'] }, { label: 'a\u200bb', scopes: ['public'] }])
     assert.throws(() => tokens.create(body), { status: 400 });
   for (let index = 0; index < MAX_TOKENS; index += 1) tokens.create({ label: `agent-${index}`, scopes: ['public'] });
   assert.throws(() => tokens.create({ label: 'one-more', scopes: ['public'] }), { status: 409 });
@@ -89,7 +89,8 @@ test('a dataset is copied field by field, and a malformed one is dropped whole',
 const project = (id, adapter, extra = {}) => ({ id, name: id, adapter, enabled: true, url: 'https://internal.example/path', apiUrl: 'https://internal.example/api', ...extra });
 const overviewOf = at => ({ generatedAt: iso(at), projects: [
   { project: project('monitor', 'monitor'), state: 'online', message: '正常', checkedAt: iso(at - 5000), lastSuccessAt: iso(at - 5000), updatedAt: iso(at - 8000), latencyMs: 42, staleAfterSeconds: 120, diagnostics: [],
-    metrics: [{ key: 'spread', label: '布伦特 − WTI 价差', value: 3.14159265, unit: 'USDT/桶' }, { key: 'modules', label: '监控模块', value: 4, unit: '个' }, { key: 'bad', label: 'x', value: { a: 1 } }] },
+    metrics: [{ key: 'spread', label: '布伦特 − WTI 价差', value: 3.14159265, unit: 'USDT/桶' }, { key: 'modules', label: '监控模块', value: 4, unit: '个' }, { key: 'bad', label: 'x', value: { a: 1 } },
+      { key: 'premium_xyz', label: 'Binance 相对 xyz:ANT 溢价', value: null, unit: '%' }, { key: 'position_pnl', label: '持仓盈亏', value: 987654.5, unit: 'USD' }, { key: 'funding', label: '资金费率年化', value: 'wallet 0xdef', unit: '%' }] },
   { project: project('asset', 'asset'), state: 'partial', message: '账户 0xabc 余额读取失败', checkedAt: iso(at - 9000), lastSuccessAt: iso(at - 60_000), updatedAt: iso(at - 9000), latencyMs: 800, staleAfterSeconds: 900,
     diagnostics: [{ id: 'hub:connection', kind: 'fault', message: 'https://internal.example/api?key=abc 失败', firstSeenAt: iso(at) }], metrics: [{ key: 'ledger_total', label: '表内总额', value: 123456.78, unit: 'USD' }], sync: { account: 'private' } },
   { project: project('docs', 'link'), state: 'online', message: '链接入口', checkedAt: null, updatedAt: null, latencyMs: null, metrics: [] },
@@ -107,12 +108,17 @@ const aeroState = at => ({ schema: 1, revision: 7, serverNow: at, config: { enab
 test('the data plane builds its datasets from market and state fields only', () => {
   const feed = createRuntimeFeed({ readOverview: () => overviewOf(T0), readEventLoop: () => lag(T0), readAero: () => aeroState(T0), now: () => T0, log: quiet })();
   const text = JSON.stringify(feed);
-  for (const leak of ['ledger_total', '123456', '0xabc', 'internal.example', 'SECRET-KEY', 'rpc.example', 'favourite', 'private', '余额']) assert.ok(!text.includes(leak), leak);
+  for (const leak of ['ledger_total', '123456', '0xabc', 'internal.example', 'SECRET-KEY', 'rpc.example', 'favourite', 'private', '余额', 'position_pnl', '987654', '0xdef']) assert.ok(!text.includes(leak), leak);
   const byId = Object.fromEntries(feed.datasets.map(item => [item.id, item]));
   assert.deepEqual(Object.keys(byId), ['system.projects', 'system.event-loop', 'market.monitor', 'market.aero']);
-  // Monitor metrics only; the source time is the summary's own data time and the expiry follows its staleAfterSeconds.
-  assert.deepEqual(byId['market.monitor'].rows.map(item => [item.entity, item.metric, item.value, item.unit, item.asOf, item.expiresAt, item.stale]),
-    [['monitor:monitor', 'spread', 3.14159, 'USDT/桶', iso(T0 - 8000), iso(T0 + 112_000), false], ['monitor:monitor', 'modules', 4, '个', iso(T0 - 8000), iso(T0 + 112_000), false]]);
+  // Monitor's listed metrics only, as numbers; the source time is the summary's own data time and the expiry follows its staleAfterSeconds.
+  // A value Monitor could not read stays a row with null; an unlisted key or a text value is not served.
+  assert.deepEqual(byId['market.monitor'].rows.map(item => [item.entity, item.metric, item.value, item.unit, item.asOf, item.expiresAt, item.stale, item.status]),
+    [['monitor:monitor:oil', 'spread', 3.14159, 'USDT/桶', iso(T0 - 8000), iso(T0 + 112_000), false, 'ok'], ['monitor:monitor:oil', 'modules', 4, '个', iso(T0 - 8000), iso(T0 + 112_000), false, 'ok'],
+      ['monitor:monitor:oil', 'premium_xyz', null, '%', iso(T0 - 8000), iso(T0 + 112_000), false, 'unknown']]);
+  // The monitor a project summarises is part of the entity: `spread` is another quantity under hynix.
+  const entityOf = url => { const other = overviewOf(T0); other.projects[0].project.url = url; return createRuntimeFeed({ readOverview: () => other, readEventLoop: () => lag(T0), readAero: () => aeroState(T0), now: () => T0, log: quiet })().datasets[2].rows[0].entity; };
+  assert.deepEqual(['https://hub.example/?monitor=hynix', 'https://hub.example/?monitor=../x%20y', 'not a url'].map(entityOf), ['monitor:monitor:hynix', 'monitor:monitor:unknown', 'monitor:monitor:unknown']);
   // Project rows: state and counts, no metric values or messages; link entries are not data sources.
   const states = byId['system.projects'].rows.filter(item => item.metric === 'state').map(item => [item.entity, item.value, item.status]);
   assert.deepEqual(states, [['project:monitor', 'online', 'ok'], ['project:asset', 'partial', 'warn'], ['project:aster', 'disabled', 'ok']]);
@@ -166,6 +172,9 @@ test('a snapshot serves the scopes of the token, in the row format of the catalo
   assert.deepEqual(all.datasets[1].rows.filter(item => item.metric !== 'restart_count').map(item => [item.entity, item.metric, item.value, item.status]),
     [['runtime', 'ready', true, 'ok'], ['module:monitor', 'state', 'ready', 'ok'], ['module:monitor', 'consecutive_failures', 0, 'ok'], ['module:aster', 'state', 'backoff', 'alert'], ['module:aster', 'consecutive_failures', 3, 'warn']]);
   assert.deepEqual(feed.catalog(['public']).datasets.map(item => item.id), ['market.monitor', 'market.aero']);
+  // The host cannot be read: that dataset alone is unavailable.
+  const blind = createAgentFeed({ hostStatus: { read: async () => { throw new Error('statfs'); } }, supervisor: { status: async () => ({ ready: true, modules: [] }) }, runtime: { agentFeed: async () => ({ schemaVersion: 1, datasets: [] }) }, now: () => T0, log: quiet });
+  assert.deepEqual((await blind.snapshot(['system'], ['system.host', 'system.runtime'])).datasets.map(item => [item.id, item.status, item.message]), [['system.host', 'unavailable', '数据集暂时无法生成'], ['system.runtime', 'ok', null]]);
   assert.ok(!JSON.stringify(feed.catalog(['public', 'system'])).includes('origin'));
 });
 
@@ -180,6 +189,9 @@ test('readers share one build per interval, and staleness is judged when the sna
   assert.deepEqual([calls(), reused.generatedAt, reused.datasets[0].rows[0].asOf, reused.datasets[0].rows[0].stale], [1, iso(T0 + 4000), iso(T0 - 8000), false]);
   clock.at = T0 + 5000; await feed.snapshot(['public'], null);
   assert.equal(calls(), 2);
+  // The clock steps back an hour: the snapshot is rebuilt, not kept for the hour.
+  clock.at = T0 - 3_600_000; await feed.snapshot(['public'], null);
+  assert.equal(calls(), 3);
   const expiring = feedFixture({ agentFeed: () => ({ schemaVersion: 1, datasets: [dataset('market.monitor', [row({ entity: 'monitor:monitor', metric: 'spread', value: 3, asOf: iso(T0), expiresAt: iso(T0 + 2000) }), row({ entity: 'monitor:monitor', metric: 'undated', value: 1 })])] }) });
   assert.deepEqual((await expiring.feed.snapshot(['public'], ['market.monitor'])).datasets[0].rows.map(item => item.stale), [false, true]);
   expiring.clock.at = T0 + 2000;
@@ -247,7 +259,7 @@ test('the data plane builds the feed from its own state without a request', asyn
 });
 
 // The API server against a scripted data plane.
-async function apiFixture(t, { agentFeed = async () => ({ schemaVersion: 1, datasets: [] }) } = {}) {
+async function apiFixture(t, { agentFeed = async () => ({ schemaVersion: 1, datasets: [] }), candidate = false } = {}) {
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'hub-agent-feed-'));
   const db = openHubDatabase(path.join(dataDir, 'hub.sqlite')), control = createControlStore(db);
   const logs = [], log = { ...quiet, info: (fields, message) => logs.push({ fields, message }) };
@@ -260,17 +272,18 @@ async function apiFixture(t, { agentFeed = async () => ({ schemaVersion: 1, data
   const api = createApiServer({ control, catalog: createProjectCatalog({ control, embeddedModules: false, decrypt }), encrypt, decrypt, embeddedModules: false, log,
     supervisor: createInProcessClient(createRuntimeService({ moduleRuntime: null, guard: null, readMaintenance })), runtime,
     executionJobs: { state: () => ({ jobs: [] }), openEntries: () => 0, transaction: fn => fn() }, readMaintenance, updatesClient: Object.fromEntries(['status', 'check', 'apply', 'token'].map(method => [method, async () => state])),
-    secureCookies: false, configuredOrigin: '', distDir: path.join(dataDir, 'dist') });
+    secureCookies: false, configuredOrigin: '', distDir: path.join(dataDir, 'dist'), candidate });
   await api.initialize();
   await new Promise(resolve => api.server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${api.server.address().port}`;
   t.after(async () => { await api.close(); db.close(); await rm(dataDir, { recursive: true, force: true }); });
+  const agent = (route, token, options = {}) => fetch(origin + route, { ...options, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers } });
+  if (candidate) return { origin, control, agent };
   const login = await fetch(origin + '/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin }, body: JSON.stringify({ password: PASSWORD }) });
   const cookie = login.headers.get('set-cookie').split(';')[0], csrf = (await login.json()).csrfToken;
   const page = (route, { method = 'GET', body, headers = { 'X-CSRF-Token': csrf } } = {}) => fetch(origin + route, { method, headers: { Cookie: cookie, Origin: origin, ...headers, ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}) }, ...(body !== undefined ? { body: JSON.stringify(body) } : {}) });
-  const agent = (route, token, options = {}) => fetch(origin + route, { ...options, headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options.headers } });
   const create = async (label, scopes) => (await page('/api/system/agent-feed/tokens', { method: 'POST', body: { label, scopes } })).json();
-  return { origin, cookie, control, logs, forwarded, page, agent, create };
+  return { origin, cookie, control, logs, forwarded, page, agent, create, api };
 }
 
 test('the feed takes its token and nothing else, and the token opens nothing else', async t => {
@@ -282,6 +295,7 @@ test('the feed takes its token and nothing else, and the token opens nothing els
     assert.equal(response.status, 401); assert.equal(response.headers.get('www-authenticate'), 'Bearer');
   }
   assert.equal((await f.agent('/api/agent/v1/catalog', token)).status, 200);
+  assert.equal((await f.agent('/api/agent/v1/catalog', null, { headers: { Authorization: `bearer ${token}` } })).status, 200);
   // The token is not a session: every other route still asks for a login, and nothing reaches the data plane.
   for (const route of ['/api/overview', '/api/projects', '/api/system/agent-feed', '/api/system/host', '/api/trading/positions', '/api/trading/execution', '/api/automation/feishu-digest'])
     assert.equal((await f.agent(route, token)).status, 401, route);
@@ -335,4 +349,21 @@ test('each token has its own request budget', { timeout: 30_000 }, async t => {
   assert.equal(refused.status, 429);
   assert.ok(Number(refused.headers.get('retry-after')) >= 1 && (await refused.json()).retryAfterSeconds >= 1);
   assert.equal((await f.agent('/api/agent/v1/catalog', second.token)).status, 200);
+});
+
+test('resetting the password revokes every token along with the sessions', async t => {
+  const f = await apiFixture(t);
+  const { token } = await f.create('巡检', ['system']);
+  assert.equal((await f.agent('/api/agent/v1/catalog', token)).status, 200);
+  await f.api.resetPassword();
+  assert.equal((await f.agent('/api/agent/v1/catalog', token)).status, 401);
+  assert.equal(f.control.getSetting('agent-feed-tokens'), JSON.stringify({ schemaVersion: 1, tokens: [] }));
+  assert.equal((await f.page('/api/system/agent-feed')).status, 401);
+});
+
+test('an API slot that is not serving yet answers no feed request', async t => {
+  const f = await apiFixture(t, { candidate: true });
+  const tokens = createAgentTokens({ getSetting: f.control.getSetting, setSetting: f.control.setSetting });
+  const { token } = tokens.create({ label: 'a', scopes: ['system'] });
+  for (const route of ['/api/agent/v1/catalog', '/api/agent/v1/snapshot']) assert.equal((await f.agent(route, token)).status, 503);
 });

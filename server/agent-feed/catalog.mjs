@@ -22,10 +22,10 @@ export const DATASETS = Object.freeze([
     description: '数据面事件循环延迟。卡顿期间行情与请求都要排队。entity 为 runtime。',
     metrics: { max_lag_1m: 'ms', stalls_1m: null, max_lag_5m: 'ms', stalls_5m: null } },
   { id: 'market.monitor', scope: 'public', origin: 'runtime', title: 'Monitor 行情指标', refreshSeconds: 30,
-    description: 'Market Monitor 的摘要指标：原油价格与价差、海力士溢价与资金费率、Anthropic 各所溢价等，取决于 Monitor 当前配置的监控。entity 为 monitor:<模块>，metric、label 与 unit 由 Monitor 给出。',
+    description: 'Monitor 项目当前选中的那一个监控的摘要指标（默认原油）。entity 为 monitor:<项目>:<监控>，监控取值 oil/hynix/anthropic/perpetual。oil：brent、wti、spread（布伦特 − WTI）；hynix：premium、spread、funding；anthropic：premium_<对手所>；perpetual：exchanges、live_exchanges、quotes；modules 是监控总数。同名指标在不同监控下含义不同，以 entity 区分；label 与 unit 由 Monitor 给出。',
     metrics: null },
   { id: 'market.aero', scope: 'public', origin: 'runtime', title: 'Aero 池子行情', refreshSeconds: 900,
-    description: 'AERO 价格与各链 TVL 最高的池子。entity 为 token:AERO 或 pool:<链>:<池地址>，label 是交易对与 tick 间距。fee 是池子手续费率；emission 是每天排放的 AERO 数量；daily_vol 是小时对数收益折算到 1 天的波动率。不含年化：年化取决于所选价格区间。',
+    description: 'AERO 价格，以及已扫描的全部链合并后 TVL 最高的 40 个池子。entity 为 token:AERO 或 pool:<链>:<池地址>，label 是交易对与 tick 间距。fee 是池子手续费率；emission 是每天排放的 AERO 数量；daily_vol 是小时对数收益折算到 1 天的波动率。不含年化：年化取决于所选价格区间。',
     metrics: { price: 'USD', tvl: 'USD', fee: '%', emission: 'AERO/day', daily_vol_24h: '%', daily_vol_7d: '%' } },
 ]);
 export const datasetById = id => DATASETS.find(item => item.id === id) ?? null;

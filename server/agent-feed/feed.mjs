@@ -75,7 +75,9 @@ export function createAgentFeed({ hostStatus, supervisor, runtime, now = Date.no
   }
   let cached = null, pending = null;
   function current() {
-    if (cached && now() - cached.at < cacheMs) return cached.value;
+    // A clock that stepped back must not keep one snapshot for as long as the step.
+    const age = cached ? now() - cached.at : -1;
+    if (age >= 0 && age < cacheMs) return cached.value;
     return pending ??= build().then(value => { cached = { at: now(), value }; return value; }).finally(() => { pending = null; });
   }
   // The catalog's unit applies where a row gives none; expiresAt is internal.

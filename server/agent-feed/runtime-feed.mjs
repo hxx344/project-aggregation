@@ -41,6 +41,16 @@ function eventLoop(lag, at) {
 
 // Monitor's summary metrics are market observations (prices, spreads, premiums,
 // funding rates, monitor counts). Other adapters' metrics are account figures and stay out.
+// Only the keys below pass, as numbers: a metric Monitor adds later is not served until it is listed here.
+// A Monitor project summarises one monitor, chosen by its address (default oil); the same key means
+// something else under another monitor, so the monitor is part of the entity.
+const MONITOR_KEYS = new Set(['brent', 'wti', 'spread', 'premium', 'funding', 'exchanges', 'live_exchanges', 'quotes', 'modules']);
+const monitorKey = key => typeof key === 'string' && (MONITOR_KEYS.has(key) || /^premium_[a-z0-9]{1,16}$/.test(key));
+function selectedMonitor(project) {
+  let id = null;
+  try { id = new URL(project.url || project.apiUrl).searchParams.get('monitor'); } catch { return 'unknown'; }
+  return id === null ? 'oil' : /^[a-z0-9-]{1,24}$/.test(id) ? id : 'unknown';
+}
 function monitor(overview, at) {
   const sources = overview.projects.filter(item => item.project.adapter === 'monitor' && item.project.enabled);
   if (!sources.length) return dataset('market.monitor', [], { message: '没有启用的 Monitor 模块' });
@@ -48,9 +58,11 @@ function monitor(overview, at) {
   for (const item of sources) {
     const updated = stamp(item.updatedAt), current = ['online', 'partial'].includes(item.state);
     const ttl = Number.isFinite(item.staleAfterSeconds) ? item.staleAfterSeconds * 1000 : null;
+    const entity = `monitor:${item.project.id}:${selectedMonitor(item.project)}`;
     for (const metric of Array.isArray(item.metrics) ? item.metrics : []) {
-      if (typeof metric?.key !== 'string' || !['number', 'string', 'boolean'].includes(typeof metric.value)) continue;
-      rows.push(row({ entity: `monitor:${item.project.id}`, metric: metric.key, label: metric.label, value: typeof metric.value === 'number' ? rounded(metric.value) : metric.value, unit: metric.unit ?? null,
+      // A value Monitor could not read is null and stays a row; anything that is not a number is not a market figure.
+      if (!monitorKey(metric?.key) || metric.value !== null && typeof metric.value !== 'number') continue;
+      rows.push(row({ entity, metric: metric.key, label: metric.label, value: rounded(metric.value), unit: metric.unit ?? null,
         asOf: isoOf(updated), expiresAt: updated === null || ttl === null ? null : isoOf(updated + ttl), stale: !current || updated === null }));
     }
   }

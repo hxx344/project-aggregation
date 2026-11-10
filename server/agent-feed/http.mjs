@@ -13,7 +13,7 @@ const ID = /^\/tokens\/([0-9a-f-]{36})$/;
 // called after the API has checked the session, origin and CSRF token.
 export function createAgentFeedRoutes({ tokens, feed, log, clientAddress = () => undefined, now = Date.now }) {
   const limited = createRateLimit({ limit: REQUESTS_PER_MINUTE, windowMs: 60_000, now });
-  const bearer = req => /^Bearer ([^\s]+)$/.exec(req.headers.authorization || '')?.[1] ?? null;
+  const bearer = req => /^Bearer ([^\s]+)$/i.exec(req.headers.authorization || '')?.[1] ?? null;
   async function agent(req, res, url) {
     if (req.method !== 'GET') { send(res, 405, { error: '数据接口只读，仅支持 GET' }, { Allow: 'GET' }); return; }
     const access = tokens.verify(bearer(req));
