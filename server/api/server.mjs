@@ -24,6 +24,9 @@ import { updateSettings } from '../control/update-state.mjs';
 import { clientAddress } from '../slot-protocol.mjs';
 import { HttpError, send, readJson, readJsonBody, errorResponder } from '../http-common.mjs';
 import { createHostStatus } from '../host-status.mjs';
+import { createAgentTokens } from '../agent-feed/tokens.mjs';
+import { createAgentFeed } from '../agent-feed/feed.mjs';
+import { AGENT_PREFIX, MANAGE_PATH, createAgentFeedRoutes } from '../agent-feed/http.mjs';
 import { publicRuntimeImpact } from '../update-impact.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
@@ -113,6 +116,8 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   });
   let updates = candidate ? null : coordinator();
   const hostStatus = createHostStatus({ dataDir });
+  // Read-only tokens for other agents (docs/agent-feed.md): a token reads /api/agent/v1 and nothing else.
+  const agentRoutes = createAgentFeedRoutes({ tokens: createAgentTokens({ getSetting, setSetting }), feed: createAgentFeed({ hostStatus, supervisor, runtime, log }), log, clientAddress });
   // Supervisor state joined with the trading maintenance gate; no pids, paths or secrets.
   async function moduleStatus() {
     const status = await supervisor.status();
@@ -274,6 +279,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       const ready = !draining && (await supervisor.status().catch(() => null))?.ready === true;
       send(res, ready ? 200 : 503, { ready }); return;
     }
+    // Answered before the session is looked at: the cookie grants nothing here, and the token nothing elsewhere.
+    if (pathname === AGENT_PREFIX || pathname.startsWith(`${AGENT_PREFIX}/`)) {
+      if (candidate) throw new HttpError(503, '候选实例尚未接管服务');
+      await agentRoutes.agent(req, res, url); return;
+    }
     const current = session(req);
     if (pathname === '/api/session' && req.method === 'GET') { send(res, 200, current ? { authenticated: true, csrfToken: current.csrf } : { authenticated: false }); return; }
     if (candidate) throw new HttpError(503, '候选实例尚未接管服务');
@@ -334,6 +344,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
+    if (pathname === MANAGE_PATH || pathname.startsWith(`${MANAGE_PATH}/`)) {
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台管理数据接口令牌');
+      if (req.headers.origin) sameOrigin(req);
+      await agentRoutes.manage(req, res, url); return;
+    }
     if (pathname === '/api/system/backup-readiness') {
       if (!['GET', 'POST'].includes(req.method) || url.search) throw new HttpError(400, '备份台账请求无效');
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台核对备份台账');
