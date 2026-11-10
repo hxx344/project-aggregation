@@ -1871,6 +1871,19 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `ant-reduction-self-disarm-20261109`；只读排查发现，修复前未确认线上发生。
 
+
+### L111：嵌入模块的换算口径必须来自宿主当前配置
+
+**适用条件：** 工作台保存浏览器偏好，独立子域的嵌入模块用同一业务参数换算行情、历史或持仓展示。
+
+**根因：** Monitor 把交易中心的默认股数复制为常量，未接收用户保存的股数；因此原始行情正确，监控溢价仍按另一份假设计算。子域自己的 localStorage 不能代表宿主配置。
+
+**以后做法：** 通过现有可信宿主桥接传递最小只读参数，覆盖首次握手、保存通知、跨标签与切回；未知或损坏配置不冒充已同步默认值。配置作为派生计算及缓存的输入，同时更新实时、历史、统计和相关持仓口径；独立页面与服务端无法访问浏览器配置时明确标注默认口径，不改写原始行情或订单快照。
+
+**如何验证：** [股数计算测试](modules/monitor/tests/anthropic-shares.test.mjs) 使用非默认 S/F 核对三腿、历史与趋势重算；[偏好测试](tests/trading-preferences.test.mjs) 和 [桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 覆盖未知/非法/重连/保存失败；[工作台浏览器夹具](tests/monitor-anthropic-shares.browser.mjs) 经实际 iframe 检查交易中心修改和跨标签同步。
+
+**证据与事件：** `anthropic-monitor-share-preferences-20261110`；2026-11-10 用户截图指出溢价应使用交易中心股数。基线 `a12e583` 的 `modules/monitor/modules/anthropic/market.mjs` 固定除以 12.7/16.7，`src/OilTradingPage.tsx` 则从 `workbench:anthropic-shares:v1` 读取可编辑值。本次为一次用户纠正，不推进提交复盘检查点。
+
 ## 已归档
 
 尚无。达到 [升级条件](docs/code-standards.md#升级规则) 后，将对应条目从《经验条目》移到本节，保留证据与规范链接；不按重复复盘次数自动升级。

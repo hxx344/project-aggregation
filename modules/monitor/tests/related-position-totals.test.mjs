@@ -10,8 +10,20 @@ const bn = (overrides = {}) => ({ key: 'bn', source: 'Asset', exchange: 'Binance
   updatedAt: new Date(now).toISOString(), stale: false, cycle: cycle(), ...overrides });
 const rh = (overrides = {}) => bn({ key: 'rh', exchange: 'Lighter RH', exchangeId: 'rh-lighter', symbol: 'ANTHROPIC', side: 'long',
   quantity: '24.73130', entryPrice: '1530.9', unrealizedPnl: '1705.13', pnlCurrency: 'USDG', cycle: undefined, ...overrides });
-const quote = { premiums: { xyz: 5, io: 10, rh: 12 }, fetchedAt: new Date(now).toISOString(), staleAfterMs: 35000, stale: false };
+const quote = { premiums: { xyz: 5, io: 10, rh: 12 }, shares: { outstanding: 12.7, diluted: 16.7 }, fetchedAt: new Date(now).toISOString(), staleAfterMs: 35000, stale: false };
 const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-8, `${actual} != ${expected}`);
+
+test('opening, closing and estimated holdings use the same custom assumptions as current premiums', () => {
+  const items = [bn({ entryPrice: '1000', quantity: '2', cycle: cycle({ closedQuantity: '1', closePrice: '1100' }) }),
+    rh({ entryPrice: '1000', quantity: '1', cycle: cycle({ currency: 'USDG', closedQuantity: '1', closePrice: '1000' }) })];
+  const { pair } = relatedAnthropicPair(items, { ...quote, shares: { outstanding: 10, diluted: 20 } }, false, now);
+  close(pair.opening, 100); close(pair.closing, 120); close(pair.change, -88);
+  assert.deepEqual(pair.shares, [20, 20]);
+  const { pair: unknown } = relatedAnthropicPair(items, { ...quote, shares: null, premiums: { xyz: null, io: null, rh: null } }, false, now);
+  assert.equal(unknown.opening, null); assert.equal(unknown.closing, null); assert.equal(unknown.current, null); assert.equal(unknown.change, null);
+  assert.deepEqual(unknown.shares, [null, null]);
+  assert.equal(unknown.unrealized.value, pair.unrealized.value, 'native money values remain independent of share assumptions');
+});
 
 test('the reported Binance/RH position has +406.33 unrealized and +394.84 known net under explicit 1:1 estimate', () => {
   const { pair, reason } = relatedAnthropicPair([bn(), rh()], quote, false, now);

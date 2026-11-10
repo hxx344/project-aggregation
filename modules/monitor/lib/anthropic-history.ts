@@ -1,6 +1,6 @@
 import type { Point } from "./market.ts";
 import type { SpreadChartConfig } from "../app/spread-chart";
-import { ANTHROPIC_CANDLE_MS, ANTHROPIC_LEGS, ANTHROPIC_LEG_KEYS, anthropicChartRows, validateAnthropicCandles, validateAnthropicQuote } from "../modules/anthropic/market.mjs";
+import { ANTHROPIC_CANDLE_MS, ANTHROPIC_LEGS, ANTHROPIC_LEG_KEYS, ANTHROPIC_SHARES, anthropicChartRows, validateAnthropicCandles, validateAnthropicQuote, type AnthropicShares } from "../modules/anthropic/market.mjs";
 import type { QuoteFreshness } from "./market-freshness.ts";
 import { anthropicTradeEvents, anthropicTradeMarkers } from "./anthropic-trades.ts";
 
@@ -47,7 +47,7 @@ export function retainAnthropicHistory(previous: AnthropicHistory | null, next: 
 }
 
 /** Binance (`adr`) against one comparison leg (`equivalent`), both per share. */
-export const anthropicPoints = (rows: AnthropicRow[], leg: AnthropicComparisonLeg): Point[] => anthropicChartRows(rows, leg);
+export const anthropicPoints = (rows: AnthropicRow[], leg: AnthropicComparisonLeg, shares: AnthropicShares | null = ANTHROPIC_SHARES): Point[] => anthropicChartRows(rows, leg, shares);
 
 const BARS_PER_DAY = 86_400_000 / ANTHROPIC_CANDLE_MS;
 const usd = (v: number) => `$${v.toFixed(2)}`;

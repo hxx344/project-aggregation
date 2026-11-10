@@ -8,7 +8,7 @@ registerHooks({ resolve(specifier, context, nextResolve) {
   catch (error) { if (specifier.startsWith('./') && context.parentURL?.includes('/src/') && error.code === 'ERR_MODULE_NOT_FOUND') return nextResolve(`${specifier}.ts`, context); throw error; }
 } });
 const preferences = await import('../src/trading-preferences.ts');
-const { normalizeTradingPreferences, readTradingPreferences, saveTradingPreferences, normalizeShares, EXECUTION_PREFERENCES_KEY, PAIR_PREFERENCE_KEY, DAYS_PREFERENCE_KEY, readTradingPair, readTradingDays } = preferences;
+const { normalizeTradingPreferences, readTradingPreferences, saveTradingPreferences, normalizeShares, readShares, readMonitorShares, saveShares, observeSharesChanges, SHARES_PREFERENCES_KEY, SHARES_PREFERENCES_EVENT, EXECUTION_PREFERENCES_KEY, PAIR_PREFERENCE_KEY, DAYS_PREFERENCE_KEY, readTradingPair, readTradingDays } = preferences;
 const { readPreference, writePreference } = await import('../src/ui-preferences.ts');
 const { readTradingSection, saveTradingSection } = await import('../src/trading-navigation.ts');
 const memory = new Map();
@@ -76,6 +76,65 @@ test('explicit URL and legacy links win over saved navigation; reversed pairs re
 test('shares retain decimal strings and reject incomplete, inconsistent or oversized values', () => {
   assert.deepEqual(normalizeShares({ outstanding: '13.100', diluted: '18.20' }), { outstanding: '13.100', diluted: '18.20' });
   for (const value of [null, { outstanding: '30', diluted: '20' }, { outstanding: '', diluted: '20' }, { outstanding: '1'.repeat(30), diluted: '20' }]) assert.deepEqual(normalizeShares(value), { outstanding: '12.7', diluted: '16.7' });
+});
+
+test('monitor shares use the trading default only for an absent preference, not invalid saved data', () => {
+  memory.delete(SHARES_PREFERENCES_KEY);
+  assert.deepEqual(readMonitorShares(), readShares());
+  memory.set(SHARES_PREFERENCES_KEY, JSON.stringify({ outstanding: '13.100', diluted: '18.20', ignored: 'private' }));
+  assert.deepEqual(readMonitorShares(), { outstanding: '13.100', diluted: '18.20' });
+  for (const raw of ['', '{', 'null', '[]', 'x'.repeat(32_769), JSON.stringify({ outstanding: '30', diluted: '20' }), JSON.stringify({ outstanding: 12.7, diluted: '16.7' })]) {
+    memory.set(SHARES_PREFERENCES_KEY, raw);
+    assert.equal(readMonitorShares(), null, 'damaged values cannot be labelled synchronized');
+    assert.deepEqual(readShares(), { outstanding: '12.7', diluted: '16.7' }, 'the existing trading default contract is unchanged');
+  }
+  memory.delete(SHARES_PREFERENCES_KEY);
+});
+
+test('share persistence notifies same-window and other-tab consumers, scoped to its own preference', () => {
+  const source = new EventTarget(), observed = [];
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: source });
+  const stop = observeSharesChanges(() => observed.push(readMonitorShares()));
+  const storageChanged = key => { const event = new Event('storage'); Object.defineProperty(event, 'key', { value: key }); source.dispatchEvent(event); };
+  try {
+    const shares = { outstanding: '14.1', diluted: '18.4' };
+    assert.equal(saveShares({ ...shares, ignored: 'private' }), true);
+    assert.deepEqual(observed, [shares], 'notify only after durable values can be read');
+    assert.deepEqual(JSON.parse(memory.get(SHARES_PREFERENCES_KEY)), shares);
+    assert.equal(saveShares({ outstanding: '30', diluted: '20' }), false);
+    assert.deepEqual(readMonitorShares(), shares);
+    writePreference(PAIR_PREFERENCE_KEY, 'binance,bybit'); storageChanged(PAIR_PREFERENCE_KEY);
+    assert.equal(observed.length, 1, 'unrelated preference events do not synchronize shares');
+    const otherTab = { outstanding: '15', diluted: '19' };
+    memory.set(SHARES_PREFERENCES_KEY, JSON.stringify(otherTab)); storageChanged(SHARES_PREFERENCES_KEY);
+    assert.deepEqual(observed.at(-1), otherTab);
+    memory.delete(SHARES_PREFERENCES_KEY); storageChanged(null);
+    assert.deepEqual(observed.at(-1), { outstanding: '12.7', diluted: '16.7' }, 'clear in another tab restores the actual default');
+    assert.equal(observed.length, 3);
+    stop(); source.dispatchEvent(new CustomEvent(SHARES_PREFERENCES_EVENT)); storageChanged(SHARES_PREFERENCES_KEY);
+    assert.equal(observed.length, 3, 'leaving the host removes both subscriptions');
+  } finally {
+    stop(); memory.delete(SHARES_PREFERENCES_KEY);
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow); else delete globalThis.window;
+  }
+});
+
+test('failed share persistence neither reports success nor publishes an update', () => {
+  const source = new EventTarget(); let notifications = 0;
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  Object.defineProperty(globalThis, 'window', { configurable: true, value: source });
+  source.addEventListener(SHARES_PREFERENCES_EVENT, () => { notifications++; });
+  Object.defineProperty(globalThis, 'localStorage', { configurable: true, get() { throw new Error('blocked'); } });
+  try {
+    assert.equal(saveShares({ outstanding: '14', diluted: '18' }), false);
+    assert.equal(notifications, 0);
+    assert.equal(readMonitorShares(), null);
+    assert.deepEqual(readShares(), { outstanding: '12.7', diluted: '16.7' });
+  } finally {
+    Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
+    if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow); else delete globalThis.window;
+  }
 });
 
 test('malformed, oversized and unavailable storage never breaks defaults or editing', () => {

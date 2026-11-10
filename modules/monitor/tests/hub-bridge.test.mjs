@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { trustedHubOrigin, cleanHubQuery, observeNetworkActivity, hubSelectionUrl, MODULE_CAPABILITIES, hostCapabilityList, canUseHostCapability, isHubMessage, cleanPositionsRequest, parsePositionsReply, createPositionsRequester, positionsFollowUp } from '../lib/hub-bridge.ts';
+import { trustedHubOrigin, cleanHubQuery, observeNetworkActivity, hubSelectionUrl, MODULE_CAPABILITIES, hostCapabilityList, canUseHostCapability, isHubMessage, parseHubAnthropicShares, createHubAnthropicSharesStore, useHubAnthropicShares, cleanPositionsRequest, parsePositionsReply, createPositionsRequester, positionsFollowUp } from '../lib/hub-bridge.ts';
+import { createElement } from 'react';
+import { renderToString } from 'react-dom/server';
 import { relatedSpreadPairs, RELATED_SYMBOLS } from '../lib/related-pairs.ts';
 import { exchangeContracts } from '../lib/exchange-quotes.ts';
 
@@ -38,13 +40,55 @@ test('a new host asset selection leaves the old chart and replaces only navigati
 });
 
 test('module declares positions and open-trading; host capabilities are sanitized and required', () => {
-  for (const capability of ['activity', 'navigate', 'changed', 'positions', 'open-trading']) assert.ok(MODULE_CAPABILITIES.includes(capability));
+  for (const capability of ['activity', 'navigate', 'changed', 'positions', 'open-trading', 'anthropic-shares']) assert.ok(MODULE_CAPABILITIES.includes(capability));
   assert.deepEqual(hostCapabilityList(['activity', 'positions', 'positions', 7, 'Bad Value', 'open-trading']), ['activity', 'positions', 'open-trading']);
   assert.deepEqual(hostCapabilityList(undefined), []); assert.deepEqual(hostCapabilityList('positions'), []);
   assert.equal(canUseHostCapability(true, ['activity', 'navigate'], 'positions'), false, 'old hosts never receive positions requests');
   assert.equal(canUseHostCapability(false, ['positions'], 'positions'), false, 'no request before the host handshake');
   assert.equal(canUseHostCapability(true, ['positions'], 'open-trading'), false);
   assert.equal(canUseHostCapability(true, ['positions', 'open-trading'], 'open-trading'), true);
+});
+
+test('Anthropic shares accept only bounded trading decimal strings with matching share-count semantics', () => {
+  assert.deepEqual(parseHubAnthropicShares({ outstanding: '12.700', diluted: ' 16.7 ' }), { outstanding: 12.7, diluted: 16.7 });
+  assert.deepEqual(parseHubAnthropicShares({ outstanding: '1', diluted: '100', ignored: 'private' }), { outstanding: 1, diluted: 100 });
+  for (const value of [null, undefined, [], '12.7', {}, { outstanding: 12.7, diluted: '16.7' }, { outstanding: ['12.7'], diluted: '16.7' },
+    { outstanding: '0.99', diluted: '16.7' }, { outstanding: '12.7', diluted: '101' }, { outstanding: '20', diluted: '16.7' },
+    { outstanding: '1e1', diluted: '16.7' }, { outstanding: 'Infinity', diluted: '16.7' }, { outstanding: 'NaN', diluted: '16.7' },
+    { outstanding: '12.7', diluted: '16.7000000000000000001' }, { outstanding: '0'.repeat(24) + '1', diluted: '16.7' },
+  ]) assert.equal(parseHubAnthropicShares(value), null);
+});
+
+test('Anthropic share snapshots revoke stale assumptions on invalid updates, old hosts and new sessions', () => {
+  const store = createHubAnthropicSharesStore(), capabilities = ['activity', 'anthropic-shares'];
+  const shares = { outstanding: '14.1', diluted: '18.4' };
+  const initial = store.getSnapshot();
+  assert.deepEqual(initial, { status: 'connecting', shares: null });
+  assert.equal(store.getSnapshot(), initial, 'getSnapshot must be referentially stable');
+  store.receive(shares, capabilities);
+  const synced = store.getSnapshot();
+  assert.deepEqual(synced, { status: 'synced', shares: { outstanding: 14.1, diluted: 18.4 } });
+  store.receive({ outstanding: '14.10', diluted: '18.40' }, capabilities);
+  assert.equal(store.getSnapshot(), synced, 'unchanged activity messages keep the same snapshot');
+  store.receive({ outstanding: '15', diluted: '19' }, capabilities);
+  assert.deepEqual(store.getSnapshot().shares, { outstanding: 15, diluted: 19 });
+  for (const invalid of [undefined, null, { outstanding: '30', diluted: '20' }]) {
+    store.receive(invalid, capabilities);
+    assert.deepEqual(store.getSnapshot(), { status: 'unavailable', shares: null });
+    store.receive(shares, capabilities);
+  }
+  store.receive(shares, ['activity']);
+  assert.deepEqual(store.getSnapshot(), { status: 'unavailable', shares: null }, 'old hosts cannot certify shares even if a field is present');
+  store.receive(shares, capabilities); store.reset();
+  assert.equal(store.getSnapshot(), initial, 'a new handshake cannot reuse the prior document shares');
+  store.receive(undefined, capabilities);
+  assert.deepEqual(store.getSnapshot(), { status: 'unavailable', shares: null });
+});
+
+test('Anthropic share hook renders the stable standalone server snapshot before hydration', () => {
+  function Probe() { return createElement('span', null, JSON.stringify(useHubAnthropicShares())); }
+  const html = renderToString(createElement(Probe));
+  assert.equal(html, '<span>{&quot;shares&quot;:null,&quot;status&quot;:&quot;standalone&quot;}</span>');
 });
 
 test('host messages must come from the direct parent at the trusted origin with the hub envelope', () => {

@@ -32,6 +32,8 @@ async page => {
       ...(venue.id === 'binance' ? { side: row.side === 'buy' ? 'sell' : 'buy', positionBefore: String(-Number(row.positionBefore)), positionAfter: String(-Number(row.positionAfter)) } : {}) }));
   }
   const errors = [], requests = [], listener = error => errors.push(error.stack ?? error.message);
+  const sharesKey = 'workbench:anthropic-shares:v1';
+  let previousShares;
   let failReads = false;
   let missingRh = false;
   let launchMonitor = 'anthropic';
@@ -47,6 +49,7 @@ async page => {
       return route.fulfill({ response: await route.fetch({ url: monitorBuild + path + url.search }) });
     }
     if (url.origin !== origin) return route.abort('blockedbyclient');
+    if (path === '/fixture-preferences') return route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Isolated preferences</title>' });
     if (path === '/api/projects/monitor/launch' && request.method() === 'POST') return send({ url: `${moduleOrigin}/${launchMonitor ? `?monitor=${launchMonitor}` : ''}` });
     if (request.method() !== 'GET') throw new Error(`Unexpected host write: ${path}`);
     if (path === '/api/session') return send({ authenticated: true, csrfToken: 'ant-fixture-only' });
@@ -72,6 +75,12 @@ async page => {
   page.on('pageerror', listener);
   await page.route('**/*', handler);
   try {
+    await page.goto(`${origin}/fixture-preferences`);
+    previousShares = await page.evaluate(key => {
+      const previous = localStorage.getItem(key);
+      localStorage.setItem(key, JSON.stringify({ outstanding: '12.7', diluted: '16.7' }));
+      return previous;
+    }, sharesKey);
     await page.goto(`${origin}/?view=project&id=monitor`);
     await page.frameLocator('iframe[title="monitor模块"]').locator('body').evaluate(() => { for (const key of Object.keys(localStorage)) if (key.startsWith('monitor:')) localStorage.removeItem(key); });
     await page.reload();
@@ -182,6 +191,10 @@ async page => {
     check(errors.length === 0, errors.join('\n'));
     return { passed: true, errors, markets: [...new Set(requests)], checks: ['real host bridge', 'RH entry/exit keyboard details', 'native prices', 'no RH or ambiguous CEX markers on xyz/io', 'actual pair and screenshot PnL', 'explicit 1:1 estimate and missing cycle', 'range and price modes', 'refresh failure retention', 'foreground-only reads', '390px layout', 'reload preferences', 'market isolation', 'monitor URL priority'] };
   } finally {
+    if (previousShares !== undefined) {
+      await page.goto(`${origin}/fixture-preferences`);
+      await page.evaluate(({ key, previous }) => { if (previous === null) localStorage.removeItem(key); else localStorage.setItem(key, previous); }, { key: sharesKey, previous: previousShares });
+    }
     page.off('pageerror', listener);
     await page.unroute('**/*', handler);
     await page.clock.resume();
