@@ -4,10 +4,13 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseQuote, positionOf, reject,
-  type AccountBinding, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type OrderSide, type OrderType, type PositionSide, type Quote, type Venue,
+  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
+  type AccountBinding, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type Venue,
 } from './contracts.ts';
-import { VenueError, parseOrderReport, type OrderReport, type OrderRequest, type VenueConnector } from './connector.ts';
+import {
+  STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
+  type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type VenueConnector,
+} from './connector.ts';
 import type { Store } from './store.ts';
 import { ControlRefusal, MAX_OWNED_BUDGET_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
@@ -33,6 +36,10 @@ export interface Budgets {
   pairQuoteWindowMs: number;
   /** Hedge orders per job, counting the first; a definitive venue refusal stops earlier. */
   hedgeAttempts: number;
+  /** How far a venue clock may be off when strategies are searched by creation time (Hub VENUE_CLOCK_TOLERANCE_MS). */
+  venueClockToleranceMs: number;
+  /** Slack on each side of the send window an adopted strategy's creation time must fall in. */
+  adoptSkewMs: number;
   /** Events, commands and consumed previews of finished jobs older than this are deleted; jobs and orders are kept. */
   historyRetentionMs: number;
   pruneIntervalMs: number;
@@ -41,7 +48,7 @@ export interface Budgets {
 export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
   previewTtlMs: 30_000, previewQuoteMaxAgeMs: 10_000, sendQuoteMaxAgeMs: 10_000, futureToleranceMs: 1_000, callTimeoutMs: 35_000,
   createObserveMs: 120_000, createArrivalMarginMs: 60_000, absentChecks: 2, absentSpacingMs: 5_000, cancelAttempts: 5, cancelRetryMs: 10_000, leaseTtlMs: 60_000,
-  unresolvedGraceMs: 60_000, maxSlippageBps: 50, pairQuoteWindowMs: 1_500, hedgeAttempts: 5,
+  unresolvedGraceMs: 60_000, maxSlippageBps: 50, pairQuoteWindowMs: 1_500, hedgeAttempts: 5, venueClockToleranceMs: 300_000, adoptSkewMs: 5_000,
   historyRetentionMs: 90 * 24 * 3_600_000, pruneIntervalMs: 3_600_000, pruneBatch: 500,
 });
 
@@ -64,7 +71,7 @@ export interface PlannedLeg {
   side: PositionSide;
   orderSide: OrderSide;
   quantity: string;
-  orderType: OrderType;
+  orderType: LegOrderType;
   limitPrice: string | null;
   reduceOnly: boolean;
   accountKey: string;
@@ -74,7 +81,7 @@ export interface PlannedLeg {
   positionMode: 'one-way' | 'hedge';
   baseline: string;
   instrument: Instrument;
-  /** Worst acceptable book price for this leg's side, fixed at preview. The lead sends it as an IOC limit; the hedge only checks it before the lead goes out. Absent in rows written before it existed. */
+  /** Worst acceptable book price for this leg's side, fixed at preview. The lead sends it as an IOC limit (a chase lead as its maxChasePrice); the hedge only checks it before the lead goes out. Absent in rows written before it existed. */
   priceBound?: string | null;
   quote: Pick<Quote, 'bid' | 'ask' | 'receivedAt' | 'connectionGeneration' | 'sequence'>;
 }
@@ -110,8 +117,10 @@ export interface Operation {
   /** 0 for the first order of a leg; hedge resumes count up. Absent in rows written before it existed means 0. */
   attempt?: number;
   venue: Venue;
+  /** strategy: a venue-native chase strategy whose remoteId is its strategy id; the client order id stays local. Absent means order. */
+  kind?: 'order' | 'strategy';
   clientOrderId: string;
-  request: OrderRequest;
+  request: OrderRequest | ChaseRequest;
   state: OpState;
   remoteId: string | null;
   filledQuantity: string;
@@ -131,8 +140,39 @@ export interface Operation {
   openCheckedFrom?: number | null;
   /** First time the shared registry refused a cancel of this order. */
   cancelBlockedAt?: number | null;
+  /** Strategy only: last status read from the venue, and whether its children were settled then. */
+  strategyStatus?: StrategyStatus | null;
+  childrenSettled?: boolean;
+  /** Strategy only: first time it read ended with a child still open; bounded by unresolvedGraceMs. */
+  childrenWaitSince?: number | null;
+  /** Strategy only: when a person attached a strategy id to a create that had no answer. */
+  adoptedAt?: number | null;
+  /** Strategy only: last read that showed remoteId names this create. Only such an id is ever stopped. */
+  identityVerifiedAt?: number | null;
+  /** Strategy only: a later read of a verified id described another strategy; nothing more is sent to it. */
+  identityMismatchAt?: number | null;
+  /** Strategy only: a person released a create without an answer, accepting that it may have executed; it stays unknown and is never adopted or resent. */
+  releasedAt?: number | null;
+  /** Strategy only: stops tried for an adopted strategy while its job waits for a person, bounded by cancelAttempts. */
+  manualStops?: number;
+  manualStopAt?: number | null;
+  /** Strategy only: the id the create's answer named, written before it is checked so a takeover mid-check still shows it to a person. */
+  ackStrategyId?: string | null;
+  /** Strategy only: when that answer arrived. The venue makes a strategy before answering, so none made later can be this create's. */
+  ackAt?: number | null;
   note: string | null;
 }
+
+const isStrategy = (op: Operation): boolean => op.kind === 'strategy';
+/** A strategy create without an answer and not released by a person: the venue takes no client id, so nothing automatic can find it or prove it absent. */
+const isOrphanStrategy = (op: Operation): boolean => op.kind === 'strategy' && op.state === 'unknown' && op.remoteId === null && op.releasedAt == null;
+/** Lower bound as for adoption; upper bound the answer's arrival, both widened by the venue clock skew. */
+const outsideAck = (op: Operation, createdAt: number, ackAt: number, skewMs: number): boolean => createdAt < op.preparedAt - skewMs || createdAt > ackAt + skewMs;
+const ackHint = (op: Operation): string => op.ackStrategyId ? `；交易所曾回报策略编号 ${op.ackStrategyId}，核对后可认领` : '';
+const strategyIdentity = (op: Operation): StrategyIdentity => {
+  const { symbol, side, positionSide, reduceOnly, quantity, maxChasePrice } = op.request as ChaseRequest;
+  return { symbol, side, positionSide, reduceOnly, quantity, maxChasePrice };
+};
 
 export interface ExecutorOptions {
   store: Store;
@@ -174,6 +214,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const control = controlOptions ? createAccountControl({ ...controlOptions, lost: (message: string): never => { retired = true; throw new WriterLostError(message); } }) : null;
 
   const connectorFor = (venue: Venue): VenueConnector => venues.get(venue) ?? reject('venue_unavailable', `${VENUE_NAMES[venue]} 连接器不可用`, 503);
+  const chaseConnector = (venue: Venue): ChaseConnector => {
+    const connector = connectorFor(venue);
+    return supportsChase(connector) ? connector : reject('chase_unsupported', `${VENUE_NAMES[venue]} 连接器不支持原生追价策略`, 409);
+  };
   const event = (jobId: string | null, type: string, detail: Record<string, unknown> = {}) =>
     db.prepare('INSERT INTO events(job_id, type, at, json) VALUES (?, ?, ?, ?)').run(jobId, type, now(), JSON.stringify(detail));
 
@@ -218,7 +262,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   function recoverAfterTakeover(): void {
     for (const op of unsettledOps()) {
       if (op.state === 'prepared') { Object.assign(op, { state: 'not-sent', note: '恢复：落盘后、发送前中断，传输未调用' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
-      else if (op.state === 'sending') { Object.assign(op, { state: 'unknown', note: '恢复：发送中断，结果未知，按原客户订单号核对' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
+      else if (op.state === 'sending') { Object.assign(op, { state: 'unknown', note: isStrategy(op) ? `恢复：追价策略发送中断，结果未知；交易所无客户编号，需人工认领或确认未创建${ackHint(op)}` : '恢复：发送中断，结果未知，按原客户订单号核对' }); saveOp(op); event(op.jobId, 'operation-recovered', { op: op.id, state: op.state }); }
     }
     for (const job of unfinishedJobs()) {
       if (job.status === 'accepted' && !opsOf(job.id).length) finish(job, 'failed', '服务重启时任务尚未发送，已取消；请重新预览');
@@ -329,6 +373,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     assertWriter();
     const accounts = intent.legs.map(leg => accountFor(leg.venue) ?? reject('account_missing', `${VENUE_NAMES[leg.venue]} 尚未绑定已核验的账户`, 409));
     for (const leg of intent.legs) if (connectorFor(leg.venue).capabilities.maxClientOrderIdLength < CLIENT_ORDER_ID_LENGTH) reject('client_order_id', `${VENUE_NAMES[leg.venue]} 客户订单号长度上限不足`, 409);
+    for (const leg of intent.legs) if (leg.orderType === 'chase') chaseConnector(leg.venue);
     for (const row of accounts) if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${row.account_key}:${intent.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409);
     const reads = await Promise.all(intent.legs.map(async (leg, index) => {
       const binding = bindingOf(accounts[index]);
@@ -364,7 +409,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         `先发送 ${VENUE_NAMES[legs[0].venue]} 腿，成交确认后按其成交量发送 ${VENUE_NAMES[legs[1].venue]} 对冲腿。`,
         legs[0].orderType === 'market'
           ? `价格保护 ${slippageBps} 基点：首腿以 IOC 限价 ${legs[0].priceBound} 发送，未即时成交的部分由交易所撤销；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送。`
-          : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
+          : legs[0].orderType === 'chase'
+            ? `首腿以 ${VENUE_NAMES[legs[0].venue]} 原生追价策略发送，${legs[0].orderSide === 'buy' ? '最高' : '最低'}追价为 ${slippageBps} 基点界限 ${legs[0].priceBound}；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送；截止、停止或策略被交易所暂停时停止策略，按停止后重查的实际成交对冲。追价策略不接受客户编号：交易所回报的策略编号须经查询核对身份后才会被停止；创建结果不明时不重发、不自动核对，任务转人工，需填写策略编号认领、在观察窗后确认未创建，或强制释放（策略可能已成交，由人工在交易所处理）。`
+            : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
         '对冲腿按市价发送；首腿成交后，包括服务重启接管后，按已落盘成交量补发对冲腿，补发不设价格限制。',
         '模拟传输：不会访问任何真实交易所。',
       ],
@@ -433,6 +480,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       }
       const job = readJob(jobId);
       if (job.status !== 'attention') reject('not_attention', '只有待人工处理的任务需要确认', 409);
+      // Releasing the account while a strategy nobody tracks may be running would let it trade unseen.
+      if (opsOf(jobId).some(isOrphanStrategy)) reject('strategy_unresolved', '追价策略创建结果未知：须先填写策略编号认领、在观察窗后确认未创建或强制释放，才能确认人工处理', 409);
       db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'acknowledge', payload, session, jobId, now());
       job.acknowledgedAt = now(); saveJob(job);
       db.prepare('DELETE FROM locks WHERE job_id = ?').run(jobId);
@@ -448,7 +497,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
    * released as possibly executed, so the account is writable again; local reconciliation goes on.
    */
   function releaseControl(jobId: string): void {
-    const mine = new Set(opsOf(jobId).map(op => op.clientOrderId));
+    const mine = new Map(opsOf(jobId).map(op => [op.clientOrderId, op.id]));
     try { if (!control?.anyPending()) return; } catch (error) { if (error instanceof WriterLostError) throw error; return; }
     for (const leg of readJob(jobId).legs) {
       // Writes on a principal that is no longer bound stay in the registry for manual recovery.
@@ -459,12 +508,154 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       let pending: string[];
       try { pending = control.pending(binding); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
       for (const operationId of pending) {
-        const parsed = parseOperationId(operationId);
-        if (!parsed || !mine.has(parsed.clientOrderId)) continue;
+        const parsed = parseOperationId(operationId), opId = parsed && mine.get(parsed.clientOrderId);
+        // A write still running finishes its own entry once its result is durable; resolving it now would release the account mid-send.
+        if (!opId || inFlight.has(opId) || cancelling.has(opId)) continue;
         try { control.resolve(binding, operationId, 'confirmed'); } catch (error) { if (error instanceof WriterLostError) throw error; continue; }
         write(() => event(jobId, 'control-released', { operationId }));
       }
     }
+  }
+
+  // ---- strategies without an answer --------------------------------------------
+  function priorCommand(requestId: string, payload: string, session: string): boolean {
+    const existing = db.prepare('SELECT digest, session FROM commands WHERE request_id = ?').get(requestId) as { digest: string; session: string } | undefined;
+    if (existing && (existing.digest !== payload || existing.session !== session)) reject('request_reused', '请求编号已用于其他内容', 409);
+    return !!existing;
+  }
+  /** Strategy ids already attached to an operation of any job; such a strategy is accounted for there. */
+  const claimedStrategies = (): Set<string> => new Set((db.prepare("SELECT json_extract(json, '$.remoteId') AS id FROM operations WHERE json_extract(json, '$.kind') = 'strategy' AND json_extract(json, '$.remoteId') IS NOT NULL").all() as { id: string }[]).map(row => row.id));
+  function orphanOf(job: Job): Operation {
+    if (job.status !== 'attention') reject('not_attention', '只有待人工处理的任务可以认领追价策略、确认未创建或强制释放', 409);
+    return opsOf(job.id).find(isOrphanStrategy) ?? reject('no_pending_strategy', '该任务没有创建结果未知的追价策略', 409);
+  }
+  function manualTarget(job: Job): { op: Operation; binding: AccountBinding } {
+    const op = orphanOf(job);
+    const leg = job.legs[op.leg], row = accountFor(leg.venue);
+    if (!row || row.account_key !== leg.accountKey) reject('binding_changed', `${VENUE_NAMES[leg.venue]} 账户绑定已变化，暂不能核对`, 409);
+    return { op, binding: bindingOf(row as AccountRow) };
+  }
+  function resolvedBy(jobId: string, reason: string): void { const job = readJob(jobId); job.reason = reason; saveJob(job); }
+  const manualId = (input: Record<string, unknown>) => {
+    const jobId = text(input.jobId, '任务编号', UUID);
+    if (typeof input.requestId !== 'string' || !UUID.test(input.requestId)) reject('request_id', '请求编号无效');
+    return { jobId, requestId: input.requestId as string };
+  };
+
+  /**
+   * A person names the strategy a create without an answer made. It must match the request exactly, have been
+   * created around the send, and belong to no other operation; whatever is still running is then stopped.
+   */
+  async function adoptStrategy(input: unknown, session: string): Promise<ReturnType<typeof jobView>> {
+    const raw = exactKeys(input, ['jobId', 'requestId', 'strategyId']);
+    const { jobId, requestId } = manualId(raw), strategyId = text(raw.strategyId, '策略编号', STRATEGY_ID);
+    const payload = digest({ kind: 'adopt-strategy', jobId, strategyId });
+    assertWriter();
+    if (priorCommand(requestId, payload, session)) return jobView(jobId);
+    const { op, binding } = manualTarget(readJob(jobId)), name = `${VENUE_NAMES[op.venue]} ${op.request.symbol}`;
+    if (claimedStrategies().has(strategyId)) reject('strategy_claimed', '该策略编号已被其他委托认领', 409);
+    let report: StrategyReport;
+    try {
+      const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal }));
+      report = value === null ? reject('strategy_not_found', `${name} 交易所查无该策略编号`, 409) : parseStrategyReport(value, { ...strategyIdentity(op), strategyId });
+    } catch (error) { return readFailure(error); }
+    // createdAt is the venue's clock; the window is the local prepare-to-send span widened by the skew.
+    const from = op.preparedAt - budgets.adoptSkewMs, to = (op.sentAt ?? op.preparedAt) + budgets.callTimeoutMs + budgets.adoptSkewMs;
+    if (report.createdAt < from || report.createdAt > to) reject('strategy_window', `${name} 该策略的创建时间不在本委托发送时段内，不能认领`, 409);
+    const adopted = write(() => {
+      if (priorCommand(requestId, payload, session)) return false;
+      const current = readOp(op.id);
+      if (readJob(jobId).status !== 'attention' || !isOrphanStrategy(current)) reject('operation_changed', '待核对委托已变化，请刷新后重试', 409);
+      if (claimedStrategies().has(strategyId)) reject('strategy_claimed', '该策略编号已被其他委托认领', 409);
+      db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'adopt-strategy', payload, session, jobId, now());
+      applyStrategy(current, report);
+      current.adoptedAt = now(); current.note = '人工认领的追价策略';
+      saveOp(current);
+      // The reason that called for a person no longer describes the job.
+      resolvedBy(jobId, `已人工认领 ${name} 追价策略 ${strategyId}（首腿成交 ${current.filledQuantity}），未结束的部分由执行器有界停止，停止情况见委托备注；对冲腿不自动补发，敞口须人工处理后确认`);
+      event(jobId, 'strategy-adopted', { op: op.id, requestId, strategyId, state: current.state, strategyStatus: report.status, filled: report.filledQuantity });
+      return true;
+    });
+    if (!adopted) return jobView(jobId);
+    // The create must be settled in the registry first: an unresolved write on the account refuses the stop's record.
+    settleControl();
+    const latest = readOp(op.id);
+    if (latest.state === 'open' && latest.strategyStatus !== 'terminal') {
+      try { await cancel(readJob(jobId), latest); } catch (error) { if (error instanceof WriterLostError) throw error; }
+    }
+    settleControl();
+    return jobView(jobId);
+  }
+
+  /**
+   * A person confirms a create without an answer made nothing. Accepted only after the request can no longer
+   * arrive, when no unclaimed strategy on the symbol is running or was created around the send (venue clock
+   * tolerance included), and a fresh account read shows the position equal to the known fills and no order.
+   */
+  async function confirmNotCreated(input: unknown, session: string): Promise<ReturnType<typeof jobView>> {
+    const raw = exactKeys(input, ['jobId', 'requestId']);
+    const { jobId, requestId } = manualId(raw);
+    const payload = digest({ kind: 'confirm-not-created', jobId });
+    assertWriter();
+    if (priorCommand(requestId, payload, session)) return jobView(jobId);
+    const job = readJob(jobId), { op, binding } = manualTarget(job), leg = job.legs[op.leg], name = `${VENUE_NAMES[leg.venue]} ${leg.symbol}`;
+    const settledAt = createSettledAt(op);
+    if (now() < settledAt) reject('create_window', `${name} 追价策略创建请求仍可能送达交易所，请约 ${Math.ceil((settledAt - now()) / 1000)} 秒后再确认`, 409);
+    const tolerance = budgets.venueClockToleranceMs, sentAt = op.sentAt ?? op.preparedAt;
+    const near = { from: sentAt - tolerance, to: sentAt + budgets.callTimeoutMs + tolerance };
+    // The listing runs through now plus the tolerance, as a strategy created near the send may have ended much later;
+    // only strategies created near the send are candidates, or any later one on the symbol would block this forever.
+    const window = { from: near.from, to: Math.max(near.to, now() + tolerance) };
+    let listed: StrategyReport[];
+    try {
+      const value: unknown = await callVenue('read', signal => chaseConnector(op.venue).listStrategies(binding, leg.symbol, window, { signal }));
+      listed = Array.isArray(value) ? value.map(item => parseStrategyReport(item)) : reject('report_shape', '策略列表结构无效', 502);
+    } catch (error) { return readFailure(error); }
+    const claimed = claimedStrategies(), candidates = listed.filter(item => item.symbol === leg.symbol && !claimed.has(item.strategyId));
+    if (candidates.some(item => item.status !== 'terminal')) reject('strategy_running', `${name} 仍有运行中或暂停的追价策略，请填写其策略编号认领`, 409);
+    if (candidates.some(item => item.createdAt >= near.from && item.createdAt <= near.to)) reject('strategy_candidate', `${name} 存在下单时段前后创建的同合约追价策略，请填写其策略编号认领`, 409);
+    // The account is read after the listing so the decision uses the latest evidence (L091).
+    const snapshot = await readAccount(binding, leg.symbol);
+    if (cmp(positionOf(snapshot, leg.symbol, leg.side), expectedPosition(job, op.leg)) !== 0 || snapshot.openOrders.some(order => order.symbol === leg.symbol)) {
+      reject('position_mismatch', `${name} 当前持仓或挂单与本任务已知成交不一致，不能确认策略未创建`, 409);
+    }
+    const confirmed = write(() => {
+      if (priorCommand(requestId, payload, session)) return false;
+      const current = readOp(op.id);
+      if (readJob(jobId).status !== 'attention' || !isOrphanStrategy(current)) reject('operation_changed', '待核对委托已变化，请刷新后重试', 409);
+      db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'confirm-not-created', payload, session, jobId, now());
+      Object.assign(current, { state: 'not-created', note: '人工确认：观察窗后交易所无对应追价策略，持仓与挂单无痕迹，判定未创建', lastCheckedAt: now() });
+      saveOp(current);
+      resolvedBy(jobId, `已人工确认 ${name} 追价策略未创建；任务不再发送，确认处理后释放合约`);
+      event(jobId, 'strategy-not-created', { op: op.id, requestId });
+      return true;
+    });
+    if (confirmed) settleControl();
+    return jobView(jobId);
+  }
+
+  /**
+   * Last resort when a create without an answer can be neither adopted nor proven absent: a person accepts that the
+   * strategy may have executed and handles it on the venue. The operation stays unknown, its shared create is released as
+   * possibly executed, and it is never adopted or resent; only then can the job be acknowledged.
+   */
+  function releaseStrategy(input: unknown, session: string): ReturnType<typeof jobView> {
+    const raw = exactKeys(input, ['jobId', 'requestId'], ['acknowledgeRisk']);
+    const { jobId, requestId } = manualId(raw);
+    if (raw.acknowledgeRisk !== true) reject('acknowledge_risk', '强制释放须明确确认风险：策略可能已成交，由人工在交易所处理');
+    const payload = digest({ kind: 'release-strategy', jobId });
+    const released = write(() => {
+      if (priorCommand(requestId, payload, session)) return false;
+      const op = orphanOf(readJob(jobId));
+      db.prepare('INSERT INTO commands(request_id, kind, digest, session, job_id, accepted_at) VALUES (?, ?, ?, ?, ?, ?)').run(requestId, 'release-strategy', payload, session, jobId, now());
+      Object.assign(op, { releasedAt: now(), note: '人工强制释放：策略可能已成交，由人工在交易所处理' });
+      saveOp(op);
+      resolvedBy(jobId, '已人工强制释放追价策略：策略可能已成交，敞口与策略须由人工在交易所处理，之后确认处理以释放合约');
+      event(jobId, 'strategy-released', { op: op.id, requestId });
+      return true;
+    });
+    if (released) settleControl();
+    return jobView(jobId);
   }
 
   /** Read-only market and position view. ANT is observable on Binance only and never executable here. */
@@ -526,20 +717,28 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   async function send(job: Job, index: 0 | 1, quantity: string, attempt = 0): Promise<void> {
-    const leg = job.legs[index];
-    // A market lead goes out as an IOC limit at its preview bound, so the venue itself enforces the protection (L100).
-    const protectedLead = index === 0 && leg.orderType === 'market' && leg.priceBound != null;
-    const request: OrderRequest = {
-      clientOrderId: clientOrderIdFor(job, index, attempt), symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity,
-      type: protectedLead ? 'limit' : leg.orderType, limitPrice: protectedLead ? leg.priceBound as string : leg.limitPrice,
-      timeInForce: protectedLead || leg.orderType === 'market' ? 'ioc' : 'gtc', reduceOnly: leg.reduceOnly,
-    };
-    const op: Operation = { id: randomUUID(), jobId: job.id, leg: index, attempt, venue: leg.venue, clientOrderId: request.clientOrderId, request, state: 'prepared', remoteId: null, filledQuantity: '0', averagePrice: null, venueStatus: null,
-      preparedAt: now(), sentAt: null, lastCheckedAt: null, absentChecks: 0, absentAt: null, positionMismatchAt: null, cancelSent: 0, cancelRequestedAt: null, note: null };
+    const leg = job.legs[index], orderType = leg.orderType, clientOrderId = clientOrderIdFor(job, index, attempt);
+    let request: OrderRequest | ChaseRequest;
+    if (orderType === 'chase') {
+      // The preview bound is the venue-enforced protection of a chase lead, as the IOC limit is for a market lead.
+      if (index !== 0 || !leg.priceBound) reject('chase_unsupported', '追价策略只用于首腿且需要价格保护界限，未发送', 409);
+      request = { clientOrderId, symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity, type: 'chase', maxChasePrice: leg.priceBound as string, reduceOnly: leg.reduceOnly };
+    } else {
+      // A market lead goes out as an IOC limit at its preview bound, so the venue itself enforces the protection (L100).
+      const protectedLead = index === 0 && orderType === 'market' && leg.priceBound != null;
+      request = {
+        clientOrderId, symbol: leg.symbol, side: leg.orderSide, positionSide: leg.side, quantity,
+        type: protectedLead ? 'limit' : orderType, limitPrice: protectedLead ? leg.priceBound as string : leg.limitPrice,
+        timeInForce: protectedLead || orderType === 'market' ? 'ioc' : 'gtc', reduceOnly: leg.reduceOnly,
+      };
+    }
+    const op: Operation = { id: randomUUID(), jobId: job.id, leg: index, attempt, venue: leg.venue, kind: request.type === 'chase' ? 'strategy' : 'order', clientOrderId, request, state: 'prepared', remoteId: null, filledQuantity: '0', averagePrice: null, venueStatus: null,
+      preparedAt: now(), sentAt: null, lastCheckedAt: null, absentChecks: 0, absentAt: null, positionMismatchAt: null, cancelSent: 0, cancelRequestedAt: null, note: null,
+      ...(request.type === 'chase' ? { strategyStatus: null, childrenSettled: false, childrenWaitSince: null, adoptedAt: null } : {}) };
     inFlight.add(op.id);
     try { await sendPrepared(job, index, op, request); } finally { inFlight.delete(op.id); }
   }
-  async function sendPrepared(job: Job, index: 0 | 1, op: Operation, request: OrderRequest): Promise<void> {
+  async function sendPrepared(job: Job, index: 0 | 1, op: Operation, request: OrderRequest | ChaseRequest): Promise<void> {
     const leg = job.legs[index], quantity = request.quantity;
     const binding = write(() => {
       const current = readJob(job.id);
@@ -565,30 +764,72 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     try { write(() => { Object.assign(op, { state: 'sending', sentAt: now() }); saveOp(op); }); }
     catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
-    let report: OrderReport | null = null, failure: unknown = null;
+    let report: OrderReport | null = null, strategyId: string | null = null, failure: unknown = null;
     const beforeSend = () => { assertWriter(); if (registered) control?.assertSend(registered, budgets.callTimeoutMs); };
-    try { report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend })), request); }
-    catch (error) { failure = error; }
+    try {
+      if (request.type === 'chase') strategyId = parseStrategyAck(await callVenue('write', signal => chaseConnector(leg.venue).placeChase(binding, strategyRequestOf(request), { signal, beforeSend }))).strategyId;
+      else report = parseOrderReport(await callVenue('write', signal => connectorFor(leg.venue).place(binding, request, { signal, beforeSend })), request);
+    } catch (error) { failure = error; }
+    const ackAt = now();
+    if (strategyId !== null) {
+      const acked = strategyId;
+      write(() => { const current = readOp(op.id); if (current.state !== 'sending') return; Object.assign(current, { ackStrategyId: acked, ackAt }); saveOp(current); });
+    }
+    const ack = strategyId === null ? null : await checkAck(op, binding, strategyId, ackAt);
     const settled = write(() => {
       const current = readOp(op.id);
       if (current.state !== 'sending') return null;
+      // An id some other operation already holds cannot name this create; the answer is as good as none.
+      const answer = strategyId !== null && claimedStrategies().has(strategyId) ? { orphan: `回报的策略编号 ${strategyId} 已被其他委托认领` } : ack;
       if (report) applyReport(current, report);
+      else if (answer && 'report' in answer) applyStrategy(current, answer.report);
+      else if (answer && 'unread' in answer) Object.assign(current, { state: 'open', remoteId: strategyId, strategyStatus: 'working', identityVerifiedAt: null, lastCheckedAt: now(), note: answer.unread });
       else if (failure instanceof VenueError && failure.kind === 'not-sent') Object.assign(current, { state: 'not-sent', note: failure.message.slice(0, 200) });
       else if (failure instanceof VenueError && failure.kind === 'rejected') Object.assign(current, { state: 'rejected', note: failure.message.slice(0, 200) });
       // Any other outcome, including a report that fails validation, leaves the result unknown.
+      else if (isStrategy(current)) Object.assign(current, { state: 'unknown', note: `追价策略创建结果未知（${answer && 'orphan' in answer ? answer.orphan : failure instanceof Error ? failure.message.slice(0, 120) : '无回报'}）；交易所无客户编号，不重发` });
       else Object.assign(current, { state: 'unknown', note: `结果未知：${failure instanceof Error ? failure.message.slice(0, 160) : '无回报'}` });
       saveOp(current);
-      event(job.id, 'operation-sent', { op: op.id, state: current.state, filled: current.filledQuantity });
-      return current.state;
+      event(job.id, 'operation-sent', { op: op.id, state: current.state, filled: current.filledQuantity, ...(strategyId !== null ? { strategyId } : {}) });
+      return current.state as OpState;
     });
     // Released only after the local result is durable; anything left open is settled from local facts later.
     if (registered && settled) control?.finish(registered, outcomeOf(settled));
+  }
+  type AckCheck = { report: StrategyReport } | { orphan: string } | { unread: string };
+  /**
+   * An acknowledged id is taken only once a read shows it names this create; an id that names another strategy or none
+   * is as good as no answer. A failed read keeps the id, but it is never stopped until a read verifies it.
+   */
+  async function checkAck(op: Operation, binding: AccountBinding, strategyId: string, ackAt: number): Promise<AckCheck> {
+    if (claimedStrategies().has(strategyId)) return { orphan: `回报的策略编号 ${strategyId} 已被其他委托认领` };
+    try {
+      const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal }));
+      if (value === null) return { orphan: `交易所查无回报的策略编号 ${strategyId}` };
+      const report = parseStrategyReport(value, { ...strategyIdentity(op), strategyId });
+      if (outsideAck(op, report.createdAt, ackAt, budgets.adoptSkewMs)) return { orphan: `回报的策略编号 ${strategyId} 的创建时间不在本委托发送时段内` };
+      return { report };
+    } catch (error) {
+      if (error instanceof ContractError && error.code === 'strategy_identity') return { orphan: `回报的策略编号 ${strategyId} 经查询与本委托身份不一致` };
+      return { unread: `回报的策略编号 ${strategyId} 暂未能查询核对身份（${error instanceof Error ? error.message.slice(0, 120) : '未知'}），核对前不发送停止` };
+    }
   }
   function outcomeOf(state: OpState): WriteOutcome {
     if (state === 'open' || state === 'filled' || state === 'canceled') return 'confirmed';
     return state === 'rejected' || state === 'not-sent' || state === 'not-created' ? 'rejected' : 'unknown';
   }
 
+  /** A strategy is settled only once it is over and its children are too; anything else still rests. */
+  function applyStrategy(op: Operation, report: StrategyReport): void {
+    if (cmp(report.filledQuantity, op.filledQuantity) < 0) reject('report_regressed', '策略回报的成交数量回退，保留原状态', 409);
+    // An ended strategy never runs again; a stale report saying otherwise would bring back stops and restart the children wait.
+    if (op.strategyStatus === 'terminal' && report.status !== 'terminal') reject('report_regressed', '策略回报的状态从已结束回退，保留原状态', 409);
+    const settled = report.status === 'terminal' && report.childrenSettled;
+    const state: OpState = settled ? (cmp(report.filledQuantity, op.request.quantity) === 0 ? 'filled' : 'canceled') : 'open';
+    const lagging = report.status === 'terminal' && !report.childrenSettled;
+    Object.assign(op, { state, remoteId: report.strategyId, filledQuantity: report.filledQuantity, averagePrice: report.averagePrice, strategyStatus: report.status, childrenSettled: report.childrenSettled,
+      childrenWaitSince: lagging ? op.childrenWaitSince ?? now() : null, identityVerifiedAt: now(), lastCheckedAt: now(), absentChecks: 0, absentAt: null });
+  }
   function applyReport(op: Operation, report: OrderReport): void {
     // Cumulative fills never go backwards; a lower count is a stale or foreign answer.
     if (cmp(report.filledQuantity, op.filledQuantity) < 0) reject('report_regressed', '委托回报的成交数量回退，保留原状态', 409);
@@ -613,18 +854,21 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (inFlight.has(current.id) || (current.state !== 'prepared' && current.state !== 'sending')) return;
       Object.assign(current, current.state === 'prepared'
         ? { state: 'not-sent', note: '落盘后发送标记未写入，传输未调用' }
-        : { state: 'unknown', note: '发送结果未能写入，按原客户订单号核对' });
+        : { state: 'unknown', note: isStrategy(current) ? `追价策略发送结果未能写入，结果未知；交易所无客户编号，需人工认领或确认未创建${ackHint(current)}` : '发送结果未能写入，按原客户订单号核对' });
       saveOp(current); event(op.jobId, 'operation-recovered', { op: op.id, state: current.state });
     });
   }
 
   async function reconcile(job: Job, op: Operation): Promise<void> {
+    // A released create has nothing the venue can be asked about, and its release note must stay.
+    if (op.releasedAt != null) return;
     const leg = job.legs[op.leg], row = accountFor(leg.venue);
     // Reconciling on another principal could find nothing and wrongly conclude not-created.
     if (!row || row.account_key !== leg.accountKey) { write(() => { const current = readOp(op.id); current.note = '账户绑定已变化，暂停核对'; saveOp(current); }); return; }
-    const binding = bindingOf(row), startedAt = now();
+    if (isStrategy(op)) return reconcileStrategy(job, op, bindingOf(row));
+    const binding = bindingOf(row), startedAt = now(), request = op.request as OrderRequest;
     let report: OrderReport | null;
-    try { const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, op.request, { signal })); report = value === null ? null : parseOrderReport(value, op.request); }
+    try { const value = await callVenue('read', signal => connectorFor(op.venue).query(binding, request, { signal })); report = value === null ? null : parseOrderReport(value, request); }
     catch (error) {
       write(() => {
         const current = readOp(op.id);
@@ -679,20 +923,95 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       saveOp(current); event(job.id, 'operation-not-created', { op: op.id });
     });
   }
+  /** Only by strategy id: without one there is nothing the venue can be asked, and a miss is never read as not created. */
+  async function reconcileStrategy(job: Job, op: Operation, binding: AccountBinding): Promise<void> {
+    const strategyId = op.remoteId;
+    if (strategyId === null) return;
+    const startedAt = now();
+    let report: StrategyReport | null;
+    try { const value = await callVenue('read', signal => chaseConnector(op.venue).queryStrategy(binding, strategyId, { signal })); report = value === null ? null : parseStrategyReport(value, { ...strategyIdentity(op), strategyId }); }
+    catch (error) {
+      if (error instanceof ContractError && error.code === 'strategy_identity') return strategyMismatch(job, op, strategyId);
+      write(() => { const current = readOp(op.id); current.note = `策略核对读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; current.lastCheckedAt = now(); saveOp(current); });
+      return;
+    }
+    if (!report) {
+      write(() => {
+        const current = readOp(op.id);
+        if (SETTLED.has(current.state) || current.remoteId !== strategyId) return;
+        if (current.identityVerifiedAt == null) return disown(current, `交易所查无回报的策略编号 ${strategyId}`);
+        current.note = '交易所查无该追价策略编号，保留待人工核对'; current.lastCheckedAt = now(); saveOp(current);
+      });
+      return;
+    }
+    const found = report;
+    write(() => {
+      const current = readOp(op.id);
+      if (SETTLED.has(current.state) || current.remoteId !== strategyId) return;
+      // The first read that verifies an id checks its creation time too, whether at the answer or later after a failed read.
+      if (current.identityVerifiedAt == null && outsideAck(current, found.createdAt, current.ackAt ?? (current.sentAt ?? current.preparedAt) + budgets.callTimeoutMs, budgets.adoptSkewMs)) {
+        return disown(current, `回报的策略编号 ${strategyId} 的创建时间不在本委托发送时段内`);
+      }
+      applyStrategy(current, found);
+      current.note = strategyNote(current);
+      if (current.state === 'open') current.openCheckedFrom = startedAt;
+      saveOp(current); event(job.id, 'operation-reconciled', { op: op.id, state: current.state, strategyStatus: current.strategyStatus, filled: current.filledQuantity });
+    });
+  }
+  const strategyNote = (op: Operation): string | null => {
+    if (op.adoptedAt == null) return null;
+    const tries = Math.max(op.manualStops ?? 0, op.cancelSent);
+    return tries >= budgets.cancelAttempts && op.strategyStatus !== 'terminal' ? `人工认领的追价策略：已尝试停止 ${tries} 次仍未结束，不再自动停止；需人工在交易所处理` : '人工认领的追价策略';
+  };
+  /**
+   * The id answered for something else. One never verified did not name this create, which is then as unknown as one
+   * without an answer; a verified one is kept but nothing more is sent to it. Either way a person takes over.
+   */
+  function strategyMismatch(job: Job, op: Operation, strategyId: string): void {
+    write(() => {
+      const current = readOp(op.id);
+      if (SETTLED.has(current.state) || current.remoteId !== strategyId) return;
+      const verified = current.identityVerifiedAt != null;
+      event(job.id, 'strategy-identity-mismatch', { op: op.id, strategyId, verified });
+      if (!verified) return disown(current, `回报的策略编号 ${strategyId} 经查询与本委托身份不一致`);
+      Object.assign(current, { identityMismatchAt: current.identityMismatchAt ?? now(), note: `策略编号 ${strategyId} 的查询回报与本委托身份不一致，不再对其发送停止；需人工核对` });
+      current.lastCheckedAt = now(); saveOp(current);
+      const latest = readJob(job.id);
+      if (!FINAL_JOB.has(latest.status)) finish(latest, 'attention', `${VENUE_NAMES[current.venue]} 追价策略编号 ${strategyId} 的查询回报与本委托身份不一致，不对其发送停止；需人工核对`);
+    });
+  }
+  /**
+   * Inside a write. An id no read has verified did not name this create, which is then as unknown as one without an
+   * answer: it holds the job for a person exactly like that one, so the job cannot be acknowledged until it is resolved.
+   */
+  function disown(current: Operation, cause: string): void {
+    const strategyId = current.remoteId;
+    Object.assign(current, { state: 'unknown', remoteId: null, strategyStatus: null, lastCheckedAt: now(), note: `${cause}，追价策略创建结果未知；交易所无客户编号，不重发` });
+    saveOp(current);
+    event(current.jobId, 'strategy-disowned', { op: current.id, strategyId });
+    const job = readJob(current.jobId);
+    if (!FINAL_JOB.has(job.status)) finish(job, 'attention', orphanReason(current));
+  }
   /** Baseline plus this job's settled fills on the leg, excluding the operation under test (which has none known). */
   function expectedPosition(job: Job, index: 0 | 1): string {
     const leg = job.legs[index], filled = add('0', ...opsOf(job.id).filter(item => item.leg === index).map(item => item.filledQuantity));
     return job.action === 'open' ? add(leg.baseline, filled) : sub(leg.baseline, filled);
   }
 
-  async function cancel(job: Job, op: Operation): Promise<void> {
-    if (op.cancelSent >= budgets.cancelAttempts || (op.cancelRequestedAt !== null && now() - op.cancelRequestedAt < budgets.cancelRetryMs)) return;
+  const cancelDue = (op: Operation): boolean => op.cancelSent < budgets.cancelAttempts && (op.cancelRequestedAt === null || now() - op.cancelRequestedAt >= budgets.cancelRetryMs);
+  /** For a strategy this is a stop, which only proves the venue accepted it; the strategy is read again whatever the answer. */
+  async function cancel(job: Job, op: Operation, reason?: string): Promise<void> {
+    if (!cancelDue(op)) return;
+    const strategyId = isStrategy(op) ? op.remoteId : undefined;
+    // Checked here too, so no caller can stop a strategy id that no read has shown to be this create's.
+    if (strategyId === null || (strategyId !== undefined && (op.identityVerifiedAt == null || op.identityMismatchAt != null))) return;
     const leg = job.legs[op.leg], binding = bindingOf(accountFor(leg.venue) ?? reject('account_missing', '账户绑定缺失，保留待核对', 409));
     const seq = (op.cancelSeq ?? 0) + 1;
+    let stopFailed: string | null = null;
     // The shared operation comes first: a sequence above the local one then proves this cancel was never sent.
     let registered: WriterOperation | null = null;
     if (control) {
-      try { registered = control.prepareCancel(binding, job.id, op.request, seq); }
+      try { registered = control.prepareCancel(binding, job.id, op.request, seq, strategyId); }
       catch (error) {
         if (!(error instanceof ControlRefusal)) throw error;
         write(() => { const current = readOp(op.id); current.cancelBlockedAt ??= now(); current.note = `撤单未发送：${error.message.slice(0, 160)}`; saveOp(current); });
@@ -702,24 +1021,38 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     cancelling.add(op.id);
     try {
       // Counted before transport so a crash mid-request stays counted; only a provable not-sent gives it back.
-      try { write(() => { const current = readOp(op.id); current.cancelSent += 1; current.cancelSeq = seq; current.cancelRequestedAt = now(); current.cancelBlockedAt = null; saveOp(current); event(job.id, 'cancel-sent', { op: op.id, attempt: current.cancelSent }); }); }
+      try { write(() => { const current = readOp(op.id); current.cancelSent += 1; current.cancelSeq = seq; current.cancelRequestedAt = now(); current.cancelBlockedAt = null; saveOp(current); event(job.id, 'cancel-sent', { op: op.id, attempt: current.cancelSent, ...(reason ? { reason } : {}) }); }); }
       catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
       let outcome: WriteOutcome | null = null;
       const beforeSend = () => { assertWriter(); if (registered) control?.assertSend(registered, budgets.callTimeoutMs); };
       try {
-        const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, op.request, { signal, beforeSend })), op.request);
-        outcome = 'confirmed';
-        write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
+        if (strategyId !== undefined) {
+          const ack = parseStrategyAck(await callVenue('write', signal => chaseConnector(op.venue).stopStrategy(binding, strategyId, { signal, beforeSend })));
+          if (ack.strategyId !== strategyId) reject('strategy_identity', '停止回报的策略编号与本操作不一致', 502);
+          outcome = 'confirmed';
+        } else {
+          const request = op.request as OrderRequest;
+          const report = parseOrderReport(await callVenue('write', signal => connectorFor(op.venue).cancel(binding, request, { signal, beforeSend })), request);
+          outcome = 'confirmed';
+          write(() => { const current = readOp(op.id); if (SETTLED.has(current.state)) return; applyReport(current, report); saveOp(current); });
+        }
       } catch (error) {
         outcome ??= error instanceof VenueError && (error.kind === 'not-sent' || error.kind === 'rejected') ? 'rejected' : 'unknown';
+        const note = `撤单未确认：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`;
+        stopFailed = note;
         write(() => {
           const current = readOp(op.id);
           if (error instanceof VenueError && error.kind === 'not-sent') current.cancelSent -= 1;
-          current.note = `撤单未确认：${error instanceof Error ? error.message.slice(0, 160) : '未知'}`; saveOp(current);
+          current.note = note; saveOp(current);
         });
       }
       if (registered) control?.finish(registered, outcome);
     } finally { cancelling.delete(op.id); }
+    if (strategyId === undefined) return;
+    try { await reconcile(job, readOp(op.id)); } catch (error) { if (error instanceof WriterLostError) throw error; }
+    // The read clears the note; a failed stop must stay visible while the strategy still runs.
+    const note = stopFailed ?? reason;
+    if (note) write(() => { const current = readOp(op.id); if (stopFailed && SETTLED.has(current.state)) return; current.note = note; saveOp(current); });
   }
 
   // ---- job progression ---------------------------------------------------------
@@ -736,6 +1069,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     // A write this pass settled must not read as an unresolved registry entry when the same pass resends.
     settleControl();
+    if (holdOrphan(job.id)) return;
     // The grace starts no earlier than this writer's takeover, so a long outage still gets full checks before escalation.
     const unresolved = opsOf(job.id).find(item => item.state === 'unknown' && now() >= Math.max(createSettledAt(item), heldSince) + budgets.unresolvedGraceMs);
     if (unresolved) {
@@ -747,15 +1081,26 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const pastDeadline = now() >= job.deadlineAt;
     // After a takeover nothing new is sent, so resting orders are withdrawn instead of waiting for the deadline.
     const withdraw = stop || pastDeadline || job.holdNewSends;
-    for (const op of opsOf(job.id).filter(item => item.state === 'open')) if (withdraw) await cancel(job, op);
+    for (const op of opsOf(job.id).filter(item => item.state === 'open')) if (wantsStop(op, withdraw)) await cancel(job, op, withdraw ? undefined : '追价策略被交易所暂停，已停止；按实际成交对冲');
     job = readJob(job.id);
     if (FINAL_JOB.has(job.status)) return;
-    const exhausted = withdraw ? opsOf(job.id).find(item => item.state === 'open' && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null && now() - item.cancelRequestedAt >= budgets.cancelRetryMs) : undefined;
+    const exhausted = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelSent >= budgets.cancelAttempts && item.cancelRequestedAt !== null && now() - item.cancelRequestedAt >= budgets.cancelRetryMs);
     if (exhausted) { write(() => finish(readJob(job.id), 'attention', `撤单 ${exhausted.cancelSent} 次仍未确认，委托可能仍在挂单；需人工核对`)); return; }
     // A refusal caused by this order's own unknown cancel clears once that cancel's window has passed, so the grace counts from then;
     // like every grace here it starts no earlier than this writer's takeover.
-    const blocked = withdraw ? opsOf(job.id).find(item => item.state === 'open' && item.cancelBlockedAt != null && now() >= Math.max(item.cancelBlockedAt, item.cancelRequestedAt === null ? 0 : cancelSettledAt(item), heldSince) + budgets.unresolvedGraceMs) : undefined;
+    const blocked = opsOf(job.id).find(item => item.state === 'open' && wantsStop(item, withdraw) && item.cancelBlockedAt != null && now() >= Math.max(item.cancelBlockedAt, item.cancelRequestedAt === null ? 0 : cancelSettledAt(item), heldSince) + budgets.unresolvedGraceMs);
     if (blocked) { write(() => finish(readJob(job.id), 'attention', `撤单被账户写入登记阻止超过 ${budgets.unresolvedGraceMs} 毫秒（${(blocked.note ?? '').slice(0, 120)}），委托仍在挂单；需人工核对`)); return; }
+    const lagging = opsOf(job.id).find(item => item.state === 'open' && item.childrenWaitSince != null && now() >= Math.max(item.childrenWaitSince, heldSince) + budgets.unresolvedGraceMs);
+    if (lagging) { write(() => finish(readJob(job.id), 'attention', `${VENUE_NAMES[lagging.venue]} 追价策略已结束，但子单超过 ${budgets.unresolvedGraceMs} 毫秒仍未结清，成交量无法确认；需人工核对`)); return; }
+    // An id that no read has verified is never stopped, so it may run on unseen; that too is bounded by the grace.
+    const unverified = opsOf(job.id).find(item => isStrategy(item) && item.state === 'open' && item.identityVerifiedAt == null && now() >= Math.max(item.sentAt ?? item.preparedAt, heldSince) + budgets.unresolvedGraceMs);
+    if (unverified) {
+      write(() => {
+        const current = readOp(unverified.id);
+        if (current.state === 'open' && current.identityVerifiedAt == null) disown(current, `回报的策略编号 ${current.remoteId} 超过 ${budgets.unresolvedGraceMs} 毫秒仍未能查询核对身份，未对其发送停止`);
+      });
+      return;
+    }
     const lead = legOps(job.id, 0)[0], hedges = legOps(job.id, 1);
     if (!lead) {
       if (stop) { write(() => finish(readJob(job.id), 'stopped', '已停止，未发送任何委托')); return; }
@@ -769,6 +1114,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         write(() => finish(readJob(job.id), 'failed', reason)); return;
       }
       await send(job, 0, job.legs[0].quantity);
+      holdOrphan(job.id);
       return;
     }
     if (!SETTLED.has(lead.state)) return;
@@ -807,6 +1153,26 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     }
     write(() => settleJob(readJob(job.id)));
   }
+
+  /**
+   * Orders are cancelled only when withdrawing. A strategy is stopped then too, and also when the venue paused it, since a
+   * paused strategy neither fills nor ends; one already ended is only read again until its children settle.
+   */
+  function wantsStop(op: Operation, withdraw: boolean): boolean {
+    if (!isStrategy(op)) return withdraw;
+    return op.remoteId !== null && op.identityVerifiedAt != null && op.identityMismatchAt == null && op.strategyStatus !== 'terminal' && (withdraw || op.strategyStatus === 'paused');
+  }
+  /** A strategy create without an answer goes to a person at once: waiting cannot make it any more knowable. */
+  function holdOrphan(jobId: string): boolean {
+    const orphan = opsOf(jobId).find(isOrphanStrategy);
+    if (!orphan) return false;
+    write(() => {
+      const current = readJob(jobId);
+      if (!FINAL_JOB.has(current.status)) finish(current, 'attention', orphanReason(orphan));
+    });
+    return true;
+  }
+  const orphanReason = (orphan: Operation): string => `${VENUE_NAMES[orphan.venue]} 追价策略创建结果未知（交易所无客户编号，无法自动核对；${(orphan.note ?? '无回报').slice(0, 100)}），不再发送；需人工填写策略编号认领、在观察窗后确认未创建，或强制释放`;
 
   /** Hedge the lead's actual fill in the planned proportion, floored to the hedge venue's step. */
   function hedgeQuantityFor(job: Job, leadFilled: string): string {
@@ -884,6 +1250,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (!parsed || !row) return null;
     const op = JSON.parse(row.json) as Operation;
     if (inFlight.has(op.id) || cancelling.has(op.id)) return null;
+    // Only adoption, a person's confirmation of not-created or a release settles such a create; acknowledgement is refused until then.
+    // A create whose answered id was disowned later was already settled as confirmed when that id was kept, which stays.
+    if (isOrphanStrategy(op)) return null;
     const proven = provenOutcome(parsed, op);
     if (proven) return proven;
     // A person who acknowledged the job owns its exposure; its writes are released as possibly executed (plan 6.1).
@@ -892,13 +1261,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   function provenOutcome(parsed: NonNullable<ReturnType<typeof parseOperationId>>, op: Operation): 'confirmed' | 'rejected' | null {
     if (parsed.kind === 'create') {
+      // A person released it as possibly executed.
+      if (op.releasedAt != null) return 'confirmed';
       // prepared never reached transport: the sending mark commits before any send.
       if (op.state === 'prepared' || op.state === 'not-sent' || op.state === 'rejected' || op.state === 'not-created') return 'rejected';
       return op.state === 'open' || op.state === 'filled' || op.state === 'canceled' ? 'confirmed' : null;
     }
     if (parsed.seq > (op.cancelSeq ?? 0)) return 'rejected';
-    // Once the order is over, a cancel of it can no longer change anything.
-    if (SETTLED.has(op.state)) return 'confirmed';
+    // Once the order is over, a cancel of it can no longer change anything; an ended strategy is over even while its children settle.
+    if (SETTLED.has(op.state) || (isStrategy(op) && op.strategyStatus === 'terminal')) return 'confirmed';
     // Past the window in which the venue could still accept the signed cancel, an order seen resting afterwards proves it did nothing (L091).
     return op.state === 'open' && op.cancelRequestedAt !== null && op.openCheckedFrom != null && op.openCheckedFrom >= cancelSettledAt(op) ? 'rejected' : null;
   }
@@ -925,6 +1296,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         recoverIdle(op);
         const current = readOp(op.id);
         if (current.state === 'unknown' || current.state === 'open') await reconcile(job, current);
+        // The one exception to sending nothing: a person adopted this strategy, taking it over and asking for the rest to be stopped,
+        // until that person acknowledges the job. A not-sent stop gives its cancel attempt back, so the tries are bounded on their own.
+        const latest = readOp(op.id);
+        // Read again: a person may have acknowledged the job while the reconcile above was waiting on the venue.
+        if (latest.adoptedAt != null && readJob(op.jobId).acknowledgedAt == null && latest.state === 'open' && wantsStop(latest, true) && cancelDue(latest)
+          && (latest.manualStopAt == null || now() - latest.manualStopAt >= budgets.cancelRetryMs)) {
+          if ((latest.manualStops ?? 0) >= budgets.cancelAttempts) {
+            const note = strategyNote(latest);
+            if (latest.note !== note) write(() => { const current = readOp(op.id); current.note = note; saveOp(current); });
+          } else {
+            write(() => { const current = readOp(op.id); current.manualStops = (current.manualStops ?? 0) + 1; current.manualStopAt = now(); saveOp(current); });
+            await cancel(job, readOp(op.id));
+          }
+        }
       } catch (error) { if (error instanceof WriterLostError) throw error; }
     }
     // Again at the end, so a result reconciled in this pass releases its account before the next one.
@@ -942,11 +1327,14 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return {
       id: job.id, status: job.status, reason: job.reason, stopRequested: stopRequested(id), createdAt: job.createdAt, deadlineAt: job.deadlineAt, holdNewSends: job.holdNewSends,
       locked: !!db.prepare('SELECT 1 FROM locks WHERE job_id = ? LIMIT 1').get(id), acknowledgedAt: job.acknowledgedAt,
+      /** A strategy create without an answer waits for adoption, a confirmation of not-created or a release. */
+      strategyPending: ops.some(isOrphanStrategy),
       legs: job.legs.map(leg => {
         const mine = ops.filter(item => item.leg === leg.index).sort((a, b) => attemptOf(a) - attemptOf(b)), op = mine.at(-1);
-        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null,
+        return { venue: leg.venue, symbol: leg.symbol, side: leg.side, orderSide: leg.orderSide, orderType: leg.orderType, plannedQuantity: leg.quantity, accountId: maskId(leg.accountId), priceBound: leg.priceBound ?? null,
           attempts: mine.length, filledQuantity: add('0', ...mine.map(item => item.filledQuantity)),
-          operation: op ? { clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId, note: op.note } : null };
+          operation: op ? { kind: op.kind ?? 'order', clientOrderId: op.clientOrderId, state: op.state, quantity: op.request.quantity, filledQuantity: op.filledQuantity, averagePrice: op.averagePrice, remoteId: op.remoteId,
+            strategyStatus: op.strategyStatus ?? null, childrenSettled: op.childrenSettled ?? null, adoptedAt: op.adoptedAt ?? null, releasedAt: op.releasedAt ?? null, ackStrategyId: op.ackStrategyId ?? null, note: op.note } : null };
       }),
       events,
     };
@@ -965,6 +1353,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     confirm,
     requestStop,
     acknowledge,
+    adoptStrategy,
+    confirmNotCreated,
+    releaseStrategy,
     observe,
     tick,
     jobView,

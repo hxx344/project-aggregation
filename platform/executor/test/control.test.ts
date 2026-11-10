@@ -10,7 +10,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { ContractError } from '../src/contracts.ts';
 import { createExecutor } from '../src/executor.ts';
 import type { AccountWriterPort, RegistryIdentity } from '../src/account-control.ts';
-import { SESSION, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
+import { SESSION, chaseIntent, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
 import type { Budgets } from '../src/executor.ts';
 
 interface Snapshot { accounts: { authority: string; environment: string; moduleId: string; state: string }[]; operations: { moduleId: string; state: string; count: number }[] }
@@ -355,6 +355,139 @@ test('写者登记：撤单登记为独立操作；撤单结果未知时阻止�
   assert.equal(states[`platform:create:${lead}`], 'confirmed');
 }, { budgets: { callTimeoutMs: 35_000 } }));
 
+/** Records every payload the registry is asked to prepare. */
+const recording = (payloads: Map<string, Record<string, unknown>>): Wrap => writer => new Proxy(writer, {
+  get(target, key) {
+    if (key === 'prepare') return (ticket: never, operationId: string, payload: Record<string, unknown>) => { payloads.set(operationId, payload); return target.prepare(ticket, operationId, payload); };
+    const value = Reflect.get(target, key);
+    return typeof value === 'function' ? value.bind(target) : value;
+  },
+});
+
+test('写者登记：追价首腿建单登记带 strategy 与 maxChasePrice，停止按策略编号登记，结果落盘后均为已确认', () => {
+  const payloads = new Map<string, Record<string, unknown>>();
+  return withControl(async (h, registry) => {
+    h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0.4' });
+    const { jobId } = await previewAndConfirm(h, chaseIntent({ timeoutMs: 30_000 }));
+    const view = await settle(h, jobId, { ticks: 60 });
+    assert.equal(view.status, 'completed');
+    const op = view.legs[0].operation!, coid = op.clientOrderId;
+    const create = payloads.get(`platform:create:${coid}`)!;
+    assert.deepEqual([create.type, create.strategy, create.maxChasePrice, create.quantity, create.clientOrderId], ['chase', 'chase', '70.42', '1', coid]);
+    assert.equal(Object.hasOwn(create, 'limitPrice'), false);
+    assert.deepEqual(payloads.get(`platform:cancel:${coid}:1`)?.intentTarget, { symbol: 'CLUSDT', remoteId: op.remoteId });
+    const states = registry.states();
+    assert.deepEqual([states[`platform:create:${coid}`], states[`platform:cancel:${coid}:1`]], ['confirmed', 'confirmed']);
+    assert.ok(!Object.values(states).some(state => state === 'sending' || state === 'unknown'));
+  }, { wrap: recording(payloads) });
+});
+
+test('写者登记：追价 ACK 丢失时建单登记保持未知，人工确认被拒；认领后登记为已确认，停止剩余也登记并确认', () => withControl(async (h, registry) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response', filled: '0.3' });
+  const { jobId } = await previewAndConfirm(h, chaseIntent());
+  await h.ex.tick();
+  const coid = leg(h, jobId, 0).operation!.clientOrderId;
+  assert.equal(h.ex.jobView(jobId).status, 'attention');
+  for (let i = 0; i < 3; i++) { h.advance(1_000); await h.ex.tick(); }
+  assert.equal(registry.states()[`platform:create:${coid}`], 'unknown');
+  assert.throws(() => h.ex.acknowledge(jobId, randomUUID(), SESSION), code('strategy_unresolved'));
+  assert.equal(registry.states()[`platform:create:${coid}`], 'unknown');
+  const [real] = h.bybit.strategiesOf(ACCOUNTS.bybit);
+  await h.ex.adoptStrategy({ jobId, requestId: randomUUID(), strategyId: real.strategyId }, SESSION);
+  const states = registry.states();
+  assert.deepEqual([states[`platform:create:${coid}`], states[`platform:cancel:${coid}:1`]], ['confirmed', 'confirmed']);
+  assert.equal(leg(h, jobId, 0).operation?.state, 'canceled');
+  h.ex.acknowledge(jobId, randomUUID(), SESSION);
+  assert.equal(h.ex.jobView(jobId).locked, false);
+}));
+
+test('写者登记：追价请求丢失时同账户其他任务不发送；人工确认未创建后登记结清为未执行，账户恢复可写', () => withControl(async (h, registry) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-request' });
+  const first = await previewAndConfirm(h, chaseIntent());
+  await h.ex.tick();
+  const coid = leg(h, first.jobId, 0).operation!.clientOrderId;
+  const second = await previewAndConfirm(h, chaseIntent({ symbol: 'BZUSDT', timeoutMs: 3_600_000 }));
+  for (let i = 0; i < 5; i++) { await h.ex.tick(); h.advance(1_000); }
+  assert.equal(h.bybit.calls['strategy-place'], 1, '同账户有未核对的登记时不发送');
+  assert.match(h.ex.jobView(second.jobId).reason ?? '', /写入登记/);
+  h.advance(121_000);
+  await h.ex.confirmNotCreated({ jobId: first.jobId, requestId: randomUUID() }, SESSION);
+  assert.equal(registry.states()[`platform:create:${coid}`], 'rejected');
+  assert.equal((await settle(h, second.jobId)).status, 'completed');
+}));
+
+test('写者登记：追价停止结果不明，之后读到策略已结束时撤单登记结清为已确认', () => withControl(async (h, registry) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0.4' });
+  const { jobId } = await previewAndConfirm(h, chaseIntent({ timeoutMs: 30_000 }));
+  await h.ex.tick();
+  const coid = leg(h, jobId, 0).operation!.clientOrderId;
+  h.bybit.inject({ operation: 'strategy-stop', mode: 'lost-response' });
+  // The read before the stop and the one right after it both fail, so the end is first seen on a later pass.
+  h.bybit.inject({ operation: 'strategy-query', mode: 'read-fail', times: 2 });
+  h.advance(31_000);
+  await h.ex.tick();
+  assert.equal(h.bybit.arrived['strategy-stop'], 1);
+  assert.deepEqual([leg(h, jobId, 0).operation?.state, leg(h, jobId, 0).operation?.strategyStatus], ['open', 'working']);
+  assert.equal(registry.states()[`platform:cancel:${coid}:1`], 'unknown');
+  h.advance(1_000);
+  await h.ex.tick();
+  assert.deepEqual([leg(h, jobId, 0).operation?.state, leg(h, jobId, 0).operation?.strategyStatus], ['canceled', 'terminal']);
+  assert.equal(registry.states()[`platform:cancel:${coid}:1`], 'confirmed');
+  assert.equal((await settle(h, jobId)).status, 'completed');
+  assert.equal(h.bybit.arrived['strategy-stop'], 1);
+}));
+
+test('写者登记：追价强制释放后建单登记结清为已确认（可能已执行），确认人工处理后账户恢复可写', () => withControl(async (h, registry) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const { jobId } = await previewAndConfirm(h, chaseIntent());
+  await h.ex.tick();
+  const coid = leg(h, jobId, 0).operation!.clientOrderId;
+  assert.equal(registry.states()[`platform:create:${coid}`], 'unknown');
+  h.ex.releaseStrategy({ jobId, requestId: randomUUID(), acknowledgeRisk: true }, SESSION);
+  assert.equal(registry.states()[`platform:create:${coid}`], 'confirmed');
+  assert.equal(leg(h, jobId, 0).operation?.state, 'unknown');
+  h.ex.acknowledge(jobId, randomUUID(), SESSION);
+  // The released strategy filled on the venue; the person has taken that exposure over.
+  h.bybit.setPosition(ACCOUNTS.bybit, 'CLUSDT', 'long', '0');
+  const next = await previewAndConfirm(h, chaseIntent());
+  assert.equal((await settle(h, next.jobId)).status, 'completed');
+  assert.equal(h.bybit.calls['strategy-place'], 2);
+}));
+
+test('写者登记：追价停止被登记阻止转人工后，登记恢复也不再停止未认领的策略', () => {
+  const busy: Busy = { cancel: true, resolve: false };
+  return withControl(async h => {
+    h.bybit.inject({ operation: 'strategy-place', mode: 'partial', filled: '0.4' });
+    const { jobId } = await previewAndConfirm(h, chaseIntent({ timeoutMs: 3_600_000 }));
+    await h.ex.tick();
+    h.ex.requestStop(jobId, randomUUID(), SESSION);
+    const view = await settle(h, jobId, { ticks: 120 });
+    assert.equal(view.status, 'attention');
+    assert.match(view.reason ?? '', /撤单被账户写入登记阻止/);
+    busy.cancel = false;
+    for (let i = 0; i < 5; i++) { h.advance(10_000); await h.ex.tick(); }
+    assert.equal(h.bybit.calls['strategy-stop'], 0);
+    assert.equal(leg(h, jobId, 0).operation?.strategyStatus, 'working');
+  }, { wrap: flaky(busy) });
+});
+
+test('写者登记：人工确认处理时正在发送的停止不被提前结清，停止结果落盘后才结清', () => withControl(async (h, registry) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response', filled: '0.3' });
+  const { jobId } = await previewAndConfirm(h, chaseIntent());
+  await h.ex.tick();
+  const coid = leg(h, jobId, 0).operation!.clientOrderId;
+  h.bybit.inject({ operation: 'strategy-stop', mode: 'hang-after-apply' });
+  const [real] = h.bybit.strategiesOf(ACCOUNTS.bybit);
+  const adopting = h.ex.adoptStrategy({ jobId, requestId: randomUUID(), strategyId: real.strategyId }, SESSION);
+  for (let i = 0; i < 50 && h.bybit.arrived['strategy-stop'] === 0; i++) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.bybit.arrived['strategy-stop'], 1);
+  h.ex.acknowledge(jobId, randomUUID(), SESSION);
+  assert.notEqual(registry.states()[`platform:cancel:${coid}:1`], 'confirmed');
+  h.bybit.releaseHung();
+  await adopting;
+  assert.equal(registry.states()[`platform:cancel:${coid}:1`], 'confirmed');
+  assert.equal(leg(h, jobId, 0).operation?.state, 'canceled');
+}, { budgets: { callTimeoutMs: 35_000 } }));
 test('写者登记：模拟传输不得以 mainnet 身份登记，调用预算须在登记租约之内', () => {
   const registry = createRegistry(), h = createHarness();
   try {

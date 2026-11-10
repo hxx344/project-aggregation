@@ -185,10 +185,12 @@ export function positionOf(snapshot: AccountSnapshot, symbol: string, side: Posi
 
 export type OrderSide = 'buy' | 'sell';
 export type OrderType = 'market' | 'limit';
+/** chase: a venue-native chase strategy, lead leg on Bybit only; it is a strategy, not an order. */
+export type LegOrderType = OrderType | 'chase';
 export type Action = 'open' | 'close';
 export const orderSideOf = (action: Action, side: PositionSide): OrderSide => (action === 'open') === (side === 'long') ? 'buy' : 'sell';
 
-export interface LegIntent { venue: Venue; side: PositionSide; quantity: string; orderType: OrderType; limitPrice: string | null }
+export interface LegIntent { venue: Venue; side: PositionSide; quantity: string; orderType: LegOrderType; limitPrice: string | null }
 /** maxSlippageBps: how far either book may move against the preview before the lead is sent; null uses the executor default. */
 export interface Intent { market: 'oil'; preset: 'cross-exchange'; symbol: string; action: Action; timeoutMs: number; maxSlippageBps: number | null; legs: [LegIntent, LegIntent] }
 export const MAX_SLIPPAGE_BPS = 1_000;
@@ -204,13 +206,16 @@ export function parseIntent(value: unknown): Intent {
     const leg = exactKeys(item, ['venue', 'side', 'quantity', 'orderType'], ['limitPrice']);
     const venue = oneOf(leg.venue, VENUES, '交易所');
     if (!VENUE_EXECUTION_SYMBOLS[venue].includes(symbol)) reject('venue_symbol', `${VENUE_NAMES[venue]} 不支持 ${symbol} 执行`);
-    const orderType = oneOf(leg.orderType, ['market', 'limit'] as const, '下单方式');
+    const orderType = oneOf(leg.orderType, ['market', 'limit', 'chase'] as const, '下单方式');
     const limitPrice = leg.limitPrice === undefined || leg.limitPrice === null ? null : decimalField(leg.limitPrice, '限价');
-    if ((orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : '市价单不设限价');
+    if ((orderType === 'limit') !== (limitPrice !== null)) reject('limit_price', orderType === 'limit' ? '限价单需要限价' : orderType === 'chase' ? '追价策略不设限价（最高追价取预览的价格保护界限）' : '市价单不设限价');
     return { venue, side: oneOf(leg.side, ['long', 'short'] as const, '仓位方向'), quantity: decimalField(leg.quantity, '每腿数量'), orderType, limitPrice };
   }) as [LegIntent, LegIntent];
   if (legs[0].venue === legs[1].venue) reject('same_venue', '跨所双腿须选择两个不同交易所');
   if (legs[0].side === legs[1].side) reject('same_side', '双腿方向必须相反');
+  // The hedge must go out at once for whatever the lead filled; a strategy that may rest or pause cannot do that.
+  if (legs[1].orderType === 'chase') reject('chase_unsupported', '追价策略只能用于首腿，对冲腿按市价发送');
+  if (legs[0].orderType === 'chase' && legs[0].venue !== 'bybit') reject('chase_unsupported', '只有 Bybit 支持原生追价策略');
   const maxSlippageBps = raw.maxSlippageBps === undefined || raw.maxSlippageBps === null ? null : integer(raw.maxSlippageBps, 1, MAX_SLIPPAGE_BPS, '价格保护基点');
   return { market: 'oil', preset: 'cross-exchange', symbol, action, timeoutMs: integer(raw.timeoutMs, 30_000, 3_600_000, '最长执行毫秒数'), maxSlippageBps, legs };
 }

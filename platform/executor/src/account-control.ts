@@ -4,7 +4,7 @@
 // The registry pins an account to the first module that claims it, forever:
 // only testnet or demo identities may be claimed while transport is simulated.
 import { ContractError, VENUE_NAMES, type AccountBinding, type Venue } from './contracts.ts';
-import type { OrderRequest } from './connector.ts';
+import type { ChaseRequest, OrderRequest } from './connector.ts';
 
 export type ControlEnvironment = 'testnet' | 'demo';
 export const CONTROL_ENVIRONMENTS: readonly ControlEnvironment[] = ['testnet', 'demo'];
@@ -56,8 +56,9 @@ export function parseOperationId(operationId: string): { kind: 'create'; clientO
 export interface AccountControl {
   /** Claims the account if needed, checks ownership and that no earlier write of this module on it is unresolved. */
   admit(binding: AccountBinding, budgetMs: number): void;
-  prepareCreate(binding: AccountBinding, jobId: string, request: OrderRequest): WriterOperation;
-  prepareCancel(binding: AccountBinding, jobId: string, request: OrderRequest, seq: number): WriterOperation;
+  prepareCreate(binding: AccountBinding, jobId: string, request: OrderRequest | ChaseRequest): WriterOperation;
+  /** strategyId: the cancel stops a chase strategy, which the venue knows only by that id. */
+  prepareCancel(binding: AccountBinding, jobId: string, request: Pick<OrderRequest, 'symbol' | 'clientOrderId'>, seq: number, strategyId?: string): WriterOperation;
   /** Final check inside the connector's beforeSend. */
   assertSend(operation: WriterOperation, budgetMs: number): void;
   /** Releases the shared operation after the local result is durable; a refusal leaves it for settle. */
@@ -109,13 +110,17 @@ export function createAccountControl({ writer, environment, lost }: { writer: Ac
     prepareCreate(binding, jobId, request) {
       const ticket = ticketFor(binding);
       // Deterministic from the persisted request, so it never carries credentials, timestamps or nonces.
-      const payload = { groupId: groupId(jobId), action: 'create', venue: binding.venue, clientOrderId: request.clientOrderId, symbol: request.symbol, side: request.side, positionSide: request.positionSide,
-        type: request.type, quantity: request.quantity, limitPrice: request.limitPrice, timeInForce: request.timeInForce ?? 'gtc', reduceOnly: request.reduceOnly };
+      const base = { groupId: groupId(jobId), action: 'create', venue: binding.venue, clientOrderId: request.clientOrderId, symbol: request.symbol, side: request.side, positionSide: request.positionSide };
+      const payload = request.type === 'chase'
+        ? { ...base, type: request.type, quantity: request.quantity, reduceOnly: request.reduceOnly, strategy: 'chase', maxChasePrice: request.maxChasePrice }
+        : { ...base, type: request.type, quantity: request.quantity, limitPrice: request.limitPrice, timeInForce: request.timeInForce ?? 'gtc', reduceOnly: request.reduceOnly };
       return guarded(binding, () => writer.prepare(ticket, createOperationId(request.clientOrderId), payload));
     },
-    prepareCancel(binding, jobId, request, seq) {
+    prepareCancel(binding, jobId, request, seq, strategyId) {
       const ticket = ticketFor(binding);
-      const payload = { groupId: groupId(jobId), action: 'cancel', venue: binding.venue, intentAction: 'cancel', intentTarget: { symbol: request.symbol, clientOrderId: request.clientOrderId } };
+      const payload = strategyId === undefined
+        ? { groupId: groupId(jobId), action: 'cancel', venue: binding.venue, intentAction: 'cancel', intentTarget: { symbol: request.symbol, clientOrderId: request.clientOrderId } }
+        : { groupId: groupId(jobId), action: 'cancel', venue: binding.venue, strategy: 'chase', intentAction: 'cancel', intentTarget: { symbol: request.symbol, remoteId: strategyId } };
       return guarded(binding, () => writer.prepare(ticket, cancelOperationId(request.clientOrderId, seq), payload));
     },
     assertSend(operation, budgetMs) { guarded(null, () => writer.assertOwned(operation, budgetMs)); },

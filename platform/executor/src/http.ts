@@ -5,13 +5,13 @@
 // local process that merely reaches the port can drive it.
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { ContractError, VENUES, type Venue } from './contracts.ts';
+import { ContractError, VENUES, exactKeys, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
 import { PAGE } from './page.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
-const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge))?$/i;
+const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
 
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
@@ -88,11 +88,25 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), session)));
     if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), session));
     const match = UUID_PATH.exec(url.pathname);
-    if (match && request.method === 'GET' && !match[2]) return send(response, 200, executor.jobView(match[1]));
-    if (match && request.method === 'POST' && match[2]) {
+    // The path match is case-insensitive, so the action is compared lowercased; otherwise /STOP would fall through to acknowledge.
+    const action = match?.[2]?.toLowerCase();
+    if (match && request.method === 'GET' && !action) return send(response, 200, executor.jobView(match[1]));
+    if (match && request.method === 'POST' && action === 'adopt-strategy') {
+      const body = exactKeys(await readJson(request), ['requestId', 'strategyId']);
+      return send(response, 200, await executor.adoptStrategy({ jobId: match[1], requestId: body.requestId, strategyId: body.strategyId }, session));
+    }
+    if (match && request.method === 'POST' && action === 'confirm-not-created') {
+      const body = exactKeys(await readJson(request), ['requestId']);
+      return send(response, 200, await executor.confirmNotCreated({ jobId: match[1], requestId: body.requestId }, session));
+    }
+    if (match && request.method === 'POST' && action === 'release-strategy') {
+      const body = exactKeys(await readJson(request), ['requestId'], ['acknowledgeRisk']);
+      return send(response, 200, executor.releaseStrategy({ jobId: match[1], requestId: body.requestId, acknowledgeRisk: body.acknowledgeRisk }, session));
+    }
+    if (match && request.method === 'POST' && (action === 'stop' || action === 'acknowledge')) {
       const body = await readJson(request) as { requestId?: unknown } | null;
       const requestId = typeof body?.requestId === 'string' ? body.requestId : '';
-      return send(response, 200, match[2] === 'stop' ? executor.requestStop(match[1], requestId, session) : executor.acknowledge(match[1], requestId, session));
+      return send(response, 200, action === 'stop' ? executor.requestStop(match[1], requestId, session) : executor.acknowledge(match[1], requestId, session));
     }
     return send(response, 404, { code: 'not_found', message: '不存在' });
   }

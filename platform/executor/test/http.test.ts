@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer, sessionCookieName } from '../src/http.ts';
 import { assertDedicatedDataDir, writeAccessUrl } from '../src/main.ts';
-import { bindAccounts, createHarness, openIntent, settle } from './harness.ts';
+import { bindAccounts, chaseIntent, createHarness, openIntent, settle } from './harness.ts';
 
 const TOKEN = 'http-access-token-0001';
 const SESSION = 'http-session-value-0001';
@@ -104,6 +104,57 @@ test('HTTP：预览、确认、重复确认返回原任务；状态页只显示�
   assert.equal(((await stale.json()) as { code: string }).code, 'preview_invalid');
 }));
 
+test('HTTP：追价策略认领与确认未创建接口沿用会话与请求标记，参数与状态错误映射为 4xx', () => withServer(async (base, cookie, h) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const preview = await (await post(base, '/api/preview', chaseIntent(), { cookie })).json() as { id: string };
+  const { job } = await (await post(base, '/api/confirm', { previewId: preview.id, requestId: randomUUID(), confirmLive: true }, { cookie })).json() as { job: { id: string } };
+  await h.ex.tick();
+  const path = `/api/jobs/${job.id}`;
+  const codeOf = async (response: Response) => [response.status, ((await response.json()) as { code: string }).code];
+  assert.equal((await fetch(base + path + '/adopt-strategy', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: 'x' }, {})).status, 401);
+  assert.deepEqual(await codeOf(await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: 'x', more: 1 }, { cookie })), [400, 'unknown_field']);
+  assert.deepEqual(await codeOf(await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: randomUUID() }, { cookie })), [409, 'strategy_not_found']);
+  assert.deepEqual(await codeOf(await post(base, path + '/confirm-not-created', { requestId: randomUUID() }, { cookie })), [409, 'create_window']);
+  assert.deepEqual(await codeOf(await post(base, path + '/ACKNOWLEDGE', { requestId: randomUUID() }, { cookie })), [409, 'strategy_unresolved']);
+  assert.equal((await post(base, path + '/STOP', { requestId: randomUUID() }, { cookie })).status, 200, '大小写不同的动作仍按原动作处理');
+  const state = await (await fetch(base + '/api/state', { headers: { cookie } })).json() as { jobs: { strategyPending: boolean }[] };
+  assert.equal(state.jobs[0].strategyPending, true);
+  const [real] = h.bybit.strategiesOf('BY2002');
+  const adopted = await post(base, path + '/adopt-strategy', { requestId: randomUUID(), strategyId: real.strategyId }, { cookie });
+  assert.equal(adopted.status, 200);
+  const body = await adopted.json() as { strategyPending: boolean; legs: { operation: { remoteId: string; state: string } }[] };
+  assert.deepEqual([body.strategyPending, body.legs[0].operation.remoteId, body.legs[0].operation.state], [false, real.strategyId, 'filled']);
+  assert.deepEqual(await codeOf(await post(base, path + '/confirm-not-created', { requestId: randomUUID() }, { cookie })), [409, 'no_pending_strategy']);
+  const page = await (await fetch(base + '/', { headers: { cookie } })).text();
+  assert.match(page, /认领策略/);
+  assert.match(page, /确认未创建/);
+}));
+
+test('HTTP：追价强制释放须 acknowledgeRisk 严格为 true，释放后可确认人工处理；页面有强制释放按钮', () => withServer(async (base, cookie, h) => {
+  h.bybit.inject({ operation: 'strategy-place', mode: 'lost-response' });
+  const preview = await (await post(base, '/api/preview', chaseIntent(), { cookie })).json() as { id: string };
+  const { job } = await (await post(base, '/api/confirm', { previewId: preview.id, requestId: randomUUID(), confirmLive: true }, { cookie })).json() as { job: { id: string } };
+  await h.ex.tick();
+  const path = `/api/jobs/${job.id}`;
+  const codeOf = async (response: Response) => [response.status, ((await response.json()) as { code: string }).code];
+  assert.equal((await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: true }, {})).status, 401);
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID() }, { cookie })), [400, 'acknowledge_risk']);
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: 'true' }, { cookie })), [400, 'acknowledge_risk']);
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: true, jobId: job.id }, { cookie })), [400, 'unknown_field']);
+  assert.deepEqual(await codeOf(await post(base, path + '/acknowledge', { requestId: randomUUID() }, { cookie })), [409, 'strategy_unresolved']);
+  const requestId = randomUUID();
+  const released = await post(base, path + '/release-strategy', { requestId, acknowledgeRisk: true }, { cookie });
+  assert.equal(released.status, 200);
+  const body = await released.json() as { strategyPending: boolean; legs: { operation: { state: string; releasedAt: number | null } }[] };
+  assert.deepEqual([body.strategyPending, body.legs[0].operation.state, typeof body.legs[0].operation.releasedAt], [false, 'unknown', 'number']);
+  assert.equal((await post(base, path + '/release-strategy', { requestId, acknowledgeRisk: true }, { cookie })).status, 200, '同一请求编号重试返回原结果');
+  assert.deepEqual(await codeOf(await post(base, path + '/release-strategy', { requestId: randomUUID(), acknowledgeRisk: true }, { cookie })), [409, 'no_pending_strategy']);
+  assert.equal((await post(base, path + '/acknowledge', { requestId: randomUUID() }, { cookie })).status, 200);
+  const page = await (await fetch(base + '/', { headers: { cookie } })).text();
+  assert.match(page, /强制释放（策略可能已成交）/);
+  assert.match(page, /manualRequestId/);
+}));
 test('入口：拒绝相对路径与工作台数据目录', () => {
   const h = createHarness();
   try {

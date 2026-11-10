@@ -25,6 +25,11 @@ export interface ConnectorCapabilities {
   maxClientOrderIdLength: number;
   /** After this long past the send attempt the venue no longer accepts the signed request (Binance recvWindow, Bybit recv_window). */
   requestValidityMs: number;
+  /**
+   * Venue-native chase strategy (Bybit /v5/strategy/*). It takes no client id and no idempotency token,
+   * so a create without a usable answer can never be retried or matched automatically.
+   */
+  chase?: true;
 }
 
 export interface OrderRequest {
@@ -76,6 +81,72 @@ export function parseOrderReport(value: unknown, request: Pick<OrderRequest, 'cl
   return report;
 }
 
+/** What the venue receives for a chase strategy; maxChasePrice is the worst price it may chase to. */
+export interface StrategyRequest {
+  symbol: string;
+  side: OrderSide;
+  positionSide: PositionSide;
+  quantity: string;
+  maxChasePrice: string;
+  reduceOnly: boolean;
+}
+/** Local record of a chase create. clientOrderId only names the operation here and in the shared registry; the venue never sees it. */
+export interface ChaseRequest extends StrategyRequest { clientOrderId: string; type: 'chase' }
+export const strategyRequestOf = ({ symbol, side, positionSide, quantity, maxChasePrice, reduceOnly }: ChaseRequest): StrategyRequest => ({ symbol, side, positionSide, quantity, maxChasePrice, reduceOnly });
+
+export const STRATEGY_ID = /^[A-Za-z0-9_-]{1,100}$/;
+export interface StrategyAck { strategyId: string }
+export function parseStrategyAck(value: unknown): StrategyAck {
+  const raw = exactKeys(value, ['strategyId']);
+  return { strategyId: text(raw.strategyId, '策略编号', STRATEGY_ID) };
+}
+
+/** working: may still place children. paused: stopped by the venue, not over. terminal: no new children. */
+export type StrategyStatus = 'working' | 'paused' | 'terminal';
+export interface StrategyReport {
+  strategyId: string;
+  symbol: string;
+  side: OrderSide;
+  positionSide: PositionSide;
+  reduceOnly: boolean;
+  quantity: string;
+  filledQuantity: string;
+  averagePrice: string | null;
+  status: StrategyStatus;
+  maxChasePrice: string;
+  /** No child order still open and the children's fills add up to the strategy's executed size; a terminal status alone is not settled. */
+  childrenSettled: boolean;
+  /** Venue clock. */
+  createdAt: number;
+  updatedAt: number;
+}
+export type StrategyIdentity = Pick<StrategyReport, 'symbol' | 'side' | 'positionSide' | 'reduceOnly' | 'quantity' | 'maxChasePrice'> & { strategyId?: string };
+/** Without expected the report is only checked for shape, as for a listing; with it, identity must match exactly. */
+export function parseStrategyReport(value: unknown, expected?: StrategyIdentity): StrategyReport {
+  const raw = exactKeys(value, ['strategyId', 'symbol', 'side', 'positionSide', 'reduceOnly', 'quantity', 'filledQuantity', 'averagePrice', 'status', 'maxChasePrice', 'childrenSettled', 'createdAt', 'updatedAt']);
+  const flag = (item: unknown, name: string): boolean => typeof item === 'boolean' ? item : reject('report_shape', `${name}无效`, 502);
+  const report: StrategyReport = {
+    strategyId: text(raw.strategyId, '策略编号', STRATEGY_ID),
+    symbol: text(raw.symbol, '合约'),
+    side: oneOf(raw.side, ['buy', 'sell'] as const, '策略方向'),
+    positionSide: oneOf(raw.positionSide, ['long', 'short'] as const, '仓位方向'),
+    reduceOnly: flag(raw.reduceOnly, '只减仓标记'),
+    quantity: decimalField(raw.quantity, '策略数量'),
+    filledQuantity: decimalField(raw.filledQuantity, '成交数量', 'nonnegative'),
+    averagePrice: raw.averagePrice === null ? null : decimalField(raw.averagePrice, '成交均价'),
+    status: oneOf(raw.status, ['working', 'paused', 'terminal'] as const, '策略状态'),
+    maxChasePrice: decimalField(raw.maxChasePrice, '最高追价'),
+    childrenSettled: flag(raw.childrenSettled, '子单结清标记'),
+    createdAt: integer(raw.createdAt, 0, Number.MAX_SAFE_INTEGER, '策略创建时间'),
+    updatedAt: integer(raw.updatedAt, 0, Number.MAX_SAFE_INTEGER, '策略更新时间'),
+  };
+  if (expected && ((expected.strategyId !== undefined && report.strategyId !== expected.strategyId) || report.symbol !== expected.symbol || report.side !== expected.side
+    || report.positionSide !== expected.positionSide || report.reduceOnly !== expected.reduceOnly || cmp(report.quantity, expected.quantity) !== 0 || cmp(report.maxChasePrice, expected.maxChasePrice) !== 0)) reject('strategy_identity', '策略的合约、方向、仓位方向、数量、最高追价或只减仓与本委托不一致', 409);
+  if (cmp(report.filledQuantity, report.quantity) > 0) reject('report_overfill', '策略回报成交数量超过策略数量', 409);
+  if ((report.averagePrice === null) !== (cmp(report.filledQuantity, '0') === 0)) reject('report_price', '成交均价与成交数量不一致', 502);
+  return report;
+}
+
 export interface CallOptions { signal: AbortSignal }
 export interface SendOptions extends CallOptions {
   /** Called synchronously right before transmission; a throw means the request was not sent. */
@@ -92,4 +163,18 @@ export interface VenueConnector {
   /** null means the venue answered that no order with this client id exists. */
   query(binding: AccountBinding, order: OrderRequest, options: CallOptions): Promise<OrderReport | null>;
   cancel(binding: AccountBinding, order: OrderRequest, options: SendOptions): Promise<OrderReport>;
+  /** Present only with capabilities.chase. An answer only proves acceptance; fills are read with queryStrategy. */
+  placeChase?(binding: AccountBinding, request: StrategyRequest, options: SendOptions): Promise<StrategyAck>;
+  /** null means the venue answered that no strategy with this id exists on the account. */
+  queryStrategy?(binding: AccountBinding, strategyId: string, options: CallOptions): Promise<StrategyReport | null>;
+  /** An answer does not prove that nothing filled; the strategy must be read again. */
+  stopStrategy?(binding: AccountBinding, strategyId: string, options: SendOptions): Promise<StrategyAck>;
+  /**
+   * Every working or paused strategy on the symbol, whenever created, plus the ended ones created within [from, to] (venue clock).
+   * The answer must be complete (every page read); a listing that cannot be read in full must throw a read failure, never return part of it.
+   */
+  listStrategies?(binding: AccountBinding, symbol: string, window: { from: number; to: number }, options: CallOptions): Promise<StrategyReport[]>;
 }
+export type ChaseConnector = VenueConnector & Required<Pick<VenueConnector, 'placeChase' | 'queryStrategy' | 'stopStrategy' | 'listStrategies'>>;
+export const supportsChase = (connector: VenueConnector): connector is ChaseConnector => connector.capabilities.chase === true
+  && typeof connector.placeChase === 'function' && typeof connector.queryStrategy === 'function' && typeof connector.stopStrategy === 'function' && typeof connector.listStrategies === 'function';

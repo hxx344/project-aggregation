@@ -75,6 +75,12 @@ export const openIntent = (overrides: { quantity?: [string, string]; orderType?:
   ],
 });
 
+/** Bybit native chase lead, Binance market hedge. */
+export const chaseIntent = ({ quantity = '1', timeoutMs = 60_000, symbol = 'CLUSDT' }: { quantity?: string; timeoutMs?: number; symbol?: string } = {}) => ({
+  market: 'oil', preset: 'cross-exchange', symbol, action: 'open', timeoutMs,
+  legs: [{ venue: 'bybit', side: 'long', quantity, orderType: 'chase' }, { venue: 'binance', side: 'short', quantity, orderType: 'market' }],
+});
+
 export async function previewAndConfirm(h: Harness, intent: unknown = openIntent()) {
   const preview = await h.ex.preview(intent, SESSION);
   const requestId = randomUUID();
