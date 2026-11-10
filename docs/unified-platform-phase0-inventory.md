@@ -9,7 +9,7 @@
 - 新执行器原型（`platform/executor/src`）为阶段 1 首切片，仅模拟传输；第 6.8、6.9、7.2、8 节按当前代码与测试记录。
 - 已完成：全工作区功能矩阵（111 行）、进程拓扑、数据分类与缺口、凭据位置、旧系统与新原型执行状态图、时效常量、阶段 1 预算登记（含本机测量，非目标服务器）、待核实清单。
 - 未完成：收益口径专项、旧测试期望值逐项核对、代表性真实负载采集。原因见第 10 节。
-- 需用户确认：M15“上新与额度监控”的归属；Aero（D 系列、S05）的迁移阶段。
+- 用户已确认（2026-11-11）：M15 随 ASTER 在阶段 3 迁移；Aero（D06–D12、S05）与 ASTER 单账户开仓（S06）在阶段 3 迁移；接管后首腿已成交时自动补发对冲腿；接真实账户的前置项全部放进阶段 2。详见第 9 节《用户决定》。
 
 ## 1 编号约定与 F 行关系
 
@@ -106,7 +106,7 @@ T、S 与首批 F 行的对应：
 | M12 | Var 会话 token | 本地写入（凭据） | 原地收敛 | token 过期时只有 Var 腿不可用 | `modules/monitor/server/variational-session.mjs:9-30` |
 | M13 | CrossEx 资格筛选与导入预填 | 只读 | 原地收敛（下单在 T16） | 已公告下架合约拒绝导入 | `modules/monitor/lib/crossex-import.ts:51,67` |
 | M14 | 关联持仓与成交标记 | 只读 | 原地收敛 | 未登录工作台时显示“未登录工作台” | `modules/monitor/lib/hub-bridge.ts:182,261` |
-| M15 | 上新与额度监控（方案第 2 节所列） | 归属 ASTER（见 S13/S14），市场工作区无独立实现 | 待核实（迁移归属待用户确认） | — | monitor 只有下架字段 `modules/monitor/server/perpetual-service.mjs:157-168`；上新与额度告警在 `modules/aster/trading/server.py:513-531` |
+| M15 | 上新与额度监控（方案第 2 节所列） | 归属 ASTER（见 S13/S14），市场工作区无独立实现 | 阶段 3（随 ASTER 迁移，用户已确认） | — | monitor 只有下架字段 `modules/monitor/server/perpetual-service.mjs:157-168`；上新与额度告警在 `modules/aster/trading/server.py:513-531` |
 
 M15 抽查：monitor 源码中 `listing` 相关命中都是下架时间或“新上市窗口不完整”，没有上新告警；ASTER 的 `PATCH /api/listings/{symbol}/capacity-alert` 才是上新额度提醒。
 
@@ -143,7 +143,7 @@ M15 抽查：monitor 源码中 `listing` 相关命中都是下架时间或“新
 | S02 | 自动敞口预览 | 只读 | 阶段 3 | 读取期间任务变化提示重刷；不跨方向轧差 | `server/trading-auto-exposure.mjs:9,22-40` |
 | S03 | ANT 自动减仓与强平保护（F09） | 实盘写入 | 阶段 3 | 风险证据超 30 s 不触发；上一轮未完整确认不开始下一轮 | `server/trading-anthropic-reduction.mjs:8,72-152`；`server/trading-reduction-plan.mjs:4-6` |
 | S04 | 飞书汇总（与 Y04 同一实现，从策略视角登记） | 只读（外部通知） | 原地收敛 | 来源超 20 s 未返回时该节标缺失 | `server/automation/feishu-digest-sources.mjs:8-13` |
-| S05 | Aero Safe 链上执行（D06–D12 的总入口） | 实盘写入（链上） | 原地收敛（推定）/待确认 | 写者恢复状态非 normal 拒绝执行；`pending.json` 损坏返回 409 | `server/runtime/data-plane.mjs:393-419`；`server/automation/aero-safe.mjs:20-46` |
+| S05 | Aero Safe 链上执行（D06–D12 的总入口） | 实盘写入（链上） | 阶段 3（用户已确认） | 写者恢复状态非 normal 拒绝执行；`pending.json` 损坏返回 409 | `server/runtime/data-plane.mjs:393-419`；`server/automation/aero-safe.mjs:20-46` |
 | S06 | ASTER 单账户普通开仓 | 实盘写入（需 `ASTER_ALLOW_LIVE=1`） | 阶段 3 | 未设开关时启动报错 | `modules/aster/trading/engine.py:239,878`；`modules/aster/trading/execution.py:93,272-295` |
 | S07 | ASTER 模拟账户 `mode=paper` | 模拟 | 阶段 3 | 不设实盘开关可运行，划转记 `paper_confirmed` | `modules/aster/trading/paper.py` |
 | S08 | ASTER 配对组管理（只绑定账户） | 本地写入（不下单） | 阶段 3 | 运行中、ADL 未完成或划转未核实时拒绝删除 | `modules/aster/trading/pairing.py:122,231,367` |
@@ -151,7 +151,7 @@ M15 抽查：monitor 源码中 `listing` 相关命中都是下架时间或“新
 | S10 | ASTER 划转档案与备注 | 只读（本地备注写入） | 阶段 3 | 档案最多返回 50 条 | `modules/aster/trading/margin_archive.py:10` |
 | S11 | ASTER ADL 监测与应急减仓 | 实盘写入 | 阶段 2 切片 / 阶段 3 迁移 | 只减有 ADL 成交证据的多出一侧；原单最多查 3 次，满 120 s 重读现场 | `modules/aster/trading/adl.py:28-37,404-423`；`modules/aster/trading/adl_recovery.py:11-14` |
 | S12 | ASTER ADL 处理报告 | 只读 | 阶段 3 | 打开报告不触发交易所请求 | `modules/aster/trading/adl_view.py:13` |
-| S13 | ASTER 币种监控、上新与额度告警、失衡通知 | 只读（外部通知） | 原地收敛（M15 归属待确认） | 快照超 8 s 不作失衡样本 | `modules/aster/trading/server.py:513-531`；`modules/aster/trading/monitoring.py:26` |
+| S13 | ASTER 币种监控、上新与额度告警、失衡通知 | 只读（外部通知） | 原地收敛（M15 随 ASTER 在阶段 3 迁移） | 快照超 8 s 不作失衡样本 | `modules/aster/trading/server.py:513-531`；`modules/aster/trading/monitoring.py:26` |
 | S14 | ASTER 额度中继（XAU/XAG）与 Hub 摘要 | 只读 | 原地收敛（阶段 2 时序原型的对照） | 中继数据过期时显示过期，不用于开仓 | `modules/aster/trading/capacity_relay_client.py:48-50` |
 | S15 | 配对组普通开仓、补单、底仓采纳等 | 已移除 | 不迁移（阶段 3 兼容旧数据） | 启动丢弃旧批次并归档；提交 `ordinary` 返回 422 | `modules/aster/trading/pair_legacy.py`；`modules/aster/docs/README.md:17-24` |
 | S16 | 单账户多空循环、仓位迁移、配对循环 | 已移除 | 不迁移（阶段 3 兼容旧数据） | 有旧批次的账户保持暂停待人工核对 | `modules/aster/trading/account_legacy.py`；`modules/aster/docs/README.md:26-36` |
@@ -173,7 +173,7 @@ M15 抽查：monitor 源码中 `listing` 相关命中都是下架时间或“新
 
 ### 2.7 链上（D，原编号 C）
 
-编号映射：原盘点 C01–C13 依序改为 D01–D13（C01→D01 … C13→D13），内容不变。总方案第 2 节列出了链上工作区，但第 7 节阶段 3 只写“Aero 与研究”，没有单独给出收敛或迁移方式；D 系列的迁移去向保留原盘点的推定，整体标“原地收敛（推定）/待确认”。
+编号映射：原盘点 C01–C13 依序改为 D01–D13（C01→D01 … C13→D13），内容不变。总方案第 2 节列出了链上工作区，但第 7 节阶段 3 只写“Aero 与研究”，没有单独给出收敛或迁移方式；只读研究部分（D01–D05）保留原地收敛；Safe 执行部分（D06–D12）与总入口 S05 经用户确认在阶段 3 迁移。
 
 | 编号 | 能力与入口 | 性质 | 迁移去向 | 验收案例 | 主要证据 |
 | --- | --- | --- | --- | --- | --- |
@@ -182,13 +182,13 @@ M15 抽查：monitor 源码中 `listing` 相关命中都是下架时间或“新
 | D03 | 小时样本与窗口均值 | 只读（观测） | 原地收敛 | 超 30 天样本清理，其余重启后仍在 | `server/research/aero-market-samples.mjs:6-9,130` |
 | D04 | LP 区间策略回放，最多 250 池 | 模拟 | 原地收敛 | 历史不足 6 小时返回 `insufficient_history` | `server/research/aero-market-replay.mjs:15,80` |
 | D05 | 收藏池，最多 500 | 本地写入 | 原地收敛 | 重启后顺序保持；文件损坏回退并提示 | `server/research/aero-market.mjs:57,177` |
-| D06 | Safe 配置与 bot 私钥 | 本地写入（实盘配置、凭据） | 阶段 3（待确认） | 私钥加密保存，任何接口不回显 | `server/automation/aero-safe.mjs:75-89,1293-1298` |
-| D07 | Safe 仓位、余额、nonce 读取（刷新间隔 ≥ 5 s，预算 60 s） | 只读 | 阶段 3（待确认） | 读取超 60 s 报错，原快照保留 | `tools/aero-roles/executor.mjs:398-458`；`server/automation/aero-safe.mjs:565-590` |
-| D08 | 手动链上操作（开、平、减、退池、质押、解押、领取、卖出、兑换），预览 2 分钟 | 实盘写入 | 阶段 3（待确认） | `pending.json` 写失败时不广播 | `server/automation/aero-safe.mjs:42,606-616,1345-1371`；`tools/aero-roles/executor.mjs:488-541` |
-| D09 | 自动调仓（出区间满 5 分钟平仓并居中重开），30 s 一轮 | 实盘写入 | 阶段 3（待确认） | 平仓中断后自动调仓停用待人工核对 | `server/automation/aero-auto.mjs:7,105-199` |
-| D10 | 单池仓位策略与美元上限 | 本地写入 | 阶段 3（待确认） | `policy.json` 损坏时禁止加仓并暂停自动调仓 | `server/automation/aero-safe.mjs:984-988` |
-| D11 | Roles 白名单与权限变更批次 | 本地写入（实盘配置；是否由 bot 发送待核实） | 阶段 3（待确认） | 加池批次只含变化作用域，不重置已有额度 | `server/automation/aero-safe.mjs:10,1020-1023` |
-| D12 | 状态通知（中断、需核对、恢复） | 外部写入 | 阶段 3（待确认） | 发送失败重试 3 次、间隔 60 s | `server/automation/aero-notifications.mjs:10-14` |
+| D06 | Safe 配置与 bot 私钥 | 本地写入（实盘配置、凭据） | 阶段 3 | 私钥加密保存，任何接口不回显 | `server/automation/aero-safe.mjs:75-89,1293-1298` |
+| D07 | Safe 仓位、余额、nonce 读取（刷新间隔 ≥ 5 s，预算 60 s） | 只读 | 阶段 3 | 读取超 60 s 报错，原快照保留 | `tools/aero-roles/executor.mjs:398-458`；`server/automation/aero-safe.mjs:565-590` |
+| D08 | 手动链上操作（开、平、减、退池、质押、解押、领取、卖出、兑换），预览 2 分钟 | 实盘写入 | 阶段 3 | `pending.json` 写失败时不广播 | `server/automation/aero-safe.mjs:42,606-616,1345-1371`；`tools/aero-roles/executor.mjs:488-541` |
+| D09 | 自动调仓（出区间满 5 分钟平仓并居中重开），30 s 一轮 | 实盘写入 | 阶段 3 | 平仓中断后自动调仓停用待人工核对 | `server/automation/aero-auto.mjs:7,105-199` |
+| D10 | 单池仓位策略与美元上限 | 本地写入 | 阶段 3 | `policy.json` 损坏时禁止加仓并暂停自动调仓 | `server/automation/aero-safe.mjs:984-988` |
+| D11 | Roles 白名单与权限变更批次 | 本地写入（实盘配置；是否由 bot 发送待核实） | 阶段 3 | 加池批次只含变化作用域，不重置已有额度 | `server/automation/aero-safe.mjs:10,1020-1023` |
+| D12 | 状态通知（中断、需核对、恢复） | 外部写入 | 阶段 3 | 发送失败重试 3 次、间隔 60 s | `server/automation/aero-notifications.mjs:10-14` |
 | D13 | 资产模块中的 Aero LP 估值 | 已移除 | 不迁移 | 资产总额不含 `mode='aero'` 行 | `modules/asset/drizzle/0004_remove_aero_lp.sql` |
 
 ### 2.8 研究室（R）
@@ -563,7 +563,7 @@ stateDiagram-v2
 | `attention` 处理 | 非终态，15 s 重读，可人工 reconcile | 不再发送和撤单，但每轮继续核对未结委托；保留合约锁，人工 `acknowledge` 后释放 | 已对齐“敞口未处理不得再开同合约”；没有执行器内的人工改单入口 |
 | 未送达的区分 | 本地拒发、重启时的 prepared、查无判定都写 `rejected` | `not-sent`（可证明未离开进程）、`not-created`（观察窗后判定未送达）、`rejected`（交易所明确拒绝）分开 | 新原型更贴近契约“未知不折叠为失败” |
 | 中间控制态 | `stopping`、`paused`，可续做剩余数量 | 无；停止是持久 `stop_requests`，只撤 `open` 操作 | 首切片不含续做，属范围差异 |
-| 重启处理 | 活动任务进入 `stopping` 并撤余单 | `holdNewSends`：只核对，立即撤挂单；首腿已成交也不再发对冲腿，转 `attention` | 更保守；是否改为“按落盘进度续发对冲腿”待用户确认（第 9 节第 28 项） |
+| 重启处理 | 活动任务进入 `stopping` 并撤余单 | `holdNewSends`：只核对，立即撤挂单；首腿已成交也不再发对冲腿，转 `attention` | 用户已确认改为自动补发对冲腿，阶段 2 实现（第 9 节第 28 项） |
 | 撤单尝试用尽 | 未结清进入 `attention` | 5 次用尽且过重试间隔后进入 `attention` | 与 Hub 等价 |
 | `open` 操作查无 | 走对账路径 | 只写备注，保持 `open` | 待核实：人工处理接口未实现 |
 | 停止时首腿已成交 | 停止后保留已成交，任务 `stopped` | 不发对冲腿，按不平衡进入 `attention` | 更保守；需在页面契约中说明 |
@@ -681,9 +681,9 @@ CI 中测量步骤只在退出码 2（仅预算未达）时视为通过；任务
 
 **基线与范围**
 1. `f721068` 与 `6039493` 除方案文档外是否完全一致（报告 0）。
-2. M15“上新与额度监控”归属：保留在市场工作区（迁移时从 ASTER 拆出）、归策略与风险的 ASTER，还是移除（报告 1、3，本文抽查）。
-3. Aero（D 系列、S05）迁移阶段：总方案未单列，目前为推定（报告 2、3）。
-4. ASTER 单账户开仓（S06）归阶段 3 是否符合方案意图（报告 3）。
+2. ~~M15“上新与额度监控”归属~~：随 ASTER 在阶段 3 迁移（用户决定）。
+3. ~~Aero（D 系列、S05）迁移阶段~~：D06–D12 与 S05 在阶段 3 迁移，D01–D05 原地收敛（用户决定）。
+4. ~~ASTER 单账户开仓（S06）归阶段 3 是否符合方案意图~~：阶段 3，随 ASTER 迁移（用户决定）。
 
 **存储与备份**
 5. `hub.sqlite` 在 WAL 下未显式设置 `synchronous` 时的实际值（报告 0）。
@@ -719,13 +719,19 @@ CI 中测量步骤只在退出码 2（仅预算未达）时视为通过；任务
 25. 未建模 Bybit 原生追价策略（F04 要求）；未接入共享写者登记 `execution-control.sqlite`（接管真实账户前必需）。
 26. 事件、命令、已消费预览没有保留期限；WAL 未设上限。
 27. 本机持锁最大值与事件循环阻塞未达建议预算（第 8 节）；需在目标服务器测量，并在阶段 2 决定写入线程或批量提交。
-28. 接管或重启后首腿已成交时不再发对冲腿（转 `attention`）：更保守，但与“按落盘进度续做”（L095）有张力，需用户确认是否允许新写者在通过对冲守卫后续发对冲腿。
+28. 接管或重启后首腿已成交时不再发对冲腿（转 `attention`）。用户已决定改为自动补发对冲腿（见下文《用户决定》），阶段 2 实现。
 29. 无价格保护：首腿发送前只校验盘口新鲜度，不校验价格偏离预览；对冲腿为市价单（对照 L100）。接真实连接器前补。
 30. 接真实连接器时，“客户订单号重复”的拒绝应视为订单可能存在（按未知处理），不能映射为明确拒绝；签名与时间戳须在 `beforeSend` 守卫之后生成，并补守卫测试。
 31. 会话 cookie 只防跨站请求，任何本机进程 `GET /` 都能取得；接真实账户前需要本地鉴权。cookie 不按端口隔离，同机多实例会互相覆盖。
 32. 数据目录检查会拒绝位于工作台代码或数据目录之下的任何路径（两者都含 `modules`），属安全方向的误拒；检查与建库之间路径被替换为链接的窗口未处理。
 33. 宽限起点用进程内的接管时刻：入口重启间隔小于 60 s 时会不断推后转人工（不发新单、锁保留，查无判定仍可完成）；需要严格上界时把首次接管时刻持久化到操作上。宽限判定依赖连接器能力，重启后缺少该场所连接器时任务停在 `running`（安全方向），接真实连接器前补保守兜底。
 34. 存储层小项：两个进程同时首次迁移空库时后者失败（安全失败）；事务拒绝异步回调后，回调 await 之后的部分仍在事务外运行。
+
+**用户决定（2026-11-11）**
+
+- 接管或重启时首腿已成交、对冲腿未发：新写者按落盘进度自动补发对冲腿，仍经过账户绑定、数量和对冲守卫；价格偏离不作为补发的阻断条件（用户明确选择不设限制）。首腿发送前的价格保护（第 29 项）照常适用。阶段 2 实现并补接管补发测试。
+- 接真实账户的前置项全部放进阶段 2：接入 `execution-control.sqlite`（第 25 项）、Bybit 原生追价（第 25 项）、价格保护（第 29 项）、本地鉴权（第 31 项）、保留期与 WAL 上限（第 26 项）。
+- M15 随 ASTER 在阶段 3 迁移；Aero（D06–D12、S05）在阶段 3 迁移；ASTER S06 在阶段 3 随 ASTER 迁移。
 
 第 19–23 项及独立审查（R3）提出的 P1/P2 已在原型内修复：未知委托与对冲腿账户读取失败有界转人工、同实例结果未写入的恢复、入口循环失败交还租约退出、预览出口脱敏、页面确认重试保留按钮、数据目录按祖先与大小写检查、预览要求两腿桶数相等。
 
