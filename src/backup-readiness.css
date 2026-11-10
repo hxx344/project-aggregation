@@ -1,0 +1,13 @@
+.backup-readiness{min-width:0;margin-top:24px;padding:24px;border:1px solid var(--border);border-radius:var(--radius-md);background:var(--surface-1);font-size:.8125rem;line-height:1.65}
+.backup-readiness h2{font-size:1.05rem;margin:0 0 10px}
+.backup-readiness h3{font-size:.875rem;line-height:1.7}
+.backup-readiness p{margin:10px 0;color:var(--text-secondary)}
+.backup-readiness code{overflow-wrap:anywhere;word-break:break-word;font-size:.75rem}
+.backup-readiness article{border-top:1px solid var(--border);margin-top:20px;padding-top:12px;min-width:0}
+.backup-readiness summary{cursor:pointer;padding:8px 0}
+.backup-readiness fieldset{min-width:0;margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:var(--radius-sm)}
+.backup-readiness label{display:inline-flex;flex-wrap:wrap;align-items:center;gap:6px;margin:4px 12px 6px 0;max-width:100%}
+.backup-readiness input,.backup-readiness select{max-width:100%;min-width:0}
+.backup-readiness input[type=number]{width:120px}
+.backup-readiness [role=alert]{color:var(--danger,#f87171)}
+@media(max-width:600px){.backup-readiness{padding:16px}.backup-readiness h3{overflow-wrap:anywhere}}

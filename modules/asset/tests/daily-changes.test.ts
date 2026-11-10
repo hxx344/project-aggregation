@@ -4,6 +4,8 @@ import { calculateDailyChanges, readDailyChanges, type ChangeSnapshot } from '..
 import { comboOf, comparePositions, type GroupId, type PositionAnalysis, type PositionsCapture } from '../lib/daily-positions.ts';
 import { openDatabase } from '../lib/sqlite.ts';
 import { readSnapshotHistory } from '../lib/snapshot-history.ts';
+import { CASH_FLOW_KEY } from '../lib/cash-flows.ts';
+import { randomUUID } from 'node:crypto';
 
 const row = (id: string, project: string, value: number | null, kind = '资产') => ({ id, project, kind, value });
 const snap = (date: string, rows: ChangeSnapshot['rows'], extra: Partial<ChangeSnapshot> = {}): ChangeSnapshot => ({
@@ -24,6 +26,14 @@ test('attributes each change to asset rows, separates withdrawals and sorts by s
   assert.equal(day.change, 30);
   assert.equal(day.unattributed, 0);
   assert.equal(day.change, day.sources.reduce((sum, source) => sum + source.change, 0) + day.withdrawnChange + day.unattributed);
+});
+
+test('a pure annotated deposit remains asset growth while its full known contribution is cash flow, not investment return', () => {
+  const [day] = calculateDailyChanges({ ...base, snapshots: [snap('2026-10-21', [row('bank', '银行', 100)]), snap('2026-10-22', [row('bank', '银行', 200)])],
+    cashFlows: [{ id: randomUUID(), revision: 1, date: '2026-10-22', account: 'bank', currency: 'USD', amount: '100', kind: 'external', transferId: null,
+      usdRate: null, rateAt: null, reference: 'deposit-1', reason: '入金凭证', void: false, recordedAt: '2026-10-22T01:00:00Z' }] }).days;
+  assert.equal(day.change, 100); assert.equal(day.attribution.cashFlows.knownNetUsd, 100); assert.equal(day.attribution.knownPositionChange, null);
+  assert.equal(day.attribution.unexplained, 0); assert.equal(day.attribution.cashFlows.complete, false, 'annotation coverage is never inferred from balances');
 });
 
 test('compares observed days without interpolation and keeps the base before the window', () => {
@@ -249,6 +259,31 @@ const capture = (at: string, positions: ReturnType<typeof leg>[], status: 'live'
     positions: positions.map(item => item.cycle ? { ...item, cycle: { ...item.cycle, updatedAt: item.cycle.updatedAt ?? at } } : item) },
 ] });
 const binance = (value: number, details = [usdt(value)]) => ({ id: 'row-9', project: 'binance', kind: '资产', value, mode: 'binance', details });
+
+test('real daily reader jointly replays deposit, missing fee, changed cycle and old FX evidence without filling missing dates', async t => {
+  const database = openDatabase(':memory:'); t.after(() => database.close());
+  const before = capture('2026-10-21T00:00:00Z', [leg('CLUSDT', 'long', '1', '10', { since: '2026-10-20T00:00:00Z', net: '2' })]);
+  const after = capture('2026-10-23T00:00:00Z', [leg('CLUSDT', 'long', '1', '15', { since: '2026-10-22T00:00:00Z', net: null })]);
+  for (const [date, value, positions] of [['2026-10-21', 1000, before], ['2026-10-23', 1110, after]] as const) {
+    await database.prepare('INSERT INTO snapshots VALUES(?,?,?)').bind('owner', date, JSON.stringify({ id: 'daily-' + date, date, total: value, assets: [binance(value, [usdt(value, 1)])], positions })).run();
+  }
+  const audit = [{ id: randomUUID(), revision: 1, date: '2026-10-23', account: 'bank', currency: 'USD', amount: '100', kind: 'external', transferId: null,
+    usdRate: null, rateAt: null, reference: 'deposit receipt', reason: '入金核对', void: false, recordedAt: '2026-10-23T01:00:00Z' },
+  { id: randomUUID(), revision: 1, date: '2026-10-23', account: 'bank', currency: 'EUR', amount: '10', kind: 'external', transferId: null,
+    usdRate: '1.1', rateAt: '2026-10-20T00:00:00Z', reference: 'old fx receipt', reason: '缺少同日汇率', void: false, recordedAt: '2026-10-23T01:00:00Z' }];
+  await database.prepare('INSERT INTO settings VALUES(?,?,?)').bind('owner', CASH_FLOW_KEY, JSON.stringify(audit)).run();
+  const report = await readDailyChanges(database, 'owner', Date.parse('2026-10-23T04:00:00Z'));
+  assert.equal(report.days.length, 1); const day = report.days[0]; assert.equal(day.gapDays, 2); assert.equal(day.change, 110);
+  assert.equal(day.attribution.cashFlows.knownNetUsd, 100); assert.equal(day.attribution.cashFlows.missingRate, 1);
+  assert.equal(day.attribution.knownPositionChange, 5); assert.equal(day.positions!.groups[0].complete, false);
+  assert.equal(day.attribution.unexplained, 5);
+  assert.equal(day.change, day.withdrawnChange + day.attribution.cashFlows.knownNetUsd! + day.attribution.knownPositionChange! + day.attribution.unexplained);
+  assert.match(day.attribution.note, /缺少独立时效元数据/);
+  after.scopes[0].generation = 'replaced-account';
+  await database.prepare('UPDATE snapshots SET data=? WHERE owner=? AND date=?').bind(JSON.stringify({ id: 'daily-2026-10-23', date: '2026-10-23', total: 1110, assets: [binance(1110)], positions: after }), 'owner', '2026-10-23').run();
+  const changed = (await readDailyChanges(database, 'owner', Date.parse('2026-10-23T04:00:00Z'))).days[0];
+  assert.equal(changed.attribution.knownPositionChange, null); assert.equal(changed.attribution.unexplained, 10);
+});
 
 test('exchange rows break down by account and coin; lines without both sides of details are not invented', () => {
   const [day] = calculateDailyChanges({ ...base, snapshots: [

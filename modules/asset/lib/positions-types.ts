@@ -1,3 +1,5 @@
+import type { CycleEvidence } from '../../../server/cycle-evidence.mjs';
+export type { CycleEvidence, CycleEvidenceRow } from '../../../server/cycle-evidence.mjs';
 /** Decimal strings preserve exchange precision; quantities are absolute. */
 export type Position = {
   id: string;
@@ -26,6 +28,7 @@ export type Position = {
 
 /** Signed cash flows in `currency`; `net` = realizedPnl + fees + funding and is null when any part is unknown. */
 export type PositionCycle = {
+  evidence?: CycleEvidence;
   status: 'loading' | 'complete' | 'partial' | 'unavailable';
   since: string | null;
   closedQuantity: string | null;

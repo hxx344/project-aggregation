@@ -303,6 +303,17 @@ def require_service_parent(directory, config):
 
 
 def main(arguments=None):
+    arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments and (arguments[0].startswith('schedule-') or arguments[0] == 'backup-register'):
+        if sys.platform != 'linux' or os.geteuid() != 0:
+            raise ValueError('RECOVERY_REQUIRES_LINUX_ROOT')
+        # -I excludes caller-controlled import paths; load only our trusted sibling.
+        import importlib.util
+        module_file = trusted(Path(__file__).resolve().with_name('maintenance.py'))
+        spec = importlib.util.spec_from_file_location('recovery_maintenance', module_file)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.main(sys.modules[__name__], arguments)
     parser = argparse.ArgumentParser(description='Cold encrypted backups and isolated recovery; no automatic production data replacement.')
     parser.add_argument('action', choices=['keys', 'backup', 'handoff', 'restore', 'admit', 'inspect'])
     parser.add_argument('--destination', type=Path)

@@ -35,8 +35,8 @@ export async function readHubSummary(services, now = Date.now(), monitorId = 'oi
     const state = !quote ? 'offline' : stale ? 'stale' : missing || quote.collection?.error ? 'partial' : 'online';
     const detail = quote?.collection?.error || (!quote ? '后台尚未取得报价' : stale ? '报价已过期，保留原采集时间' : missing);
     return { updatedAt: at ? new Date(at).toISOString() : null,
-      health: { state, message: healthMessage(entry.title + (detail ? '：' + detail : '监控已连接；标记价格按股数假设换算为每股价格')), staleAfterSeconds },
-      metrics: [...ANTHROPIC_COMPARISON_LEGS.map(leg => metric(`premium_${leg}`, `Binance 相对 ${ANTHROPIC_LEGS[leg].name} 溢价`, premium(leg), '%')), modules] };
+      health: { state, message: healthMessage(entry.title + (detail ? '：' + detail : '监控已连接') + '；服务端摘要采用默认股数：流通 127 亿、完全稀释 167 亿，浏览器设置见监控页'), staleAfterSeconds },
+      metrics: [...ANTHROPIC_COMPARISON_LEGS.map(leg => metric(`premium_${leg}`, `Binance 相对 ${ANTHROPIC_LEGS[leg].name} 溢价（默认股数）`, premium(leg), '%')), modules] };
   }
   const stale = quote && (!at || at > now + 1000 || now - at > staleAfterSeconds * 1000 || quote.status === 'snapshot' || quote.collection?.stale);
   const oilSpreadValue = monitorId === 'oil' ? oilSpread(finite(quote?.brent?.markPx), finite(quote?.wti?.markPx)) : null;

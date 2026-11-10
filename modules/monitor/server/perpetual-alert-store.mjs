@@ -2,13 +2,14 @@ import { mkdir, readFile, writeFile, rename, unlink, stat } from 'node:fs/promis
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { initialPerpetualAlertState, validatePerpetualAlertConfig } from './perpetual-alert-engine.mjs';
+import { boundedPerpetualAlertState, PERPETUAL_ALERT_FILE_BYTES } from './perpetual-alert-limits.mjs';
 
 export async function openPerpetualAlertStore(directory) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const file = resolve(directory, 'opportunity-alerts.json');
   let state = initialPerpetualAlertState();
   try {
-    if ((await stat(file)).size > 1_000_000) throw new Error('State too large');
+    if ((await stat(file)).size > PERPETUAL_ALERT_FILE_BYTES) throw new Error('State too large');
     const loaded = JSON.parse(await readFile(file, 'utf8'));
     if (loaded.version !== 1 || !Number.isSafeInteger(loaded.revision) || loaded.revision < 0 || !loaded.ruleStates || typeof loaded.ruleStates !== 'object' || Array.isArray(loaded.ruleStates) || !Array.isArray(loaded.history)) throw new Error('Invalid state');
     loaded.config = validatePerpetualAlertConfig(loaded.config);
@@ -25,8 +26,8 @@ export async function openPerpetualAlertStore(directory) {
   return {
     get: () => structuredClone(state),
     async save(next) {
-      const copy = structuredClone(next), temporary = `${file}.${randomUUID()}.tmp`;
-      try { await writeFile(temporary, `${JSON.stringify(copy)}\n`, { mode: 0o600 }); await rename(temporary, file); state = copy; }
+      const { state: copy, body } = boundedPerpetualAlertState(next), temporary = `${file}.${randomUUID()}.tmp`;
+      try { await writeFile(temporary, body, { mode: 0o600 }); await rename(temporary, file); state = copy; }
       catch (error) { await unlink(temporary).catch(() => {}); throw error; }
     },
   };

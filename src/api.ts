@@ -2,7 +2,8 @@ let csrfToken = '';
 export function setCsrfToken(value: string) { csrfToken = value; }
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) { super(message); this.status = status; }
+  retryAfter: string | null;
+  constructor(message: string, status: number, retryAfter: string | null = null) { super(message); this.status = status; this.retryAfter = retryAfter; }
 }
 export async function api<T>(url: string, { timeoutMs = 15_000, ...options }: RequestInit & { timeoutMs?: number } = {}): Promise<T> {
   const controller = new AbortController();
@@ -38,7 +39,7 @@ export async function api<T>(url: string, { timeoutMs = 15_000, ...options }: Re
         data = {};
       }
       controller.signal.throwIfAborted();
-      if (!response.ok) throw new ApiError(typeof data?.error === 'string' && data.error || '请求未完成，请稍后重试。', response.status);
+      if (!response.ok) throw new ApiError(typeof data?.error === 'string' && data.error || '请求未完成，请稍后重试。', response.status, response.headers.get('Retry-After'));
       return data as T;
     })()]);
   } finally {

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { expected, loadCatalog, nodeSide, pythonSide, runScenario } from './fixtures/account-writer-protocol.mjs';
 import { raisedCodes } from './fixtures/raised-codes.mjs';
+import { validateCoverage, discoverNodeCases, discoverPythonCases } from './fixtures/account-writer-coverage.mjs';
 
 // Completeness gate for the account writer protocol (docs/evolution-plan.md E7):
 // both implementations must match tests/fixtures/account-writer-protocol.json,
@@ -39,6 +40,33 @@ test('every error code has a vector or a recorded reason for having none', () =>
   assert.deepEqual(Object.keys(catalog.notVectored).filter((code) => vectored.includes(code)), [], 'codes both vectored and listed in notVectored');
   assert.deepEqual(sorted([...vectored, ...Object.keys(catalog.notVectored)]), catalog.errorCodes, 'each code needs a vector step or a notVectored reason');
   for (const [code, reason] of Object.entries(catalog.notVectored)) assert.ok(typeof reason === 'string' && reason.length > 0, code);
+});
+
+test('fault coverage names existing cases with honest language and execution boundaries', () => {
+  const coverage = validateCoverage(catalog);
+  for (const code of ['LEASE_EXPIRED', 'CLOCK_ROLLBACK', 'REGISTRY_REPLACED', 'REGISTRY_BUSY', 'OWNERSHIP_LOST', 'WRITER_CLOSED']) {
+    const languages = sorted(coverage.filter(row => row.code === code).flatMap(row => row.languages));
+    assert.deepEqual(languages, ['node', 'python'], code);
+  }
+  assert.ok(coverage.some(row => row.kind === 'interop'));
+  assert.ok(coverage.some(row => row.kind === 'not-applicable-to-shared-vector'));
+});
+
+test('coverage gate rejects removed cases and falsely claimed Python or interop coverage', () => {
+  const missing = structuredClone(catalog);
+  missing.regressionCoverage.LEASE_EXPIRED.cases[0].id = 'removed or renamed test';
+  assert.throws(() => validateCoverage(missing), /missing test/);
+  const wrongLanguage = structuredClone(catalog);
+  wrongLanguage.regressionCoverage.LEASE_EXPIRED.cases[0].languages = ['python'];
+  assert.throws(() => validateCoverage(wrongLanguage), /incorrect language/);
+  const fakeInterop = structuredClone(catalog);
+  Object.assign(fakeInterop.regressionCoverage.LEASE_EXPIRED.cases[0], { kind: 'interop', languages: ['node', 'python'] });
+  assert.throws(() => validateCoverage(fakeInterop), /incorrect language/);
+});
+
+test('coverage discovery ignores commented tests and Python docstrings', () => {
+  assert.deepEqual([...discoverNodeCases("// test('gone', () => {});\ntest('present', () => {});").keys()], ['present']);
+  assert.deepEqual([...discoverPythonCases('class Cases:\n    """def test_gone(self): pass"""\n    def test_present(self): pass\n').keys()], ['Cases.test_present']);
 });
 
 test('both writers declare the cataloged versions, timings, authorities and environments', () => {

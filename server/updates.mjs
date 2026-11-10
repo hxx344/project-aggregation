@@ -2,6 +2,7 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { newUpdateOwner, trackUpdateOwner, finishUpdateOwner, updateOwnerAlive } from './control/update-owner.mjs';
 import { EXECUTION_MAINTENANCE as MAINTENANCE, FINAL_EXECUTION } from './control/execution-jobs.mjs';
+import { publicUpdateDiagnostic } from './update-evidence.mjs';
 
 const SOCKET_PATH = '/run/project-aggregation-updater/control.sock';
 const UNAVAILABLE = '更新服务不可用，请先运行一键部署初始化更新服务';
@@ -151,7 +152,7 @@ export function validateUpdateBody(action, body) {
 
 /** socketPath is a test dependency only; production does not read a URL/path from env or requests. */
 export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 } = {}) {
-  function request(method, route, body) {
+  function request(method, route, body, normalize = publicUpdateState) {
     return new Promise((resolve, reject) => {
       let settled = false, connected = false;
       const tokenRequest = route === '/token';
@@ -167,15 +168,16 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
         res.on('end', () => {
           if (settled) return;
           if (res.statusCode < 200 || res.statusCode >= 300) {
-            const status = [400, 409, 429, 503].includes(res.statusCode) ? res.statusCode : 503;
-            const message = status === 409 ? tokenRequest ? TOKEN_BUSY : '更新计划已改变或已有更新任务，请刷新后重试'
+            const diagnosticRequest = route.startsWith('/diagnostics/');
+            const status = [400, 409, 429, 503, ...(diagnosticRequest ? [404] : [])].includes(res.statusCode) ? res.statusCode : 503;
+            const message = status === 404 ? '该更新任务的诊断未保留，旧版更新服务可能尚不支持导出' : status === 409 ? tokenRequest ? TOKEN_BUSY : '更新计划已改变或已有更新任务，请刷新后重试'
               : status === 400 ? tokenRequest ? TOKEN_INVALID : '更新计划无效，请重新检查更新'
                 : status === 429 ? '更新请求过于频繁，请稍后重试'
                   : tokenRequest ? 'GitHub Token 保存结果尚未确认，请刷新配置状态后核对' : UNAVAILABLE;
             finish(new UpdateError(status, message, { uncertain: method === 'POST' && status === 503 })); return;
           }
           try {
-            const value = publicUpdateState(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            const value = normalize(JSON.parse(Buffer.concat(chunks).toString('utf8')));
             if (tokenRequest && value.githubToken === undefined) throw new Error('Missing token configuration status');
             finish(null, value);
           } catch { finish(unavailable(method === 'POST')); }
@@ -191,6 +193,10 @@ export function createUpdateClient({ socketPath = SOCKET_PATH, timeoutMs = 8000 
   }
   return {
     async status() { try { return await request('GET', '/status'); } catch { return unavailableUpdateState(); } },
+    diagnostic(jobId) {
+      if (typeof jobId !== 'string' || !/^[a-f0-9]{32}$/.test(jobId)) throw new UpdateError(400, '更新任务标识无效');
+      return request('GET', `/diagnostics/${jobId}`, undefined, value => publicUpdateDiagnostic(value, jobId));
+    },
     check() { return request('POST', '/check', {}); },
     apply(planId, deployMode = 'source', scope = 'full', phase = 'activate') {
       validateUpdateBody('apply', { planId, deployMode, phase });
@@ -527,5 +533,22 @@ export function createUpdateCoordinator({ client, execution, readMaintenance = (
     } finally { closed = true; clearTimeout(watcher); finishUpdateOwner(applying?.owner); }
     await Promise.allSettled([polling, moduleSync]);
   }
-  return { status, check, apply, token, withExecutionEntry, initialize: () => synchronizeModules(), resynchronize, observeModules, moduleMaintenance, close };
+  async function diagnostic(jobId) {
+    assertOpen();
+    if (typeof client.diagnostic !== 'function') throw new UpdateError(503, '当前更新服务尚不支持诊断导出');
+    return publicUpdateDiagnostic(await client.diagnostic(jobId), jobId);
+  }
+  async function inspectPlan(planId, deployMode, phase) {
+    assertOpen();
+    if (typeof planId !== 'string' || !PLAN_ID.test(planId) || !DEPLOYMENT_MODES.has(deployMode) || !PHASES.has(phase)) throw new UpdateError(400, '更新计划参数无效');
+    // Deliberately bypass learn/status maintenance synchronization: this is a
+    // read-only projection and must not prepare an update or mutate admission.
+    const state = publicUpdateState(await client.status());
+    if (!state.enabled || state.planId !== planId || !state.expiresAt || Date.parse(state.expiresAt) <= Date.now() || state.checking || state.checkError
+      || state.deploymentModes && !state.deploymentModes.includes(deployMode)) throw new UpdateError(409, '更新计划已变化或过期，请重新检查');
+    const scope = state.planScopes?.[deployMode] ?? 'full';
+    if (phase === 'prepare' && (scope !== 'full' || state.planPrepare !== true)) throw new UpdateError(409, '当前计划不支持准备阶段');
+    return { planId, deployMode, phase, scope, expiresAt: state.expiresAt, modules: state.modules.filter(row => row.state === 'available').map(row => ({ id: row.id, name: row.name })) };
+  }
+  return { status, diagnostic, inspectPlan, check, apply, token, withExecutionEntry, initialize: () => synchronizeModules(), resynchronize, observeModules, moduleMaintenance, close };
 }

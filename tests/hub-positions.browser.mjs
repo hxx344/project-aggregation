@@ -55,6 +55,8 @@ async (page) => {
     if (launch) { const id = launch[1], count = (launches.get(id) || 0) + 1; launches.set(id, count); return send({ url: `${origin}/_bridge-fixture/${id}/${count}` }); }
     if (path === '/api/session') return send({ authenticated: true, csrfToken: 'bridge-fixture-only' });
     if (path === '/api/health') return send({ status: 'ok' });
+    if (path === '/api/system/modules') return send({ enabled: false, modules: [] });
+    if (path === '/api/system/host') return send({ generatedAt: stamp(), cpu: { usagePercent: 1, cores: 4, loadAverage: [0, 0, 0] }, memory: { usedPercent: 1, usedBytes: 1, totalBytes: 100, availableBytes: 99 }, disks: [], uptimeSeconds: 60 });
     if (path === '/api/overview/events' || path === '/api/system/updates/events') return route.abort();
     if (path === '/api/overview') return send(overview());
     if (path === '/api/system/updates') return send({ enabled: false, checking: false, checkedAt: null, checkError: null, planId: null, expiresAt: null, modules: [], job: null });
@@ -96,7 +98,7 @@ async (page) => {
     await page.goto(`${origin}/?view=project&id=monitor`);
     let monitor = await connect('monitor');
     const capabilities = await monitor.evaluate(() => fixture.hostReady);
-    assert(capabilities.every(value => JSON.stringify(value) === JSON.stringify([...hostBase, 'positions', 'open-trading', 'fills'])), `monitor host capabilities: ${JSON.stringify(capabilities)}`);
+    assert(capabilities.every(value => JSON.stringify(value) === JSON.stringify([...hostBase, 'positions', 'open-trading', 'fills', 'anthropic-shares'])), `monitor host capabilities: ${JSON.stringify(capabilities)}`);
 
     holdRead = true;
     await ask(monitor, request('oil-1')); await ask(monitor, request('oil-2'));
@@ -172,6 +174,21 @@ async (page) => {
     await ask(asset, request('asset-1')); await ask(asset, { type: 'open-trading', market: 'oil' });
     await noReply(asset, ['asset-1']);
     assert(new URL(page.url()).searchParams.get('id') === 'asset' && reads() === 1, 'non-monitor projects cannot read positions or open trading');
+
+    // A slow follow-up cannot hide positions already read by the other entry.
+    holdRead = true;
+    const sharedReads = reads();
+    await page.getByRole('button', { name: '交易中心', exact: true }).click();
+    await page.getByRole('heading', { name: '交易中心', exact: true }).waitFor();
+    await page.locator('.positions-table').first().waitFor({ timeout: 1500 });
+    assert((await page.locator('.positions-page').innerText()).includes('CLUSDT'), 'all positions displays the bridge snapshot before refresh responds');
+    await eventually(() => reads() === sharedReads + 1, 'trading center starts one background refresh');
+    await page.locator('.project-nav').filter({ hasText: 'monitor' }).click();
+    monitor = await connect('monitor');
+    await ask(monitor, request('shared-slow'));
+    const shared = await reply(monitor, 'shared-slow', 30);
+    assert(shared.status === 'ok' && shared.items.some(item => item.symbol === 'CLUSDT') && reads() === sharedReads + 1, 'related positions reuses the same snapshot while the shared refresh is held');
+    holdRead = false; release();
 
     // A fresh document: 401 answers the module without expiring the hub session.
     expire = true;

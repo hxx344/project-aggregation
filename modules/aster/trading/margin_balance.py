@@ -33,6 +33,7 @@ LOG = logging.getLogger("aster.trading")
 
 DEFAULT_MARGIN = {"enabled": False, "master_env_prefix": "", "check_interval_seconds": 5,
     "threshold": "10", "min_transfer": "1", "max_transfer": "1000", "buffer_ratio": "0.05",
+    "absolute_reserve_enabled": False, "long_reserve": "0", "short_reserve": "0",
     "cooldown_seconds": 30}
 TRANSFER_TYPES = frozenset({"TRANSFER", "SUBUSER_ASSET_TRANSFER"})
 TRANSFER_UNIT = Fraction(Decimal("0.00000001"))
@@ -124,7 +125,7 @@ def validate_margin(config):
     if not isinstance(config, dict) or set(config) - set(DEFAULT_MARGIN):
         raise TradingError("保证金平衡配置字段无效")
     value = {**DEFAULT_MARGIN, **config}
-    if type(value["enabled"]) is not bool:
+    if type(value["enabled"]) is not bool or type(value["absolute_reserve_enabled"]) is not bool:
         raise TradingError("保证金平衡开关必须是布尔值")
     prefix = value["master_env_prefix"]
     if not isinstance(prefix, str) or (prefix and not re.fullmatch(r"[A-Z][A-Z0-9_]{1,40}", prefix)):
@@ -133,8 +134,8 @@ def validate_margin(config):
         number = value[name]
         if type(number) not in (int, float) or not math.isfinite(number) or not low <= number <= high:
             raise TradingError("保证金检查间隔或划转冷却时间无效")
-    for name in ("threshold", "min_transfer", "max_transfer", "buffer_ratio"):
-        amount = positive(value[name], allow_zero=name in {"threshold", "buffer_ratio"})
+    for name in ("threshold", "min_transfer", "max_transfer", "buffer_ratio", "long_reserve", "short_reserve"):
+        amount = positive(value[name], allow_zero=name in {"threshold", "buffer_ratio", "long_reserve", "short_reserve"})
         if amount > 1000000000 or (name == "buffer_ratio" and amount >= 1):
             raise TradingError("保证金平衡金额或风险缓冲无效")
         value[name] = wire(amount)
@@ -567,11 +568,13 @@ class MarginBalancer:
         # The exchange's withdrawal limit already accounts for positions and
         # reserved funds. Opening-strategy limits do not govern a funds transfer.
         equity = max(Fraction(0), Fraction(dec(snapshot.equity)))
-        cash_room = Fraction(snapshot.available) - equity * buffer
+        absolute = Fraction(dec(config.get(source + "_reserve", "0"))) if config.get("absolute_reserve_enabled", False) else Fraction(0)
+        reserve = max(equity * buffer, absolute)
+        cash_room = Fraction(snapshot.available) - reserve
         constraints = {"余额差的一半": Fraction(abs(delta)) / 2,
             "单次上限": Fraction(dec(config["max_transfer"])),
             "来源账户可划余额": Fraction(positive(withdrawable[source], True)),
-            "现金保留": cash_room}
+            "绝对现金保留" if absolute > equity * buffer else "现金保留": cash_room}
         amount = min(constraints.values())
         amount = max(Fraction(0), amount)
         units = amount // TRANSFER_UNIT
@@ -584,7 +587,7 @@ class MarginBalancer:
                     if max(Fraction(0), value) // TRANSFER_UNIT * TRANSFER_UNIT < dec(config["min_transfer"]))
                 side = "A 多侧" if source == "long" else "B 空侧"
                 diagnostics["reason"] = (
-                    f"转出侧 {side}；现金保留 {cash(equity * buffer)} USD1；"
+                    f"转出侧 {side}；现金保留 {cash(reserve)} USD1（比例与绝对保留取较大值）；"
                     f"限制项：{limited}；共同约束后的安全可划金额 {wire(rounded)} USD1，"
                     f"低于最小划转额 {_display_amount(Fraction(dec(config['min_transfer'])))} USD1")
             return None

@@ -9,6 +9,7 @@ import { ANTHROPIC_CONTRACTS, contractKey, findContract, sharesProblem } from '.
 import { readTradingPreferences, saveTradingPreferences, TRADING_PAIRS } from './trading-preferences';
 import type { ExecutionPreferences } from './trading-preferences';
 import './trading-execution.css';
+import TradingExecutionEvidence from './TradingExecutionEvidence';
 
 const BASE = '/api/trading/execution';
 // Writes wait past the API's 60 s forwarding deadline, so the server's own
@@ -188,6 +189,7 @@ const JobCard = memo(function JobCard({ job, disabled, canPreview, write, resume
     })}
     <footer><span>停止只撤销余单，已成交仓位保留。</span>{job.canResume ? <button className="button secondary" type="button" disabled={disabled || !canPreview} onClick={() => resume(job.id)}>预览继续剩余</button> : null}</footer>
     <details className="execution-events"><summary>执行记录与编号</summary><p>执行编号：{job.id} · 最晚结束：{date(job.deadlineAt)}（北京时间）</p><ul>{job.events.map((event, index) => <li key={`${event.time}-${index}`}><time>{date(event.time)}</time><span>{event.message}</span></li>)}</ul></details>
+    <TradingExecutionEvidence jobId={job.id} updatedAt={job.updatedAt}/>
   </article>;
 });
 

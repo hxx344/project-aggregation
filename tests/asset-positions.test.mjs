@@ -16,6 +16,11 @@ const payload = () => ({ schemaVersion: 1, generatedAt: STAMP, exchanges: [{ id:
 const target = (id = 'asset', rev = revision) => ({ project: { id, name: `Asset ${id}`, adapter: 'asset', enabled: true, apiUrl: `http://127.0.0.1/${id}`, authOrigin: 'http://127.0.0.1' }, credentials: { password: 'fixture-only-password' }, revision: rev });
 const scope = data => data.exchanges[0].accounts[0].scopes[0];
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+async function promptly(promise) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error('cached positions waited for the upstream read')), 300); })]); }
+  finally { clearTimeout(timer); }
+}
 
 test('allowlists dynamic exchange data and preserves decimal strings, units and nulls', () => {
   const raw = payload(); raw.apiSecret = 'do-not-return'; raw.exchanges[0].accounts[0].credentials = { apiKey: 'do-not-return' };
@@ -99,6 +104,96 @@ test('coalesces in-flight reads and reuses cached data without exporting credent
   assert.ok(!JSON.stringify(a).includes('fixture-only-password'));
 });
 
+test('UI reads return cached positions during one shared refresh while default consumers still wait', async t => {
+  const f = fixture(t), initial = await f.reader.state(); f.tick();
+  const gate = deferred(), entered = deferred();
+  const empty = payload(); scope(empty).positions = []; scope(empty).fetchedAt = new Date(NOW + 5001).toISOString();
+  f.handle(async () => { entered.resolve(); await gate.promise; return { data: empty }; });
+  try {
+    const reads = Array.from({ length: 3 }, () => f.reader.state({ staleWhileRevalidate: true }));
+    const cached = await promptly(Promise.all(reads)); await entered.promise;
+    assert.equal(f.calls.filter(call => call.path === '/api/hub/positions').length, 2);
+    for (const result of cached) {
+      assert.equal(result.sources[0].checkedAt, initial.sources[0].checkedAt);
+      assert.equal(result.sources[0].data.generatedAt, STAMP);
+      assert.equal(scope(result.sources[0].data).fetchedAt, STAMP);
+      assert.equal(scope(result.sources[0].data).status, 'live');
+      assert.equal(scope(result.sources[0].data).refreshing, true);
+      assert.equal(scope(result.sources[0].data).positions.length, 1);
+    }
+    let completed = false;
+    const waiting = f.reader.state().then(result => { completed = true; return result; });
+    await Promise.resolve(); assert.equal(completed, false, 'baseline and digest reads keep waiting for current results');
+    gate.resolve(); const current = await waiting;
+    assert.deepEqual(scope(current.sources[0].data).positions, [], 'successful empty snapshots clear old positions');
+    assert.equal(scope(current.sources[0].data).refreshing, false);
+    assert.equal(scope(current.sources[0].data).fetchedAt, scope(empty).fetchedAt);
+    assert.equal(f.calls.filter(call => call.path === '/api/hub/positions').length, 2);
+  } finally { gate.resolve(); }
+});
+
+test('UI refresh failures preserve old positions and never renew their data timestamps or freshness', async t => {
+  const f = fixture(t); await f.reader.state(); f.tick(90_001);
+  const gate = deferred();
+  f.handle(async () => { await gate.promise; throw new Error('upstream-secret'); });
+  try {
+    const refreshing = (await promptly(f.reader.state({ staleWhileRevalidate: true }))).sources[0];
+    assert.equal(scope(refreshing.data).status, 'stale');
+    assert.equal(scope(refreshing.data).refreshing, true);
+    assert.equal(refreshing.checkedAt, STAMP);
+    const waiting = f.reader.state(); gate.resolve(); const failed = (await waiting).sources[0];
+    assert.equal(failed.status, 'stale'); assert.equal(scope(failed.data).status, 'stale');
+    assert.equal(scope(failed.data).refreshing, false);
+    assert.equal(failed.data.generatedAt, STAMP); assert.equal(scope(failed.data).fetchedAt, STAMP);
+    assert.equal(scope(failed.data).positions[0].quantity, position().quantity);
+    assert.ok(!JSON.stringify(failed).includes('upstream-secret'));
+    const calls = f.calls.length;
+    assert.equal((await promptly(f.reader.state({ staleWhileRevalidate: true }))).sources[0].status, 'stale');
+    assert.equal(f.calls.length, calls, 'failed reads retain the retry cache window');
+  } finally { gate.resolve(); }
+});
+
+test('a new slow source does not delay cached sources and stays explicitly unavailable until its first result', async t => {
+  const f = fixture(t); await f.reader.state();
+  const gate = deferred(), entered = deferred(); f.select([target(), target('new-asset')]);
+  f.handle(async () => { entered.resolve(); await gate.promise; return { data: payload() }; });
+  try {
+    const cached = await promptly(f.reader.state({ staleWhileRevalidate: true })); await entered.promise;
+    assert.equal(cached.sources[0].status, 'ready');
+    assert.equal(scope(cached.sources[0].data).positions.length, 1);
+    assert.equal(cached.sources[1].status, 'unavailable'); assert.equal(cached.sources[1].data, null);
+    assert.equal(cached.sources[1].checkedAt, null); assert.match(cached.sources[1].error, /首次读取/);
+    const waiting = f.reader.state(); gate.resolve();
+    assert.equal((await waiting).sources[1].status, 'ready');
+  } finally { gate.resolve(); }
+});
+
+test('UI reads discard cached and late background data after revision changes or removal', async t => {
+  const f = fixture(t); await f.reader.state(); f.tick();
+  const gate = deferred(), entered = deferred();
+  f.handle(async () => { entered.resolve(); await gate.promise; return { data: payload() }; });
+  try {
+    await promptly(f.reader.state({ staleWhileRevalidate: true })); await entered.promise;
+    const earlier = f.reader.state();
+    f.select([target('asset', 'b'.repeat(64))]);
+    const fresh = payload(); scope(fresh).positions = [];
+    f.handle(async () => ({ data: fresh }));
+    const changed = await f.reader.state({ staleWhileRevalidate: true });
+    assert.deepEqual(scope(changed.sources[0].data).positions, [], 'new revision cannot return the old cached positions');
+    gate.resolve();
+    assert.deepEqual(scope((await earlier).sources[0].data).positions, [], 'late old-revision response cannot overwrite new data');
+    f.tick(); const removedGate = deferred(), removedEntered = deferred();
+    f.handle(async () => { removedEntered.resolve(); await removedGate.promise; return { data: payload() }; });
+    try {
+      await promptly(f.reader.state({ staleWhileRevalidate: true })); await removedEntered.promise;
+      const removedPending = f.reader.state(); f.select([]);
+      assert.deepEqual((await promptly(f.reader.state({ staleWhileRevalidate: true }))).sources, []);
+      removedGate.resolve(); assert.deepEqual((await removedPending).sources, []);
+      assert.deepEqual(f.reader.peek().sources, []);
+    } finally { removedGate.resolve(); }
+  } finally { gate.resolve(); }
+});
+
 test('isolates multiple Asset sources and retains stale snapshots after safe failures', async t => {
   const f = fixture(t);
   f.select([target(), target('asset2'), { ...target('not-configured'), credentials: null }, { ...target('disabled'), project: { ...target('disabled').project, enabled: false } }]);
@@ -144,7 +239,7 @@ test('times out with a controlled error and aborts pending requests on close', a
   }));
   const timer = setTimeout(() => {}, 100);
   try {
-    const result = await f.reader.state(); assert.equal(result.sources[0].status, 'unavailable'); assert.match(result.sources[0].error, /超时/);
+    const result = await f.reader.state({ staleWhileRevalidate: true }); assert.equal(result.sources[0].status, 'unavailable'); assert.match(result.sources[0].error, /超时/);
   } finally { clearTimeout(timer); }
   f.tick(); const pending = f.reader.state(); await f.reader.close();
   assert.deepEqual((await pending).sources, []);
@@ -165,6 +260,11 @@ test('optional cycle summaries are allowlisted, absent for older Asset versions 
   const cycle = () => ({ status: 'complete', since: '2026-10-11T00:00:00.000Z', closedQuantity: '1', closePrice: '60300.5', realizedPnl: '12.000000000000000001', fees: '-0.3', funding: '-0.1', net: '11.600000000000000001', currency: 'USDT', note: null, updatedAt: '2026-10-11T23:00:00.000Z' });
   const raw = payload(); scope(raw).positions[0].cycle = { ...cycle(), secret: 'do-not-return' };
   assert.deepEqual(scope(normalizeAssetPositions(raw, NOW)).positions[0].cycle, cycle());
+  const evidence = { version: 1, coverageStart: cycle().since, coverageEnd: cycle().updatedAt, openingFound: true, totalRows: 1, truncated: false,
+    rows: [{ id: 'trade-1', time: cycle().since, kind: 'fill', status: 'included', quantity: '1', price: '60000', fraction: null, realizedPnl: '0', fee: '-0.3', feeCurrency: 'USDT', amount: null, currency: 'USDT', reason: null }] };
+  scope(raw).positions[0].cycle.evidence = { ...evidence, privateKey: 'do-not-return', rows: evidence.rows.map(row => ({ ...row, privateKey: 'do-not-return' })) };
+  assert.deepEqual(scope(normalizeAssetPositions(raw, NOW)).positions[0].cycle.evidence, evidence);
+  assert.equal(JSON.stringify(normalizeAssetPositions(raw, NOW)).includes('do-not-return'), false);
   assert.equal('cycle' in scope(normalizeAssetPositions(payload(), NOW)).positions[0], false);
   for (const bad of [{ ...cycle(), status: 'done' }, { ...cycle(), net: 12 }, { ...cycle(), note: 'x'.repeat(301) }, { ...cycle(), updatedAt: '2030-01-01T00:00:00.000Z' }, 'complete']) {
     const broken = payload(); scope(broken).positions[0].cycle = bad;

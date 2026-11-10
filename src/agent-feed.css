@@ -1,0 +1,14 @@
+.af-body{display:flex;flex-direction:column;gap:12px;padding:0 20px 18px;font-size:.8125rem;line-height:1.65;color:var(--text-secondary)}
+.af-body code,.af-table code{font-family:var(--font-mono,ui-monospace,SFMono-Regular,Menlo,monospace);font-size:.75rem;color:var(--text-primary)}
+.af-token{display:block;padding:10px 12px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);background:var(--surface-2);overflow-wrap:anywhere;user-select:all}
+.af-created{border-color:rgba(45,190,135,.45)}
+.af-table{overflow-x:auto;margin:14px 20px 18px;border:1px solid var(--surface-4);border-radius:var(--radius-sm)}
+.af-table table{width:100%;border-collapse:collapse;font-size:.75rem}
+.af-table th,.af-table td{padding:8px 10px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--surface-4)}
+.af-table th{font-weight:600;color:var(--text-secondary);background:var(--surface-2)}
+.af-table tbody tr:last-child td{border-bottom:0}
+.af-table .right{text-align:right}
+.af-form{border-top:1px solid var(--surface-4);padding-top:16px}
+.af-scopes{display:flex;flex-wrap:wrap;gap:8px 24px}
+.af-scopes .checkbox-field{margin:0}
+.af-scopes small{display:block;font-size:.6875rem;color:var(--text-tertiary)}

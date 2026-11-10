@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } 
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
+import { readTradingPage } from './trading-read';
 import { ageTradingData, pairExchanges, tradingCacheNow } from './trading-cache';
 import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
@@ -17,7 +18,7 @@ import { amount, beijingTime, polarity, roundedAmount } from './trading-format';
 import { tradingSectionOf } from './trading-sections';
 import type { TradingSection } from './trading-sections';
 import { sharesProblem } from './trading-anthropic';
-import { DAYS_PREFERENCE_KEY, PAIR_PREFERENCE_KEY, SHARES_PREFERENCES_KEY, readShares, readTradingDays, readTradingPair } from './trading-preferences';
+import { DAYS_PREFERENCE_KEY, PAIR_PREFERENCE_KEY, readShares, saveShares, readTradingDays, readTradingPair } from './trading-preferences';
 import { writePreference } from './ui-preferences';
 import type { AnthropicShares } from './trading-execution-types';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPair, TradingPosition, TradingReadState, TradingState } from './trading-types';
@@ -142,7 +143,7 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
   // One set of Anthropic share-count assumptions for the spread view and the live preview.
   const [shares, setShares] = useState<AnthropicShares>(readShares);
   const [anthropicOverview, setAnthropicOverview] = useState<OverviewMarket | null>(null);
-  useEffect(() => { if (!sharesProblem(shares)) writePreference(SHARES_PREFERENCES_KEY, shares); }, [shares]);
+  useEffect(() => { if (!sharesProblem(shares)) saveShares(shares); }, [shares]);
   useEffect(() => { writePreference(PAIR_PREFERENCE_KEY, pair); writePreference(DAYS_PREFERENCE_KEY, days); }, [pair, days]);
   const [sources, setSources] = useState<TradingImportSource[] | null>(null);
   const [sourcesLoading, setSourcesLoading] = useState(false);
@@ -187,26 +188,26 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
     if (!force && document.hidden && lastReadAt.current !== null && performance.now() - lastReadAt.current < 30_000) return Promise.resolve();
     if (force) cancelRead();
     const requestedPair = pairRef.current;
-    const request = cache.beginRead(requestedPair), controller = request.controller;
     const version = ++sequence.current;
     const requestedDays = daysRef.current;
     const requestedPage = pageRef.current;
+    const shared = readTradingPage(cache, api<TradingState>, requestedDays, requestedPage, requestedPair);
+    const request = shared.request, controller = request.controller;
     lastReadAt.current = performance.now();
     setReading(true);
     const promise = (async () => {
       try {
-        const next = await api<TradingState>(`/api/trading?days=${requestedDays}&page=${requestedPage}&pair=${requestedPair}`, { signal: controller.signal, timeoutMs: 12_000 });
-        if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
-        if (cache.accept(request, next)) {
+        const next = await shared.promise;
+        if (!mounted.current || version !== sequence.current || !next) return;
+        if (cache.get(next.period.days, next.funding.pagination.page, requestedPair)?.data === next) {
           setError('');
           if (requestedPair === pairRef.current && requestedDays === daysRef.current && requestedPage === pageRef.current && next.funding.pagination.page !== requestedPage) setPage(next.funding.pagination.page);
         }
       } catch (cause) {
         if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
         if (cause instanceof ApiError && cause.status === 401) expiredRef.current();
-        else { cache.fail(request, requestedDays, requestedPage); setError(cause instanceof Error ? cause.message : '交易数据读取失败，请重试。'); }
+        else setError(cause instanceof Error ? cause.message : '交易数据读取失败，请重试。');
       } finally {
-        cache.finish(request);
         if (mounted.current && version === sequence.current) setReading(false);
         if (pending.current?.controller === controller) pending.current = null;
       }
@@ -338,6 +339,10 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
       {pairTab ? <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div> : <p className="trading-toolbar-note"><ShieldCheck size={15} />只读观察账户：读取原油、海力士与 Anthropic 的仓位和资金费账单，不能下单</p>}
       {dataTab ? <button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button> : null}
     </div> : null}
+    <div hidden={section !== 'trade' && !dataTab}>
+      {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
+      {error && !offline ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>仓位同步中断：{error}{data ? ' 当前保留上次数据，正在自动重试。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
+    </div>
     <div className="trading-tab" hidden={section !== 'trade'}>
       <div className="trading-trade-top">
         <TradingSpread pair={pair} onPair={changePair} shares={shares} onShares={setShares} />
@@ -347,8 +352,6 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
     </div>
     <div className="trading-tab" hidden={section !== 'auto'}><TradingAutoRules onExpired={onExpired} /></div>
     <div className="trading-tab" hidden={!dataTab}>
-    {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
-    {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}
     {notice ? <div className="trading-notice" role="status">{notice}</div> : null}
     {data ? <div className={`trading-notice trading-cache-status${oldCache || data.cache.error ? ' warning' : ''}`} role={data.cache.error ? 'alert' : 'status'}><span>{data.cache.error ? `${data.cache.error.message} 失败时间：${formatDate(data.cache.error.at)}（北京时间）。` : oldCache ? '当前显示旧缓存，等待更新。' : data.cache.rebuilding ? '后台正在更新缓存，当前显示上次数据。' : reading ? '已显示缓存，正在检查更新。' : '已显示缓存。'} 缓存生成：{formatDate(data.cache.builtAt)}{data.cache.builtAt ? '（北京时间）' : ''}</span></div> : null}

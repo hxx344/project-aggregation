@@ -15,6 +15,22 @@ const state = (days = 7, page = 0, revision = 1) => ({
 });
 const read = (cache, data) => { const request = cache.beginRead(); assert.equal(cache.accept(request, data), true); cache.finish(request); return data; };
 
+test('disconnect invalidates every cached selection until each receives a new response', () => {
+  const cache = createTradingCache();
+  read(cache, state()); read(cache, state(30));
+  const oldTime = Date.parse(time) + 1000;
+  cache.markUnavailable();
+  for (const entry of [cache.get(7, 0), cache.get(30, 0), cache.latest()]) {
+    assert.equal(ageTradingData(entry, oldTime).accounts[0].positions.state, 'stale');
+    assert.equal(entry.data.accounts[0].positions.fetchedAt, time);
+  }
+  const pending = cache.beginRead();
+  assert.equal(ageTradingData(cache.get(7, 0), oldTime).accounts[0].positions.state, 'stale', 'online/read-start alone cannot restore freshness');
+  cache.accept(pending, state()); cache.finish(pending);
+  assert.equal(ageTradingData(cache.get(7, 0), oldTime).accounts[0].positions.state, 'live');
+  assert.equal(ageTradingData(cache.get(30, 0), oldTime).accounts[0].positions.state, 'stale');
+});
+
 test('session cache reuses exact range and server page without expanding ledger responses', () => {
   const cache = createTradingCache();
   const first = read(cache, state()), second = read(cache, state(7, 1)), month = read(cache, state(30));
@@ -218,4 +234,71 @@ test('URL pair selection uses canonical exchange order and safe defaults', () =>
   assert.equal(normalizeTradingPair('okx,binance'), 'binance,okx');
   assert.equal(normalizeTradingPair('okx,bybit'), 'bybit,okx');
   for (const pair of [null, '', 'okx', 'binance,binance', 'binance,bybit,okx', 'unknown,okx']) assert.equal(normalizeTradingPair(pair), 'binance,bybit');
+});
+
+test('overlapping page readers share one response without resetting the cache age', async () => {
+  const cache = createTradingCache();
+  let release, calls = 0, updates = 0;
+  cache.subscribe(() => { updates++; });
+  const load = () => { calls++; return new Promise(resolve => { release = resolve; }); };
+  const warmup = cache.read(7, 0, 'binance,bybit', load);
+  const page = cache.read(7, 0, 'binance,bybit', load);
+  await Promise.resolve(); assert.equal(calls, 1);
+  const data = state(); release(data);
+  assert.equal(await warmup.promise, data); const receivedAt = cache.get(7, 0).receivedAt;
+  assert.equal(await page.promise, data);
+  assert.equal(updates, 1); assert.equal(cache.get(7, 0).receivedAt, receivedAt);
+  assert.equal(cache.get(7, 0).data.cache.servedAt, time);
+  const aged = ageTradingData(cache.get(7, 0), tradingCacheNow(cache.get(7, 0), receivedAt + 75_001));
+  assert.equal(aged.legs[0].state, 'stale');
+});
+
+test('shared reads keep pair, days and ledger page separate', async () => {
+  const cache = createTradingCache();
+  const selections = [[7, 0, 'binance,bybit'], [30, 0, 'binance,bybit'], [7, 1, 'binance,bybit'], [7, 0, 'binance,okx']];
+  let calls = 0;
+  const reads = selections.map(([days, page, pair]) => cache.read(days, page, pair, async () => {
+    calls++; return { ...state(days, page), exchanges: pair.split(',') };
+  }));
+  await Promise.all(reads.map(read => read.promise)); assert.equal(calls, 4);
+  for (const [days, page, pair] of selections) {
+    const data = cache.get(days, page, pair).data;
+    assert.equal(data.period.days, days); assert.equal(data.funding.pagination.page, page); assert.equal(data.exchanges.join(','), pair);
+  }
+});
+
+for (const invalidation of ['clear', 'mutation', 'abort']) {
+  test(`a ${invalidation} discards a late shared result and preserves the replacement read`, async () => {
+    const cache = createTradingCache(); let releaseOld, releaseNew;
+    const old = cache.read(7, 0, 'binance,bybit', () => new Promise(resolve => { releaseOld = resolve; }));
+    await Promise.resolve();
+    if (invalidation === 'clear') cache.clear();
+    else if (invalidation === 'mutation') {
+      const mutation = cache.beginMutation('binance'); cache.accept(mutation, state(7, 0, 2), true); cache.finish(mutation);
+    } else old.request.controller.abort();
+    const replacement = cache.read(7, 0, 'binance,bybit', () => new Promise(resolve => { releaseNew = resolve; }));
+    await Promise.resolve(); releaseOld(state()); assert.equal(await old.promise, null);
+    const joined = cache.read(7, 0, 'binance,bybit', () => { throw new Error('replacement must remain shared'); });
+    assert.equal(joined, replacement);
+    const data = state(7, 0, 2); releaseNew(data); assert.equal(await replacement.promise, data);
+    assert.equal(cache.get(7, 0).data, data);
+  });
+}
+
+test('a shared read failure preserves values as stale and allows a later retry', async () => {
+  const cache = createTradingCache(), data = read(cache, state());
+  const failure = cache.read(7, 0, 'binance,bybit', async () => { throw new Error('unavailable'); });
+  await assert.rejects(failure.promise, /unavailable/);
+  assert.equal(cache.get(7, 0).data, data); assert.equal(cache.get(7, 0).failed, true);
+  assert.equal(ageTradingData(cache.get(7, 0), Date.parse(time)).legs[0].state, 'stale');
+  const next = state(); await cache.read(7, 0, 'binance,bybit', async () => next).promise;
+  assert.equal(cache.get(7, 0).data, next); assert.equal(cache.get(7, 0).failed, false);
+});
+
+test('unavailability cancels reads without abandoning an in-flight account mutation', () => {
+  const cache = createTradingCache(), mutation = cache.beginMutation('binance'), request = cache.beginRead();
+  cache.markUnavailable();
+  assert.equal(request.controller.signal.aborted, true); assert.equal(cache.valid(request), false);
+  assert.equal(mutation.controller.signal.aborted, false); assert.equal(cache.valid(mutation), true);
+  assert.equal(cache.busy(), 'binance'); cache.finish(mutation);
 });

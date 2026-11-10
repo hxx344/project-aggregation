@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto';
 import { parseArgs, parseEnv } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { createBackup } from './backup.mjs';
+import { verifyArchive } from './archive.mjs';
 import { restoreBackup, admitHandoff } from './restore.mjs';
 import { acquireRecoveryLocks } from './lifecycle-lock.mjs';
 import { safePath, readLockedRegistry, openSourceDatabase } from './inventory.mjs';
@@ -47,7 +48,7 @@ function publicState(dataDir) {
 
 export async function runRecoveryCli(args = process.argv.slice(2)) {
   const { positionals, values } = parseArgs({ args, options, allowPositionals: true, strict: true });
-  if (positionals.length !== 1 || !['keys','backup','handoff','restore','admit','inspect','check-source'].includes(positionals[0])) fail('RECOVERY_ACTION_INVALID');
+  if (positionals.length !== 1 || !['keys','backup','handoff','restore','admit','inspect','check-source','verify-archive'].includes(positionals[0])) fail('RECOVERY_ACTION_INVALID');
   const action = positionals[0];
   if (action === 'keys') {
     const files = [absolute(values['data-key-file']), absolute(values['secrets-key-file'])];
@@ -75,6 +76,7 @@ export async function runRecoveryCli(args = process.argv.slice(2)) {
     const held = await acquireRecoveryLocks({ dataDir, expectedOwnerUid, timeoutMs: 5000 }); locks.push(held); return held;
   };
   try {
+    if (action === 'verify-archive') return await verifyArchive({ backupDir: absolute(values['backup-dir']), dataKey, secretsKey, ...bounds });
     if (action === 'backup' || action === 'handoff') {
       const dataDir = absolute(values['data-dir']), lock = await hold(dataDir, owner(values['owner-uid']));
       const content = values['environment-file'] ? readPrivateFile(values['environment-file'], 1024 * 1024, { allowGroupRead: true }) : null;

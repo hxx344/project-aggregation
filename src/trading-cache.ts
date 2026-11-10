@@ -11,6 +11,7 @@ export const pairExchanges = (pair: TradingPair) => pair.split(',') as [TradingE
 
 export type TradingCacheEntry = { data: TradingState; receivedAt: number; requestId: number; failed: boolean };
 type Request = { controller: AbortController; session: number; generation: number; id: number; kind: 'read' | 'mutation' | 'source'; pair: TradingPair };
+type SharedRead = { request: Request; promise: Promise<TradingState | null> };
 const key = (days: 7 | 30, page: number, pair: TradingPair) => `${pair}:${days}:${page}`;
 const MAX_PAGES = 12;
 
@@ -18,6 +19,7 @@ const MAX_PAGES = 12;
 export function createTradingCache() {
   const pages = new Map<string, TradingCacheEntry>();
   const requests = new Set<Request>();
+  const reads = new Map<string, SharedRead>();
   const listeners = new Set<() => void>();
   let session = 0, generation = 0, requestId = 0, version = 0;
   const latest = new Map<TradingPair, TradingCacheEntry>();
@@ -26,7 +28,7 @@ export function createTradingCache() {
   let mutation: { request: Request; label: string } | null = null;
   const notify = () => { version++; listeners.forEach(listener => listener()); };
   const valid = (request: Request) => request.session === session && !request.controller.signal.aborted && (request.kind !== 'read' || request.generation === generation);
-  const cancelReads = () => { for (const request of requests) if (request.kind === 'read') { request.controller.abort(); requests.delete(request); } };
+  const cancelReads = () => { for (const request of requests) if (request.kind === 'read') { request.controller.abort(); requests.delete(request); } reads.clear(); };
   const invalidate = () => { generation++; cancelReads(); pages.clear(); latest.clear(); };
   const touch = (pageKey: string, entry: TradingCacheEntry) => { pages.delete(pageKey); pages.set(pageKey, entry); };
   const begin = (kind: Request['kind'], pair = DEFAULT_TRADING_PAIR): Request => {
@@ -71,6 +73,29 @@ export function createTradingCache() {
     busy: () => mutation?.label ?? null,
     valid,
     beginRead: (pair = DEFAULT_TRADING_PAIR) => begin('read', pair),
+    // Warmup and the page share one bounded GET for the exact selection. Only
+    // this owner accepts the payload, so joining a read cannot renew its age.
+    read(days: 7 | 30, page: number, pair: TradingPair, load: (signal: AbortSignal) => Promise<TradingState>): SharedRead {
+      const pageKey = key(days, page, pair), existing = reads.get(pageKey);
+      if (existing && valid(existing.request)) return existing;
+      const request = begin('read', pair);
+      const promise = Promise.resolve().then(() => {
+        request.controller.signal.throwIfAborted();
+        return load(request.controller.signal);
+      }).then(data => accept(request, data) ? data : null).catch(cause => {
+        if (valid(request)) {
+          const entry = pages.get(pageKey);
+          if (entry) entry.failed = true;
+          notify();
+        }
+        throw cause;
+      }).finally(() => {
+        requests.delete(request);
+        if (reads.get(pageKey)?.request === request) reads.delete(pageKey);
+      });
+      const shared = { request, promise }; reads.set(pageKey, shared);
+      return shared;
+    },
     beginSource: () => begin('source'),
     beginMutation(label: string, pair = DEFAULT_TRADING_PAIR) {
       if (mutation) return null;
@@ -83,6 +108,12 @@ export function createTradingCache() {
       if (entry) entry.failed = true;
       notify();
     },
+    markUnavailable() {
+      // Reconnecting permits a new read; it cannot revalidate pre-disconnect evidence.
+      cancelReads();
+      for (const entry of [...pages.values(), ...latest.values()]) entry.failed = true;
+      notify();
+    },
     finish(request: Request) {
       requests.delete(request);
       if (mutation?.request === request) { mutation = null; notify(); }
@@ -90,7 +121,7 @@ export function createTradingCache() {
     clear() {
       session++; generation++;
       for (const request of requests) request.controller.abort();
-      requests.clear(); pages.clear(); latest.clear(); latestAccounts = undefined; mutation = null; selection = { days: 7, page: 0, pair: DEFAULT_TRADING_PAIR }; notify();
+      requests.clear(); reads.clear(); pages.clear(); latest.clear(); latestAccounts = undefined; mutation = null; selection = { days: 7, page: 0, pair: DEFAULT_TRADING_PAIR }; notify();
     },
   };
 }

@@ -1,8 +1,8 @@
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ArrowUpRight, ChevronDown, CircleAlert, LoaderCircle, RefreshCw, ShieldCheck, Wallet } from 'lucide-react';
-import { api, ApiError } from './api';
+import { usePositionsCache } from './positions-cache-context';
 import { amount, beijingTime } from './trading-format';
-import type { AssetPosition, PositionAccount, PositionScope, PositionScopeStatus, PositionSource, TradingPositionsResponse } from './trading-positions-types';
+import type { AssetPosition, PositionAccount, PositionScope, PositionScopeStatus, PositionSource } from './trading-positions-types';
 
 const staleAfterMs = 90_000;
 const statusNames: Record<PositionScopeStatus, string> = { unconfigured: '未配置', loading: '首次读取中', live: '已同步', stale: '旧值', error: '读取失败', unsupported: '暂不支持' };
@@ -52,42 +52,35 @@ const ScopePositions = memo(function ScopePositions({ scope, stale, now, context
 });
 
 export default function TradingPositions({ onExpired, onProject, navigationSearch }: { onExpired: () => void; onProject: (id: string) => void; navigationSearch: string }) {
-  const [data, setData] = useState<TradingPositionsResponse | null>(null);
+  const cache = usePositionsCache();
+  const { data, error, failed, reading, unauthorized } = useSyncExternalStore(cache.subscribe, cache.getSnapshot);
   const [filters, setFilters] = useState(readFilters);
-  const [error, setError] = useState('');
   const [offline, setOffline] = useState(!navigator.onLine);
-  const [reading, setReading] = useState(false);
   const [, setClock] = useState(0);
-  const mounted = useRef(false), version = useRef(0), receivedAt = useRef(0), lastReadAt = useRef<number | null>(null);
-  const pending = useRef<{ controller: AbortController; promise: Promise<void> } | null>(null);
+  const mounted = useRef(false), version = useRef(0), lastReadAt = useRef<number | null>(null);
+  const pending = useRef<{ promise: Promise<void> } | null>(null);
   const expiredRef = useRef(onExpired);
   useEffect(() => { expiredRef.current = onExpired; }, [onExpired]);
+  useEffect(() => { if (unauthorized) expiredRef.current(); }, [unauthorized]);
   useEffect(() => { setFilters(readFilters()); }, [navigationSearch]);
-  const cancel = useCallback(() => { version.current++; pending.current?.controller.abort(); pending.current = null; }, []);
+  // A view leaving does not cancel the shared read needed by another view.
+  const cancel = useCallback(() => { version.current++; pending.current = null; }, []);
   const load = useCallback((force = false): Promise<void> => {
     if (!mounted.current || !navigator.onLine) return Promise.resolve();
     if (pending.current && !force) return pending.current.promise;
     if (!force && document.hidden && lastReadAt.current !== null && performance.now() - lastReadAt.current < 30_000) return Promise.resolve();
     if (force) cancel();
-    const requestVersion = ++version.current, controller = new AbortController();
-    lastReadAt.current = performance.now(); setReading(true);
+    const requestVersion = ++version.current;
+    lastReadAt.current = performance.now();
     const promise = (async () => {
       try {
-        const next = await api<TradingPositionsResponse>('/api/trading/positions', { signal: controller.signal, timeoutMs: 15_000 });
-        if (!mounted.current || version.current !== requestVersion) return;
-        // A successful response is authoritative, including removed sources/accounts.
-        receivedAt.current = performance.now(); setData(next); setError('');
-      } catch (cause) {
-        if (!mounted.current || version.current !== requestVersion) return;
-        if (cause instanceof ApiError && cause.status === 401) { setData(null); expiredRef.current(); }
-        else setError(cause instanceof Error ? cause.message : '仓位读取失败，请重试。');
+        await cache.refresh(force);
       } finally {
-        if (mounted.current && version.current === requestVersion) setReading(false);
-        if (pending.current?.controller === controller) pending.current = null;
+        if (version.current === requestVersion) pending.current = null;
       }
     })();
-    pending.current = { controller, promise }; return promise;
-  }, [cancel]);
+    pending.current = { promise }; return promise;
+  }, [cache, cancel]);
   useEffect(() => {
     let disposed = false;
     let resumeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -96,7 +89,7 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
     const resume = () => {
       if (disposed) return;
       setOffline(!navigator.onLine); setClock(value => value + 1);
-      if (!navigator.onLine) { cancelResume(); cancel(); setReading(false); }
+      if (!navigator.onLine) { cancelResume(); cancel(); cache.markUnavailable(); }
       else if (resumeTimer === undefined) {
         const previousRead = pending.current;
         // Coalesce wake events and preserve reads started during the grace period.
@@ -121,7 +114,7 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
       window.removeEventListener('online', resume); window.removeEventListener('offline', resume);
       window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume);
     };
-  }, [cancel, load]);
+  }, [cache, cancel, load]);
   useEffect(() => {
     const back = () => setFilters(readFilters());
     window.addEventListener('popstate', back);
@@ -139,8 +132,8 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
     history.pushState(null, '', url); setFilters(next);
   }
   const sources = data?.sources ?? [];
-  const now = data ? Date.parse(data.generatedAt) + performance.now() - receivedAt.current : Date.now();
-  const stale = offline || !!error || !!data && oldTime(data.generatedAt, now);
+  const now = cache.now();
+  const stale = offline || failed || !!error || !!data && oldTime(data.generatedAt, now);
   const selectedSources = sources.filter(source => !filters.source || source.projectId === filters.source);
   const exchangeOptions = Array.from(new Map(selectedSources.flatMap(source => source.data?.exchanges.map(exchange => [exchange.id, exchange.name] as const) ?? [])).entries());
   const groups = selectedSources.flatMap(source => (source.data?.exchanges ?? []).filter(exchange => !filters.exchange || exchange.id === filters.exchange).map(exchange => ({ source, exchange })));
@@ -153,6 +146,7 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
     <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>Asset 中全部交易所账户的持仓 · 只读查看，账户在 Asset 管理</span></p><button className="button secondary" onClick={() => void load(true)} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
     {offline ? <div className="positions-notice" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的旧值；连接恢复后自动更新。</div> : null}
     {error ? <div className="positions-notice" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据，已标记为旧值。' : ''}</span></div> : null}
+    {data && reading ? <div className="positions-notice" role="status">已显示上次读取的仓位，正在后台更新。</div> : null}
     {data ? <>
       <div className={`positions-overview ${stale || issues ? 'attention' : ''}`} role="status"><span>{stale ? '当前显示旧值' : issues ? '部分账户或来源待核对' : sources.length ? '仓位状态已更新' : '尚未接入 Asset 来源'}</span><small>工作台读取：{formatDate(data.generatedAt)}（北京时间）· 每 5 秒检查更新</small></div>
       <div className="positions-sources" aria-label="Asset 数据来源">{sources.map(source => <section className="positions-source" key={source.projectId}><div><strong>{source.name}</strong><span className={`positions-status ${source.status === 'ready' ? sourceStale(source) ? 'stale' : 'live' : source.status === 'unconfigured' ? 'unconfigured' : 'error'}`}>{source.status === 'ready' && sourceStale(source) ? '来源旧值' : sourceNames[source.status]}</span></div><p>来源读取：{formatDate(source.checkedAt)}（北京时间）</p>{source.error ? <p className="positions-warning">{source.error}</p> : null}<button className="positions-project-link" type="button" onClick={() => onProject(source.projectId)} aria-label={`在 ${source.name} 管理账户`}>在 Asset 管理账户<ArrowUpRight size={15} /></button></section>)}</div>

@@ -192,8 +192,9 @@ class RuntimeDependencyTests(unittest.TestCase):
                 content = file.read_bytes(); file.unlink()
                 try:
                     with patch.object(module, 'read_runtime_lock', return_value=self.lock):
-                        with self.assertRaisesRegex(ValueError, 'Missing trusted research runtime file: ' + name):
+                        with self.assertRaises(ValueError) as raised:
                             module.stage_runtime(self.source, self.target)
+                        self.assertEqual(str(raised.exception), 'Missing trusted research runtime file: ' + str(Path(name)))
                 finally:
                     file.write_bytes(content)
                     shutil.rmtree(self.target)

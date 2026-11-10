@@ -30,6 +30,8 @@ export function createPortalStore({ db, stmt }) {
     liveGrants: now => live('portal_grants', now),
     // Every stored grant with its digest, for the Portal's liveness sweep.
     grants: () => stmt.prepare('SELECT * FROM portal_grants').all().map(row => ({ ...record(row), digest: row.digest })),
+    sessionGrants: (sessionId, now) => stmt.prepare('SELECT * FROM portal_grants WHERE session_id=? AND expires>? ORDER BY project_id,expires LIMIT 301').all(sessionId, now).map(row => ({ ...record(row), digest: row.digest })),
+    revokeSessionGrant: (digest, sessionId) => immediate(db, () => stmt.prepare('DELETE FROM portal_grants WHERE digest=? AND session_id=?').run(digest, sessionId).changes > 0),
     revokeGrants: digests => immediate(db, () => { for (const digest of digests) stmt.prepare('DELETE FROM portal_grants WHERE digest=?').run(digest); }),
     // Runs `fn` without waiting for another writer: a write in it throws at once while the database is busy.
     withoutWaiting: fn => {

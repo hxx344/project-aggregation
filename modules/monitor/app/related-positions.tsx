@@ -5,6 +5,7 @@ import { ArrowUpRight, ChevronDown, Link2 } from "lucide-react";
 import { hubOpenTrading, POSITIONS_TIMEOUT_MS, useHubHost, useHubPositions, type HubPositionItem, type HubPositionsView, type PositionsMarket } from "../lib/hub-bridge";
 import { pairedMarket, relatedSpreadPairs, type RealizedStatus, type SpreadPair, type UnpairedReason, type VenueSpreads } from "../lib/related-pairs";
 import type { SpreadMarket } from "../lib/exchange-quotes";
+import CycleEvidenceView from './cycle-evidence';
 import { relatedAnthropicPair, type AnthropicPairQuotes } from "../lib/related-position-totals";
 
 export type { VenueSpreads };
@@ -53,6 +54,7 @@ function CycleSummary({ item }: { item: HubPositionItem }) {
       {amount("已实现盈亏", cycle.realizedPnl)}{amount("手续费", cycle.fees)}{amount("资金费", cycle.funding)}{amount("净额", cycle.net)}
     </dl>
     {cycle.note ? <p className="related-cycle-note">{cycle.note}</p> : null}
+    {cycle.evidence ? <CycleEvidenceView key={`${item.key}:${cycle.since}:${cycle.updatedAt}`} evidence={cycle.evidence}/> : <p className="related-cycle-note">当前响应未附带本轮逐笔核对证据（来源未保留或已达到明细预算）。</p>}
   </div>;
 }
 
@@ -118,10 +120,7 @@ function AnthropicTotals({ items, incomplete, retained, quotes }: { items: HubPo
         {amount("手续费", pair.fees)}{amount("资金费", pair.funding)}{amount("已实现净额", pair.net)}
         <MoneyCell label="完整总盈亏" value={pair.total} currency="USD"/>
       </dl>
-      {pair.missing.length > 0 ? <p className="related-cycle-note">未计入或未完整：{pair.missing.join("；")}。已知估算不等于完整总盈亏。</p> : null}
-      <p className="related-cycle-note">折算股数：{pair.shares.map((shares, index) => `${index === 0 ? "Binance" : pair.label.split(" ↔ ")[1]} ${shares === null ? "—" : shares.toLocaleString("en-US", { maximumFractionDigits: 3 })} 股`).join(" / ")}</p>
     </div>
-    <p className="detail-side-foot">溢价 = Binance 每股 ÷ 对比合约每股 − 1；沿用监控页股数假设。合计来自当前唯一反向两腿，各腿已实现取其本轮统计；缺项不补零，数量不匹配时仍保留实际股数。历史标记另按真实成交合约归属。</p>
   </div>;
 }
 

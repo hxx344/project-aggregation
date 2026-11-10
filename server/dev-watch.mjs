@@ -55,19 +55,27 @@ export function findMarked(name, value) {
 // left are ended before the first start. `close()` resolves with the pids of
 // this watch's groups that could not be ended.
 export function createDevWatch({ entry = path.join(root, 'server', 'launcher.mjs'), roots = WATCHED.map(dir => path.join(root, dir)), env = process.env, logger = defaultLogger,
-  stopMs = STOP_MS, residueGraceMs = RESIDUE_GRACE_MS, debounceMs = DEBOUNCE_MS, probeMs = 100, scan = findMarked } = {}) {
+  stopMs = STOP_MS, residueGraceMs = RESIDUE_GRACE_MS, debounceMs = DEBOUNCE_MS, probeMs = 100, scan = findMarked,
+  spawnProcess = spawn, signalProcess = (pid, signal) => process.kill(pid, signal) } = {}) {
   let group = null, timer = null, queued = false, closing = null, cycle = Promise.resolve(), starts = 0;
   const watchers = [], runs = [];
+  // Retain the selector even when cleanup throws or the parent has exited.
+  // A later source change may retry cleanup, but cannot forget the old group.
+  const pendingResidue = new Set([orphaned]);
   const log = (level, fields, message) => logger[level]({ type: 'dev-watch', ...fields }, message);
   // Lifecycle steps run one after another, so a group never starts before the last one left.
-  const enqueue = work => (cycle = cycle.then(work).catch(error => { log('error', { err: error }, '开发进程组操作失败'); return []; }));
+  const enqueue = (work, propagate = false) => {
+    const pending = cycle.then(work);
+    cycle = pending.catch(error => { log('error', { err: error }, '开发进程组操作失败'); return []; });
+    return propagate ? pending : cycle;
+  };
 
   function start() {
     const run = markerOf(process.pid, randomUUID());
     runs.push(run); starts += 1;
     // Its own process group, so a terminal's Ctrl-C reaches only this watch,
     // which then stops the group in the launcher's order.
-    const child = spawn(process.execPath, [entry], { env: { ...env, [DEV_RUN_ENV]: run }, stdio: ['ignore', 'inherit', 'inherit'], detached: true });
+    const child = spawnProcess(process.execPath, [entry], { env: { ...env, [DEV_RUN_ENV]: run }, stdio: ['ignore', 'inherit', 'inherit'], detached: true });
     const current = { child, run, stopping: false };
     current.exited = new Promise(resolve => {
       child.once('exit', (exitCode, signal) => resolve({ exitCode, signal }));
@@ -79,8 +87,9 @@ export function createDevWatch({ entry = path.join(root, 'server', 'launcher.mjs
       void enqueue(async () => {
         if (group !== current) return;
         group = null;
+        pendingResidue.add(run);
         log('warn', result, '工作台进程组已退出，源码变更后再启动');
-        await residue(run);
+        await cleanupResidue();
       });
     });
   }
@@ -91,13 +100,22 @@ export function createDevWatch({ entry = path.join(root, 'server', 'launcher.mjs
     log('warn', { pids: left }, message);
     const deadline = Date.now() + residueGraceMs;
     while (left.length) {
-      for (const pid of left) { try { process.kill(pid, 'SIGKILL'); } catch {} }
+      for (const pid of left) { try { signalProcess(pid, 'SIGKILL'); } catch {} }
       if (Date.now() >= deadline) break;
       await delay(probeMs);
       left = scan(DEV_RUN_ENV, marker);
     }
     if (left.length) log('error', { pids: left }, '残留进程未能结束');
     return left;
+  }
+  async function cleanupResidue() {
+    const remaining = new Set();
+    for (const marker of pendingResidue) {
+      const left = await residue(marker, marker === orphaned ? '发现已退出的 watch 留下的工作台进程，正在强制结束' : undefined);
+      if (left.length) for (const pid of left) remaining.add(pid);
+      else pendingResidue.delete(marker);
+    }
+    return [...remaining];
   }
   const bounded = (promise, ms) => {
     let expiry;
@@ -106,22 +124,29 @@ export function createDevWatch({ entry = path.join(root, 'server', 'launcher.mjs
   };
   async function stopGroup() {
     const current = group;
-    if (!current) return [];
+    if (!current) return cleanupResidue();
     current.stopping = true;
+    pendingResidue.add(current.run);
     const { child } = current;
     // A group that already left may have had its pid reused.
     if (child.pid && child.exitCode === null && child.signalCode === null) {
-      try { process.kill(child.pid, 'SIGTERM'); } catch {}
+      try { signalProcess(child.pid, 'SIGTERM'); } catch {}
       if (await bounded(current.exited, stopMs) === 'expired') {
         log('error', { stopMs }, '工作台进程组未在期限内退出，正在强制结束');
         kill(current);
         if (await bounded(current.exited, residueGraceMs) === 'expired') log('error', { pid: child.pid }, '工作台进程未报告退出');
       }
     }
+    const left = await cleanupResidue();
+    if (child.pid && child.exitCode === null && child.signalCode === null) {
+      // /proc scanning alone cannot replace the parent's observed exit.
+      pendingResidue.add(current.run);
+      return [...new Set([...left, child.pid])];
+    }
     group = null;
-    return residue(current.run);
+    return left;
   }
-  const kill = current => { if (current.child.pid && current.child.exitCode === null && current.child.signalCode === null) { try { process.kill(-current.child.pid, 'SIGKILL'); } catch {} } };
+  const kill = current => { if (current.child.pid && current.child.exitCode === null && current.child.signalCode === null) { try { signalProcess(-current.child.pid, 'SIGKILL'); } catch {} } };
   // Changes that arrive before a restart starts the next group are covered by
   // it: that group loads the sources as they are then.
   function changed(file) {
@@ -131,10 +156,12 @@ export function createDevWatch({ entry = path.join(root, 'server', 'launcher.mjs
       if (queued || closing) return;
       queued = true;
       void enqueue(async () => {
-        log('info', { file: path.relative(root, file) }, '源码已变更，正在重启工作台进程组');
-        await stopGroup();
-        queued = false;
-        if (!closing) start();
+        try {
+          log('info', { file: path.relative(root, file) }, '源码已变更，正在重启工作台进程组');
+          const left = await stopGroup();
+          if (left.length) log('error', { pids: left }, '旧进程尚未清理完成，已阻止启动；下次源码变更时重试');
+          else if (!closing) start();
+        } finally { queued = false; }
       });
     }, debounceMs);
   }
@@ -152,15 +179,16 @@ export function createDevWatch({ entry = path.join(root, 'server', 'launcher.mjs
     }
   }
   void enqueue(async () => {
-    await residue(orphaned, '发现已退出的 watch 留下的工作台进程，正在强制结束');
-    if (!closing) start();
+    const left = await cleanupResidue();
+    if (left.length) log('error', { pids: left }, '孤儿进程尚未清理完成，已阻止首次启动；下次源码变更时重试');
+    else if (!closing) start();
   });
   function close() {
     return closing ??= (clearTimeout(timer), enqueue(async () => {
       for (const watcher of watchers.splice(0)) watcher.close();
-      await stopGroup();
-      return runs.flatMap(run => scan(DEV_RUN_ENV, run));
-    }));
+      const left = await stopGroup();
+      return [...new Set([...left, ...runs.flatMap(run => scan(DEV_RUN_ENV, run))])];
+    }, true));
   }
   // Ends the running group at once instead of waiting for its stop (a second Ctrl-C).
   const forceStop = () => { if (group) kill(group); };
@@ -189,8 +217,13 @@ export async function runDevWatch({ platform = process.platform, logger = defaul
       resolve();
     });
   });
-  const left = await devWatch.close();
-  process.exitCode = left.length ? 1 : 0;
+  try {
+    const left = await devWatch.close();
+    process.exitCode = left.length ? 1 : 0;
+  } catch (error) {
+    logger.error({ err: error, type: 'dev-watch' }, '无法确认开发进程已全部退出');
+    process.exitCode = 1;
+  }
 }
 
 if (import.meta.main) await runDevWatch();

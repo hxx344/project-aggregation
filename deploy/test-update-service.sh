@@ -17,6 +17,7 @@ fresh_case() {
   printf 'MODULES = ()\n' > "$case_root/release/server/update-service/registry.py"
   printf 'RELEASE = "stable"\n' > "$case_root/release/server/update-service/releases.py"
   printf 'def get_progress(*args): return None\n' > "$case_root/release/server/update-service/progress.py"
+  printf 'def snapshot(*args): return None\n' > "$case_root/release/server/update-service/diagnostics.py"
   printf 'EXTRA = True\n' > "$case_root/release/server/update-service/utility.py"
   printf 'not a runtime file\n' > "$case_root/release/server/update-service/README.txt"
   chmod 0644 "$case_root/release/.managed-release" "$case_root/release/server/update-service/"*
@@ -213,7 +214,7 @@ mkdir -p "$APP_DIR/releases" "$APP_DIR/cache" "$source_dir/server/update-service
 cp "$case_root/release/server/update-service/"*.py "$source_dir/server/update-service/"
 cp "$repository/deploy/build-artifact-cache.py" "$source_dir/deploy/build-artifact-cache.py"
 mkdir -p "$source_dir/tools/entropy-lighter-lab"
-cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,config.example.json} "$source_dir/tools/entropy-lighter-lab/"
+cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,evidence.mjs,config.example.json} "$source_dir/tools/entropy-lighter-lab/"
 mkdir -p "$source_dir/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$source_dir/tools/aero-roles/"
 printf '{"name":"source-permission-fixture"}\n' > "$source_dir/package.json"

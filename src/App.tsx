@@ -1,6 +1,6 @@
 import { Component, lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import { Activity, ArrowLeftRight, ArrowUpRight, BellRing, Check, ChevronRight, CircleAlert, ChartNoAxesCombined, FolderKanban, Gauge, Info, LayoutDashboard, LoaderCircle, LogOut, Menu, RefreshCw, Save, ScrollText, Server, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
+import { Activity, ArrowLeftRight, ArrowUpRight, BellRing, Bot, Check, ChevronRight, CircleAlert, ChartNoAxesCombined, FolderKanban, Gauge, Info, LayoutDashboard, LoaderCircle, LogOut, Menu, RefreshCw, Save, ScrollText, Server, Settings2, ShieldCheck, Wallet, X } from 'lucide-react';
 import { api, ApiError, setCsrfToken } from './api';
 import { clearCache as clearAeroMarketCache } from './aero-market-cache';
 import ProjectWorkspace from './ProjectWorkspace';
@@ -13,6 +13,12 @@ import { createOverviewDecoder, createStreamWatchdog } from './overview-feed';
 import { checkNotice, statusText } from './check-notice';
 import { groupLabels, ProjectIcon, Status } from './ProjectBadges';
 import { createTradingCache } from './trading-cache';
+import { warmTradingCache } from './trading-read';
+import { readTradingDays, readTradingPair } from './trading-preferences';
+import type { TradingState } from './trading-types';
+import { createPositionsCache } from './positions-cache';
+import { PositionsCacheContext } from './positions-cache-context';
+import type { TradingPositionsResponse } from './trading-positions-types';
 import { readTradingSection } from './trading-navigation';
 import type { Notice } from './check-notice';
 import type { NavigationQuery } from './hub-state';
@@ -26,7 +32,10 @@ const BinanceLighterCostPage = lazy(() => import('./BinanceLighterCostPage'));
 const AeroPage = lazy(() => import('./AeroPage'));
 const FeishuDigestPage = lazy(() => import('./FeishuDigestPage'));
 const ServerStatusPage = lazy(() => import('./ServerStatusPage'));
+const AgentFeedPage = lazy(() => import('./AgentFeedPage'));
 const DiagnosticPage = lazy(() => import('./DiagnosticPage'));
+const PortalAccess = lazy(() => import('./PortalAccess'));
+const BackupReadiness = lazy(() => import('./BackupReadiness'));
 class ChartBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false };
   static getDerivedStateFromError() { return { failed: true }; }
@@ -36,13 +45,13 @@ class ChartBoundary extends Component<{ children: ReactNode }, { failed: boolean
 }
 const categories: Record<Category, string> = { trading: '交易执行', monitoring: '市场监控', assets: '资产管理', other: '其他项目' };
 const adapters: Record<Adapter, string> = { aster: 'Gate CrossEx工作台', monitor: 'Market Monitor', asset: '资产账本', standard: '标准概览接口', link: '仅网页入口' };
-type Route = { view: 'overview' | 'projects' | 'project' | 'trading' | 'diagnostic' | 'research' | 'cost-lab' | 'aero' | 'feishu-digest' | 'server-status'; id: string; query?: NavigationQuery };
+type Route = { view: 'overview' | 'projects' | 'project' | 'trading' | 'diagnostic' | 'research' | 'cost-lab' | 'aero' | 'feishu-digest' | 'server-status' | 'agent-feed'; id: string; query?: NavigationQuery };
 
 function readRoute(): Route {
   const params = new URLSearchParams(location.search);
   const view = params.get('view');
   const query = Object.fromEntries(HUB_QUERY_KEYS.filter(key => params.has(key)).map(key => [key, params.get(key)]));
-  return { view: view === 'projects' || view === 'project' || view === 'trading' || view === 'diagnostic' || view === 'research' || view === 'cost-lab' || view === 'aero' || view === 'feishu-digest' || view === 'server-status' ? view : view === 'aero-market' || view === 'aero-safe' || view === 'aero-lp' ? 'aero' : 'overview', id: params.get('id') || '', ...(Object.keys(query).length && navigationQuery(query) ? { query: navigationQuery(query)! } : {}) };
+  return { view: view === 'projects' || view === 'project' || view === 'trading' || view === 'diagnostic' || view === 'research' || view === 'cost-lab' || view === 'aero' || view === 'feishu-digest' || view === 'server-status' || view === 'agent-feed' ? view : view === 'aero-market' || view === 'aero-safe' || view === 'aero-lp' ? 'aero' : 'overview', id: params.get('id') || '', ...(Object.keys(query).length && navigationQuery(query) ? { query: navigationQuery(query)! } : {}) };
 }
 function formatDate(value: string | null, full = false) {
   if (!value || !Number.isFinite(new Date(value).getTime())) return '尚无记录';
@@ -76,6 +85,7 @@ function Login({ onLogin }: { onLogin: () => void }) {
 export default function App() {
   const [authenticated, setAuthenticated] = useState<boolean | null>(null);
   const [tradingCache] = useState(createTradingCache);
+  const [positionsCache] = useState(() => createPositionsCache(signal => api<TradingPositionsResponse>('/api/trading/positions', { signal, timeoutMs: 15_000 })));
   const [route, setRoute] = useState<Route>(readRoute);
   const [diagnosticOpened, setDiagnosticOpened] = useState(false);
   useEffect(() => { if (route.view === 'diagnostic') setDiagnosticOpened(true); }, [route.view]);
@@ -110,13 +120,34 @@ export default function App() {
   }, [menuOpen]);
 
   // 退出或会话过期时一并清掉 Aero 市场的本机缓存。
-  const expire = useCallback(() => { tradingCache.clear(); void clearAeroMarketCache(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache]);
+  const expire = useCallback(() => { tradingCache.clear(); positionsCache.clear(); void clearAeroMarketCache(); requestVersion.current++; pendingLoad.current?.controller.abort(); pendingLoad.current = null; setAuthenticated(false); setOverview(null); setEditor(null); setNotice(null); setCsrfToken(''); }, [tradingCache, positionsCache]);
   useEffect(() => {
     const controller = new AbortController();
     api<{ authenticated: boolean; csrfToken?: string }>('/api/session', { signal: controller.signal }).then(s => { if (controller.signal.aborted) return; setCsrfToken(s.csrfToken || ''); setAuthenticated(s.authenticated); }).catch(e => { if (!controller.signal.aborted && e.name !== 'AbortError') { setAuthenticated(false); setError('工作台服务暂时不可用，请检查服务后刷新。'); } });
     return () => controller.abort();
   }, []);
-  const accept = useCallback((data: Overview) => { receivedAt.current = performance.now(); setOverview(data); setError(''); }, []);
+  const positionsSources = useRef<string | null>(null);
+  const accept = useCallback((data: Overview) => {
+    const sources = JSON.stringify(data.projects.filter(item => item.project.adapter === 'asset').map(item => item.project));
+    if (positionsSources.current !== null && positionsSources.current !== sources) positionsCache.invalidate();
+    positionsSources.current = sources;
+    receivedAt.current = performance.now(); setOverview(data); setError('');
+  }, [positionsCache]);
+  const tradingWarmed = useRef(false);
+  useEffect(() => {
+    if (!authenticated) { tradingWarmed.current = false; return; }
+    if (!overview || tradingWarmed.current) return;
+    // Only prefetch the user's last observation view; the default positions
+    // entry must not start arbitrage/execution reads that the user never opened.
+    const selected = readTradingSection(location.search);
+    if (!['legs', 'pnl', 'accounts'].includes(selected)) return;
+    const timer = setTimeout(() => {
+      if (document.hidden || !navigator.onLine) return;
+      tradingWarmed.current = true;
+      void warmTradingCache(tradingCache, api<TradingState>, { days: readTradingDays(location.search), pair: readTradingPair(location.search) }, expire);
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [authenticated, overview, tradingCache, expire]);
   const load = useCallback((signal?: AbortSignal, force = false) => {
     if (pendingLoad.current && !pendingLoad.current.signal.aborted && !force) return pendingLoad.current.promise;
     pendingLoad.current?.controller.abort();
@@ -174,14 +205,15 @@ export default function App() {
       }, 1000);
     };
     const visible = () => { if (document.hidden) connect(); else resume(); };
-    const offline = () => { clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
+    const offline = () => { tradingCache.markUnavailable(); positionsCache.markUnavailable(); clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
+    if (!navigator.onLine) { tradingCache.markUnavailable(); positionsCache.markUnavailable(); }
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
     // This local timer only sends requests when the stream heartbeat has expired.
     const health = window.setInterval(() => { if (navigator.onLine && !document.hidden && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
     return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearTimeout(resumeTimer); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
-  }, [authenticated, accept, load]);
+  }, [authenticated, accept, load, tradingCache, positionsCache]);
   useEffect(() => {
     if (!overview || !authenticated) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -204,11 +236,17 @@ export default function App() {
     history.pushState(null, '', `${location.pathname}${params.size ? `?${params}` : ''}`); setRoute(next); setMenuOpen(false); if (menuOpen) mobileMenuButton.current?.focus(); window.scrollTo(0, 0);
   };
   const changed = useCallback((id: string) => {
+    const asset = overview?.projects.some(item => item.project.id === id && item.project.adapter === 'asset');
+    if (asset) positionsCache.invalidate({ id, run: async signal => {
+      await api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal, timeoutMs: 10_000 });
+    } });
     if (refreshTimers.current.has(id)) return;
     refreshTimers.current.set(id, setTimeout(() => {
-      void api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal: AbortSignal.timeout(10_000) }).then(() => { if (!streamLive.current) void load(); }).catch(e => { if (e instanceof ApiError && e.status === 401) expire(); }).finally(() => refreshTimers.current.delete(id));
+      const checking = asset ? positionsCache.refresh().then(outcome => { if (outcome.status === 'unauthorized') expire(); })
+        : api(`/api/projects/${encodeURIComponent(id)}/check`, { method: 'POST', signal: AbortSignal.timeout(10_000) });
+      void checking.then(() => { if (!streamLive.current) void load(); }).catch(e => { if (e instanceof ApiError && e.status === 401) expire(); }).finally(() => refreshTimers.current.delete(id));
     }, 500));
-  }, [load, expire]);
+  }, [load, expire, overview, positionsCache]);
   const check = async (project: Project) => {
     setNotice(null);
     setChecking(project.id);
@@ -221,36 +259,38 @@ export default function App() {
     catch (e) { setError(e instanceof Error ? e.message : '退出失败，请重试'); }
   };
   if (authenticated === null) return <div className="app-loading"><LoaderCircle className="spin" /><p>正在打开工作台</p></div>;
-  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); void clearAeroMarketCache(); setError(''); setAuthenticated(true); }} /></>;
+  if (!authenticated) return <>{error ? <div className="service-error" role="alert">{error}</div> : null}<Login onLogin={() => { tradingCache.clear(); positionsCache.clear(); void clearAeroMarketCache(); setError(''); setAuthenticated(true); }} /></>;
   const serverNow = overview ? Date.parse(overview.generatedAt) + performance.now() - receivedAt.current : Date.now();
   const snapshots = overview?.projects.map(snapshot => ageSnapshot(snapshot, serverNow)) || [];
   const selected = snapshots.find(s => s.project.id === route.id);
-  const pageTitle = route.view === 'overview' ? '总览' : route.view === 'projects' ? '模块设置' : route.view === 'trading' ? '交易中心' : route.view === 'diagnostic' ? '请求诊断' : route.view === 'cost-lab' ? '对冲成本研究' : route.view === 'research' ? 'Entropy / Lighter' : route.view === 'aero' ? 'Aero' : route.view === 'feishu-digest' ? '飞书汇总' : route.view === 'server-status' ? '服务器状态' : selected?.project.name || '项目详情';
-  const section = route.view === 'project' ? selected ? groupLabels[selected.project.category] : null : route.view === 'trading' || route.view === 'aero' ? '交易' : route.view === 'research' || route.view === 'cost-lab' ? '监控' : route.view === 'projects' || route.view === 'diagnostic' || route.view === 'feishu-digest' || route.view === 'server-status' ? '系统' : null;
+  const pageTitle = route.view === 'overview' ? '总览' : route.view === 'projects' ? '模块设置' : route.view === 'trading' ? '交易中心' : route.view === 'diagnostic' ? '请求诊断' : route.view === 'cost-lab' ? '对冲成本研究' : route.view === 'research' ? 'Entropy / Lighter' : route.view === 'aero' ? 'Aero' : route.view === 'feishu-digest' ? '飞书汇总' : route.view === 'server-status' ? '服务器状态' : route.view === 'agent-feed' ? 'Agent 数据接口' : selected?.project.name || '项目详情';
+  const section = route.view === 'project' ? selected ? groupLabels[selected.project.category] : null : route.view === 'trading' || route.view === 'aero' ? '交易' : route.view === 'research' || route.view === 'cost-lab' ? '监控' : route.view === 'projects' || route.view === 'diagnostic' || route.view === 'feishu-digest' || route.view === 'server-status' || route.view === 'agent-feed' ? '系统' : null;
   const attentionCount = snapshots.filter(s => s.project.enabled && s.project.adapter !== 'link' && attentionDiagnostics(s, serverNow).length).length;
   const enabledCount = snapshots.filter(s => s.project.enabled && s.project.adapter !== 'link').length;
   const firstOf = (category: Category) => snapshots.find(s => s.project.category === category && s.project.enabled);
   const monitorEntry = firstOf('monitoring'), assetEntry = firstOf('assets');
   const projectNav = (s: Snapshot) => <button key={s.project.id} className={`nav-item project-nav ${route.view === 'project' && route.id === s.project.id ? 'active' : ''}`} aria-current={route.view === 'project' && route.id === s.project.id ? 'page' : undefined} onPointerEnter={() => setPreloadId(s.project.id)} onFocus={() => setPreloadId(s.project.id)} onClick={() => navigate({ view: 'project', id: s.project.id })}><ProjectIcon category={s.project.category} size={17} /><span>{s.project.name}</span><span className={`nav-status ${s.project.adapter === 'link' ? 'unconfigured' : s.state}`} aria-label={s.project.adapter === 'link' ? '网页入口' : statusText[s.state]} /></button>;
   const viewNav = (view: Route['view'], label: string, icon: ReactNode, extra?: ReactNode) => <button className={`nav-item ${route.view === view ? 'active' : ''}`} aria-current={route.view === view ? 'page' : undefined} onClick={() => navigate({ view, id: '' })}>{icon}<span className="nav-text">{label}</span>{extra}</button>;
-  return <div className={`app-shell ${route.view === 'project' ? 'project-shell' : ''}`}>
+  return <PositionsCacheContext.Provider value={positionsCache}><div className={`app-shell ${route.view === 'project' ? 'project-shell' : ''}`}>
     <a href="#main-content" className="skip-link">跳到主要内容</a>
     {menuOpen ? <button className="nav-backdrop" aria-label="关闭导航" onClick={() => { setMenuOpen(false); mobileMenuButton.current?.focus(); }} /> : null}
     <aside ref={sidebar} className={`sidebar ${menuOpen ? 'open' : ''}`}><Brand /><nav aria-label="主导航">{viewNav('overview', '总览', <LayoutDashboard size={17} />, attentionCount ? <span className="nav-count" aria-hidden="true">{attentionCount}</span> : null)}
       {(['trading', 'monitoring', 'assets', 'other'] as const).map(category => { const items = snapshots.filter(s => s.project.category === category); if (category !== 'trading' && category !== 'monitoring' && !items.length) return null; return <div className="nav-group" role="group" aria-label={groupLabels[category]} key={category}><div className="nav-label" aria-hidden="true">{groupLabels[category]}</div>{category === 'trading' ? <>{viewNav('trading', '交易中心', <ArrowLeftRight size={17} />)}{viewNav('aero', 'Aero', <ShieldCheck size={17} />)}</> : null}{items.map(projectNav)}{category === 'monitoring' ? <>{viewNav('research', 'Entropy / Lighter', <Activity size={17} />)}{viewNav('cost-lab', '对冲成本研究', <ChartNoAxesCombined size={17} />)}</> : null}</div>; })}
-      <div className="nav-group" role="group" aria-label="系统"><div className="nav-label" aria-hidden="true">系统</div>{viewNav('projects', '模块设置', <Settings2 size={17} />)}{viewNav('feishu-digest', '飞书汇总', <BellRing size={17} />)}{viewNav('server-status', '服务器状态', <Server size={17} />)}{viewNav('diagnostic', '请求诊断', <ScrollText size={17} />)}<UpdateStatus onExpired={expire} onOpen={() => setMenuOpen(false)} /></div></nav><div className="sidebar-bottom"><div><span className="workspace-avatar">私</span><span>个人工作台<small>数据保存在自有服务器</small></span></div><button className="icon-button" title="退出登录" aria-label="退出登录" onClick={() => void logout()}><LogOut size={17} /></button></div></aside>
-    <div className="workspace"><header className="topbar"><div className="breadcrumb"><button ref={mobileMenuButton} className="icon-button mobile-menu" aria-label="打开导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={21} /></button>{section ? <><span>{section}</span><ChevronRight size={13} /></> : null}<strong>{pageTitle}</strong></div><div className="topbar-right"><HostStatusBadge onOpen={() => navigate({ view: 'server-status', id: '' })} onExpired={expire} /><ConnectionStatus />{route.view !== 'trading' && route.view !== 'research' && route.view !== 'cost-lab' && route.view !== 'aero' && route.view !== 'feishu-digest' && route.view !== 'server-status' ? <><span className="refresh-label">总览读取于 {formatDate(overview?.generatedAt || null)}</span><button className="icon-button" aria-label="刷新总览" title="刷新总览" disabled={loading} onClick={() => void load()}><RefreshCw size={18} className={loading ? 'spin' : ''} /></button></> : null}</div></header>
-      <main id="main-content" className={`main-content ${route.view === 'project' ? 'project-content' : ''}`}>{route.view !== 'project' && route.view !== 'trading' && route.view !== 'research' && route.view !== 'cost-lab' && route.view !== 'aero' && route.view !== 'feishu-digest' && route.view !== 'server-status' ? <div className="page-heading"><div><h1>{pageTitle}</h1><p className="page-meta">{route.view === 'overview' ? <><span>{enabledCount} 个启用模块</span><span>{attentionCount ? `${attentionCount} 个需要关注` : '暂无需要处理的问题'}</span></> : route.view === 'projects' ? <span>管理内嵌模块的显示与刷新</span> : <span>本机浏览器发往工作台的请求记录</span>}<span>时间按本机时区显示</span></p></div><span className="today">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</span></div> : null}
+      <div className="nav-group" role="group" aria-label="系统"><div className="nav-label" aria-hidden="true">系统</div>{viewNav('projects', '模块设置', <Settings2 size={17} />)}{viewNav('feishu-digest', '飞书汇总', <BellRing size={17} />)}{viewNav('server-status', '服务器状态', <Server size={17} />)}{viewNav('agent-feed', 'Agent 数据接口', <Bot size={17} />)}{viewNav('diagnostic', '请求诊断', <ScrollText size={17} />)}<UpdateStatus onExpired={expire} onOpen={() => setMenuOpen(false)} /></div></nav><div className="sidebar-bottom"><div><span className="workspace-avatar">私</span><span>个人工作台<small>数据保存在自有服务器</small></span></div><button className="icon-button" title="退出登录" aria-label="退出登录" onClick={() => void logout()}><LogOut size={17} /></button></div></aside>
+    <div className="workspace"><header className="topbar"><div className="breadcrumb"><button ref={mobileMenuButton} className="icon-button mobile-menu" aria-label="打开导航" aria-expanded={menuOpen} onClick={() => setMenuOpen(true)}><Menu size={21} /></button>{section ? <><span>{section}</span><ChevronRight size={13} /></> : null}<strong>{pageTitle}</strong></div><div className="topbar-right"><HostStatusBadge onOpen={() => navigate({ view: 'server-status', id: '' })} onExpired={expire} /><ConnectionStatus />{route.view !== 'trading' && route.view !== 'research' && route.view !== 'cost-lab' && route.view !== 'aero' && route.view !== 'feishu-digest' && route.view !== 'server-status' && route.view !== 'agent-feed' ? <><span className="refresh-label">总览读取于 {formatDate(overview?.generatedAt || null)}</span><button className="icon-button" aria-label="刷新总览" title="刷新总览" disabled={loading} onClick={() => void load()}><RefreshCw size={18} className={loading ? 'spin' : ''} /></button></> : null}</div></header>
+      <main id="main-content" className={`main-content ${route.view === 'project' ? 'project-content' : ''}`}>{route.view !== 'project' && route.view !== 'trading' && route.view !== 'research' && route.view !== 'cost-lab' && route.view !== 'aero' && route.view !== 'feishu-digest' && route.view !== 'server-status' && route.view !== 'agent-feed' ? <div className="page-heading"><div><h1>{pageTitle}</h1><p className="page-meta">{route.view === 'overview' ? <><span>{enabledCount} 个启用模块</span><span>{attentionCount ? `${attentionCount} 个需要关注` : '暂无需要处理的问题'}</span></> : route.view === 'projects' ? <span>管理内嵌模块的显示与刷新</span> : <span>本机浏览器发往工作台的请求记录</span>}<span>时间按本机时区显示</span></p></div><span className="today">{new Intl.DateTimeFormat('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' }).format(new Date())}</span></div> : null}
       {error ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{error}<button onClick={() => void load()}>重试</button></div> : null}
       {diagnosticOpened || route.view === 'diagnostic' ? <section hidden={route.view !== 'diagnostic'} aria-label="请求诊断面板"><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载诊断工具…</p></div>}><DiagnosticPage active={route.view === 'diagnostic'} onExpired={expire} /></Suspense></section> : null}
-      {route.view === 'trading' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载交易模块…</p></div>}><TradingPage cache={tradingCache} onExpired={expire} navigationSearch={location.search} onProject={id => navigate({ view: 'project', id })} /></Suspense> : route.view === 'cost-lab' ? <ChartBoundary><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载成本研究…</p></div>}><BinanceLighterCostPage onExpired={expire} /></Suspense></ChartBoundary> : route.view === 'research' ? <ChartBoundary><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载研究面板…</p></div>}><EntropyLighterPage onExpired={expire} /></Suspense></ChartBoundary> : route.view === 'aero' ? <ChartBoundary key="aero"><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载 Aero…</p></div>}><AeroPage onExpired={expire} /></Suspense></ChartBoundary> : route.view === 'feishu-digest' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载飞书汇总…</p></div>}><FeishuDigestPage onExpired={expire} /></Suspense> : route.view === 'server-status' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载服务器状态…</p></div>}><ServerStatusPage onExpired={expire} /></Suspense> : route.view === 'diagnostic' ? null : !overview ? <div className="empty-state loading-state"><LoaderCircle className="spin" /><h2>正在读取项目</h2><p>正在读取内嵌模块的运行状态。</p></div> : route.view === 'overview' ? <OverviewPage now={serverNow} onPreload={setPreloadId} snapshots={snapshots} onProject={id => navigate({ view: 'project', id })} onEdit={setEditor} onManage={() => navigate({ view: 'projects', id: '' })} /> : route.view === 'projects' ? <ProjectsPage now={serverNow} snapshots={snapshots} onEdit={setEditor} onCheck={check} checking={checking} /> : selected ? null : <div className="empty-state"><FolderKanban /><h2>没有找到这个项目</h2><p>项目可能已被移除，请回到模块设置查看。</p><button className="button secondary" onClick={() => navigate({ view: 'projects', id: '' })}>查看项目</button></div>}
+      {route.view === 'trading' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载交易模块…</p></div>}><TradingPage cache={tradingCache} onExpired={expire} navigationSearch={location.search} onProject={id => navigate({ view: 'project', id })} /></Suspense> : route.view === 'cost-lab' ? <ChartBoundary><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载成本研究…</p></div>}><BinanceLighterCostPage onExpired={expire} /></Suspense></ChartBoundary> : route.view === 'research' ? <ChartBoundary><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载研究面板…</p></div>}><EntropyLighterPage onExpired={expire} /></Suspense></ChartBoundary> : route.view === 'aero' ? <ChartBoundary key="aero"><Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载 Aero…</p></div>}><AeroPage onExpired={expire} /></Suspense></ChartBoundary> : route.view === 'feishu-digest' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载飞书汇总…</p></div>}><FeishuDigestPage onExpired={expire} /></Suspense> : route.view === 'server-status' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载服务器状态…</p></div>}><ServerStatusPage onExpired={expire} /></Suspense> : route.view === 'agent-feed' ? <Suspense fallback={<div className="empty-state loading-state" role="status"><LoaderCircle className="spin" /><p>正在加载数据接口…</p></div>}><AgentFeedPage onExpired={expire} /></Suspense> : route.view === 'diagnostic' ? null : !overview ? <div className="empty-state loading-state"><LoaderCircle className="spin" /><h2>正在读取项目</h2><p>正在读取内嵌模块的运行状态。</p></div> : route.view === 'overview' ? <OverviewPage now={serverNow} onPreload={setPreloadId} snapshots={snapshots} onProject={id => navigate({ view: 'project', id })} onEdit={setEditor} onManage={() => navigate({ view: 'projects', id: '' })} /> : route.view === 'projects' ? <ProjectsPage now={serverNow} snapshots={snapshots} onEdit={setEditor} onCheck={check} checking={checking} /> : selected ? null : <div className="empty-state"><FolderKanban /><h2>没有找到这个项目</h2><p>项目可能已被移除，请回到模块设置查看。</p><button className="button secondary" onClick={() => navigate({ view: 'projects', id: '' })}>查看项目</button></div>}
       {overview ? <ProjectWorkspace snapshots={snapshots} now={serverNow} priorityId={preloadId} projects={overview.projects.map(s => s.project)} activeId={route.view === 'project' ? route.id : null} query={route.query} onEdit={setEditor} onExpired={expire} onChanged={changed} onNavigate={(id, query) => { const target = overview.projects.find(s => s.project.id === id && s.project.enabled && s.project.accessMode === 'proxy'); if (target) navigate({ view: 'project', id, query }); }} onOpenTrading={() => navigate({ view: 'trading', id: '' })} /> : null}
+      {route.view === 'projects' ? <Suspense fallback={<p role="status">正在读取模块授权…</p>}><PortalAccess onExpired={expire} /></Suspense> : null}
+      {route.view === 'server-status' ? <Suspense fallback={<p role="status">正在读取备份台账…</p>}><BackupReadiness onExpired={expire} /></Suspense> : null}
       </main>
       {!menuOpen ? <nav className="mobile-tabbar" aria-label="快捷导航"><button className={route.view === 'overview' ? 'active' : ''} onClick={() => navigate({ view: 'overview', id: '' })}><LayoutDashboard size={19} />总览</button><button className={route.view === 'trading' ? 'active' : ''} onClick={() => navigate({ view: 'trading', id: '' })}><ArrowLeftRight size={19} />交易</button>{monitorEntry ? <button className={route.view === 'project' && route.id === monitorEntry.project.id ? 'active' : ''} onClick={() => navigate({ view: 'project', id: monitorEntry.project.id })}><Activity size={19} />监控</button> : null}{assetEntry ? <button className={route.view === 'project' && route.id === assetEntry.project.id ? 'active' : ''} onClick={() => navigate({ view: 'project', id: assetEntry.project.id })}><Wallet size={19} />资产</button> : null}<button aria-label="更多导航" onClick={() => setMenuOpen(true)}><Menu size={19} />更多</button></nav> : null}
     </div>
-    {editor ? <ProjectEditor key={editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { setEditor(null); setNotice({ title: message, tone: 'success' }); await load(); }} onExpired={expire} /> : null}
+    {editor ? <ProjectEditor key={editor.id} project={editor} onClose={() => setEditor(null)} onSaved={async message => { positionsCache.invalidate(); setEditor(null); setNotice({ title: message, tone: 'success' }); await load(); }} onExpired={expire} /> : null}
     {notice ? <div className={`toast ${notice.tone}`} role={notice.tone === 'warning' || notice.tone === 'error' ? 'alert' : 'status'}>{notice.tone === 'success' ? <Check size={18} /> : notice.tone === 'info' ? <Info size={18} /> : <CircleAlert size={18} />}<div className="toast-content"><strong>{notice.title}</strong>{notice.detail ? <p>{notice.detail}</p> : null}</div><button aria-label="关闭提示" onClick={() => setNotice(null)}><X size={16} /></button></div> : null}
-  </div>;
+  </div></PositionsCacheContext.Provider>;
 }
 
 function OverviewPage({ snapshots, now, onProject, onEdit, onManage, onPreload }: { now: number; onPreload: (id: string) => void; snapshots: Snapshot[]; onProject: (id: string) => void; onEdit: (p: Project) => void; onManage: () => void }) {

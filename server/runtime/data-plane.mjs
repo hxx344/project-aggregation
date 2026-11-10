@@ -15,6 +15,7 @@ import { createAnthropicReduction } from '../trading-anthropic-reduction.mjs';
 import { createExecutionPositionWatch } from '../trading-execution-position-watch.mjs';
 import { createAnthropicHistory } from '../trading-anthropic-history.mjs';
 import { createFillAttribution } from '../trading-fill-attribution.mjs';
+import { createExecutionEvidence } from '../trading-execution-evidence.mjs';
 import { ExecutionError } from '../trading-execution-plan.mjs';
 import { normalizeTradingPair } from '../trading-markets.mjs';
 import { UpdateError } from '../updates.mjs';
@@ -32,7 +33,12 @@ import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
 import { createEventLoopLag } from './event-loop-lag.mjs';
+import { createRuntimeFeed } from '../agent-feed/runtime-feed.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
+import { createModuleUpdateGuard } from '../modules/updates.mjs';
+import { nativeUpdateImpact, publicRuntimeImpact } from '../update-impact.mjs';
+import { createBackupReadiness } from '../recovery/readiness.mjs';
+import { immediate } from '../control/schema.mjs';
 
 const respond = errorResponder([HttpError, TradingError, ExecutionError, UpdateError, RuntimeError]);
 // The API reports every 15 s; a sample needs a report at most this old (design doc 5.8).
@@ -65,6 +71,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   warmup = resolveWarmup(), baselineIntervalMs = BASELINE_INTERVAL_MS, baselineNow = Date.now, capabilitiesRequest = requestJson }) {
   validateBaselineInterval(baselineIntervalMs);
   const { stmt, sessions, projects } = control;
+  const backupReadiness = createBackupReadiness({ getSetting: key => control.getSetting(key), setSetting: (key, value) => control.setSetting(key, value), transaction: action => immediate(db, action) });
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
   const research = createEntropyLighterResearch({ dataDir, enabledByDefault: researchEnabledByDefault, log });
   const costResearch = createBinanceLighterCost({ dataDir, log });
@@ -72,7 +79,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const aeroMarket = createAeroMarket({ dataDir, enabledByDefault: aeroMarketEnabledByDefault, log });
   // Aero 实盘：bot 经 Safe 的 Roles 模块执行，受维护与隔离恢复闸门约束。
   const aeroSafe = createAeroSafe({ dataDir, encrypt, decrypt, readMaintenance: () => control.getSetting('updates-maintenance') === '1',
-    readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', readPrices: () => aeroMarket.tokenPrices(), log });
+    readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal', readPrices: () => aeroMarket.tokenPrices(), notificationChannel: () => feishuDigest, log });
   const trading = createTrading({ db, stmt, encrypt, decrypt, clientFactory: tradingClientFactory, intervalMs: tradingRefreshIntervalMs, now: tradingNow, taskTimeoutMs: tradingTaskTimeoutMs, logger: log });
   const writerDatabase = path.join(dataDir, 'execution-control.sqlite');
   // A legacy external-module launch must not turn off protection for data that
@@ -81,6 +88,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const execution = createTradingExecution({ db, stmt, encrypt, decrypt, clientFactory: executionClientFactory, intervalMs: executionIntervalMs, now: executionNow, accountWriter: sharedAccountWriter, isSessionActive: sessions.isActive });
   const anthropicHistory = createAnthropicHistory({ execution, now: executionNow });
   const attributeFills = createFillAttribution({ db, stmt });
+  const impactGuard = embeddedModules ? createModuleUpdateGuard({ request: capabilitiesRequest }) : null;
   const executionEntries = createExecutionEntries({ db, log, readMaintenance: () => control.getSetting('updates-maintenance') === '1', refuse: () => { throw new UpdateError(409, EXECUTION_MAINTENANCE); } });
   // Automatic rules create jobs through the same maintenance entry as a manual start.
   const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
@@ -145,6 +153,13 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   // Background reads keep Asset's per-scope fills warm, so opening a chart serves fresh trades at once.
   const assetFillsByMarket = Object.fromEntries(Object.keys(FILL_MARKETS).map(market => [market, createAssetFills({ market, listTargets: assetTargets, request: assetFillsRequest,
     cacheMs: assetFillsCacheMs, timeoutMs: assetFillsTimeoutMs, now: assetFillsNow, backgroundIntervalMs: assetFillsBackgroundMs })]));
+  const executionEvidence = createExecutionEvidence({ db, stmt, now: executionNow,
+    readOperations: (jobId, localIds) => sharedAccountWriter?.executionEvidence(jobId, localIds) ?? null, readFills: () => {
+    const data = assetFillsByMarket.anthropic.peek(), native = anthropicHistory.peek();
+    data.sources.push(native.source);
+    data.pending = native.pending;
+    return attributeFills(data, native.source, execution.historyConnections());
+  } });
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
     positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state(),
     anthropic: { quotes: () => execution.quotes(), positions: () => anthropicWatch.state() } }) });
@@ -256,6 +271,28 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     const reply = (status, body) => ({ status, body });
     // The API checked the session; it may have ended while the request waited for admission.
     if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+    if (pathname === '/api/system/backup-readiness') {
+      if (url.search) throw new HttpError(400, '备份台账不接受查询参数');
+      if (method === 'GET') return reply(200, backupReadiness.snapshot());
+      if (method === 'POST') {
+        const input = await bodyOf(); gone();
+        if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+        return reply(200, backupReadiness.record(input));
+      }
+      throw new HttpError(405, '备份台账不支持此操作');
+    }
+    if (pathname === '/api/system/update-impact') {
+      if (method !== 'GET' || url.search) throw new HttpError(400, '更新影响仅支持无参数只读查询');
+      gone();
+      const modules = impactGuard ? await impactGuard.readImpact({ signal }) : [];
+      gone();
+      if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+      const automation = aeroSafe.state(), observedAt = new Date().toISOString();
+      // Mirror only the displayed local activity. It never authorizes stopping.
+      const busy = automation.job?.status === 'running';
+      modules.push(nativeUpdateImpact(db), { moduleId: 'aero', observedAt, busy, reasonCode: busy ? 'aero-task-active' : 'aero-idle', activeRequests: null });
+      return reply(200, publicRuntimeImpact({ schemaVersion: 1, observedAt, modules }));
+    }
     if (pathname === '/api/research/binance-lighter-cost' || pathname.startsWith('/api/research/binance-lighter-cost/')) {
       if (url.search) throw new HttpError(400, '成本研究接口不接受查询参数');
       const base = '/api/research/binance-lighter-cost';
@@ -281,6 +318,17 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       return reply(200, await costResearch[action](authorize));
     }
     if (pathname === '/api/research/entropy-lighter' || pathname.startsWith('/api/research/entropy-lighter/')) {
+      if (pathname === '/api/research/entropy-lighter/evidence') {
+        if (method !== 'GET') throw new HttpError(405, '研究证据仅支持只读导出');
+        const keys = [...url.searchParams.keys()];
+        if (keys.length !== 4 || new Set(keys).size !== 4 || keys.some(key => !['session', 'symbol', 'from', 'to'].includes(key))) throw new HttpError(400, '请提供会话、标的和起止时间');
+        const from = url.searchParams.get('from'), to = url.searchParams.get('to');
+        if (![from, to].every(value => /^\d{1,16}$/.test(value) && Number.isSafeInteger(Number(value)))) throw new HttpError(400, '起止时间必须为毫秒整数');
+        const data = await research.exportEvidence({ session: url.searchParams.get('session'), symbol: url.searchParams.get('symbol'), from: Number(from), to: Number(to) });
+        gone();
+        if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+        return reply(200, data);
+      }
       if (url.search) throw new HttpError(400, '研究接口不接受查询参数');
       if (pathname === '/api/research/entropy-lighter' && method === 'GET') return reply(200, research.state());
       if (pathname === '/api/research/entropy-lighter/report' && method === 'GET') return reply(200, { report: research.state().report });
@@ -347,7 +395,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (pathname === '/api/automation/aero-safe' && method === 'GET') return reply(200, aeroSafe.state());
       const routes = { 'PUT /config': 'save', 'PUT /wallet': 'setKey', 'POST /wallet/clear': 'clearKey', 'POST /refresh': 'refresh', 'POST /preview': 'preview', 'POST /execute': 'execute', 'PUT /auto': 'setAuto', 'PUT /policy': 'setPolicy', 'POST /auto/discard': 'discardAuto',
         'POST /changes/pool': 'addPoolChange', 'POST /changes/allowances': 'setAllowanceChanges', 'POST /changes/remove': 'removePoolChange',
-        'POST /changes/batch': 'buildChangeBatch', 'POST /changes/apply': 'applyChangeBatch', 'POST /changes/clear': 'clearChanges' };
+        'POST /changes/batch': 'buildChangeBatch', 'POST /changes/apply': 'applyChangeBatch', 'POST /changes/clear': 'clearChanges',
+        'POST /changes/review': 'reviewBatch', 'PUT /notifications': 'setNotifications' };
       const action = routes[`${method} ${pathname.slice('/api/automation/aero-safe'.length)}`];
       if (!action) throw new HttpError(404, 'Aero 实盘接口不存在');
       const body = await bodyOf();
@@ -360,6 +409,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (action === 'execute') { only('action', 'params'); return reply(200, await aeroSafe.execute(body.action, body.params, authorize, { deadline })); }
       if (action === 'setAuto') { only('auto'); return reply(200, await aeroSafe.setAuto(body.auto, authorize, { deadline })); }
       if (action === 'setPolicy') { only('policy'); return reply(200, await aeroSafe.setPolicy(body.policy, authorize, { deadline })); }
+      if (action === 'setNotifications') { only('interrupted', 'needs_review', 'recovered'); return reply(200, await aeroSafe.setNotifications(body, authorize, { deadline })); }
+      if (action === 'reviewBatch') { only('id', 'blockNumber', 'transactionHash'); return reply(200, await aeroSafe.reviewBatch(body, authorize, { deadline })); }
       if (action === 'addPoolChange') { only('pool', 'allowances'); return reply(200, await aeroSafe.addPoolChange(body, authorize, { deadline })); }
       if (action === 'setAllowanceChanges') { only('allowances'); return reply(200, await aeroSafe.setAllowanceChanges(body.allowances, authorize, { deadline })); }
       if (action === 'removePoolChange') { only('pool'); return reply(200, await aeroSafe.removePoolChange(body, authorize, { deadline })); }
@@ -373,7 +424,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         : pathname === '/api/automation/feishu-digest/channel' && method === 'PUT' ? 'setChannel'
           : pathname === '/api/automation/feishu-digest/channel/clear' && method === 'POST' ? 'clearChannel'
             : pathname === '/api/automation/feishu-digest/preview' && method === 'POST' ? 'preview'
-              : pathname === '/api/automation/feishu-digest/send' && method === 'POST' ? 'send' : null;
+              : pathname === '/api/automation/feishu-digest/send' && method === 'POST' ? 'send'
+                : pathname === '/api/automation/feishu-digest/reviews' && method === 'POST' ? 'reviewDelivery' : null;
       if (!action) throw new HttpError(404, '汇总接口不存在');
       const body = await bodyOf();
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
@@ -383,6 +435,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         return reply(200, await feishuDigest[action](config, { fresh }));
       }
       if (action === 'setChannel') return reply(200, feishuDigest.setChannel(body));
+      if (action === 'reviewDelivery') return reply(200, feishuDigest.reviewDelivery(body));
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await feishuDigest[action]());
     }
@@ -420,7 +473,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     if (pathname === '/api/trading/positions') {
       if (method !== 'GET') throw new HttpError(405, '仓位接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '仓位接口不接受查询参数');
-      const data = await assetPositions.state();
+      const data = await assetPositions.state({ staleWhileRevalidate: true });
       if (!sessions.isActive(sessionId)) throw new HttpError(401, '请先登录工作台');
       return reply(200, data);
     }
@@ -479,6 +532,16 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (account && method === 'DELETE') return reply(200, await entered(body => execution.disconnect(account[1], body, sessionId), false));
       if (pathname === '/api/trading/execution/preview' && method === 'POST') return reply(200, await entered(body => execution.preview(body, sessionId, { signal })));
       if (pathname === '/api/trading/execution/jobs' && method === 'POST') return reply(202, await entered(body => execution.start(body, sessionId)));
+      const evidenceJob = pathname.match(/^\/api\/trading\/execution\/jobs\/([0-9a-f-]{36})\/evidence$/);
+      if (evidenceJob) {
+        if (method !== 'GET') throw new HttpError(405, '执行证据仅支持只读导出');
+        if (url.search) throw new HttpError(400, '执行证据不接受查询参数');
+        const data = await executionEvidence(evidenceJob[1]);
+        gone();
+        if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+        if (!data) throw new HttpError(404, '执行任务不存在或历史已清理');
+        return reply(200, data);
+      }
       if (pathname === '/api/trading/execution/anthropic-reduction/test') {
         if (url.search) throw new HttpError(400, '自动减仓接口不接受查询参数');
         if (method !== 'POST') throw new HttpError(405, '自动减仓测试接口不支持此操作');
@@ -511,7 +574,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     const project = pathname.match(/^\/api\/projects\/([a-zA-Z0-9_-]+)\/(check|sync)$/);
     if (project && method === 'POST') {
       const id = project[1]; const row = rowFor(id);
-      if (project[2] === 'check') return reply(200, { snapshot: await check(id) });
+      if (project[2] === 'check') {
+        // Asset account edits notify the Hub through this check without changing its project revision.
+        assetPositions.invalidate(id);
+        return reply(200, { snapshot: await check(id) });
+      }
       const value = publicProject(row);
       if (value.adapter !== 'asset' || !value.enabled || !value.autoSync) throw new HttpError(400, '请先启用资产后台同步');
       void assetSync.run(id).catch(() => {}); return reply(202, { sync: assetSync.getStatus(id) });
@@ -548,10 +615,12 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   // All collectors, WS feeds and research share this process's single thread.
   const eventLoop = createEventLoopLag(); eventLoop.start();
+  // The agent feed's datasets from this process's memory (docs/agent-feed.md): no request is started for it.
+  const agentFeed = createRuntimeFeed({ readOverview: overview, readEventLoop: () => eventLoop.read(), readAero: () => aeroMarket.state(), log });
 
   function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); executionAuto.stop(); anthropicReduction.stop(); anthropicHistory.stop(); }
   return {
-    trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle,
+    trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle, agentFeed,
     get baseline() { return baseline; },
     subscribeOverview(subscriber) { subscribers.add(subscriber); return () => subscribers.delete(subscriber); },
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.

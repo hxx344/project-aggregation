@@ -1,3 +1,4 @@
+import type { CycleEvidence } from '../server/cycle-evidence.mjs';
 export type PositionScopeStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';
 
 export interface AssetPosition {
@@ -25,6 +26,7 @@ export interface AssetPosition {
 
 /** Signed cash flows in `currency`; `net` = realizedPnl + fees + funding and is null when any part is unknown. */
 export interface PositionCycle {
+  evidence?: CycleEvidence;
   status: 'loading' | 'complete' | 'partial' | 'unavailable';
   since: string | null;
   closedQuantity: string | null;

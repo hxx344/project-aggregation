@@ -106,3 +106,18 @@ test('the shared exchange transport invalidates only the Asset build, including 
     assert.equal(f.calls().length, before + 1, 'unchanged inputs reuse the successful build');
   }
 });
+
+test('cycle evidence invalidates Monitor and Asset without rebuilding unrelated modules', t => {
+  const f = fixture(t);
+  assert.equal(f.run().status, 0);
+  mkdirSync(path.join(f.root, 'server'), { recursive: true });
+  for (const filename of ['cycle-evidence.mjs', 'cycle-evidence.d.mts']) {
+    const before = f.calls().length;
+    writeFileSync(path.join(f.root, 'server', filename), 'changed cycle evidence input');
+    const result = f.run();
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(f.calls().slice(before), ['monitor', 'asset']);
+    assert.equal(f.run().status, 0);
+    assert.equal(f.calls().length, before + 2);
+  }
+});

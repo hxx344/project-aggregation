@@ -24,6 +24,10 @@ import { updateSettings } from '../control/update-state.mjs';
 import { clientAddress } from '../slot-protocol.mjs';
 import { HttpError, send, readJson, readJsonBody, errorResponder } from '../http-common.mjs';
 import { createHostStatus } from '../host-status.mjs';
+import { createAgentTokens } from '../agent-feed/tokens.mjs';
+import { createAgentFeed } from '../agent-feed/feed.mjs';
+import { AGENT_PREFIX, MANAGE_PATH, createAgentFeedRoutes } from '../agent-feed/http.mjs';
+import { publicRuntimeImpact } from '../update-impact.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const token = () => randomBytes(32).toString('base64url');
@@ -112,6 +116,8 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
   });
   let updates = candidate ? null : coordinator();
   const hostStatus = createHostStatus({ dataDir });
+  // Read-only tokens for other agents (docs/agent-feed.md): a token reads /api/agent/v1 and nothing else.
+  const agentRoutes = createAgentFeedRoutes({ tokens: createAgentTokens({ getSetting, setSetting }), feed: createAgentFeed({ hostStatus, supervisor, runtime, log }), log, clientAddress });
   // Supervisor state joined with the trading maintenance gate; no pids, paths or secrets.
   async function moduleStatus() {
     const status = await supervisor.status();
@@ -273,6 +279,11 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       const ready = !draining && (await supervisor.status().catch(() => null))?.ready === true;
       send(res, ready ? 200 : 503, { ready }); return;
     }
+    // Answered before the session is looked at: the cookie grants nothing here, and the token nothing elsewhere.
+    if (pathname === AGENT_PREFIX || pathname.startsWith(`${AGENT_PREFIX}/`)) {
+      if (candidate) throw new HttpError(503, '候选实例尚未接管服务');
+      await agentRoutes.agent(req, res, url); return;
+    }
     const current = session(req);
     if (pathname === '/api/session' && req.method === 'GET') { send(res, 200, current ? { authenticated: true, csrfToken: current.csrf } : { authenticated: false }); return; }
     if (candidate) throw new HttpError(503, '候选实例尚未接管服务');
@@ -333,6 +344,26 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
     }
     if (!current) throw new HttpError(401, '请先登录工作台');
     if (!['GET', 'HEAD'].includes(req.method)) { sameOrigin(req); if (req.headers['x-csrf-token'] !== current.csrf) throw new HttpError(403, '请求校验失败，请刷新页面后重试'); }
+    if (pathname === MANAGE_PATH || pathname.startsWith(`${MANAGE_PATH}/`)) {
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台管理数据接口令牌');
+      if (req.headers.origin) sameOrigin(req);
+      await agentRoutes.manage(req, res, url); return;
+    }
+    if (pathname === '/api/system/backup-readiness') {
+      if (!['GET', 'POST'].includes(req.method) || url.search) throw new HttpError(400, '备份台账请求无效');
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台核对备份台账');
+      if (req.headers.origin) sameOrigin(req);
+      await forward(req, res, url, current); return;
+    }
+    if (pathname === '/api/portal/grants' || pathname.startsWith('/api/portal/grants/')) {
+      if (url.search) throw new HttpError(400, '模块授权接口不接受查询参数');
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台管理模块授权');
+      if (req.headers.origin) sameOrigin(req);
+      if (pathname === '/api/portal/grants' && req.method === 'GET') { send(res, 200, portal.listAccess(current.id)); return; }
+      const revoke = /^\/api\/portal\/grants\/([a-f0-9]{64})$/.exec(pathname);
+      if (revoke && req.method === 'DELETE') { send(res, 200, portal.revokeAccess(current.id, revoke[1])); return; }
+      throw new HttpError(405, '模块授权接口不支持此操作');
+    }
     if (pathname === '/api/system/architecture' || pathname === '/api/system/metrics' || pathname === '/api/system/accounts' || pathname === '/api/system/recovery' || pathname === '/api/system/modules' || pathname === '/api/system/host' || pathname === '/api/system/event-loop') {
       if (req.method !== 'GET') throw new HttpError(405, '基线接口仅支持只读查询');
       if (url.search) throw new HttpError(400, '基线接口不接受查询参数');
@@ -361,7 +392,41 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       return;
     }
     if (pathname === '/api/system/updates' || pathname.startsWith('/api/system/updates/')) {
+      if (pathname === '/api/system/updates/impact') {
+        if (req.method !== 'GET') throw new HttpError(405, '更新影响仅支持只读查询');
+        if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台核对更新影响');
+        if (req.headers.origin) sameOrigin(req);
+        const keys = [...url.searchParams.keys()];
+        if (keys.length !== 3 || new Set(keys).size !== 3 || keys.some(key => !['planId', 'deployMode', 'phase'].includes(key))) throw new HttpError(400, '更新影响参数无效');
+        const args = ['planId', 'deployMode', 'phase'].map(key => url.searchParams.get(key));
+        const plan = await updates.inspectPlan(...args);
+        let evidence = null;
+        if (plan.scope === 'full' && plan.phase === 'activate') {
+          const controller = new AbortController(), abort = () => controller.abort();
+          const timer = setTimeout(abort, 6500); timer.unref?.(); res.once('close', abort);
+          try {
+            const result = await runtime.forward({ method: 'GET', target: '/api/system/update-impact', sessionId: current.id,
+              deadline: Date.now() + 6000, signal: controller.signal, body: [] });
+            if (result.status === 200) evidence = publicRuntimeImpact(result.body);
+          } catch { /* Unavailable evidence is displayed as unknown, never as idle. */ }
+          finally { clearTimeout(timer); res.removeListener('close', abort); }
+        }
+        const latest = await updates.inspectPlan(...args);
+        if (JSON.stringify(latest) !== JSON.stringify(plan)) throw new HttpError(409, '更新计划在读取期间变化，请重新核对');
+        if (!sessions.isActive(current.id)) throw new HttpError(401, '登录已失效，请重新登录');
+        send(res, 200, { schemaVersion: 1, ...plan, observedAt: new Date().toISOString(), evidence,
+          effect: plan.phase === 'prepare' ? 'prepare-only' : plan.scope === 'api' ? 'api-reconnect' : 'module-restart' }); return;
+      }
       if (url.search) throw new HttpError(400, '更新接口不接受查询参数');
+      const diagnosticJob = /^\/api\/system\/updates\/jobs\/([a-f0-9]{32})\/diagnostic$/.exec(pathname);
+      if (diagnosticJob) {
+        if (req.method !== 'GET') throw new HttpError(405, '更新诊断仅支持只读导出');
+        if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台导出更新诊断');
+        if (req.headers.origin) sameOrigin(req);
+        const data = await updates.diagnostic(diagnosticJob[1]);
+        if (!sessions.isActive(current.id)) throw new HttpError(401, '登录已失效，请重新登录');
+        send(res, 200, data); return;
+      }
       if (pathname === '/api/system/updates' && req.method === 'GET') { send(res, 200, await updates.status()); return; }
       if (pathname === '/api/system/updates/events' && req.method === 'GET') {
         if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台订阅状态');

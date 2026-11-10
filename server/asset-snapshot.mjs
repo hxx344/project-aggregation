@@ -17,12 +17,13 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
     for (const [id, entry] of entries) if (!selected.some(target => target.project.id === id && target.revision === entry.revision && usable(target))) invalidate(id);
     return selected;
   }
-  function view(target, entry) {
+  function view(target, entry, staleWhileRevalidate = false) {
     const failed = !!entry?.error;
+    const refreshing = staleWhileRevalidate && !!entry?.pending;
     return { projectId: target.project.id, name: target.project.name,
       status: !usable(target) ? 'unconfigured' : failed ? entry.data ? 'stale' : 'unavailable' : entry?.data ? 'ready' : 'unavailable',
-      error: !usable(target) ? '请在项目管理中保存 Asset 服务地址和登录密码' : entry?.error ?? (entry?.data ? null : 'Asset 来源已更改，请重新读取'),
-      checkedAt: entry?.checkedAt ?? null, data: age(entry?.data ?? null, now(), failed),
+      error: !usable(target) ? '请在项目管理中保存 Asset 服务地址和登录密码' : entry?.error ?? (entry?.data ? null : refreshing ? '正在首次读取 Asset 来源，请稍后刷新' : 'Asset 来源已更改，请重新读取'),
+      checkedAt: entry?.checkedAt ?? null, data: age(entry?.data ?? null, now(), failed, { refreshing }),
     };
   }
   async function read(target) {
@@ -52,15 +53,22 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
     })();
     return entry.pending;
   }
-  async function state() {
+  async function state({ staleWhileRevalidate = false } = {}) {
     if (closed) return { generatedAt: new Date(now()).toISOString(), sources: [] };
     // The project store caps this list at 30. Asset serves cached snapshots, so
     // independent sources can be read together within one request deadline.
-    await Promise.all(reconcile().map(read));
+    const selected = reconcile();
+    // UI reads can keep showing a current-revision snapshot while each source
+    // refreshes. A newly added source must not hold up already available ones.
+    // With no successful snapshot, retain the bounded first-read behavior.
+    const cached = staleWhileRevalidate && selected.some(target => entries.get(target.project.id)?.data);
+    const pending = Promise.all(selected.map(read));
+    if (cached) void pending.catch(() => {});
+    else await pending;
     if (closed) return { generatedAt: new Date(now()).toISOString(), sources: [] };
     // A removed or edited project must never survive a request that started before the edit.
     const current = reconcile();
-    return { generatedAt: new Date(now()).toISOString(), sources: current.map(target => view(target, entries.get(target.project.id))) };
+    return { generatedAt: new Date(now()).toISOString(), sources: current.map(target => view(target, entries.get(target.project.id), staleWhileRevalidate)) };
   }
   // Background reads stop once no page has asked for backgroundIdleMs, so unused sources stop polling exchanges.
   const recentlyRead = () => backgroundIdleMs === Infinity || foregroundAt !== null && now() - foregroundAt < backgroundIdleMs;
@@ -69,7 +77,15 @@ export function createAssetSnapshot({ listTargets, request = requestJson, now = 
     timer = setInterval(() => { if (recentlyRead()) background ??= state().catch(() => {}).finally(() => { background = null; }); }, backgroundIntervalMs);
     timer.unref?.();
   }
-  return { state: () => { foregroundAt = now(); return state(); }, invalidate, async close() {
+  // Evidence exports inspect already observed data without starting reads or
+  // extending background polling. Never return a previous credential revision.
+  function peek() {
+    return { generatedAt: new Date(now()).toISOString(), sources: closed ? [] : targets().map(target => {
+      const entry = entries.get(target.project.id);
+      return view(target, usable(target) && entry?.revision === target.revision ? entry : undefined);
+    }) };
+  }
+  return { state: options => { foregroundAt = now(); return state(options); }, peek, invalidate, async close() {
     closed = true; clearInterval(timer);
     const pending = [...entries.values()].map(entry => entry.pending);
     for (const id of entries.keys()) invalidate(id);

@@ -400,6 +400,87 @@ class ScopeContractTests(unittest.TestCase):
 
 
 class CoordinatorTests(RootFixture):
+    def test_failed_job_diagnostic_keeps_its_frozen_versions_and_excludes_logs(self):
+        checked = self.check()
+        self.coordinator.apply(checked['planId'])
+        job_id = self.coordinator.load()['job']['id']
+        self.installer_hook = lambda key: 1
+        observation = {'observedAt': updater.iso(self.clock), 'units': [{'unit': 'project-aggregation.service', 'activeState': 'active', 'subState': 'running', 'Environment': 'private-unit-secret'}]}
+        with patch.object(updater, 'observe_units', return_value=observation):
+            self.coordinator.run()
+        value = self.coordinator.diagnostic(job_id)
+        self.assertEqual(value['job']['status'], 'failed')
+        self.assertEqual(value['versions'][0]['fromCommit'], OLD)
+        self.assertEqual(value['versions'][0]['targetCommit'], NEW)
+        self.assertEqual(value['observation']['units'][0]['activeState'], 'active')
+        self.assertEqual(value['health']['status'], 'unknown')
+        self.assertEqual(value['rollback']['status'], 'unknown')
+        self.assertNotIn('PRIVATE_DEPLOYMENT_CREDENTIAL', json.dumps(value))
+        self.assertNotIn('private-unit-secret', json.dumps(value))
+        state = self.coordinator.load()
+        state['modules'] = []
+        state['job'] = {**state['job'], 'id': 'c' * 32}
+        updater.private_directory(self.coordinator.jobs / state['job']['id'])
+        self.coordinator.save(state)
+        self.assertEqual(self.coordinator.diagnostic(job_id), value, 'later jobs must not rewrite the prior evidence')
+
+    def test_current_failed_job_without_archived_diagnostic_marks_missing_facts(self):
+        checked = self.check()
+        self.coordinator.apply(checked['planId'])
+        state = self.coordinator.load()
+        job_id = state['job']['id']
+        state['job'].update(status='interrupted', finishedAt=updater.iso(self.clock))
+        self.coordinator.save(state)
+        (self.coordinator.jobs / job_id / 'diagnostic.json').unlink()
+        value = self.coordinator.diagnostic(job_id)
+        self.assertEqual(value['versions'], [])
+        self.assertIn('version-evidence-incomplete', value['missing'])
+        self.assertIn('unit-states-not-recorded', value['missing'])
+        with self.assertRaises(updater.UpdateError) as error:
+            self.coordinator.diagnostic('e' * 32)
+        self.assertEqual(error.exception.status, 404)
+        with self.assertRaises(updater.UpdateError):
+            self.coordinator.diagnostic('../state')
+
+    def test_diagnostic_write_failure_does_not_change_update_outcome(self):
+        checked = self.check()
+        original = updater.write_json
+        def failing(path, data):
+            if path.name == 'diagnostic.json':
+                raise OSError('controlled evidence write failure')
+            return original(path, data)
+        self.installer_hook = lambda key: 1
+        with patch.object(updater, 'write_json', side_effect=failing), patch.object(updater, 'observe_units', return_value={'units': []}):
+            accepted = self.coordinator.apply(checked['planId'])
+            self.coordinator.run()
+        state = self.coordinator.load()
+        self.assertEqual(state['job']['id'], accepted['job']['id'])
+        self.assertEqual(state['job']['status'], 'failed')
+        self.assertEqual(len(self.executed), 1)
+        self.assertIn('version-evidence-incomplete', self.coordinator.diagnostic(state['job']['id'])['missing'])
+
+    def test_malformed_diagnostic_auxiliary_fields_degrade_without_losing_current_job(self):
+        checked = self.check()
+        self.coordinator.apply(checked['planId'])
+        state = self.coordinator.load()
+        state['job'].update(status='failed', finishedAt=updater.iso(self.clock))
+        self.coordinator.save(state)
+        job_id = state['job']['id']
+        filename = self.coordinator.jobs / job_id / 'diagnostic.json'
+        original = updater.read_json(filename)
+        for change in ({'versions': None}, {'observation': {'units': None}}, {'versions': [{'id': []}], 'observation': {'units': [{'unit': {}}]}}):
+            updater.write_json(filename, {**original, **change})
+            value = self.coordinator.diagnostic(job_id)
+            self.assertEqual(value['job']['status'], 'failed')
+            self.assertEqual(value['health']['status'], 'unknown')
+            self.assertTrue(value['missing'])
+        state['job'] = None
+        self.coordinator.save(state)
+        updater.write_json(filename, {**original, 'versions': None})
+        with self.assertRaises(updater.UpdateError) as error:
+            self.coordinator.diagnostic(job_id)
+        self.assertEqual(error.exception.status, 404)
+
     def setUp(self):
         super().setUp()
         self.clock = 1800000000.0

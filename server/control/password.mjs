@@ -1,6 +1,7 @@
 import { randomBytes, scrypt as scryptCallback, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { immediate } from './schema.mjs';
+import { NO_TOKENS, TOKENS_KEY } from '../agent-feed/tokens.mjs';
 
 const scrypt = promisify(scryptCallback);
 
@@ -24,10 +25,11 @@ export async function ensurePassword(store, { initialPassword, log }) {
   if (!initialPassword) log.info({ type: 'security' }, `工作台初始登录密码：${password}\n请保存此密码；只在首次启动显示。重置请运行 node server/setup.mjs --reset-password`);
 }
 
-// Replaces the password and revokes every session; callers close their open streams afterwards.
+// Replaces the password and revokes every session and every agent feed token (a session could have
+// created one); callers close their open streams afterwards.
 export async function resetPassword(store) {
   const password = randomBytes(18).toString('base64url');
   const record = await passwordRecord(password);
-  immediate(store.db, () => { store.setSetting('password', record); store.sessions.clear(); });
+  immediate(store.db, () => { store.setSetting('password', record); store.sessions.clear(); if (store.getSetting(TOKENS_KEY) !== undefined) store.setSetting(TOKENS_KEY, NO_TOKENS); });
   return password;
 }

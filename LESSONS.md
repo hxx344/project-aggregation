@@ -103,6 +103,8 @@
 
 **事件记录：** `legacy-chart-optimization-20261012`；历史复盘 2026-10-12（Seen 1×）；外仓证据和独立事件均待核实，暂不计入升级。
 
+**同步证据查询补充（2026-11-10）：** 基于 `a12e583` 的未发布 #334 实现，用相关 `json_each(localIds)` 子查询过滤每一条共享操作，再排序并 `LIMIT 4001`；输出有界但查询工作量仍随订单数与操作数相乘。独立 Windows SQLite 探针在 4,000 单、16,000 次操作下耗时约 19 秒，同步阻塞 runtime 并超过页面 12 秒读取期限。现从原单 ID 驱动主键精确/范围查询，累计扫描候选也有上限，保留 module/group/localId 与注册库核验；同输入约 40 毫秒且零数据库写入。检查见 [执行证据规模回归](tests/account-writer-execution-evidence.test.mjs)，不能仅凭最终 `LIMIT` 证明查询有界。事件 `execution-evidence-query-work-budget-20261110`；首次发布前审查发现，非实盘性能测量。
+
 ### L007：memo 优化先确认输入稳定性与必要更新
 
 **适用条件：** 用 `React.memo` 避免父组件无关更新导致重复渲染的组件边界。
@@ -184,6 +186,8 @@
 **如何验证：** 用 `git ls-files --error-unmatch` 确认两个样式文件已跟踪，再由干净归档的模块构建验证引用。无需因忽略规则修复重复运行无关业务回归。
 
 **事件记录：** `embedded-import-ignore-20261013`；本轮一次已核实事件。
+
+**发布白名单补充（2026-11-10）：** P2 批次 `be01451` 的研究 CLI 新增导入 `evidence.mjs`，本地完整工作树可运行，但源码安装器、CI 打包器与独立研究安装器各自的运行文件白名单遗漏该文件。[CI 42824071840](https://github.com/hxx344/project-aggregation/actions/runs/42824071840) 在固定源码发布与真实 systemd 首次启动中报 `ERR_MODULE_NOT_FOUND`，阻止候选发布。新增运行时依赖要同时核对所有实际交付白名单及隔离夹具，不能以源码目录存在或模块构建通过代替。验证复用 `deploy/test-release.py` 的真实固定 Git 提取后 CLI 启动，以及 `deploy/test-package-layout.py` 的发布树启动和缺文件拒绝；独立安装与 systemd 由 Linux CI 执行。事件 `research-runtime-publication-allowlist-20261110`，为合入 main 后、正式发布前由 CI 捕获的交付遗漏；不推进历史复盘检查点。
 
 ### L012：可选本机辅助探测默认关闭，除非用户环境确实运行该服务
 
@@ -803,6 +807,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **研究轮询补充（2026-11-05）：** 本次新增 Binance/Lighter 成本研究的提交前独立审查，以真实引擎生成 12 个情景各 20 轮成交记录，再经过工作台 HTTP 入口读取，正文达 4,830,897 字节，接受 gzip 的请求仍收到未压缩正文；前端每 5 秒读取且 10 秒超时。修复将常规状态限定为统计与在途任务，逐笔/曲线按当前会话与所选情景读取，完整导出保持原义，并只在该公开研究数据路由协商压缩。验证用 [工作台回归](tests/binance-lighter-workbench.test.mjs) 检查大报告下状态体积、单情景详情、gzip/q=0 与完整导出；[页面回归](tests/binance-lighter-cost.browser.mjs) 检查迟到详情不跨会话覆盖。事件 `cost-research-history-polling-20261105`；相对 `4bb440e` 的未发布实现，不是主线逃逸缺陷，不推进复盘检查点。
 
+**持仓核对明细补充（2026-11-10）：** 基于 `a12e583` 的未发布 #307 在每仓快照追加 200 条证据，50 仓的合法响应超过 Hub 原有 2 MiB 传输上限，导致整份持仓不可读；单行与类型检查均通过，只有真实 HTTP 规模探针暴露。现于 Asset 响应端按全部仓位共同约束证据行数、UTF-8 字节与整响应余量，不改缓存或原持仓汇总；截断保留总数并明确不能据当前片段复算完整净额。最终同类 50×200 夹具约 2.64 MB 降至 305 KB，50 仓仍完整。证据见 [响应预算](modules/asset/lib/positions-evidence.ts) 与本次 P2 交易资产审查记录；不把提高传输限额作为默认修复。事件 `position-evidence-response-budget-20261110`；首次发布前发现，未读取真实账户。
+
 ### L048：迟到的模块就绪消息仍需完成加载恢复
 
 **适用条件：** 工作台通过原生 iframe load 和模块消息共同判断就绪，并保留后台预加载页面。
@@ -846,6 +852,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **事件记录：** `monitor-binance-quote-transient-recovery-20261015`；一次用户反馈及请求链修正，不推进主线复盘检查点。
 
 **合约目录补充（2026-10-25）：** 用户截图显示原油价差停在 03:21:12、至少连续两轮未更新，同一时刻共用 CLUSDT 的 Binance 金油比 03:22:12 仍为实时。两条路径的差别：原油主报价每 60 秒必须重新下载约 1.15 MB 的全量 `exchangeInfo` 并读取全量 `premiumIndex`，金油比 5 分钟才读一次目录、按合约读价格。旧实现中目录刷新只要变慢或失败，最新价格也随整轮报价一起失败；提醒栏则把数据库记录的具体原因替换成“行情获取失败或已过期”。以后做法：Binance 与 Bybit 合约目录过期后改为后台刷新，上次有效目录不超过 10 分钟时先用它解析最新价格，超过 10 分钟仍阻塞并报错；价格、资金费、源时间与双腿一致性校验不变。数据库 fresh 读取拒绝时，在错误上附带采集器记录的固定原因，原油与金油比提醒栏改为显示该原因，其他任意异常文本仍隐藏。已登记、未改：Lighter 等比较平台的合约目录同样按 60 秒共享，但不影响主报价；海力士报价不经过 Binance 诊断，提醒栏保持原有通用提示。现场错误原因未取得，只能确认是原油路径持续约一分钟的失败，不能断言是目录超时、限流还是数据校验失败；工作台“运行详情”会显示采集器记录的原因。验证见 [报价测试](modules/monitor/tests/exchange-quotes.test.mjs) 的目录失败与慢刷新用例、[告警测试](modules/monitor/tests/oil-alerts.test.mjs) 的原因透传用例和 [数据库回归](modules/monitor/tests/market-database.test.mjs)；三处新增断言在旧实现上失败。事件 `monitor-binance-catalog-retention-20261025`，实际发生日期 2026-10-25（Asia/Shanghai）；不推进全历史复盘检查点。
+
+**工作台持仓读取补充（2026-11-10）：** 用户反馈停留在价差下单页时原油、海力士偶尔同时过期、稍后恢复。`feb56f0` 的 `OilTradingPage` 对 `/api/trading` 单次失败立即撤回两组缓存有效性，但错误和重试按钮仅在其他页签显示；旧生产构建的 503 故障注入复现立即变黄。只对这个无副作用的工作台缓存 GET，在原在途请求内增加一次 1 秒延迟重试，每次仍限 12 秒；网络/超时与 408/502/503/504 可重试，认证、限流、成功响应格式错误和任意 `Retry-After` 不即时重试。重试期间来源仍按原 75 秒有效期老化，耗尽后保留旧值并在当前页显示原因。缓存由 App 会话持有，离线失效也由 App 处理，覆盖切到总览时断网再返回；联网事件不能让旧合计恢复，必须有新成功响应。验证见 [读取回归](tests/trading-read.test.mjs)、[缓存回归](tests/trading-cache.test.mjs) 和 [故障恢复浏览器夹具](tests/trading-overview-recovery.browser.mjs)。没有取得该次线上失败的请求日志，不断言全部偶发过期都来自浏览器链路；不改变交易所采集、交易执行或来源时间。事件 `overview-cache-read-transient-recovery-20261110`；不推进历史复盘检查点。
 
 ### L051：固定版本的源码获取须有界恢复传输中断
 
@@ -1276,6 +1284,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **排队写入补充（#225，2026-11-07）：** 基线 `fdf470e` 的 Aero Safe 预览、执行与纯写入口未共同遵守服务端整体时限：慢读占队列时，API 已超时，回调后来仍可能写入或启动任务。所有同类入口（含仓位策略）继承 API 收件截止时间并预留余量；排队和每次读链共用一个预算，写入、任务启动、旧交易重新广播与结算前再检查期限和授权。单独用 `Promise.race` 返回错误不能取消异步回调中的副作用，迟到的连接缓存及回执也必须弃置。已接受任务和后台恢复保持原生命周期。验证：[Safe 回归](tests/aero-safe.test.mjs)、[真实路由截止时间](tests/aero-safe-deadline-http.test.mjs) 及 [页面等待夹具](tests/aero-safe-changes.browser.mjs)，覆盖超时后释放队列/读取仍零写入、零新任务和零请求触发的重广播。事件 `aero-safe-queued-side-effect-timeout-20261107`；离线故障注入，未操作真实账户。
 
+**共享缓存补充（2026-11-10）：** `positions-shared-snapshot-20261110`，用户反馈交易中心已有仓位，但 Monitor 关联交易仍超时。基线 `b2fa503` 中全部仓位与桥接各自读取，前者卸载丢数据，服务端已有快照过 5 秒后仍等待慢来源；仅延长超时不能让另一入口复用成功结果。只读入口共享会话快照与在途读取，服务端 UI 返回当前来源版本的已有快照再后台刷新；首次无缓存保持有界等待，成功空列表权威替换。失效/离线必须同时隔离旧在途结果，不能只把现有值标旧；原始读取时间不变，过期空列表不确认空仓。验证见 `tests/positions-cache.test.mjs`、Asset 仓位单元/HTTP 测试及 `tests/hub-positions.browser.mjs` 的挂起刷新跨入口场景。提交前独立审查另复现：仅清浏览器缓存时，服务端会重新返回同项目版本的旧账户；等待辅助来源的桥接也可能在失效后发出先前捕获的有效快照。内部账户变更先让服务端失效并等待应答，发送桥接回复时重取当前代际；对应 HTTP 与延迟辅助来源回归必须覆盖清空、离线及 401。30 来源挂起对照中基线 150ms 内未返回、新实现约 0.55ms 返回；这是隔离测试，不代表线上耗时测量，不推进复盘检查点。
+
 ### L076：显示节流不能让已收到的新观测背后的旧报价过期
 
 **适用条件：** 前端按固定周期发布已累积的行情帧，而新鲜度时钟按源时间逐秒前进，排名、提醒或筛选用该时钟判断已显示报价是否过期。
@@ -1501,6 +1511,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **跨组件敞口读取补充（#284，2026-11-09）：** `0243193` 后的未发布实现中，父组件保存开始时增加自身 GET 代次，子组件的敞口版本却只在写响应返回后更新。独立生产页面探针复现：服务端已保存 2 桶、写响应挂起，旧敞口响应随后把 1 桶显示出来。父组件提交开始即撤销传给子组件的可用版本，子组件清空结果并中止旧请求；明确失败恢复旧版本也不能复活已撤销结果。`tests/trading-auto-exposure-write-race.browser.mjs` 保留同一交错，修前 oldExposureShown=true、修后 false，保存仍在等待，恢复版本不自动读取。事件 `auto-exposure-pending-write-stale-read-20261109`；P1 在首次发布前修复。
 
 **持仓合计重连补充（2026-11-10）：** 基于 `b03f6fa` 的未发布概览合计仅用 `offline` 撤回金额；联网事件先清此标记，旧合计在新 GET 回复前恢复。独立生产页面探针挂起重连读取，确认 `+3,537.74 → — → +3,537.74`，期间没有新响应或写入。合计现独立保留失效状态，仅成功接收新快照后恢复；[概览浏览器夹具](tests/trading-overview.browser.mjs) 覆盖断线、挂起重连及新响应恢复。事件 `overview-pnl-reconnect-unconfirmed-20261110`；首次发布前修复，不改变交易保护规则。
+
+**恢复通知补充（2026-11-10）：** 基于 `a12e583` 的未发布 #297 在清除停用后，复用中断之后、但已过一天的链上缓存判定“恢复”，且下一轮先通知再刷新；独立真实 manager 夹具确认本次 RPC 失败时仍已发送恢复。恢复类结论须绑定本次重新启用与配置/钱包代次之后的新鲜成功读取；旧在途读取、旧缓存及待发送恢复事件都须失效，发送也在本轮刷新后核对。验证见 [通知恢复回归](tests/aero-notification-recovery.test.mjs)，不发送真实通知或交易。事件 `aero-recovery-notification-stale-proof-20261110`；首次发布前审查发现。
 
 ### L090：防重复发送的持久化占用不能降为尽力记录
 
@@ -1870,6 +1882,47 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `server/trading-anthropic-reduction.mjs`、`server/trading-reduction-plan.mjs`、各所 `noLiquidation` 解析（`server/trading-execution-exchanges.mjs`、`server/trading-okx-execution.mjs`、`server/trading-hyperliquid-execution.mjs`、`server/trading-rh-lighter-execution.mjs`）。2026-11-09 用户要求检查“ANT 套利自动减仓是否会被异常阻塞”，只读排查用夹具复现了这些路径：任何 409 立即停用、强平价为空 3 次后停用、停用无通知。没有发生线上事故，各所真实返回值未实盘验证。
 
 **事件记录：** `ant-reduction-self-disarm-20261109`；只读排查发现，修复前未确认线上发生。
+
+
+### L111：嵌入模块的换算口径必须来自宿主当前配置
+
+**适用条件：** 工作台保存浏览器偏好，独立子域的嵌入模块用同一业务参数换算行情、历史或持仓展示。
+
+**根因：** Monitor 把交易中心的默认股数复制为常量，未接收用户保存的股数；因此原始行情正确，监控溢价仍按另一份假设计算。子域自己的 localStorage 不能代表宿主配置。
+
+**以后做法：** 通过现有可信宿主桥接传递最小只读参数，覆盖首次握手、保存通知、跨标签与切回；未知或损坏配置不冒充已同步默认值。配置作为派生计算及缓存的输入，同时更新实时、历史、统计和相关持仓口径；独立页面与服务端无法访问浏览器配置时明确标注默认口径，不改写原始行情或订单快照。
+
+**如何验证：** [股数计算测试](modules/monitor/tests/anthropic-shares.test.mjs) 使用非默认 S/F 核对三腿、历史与趋势重算；[偏好测试](tests/trading-preferences.test.mjs) 和 [桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 覆盖未知/非法/重连/保存失败；[工作台浏览器夹具](tests/monitor-anthropic-shares.browser.mjs) 经实际 iframe 检查交易中心修改和跨标签同步。
+
+**证据与事件：** `anthropic-monitor-share-preferences-20261110`；2026-11-10 用户截图指出溢价应使用交易中心股数。基线 `a12e583` 的 `modules/monitor/modules/anthropic/market.mjs` 固定除以 12.7/16.7，`src/OilTradingPage.tsx` 则从 `workbench:anthropic-shares:v1` 读取可编辑值。本次为一次用户纠正，不推进提交复盘检查点。
+
+### L112：受私有 umask 约束的服务发布公共元数据时，显式设置专用目标权限
+
+**适用条件：** root 服务使用 `UMask=0077`，同时向固定、无秘密的公共状态目录发布供非 root 工作台读取的 JSON。
+
+**根因：** `mkdir(mode=0755)`、`open(mode=0644)` 仍受 umask 过滤，实际产生 0700/0600。交互式配置时可能正常，timer 下一次原子替换后却失去服务用户的读取权限。
+
+**以后做法：** 保留私有 umask。只在已校验 root 归属、父链和无链接的专用公开路径，通过打开的目录/文件描述符明确设置 0755/0644；不能放宽备份包、密钥或其他目录权限。公开状态只含既有白名单元数据。
+
+**如何验证：** [备份维护测试](tests/test_backup_maintenance.py) 在真实 Linux root 环境设置 umask 0077，连续发布两次，由非 root 身份实际读取 JSON，同时验证私有材料仍拒读。Windows 不代替这项权限验证，本条提交时对应 CI 尚待执行。
+
+**证据：** project-aggregation 基于 `a12e583` 的未发布 #280/#291；`server/recovery/maintenance.py` 的公开写入与生成服务 umask 可确定该 POSIX 结果，独立审查指出窗口外状态发布同样触发。修复限定固定公开目录和 FD 权限；未操作用户服务器。
+
+**事件记录：** `backup-public-status-private-umask-20261110`；首次发布前审查发现，非线上事故。
+
+### L113：追加备注须同时遵守持久状态的实际 UTF-8 总字节上限
+
+**适用条件：** 将有限条数、有限字符数的人工备注附加到原有有界告警或事件状态文件。
+
+**根因：** 每条字符数和记录条数合规，不代表整体文件可被重启读取器接受；中文 UTF-8 字节数及 JSON 开销会超过只按字符估算的预算。
+
+**以后做法：** 在实际统一保存点按序列化后的 UTF-8 字节核验，为不可丢失的原发送事实和状态增长保留空间。备注超限在改变内存和磁盘前明确拒绝，不能删原渠道回执或把失败保存当成功；读取与写入的硬上限保持一致。
+
+**如何验证：** [告警备注预算回归](modules/monitor/tests/perpetual-alert-review-budget.test.mjs) 用最大中文字段重复登记后重启真实 store，检查仍可读取、超限拒绝和原投递事实保留。
+
+**证据：** project-aggregation 基于 `a12e583` 的未发布 #330；独立 Windows store/service 探针提交 100×5 条合法备注，得到 1,126,093 字节文件，超过 1,000,000 字节读取上限而无法重开。修复统一预算并保留原状态余量，未发送外部通知。
+
+**事件记录：** `alert-review-total-byte-budget-20261110`；首次发布前审查发现，不推进历史复盘检查点。
 
 ## 已归档
 

@@ -88,11 +88,11 @@ def text(spec, summary):
 
 
 TRADE_FIELDS = ["entry", "exit", "reason", "legs", "deltas", "forward", "settlement", "credit", "fees", "pnl", "margin", "max_loss",
-                "worst_open_pnl", "fallback_fills", "missing_hours", "perp_pnl", "funding", "trend"]
+                "worst_open_pnl", "fallback_fills", "missing_hours", "perp_pnl", "funding", "trend", "evidence_id"]
 
 
-def write(directory, spec, trades, summary):
-    directory.mkdir(parents=True, exist_ok=True)
+def write(directory, spec, trades, summary, evidence=None):
+    directory.mkdir(parents=True, exist_ok=evidence is None)
     with open(directory / "trades.csv", "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, TRADE_FIELDS, extrasaction="ignore")
         writer.writeheader()
@@ -100,3 +100,7 @@ def write(directory, spec, trades, summary):
     public = {key: value for key, value in spec.items() if key not in ("start_hour", "end_hour")}
     (directory / "spec.json").write_text(json.dumps(public, indent=2, ensure_ascii=False), encoding="utf-8")
     (directory / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if evidence is not None:
+        manifest, records = evidence
+        (directory / 'evidence.jsonl').write_text(records, encoding='utf-8', newline='\n')
+        (directory / 'evidence-manifest.json').write_text(json.dumps(manifest, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')

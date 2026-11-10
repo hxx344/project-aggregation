@@ -12,6 +12,7 @@ from statistics import median
 from typing import Optional, Protocol
 
 from .pricing import YEAR_SECONDS, black, payoff
+from .evidence import closing_evidence, fill_evidence, missing_quote, quote_evidence, source_for_perp
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,7 @@ class Quote:
     mark: float        # USD
     bid: float         # USD, nan when there is no bid
     ask: float         # USD, nan when there is no ask
+    source: Optional[dict] = None  # frozen file identity and row locator, when evidence is enabled
 
     @property
     def years(self):
@@ -112,9 +114,9 @@ def leg_fee(fees, leg, forward, price):
     return fees["perp_rate"] * price * leg.qty if leg.is_perp else trade_fee(fees, forward, price, leg.qty)
 
 
-def perp_quote(price, expiry, hour):
+def perp_quote(price, expiry, hour, source=None):
     """The perpetual at `price` as a spread-free quote (every fill model fills at that price)."""
-    return None if price is None else Quote(expiry, 0.0, False, hour * 3600, price, 0.0, price, price, price)
+    return None if price is None else Quote(expiry, 0.0, False, hour * 3600, price, 0.0, price, price, price, source)
 
 
 def funding(position, market, upto):
@@ -212,7 +214,35 @@ def perp_signature(spec, state):
     return tuple((leg["side"], leg["qty"] * spec["qty"]) for _, leg in active_legs(spec, state) if leg["type"] == "perp")
 
 
-def open_position(chain, hour, spec, perp=None, carry=False, state=None):
+def select_option_quotes(chain, hour, spec, state=None):
+    """Pure contract selection shared by simulation and offline data preflight; no fills or positions."""
+    chosen = active_legs(spec, state)
+    if not chosen:
+        return [], f'flat_{state}'
+    if not chain:
+        return [], 'no_data'
+    by_expiry, selected = {}, []
+    for quote in chain:
+        if quote.expiry > hour and quote.mark > 0 and quote.iv > 0 and quote.forward > 0 and quote.years > 0:
+            by_expiry.setdefault(quote.expiry, []).append(quote)
+    for index, leg_spec in chosen:
+        if leg_spec['type'] == 'perp':
+            continue
+        expiry = choose_expiry(by_expiry, hour, leg_spec['expiry'] or spec['expiry'])
+        if expiry is None:
+            return [], 'no_expiry'
+        is_call = leg_spec['type'] == 'call'
+        options = [q for q in sorted(by_expiry[expiry], key=lambda q: q.strike) if q.is_call == is_call]
+        if leg_spec['beyond'] is not None:
+            inner = next(q.strike for i, _, q in selected if i == leg_spec['beyond'])
+            options = [q for q in options if (q.strike > inner if is_call else q.strike < inner)]
+        if not options:
+            return [], 'no_strike'
+        selected.append((index, leg_spec, min(options, key=lambda q: abs(abs(q.delta) - leg_spec['delta']))))
+    return selected, None
+
+
+def open_position(chain, hour, spec, perp=None, carry=False, state=None, evidence=None, perp_source=None):
     """Select legs by delta and fill them; returns (Position, None) or (None, skip reason).
 
     `state` is the trend state ("above"/"below") that picks the legs with a matching `when`.
@@ -221,32 +251,12 @@ def open_position(chain, hour, spec, perp=None, carry=False, state=None):
     `carry` means the previous position's perp closed this same hour, so the perp is simply held on and
     pays no entry fee; run() also refunds that previous close fee, leaving one open and one close fee."""
     chosen = active_legs(spec, state)
-    if not chosen:
-        return None, f"flat_{state}"
-    if not chain:
-        return None, "no_data"
-    by_expiry = {}
-    for quote in chain:
-        # The contract must be alive at the decision hour; `years` (time left at the quote's own
-        # snapshot) only says the quote can be priced: a 07:59 snapshot labelled 08:00 is not tradable at 08:00.
-        if quote.expiry > hour and quote.mark > 0 and quote.iv > 0 and quote.forward > 0 and quote.years > 0:
-            by_expiry.setdefault(quote.expiry, []).append(quote)
+    selected, reason = select_option_quotes(chain, hour, spec, state)
+    if reason:
+        return None, reason
     legs, quotes, fallbacks = [], [], 0
-    for index, leg_spec in chosen:
+    for index, leg_spec, quote in selected:
         sign = 1 if leg_spec["side"] == "buy" else -1
-        if leg_spec["type"] == "perp":
-            continue
-        expiry = choose_expiry(by_expiry, hour, leg_spec["expiry"] or spec["expiry"])
-        if expiry is None:
-            return None, "no_expiry"
-        is_call = leg_spec["type"] == "call"
-        options = [q for q in sorted(by_expiry[expiry], key=lambda q: q.strike) if q.is_call == is_call]
-        if leg_spec["beyond"] is not None:
-            inner = next(leg.strike for leg in legs if leg.index == leg_spec["beyond"])
-            options = [q for q in options if (q.strike > inner if is_call else q.strike < inner)]
-        if not options:
-            return None, "no_strike"
-        quote = min(options, key=lambda q: abs(abs(q.delta) - leg_spec["delta"]))
         price, fallback = fill_price(quote, sign > 0, spec["fill"])
         fallbacks += fallback
         legs.append(Leg(index, sign, quote.expiry, quote.strike, quote.is_call, leg_spec["qty"] * spec["qty"], price, quote.delta, quote.iv))
@@ -257,7 +267,7 @@ def open_position(chain, hour, spec, perp=None, carry=False, state=None):
                 return None, "no_perp"
             expiry = min(leg.expiry for leg in legs)
             legs.append(Leg(index, 1 if leg_spec["side"] == "buy" else -1, expiry, 0.0, False, leg_spec["qty"] * spec["qty"], perp, 1.0, 0.0, is_perp=True))
-            quotes.append(perp_quote(perp, expiry, hour))
+            quotes.append(perp_quote(perp, expiry, hour, perp_source))
     order = sorted(range(len(legs)), key=lambda i: legs[i].index)
     legs, quotes = [legs[i] for i in order], [quotes[i] for i in order]
     forward = median(q.forward for q, leg in zip(quotes, legs) if not leg.is_perp)
@@ -267,7 +277,10 @@ def open_position(chain, hour, spec, perp=None, carry=False, state=None):
     margin = regular_margin(legs, quotes, spec, forward) if spec["margin"]["mode"] == "regular" or loss is None else loss
     # Marked at the same hour's marks right after the fills: the spread and entry fees already lost count.
     entry = credit - fees + sum(leg.sign * leg.value(q.mark) * leg.qty for leg, q in zip(legs, quotes))
-    return Position(hour, legs, credit, fees, margin, loss, forward, fallbacks, worst=entry, extra={"trend": state}), None
+    position = Position(hour, legs, credit, fees, margin, loss, forward, fallbacks, worst=entry, extra={"trend": state})
+    if evidence:
+        evidence.begin(position, quotes, carry)
+    return position, None
 
 
 def close_value(position, quotes, spec):
@@ -285,7 +298,7 @@ def close_value(position, quotes, spec):
 def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, paid_funding=0.0, perp_pnl=0.0, perp_fee=0.0, carried=True, fills=None):
     """`fills` counts the closing fills (default: every leg); legs settled at a delivery price have none."""
     pnl = position.credit - position.fees + cash - fees - paid_funding
-    return {
+    result = {
         "entry": utc(position.entry_hour).strftime("%Y-%m-%d %H:%M"), "exit": utc(hour).strftime("%Y-%m-%d %H:%M"),
         "entry_hour": position.entry_hour, "exit_hour": hour, "reason": reason,
         "legs": " ".join(leg.label for leg in position.legs),
@@ -301,6 +314,14 @@ def finish(position, hour, reason, cash, fees, settlement=None, fallbacks=0, pai
         "_carry": (perp_fee, position.worst, tuple(("buy" if leg.sign > 0 else "sell", leg.qty) for leg in position.legs if leg.is_perp))
         if carried and any(leg.is_perp for leg in position.legs) else None,
     }
+    if '_evidence' in position.extra:
+        detail = position.extra['_evidence']
+        detail['calculation'] = {'entryCreditUsd': position.credit, 'entryFeesUsd': position.fees, 'exitCashUsd': cash,
+                                 'exitFeesUsd': fees, 'paidFundingUsd': paid_funding, 'netUsd': pnl,
+                                 'formula': 'entryCreditUsd - entryFeesUsd + exitCashUsd - exitFeesUsd - paidFundingUsd'}
+        result['_evidence'] = detail
+        position.extra['_evidence_owner'].reserve(detail)
+    return result
 
 
 def delivery(position, market, hour, expiry):
@@ -321,10 +342,13 @@ def settle(position, market, hour, spec):
     delivery price (never at a pre-expiry quote) and close the live legs at market. Returns None while
     an expired leg has no delivery price or a live leg has no quote, noting which in extra["pending"]."""
     prices = {}
+    recording = '_evidence' in position.extra
+    exits = []
     for expiry in sorted({leg.expiry for leg in position.legs if not leg.is_perp and leg.expiry <= hour}):
         prices[expiry] = delivery(position, market, hour, expiry)
         if prices[expiry] is None:
             position.extra["pending"] = "settlement"
+            missing_quote(position, hour)
             return None
     price = prices[position.expiry][0]
     cash = fees = perp_pnl = perp_fee = 0.0
@@ -333,10 +357,18 @@ def settle(position, market, hour, spec):
     for leg in position.legs:
         if leg.is_perp:  # closed at the option expiry hour's perp price (delivery estimate if missing)
             close = market.perp(position.expiry)
+            missing_perp = close is None
             carried = close is not None and hour == position.expiry
             close = close or price
             perp_pnl += leg.sign * leg.value(close) * leg.qty
             perp_fee += leg_fee(spec["fees"], leg, close, close)
+            if recording:
+                record = fill_evidence(leg, None if missing_perp else perp_quote(close, leg.expiry, position.expiry, source_for_perp(market, position.expiry)),
+                                       close, leg_fee(spec['fees'], leg, close, close), 'exit', spec['fill'])
+                if missing_perp:
+                    record['fallback'] = 'missing_perp_used_option_delivery_estimate'
+                    record['deliveryEstimateUsd'] = price
+                exits.append(record)
             fills += 1
             continue
         if leg.expiry in prices:
@@ -344,17 +376,31 @@ def settle(position, market, hour, spec):
             value = payoff(delivered, leg.strike, leg.is_call)
             cash += leg.sign * value * leg.qty
             fees += min(spec["fees"]["settle_rate"] * delivered, spec["fees"]["settle_cap_pct"] * value) * leg.qty
+            if recording:
+                stand_in = prices[leg.expiry][1]
+                source = position.extra.get('_last_forward_evidence', {}).get(leg.expiry) if stand_in else (
+                    market.settlement_evidence(leg.expiry) if hasattr(market, 'settlement_evidence') else None)
+                exits.append({'legIndex': leg.index, 'instrument': 'option', 'sign': leg.sign, 'qty': leg.qty,
+                              'expiryHour': leg.expiry, 'strike': leg.strike, 'isCall': leg.is_call, 'phase': 'settlement',
+                              'deliveryEstimateUsd': delivered, 'settlementSource': source, 'fillPriceUsd': value,
+                              'cashUsd': leg.sign * value * leg.qty,
+                              'feeUsd': min(spec['fees']['settle_rate'] * delivered, spec['fees']['settle_cap_pct'] * value) * leg.qty,
+                              'fallback': 'last_marked_forward_after_six_hours' if stand_in else 'hourly_underlying_estimate_not_official_TWAP'})
             continue
         quote = market.quote(hour, leg.expiry, leg.strike, leg.is_call)
         if quote is None:
             position.extra["pending"] = "quote"
+            missing_quote(position, hour)
             return None
         fill, fallback = fill_price(quote, leg.sign < 0, spec["fill"])
         fallbacks += fallback
         fills += 1
         cash += leg.sign * leg.value(fill) * leg.qty
         fees += leg_fee(spec["fees"], leg, quote.forward, fill)
+        if recording:
+            exits.append(fill_evidence(leg, quote, fill, leg_fee(spec['fees'], leg, quote.forward, fill), 'exit', spec['fill'], fallback))
     reason = "expiry_last_forward" if any(stand_in for _, stand_in in prices.values()) else "expiry"
+    closing_evidence(position, market, position.expiry, exits)
     return finish(position, hour, reason, cash + perp_pnl, fees + perp_fee, settlement=price, fallbacks=fallbacks,
                   paid_funding=funding(position, market, position.expiry), perp_pnl=perp_pnl, perp_fee=perp_fee, carried=carried, fills=fills)
 
@@ -367,10 +413,14 @@ def step(position, market, hour, spec):
               for leg in position.legs]
     if any(quote is None for quote in quotes):
         position.missing_hours += 1
+        missing_quote(position, hour)
         return None
     position.marked_hours += 1
     options = [(leg.expiry, q.forward) for leg, q in zip(position.legs, quotes) if not leg.is_perp]
     position.extra["last_forward"] = {expiry: median(f for e, f in options if e == expiry) for expiry, _ in options}
+    if '_evidence' in position.extra:
+        position.extra['_last_forward_evidence'] = {expiry: {'hour': hour, 'quotes': [quote_evidence(q) for leg, q in zip(position.legs, quotes)
+            if not leg.is_perp and leg.expiry == expiry]} for expiry, _ in options}
     paid = funding(position, market, hour)
     marked = position.credit - position.fees - paid + sum(leg.sign * leg.value(q.mark) * leg.qty for leg, q in zip(position.legs, quotes))
     position.worst = min(position.worst, marked)
@@ -389,6 +439,14 @@ def step(position, market, hour, spec):
         return None
     perp_pnl = sum(leg.sign * leg.value(q.mark) * leg.qty for leg, q in zip(position.legs, quotes) if leg.is_perp)
     perp_fee = sum(leg_fee(spec["fees"], leg, q.mark, q.mark) for leg, q in zip(position.legs, quotes) if leg.is_perp)
+    if '_evidence' in position.extra:
+        exits = []
+        for leg, quote in zip(position.legs, quotes):
+            if leg.is_perp:
+                quote = perp_quote(quote.mark, leg.expiry, hour, source_for_perp(market, hour))
+            fill, fallback = fill_price(quote, leg.sign < 0, spec['fill'])
+            exits.append(fill_evidence(leg, quote, fill, leg_fee(spec['fees'], leg, quote.forward, fill), 'exit', spec['fill'], fallback))
+        closing_evidence(position, market, hour, exits)
     return finish(position, hour, reason, cash, fees, fallbacks=fallbacks, paid_funding=paid, perp_pnl=perp_pnl, perp_fee=perp_fee)
 
 
@@ -398,7 +456,7 @@ def is_entry_hour(hour, spec):
     return moment.hour in spec["entry"]["hours"] and (weekdays is None or moment.weekday() in weekdays)
 
 
-def run(spec, market, progress=None):
+def run(spec, market, progress=None, evidence=None):
     """Simulate a validated spec; returns (trades, skipped entries by reason, (first, last) hour)."""
     first, last = market.span()
     start = max(first, spec["start_hour"] if spec["start_hour"] is not None else first)
@@ -428,7 +486,8 @@ def run(spec, market, progress=None):
                 signature = perp_signature(spec, state)
                 carry = bool(signature) and any(trade["_carry"][2] == signature for trade in closed_perps)
                 perp = market.perp(hour) if signature else None
-                position, reason = open_position(market.chain(hour), hour, spec, perp, carry=carry, state=state)
+                position, reason = open_position(market.chain(hour), hour, spec, perp, carry=carry, state=state, evidence=evidence,
+                                                 perp_source=source_for_perp(market, hour) if evidence and signature else None)
                 if position:
                     open_positions.append(position)
                     if carry:  # the same perp was held on, never closed: refund that close fee
@@ -438,6 +497,15 @@ def run(spec, market, progress=None):
                         held["pnl"] = round(held["pnl"] + fee, 2)
                         held["worst_open_pnl"] = round(min(worst, held["pnl"]), 2)
                         held["_carry"] = None
+                        if '_evidence' in held:
+                            detail = held['_evidence']; calculation = detail['calculation']
+                            detail['preCarryReportedPnlUsd'] = round(calculation['netUsd'], 2)
+                            calculation['exitFeesUsd'] -= fee; calculation['netUsd'] += fee
+                            detail['carryFeeRefundUsd'] = fee
+                            detail['reportedPnlRule'] = 'round(preCarryReportedPnlUsd + carryFeeRefundUsd, 2)'
+                            for record in detail['exits']:
+                                if record['instrument'] == 'perp':
+                                    record['feeUsd'] = 0.0; record['feeTreatment'] = 'carried_perp_fee_waived'
                 else:
                     skipped[reason] = skipped.get(reason, 0) + 1
             if progress:
@@ -446,6 +514,8 @@ def run(spec, market, progress=None):
     for position in open_positions:  # an expired leg without a delivery price stays unresolved, never guessed
         key = "unsettled_at_data_end" if position.extra.get("pending") == "settlement" else "open_at_data_end"
         skipped[key] = skipped.get(key, 0) + 1
+        if evidence:
+            evidence.unresolved(position, last)
     for trade in trades:
         del trade["_carry"]
     return trades, skipped, (start, end)

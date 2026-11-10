@@ -61,6 +61,11 @@ export function validateOverviewEvent(value) {
   if (!object(value) || !Number.isSafeInteger(value.revision) || value.revision < 1) throw unavailable();
   return { revision: value.revision, overview: validateOverview(value.overview) };
 }
+// The agent feed's envelope only; the API copies each dataset through its own contract (server/agent-feed/catalog.mjs).
+export function validateAgentFeed(value) {
+  if (!object(value) || value.schemaVersion !== 1 || !Array.isArray(value.datasets) || value.datasets.length > 64) throw unavailable();
+  return { schemaVersion: 1, datasets: value.datasets };
+}
 export function validateReply(value) {
   if (!object(value) || !Number.isInteger(value.status) || value.status < 200 || value.status > 599 || !object(value.body)) throw unavailable();
   return { status: value.status, body: value.body };
@@ -77,6 +82,7 @@ const validateAccepted = value => { if (!object(value) || value.accepted !== tru
 function contract(invoke, subscribe) {
   return {
     async overview() { return validateOverview(await invoke('overview')); },
+    async agentFeed() { return validateAgentFeed(await invoke('agentFeed')); },
     // `subscriber.wants()` reports whether anyone listens; deliver() receives { revision, overview }.
     subscribeOverview(subscriber) {
       if (typeof subscriber?.wants !== 'function' || typeof subscriber.deliver !== 'function') throw new TypeError('Overview subscriber needs wants() and deliver()');
@@ -100,6 +106,7 @@ function contract(invoke, subscribe) {
 export function createInProcessDataClient(dataPlane, { log }) {
   const operations = {
     overview: () => dataPlane.overview(),
+    agentFeed: () => dataPlane.agentFeed(),
     projectChanged: ({ id, reason, clearSnapshot }) => { dataPlane.projectChanged(id, { reason, clearSnapshot }); return { accepted: true }; },
     coordinateAssetSync: ({ id, revision, signal }) => dataPlane.coordinateAssetSync(id, revision, { signal }),
     forward: request => dataPlane.handle(request),
@@ -143,6 +150,8 @@ export function createSocketDataClient({ dir, protocols = SUPPORTED_PROTOCOLS, c
   const call = (route, { method = 'POST', body, budget = budgets.read, retry = false, signal } = {}) => invokeOverSocket(connection, { method, route, body, budget, retry, signal });
   const operations = {
     overview: () => call('/internal/v1/overview', { method: 'GET', retry: true }),
+    // A runtime older than this route answers 404, which the feed reports as unavailable.
+    agentFeed: () => call('/internal/v1/agent-feed', { method: 'GET', retry: true }),
     projectChanged: ({ id, reason, clearSnapshot }) => call(`/internal/v1/projects/${id}/changed`, { body: { reason, clearSnapshot } }),
     coordinateAssetSync: async ({ id, revision, signal }) => {
       const value = await call(`/internal/v1/projects/${id}/asset-sync`, { body: { revision }, budget: budgets.assetSync, signal });

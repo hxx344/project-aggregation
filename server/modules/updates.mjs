@@ -29,5 +29,21 @@ export function createModuleUpdateGuard({ request = requestJson } = {}) {
     const failure = results.find(result => result.status === 'rejected');
     if (failure) throw failure.reason;
   }
-  return { setMaintenance, prepareApply };
+  // Display only: never enter maintenance or invoke ASTER's cold-stop check.
+  // A short, non-retried request may return unknown; apply keeps its original
+  // independent, longer evidence budget and final guard.
+  async function readImpact({ signal } = {}) {
+    return Promise.all(tradingModules.map(async id => {
+      const observedAt = new Date().toISOString();
+      try {
+        const { data } = await request(moduleOrigin(id), id === 'aster' ? '/__workspace/update-impact' : '/__workspace/update-status', {
+          deadline: Date.now() + 4000, signal,
+        });
+        if (data?.busy !== true && data?.busy !== false && !(id === 'aster' && data?.busy === null && data?.requiresFinalCheck === true)) throw new Error('invalid impact');
+        return { moduleId: id, observedAt, busy: data.busy, reasonCode: data.busy === true ? 'module-busy' : data.busy === false ? 'module-idle' : 'final-order-check-required',
+          activeRequests: id === 'aster' && Number.isSafeInteger(data.activeRequests) && data.activeRequests >= 0 ? Math.min(data.activeRequests, 100000) : null };
+      } catch { return { moduleId: id, observedAt, busy: null, reasonCode: 'module-unavailable', activeRequests: null }; }
+    }));
+  }
+  return { setMaintenance, prepareApply, readImpact };
 }

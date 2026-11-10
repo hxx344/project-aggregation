@@ -65,6 +65,40 @@ function fixture(filename = ':memory:') {
   return { database, save, unseal };
 }
 
+test('cache diagnostics count actual pages, cooldown, restoration and conflict without issuing diagnostic requests', async t => {
+  const f = fixture(); t.after(() => f.database.close()); await f.save();
+  let clock = at, requests = 0, fail = false, conflict = false;
+  const starts: number[] = [];
+  const serviceOptions = { now: () => clock, read: async () => [held('1')],
+    fetcher: (async () => { requests++; if (fail && requests % 2 === 0) throw new Error('page interrupted'); return Response.json([]); }) as typeof fetch,
+    fills: async (_credentials: Credentials, _scope: string, request: { start: number }, options: { fetcher: typeof fetch }) => {
+      starts.push(request.start);
+      await options.fetcher('https://fixture.invalid/page-1'); await options.fetcher('https://fixture.invalid/page-2');
+      return [fill('measured', at - 2 * minute, 'buy', '1', conflict ? { price: '999' } : {})];
+    } };
+  const service = createFillsService(serviceOptions); t.after(() => service.close());
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  const counters = async () => (await service.diagnostics(f.database, 'owner')).groups[0].counters;
+  assert.equal((await counters()).pages, 2); assert.equal((await counters()).requests, 2);
+  await service.read(f.database, 'owner', f.unseal);
+  const hit = await counters(); assert.equal(hit.reads, 2); assert.equal(hit.cacheHits, 1); assert.equal(requests, 2);
+  assert.deepEqual(await counters(), hit); assert.equal(requests, 2, 'diagnostic reads never call exchange fetcher');
+  clock += 5 * minute; fail = true;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  await service.read(f.database, 'owner', f.unseal);
+  assert.equal((await counters()).pages, 4); assert.equal((await counters()).failures, 1); assert.equal((await counters()).cooldownSkips, 1);
+  const second = createFillsService(serviceOptions); t.after(() => second.close());
+  await second.read(f.database, 'owner', f.unseal); await second.idle();
+  const restored = (await second.diagnostics(f.database, 'owner')).groups[0].counters;
+  assert.equal(restored.restores, 1); assert.equal(restored.cooldownSkips, 1); assert.equal(restored.requests, 0); assert.equal(requests, 4);
+  clock += minute; fail = false; conflict = true;
+  await service.read(f.database, 'owner', f.unseal); await service.idle();
+  assert.equal((await counters()).conflicts, 1); assert.equal((await counters()).pages, 6);
+  assert.equal(starts[1], starts[2], 'incomplete history never advances cursor');
+  await f.save({ ...okx, apiKey: 'new-generation' });
+  assert.deepEqual((await service.diagnostics(f.database, 'owner')).groups, [], 'rebound credentials exclude prior counters before the next history read');
+});
+
 test('Binance history survives flat positions, splits full windows and retains symbol-scoped ids and precise cash flows', async () => {
   const rows = Array.from({ length: 1001 }, (_, i) => ({
     symbol: 'CLUSDT', id: i + 1, time: at - 4_000 - i * 10, side: i % 2 ? 'SELL' : 'BUY', positionSide: 'BOTH',

@@ -6,6 +6,7 @@ import { ANTHROPIC_CONTRACTS, contractKey, findContract, sharesProblem } from '.
 import { amount, beijingTime } from './trading-format';
 import type { AnthropicShares } from './trading-execution-types';
 import type { AnthropicReductionConfig, AnthropicReductionState } from './trading-anthropic-reduction-types';
+import TradingExecutionEvidence from './TradingExecutionEvidence';
 
 const BASE = '/api/trading/execution/anthropic-reduction';
 const PHASES: Record<AnthropicReductionState['state']['phase'], string> = { disabled: '已停用', armed: '监测中', reducing: '减仓执行中', completed: '已完成 · 新触发已关闭', review: '已暂停 · 请核对' };
@@ -144,6 +145,7 @@ export default function TradingAnthropicReduction({ shares, onExpired, onStateCh
       {data.live?.warning ? <p className="trading-warning" role="alert">{data.live.warning}</p> : null}
       {data.live ? <div className="trading-anthropic-reduction-live"><p>最近风险检查：{beijingTime(data.live.checkedAt)}（北京时间） · {data.live.met ? '已达到触发阈值' : '未达到触发阈值'}</p><ul>{data.live.legs.map(leg => <li key={`${leg.exchange}:${leg.symbol}:${leg.side}`}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 持仓 {amount(leg.quantity)} 原生单位 · 距强平 {leg.distancePercent !== null ? `${leg.distancePercent}%` : leg.noLiquidation ? '交易所未给出强平价（保证金充足），视为未达阈值' : '未提供'}</li>)}</ul></div> : <p className="trading-muted">尚无自动减仓风险检查结果。两腿都需要新鲜的强平风险数据；交易所明确不给强平价的腿视为未达阈值，其余数据缺失时不会自动发送委托。</p>}
       {data.job ? <div className="trading-anthropic-reduction-progress" aria-label="自动减仓执行进度"><strong>{data.job.status === 'completed' ? '上一轮已完成' : '执行进度'} · 第 {Math.min(data.job.batchIndex + 1, data.job.batchCount)} / {data.job.batchCount} 批</strong><ul>{data.job.legs.map(leg => <li key={leg.id}>{contractLabel(leg)} · {leg.side === 'long' ? '多头' : '空头'} · 已成交 {amount(leg.filledQuantity)} / 目标 {amount(leg.quantity)} · 剩余 {amount(leg.remainingQuantity)} 原生单位</li>)}</ul><p>执行编号：{data.job.id}</p></div> : null}
+      {data.job && ['completed', 'stopped'].includes(data.job.status) ? <TradingExecutionEvidence key={data.job.id} jobId={data.job.id} updatedAt={data.job.updatedAt}/> : null}
       <form onSubmit={event => void write('save', event)} aria-label="ANT 自动减仓设置">
         <fieldset className="trading-anthropic-reduction-fields" disabled={!!busy || executing}>
           {([0, 1] as const).map(index => <label key={index}>{index === 0 ? '减仓多头合约' : '减仓空头合约'}<select value={form.contracts[index]} onChange={event => { const contracts: [string, string] = [...form.contracts]; contracts[index] = event.target.value; edit({ contracts }); }}>{ANTHROPIC_CONTRACTS.map(contract => <option key={contractKey(contract)} value={contractKey(contract)} disabled={contractKey(contract) === form.contracts[1 - index]}>{contract.label}</option>)}</select></label>)}

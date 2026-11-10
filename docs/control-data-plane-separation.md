@@ -323,6 +323,7 @@ API 进程在内嵌模式下不读取 `credentials.key`。交易账户凭据的�
 | `GET /internal/v1/overview`、`GET /internal/v1/overview/events` | 最新首页投影，以及按修订号推送的 NDJSON 流 |
 | `POST /internal/v1/projects/:id/changed` | 模块偏好变化通知，幂等 |
 | `POST /internal/v1/api-stats` | API 上报 SSE 计数（5.8 节） |
+| `GET /internal/v1/agent-feed` | Agent 数据接口的数据面数据集（[说明](agent-feed.md)）：只读内存中的值，不发起外部请求；较早版本的运行时没有该路由，返回 404 |
 | `/internal/v1/forward/*` | 转发的业务路由 |
 
 内部 JSON 响应设上限，初始 4 MiB；转发请求沿用现有路由的请求体上限。
@@ -344,6 +345,7 @@ API 先完成现有的会话、来源与 `Sec-Fetch-Site` 校验，再转发方�
 | `/api/overview`、`/api/overview/events` | API | 使用运行时推送的投影 |
 | `/api/system/updates*` | API | 更新协调器 |
 | `/api/system/architecture`、`/api/system/metrics`、`/api/system/accounts`、`/api/system/recovery`、`/api/system/modules`、`/api/system/event-loop` | 转发 | 模块能力、基线、共享保护库和事件循环卡顿测量都在运行时 |
+| `/api/agent/v1/*`、`/api/system/agent-feed*` | API | Agent 数据接口（[说明](agent-feed.md)）：前者只认只读令牌、不看会话；后者是登录后的令牌管理。快照经 `GET /internal/v1/agent-feed` 读取运行时，5 秒内共用一份 |
 | `/api/trading*` | 转发 | 交易数据、导入、持仓与原生执行；原生执行写入口另有 5.5 节的准入 |
 | Portal 页面与升级连接 | API | 解析模块传输后直连模块 socket（`portal.mjs:221-224` 的 `targetFor` 已是异步函数） |
 | 静态资源 | API | |

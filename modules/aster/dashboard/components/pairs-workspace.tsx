@@ -19,6 +19,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { PairSettings } from '@/components/pair-settings';
+import { PairMarginArchive } from '@/components/pair-margin-archive';
 import { PairAdlPanel } from '@/components/pair-adl-panel';
 import { adlRecoveryBlock } from '@/lib/pair-adl';
 import { PairNotices } from '@/components/pair-notices';
@@ -615,6 +616,7 @@ function PairDetail({
             }}
           />
           <section className="panel" aria-label="保证金平衡状态">
+            <PairMarginArchive key={pair.id} pairId={pair.id} />
             <div className="section-head">
               <h2>保证金平衡</h2>
               <span
@@ -624,6 +626,7 @@ function PairDetail({
               </span>
             </div>
             <div className="execution-live-state" aria-live="polite">
+              {pair.margin.absolute_reserve_enabled ? <p>绝对保留：A 多侧 {pair.margin.long_reserve ?? '0'} USD1 · B 空侧 {pair.margin.short_reserve ?? '0'} USD1；各侧转出时与权益比例保留取较大值。</p> : null}
               <p>
                 {margin?.reason ||
                   (pair.margin.enabled

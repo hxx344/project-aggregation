@@ -9,7 +9,7 @@ import './feishu-digest.css';
 const ROOT = '/api/automation/feishu-digest';
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
 const LEVELS: Record<DigestLevel, string> = { ok: '正常', notice: '提示', idle: '未启用', warn: '需要关注', alert: '需要处理' };
-const RESULTS: Record<DigestHistoryEntry['status'], string> = { sent: '已发送', skipped: '无异常，未发送', failed: '发送失败', uncertain: '结果未知' };
+const RESULTS: Record<DigestHistoryEntry['status'], string> = { generated: '已生成', sending: '发送中', sent: '渠道确认', skipped: '无异常，未发送', failed: '明确失败', uncertain: '结果未知' };
 const dates = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const when = (value: string | number | null) => { const ms = typeof value === 'number' ? value : value ? Date.parse(value) : NaN; return Number.isFinite(ms) ? dates.format(ms) : '—'; };
 const message = (reason: unknown) => reason instanceof Error ? reason.message : '请求失败，请重试。';
@@ -50,6 +50,7 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   const [loadError, setLoadError] = useState('');
   const [actionError, setActionError] = useState('');
   const [notice, setNotice] = useState('');
+  const [reviewId, setReviewId] = useState(''), [reviewNote, setReviewNote] = useState(''), [reviewSource, setReviewSource] = useState('');
   const lifetime = useRef<AbortController | null>(null);
   const generation = useRef(0);
   const previewGeneration = useRef(0);
@@ -189,7 +190,17 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
               {preview.omitted ? <p className="fd-omitted">另有 {preview.omitted} 个模块超出飞书长度限制，不会显示。</p> : null}</div></div> : <p className="lp-table-empty">{previewing ? '正在生成预览' : '暂无预览'}</p>}
         </section>
         <section className="panel lp-section" aria-label="发送记录"><div className="panel-heading"><h2>发送记录</h2><span className="muted">最近 {snapshot.history.length} 次</span></div>
-          {snapshot.history.length ? <ol className="lp-events">{snapshot.history.map((entry, index) => <li key={`${entry.at}:${index}`} className={entry.status === 'failed' || entry.status === 'uncertain' ? 'bad' : ''}><time>{when(entry.at)}</time><span>{RESULTS[entry.status]}</span><span>{entry.kind === 'manual' ? '手动' : '定时'}{entry.attention ? ` · ${entry.attention} 个模块需关注` : ''}{entry.error ? ` · ${entry.error}` : ''}</span></li>)}</ol> : <p className="lp-table-empty">尚无发送记录。</p>}
+          <p className="as-muted">这里核对飞书汇总投递；Monitor 合约机会告警在其提醒记录内核对。人工说明不修改渠道结果、不重发消息。</p>
+          {snapshot.reviewError ? <p role="alert">{snapshot.reviewError}</p> : null}
+          {snapshot.history.length ? <ol className="lp-events">{snapshot.history.map((entry, index) => <li key={entry.id ?? `${entry.at}:${index}`} className={entry.status === 'failed' || entry.status === 'uncertain' ? 'bad' : ''}><time>{when(entry.at)}</time><span>{RESULTS[entry.status]}</span><span>{entry.kind === 'manual' ? '手动' : '定时'}{entry.attention ? ` · ${entry.attention} 个模块需关注` : ''}{entry.error ? ` · ${entry.error}` : ''}
+            {entry.stages?.length ? <small>{entry.stages.map(stage => `${RESULTS[stage.status as DigestHistoryEntry['status']] ?? stage.status} ${when(stage.at)}`).join(' → ')}</small> : null}
+            {entry.reviews?.map(review => <p key={review.id}>人工核对 · {review.actor} · {when(review.at)}：{review.note}（来源：{review.source}）</p>)}
+            {entry.id ? <button type="button" className="as-link" onClick={() => { setReviewId(entry.id!); setReviewNote(''); setReviewSource(''); }}>记录核对说明</button> : null}
+          </span></li>)}</ol> : <p className="lp-table-empty">尚无发送记录。</p>}
+          {reviewId ? <form onSubmit={event => { event.preventDefault(); void execute('review', '/reviews', 'POST', { id: reviewId, note: reviewNote, source: reviewSource }, '核对说明已保存').then(result => { if (result) setReviewId(''); }); }}>
+            <p>投递编号：{reviewId}</p><label className="lp-field">人工核对说明<input required maxLength={500} value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></label>
+            <label className="lp-field">证据来源（勿填写凭据）<input required maxLength={200} value={reviewSource} onChange={event => setReviewSource(event.target.value)} /></label>
+            <button type="submit" className="button secondary" disabled={!!busy}>保存核对说明</button></form> : null}
         </section>
       </div>
     </div>}
