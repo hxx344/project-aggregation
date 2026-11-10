@@ -42,6 +42,20 @@ test('native history starts both reads asynchronously, deduplicates follow-ups a
   assert.equal(f.calls[0][1].end - f.calls[0][1].start, 85 * DAY);
 });
 
+test('native evidence peek never refreshes and discards changed connection identities', async t => {
+  const f = fixture(t); f.bindings[1].connected = true;
+  assert.equal(scope(f.service.peek()).fills.length, 0);
+  await tick(); assert.equal(f.calls.length, 0);
+  f.service.state(); await tick();
+  assert.equal(scope(f.service.peek()).fills.length, 1);
+  f.advance(300_001);
+  assert.equal(scope(f.service.peek()).status, 'stale');
+  await tick(); assert.equal(f.calls.length, 1);
+  f.bindings[1].revision++;
+  assert.deepEqual(scope(f.service.peek()).fills, []);
+  await tick(); assert.equal(f.calls.length, 1);
+});
+
 test('failed refresh preserves rows and success time, uses safe errors and respects retryAt', async t => {
   const f = fixture(t); f.bindings[1].connected = true;
   f.service.state(); await tick(); const original = scope(f.service.state());

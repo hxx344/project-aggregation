@@ -21,7 +21,13 @@ const UNSUPPORTED: Record<FillMarket, string> = { oil: '此交易所或产品范
   anthropic: 'ANT 成交目前仅支持 Binance 与 OKX 永续合约' };
 type ReadPositions = (credentials: Credentials, scope: string, signal: AbortSignal, fetcher: typeof fetch) => Promise<Position[]>;
 type ReadFills = (credentials: Credentials, scope: string, request: FillsRequest, options: { signal: AbortSignal; fetcher: typeof fetch }) => Promise<ReadFill[]>;
+type Metrics = { since: number; reads: number; cacheHits: number; cooldownSkips: number; refreshes: number; requests: number; pages: number;
+  failures: number; truncations: number; conflicts: number; restores: number; durationMs: number };
+const metrics = (since: number, restored = false): Metrics => ({ since, reads: 0, cacheHits: 0, cooldownSkips: 0, refreshes: 0, requests: 0, pages: 0,
+  failures: 0, truncations: 0, conflicts: 0, restores: restored ? 1 : 0, durationMs: 0 });
+const increment = (value: Metrics, key: Exclude<keyof Metrics, 'since'>, amount = 1) => { value[key] = Math.min(Number.MAX_SAFE_INTEGER, value[key] + Math.max(0, amount)); };
 type Entry = {
+  metrics: Metrics;
   market: FillMarket; revision: string; scope: FillsScope; raw: ReadFill[]; touchedAt: number; retryAt: number; cursor: number | null;
   historyCursor: number | null; cacheInvalidated?: boolean;
   snapshotOkAt?: number; snapshotHealthy?: boolean; pending?: Promise<void>; abort?: AbortController;
@@ -163,15 +169,18 @@ export function createFillsService(options: { now?: () => number; deadline?: num
     };
     const job = serial(account.exchange, async () => {
       if (!await valid() || inactive(owner, account, entry.market, entry.scope.id, entry.revision)) return;
+      const startedAt = now(); increment(entry.metrics, 'refreshes');
       let timer: ReturnType<typeof setTimeout> | undefined;
       let onAbort: (() => void) | undefined;
       try {
         const work = async () => {
           const credentials = connectionSchema.parse(await unseal(account.row!.encrypted, owner + ':' + account.key));
           if (credentials.exchange !== account.exchange || !await valid()) throw new Error(FAILED);
-          let requests = 0;
+          let requests = 0, history = false;
           const fetcher: typeof fetch = async (input, init) => {
             if (abort.signal.aborted || ++requests > MAX_REQUESTS) throw new Error(FAILED);
+            increment(entry.metrics, 'requests');
+            if (history) increment(entry.metrics, 'pages');
             return (options.fetcher ?? fetch)(input, { ...init, signal: AbortSignal.any([abort.signal, ...(init?.signal ? [init.signal] : [])]) });
           };
           const snapshotStart = now();
@@ -190,7 +199,9 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           const start = Math.max(lookback, entry.historyCursor === null || backfill ? lookback : Math.min(entry.historyCursor, snapshotAt) - OVERLAP);
           const accountIdentity = entry.market === 'anthropic'
             ? entry.scope.accountIdentity ?? await (options.identity ?? readFillAccountIdentity)(credentials, { signal: abort.signal, fetcher }) : undefined;
+          history = true;
           const incoming = await (options.fills ?? readFills)(credentials, entry.scope.id, { market: entry.market, start, end: snapshotAt }, { signal: abort.signal, fetcher });
+          history = false;
           const raw = mergeFills(entry.raw, incoming, lookback);
           if (raw.some(fill => Date.parse(fill.time) > now() + 60_000)) throw new Error(FAILED);
           const replayed = replayFills(raw, positions, snapshotStart, account.exchange);
@@ -206,6 +217,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
         const { raw, replayed, snapshotAt, positions, lookback, accountIdentity } = result;
         if (entry.market === 'anthropic') entry.attributionVersion = 1;
         const truncated = raw.length > 2000 || (entry.scope.truncated && Date.parse(entry.scope.coverageStart ?? '') > lookback);
+        if (truncated) increment(entry.metrics, 'truncations');
         entry.raw = raw.slice(0, 2000);
         const fills = replayed.fills.slice(0, 2000);
         entry.scope = { ...entry.scope, ...(entry.market === 'anthropic' ? { accountIdentity } : {}), fills, truncated, refreshing: false,
@@ -223,8 +235,10 @@ export function createFillsService(options: { now?: () => number; deadline?: num
         entry.retryScheduled = replayed.skew && entry.automaticRetries < MAX_AUTO_RETRIES;
         if (entries.get(key) === entry && !abort.signal.aborted) await save(database, owner, account, entry);
       } catch (error) {
+        increment(entry.metrics, 'failures');
         // A conflicting stored history must not outlive this process; the next cold read starts over.
         if (error instanceof FillConflict) {
+          increment(entry.metrics, 'conflicts');
           entry.cacheInvalidated = true;
           await forget(database, owner, account.key, slotOf(entry.market, entry.scope.id), entry.revision);
         }
@@ -235,7 +249,7 @@ export function createFillsService(options: { now?: () => number; deadline?: num
           // A later transport failure must not resurrect a cache invalidated by a content conflict.
           if (!entry.cacheInvalidated) await save(database, owner, account, entry);
         }
-      } finally { clearTimeout(timer); if (onAbort) abort.signal.removeEventListener('abort', onAbort); }
+      } finally { increment(entry.metrics, 'durationMs', now() - startedAt); clearTimeout(timer); if (onAbort) abort.signal.removeEventListener('abort', onAbort); }
     }).catch(() => {
       if (entries.get(key) === entry) { entry.scope.status = entry.scope.fetchedAt ? 'stale' : 'error'; entry.scope.error = FAILED; entry.retryAt = now() + RETRY; }
     }).finally(() => {
@@ -273,15 +287,18 @@ export function createFillsService(options: { now?: () => number; deadline?: num
             if (!entry) {
               // Old mode evidence would pin a Binance account to both modes; a clock set back must not postpone refresh.
               const stored = restored.get(key), recent = stored?.snapshotOkAt !== undefined && tick - stored.snapshotOkAt < IDLE;
-              entry = stored ? { market, revision, scope: stored.scope, raw: stored.raw, attributionVersion: stored.attributionVersion, touchedAt: tick,
+              entry = stored ? { metrics: metrics(tick, true), market, revision, scope: stored.scope, raw: stored.raw, attributionVersion: stored.attributionVersion, touchedAt: tick,
                 retryAt: market === 'anthropic' && stored.attributionVersion !== 1 && !stored.scope.error ? -Infinity : Math.min(stored.retryAt, tick + TTL),
                 cursor: stored.cursor, historyCursor: stored.historyCursor === undefined ? stored.cursor : stored.historyCursor,
                 ...(recent ? { snapshotOkAt: stored.snapshotOkAt, snapshotHealthy: stored.snapshotHealthy } : {}), retryScheduled: false, automaticRetries: 0 }
-                : { market, revision, scope: empty(definition, true, true, market), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null, historyCursor: null,
+                : { metrics: metrics(tick), market, revision, scope: empty(definition, true, true, market), raw: [], touchedAt: tick, retryAt: -Infinity, cursor: null, historyCursor: null,
                   retryScheduled: false, automaticRetries: 0 };
               entries.set(key, entry);
             }
             entry.touchedAt = tick;
+            increment(entry.metrics, 'reads');
+            if (entry.scope.fetchedAt) increment(entry.metrics, 'cacheHits');
+            if (!entry.pending && tick < entry.retryAt && entry.scope.error) increment(entry.metrics, 'cooldownSkips');
             if (!entry.pending && tick >= entry.retryAt) refresh(database, owner, account, entry, key, unseal, entry.retryScheduled);
             else arm(database, owner, account, entry, key, unseal);
             const scope = { ...entry.scope, refreshing: !!entry.pending || entry.retryScheduled,
@@ -318,6 +335,28 @@ export function createFillsService(options: { now?: () => number; deadline?: num
         if (fills.length !== scope.fills.length) { scope.truncated = true; scope.coverageStart = fills.at(-1)?.time ?? null; scope.fills = fills; }
       }
       return { schemaVersion: 1, generatedAt: iso(tick), lookbackStart: iso(tick - CYCLE_LOOKBACK_MS), exchanges };
+    },
+    /** Local-only diagnostics. Counters cover each retained connection generation's in-process lifetime,
+     * reset after idle eviction/restart/rebind, saturate at MAX_SAFE_INTEGER, and never reveal account keys. */
+    async diagnostics(database: Database, owner: string) {
+      const accounts = await sourceAccounts(database, owner), tick = now();
+      const groups = new Map<string, { exchange: string; market: FillMarket; scope: string; counters: Metrics; entries: number; historyReady: number; replayReady: number }>();
+      for (const [key, entry] of entries) {
+        const [entryOwner, accountKey] = JSON.parse(key);
+        if (entryOwner !== owner || tick - entry.touchedAt >= IDLE) continue;
+        const account = accounts.find(item => item.key === accountKey);
+        if (!account?.row || revisionOf(account.row.encrypted) !== entry.revision) continue;
+        const groupKey = JSON.stringify([account.exchange, entry.market, entry.scope.id]);
+        if (!groups.has(groupKey) && groups.size >= 128) continue;
+        const group = groups.get(groupKey) ?? { exchange: account.exchange, market: entry.market, scope: entry.scope.id, counters: metrics(entry.metrics.since), entries: 0, historyReady: 0, replayReady: 0 };
+        group.counters.since = Math.min(group.counters.since, entry.metrics.since);
+        for (const name of Object.keys(entry.metrics) as (keyof Metrics)[]) if (name !== 'since') increment(group.counters, name, entry.metrics[name]);
+        group.entries++; if (entry.historyCursor !== null) group.historyReady++; if (entry.cursor !== null) group.replayReady++;
+        groups.set(groupKey, group);
+      }
+      return { version: 1, generatedAt: iso(tick), window: 'retained-entry-lifetime', maxGroups: 128,
+        note: '命中只说明存在缓存，不能证明历史完整；pages 为成交历史 HTTP 请求数（包括失败页），requests 还含持仓与身份读取；failures 为未完成历史更新次数，持仓回放缺证另见 replayReady。换绑/重启/闲置淘汰后重新计数。',
+        groups: [...groups.values()] };
     },
     async idle() { while (jobs.size) await Promise.allSettled([...jobs]); },
     close() { closed = true; for (const [key, entry] of entries) remove(key, entry); },

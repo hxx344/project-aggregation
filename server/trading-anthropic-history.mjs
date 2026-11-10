@@ -42,10 +42,10 @@ export function createAnthropicHistory({ execution, now = Date.now } = {}) {
     });
     tasks.add(entry.pending);
   }
-  function state() {
+  function state(refresh = true) {
     const bindings = connections().filter(binding => Object.hasOwn(VENUES, binding.exchange));
     for (const [exchange, entry] of entries) if (!bindings.some(binding => same(binding, entry.binding))) invalidate(exchange);
-    if (!closed) for (const binding of bindings) read(binding);
+    if (!closed && refresh) for (const binding of bindings) read(binding);
     const exchanges = Object.entries(VENUES).map(([exchange, name]) => {
       const binding = bindings.find(row => row.exchange === exchange), entry = entries.get(exchange);
       const configured = !!binding?.connected && !!binding.identity && !closed, data = configured ? entry?.data : null;
@@ -56,7 +56,7 @@ export function createAnthropicHistory({ execution, now = Date.now } = {}) {
       return { id: exchange, name, accounts: [{ id: data?.accountId ?? 'current', name: exchange === 'rh-lighter' ? '当前实盘连接账户' : '当前实盘连接主账户', configured, revision,
         scopes: [{ id: 'perpetual', label: 'ANT 永续成交', status, refreshing, fetchedAt: data ? entry.fetchedAt : null,
           coverageStart: data?.coverageStart ?? null, coverageEnd: data?.coverageEnd ?? null, truncated: data?.truncated ?? false,
-          error: !configured ? '请先连接该交易所实盘账户' : entry?.error ?? (stale ? '成交数据已过期，正在更新' : null), fills: data?.fills ?? [] }] }] };
+          error: !configured ? '请先连接该交易所实盘账户' : entry?.error ?? (stale ? refreshing ? '成交数据已过期，正在更新' : '成交数据已过期，尚未刷新' : null), fills: data?.fills ?? [] }] }] };
     });
     const checkedAt = [...entries.values()].map(entry => entry.checkedAt).filter(Boolean).sort().at(-1) ?? null;
     return { source: { projectId: 'anthropic-history', name: 'ANT原生成交', status: 'ready', error: null, checkedAt,
@@ -64,5 +64,5 @@ export function createAnthropicHistory({ execution, now = Date.now } = {}) {
     pending: exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.refreshing))) };
   }
   function stop() { closed = true; for (const exchange of entries.keys()) invalidate(exchange); }
-  return { state, stop, close: async () => { stop(); await Promise.allSettled([...tasks]); } };
+  return { state, peek: () => state(false), stop, close: async () => { stop(); await Promise.allSettled([...tasks]); } };
 }

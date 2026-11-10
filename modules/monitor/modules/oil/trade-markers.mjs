@@ -44,7 +44,9 @@ export function tradeDetailLines(marker, formatTime, { priceUnit = '/桶', chart
     `已实现盈亏合计 ${cashText(event.realizedPnl)}（不含手续费）`,
     ...event.fills.map(fill => {
       const parts = byFill.get(fill.key).map(effect => `${effects[effect.effect]} ${effect.quantity} ${fill.quantityUnit}`).join(' → ');
-      return `${formatTime(fill.time)} · ${labels.get(tradeVenueKey(fill))} · ${fill.symbol} · ${parts}${fill.orderId ? ` · 订单 ${fill.orderId}` : ''}`;
+      const reasons = { matched: '已按订单与账户证据关联', 'missing-order': '缺少原订单编号', 'direction-mismatch': '成交方向与任务不符', ambiguous: '本账户有多个候选任务，未关联', 'insufficient-evidence': '订单、合约或账户证据不足，未关联' };
+      const explanation = fill.attribution ? reasons[fill.attribution.reason] : null;
+      return `${formatTime(fill.time)} · ${labels.get(tradeVenueKey(fill))} · ${fill.symbol} · ${parts}${fill.orderId ? ` · 订单 ${fill.orderId}` : ''}${explanation ? ` · ${explanation}${fill.attribution.updatedAt ? `（核对 ${formatTime(fill.attribution.updatedAt)}）` : ''}` : ''}`;
     }),
   ];
 }

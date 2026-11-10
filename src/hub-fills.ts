@@ -12,8 +12,10 @@ export type FillMarket = keyof typeof FILL_MARKETS;
 export type FillsRequest = { requestId: string; market: FillMarket };
 type ScopeStatus = 'unconfigured' | 'loading' | 'live' | 'stale' | 'error' | 'unsupported';
 export type FillExecution = { jobId: string; phase: number; batch: number; comparisonLeg: 'rh' | 'xyz' | 'io'; cex: 'binance' | 'okx' };
+export type FillAttribution = { reason: 'matched' | 'missing-order' | 'direction-mismatch' | 'ambiguous' | 'insufficient-evidence'; updatedAt: string | null };
+export const FILL_ATTRIBUTION_TEXT: Record<FillAttribution['reason'], string> = { matched: '已按订单与账户证据关联', 'missing-order': '缺少原订单编号', 'direction-mismatch': '成交方向与任务不符', ambiguous: '本账户有多个候选任务，未关联', 'insufficient-evidence': '订单、合约或账户证据不足，未关联' };
 export type HubFillItem = {
-  orderId?: string; execution?: FillExecution;
+  orderId?: string; execution?: FillExecution; attribution?: FillAttribution;
   key: string; sourceId: string; source: string; exchangeId: string; exchange: string; accountId: string; account: string; scope: string;
   symbol: string; base: (typeof FILL_MARKETS)[FillMarket][number]; time: string; side: 'buy' | 'sell'; positionSide: 'long' | 'short' | 'net';
   quantity: string; quantityUnit: string; price: string; priceCurrency: string | null;
@@ -133,7 +135,10 @@ export function fillItems(response: unknown, now: number, market: FillMarket = '
             if (orderId !== null && (!orderId || orderId.length > 200 || /[\u0000-\u001f\u007f-\u009f]/.test(orderId))) throw new MalformedFills();
             const execution = market === 'anthropic' && fill.execution != null ? executionOf(fill.execution, exchangeId, symbol) : null;
             if (execution && !orderId) throw new MalformedFills();
-            items.push({ ...(orderId ? { orderId } : {}), ...(execution ? { execution } : {}), key, sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, accountId, account: accountName, scope: scopeId,
+            const rawAttribution = market === 'anthropic' && fill.attribution != null ? object(fill.attribution) : null;
+            const attribution: FillAttribution | null = rawAttribution ? { reason: enumeration(rawAttribution.reason, ['matched', 'missing-order', 'direction-mismatch', 'ambiguous', 'insufficient-evidence'] as const), updatedAt: timestamp(rawAttribution.updatedAt) } : null;
+            if (attribution && (attribution.reason === 'matched') !== !!execution) throw new MalformedFills();
+            items.push({ ...(orderId ? { orderId } : {}), ...(execution ? { execution } : {}), ...(attribution ? { attribution } : {}), key, sourceId: projectId, source: sourceName, exchangeId, exchange: exchangeName, accountId, account: accountName, scope: scopeId,
               symbol, base, time, side: enumeration(fill.side, ['buy', 'sell'] as const), positionSide: enumeration(fill.positionSide, ['long', 'short', 'net'] as const),
               quantity: decimal(fill.quantity, true)!, quantityUnit: enumeration(fill.quantityUnit, [exchangeId === 'okx' ? '张' : exchangeId === 'hyperliquid' ? symbol.split(':')[1] : base]), price: decimal(fill.price, true)!, priceCurrency,
               fee: decimal(fill.fee), feeCurrency: optional(fill.feeCurrency), realizedPnl: decimal(fill.realizedPnl), positionBefore, positionAfter, stale });

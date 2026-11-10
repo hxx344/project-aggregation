@@ -1,4 +1,5 @@
 import type { PositionCycle, TradingPositionsResponse } from './trading-positions-types';
+import { parseCycleEvidence } from '../server/cycle-evidence.mjs';
 
 export const POSITION_MARKETS = ['oil', 'hynix', 'anthropic', 'perpetual'] as const;
 export type PositionMarket = typeof POSITION_MARKETS[number];
@@ -67,9 +68,11 @@ function cycleOf(value: unknown): PositionCycle | null {
   if (value === null) return null;
   const cycle = object(value);
   if (!CYCLE_STATES.has(cycle.status as string)) throw new MalformedPositions();
+  const evidence = cycle.evidence === undefined ? undefined : parseCycleEvidence(cycle.evidence);
+  if (evidence === null) throw new MalformedPositions();
   return { status: cycle.status as PositionCycle['status'], since: optional(cycle.since), closedQuantity: optional(cycle.closedQuantity), closePrice: optional(cycle.closePrice),
     realizedPnl: optional(cycle.realizedPnl), fees: optional(cycle.fees), funding: optional(cycle.funding), net: optional(cycle.net),
-    currency: optional(cycle.currency), note: optional(cycle.note), updatedAt: optional(cycle.updatedAt) };
+    currency: optional(cycle.currency), note: optional(cycle.note), updatedAt: optional(cycle.updatedAt), ...(evidence ? { evidence } : {}) };
 }
 const old = (value: string | null, now: number) => value === null || !Number.isFinite(Date.parse(value)) || now - Date.parse(value) > POSITIONS_STALE_AFTER_MS;
 

@@ -3,6 +3,7 @@ import type { Asset, Withdrawal } from './types.ts';
 import { assetMeasures, compareEmbeddedWithdrawals, embeddedWithdrawals } from './withdrawals.ts';
 import { analyzePositions, positionsOf, type PositionAnalysis, type PositionsCapture } from './daily-positions.ts';
 import { knownAssetValue, knownWorkbookValue, sumKnownValues } from './asset-values.ts';
+import { CASH_FLOW_KEY, intervalCashFlows, readCashFlowAudit, type CashFlowRecord } from './cash-flows.ts';
 
 /** Day-over-day changes of the adjusted asset measure, attributed to ledger rows. */
 export const DAILY_CHANGE_DAYS = 90;
@@ -22,6 +23,7 @@ export type DailyChange = {
   sources: SourceChange[]; partial: boolean;
   /** Null before holdings were recorded with snapshots. */
   positions: PositionAnalysis | null;
+  attribution: { cashFlows: ReturnType<typeof intervalCashFlows>; knownPositionChange: number | null; unexplained: number; note: string };
 };
 export type DailyChangeReport = { today: string; windowStart: string; days: DailyChange[] };
 
@@ -85,7 +87,7 @@ function sourceChanges(previous: ChangeRow[], current: ChangeRow[]): SourceChang
 }
 
 /** Latest day first. Each change compares two observed days and never interpolates missing dates. */
-export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapshot[]; withdrawals: Pick<Withdrawal, 'date' | 'amount'>[]; baselineDate: string; today: string; days?: number }): DailyChangeReport {
+export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapshot[]; withdrawals: Pick<Withdrawal, 'date' | 'amount'>[]; cashFlows?: readonly CashFlowRecord[]; baselineDate: string; today: string; days?: number }): DailyChangeReport {
   const windowStart = shiftDay(input.today, -((input.days ?? DAILY_CHANGE_DAYS) - 1));
   const days = observedDays(input.snapshots, input.today);
   const result: DailyChange[] = [];
@@ -97,6 +99,10 @@ export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapsho
     const heldChange = after.held - before.held;
     const embedded = compareEmbeddedWithdrawals(previous.rows, current.rows);
     const withdrawnChange = cents(embedded.change + after.recorded - before.recorded);
+    const positions = analyzePositions({ previous: previous.positions, current: current.positions, rows: current.rows });
+    const cashFlows = intervalCashFlows(input.cashFlows ?? [], previous.date, current.date);
+    const knownGroups = positions?.groups.filter(group => group.change !== null) ?? [];
+    const knownPositionChange = knownGroups.length ? knownGroups.reduce((sum, group) => sum + group.change!, 0) : null;
     result.push({
       date: current.date, previousDate: previous.date,
       gapDays: Math.round((Date.parse(current.date) - Date.parse(previous.date)) / DAY_MS),
@@ -105,7 +111,10 @@ export function calculateDailyChanges(input: { snapshots: readonly ChangeSnapsho
       // Missing-value range changes and workbook/row-sum differences have no comparable source.
       unattributed: cents(after.adjusted - before.adjusted - withdrawnChange - sources.reduce((sum, source) => sum + source.change, 0)),
       sources, partial: !!previous.partial || !!current.partial || embedded.partial || sumKnownValues(previous.rows).partial || sumKnownValues(current.rows).partial,
-      positions: analyzePositions({ previous: previous.positions, current: current.positions, rows: current.rows }),
+      positions,
+      attribution: { cashFlows, knownPositionChange,
+        unexplained: after.adjusted - before.adjusted - withdrawnChange - (cashFlows.knownNetUsd ?? 0) - (knownPositionChange ?? 0),
+        note: '总变化 = 已标注净资金流 + 已知持仓贡献 + 出金加回 + 未解释差额。缺失分项未被认定为零；差额包含未登记资金流、估值和周期证据缺口，不命名为交易收益。快照内兑 USD 价格缺少独立时效元数据，无法证明其当时新鲜。' },
     });
   }
   return { today: input.today, windowStart, days: result.reverse() };
@@ -133,11 +142,12 @@ export async function readDailyChanges(database: ChangeDatabase, owner: string, 
   const today = new Date(now + 8 * 3_600_000).toISOString().slice(0, 10);
   const windowStart = shiftDay(today, -(days - 1));
   // The window needs the latest earlier daily snapshot as the first comparison base.
-  const [source, inWindow, before, withdrawals] = await Promise.all([
+  const [source, inWindow, before, withdrawals, cashFlows] = await Promise.all([
     database.prepare("SELECT value FROM settings WHERE owner = ? AND key = 'source-ledger'").bind(owner).first<{ value: string }>(),
     database.prepare(`SELECT data FROM snapshots WHERE owner = ? AND ${DAILY_KEY} AND date >= ? AND date <= ? ORDER BY date`).bind(owner, windowStart, today).all<{ data: string }>(),
     database.prepare(`SELECT data FROM snapshots WHERE owner = ? AND ${DAILY_KEY} AND date < ? ORDER BY date DESC LIMIT 1`).bind(owner, windowStart).first<{ data: string }>(),
     database.prepare("SELECT value FROM settings WHERE owner = ? AND key = 'withdrawals'").bind(owner).first<{ value: string }>(),
+    database.prepare('SELECT value FROM settings WHERE owner = ? AND key = ?').bind(owner, CASH_FLOW_KEY).first<{ value: string }>(),
   ]);
   const ledger: StoredSource = source ? JSON.parse(source.value) : {};
   const original = (ledger.periods ?? []).map(({ rows, ...period }) => ({ ...period, rows: rowsOf(rows, true) }));
@@ -145,5 +155,5 @@ export async function readDailyChanges(database: ChangeDatabase, owner: string, 
     const { assets, positions, ...snapshot } = JSON.parse(row.data) as StoredSnapshot;
     return { ...snapshot, rows: rowsOf(assets), positions: positionsOf(positions) };
   });
-  return calculateDailyChanges({ snapshots: [...original, ...daily], withdrawals: withdrawals ? JSON.parse(withdrawals.value) : [], baselineDate: ledger.baselineDate ?? '', today, days });
+  return calculateDailyChanges({ snapshots: [...original, ...daily], withdrawals: withdrawals ? JSON.parse(withdrawals.value) : [], cashFlows: readCashFlowAudit(cashFlows?.value), baselineDate: ledger.baselineDate ?? '', today, days });
 }

@@ -26,6 +26,14 @@ function cashId(value: unknown): string {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? String(value) : identifier(value);
 }
 const signedCurrent = (position: Position) => position.side === 'short' ? negate(position.quantity) : position.quantity;
+function feeValue(value: unknown, parse = decimal) {
+  if (value === undefined || value === null || value === '') throw new CycleUnavailable('缺少手续费证据，本轮净额不可计算');
+  return parse(value);
+}
+function feeCurrency(value: unknown) {
+  if (value === undefined || value === null || value === '') throw new CycleUnavailable('缺少手续费币种，本轮净额不可计算');
+  return text(value);
+}
 
 /** Reads pages newest first until the fill that opened the current position is found or the lookback is exhausted. */
 async function walk(request: CycleRequest, now: number, next: () => Promise<CycleFill[] | null>) {
@@ -39,14 +47,15 @@ async function walk(request: CycleRequest, now: number, next: () => Promise<Cycl
   }
   if (fills.some(fill => fill.time >= request.snapshotAt - SNAPSHOT_SKEW_MS)) throw new CycleRetry();
   const lookbackStart = now - CYCLE_LOOKBACK_MS;
-  return { current, located, fills: located ? fills.slice(0, located.index + 1) : fills, since: located ? fills[located.index].time : lookbackStart };
+  return { current, located, fills: located ? fills.slice(0, located.index + 1) : fills,
+    excludedFills: located ? fills.slice(located.index + 1) : [], since: located ? fills[located.index].time : lookbackStart };
 }
 
 type Walked = Awaited<ReturnType<typeof walk>>;
 function finish(request: CycleRequest, walked: Walked, cash: CycleCash[], fundingAttributable: boolean, now: number): PositionCycle {
   return summarizeCycle({ current: walked.current, currency: request.position.pnlCurrency, fills: walked.fills, cash,
     complete: walked.located !== null, openingFraction: walked.located?.openingFraction ?? null, since: walked.since,
-    fundingAttributable, notes: [], updatedAt: new Date(now).toISOString() });
+    fundingAttributable, notes: [], updatedAt: new Date(now).toISOString(), excludedFills: walked.excludedFills });
 }
 const opposed = (request: CycleRequest) => request.siblings.some(item => item.instrumentId === request.position.instrumentId && item.side !== request.position.side);
 
@@ -63,7 +72,7 @@ async function binanceCycle(c: BinanceCredential, scope: string, request: CycleR
     if (row.positionSide !== 'BOTH' && row.positionSide !== own) throw new Error(POSITIONS_INVALID);
     // commission is the charged amount (positive), so the cash flow is its negation; a rebate arrives negative.
     return [{ id: identifier(row.id), time, side: row.side === 'BUY' ? 'buy' : 'sell', quantity: positive(row.qty), price: positive(row.price),
-      realizedPnl: decimal(row.realizedPnl), fee: negate(decimal(row.commission)), feeCurrency: text(row.commissionAsset) }];
+      realizedPnl: decimal(row.realizedPnl), fee: negate(feeValue(row.commission)), feeCurrency: feeCurrency(row.commissionAsset) }];
   })));
   const cash: CycleCash[] = [];
   for (let start = walked.since; start <= now; start += WEEK) {
@@ -97,7 +106,7 @@ async function bybitCycle(c: BybitCredential, scope: string, request: CycleReque
           if (row.side !== 'Buy' && row.side !== 'Sell') throw new Error(POSITIONS_INVALID);
           // cashFlow is the realized trading PnL; fee is positive when charged; size is the signed position afterwards.
           fills.push({ id, time, side: row.side === 'Buy' ? 'buy' : 'sell', quantity: positive(bybitAmount(row.qty)), price: positive(bybitAmount(row.tradePrice)),
-            realizedPnl: bybitAmount(row.cashFlow), fee: negate(bybitAmount(row.fee)), feeCurrency: currency, sizeAfter: bybitAmount(row.size), order: order++ });
+            realizedPnl: bybitAmount(row.cashFlow), fee: negate(feeValue(row.fee, bybitAmount)), feeCurrency: currency, sizeAfter: bybitAmount(row.size), order: order++ });
         } else if (row.type === 'SETTLEMENT') {
           // funding already carries its cash-flow sign; USDC session settlement realizes PnL through cashFlow.
           cash.push({ id: id + ':funding', time, kind: 'funding', amount: bybitAmount(row.funding), currency });
@@ -144,7 +153,7 @@ async function okxCycle(c: OkxCredential, request: CycleRequest, options: CycleO
       if (row.posSide !== 'net' && row.posSide !== position.side) throw new Error(POSITIONS_INVALID);
       // fillSz is in contracts, like the position; fee is already a signed cash flow.
       result.push({ id: billId, time, side: row.side, quantity: positive(row.fillSz), price: positive(row.fillPx),
-        realizedPnl: decimal(row.fillPnl), fee: decimal(row.fee), feeCurrency: text(row.feeCcy) });
+        realizedPnl: decimal(row.fillPnl), fee: feeValue(row.fee), feeCurrency: feeCurrency(row.feeCcy) });
     }
     return result;
   };
@@ -171,6 +180,6 @@ export async function readPositionCycle(credentials: Credentials, scope: string,
     if (error instanceof CycleRetry || options.signal?.aborted) throw error;
     const message = error instanceof Error ? error.message : '';
     return cycleUnavailable(error instanceof CycleUnavailable || message === CYCLE_MISMATCH || message === CYCLE_CURRENCY ? message
-      : message === POSITIONS_INVALID ? '交易所成交数据格式无法识别，暂不统计本轮' : '本轮成交读取失败，稍后重试', at());
+      : message === POSITIONS_INVALID ? '交易所成交数据格式无法识别，暂不统计本轮' : '本轮成交或资金费分页未完成，稍后重试', at());
   }
 }

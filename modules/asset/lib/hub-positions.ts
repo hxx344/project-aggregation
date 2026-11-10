@@ -8,6 +8,7 @@ import type { HubPositions, Position, PositionCycle, PositionsScope } from './po
 import type { SnapshotScope } from './daily-positions.ts';
 import { POSITIONS_FAILED } from './positions-values.ts';
 import { cycleUnavailable } from './positions-cycle.ts';
+import { boundPositionEvidence } from './positions-evidence.ts';
 import { cycleSupported, CycleRetry, readPositionCycle } from './positions-cycle-readers.ts';
 import type { CycleRequest } from './positions-cycle-readers.ts';
 import { readBinancePositions, readBybitPositions, readOkxPositions, readAsterPositions } from './positions-readers.ts';
@@ -215,7 +216,7 @@ export function createPositionsService(options: { now?: () => number; ttl?: numb
         const row = latest.results.find(item => item.exchange === account.key);
         if ((row?.encrypted ?? null) !== (account.row?.encrypted ?? null)) throw new Error(POSITIONS_FAILED);
       }
-      return { schemaVersion: 1, generatedAt: new Date(now()).toISOString(), exchanges };
+      return boundPositionEvidence({ schemaVersion: 1, generatedAt: new Date(now()).toISOString(), exchanges });
     },
     /** Cached scopes for daily snapshots; never starts a read and does not keep idle entries alive. */
     async peek(database: Database, owner: string): Promise<SnapshotScope[]> {

@@ -46,6 +46,17 @@ test('same order number on another UID, scope, contract, side or position direct
   delete f.scope.accountIdentity; assert.equal(f.run().fills[0].execution, undefined);
 });
 
+test('public attribution reasons reflect the actual branch without revealing foreign account candidates', t => {
+  const f = fixture(t);
+  assert.equal(f.run().fills[0].attribution.reason, 'matched');
+  f.fill.side = 'buy'; assert.equal(f.run().fills[0].attribution.reason, 'direction-mismatch');
+  f.scope.accountIdentity = hash('binance', 'foreign');
+  assert.equal(f.run().fills[0].attribution.reason, 'insufficient-evidence');
+  f.fill.orderId = 'unseen'; assert.equal(f.run().fills[0].attribution.reason, 'insufficient-evidence');
+  delete f.fill.orderId; assert.equal(f.run().fills[0].attribution.reason, 'missing-order');
+  assert.equal(JSON.stringify(f.run()).includes('foreign'), false);
+});
+
 test('resumed single remaining leg retains original combination and consumed preview account evidence', t => {
   const f = fixture(t);
   f.db.prepare('INSERT INTO execution_previews VALUES (?,?)').run(JOB, JSON.stringify(f.job.plan));
@@ -64,6 +75,7 @@ test('conflicting account evidence and duplicate task claims never choose the fi
   f.db.exec('DELETE FROM execution_previews');
   f.saveJob({ ...f.job, id: OTHER }); f.saveOrder({ ...f.order, jobId: OTHER }, 'other');
   assert.equal(f.run().fills[0].execution, undefined);
+  assert.equal(f.run().fills[0].attribution.reason, 'ambiguous');
 });
 
 test('RH native attribution binds the current connection revision as well as its L1 identity', t => {

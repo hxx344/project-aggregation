@@ -104,6 +104,8 @@ test('an int64 Binance funding tranId still counts, and malformed fills get a fo
   assert.equal(cycle.status, 'complete'); assert.equal(cycle.funding, '0.3');
   const malformed = await read([{ ...trades[0], price: 3000 }]);
   assert.equal(malformed.status, 'unavailable'); assert.match(malformed.note!, /格式无法识别/);
+  const missingFee = await read([{ ...trades[0], commission: undefined }]);
+  assert.equal(missingFee.fees, null); assert.equal(missingFee.net, null); assert.match(missingFee.note!, /缺少手续费/);
 });
 test('Bybit reads the unified ledger with cursor pages, checks each post-trade size and counts settlement funding', async () => {
   const row = (id: string, time: number, extra: Record<string, unknown>) => ({ id, symbol: 'SOLUSDT', category: 'linear', currency: 'USDT', transactionTime: String(time), ...extra });
