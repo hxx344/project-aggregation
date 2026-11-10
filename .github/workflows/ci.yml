@@ -130,6 +130,33 @@ jobs:
       - name: Verify module selection, cache relocation and incremental type errors
         run: node --test --test-concurrency=2 deploy/test-module-builds.mjs deploy/test-typecheck-cache.mjs
 
+  platform-executor:
+    name: Unified platform executor prototype (simulated venues only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: platform/executor
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.1.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.15.0'
+          cache: pnpm
+      # Only the root TypeScript compiler is needed; the prototype has no dependencies.
+      - run: pnpm install --frozen-lockfile
+        working-directory: .
+      - name: Type check
+        run: ../../node_modules/.bin/tsc -p tsconfig.json
+      - name: Execution, recovery, fault injection and HTTP boundary tests
+        run: node --test --test-concurrency=2 test/*.test.ts
+      # Hosted runners are not the target server: a missed budget (exit 2) is reported,
+      # not gating. Jobs that fail to complete (exit 3) or a crash still fail the step.
+      - name: Mixed-load measurement (budgets informational)
+        timeout-minutes: 5
+        run: node scripts/measure.ts || test $? -eq 2
+
   aster-python:
     name: Aster Python unit tests (${{ matrix.part }}, locked dependencies)
     runs-on: ubuntu-24.04
@@ -426,7 +453,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, options-backtest, main-watch, release-mirror]
+    needs: [app, build-tooling, platform-executor, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, options-backtest, main-watch, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

@@ -1,0 +1,24 @@
+// Seeded simulated venues shared by the entry point, the load measurement and
+// the tests. Venue state lives in memory and is lost when the process exits.
+import { SimulatedVenue } from './sim-venue.ts';
+
+export const SIM_ACCOUNTS = { binance: 'BN1001', bybit: 'BY2002' } as const;
+
+export function createSimulatedVenues(clock: () => number): { binance: SimulatedVenue; bybit: SimulatedVenue } {
+  const binance = new SimulatedVenue('binance', clock);
+  const bybit = new SimulatedVenue('bybit', clock);
+  const rules = { kind: 'linear-perpetual' as const, settleAsset: 'USDT' as const, contractSize: '1', tickSize: '0.01', maxQuantity: '10000', maxMarketQuantity: '1000', minNotional: '5', catalogVersion: 'sim-1' };
+  binance.listInstrument({ ...rules, symbol: 'CLUSDT', quantityStep: '0.01', minQuantity: '0.01' }, { bid: '70.00', ask: '70.02' });
+  binance.listInstrument({ ...rules, symbol: 'BZUSDT', quantityStep: '0.01', minQuantity: '0.01' }, { bid: '74.10', ask: '74.12' });
+  binance.listInstrument({ ...rules, symbol: 'ANTHROPICUSDT', quantityStep: '0.001', minQuantity: '0.001' }, { bid: '410.5', ask: '410.9' });
+  bybit.listInstrument({ ...rules, symbol: 'CLUSDT', quantityStep: '0.1', minQuantity: '0.1' }, { bid: '70.05', ask: '70.07' });
+  bybit.listInstrument({ ...rules, symbol: 'BZUSDT', quantityStep: '0.1', minQuantity: '0.1' }, { bid: '74.15', ask: '74.17' });
+  binance.openAccount(SIM_ACCOUNTS.binance, { CLUSDT: 'one-way', BZUSDT: 'one-way', ANTHROPICUSDT: 'one-way' });
+  bybit.openAccount(SIM_ACCOUNTS.bybit, { CLUSDT: 'one-way', BZUSDT: 'one-way' });
+  return { binance, bybit };
+}
+
+export const SIM_BINDINGS = [
+  { venue: 'binance', environment: 'simulated', accountId: SIM_ACCOUNTS.binance, accountMode: 'standard', credentialVersion: 1 },
+  { venue: 'bybit', environment: 'simulated', accountId: SIM_ACCOUNTS.bybit, accountMode: 'unified', credentialVersion: 1 },
+] as const;
