@@ -98,6 +98,7 @@ export type AnthropicSummaryUpdate = {
   premiums: Partial<Record<AnthropicComparisonLeg, number | null>>;
   /** Comparison contract the trend follows. */
   trendLeg: string;
+  sharesNote?: string;
   fetchedAt: string | null;
   staleAfterMs?: number;
   history?: TrendHistory;
@@ -109,7 +110,7 @@ export function anthropicSummary(update?: AnthropicSummaryUpdate, trend?: Monito
     fetchedAt: update?.fetchedAt ?? null,
     staleAfterMs: getQuoteStaleAfterMs({ collection: { maxAgeMs: update?.staleAfterMs } }, 35_000),
     metrics: ANTHROPIC_COMPARISON_LEGS.map(leg => metric(`溢价 · ${ANTHROPIC_LEGS[leg].name}`, update?.premiums[leg], 2, "%")),
-    note: `Binance 每股价格相对 Hyperliquid / Lighter RH · 走势取 ${update?.trendLeg ?? ANTHROPIC_LEGS[ANTHROPIC_COMPARISON_LEGS[0]].name}`,
+    note: `Binance 每股价格相对 Hyperliquid / Lighter RH · 走势取 ${update?.trendLeg ?? ANTHROPIC_LEGS[ANTHROPIC_COMPARISON_LEGS[0]].name}${update?.sharesNote ? ` · ${update.sharesNote}` : ''}`,
     trend: trend ?? createTrend(update?.history, anthropicTrendOptions, update?.status === "error"),
   };
 }

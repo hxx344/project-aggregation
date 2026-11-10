@@ -9,6 +9,7 @@ import { navigation } from './hub-state';
 import type { FramePhase, NavigationQuery } from './hub-state';
 import { createPositionsSource, EXECUTION_LEG_MARKETS, openTradingRequest, POSITIONS_CAPABILITIES, POSITIONS_TIMEOUT_MS, positionsReply, positionsRequest, withExecutionLegs } from './hub-positions';
 import { FILLS_CAPABILITIES, FILLS_CACHE_MS, FILLS_TIMEOUT_MS, fillsCacheMs, fillsReply, fillsRequest, type FillMarket } from './hub-fills';
+import { observeSharesChanges, readMonitorShares } from './trading-preferences';
 
 const PAGE_LOAD_TIMEOUT_MS = 30_000;
 const PAGE_LOAD_TIMEOUT = '项目页面加载超时，请重新载入或检查该项目服务。';
@@ -34,7 +35,8 @@ export default function ProjectPage({ project, snapshot, now, active, background
   const sentNavigation = useRef('');
   // Only Monitor may read account positions/fills through the host.
   const positionsBridge = POSITIONS_BRIDGE_ENABLED && project.id === 'monitor';
-  const hostCapabilities = positionsBridge ? [...HOST_CAPABILITIES, ...POSITIONS_CAPABILITIES, ...FILLS_CAPABILITIES] : HOST_CAPABILITIES;
+  const sharesBridge = project.id === 'monitor';
+  const hostCapabilities = [...HOST_CAPABILITIES, ...(positionsBridge ? [...POSITIONS_CAPABILITIES, ...FILLS_CAPABILITIES] : []), ...(sharesBridge ? ['anthropic-shares'] : [])];
   const moduleCapabilities = useRef<string[]>([]);
   // Advances whenever the iframe document may have changed, so late replies never reach a newer document.
   const documentGeneration = useRef(0);
@@ -44,12 +46,13 @@ export default function ProjectPage({ project, snapshot, now, active, background
   const latest = useRef({ active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading });
   latest.current = { active, backgroundUpdates, query, onStatus, onChanged, onNavigate, onOpenTrading };
   const post = (value: object) => { if (proxied && source) frame.current?.contentWindow?.postMessage({ channel: 'project-hub', version: 1, ...value }, new URL(source.url).origin); };
+  const shareAssumptions = () => sharesBridge ? { anthropicShares: readMonitorShares() } : {};
   function synchronize() {
     if (!connected.current) return;
     const visible = latest.current.active && document.visibilityState === 'visible';
     // Temporarily reserve background reads for the foreground document load;
     // retain normal low-frequency background updates once that load is ready.
-    post({ type: 'activity', active: visible, backgroundUpdates: latest.current.backgroundUpdates });
+    post({ type: 'activity', active: visible, backgroundUpdates: latest.current.backgroundUpdates, ...shareAssumptions() });
     const next = latest.current.query;
     const key = next === undefined ? '' : JSON.stringify(next);
     if (!latest.current.active) { sentNavigation.current = ''; return; }
@@ -68,7 +71,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
         // previous connection, without looping with unsupported legacy peers.
         const acknowledge = !acknowledged.current || (!supportsActivity && connected.current);
         if (!supportsActivity) { connected.current = false; sentNavigation.current = ''; moduleCapabilities.current = []; setBridgeReady(false); }
-        if (acknowledge) { acknowledged.current = true; post({ type: 'ready', role: 'host', capabilities: hostCapabilities }); }
+        if (acknowledge) { acknowledged.current = true; post({ type: 'ready', role: 'host', capabilities: hostCapabilities, ...shareAssumptions() }); }
         if (!supportsActivity) return;
         moduleCapabilities.current = hostCapabilities.filter(value => (data.capabilities as unknown[]).includes(value));
         connected.current = true; setBridgeReady(true); setLoading(false);
@@ -106,7 +109,8 @@ export default function ProjectPage({ project, snapshot, now, active, background
       }
     }
     window.addEventListener('message', message); document.addEventListener('visibilitychange', synchronize);
-    return () => { window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
+    const stopShares = sharesBridge ? observeSharesChanges(synchronize) : () => {};
+    return () => { stopShares(); window.removeEventListener('message', message); document.removeEventListener('visibilitychange', synchronize); };
   }, [proxied, source]);
   useEffect(synchronize, [active, backgroundUpdates, query, source]);
   useEffect(() => () => { documentGeneration.current++; positions.current?.dispose(); positions.current = null; executionLegs.current?.dispose(); executionLegs.current = null; for (const source of Object.values(fills.current)) source.dispose(); fills.current = {}; }, []);
@@ -156,7 +160,7 @@ export default function ProjectPage({ project, snapshot, now, active, background
     // when an earlier document (or its ready-before-load event) was connected.
     connected.current = false; acknowledged.current = false; sentNavigation.current = ''; moduleCapabilities.current = []; documentGeneration.current++; setBridgeReady(false);
     setError(value => value === PAGE_LOAD_TIMEOUT ? '' : value);
-    post({ type: 'ready', role: 'host', capabilities: hostCapabilities });
+    post({ type: 'ready', role: 'host', capabilities: hostCapabilities, ...shareAssumptions() });
   }
 
   async function openInTab() {

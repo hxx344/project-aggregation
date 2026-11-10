@@ -25,6 +25,8 @@ type HistoryEntry = { at: string; status: 'sent' | 'failed' | 'uncertain'; count
 type WatchState = { generatedAt: string; sources: SourceState[]; alerts: { config: AlertConfig; channel: { configured: boolean; source: 'own' | 'digest' | null; host: string | null; error: string | null }; history: HistoryEntry[]; error: string | null; staleAfterSeconds: number; hysteresisPercent: number } };
 
 const BASE = '/api/trading/anthropic';
+// Matches the watch service's LIVE_MS; the alert interruption threshold is a separate policy.
+const POSITION_STALE_MS = 75_000;
 const NAMES: Record<Source, string> = { binance: 'Binance', okx: 'OKX', hyperliquid: 'Hyperliquid', 'rh-lighter': 'Lighter RH' };
 const STATES: Record<ReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
 const SCOPES: Record<string, string> = { standard: '标准合约', 'portfolio-margin': '组合保证金', cross: '全仓', isolated: '逐仓', agent: '主账户', 'api-key': '指定子账户' };
@@ -51,13 +53,14 @@ export default function TradingAnthropicPositions({ shares, onExpired, onOvervie
   // Save and test failures stay until the next write; the polling read clears only its own error.
   const [writeError, setWriteError] = useState<string | null>(null);
   const [offline, setOffline] = useState(!navigator.onLine), [protectionPending, setProtectionPending] = useState(false);
+  const [overviewInvalidated, setOverviewInvalidated] = useState(false);
   const [, setClock] = useState(0);
   const mounted = useRef(true), expires = useRef(onExpired), reading = useRef<AbortController | null>(null);
   const generation = useRef(0), writing = useRef(false), reductionWriting = useRef(false), receivedAt = useRef(0), transportMs = useRef(0);
   expires.current = onExpired;
   const accept = useCallback((value: WatchState, elapsed: number) => {
     receivedAt.current = performance.now(); transportMs.current = Math.max(0, elapsed);
-    setData(value); setError(null); setProtectionPending(reductionWriting.current);
+    setData(value); setError(null); setProtectionPending(reductionWriting.current); setOverviewInvalidated(false);
   }, []);
 
   const load = useCallback(async () => {
@@ -82,7 +85,7 @@ export default function TradingAnthropicPositions({ shares, onExpired, onOvervie
     let timer: ReturnType<typeof setTimeout>;
     const poll = () => { void load(); timer = setTimeout(poll, document.hidden ? 60_000 : 10_000); };
     const wake = () => { setOffline(!navigator.onLine); setClock(value => value + 1); if (!document.hidden) { clearTimeout(timer); poll(); } };
-    const disconnected = () => { setOffline(true); setProtectionPending(true); generation.current++; reading.current?.abort(); reading.current = null; };
+    const disconnected = () => { setOffline(true); setProtectionPending(true); setOverviewInvalidated(true); generation.current++; reading.current?.abort(); reading.current = null; };
     const clock = setInterval(() => { if (!document.hidden) setClock(value => value + 1); }, 1000);
     poll();
     document.addEventListener('visibilitychange', wake);
@@ -127,17 +130,21 @@ export default function TradingAnthropicPositions({ shares, onExpired, onOvervie
   const dirty = !!draft && !!config && (draft.enabled !== config.enabled || Number(draft.threshold) !== config.thresholdPercent || Number(draft.repeat) !== config.repeatMinutes);
   const serverNow = data ? Date.parse(data.generatedAt) + transportMs.current + Math.max(0, performance.now() - receivedAt.current) : NaN;
   const protectionUnavailable = !!error || offline || protectionPending;
+  const overviewStale = offline || overviewInvalidated || !!data?.sources.some(source => source.connected && source.state === 'live' &&
+    (!source.fetchedAt || !Number.isFinite(Date.parse(source.fetchedAt)) || serverNow - Date.parse(source.fetchedAt) > POSITION_STALE_MS));
   // The 价差下单 overview reuses this panel's polled read instead of starting a second one.
   const overview = useMemo<OverviewMarket>(() => {
     const sources = data?.sources ?? [], connected = sources.filter(source => source.connected);
     const finite = Number.isFinite(longShares) && Number.isFinite(shortShares);
     return {
       id: 'anthropic', name: 'Anthropic', venues: connected.length ? connected.map(source => NAMES[source.exchange]).join(' · ') : '未连接下单账户',
-      state: data ? worstState(sources.map(source => source.state)) : error ? 'error' : 'loading',
+      state: data ? worstState([...sources.map(source => source.state), ...(overviewStale ? ['stale' as const] : [])]) : error ? 'error' : 'loading',
       fetchedAt: oldestRead(connected.map(source => source.fetchedAt)),
       rows: positions.map(position => ({
         id: position.id, exchange: `${NAMES[position.exchange]}${position.account === undefined ? '' : ` · 账户 ${position.account}`}`, symbol: position.symbol,
         side: position.side, quantity: position.quantity, unit: position.quantityUnit ?? '', notional: position.notional, unrealizedPnl: position.unrealizedPnl,
+        // This watch response does not identify Hyperliquid's settlement coin.
+        pnlCurrency: position.exchange === 'hyperliquid' ? null : position.exchange === 'rh-lighter' ? 'USDG' : 'USDT',
         distancePercent: (position.riskUnknown ?? position.markPrice === null) ? null : position.distancePercent,
         near: position.distancePercent !== null && threshold !== null && Number(position.distancePercent) <= threshold,
       })),
@@ -145,7 +152,7 @@ export default function TradingAnthropicPositions({ shares, onExpired, onOvervie
       error: error ?? sources.find(source => source.error)?.error ?? null,
       empty: !data ? error ? '读取失败，稍后自动重试。' : '正在读取…' : !connected.length ? '在下方「组合交易」连接实盘账户后显示。' : sources.some(source => source.state === 'live') ? '无持仓' : '暂无可确认的仓位数据',
     };
-  }, [data, error, positions, longShares, shortShares, threshold]);
+  }, [data, error, positions, longShares, shortShares, threshold, overviewStale]);
   useEffect(() => { onOverview?.(overview); }, [overview, onOverview]);
 
   return <section className="trading-panel trading-positions trading-anthropic-positions" aria-labelledby="trading-anthropic-title">

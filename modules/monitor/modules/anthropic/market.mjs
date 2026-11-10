@@ -3,7 +3,7 @@ import { requestInfo } from '../oil/hyperliquid.mjs';
 
 /**
  * Anthropic pre-IPO perpetuals on Binance, Hyperliquid and Lighter RH quote different units, so every
- * comparison is per share. Shares per native unit mirror the trading page defaults
+ * comparison is per share. Standalone defaults mirror the trading page defaults
  * (src/trading-anthropic.ts DEFAULT_SHARES, server/trading-execution-plan.mjs SHARE_BASIS):
  * Binance quotes valuation per 1B outstanding shares (12.7B outstanding -> 12.7 shares per unit),
  * Entropy io:ANTH per 1B fully diluted shares (16.7B -> 16.7 shares), trade.xyz xyz:ANT is one share.
@@ -13,6 +13,7 @@ import { requestInfo } from '../oil/hyperliquid.mjs';
  * https://docs.lighter.xyz/trading/real-world-assets-rwas/pre-ipo-markets
  * These are listing assumptions, not exchange facts; a different share count shifts the premium.
  */
+/** @typedef {{ outstanding: number, diluted: number }} AnthropicShares */
 export const ANTHROPIC_SHARES = Object.freeze({ outstanding: 12.7, diluted: 16.7 });
 export const ANTHROPIC_LEGS = Object.freeze({
   binance: Object.freeze({ exchange: 'binance', symbol: 'ANTHROPICUSDT', name: 'Binance', venue: 'Binance', label: 'Binance ANTHROPICUSDT', sharesPerUnit: ANTHROPIC_SHARES.outstanding, basis: '流通股 127 亿' }),
@@ -94,16 +95,32 @@ export function legError(error) {
   return '响应无效或网络失败';
 }
 
-/** Per-share price of a native quote. @param {AnthropicLegKey} leg @param {number} price */
-export const perShare = (leg, price) => price / ANTHROPIC_LEGS[leg].sharesPerUnit;
+/**
+ * The current display assumptions, in billions; null means the host has not supplied valid settings.
+ * @param {AnthropicLegKey} leg @param {AnthropicShares | null} shares
+ * @returns {number | null}
+ */
+export function anthropicSharesPerUnit(leg, shares = ANTHROPIC_SHARES) {
+  if (!shares || !Number.isFinite(shares.outstanding) || !Number.isFinite(shares.diluted)
+    || shares.outstanding < 1 || shares.diluted > 100 || shares.diluted < shares.outstanding) return null;
+  return leg === 'binance' ? shares.outstanding : leg === 'xyz' ? 1 : shares.diluted;
+}
+/** Per-share price of a native quote. @param {AnthropicLegKey} leg @param {number} price @param {AnthropicShares | null} shares */
+export function perShare(leg, price, shares = ANTHROPIC_SHARES) {
+  const units = anthropicSharesPerUnit(leg, shares);
+  return units !== null && Number.isFinite(price) && price > 0 ? price / units : null;
+}
 /**
  * Binance per-share premium over a comparison leg, in percent; null when either side is missing.
  * @param {number | null | undefined} binance @param {number | null | undefined} other @param {AnthropicComparisonLeg} leg
+ * @param {AnthropicShares | null} shares
  * @returns {number | null}
  */
-export function anthropicPremium(binance, other, leg) {
+export function anthropicPremium(binance, other, leg, shares = ANTHROPIC_SHARES) {
   if (!binance || !other || !(binance > 0) || !(other > 0)) return null;
-  const value = (perShare('binance', binance) / perShare(leg, other) - 1) * 100;
+  const left = perShare('binance', binance, shares), right = perShare(leg, other, shares);
+  if (left === null || right === null) return null;
+  const value = (left / right - 1) * 100;
   return Number.isFinite(value) ? value : null;
 }
 
@@ -451,13 +468,15 @@ export async function fetchAnthropicCandles(existing = null, { fetcher = fetch, 
  * Chart rows against one comparison leg: A = Binance per share, B = the leg per share; rows missing either are skipped.
  * @param {AnthropicCandleRow[]} rows
  * @param {AnthropicComparisonLeg} leg
+ * @param {AnthropicShares | null} shares
  * @returns {{ time: number, adr: number, ordinary: number, equivalent: number, spread: number, premium: number }[]}
  */
-export function anthropicChartRows(rows, leg) {
+export function anthropicChartRows(rows, leg, shares = ANTHROPIC_SHARES) {
   return rows.flatMap(row => {
     const binance = row.binance, other = row[leg];
     if (binance === null || other === null) return [];
-    const adr = perShare('binance', binance), equivalent = perShare(leg, other);
+    const adr = perShare('binance', binance, shares), equivalent = perShare(leg, other, shares);
+    if (adr === null || equivalent === null) return [];
     return [{ time: row.time, adr, ordinary: other, equivalent, spread: adr - equivalent, premium: (adr / equivalent - 1) * 100 }];
   });
 }

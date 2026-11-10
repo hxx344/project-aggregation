@@ -118,10 +118,7 @@ function AnthropicTotals({ items, incomplete, retained, quotes }: { items: HubPo
         {amount("手续费", pair.fees)}{amount("资金费", pair.funding)}{amount("已实现净额", pair.net)}
         <MoneyCell label="完整总盈亏" value={pair.total} currency="USD"/>
       </dl>
-      {pair.missing.length > 0 ? <p className="related-cycle-note">未计入或未完整：{pair.missing.join("；")}。已知估算不等于完整总盈亏。</p> : null}
-      <p className="related-cycle-note">折算股数：{pair.shares.map((shares, index) => `${index === 0 ? "Binance" : pair.label.split(" ↔ ")[1]} ${shares === null ? "—" : shares.toLocaleString("en-US", { maximumFractionDigits: 3 })} 股`).join(" / ")}</p>
     </div>
-    <p className="detail-side-foot">溢价 = Binance 每股 ÷ 对比合约每股 − 1；沿用监控页股数假设。合计来自当前唯一反向两腿，各腿已实现取其本轮统计；缺项不补零，数量不匹配时仍保留实际股数。历史标记另按真实成交合约归属。</p>
   </div>;
 }
 

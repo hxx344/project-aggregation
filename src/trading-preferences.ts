@@ -6,6 +6,7 @@ import { preferenceChoice as choice, preferenceObject as object, readPreference,
 
 export const EXECUTION_PREFERENCES_KEY = 'workbench:execution-preferences:v1';
 export const SHARES_PREFERENCES_KEY = 'workbench:anthropic-shares:v1';
+export const SHARES_PREFERENCES_EVENT = 'workbench:anthropic-shares-changed';
 export const PAIR_PREFERENCE_KEY = 'workbench:trading-pair:v1';
 export const DAYS_PREFERENCE_KEY = 'workbench:trading-days:v1';
 export const TRADING_PAIRS: readonly TradingPair[] = ['binance,bybit', 'binance,okx', 'bybit,okx'];
@@ -65,12 +66,34 @@ export function readTradingPreferences(pair: TradingPair): TradingPreferences {
   return preferences;
 }
 export const saveTradingPreferences = (value: TradingPreferences) => writePreference(EXECUTION_PREFERENCES_KEY, normalizeTradingPreferences(value));
-export function normalizeShares(value: unknown): AnthropicShares {
+function validShares(value: unknown): AnthropicShares | null {
   const source = object(value);
   const shares = { outstanding: source.outstanding, diluted: source.diluted };
-  return typeof shares.outstanding === 'string' && shares.outstanding.length <= 24 && typeof shares.diluted === 'string' && shares.diluted.length <= 24 && !sharesProblem(shares as AnthropicShares) ? shares as AnthropicShares : { ...DEFAULT_SHARES };
+  return typeof shares.outstanding === 'string' && shares.outstanding.length <= 24 && typeof shares.diluted === 'string' && shares.diluted.length <= 24 && !sharesProblem(shares as AnthropicShares) ? shares as AnthropicShares : null;
 }
+export const normalizeShares = (value: unknown): AnthropicShares => validShares(value) ?? { ...DEFAULT_SHARES };
 export const readShares = () => normalizeShares(readPreference(SHARES_PREFERENCES_KEY));
+/** The monitor may use defaults only when no preference exists, never for unreadable or damaged saved data. */
+export function readMonitorShares(): AnthropicShares | null {
+  try {
+    const raw = localStorage.getItem(SHARES_PREFERENCES_KEY);
+    return raw === null ? { ...DEFAULT_SHARES } : raw.length <= 32_768 ? validShares(JSON.parse(raw)) : null;
+  } catch { return null; }
+}
+export function saveShares(value: AnthropicShares): boolean {
+  const shares = validShares(value);
+  if (!shares) return false;
+  try { localStorage.setItem(SHARES_PREFERENCES_KEY, JSON.stringify(shares)); }
+  catch { return false; }
+  if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent(SHARES_PREFERENCES_EVENT));
+  return true;
+}
+/** Same-window edits and other-tab edits both refresh the host's durable share assumptions. */
+export function observeSharesChanges(update: () => void, source: Pick<Window, 'addEventListener' | 'removeEventListener'> = window) {
+  const storage = (event: StorageEvent) => { if (event.key === SHARES_PREFERENCES_KEY || event.key === null) update(); };
+  source.addEventListener(SHARES_PREFERENCES_EVENT, update); source.addEventListener('storage', storage);
+  return () => { source.removeEventListener(SHARES_PREFERENCES_EVENT, update); source.removeEventListener('storage', storage); };
+}
 export const readTradingPair = (search: string) => {
   const value = new URLSearchParams(search).get('tradingPair') ?? readPreference(PAIR_PREFERENCE_KEY);
   return normalizeTradingPair(typeof value === 'string' ? value : null);

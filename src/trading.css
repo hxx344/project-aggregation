@@ -168,6 +168,9 @@
 .trading-overview-table tbody tr.trading-overview-market:hover{background:transparent}
 .trading-overview-table .trading-overview-empty,.trading-overview-table .trading-overview-summary td,.trading-overview-table .trading-overview-error{white-space:normal;font-size:11.5px;color:var(--text-tertiary)}
 .trading-overview-table .trading-overview-error{color:var(--warning)}
+.trading-overview-total th,.trading-overview-total td{background:var(--surface-3);font-weight:600}
+.trading-overview-total th{white-space:normal}
+.trading-overview-total small{display:block;color:var(--text-tertiary);font-size:10px;font-weight:400}
 
 .trading-initial{display:flex;align-items:center;justify-content:center;gap:12px;min-height:230px;color:var(--text-tertiary);font-size:14px}
 

@@ -17,7 +17,7 @@ import { amount, beijingTime, polarity, roundedAmount } from './trading-format';
 import { tradingSectionOf } from './trading-sections';
 import type { TradingSection } from './trading-sections';
 import { sharesProblem } from './trading-anthropic';
-import { DAYS_PREFERENCE_KEY, PAIR_PREFERENCE_KEY, SHARES_PREFERENCES_KEY, readShares, readTradingDays, readTradingPair } from './trading-preferences';
+import { DAYS_PREFERENCE_KEY, PAIR_PREFERENCE_KEY, readShares, saveShares, readTradingDays, readTradingPair } from './trading-preferences';
 import { writePreference } from './ui-preferences';
 import type { AnthropicShares } from './trading-execution-types';
 import type { TradingAccount, TradingAccountMode, TradingExchange, TradingImportSelection, TradingImportSource, TradingLeg, TradingPair, TradingPosition, TradingReadState, TradingState } from './trading-types';
@@ -34,7 +34,7 @@ const formatDate = (value: string | null) => beijingTime(value, '尚未同步', 
 
 const overviewRows = (legs: (PositionLeg & { positions: TradingPosition[] })[]): OverviewRow[] => legs.flatMap(leg => leg.positions.map(position => ({
   id: `${leg.id}-${position.id}`, exchange: exchangeNames[leg.exchange], symbol: position.instrumentId ?? leg.symbol, side: position.side,
-  quantity: position.quantity, unit: leg.exchange === 'okx' ? '张' : '', notional: position.notional, unrealizedPnl: position.unrealizedPnl,
+  quantity: position.quantity, unit: leg.exchange === 'okx' ? '张' : '', notional: position.notional, unrealizedPnl: position.unrealizedPnl, pnlCurrency: 'USDT',
   distancePercent: liquidationDistance(position.markPrice, position.liquidationPrice),
 })));
 const loadingMarket = (id: 'oil' | 'hynix', name: string, venues: string, error: string): OverviewMarket => ({ id, name, venues, state: error ? 'error' : 'loading', fetchedAt: null, rows: [], summary: null, error: null, empty: error || '正在读取…' });
@@ -142,7 +142,7 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
   // One set of Anthropic share-count assumptions for the spread view and the live preview.
   const [shares, setShares] = useState<AnthropicShares>(readShares);
   const [anthropicOverview, setAnthropicOverview] = useState<OverviewMarket | null>(null);
-  useEffect(() => { if (!sharesProblem(shares)) writePreference(SHARES_PREFERENCES_KEY, shares); }, [shares]);
+  useEffect(() => { if (!sharesProblem(shares)) saveShares(shares); }, [shares]);
   useEffect(() => { writePreference(PAIR_PREFERENCE_KEY, pair); writePreference(DAYS_PREFERENCE_KEY, days); }, [pair, days]);
   const [sources, setSources] = useState<TradingImportSource[] | null>(null);
   const [sourcesLoading, setSourcesLoading] = useState(false);

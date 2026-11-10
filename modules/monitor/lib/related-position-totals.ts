@@ -1,9 +1,9 @@
 import type { HubPositionItem } from './hub-bridge.ts';
 import type { AnthropicComparisonLeg } from './anthropic-history.ts';
-import { ANTHROPIC_LEGS, anthropicPremium } from '../modules/anthropic/market.mjs';
+import { ANTHROPIC_LEGS, anthropicPremium, anthropicSharesPerUnit, type AnthropicShares } from '../modules/anthropic/market.mjs';
 import { venueKey } from './related-pairs.ts';
 
-export type AnthropicPairQuotes = { premiums: Record<AnthropicComparisonLeg, number | null>; fetchedAt: string | null; staleAfterMs: number; stale: boolean };
+export type AnthropicPairQuotes = { premiums: Record<AnthropicComparisonLeg, number | null>; shares: AnthropicShares | null; fetchedAt: string | null; staleAfterMs: number; stale: boolean };
 type Cash = { value: number | null; complete: boolean };
 type CashKey = 'realizedPnl' | 'fees' | 'funding' | 'net';
 export type AnthropicPositionPair = {
@@ -54,13 +54,14 @@ export function relatedAnthropicPair(items: readonly HubPositionItem[], quotes?:
     if (fieldsMissing.length) missing.push(`${name}：${fieldsMissing.join('、')}`);
   });
   const full = unrealized.complete && cashFields.every(field => fields[field].complete);
-  const opening = anthropicPremium(positive(left.entryPrice), positive(right.entryPrice), leg);
+  const assumptions = quotes?.shares ?? null;
+  const opening = anthropicPremium(positive(left.entryPrice), positive(right.entryPrice), leg, assumptions);
   const rawCurrent = quotes?.premiums[leg], current = typeof rawCurrent === 'number' && Number.isFinite(rawCurrent) ? rawCurrent : null;
   const quoteAt = Date.parse(quotes?.fetchedAt ?? '');
   const currentStale = !quotes || quotes.stale || !Number.isFinite(quoteAt) || now - quoteAt > quotes.staleAfterMs || quoteAt > now + 60_000;
   const canClose = pairItems.every(item => cycleKnown(item) && (positive(item.cycle?.closedQuantity) ?? 0) > 0);
-  const closing = canClose ? anthropicPremium(positive(left.cycle?.closePrice), positive(right.cycle?.closePrice), leg) : null;
-  const shares = pairItems.map((item, i) => { const quantity = positive(item.quantity); return quantity === null ? null : quantity * ANTHROPIC_LEGS[i === 0 ? 'binance' : leg].sharesPerUnit; }) as [number | null, number | null];
+  const closing = canClose ? anthropicPremium(positive(left.cycle?.closePrice), positive(right.cycle?.closePrice), leg, assumptions) : null;
+  const shares = pairItems.map((item, i) => { const quantity = positive(item.quantity), units = anthropicSharesPerUnit(i === 0 ? 'binance' : leg, assumptions); return quantity === null || units === null ? null : quantity * units; }) as [number | null, number | null];
   return { reason: '', pair: { leg, label: label(leg), items: pairItems, opening, current, closing, currentStale, shares,
     change: opening !== null && current !== null ? current - opening : null, narrowingFavors: left.side === 'short', stale: pairItems.some(item => item.stale),
     unrealized, ...fields, total: full ? sumKnown([unrealized.value, fields.net.value]) : null,

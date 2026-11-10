@@ -10,7 +10,7 @@ export { cleanHubQuery, HUB_QUERY_KEYS };
 export type { HubQuery };
 export type HubProject = 'monitor' | 'crossex';
 const envelope = { channel: 'project-hub', version: 1 } as const;
-export const MODULE_CAPABILITIES = ['activity', 'navigate', 'changed', 'positions', 'fills', 'open-trading'] as const;
+export const MODULE_CAPABILITIES = ['activity', 'navigate', 'changed', 'positions', 'fills', 'open-trading', 'anthropic-shares'] as const;
 let targetOrigin = '', connected = false, hostCapabilities: ReadonlySet<string> = new Set();
 const hubListeners = new Set<() => void>();
 const positionListeners = new Set<(value: unknown) => void>();
@@ -34,7 +34,7 @@ export function hostCapabilityList(value: unknown): string[] {
   return Array.isArray(value) ? [...new Set(value.filter((item): item is string => typeof item === 'string' && /^[a-z-]{1,40}$/.test(item)))].slice(0, 32) : [];
 }
 /** Old hosts never declared positions; modules must stay silent rather than guess. */
-export function canUseHostCapability(isConnected: boolean, capabilities: Iterable<string>, capability: 'positions' | 'fills' | 'open-trading') {
+export function canUseHostCapability(isConnected: boolean, capabilities: Iterable<string>, capability: 'positions' | 'fills' | 'open-trading' | 'anthropic-shares') {
   return isConnected && new Set(capabilities).has(capability);
 }
 
@@ -182,6 +182,36 @@ export function hubOpenTrading(market: PositionsMarket) {
   if (POSITION_MARKETS.has(market) && canUseHostCapability(connected, hostCapabilities, 'open-trading')) post({ type: 'open-trading', market });
 }
 function subscribeHub(listener: () => void) { hubListeners.add(listener); return () => { hubListeners.delete(listener); }; }
+export type HubAnthropicShares = { outstanding: number; diluted: number };
+export type HubAnthropicSharesView = { shares: HubAnthropicShares | null; status: 'standalone' | 'connecting' | 'synced' | 'unavailable' };
+const STANDALONE_SHARES: HubAnthropicSharesView = { shares: null, status: 'standalone' };
+const CONNECTING_SHARES: HubAnthropicSharesView = { shares: null, status: 'connecting' };
+const UNAVAILABLE_SHARES: HubAnthropicSharesView = { shares: null, status: 'unavailable' };
+/** Values remain in billions, with the same decimal syntax and bounds as the trading center. */
+export function parseHubAnthropicShares(value: unknown): HubAnthropicShares | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const { outstanding, diluted } = value as Record<string, unknown>;
+  const valid = (entry: unknown): entry is string => typeof entry === 'string' && entry.length <= 24 && /^\d+(?:\.\d{1,18})?$/.test(entry.trim()) && Number(entry) >= 1 && Number(entry) <= 100;
+  return valid(outstanding) && valid(diluted) && Number(diluted) >= Number(outstanding) ? { outstanding: Number(outstanding), diluted: Number(diluted) } : null;
+}
+/** No prior shares survive a missing capability, malformed update, or new bridge session. */
+export function createHubAnthropicSharesStore() {
+  let snapshot = CONNECTING_SHARES;
+  return {
+    getSnapshot: () => snapshot,
+    reset: () => { snapshot = CONNECTING_SHARES; },
+    receive(value: unknown, capabilities: Iterable<string>) {
+      const shares = canUseHostCapability(true, capabilities, 'anthropic-shares') ? parseHubAnthropicShares(value) : null;
+      if (!shares) snapshot = UNAVAILABLE_SHARES;
+      else if (snapshot.status !== 'synced' || snapshot.shares?.outstanding !== shares.outstanding || snapshot.shares?.diluted !== shares.diluted) snapshot = { shares, status: 'synced' };
+    },
+  };
+}
+const anthropicShares = createHubAnthropicSharesStore();
+/** Standalone defaults are chosen by the panel; embedded views must wait for the trusted host. */
+export function useHubAnthropicShares(): HubAnthropicSharesView {
+  return useSyncExternalStore(subscribeHub, () => trustedHubOrigin(window.location, window.parent !== window) ? anthropicShares.getSnapshot() : STANDALONE_SHARES, () => STANDALONE_SHARES);
+}
 /** Host connection and declared capabilities, shared by every consumer of the single bridge. */
 export function useHubHost() {
   // Embedding is part of the snapshot so hydration starts from the server's standalone view.
@@ -247,16 +277,18 @@ export function useHubBridge(projectId: HubProject) {
     const origin = trustedHubOrigin(window.location, window.parent !== window);
     let hostActive = !origin, visible = true;
     readActivity.configure(Boolean(origin));
+    anthropicShares.reset(); notifyHub();
     const update = () => setState({ connected, active: hostActive && visible && !document.hidden && navigator.onLine, readActive: readActivity.allowed(document.hidden) && navigator.onLine });
     const message = (event: MessageEvent) => {
       if (!isHubMessage(event, origin, window.parent)) return;
       const value = event.data;
       if (value.type === 'ready' && value.role === 'host') {
-        targetOrigin = origin!; connected = true; hostCapabilities = new Set(hostCapabilityList(value.capabilities)); readActivity.connect(); update(); notifyHub();
+        targetOrigin = origin!; connected = true; hostCapabilities = new Set(hostCapabilityList(value.capabilities));
+        anthropicShares.receive(value.anthropicShares, hostCapabilities); readActivity.connect(); update(); notifyHub();
         post({ type: 'ready', role: 'module', capabilities: [...MODULE_CAPABILITIES] });
         // Sent after our ready so the host has re-accepted this document before the repeated request arrives.
         hostReadyListeners.forEach(listener => listener());
-      } else if (connected && value.type === 'activity' && typeof value.active === 'boolean') { hostActive = value.active; readActivity.update(value.active, value.backgroundUpdates); update(); }
+      } else if (connected && value.type === 'activity' && typeof value.active === 'boolean') { hostActive = value.active; anthropicShares.receive(value.anthropicShares, hostCapabilities); readActivity.update(value.active, value.backgroundUpdates); update(); notifyHub(); }
       else if (connected && value.type === 'navigate' && value.projectId === projectId) {
         const query = cleanHubQuery(value.query); if (!query) return;
         window.history.replaceState(null, '', hubSelectionUrl(window.location.href, projectId, query)); window.dispatchEvent(new PopStateEvent('popstate'));
@@ -269,7 +301,7 @@ export function useHubBridge(projectId: HubProject) {
     observer?.observe(document.documentElement); update();
     // A ready probe covers hosts whose iframe load event preceded React effects.
     if (origin) window.parent.postMessage({ ...envelope, type: 'ready', role: 'module' }, origin);
-    return () => { readActivity.configure(Boolean(origin)); stopNetwork(); observer?.disconnect(); window.removeEventListener('message', message); document.removeEventListener('visibilitychange', update); connected = false; targetOrigin = ''; hostCapabilities = new Set(); notifyHub(); };
+    return () => { readActivity.configure(Boolean(origin)); stopNetwork(); observer?.disconnect(); window.removeEventListener('message', message); document.removeEventListener('visibilitychange', update); connected = false; targetOrigin = ''; hostCapabilities = new Set(); anthropicShares.reset(); notifyHub(); };
   }, [projectId]);
   return state;
 }

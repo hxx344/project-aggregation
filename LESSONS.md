@@ -673,6 +673,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `pair-display-cadence-freshness-20261015`；一次未提交补丁审查与连续修正，不推进主线复盘检查点。
 
+**持仓概览合计补充（2026-11-10）：** 基于 `b03f6fa` 的未发布双腿盈亏合计，前端误把 Anthropic 的 `alerts.staleAfterSeconds=180` 当仓位有效期；该字段实际是监测中断通知门槛，生产持仓来源有效期为 75 秒。展示金额继承来源有效期，通知延迟不能延长它。[概览浏览器夹具](tests/trading-overview.browser.mjs) 用 76 秒旧来源在初版生产构建复现仍显示合计，改为与来源一致的 75 秒后通过。事件 `overview-pnl-source-freshness-20261110`；独立审查发现，首次发布前修复，不涉及交易授权。
+
 ### L041：账户保证金平衡独立于持仓交易策略
 
 **适用条件：** ASTER 两个子账户之间按 USD1 可用余额自动平衡，包括仅保证金管理模式、其他标的或方向的手动持仓，以及策略订单仍在核对的情况。
@@ -1498,6 +1500,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **跨组件敞口读取补充（#284，2026-11-09）：** `0243193` 后的未发布实现中，父组件保存开始时增加自身 GET 代次，子组件的敞口版本却只在写响应返回后更新。独立生产页面探针复现：服务端已保存 2 桶、写响应挂起，旧敞口响应随后把 1 桶显示出来。父组件提交开始即撤销传给子组件的可用版本，子组件清空结果并中止旧请求；明确失败恢复旧版本也不能复活已撤销结果。`tests/trading-auto-exposure-write-race.browser.mjs` 保留同一交错，修前 oldExposureShown=true、修后 false，保存仍在等待，恢复版本不自动读取。事件 `auto-exposure-pending-write-stale-read-20261109`；P1 在首次发布前修复。
 
+**持仓合计重连补充（2026-11-10）：** 基于 `b03f6fa` 的未发布概览合计仅用 `offline` 撤回金额；联网事件先清此标记，旧合计在新 GET 回复前恢复。独立生产页面探针挂起重连读取，确认 `+3,537.74 → — → +3,537.74`，期间没有新响应或写入。合计现独立保留失效状态，仅成功接收新快照后恢复；[概览浏览器夹具](tests/trading-overview.browser.mjs) 覆盖断线、挂起重连及新响应恢复。事件 `overview-pnl-reconnect-unconfirmed-20261110`；首次发布前修复，不改变交易保护规则。
+
 ### L090：防重复发送的持久化占用不能降为尽力记录
 
 **适用条件：** 通过发送前持久保存时间点或操作身份，承诺崩溃重启后不重复对外发送。
@@ -1866,6 +1870,19 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 **证据：** project-aggregation `server/trading-anthropic-reduction.mjs`、`server/trading-reduction-plan.mjs`、各所 `noLiquidation` 解析（`server/trading-execution-exchanges.mjs`、`server/trading-okx-execution.mjs`、`server/trading-hyperliquid-execution.mjs`、`server/trading-rh-lighter-execution.mjs`）。2026-11-09 用户要求检查“ANT 套利自动减仓是否会被异常阻塞”，只读排查用夹具复现了这些路径：任何 409 立即停用、强平价为空 3 次后停用、停用无通知。没有发生线上事故，各所真实返回值未实盘验证。
 
 **事件记录：** `ant-reduction-self-disarm-20261109`；只读排查发现，修复前未确认线上发生。
+
+
+### L111：嵌入模块的换算口径必须来自宿主当前配置
+
+**适用条件：** 工作台保存浏览器偏好，独立子域的嵌入模块用同一业务参数换算行情、历史或持仓展示。
+
+**根因：** Monitor 把交易中心的默认股数复制为常量，未接收用户保存的股数；因此原始行情正确，监控溢价仍按另一份假设计算。子域自己的 localStorage 不能代表宿主配置。
+
+**以后做法：** 通过现有可信宿主桥接传递最小只读参数，覆盖首次握手、保存通知、跨标签与切回；未知或损坏配置不冒充已同步默认值。配置作为派生计算及缓存的输入，同时更新实时、历史、统计和相关持仓口径；独立页面与服务端无法访问浏览器配置时明确标注默认口径，不改写原始行情或订单快照。
+
+**如何验证：** [股数计算测试](modules/monitor/tests/anthropic-shares.test.mjs) 使用非默认 S/F 核对三腿、历史与趋势重算；[偏好测试](tests/trading-preferences.test.mjs) 和 [桥接测试](modules/monitor/tests/hub-bridge.test.mjs) 覆盖未知/非法/重连/保存失败；[工作台浏览器夹具](tests/monitor-anthropic-shares.browser.mjs) 经实际 iframe 检查交易中心修改和跨标签同步。
+
+**证据与事件：** `anthropic-monitor-share-preferences-20261110`；2026-11-10 用户截图指出溢价应使用交易中心股数。基线 `a12e583` 的 `modules/monitor/modules/anthropic/market.mjs` 固定除以 12.7/16.7，`src/OilTradingPage.tsx` 则从 `workbench:anthropic-shares:v1` 读取可编辑值。本次为一次用户纠正，不推进提交复盘检查点。
 
 ## 已归档
 
