@@ -79,7 +79,7 @@ trap cleanup EXIT
 chmod 0700 "$fixture"
 mkdir -p "$fixture/release/server/update-service" "$fixture/work"
 printf 'verified-systemd-fixture\n' > "$fixture/release/.managed-release"
-for name in registry releases progress updater; do
+for name in registry releases progress diagnostics updater; do
   install -m 0644 -o root -g root "$source_root/server/update-service/$name.py" "$fixture/release/server/update-service/$name.py"
 done
 work_dir="$fixture/work"

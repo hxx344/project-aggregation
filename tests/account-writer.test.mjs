@@ -125,6 +125,14 @@ test('expired lease and backward clock retire instance; budget renews only still
   assert.throws(() => rollback.assertOwned(rollbackTicket), code('WRITER_RETIRED'));
 });
 
+test('closed writer rejects old tickets and snapshots while close remains idempotent', (t) => {
+  const f = fixture(t), writer = f.writer(), ticket = bindClaim(writer);
+  writer.close();
+  assert.throws(() => writer.assertOwned(ticket, 0), code('WRITER_CLOSED'));
+  assert.throws(() => writer.snapshot(), code('WRITER_CLOSED'));
+  assert.doesNotThrow(() => writer.close());
+});
+
 test('durable operation ledger blocks repeats, conflicting semantics, and unknown-account writes', (t) => {
   const f = fixture(t); const writer = f.writer(); const ticket = bindClaim(writer);
   const payload = { kind: 'create', clientOrderId: 'order-1', quantity: '0.01', symbol: 'BTCUSDT' };

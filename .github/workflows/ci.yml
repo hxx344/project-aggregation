@@ -200,6 +200,7 @@ jobs:
       - name: Verify recovery guard and cold-stop ownership
         run: |
           sudo env RECOVERY_TEST_NODE="$(command -v node)" python3 -I tests/test_recovery_operations.py -v
+          sudo env RECOVERY_TEST_NODE="$(command -v node)" python3 -I tests/test_backup_maintenance.py -v
       - name: Verify read-only Aster margin evidence and privacy
         run: sudo python3 -I tests/test_aster_margin_diagnostics.py -v
       - name: Verify SQLite recovery across root and service identities
@@ -253,6 +254,10 @@ jobs:
           bash -n test-download-speed.sh
       - name: Verify parallel workspace failures and process cleanup
         run: bash deploy/test-workspace-parallel.sh
+      - name: Verify bounded cleanup scale and interrupted recovery
+        run: |
+          sudo python3 -B deploy/test-cleanup-scale.py
+          bash deploy/test-cleanup-scale.sh
       - name: Verify privileged update coordinator and service bootstrap
         run: |
           sudo python3 deploy/test-updater.py -v
@@ -421,7 +426,7 @@ jobs:
         run: python3 deploy/test-mirror-nginx.py -v
 
   release:
-    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, main-watch, release-mirror]
+    needs: [app, build-tooling, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, entropy-lighter-lab, options-backtest, main-watch, release-mirror]
     if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     permissions:

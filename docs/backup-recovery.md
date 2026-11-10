@@ -144,8 +144,67 @@ handoff 在退休后发布失败时，保留同一目标对应的 `.incomplete-<
 
 默认单次预算为 **10 GiB、10,000 个文件、10 分钟**，检查可用空间并留出写入余量。数据库和财务 checkpoint 检查在可终止的子进程中运行，财务扫描累计最多 **100,000 行**、单条记录 **8 MiB**，子进程 V8 堆上限 **256 MiB**。超过限制、失锁或超时即失败，不通过跳过历史行来报告静止。低层 CLI 有显式预算参数；正式 root 入口使用默认预算。
 
-RPO 5 分钟、隔离恢复到可读服务 RTO 30 分钟仍是待验证目标。当前没有自动配置周期备份、异地上传、保留期或密钥取回流程，不能据默认 10 分钟工具预算推算生产 RPO/RTO。
+RPO 5 分钟、隔离恢复到可读服务 RTO 30 分钟仍是待验证目标。下述本地计划默认关闭，只有管理员显式配置才启用；没有异地上传或自动取回密钥，不能据每日计划或默认 10 分钟工具预算推算生产 RPO/RTO。
 
 现有 Ubuntu CI 已接入真实服务账号与打包后的五模块恢复演练，相关结果须以本次 CI 为准：从本地运行包和本地密钥制作检查点、恢复到新目录、重新启动真实五模块及 Hub，验证旧会话失效、恢复能力协商和资金写入仍受 `quarantine` 阻断。演练在只有 loopback 的独立网络命名空间运行，不依赖外网，也不发送实盘资金请求。测得的检查点年龄和恢复可读耗时只覆盖这个 CI 夹具，不包含生产数据量、异地取包、取密钥、交易所对账和人工响应。
 
 Linux systemd、cgroup、归属与启动 guard 由现有非 WSL CI 验证；Windows 原生单测覆盖可运行的库与故障场景。生产恢复承诺需要另以真实数据规模、故障范围和可用环境完成验收。
+
+## 本地维护窗口与保留
+
+此能力只管理服务器本地冷备份。未配置时禁用；已发布代码不会自行停服。管理员用一条命令设置窗口、准备两把密钥（已有密钥只验证）、注册并启用 systemd timer：
+
+```sh
+sudo /usr/bin/python3 -I /opt/project-aggregation/current/server/recovery/operations.py schedule-configure --window-start 02:00 --window-end 03:00 --timezone Asia/Shanghai --keep 7 --min-free-mb 1024
+```
+
+`Asia/Shanghai` 为默认固定 UTC+8，也可显式选 `UTC`。窗口每天执行，可跨午夜，例如 `23:00`–`01:00`；结束时刻不属于窗口。`keep` 为 2–30，最低空闲容量为 64–1,048,576 MiB。timer 每分钟检查、`Persistent=false`；错过窗口不补停，重启后仍按原窗口身份去重。配置和单元内容均未变化、timer 已处于预期状态时跳过重写、daemon-reload 和启停。
+
+计划仍先取得既有 stack/install 锁，再读取部署身份。任务开始前持久化 claim，在安装 guard、核对完整服务集合之后，**紧邻真正 stop 前再次检查窗口**。同一窗口无论成功、失败或未知，都不再次开始。空间不足、密钥缺失或锁冲突均不会冷停；锁冲突由命令返回失败并进入 systemd 日志，不能绕过互斥写入备份状态或补发通知。真正归档继续复用生命周期锁、完整 cgroup 核验与已有 10 GiB/10,000 文件/10 分钟预算。
+
+服务恢复以任务开始前的活动单元集合为准，处理 runtime 的 `Wants=` 所拉起的额外单元；恢复前仍验证 source 和 guard，保留 `quarantine`，拒绝启动 `retired`。若停止一部分服务后失败、原源不可读或启动失败，保留 `unknown` 和原服务集合，后续窗口停止新备份。重启看到旧 `running` 也转为未知；最多尝试恢复原活动服务，不重新制作归档。管理员完成检查后可显式核对该任务：
+
+```sh
+sudo /usr/bin/python3 -I /opt/project-aggregation/current/server/recovery/operations.py schedule-status
+sudo /usr/bin/python3 -I /opt/project-aggregation/current/server/recovery/operations.py schedule-resolve --run-id <schedule-status返回的任务ID>
+```
+
+`schedule-resolve` 不制作新备份、不恢复数据：恢复原服务集合后，只验证同一任务目录中已有包。验证成功登记为归档完成；目录不存在记为失败，保留中断证据；已有目录却验证失败则保持未知。它不删除进行中目录，不解除隔离或退休。停止计划与回滚前使用：
+
+```sh
+sudo /usr/bin/python3 -I /opt/project-aggregation/current/server/recovery/operations.py schedule-configure --disable
+```
+
+root 配置位于 `/etc/project-aggregation-recovery/schedule.json`，私有计划状态与目录固定在 `/var/backups/project-aggregation/scheduled/`。删除候选必须同时满足计划 ID、root 归属/权限、无链接/硬链接、受管 marker、对应 manifest 摘要、双密钥认证与全部密文摘要重检。保留至少最新两个有效计划包，手工备份、进行中/未知包和无合法 marker 的目录均不删除。删除失败保留状态和剩余材料，不将旧目录失踪当成已验证清理。归档成功后的保留失败仍显示归档完成与保留错误，不能抹去已完成的包。
+
+私有状态最多 128 条，仅淘汰已失败、已清理或手工登记的旧元数据；不会淘汰未解决任务或尚未清理的计划包证据。容量不足时拒绝启动新任务。保留核验共享 10 分钟预算，超时停止清理并保留包；子进程另留最多 5 秒退出余量。元数据淘汰不删除备份实体。公开快照最多 32 条，优先保留未知任务；密钥、manifest 条目、原文件路径及通知凭据永不进入快照。
+
+## 失败通知
+
+通知默认关闭。需要通知时，由 root 在受保护的普通文件中保存 HTTPS webhook URL，并在上述配置命令增加 `--webhook-file /root/backup-webhook-url`。该文件必须 root 拥有且仅 root 可读写；配置按受保护输入读取，不通过网页配置，不把 URL 输出到终端、公开快照或日志。
+
+接收端收到固定 JSON 字段 `event`、`backupId`、`phase`、`error`，没有环境、路径或密钥。每条失败先持久化通知 claim，再发起一次请求；总时限 8 秒、无重定向、无自动重试、无代理环境继承。超时或崩溃保留 `unknown`，重启不重发。HTTP 2xx 仅表示接收端受理，不能证明最终送达。通知失败不会改变归档、保留或服务恢复事实。
+
+## 备份取回就绪台账
+
+工作台系统状态页显示归档认证、包和两把密钥的取回状态，以及恢复演练的人工登记。三个层次互不替代：
+
+| 证据 | 实际含义 |
+| --- | --- |
+| 机器归档认证 | 双密钥校验 manifest 认证及全部密文摘要；不解密、不运行恢复，不证明依赖齐全或凭据可解密 |
+| 取回核验（人工声明） | 包、数据密钥、秘密材料密钥分别为待核验、已取回核验或缺失；不接收密钥正文 |
+| 演练（人工登记） | 未演练、CI 夹具、该包的独立演练分别标注；记录结果、时间、隔离状态、耗时及覆盖模块，CI 耗时不作生产 RTO |
+
+每条声明绑定完整备份摘要、代码版本和归档完成时间；旧包演练不会自动覆盖新包。页面使用修订号检查并发保存，其他窗口已修改时要求刷新核对；服务端在既有 Hub settings 事务中比较版本再更新。格式未知的旧台账保留原文并停止新写入，不能静默清空。此入口不执行 `restore`、`handoff`、`admit`，不解除 `quarantine`/`retired`。
+
+计划包验证后自动发布安全元数据。已有手工本地包由管理员显式登记一个目录，无需开启计划或停止服务：
+
+```sh
+sudo /usr/bin/python3 -I /opt/project-aggregation/current/server/recovery/operations.py backup-register --backup-dir /var/backups/project-aggregation/<已有包目录>
+```
+
+登记仅读取该 root 明确指定的目录，验证双密钥认证及密文摘要，不扫描所有目录，不自动上传。页面只能为已发布身份填写声明，不能提交路径让 root 读取材料。手工登记用 `manual-` 身份，与计划目录分开，永远不进入计划保留删除。
+
+公开文件固定为 root 拥有的 `/var/lib/project-aggregation-backup-status/readiness.json`，目录 0755、文件 0644；服务只读此白名单快照，不读取 root 私有密钥或备份根。显示快照观察时间，读取失败明确显示不可确认。公开写入失败不改变已完成归档或服务恢复结果，CLI 的 `metadataPublished: false` 提示管理员检查公开目录；随后 timer 的只读状态检查会再次尝试发布。人工台账最多 64 条，旧记录被淘汰时仅删除声明元数据。
+
+专项夹具为 `tests/test_backup_maintenance.py`、`tests/backup-archive.test.mjs`、`tests/backup-readiness.test.mjs`；Linux root 权限/链接和真实 `systemd-analyze verify` 在 CI 运行，夹具不调用生产服务、不使用真实 webhook。已有五模块恢复 CI 仍是独立的 CI 证据，不能当成某个生产备份已演练。

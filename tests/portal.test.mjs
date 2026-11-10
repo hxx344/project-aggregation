@@ -171,6 +171,80 @@ async function fixture(t, options = {}) {
   return { portal, projects, request, launch, authorize, host, port, upstream, get calls() { return upstreamCalls; }, get ledgerReads() { return ledgerReads; }, revoke() { validSession = false; }, revise() { revision = 'revision-two'; }, advance(ms) { time += ms; } };
 }
 
+test('current-session access management hides secrets and revokes only the selected grant', async t => {
+  const f = await fixture(t);
+  const first = await f.authorize(), second = await f.authorize(), monitor = await f.authorize('monitor');
+  const listed = f.portal.listAccess('hashed-session-id');
+  assert.equal(listed.grants.length, 3);
+  assert.equal(listed.externalScope, 'current-api-instance');
+  for (const { cookie } of [first, second, monitor]) {
+    const raw = cookie.split('=')[1];
+    assert.ok(!JSON.stringify(listed).includes(raw));
+    assert.ok(!JSON.stringify(listed).includes(createHash('sha256').update(raw).digest('hex')));
+  }
+  assert.ok(!JSON.stringify(listed).includes('hashed-session-id'));
+  const selected = listed.grants.find(row => row.projectId === 'asset');
+  assert.deepEqual(f.portal.revokeAccess('hashed-session-id', selected.id), { revoked: true, id: selected.id });
+  const results = await Promise.all([first, second].map(({ cookie }) => f.request('/', { cookie })));
+  assert.deepEqual(results.map(row => row.status).sort(), [200, 401]);
+  assert.equal((await f.request('/', { id: 'monitor', cookie: monitor.cookie })).status, 200);
+  assert.equal(f.portal.listAccess('hashed-session-id').grants.length, 2);
+  assert.throws(() => f.portal.revokeAccess('hashed-session-id', selected.id), error => error.status === 404);
+  assert.throws(() => f.portal.listAccess('another-session'), error => error.status === 401);
+});
+
+test('access management reports local-only automatic-login grants and revokes them without persistence', async t => {
+  const f = await fixture(t, { authenticateProject: async () => ({ cookie: { name: 'asset_session', value: 'private-upstream-cookie' } }) });
+  const { cookie } = await f.authorize();
+  const listed = f.portal.listAccess('hashed-session-id');
+  assert.equal(listed.grants[0].scope, 'instance');
+  assert.ok(!JSON.stringify(listed).includes('private-upstream-cookie'));
+  f.portal.revokeAccess('hashed-session-id', listed.grants[0].id);
+  assert.equal((await f.request('/', { cookie })).status, 401);
+});
+
+test('persisted access revocation propagates to another API instance HTTP and active WebSocket', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-access-shared-'));
+  const dbs = [0, 1].map(() => openHubDatabase(join(dir, 'hub.sqlite')));
+  t.after(() => { for (const db of dbs) db.close(); rmSync(dir, { recursive: true, force: true }); });
+  const stores = dbs.map(db => createPortalStore(createControlStore(db)));
+  const a = await fixture(t, { store: stores[0] }), b = await fixture(t, { store: stores[1] });
+  const { cookie } = await a.authorize();
+  assert.equal((await b.request('/', { cookie })).status, 200);
+  const socket = await new Promise((resolve, reject) => {
+    const request = http.request({ host: '127.0.0.1', port: b.port, path: '/socket', headers: { Host: b.host('asset'), Cookie: cookie,
+      Connection: 'Upgrade', Upgrade: 'websocket', Origin: `http://${b.host('asset')}`, 'Sec-WebSocket-Version': '13', 'Sec-WebSocket-Key': randomBytes(16).toString('base64') } });
+    request.once('upgrade', (_response, peer) => resolve(peer)); request.once('error', reject); request.end();
+  });
+  socket.on('error', () => {}); t.after(() => socket.destroy());
+  const stopped = new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error('revoked socket remained open')), 3000); socket.once('close', () => { clearTimeout(timer); resolve(); }); });
+  const firstId = a.portal.listAccess('hashed-session-id').grants[0].id;
+  assert.equal(b.portal.listAccess('hashed-session-id').grants[0].id, firstId);
+  a.portal.revokeAccess('hashed-session-id', firstId);
+  assert.equal((await b.request('/', { cookie })).status, 401);
+  await stopped;
+});
+
+test('failed persistent access deletion never claims success or removes another session grant', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'portal-access-busy-'));
+  const db = openHubDatabase(join(dir, 'hub.sqlite'));
+  t.after(() => { db.close(); rmSync(dir, { recursive: true, force: true }); });
+  const store = createPortalStore(createControlStore(db));
+  const f = await fixture(t, { store });
+  const { cookie } = await f.authorize();
+  const selected = f.portal.listAccess('hashed-session-id').grants[0];
+  const revoke = store.revokeSessionGrant;
+  store.revokeSessionGrant = () => { throw new Error('controlled disk failure with private detail'); };
+  assert.throws(() => f.portal.revokeAccess('hashed-session-id', selected.id), error => error.status === 503 && !error.message.includes('private detail'));
+  assert.equal(f.portal.listAccess('hashed-session-id').grants.length, 1);
+  assert.equal((await f.request('/', { cookie })).status, 200);
+  store.revokeSessionGrant = revoke;
+  assert.equal(store.revokeSessionGrant(store.grants()[0].digest, 'foreign-session'), false);
+  assert.equal(f.portal.listAccess('hashed-session-id').grants.length, 1);
+  f.portal.revokeAccess('hashed-session-id', selected.id);
+  assert.equal((await f.request('/', { cookie })).status, 401);
+});
+
 test('API instances on one hub database share tickets, grants and their revocation', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'portal-shared-')); const dbs = [0, 1].map(() => openHubDatabase(join(dir, 'hub.sqlite')));
   t.after(() => { for (const db of dbs) db.close(); rmSync(dir, { recursive: true, force: true }); });

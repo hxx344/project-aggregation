@@ -36,8 +36,9 @@ if (selected.some(id => !builds.some(build => build.id === id)) || new Set(selec
 const manifests = ['package.json', ...builds.map(({ importer }) => `${importer}/package.json`)];
 const sharedInputs = [...manifests, 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc', 'scripts/modules.mjs'];
 const moduleSharedInputs = ['server/hub-navigation.mjs', 'server/hub-navigation.d.mts', 'server/asset-identity.mjs', 'server/asset-identity.d.mts', 'server/capital-metrics.mjs', 'server/capital-metrics.d.mts'];
+const cycleEvidenceInputs = ['server/cycle-evidence.mjs', 'server/cycle-evidence.d.mts'];
 // Asset reads exchanges through the shared transport (docs/evolution-plan.md E2).
-const assetSharedInputs = ['server/exchange-transport'];
+const assetSharedInputs = ['server/exchange-transport', ...cycleEvidenceInputs];
 const environment = JSON.stringify({
   node: process.version, platform: process.platform, arch: process.arch,
   manager: process.env.npm_config_user_agent.split(' ')[0],
@@ -47,7 +48,7 @@ const ignored = new Set(['node_modules', 'dist', '.next', '.vinext', '.wrangler'
 function digest(directory, buildDirectory) {
   const hash = createHash('sha256').update('embedded-workspace-build-v2:' + environment);
   const name = path.basename(directory);
-  const inputs = ['monitor', 'crossex'].includes(name) ? [...sharedInputs, ...moduleSharedInputs] : name === 'asset' ? [...sharedInputs, ...assetSharedInputs] : sharedInputs;
+  const inputs = ['monitor', 'crossex'].includes(name) ? [...sharedInputs, ...moduleSharedInputs, ...(name === 'monitor' ? cycleEvidenceInputs : [])] : name === 'asset' ? [...sharedInputs, ...assetSharedInputs] : sharedInputs;
   const input = relative => {
     const file = path.join(root, relative);
     if (existsSync(file) && statSync(file).isDirectory()) {

@@ -97,6 +97,78 @@ async function fixture(t, { client, initialMaintenance = false, initialPendingPl
     get session() { return current; }, set state(next) { value = next; }, get state() { return value; } };
 }
 
+test('update impact binds the plan and reports native blockers without entering maintenance', async t => {
+  const f = await fixture(t); await f.login();
+  f.state = { ...state(), expiresAt: new Date(Date.now() + 60_000).toISOString(), planPrepare: true, deploymentModes: ['source', 'ci'], planScopes: { source: 'full', ci: 'api' } };
+  const id = randomUUID(); f.jobs.push({ id, status: 'paused' });
+  const query = new URLSearchParams({ planId, deployMode: 'source', phase: 'activate' });
+  const route = `${PREFIX}/impact?${query}`;
+  assert.equal((await f.request(route, { auth: false })).status, 401);
+  assert.equal((await f.request(route, { originHeader: 'https://foreign.invalid' })).status, 403);
+  let result = await f.request(route);
+  assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.effect, 'module-restart');
+  const native = result.data.evidence.modules.find(row => row.moduleId === 'hub');
+  assert.equal(native.busy, true); assert.equal(native.tasks[0].id, id);
+  assert.equal(f.maintenance(), false); assert.equal(f.pendingPlanId(), null); assert.deepEqual(f.executionCalls, []);
+  query.set('deployMode', 'ci');
+  result = await f.request(`${PREFIX}/impact?${query}`);
+  assert.equal(result.data.effect, 'api-reconnect'); assert.equal(result.data.evidence, null);
+  query.set('deployMode', 'source'); query.set('phase', 'prepare');
+  result = await f.request(`${PREFIX}/impact?${query}`);
+  assert.equal(result.data.effect, 'prepare-only'); assert.equal(result.data.evidence, null);
+  assert.equal(f.maintenance(), false);
+  assert.equal((await f.request(route + '&phase=prepare')).status, 400);
+  assert.equal((await f.request(route.replace(planId, 'b'.repeat(64)))).status, 409);
+});
+
+test('update impact rejects a plan changed during the read without writing admission', async t => {
+  const f = await fixture(t); await f.login();
+  f.state = { ...state(), expiresAt: new Date(Date.now() + 60_000).toISOString() };
+  let reads = 0;
+  f.handlers.status = () => { reads++; return { ...f.state, planId: reads === 1 ? planId : 'b'.repeat(64) }; };
+  const result = await f.request(`${PREFIX}/impact?${new URLSearchParams({ planId, deployMode: 'source', phase: 'activate' })}`);
+  assert.equal(result.status, 409);
+  assert.equal(f.maintenance(), false); assert.equal(f.pendingPlanId(), null); assert.equal(f.calls.some(row => row.method !== 'status'), false);
+});
+
+const diagnosticFixture = (jobId = 'd'.repeat(32)) => ({ schemaVersion: 1, jobId, job: { id: jobId, status: 'failed', startedAt: stamp, finishedAt: stamp,
+  deployMode: 'source', scope: 'full', phase: 'activate', activeModule: null, steps: [{ id: 'hub', status: 'failed' }] },
+  versions: [{ id: 'hub', fromCommit: 'b'.repeat(40), targetCommit: 'a'.repeat(40) }], observation: { observedAt: null, units: [] },
+  health: { status: 'unknown' }, rollback: { status: 'unknown' }, missing: ['unit-states-not-recorded', 'health-result-not-recorded', 'rollback-result-not-recorded'] });
+
+test('update diagnostic travels through the real authenticated API without exposing raw task fields', async t => {
+  const calls = [], jobId = 'd'.repeat(32);
+  const client = { status: async () => state(), diagnostic: async id => { calls.push(id); return { ...diagnosticFixture(id), secret: 'never-export-private-log' }; } };
+  const f = await fixture(t, { client });
+  const route = `${PREFIX}/jobs/${jobId}/diagnostic`;
+  assert.equal((await f.request(route, { auth: false })).status, 401);
+  await f.login();
+  assert.equal((await f.request(route, { originHeader: 'https://foreign.invalid' })).status, 403);
+  const result = await f.request(route);
+  assert.equal(result.status, 200); assert.equal(result.data.jobId, jobId);
+  assert.equal(result.data.secret, undefined); assert.deepEqual(calls, [jobId]);
+  assert.equal((await f.request(route, { method: 'POST', body: {} })).status, 405);
+  assert.equal(f.maintenance(), false); assert.deepEqual(f.executionCalls, []);
+});
+
+test('local updater diagnostic client rejects mixed task identity and filters all unknown fields', async t => {
+  const socketPath = process.platform === 'win32' ? `\\\\.\\pipe\\update-diagnostic-${randomUUID()}` : path.join(os.tmpdir(), `update-diagnostic-${randomUUID()}.sock`);
+  const jobId = 'd'.repeat(32), calls = [];
+  let data = { ...diagnosticFixture(jobId), rawLog: 'do-not-export' }, status = 200;
+  const server = http.createServer((req, res) => { calls.push(req.url); res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); });
+  await new Promise(resolve => server.listen(socketPath, resolve));
+  t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
+  const client = createUpdateClient({ socketPath, timeoutMs: 1000 });
+  const value = await client.diagnostic(jobId);
+  assert.equal(value.jobId, jobId); assert.equal(value.rawLog, undefined);
+  assert.deepEqual(calls, [`/diagnostics/${jobId}`]);
+  data = diagnosticFixture('c'.repeat(32));
+  await assert.rejects(client.diagnostic(jobId), error => error.status === 503);
+  status = 404;
+  await assert.rejects(client.diagnostic(jobId), error => error.status === 404);
+});
+
 test('update HTTP routes require login, Origin and CSRF and accept only their fixed inputs', async t => {
   const f = await fixture(t);
   for (const [route, method] of [[PREFIX, 'GET'], [`${PREFIX}/events`, 'GET'], [`${PREFIX}/check`, 'POST'], [`${PREFIX}/apply`, 'POST'], [`${PREFIX}/token`, 'POST']]) {
