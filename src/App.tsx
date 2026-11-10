@@ -177,14 +177,15 @@ export default function App() {
       }, 1000);
     };
     const visible = () => { if (document.hidden) connect(); else resume(); };
-    const offline = () => { clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
+    const offline = () => { tradingCache.markUnavailable(); clearTimeout(resumeTimer); resumeTimer = undefined; connect(); pendingLoad.current?.controller.abort(); };
+    if (!navigator.onLine) tradingCache.markUnavailable();
     connect();
     document.addEventListener('visibilitychange', visible); window.addEventListener('online', resume); window.addEventListener('offline', offline);
     window.addEventListener('focus', resume); window.addEventListener('pageshow', resume);
     // This local timer only sends requests when the stream heartbeat has expired.
     const health = window.setInterval(() => { if (navigator.onLine && !document.hidden && watchdog.expired()) { connect(); void load(controller.signal); } }, 5000);
     return () => { controller.abort(); stream?.close(); stream = null; streamLive.current = false; clearTimeout(retry); clearTimeout(resumeTimer); clearInterval(health); document.removeEventListener('visibilitychange', visible); window.removeEventListener('online', resume); window.removeEventListener('offline', offline); window.removeEventListener('focus', resume); window.removeEventListener('pageshow', resume); for (const timer of refreshTimers.current.values()) clearTimeout(timer); refreshTimers.current.clear(); };
-  }, [authenticated, accept, load]);
+  }, [authenticated, accept, load, tradingCache]);
   useEffect(() => {
     if (!overview || !authenticated) return;
     let timer: ReturnType<typeof setTimeout> | undefined;

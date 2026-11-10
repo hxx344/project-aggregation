@@ -15,6 +15,22 @@ const state = (days = 7, page = 0, revision = 1) => ({
 });
 const read = (cache, data) => { const request = cache.beginRead(); assert.equal(cache.accept(request, data), true); cache.finish(request); return data; };
 
+test('disconnect invalidates every cached selection until each receives a new response', () => {
+  const cache = createTradingCache();
+  read(cache, state()); read(cache, state(30));
+  const oldTime = Date.parse(time) + 1000;
+  cache.markUnavailable();
+  for (const entry of [cache.get(7, 0), cache.get(30, 0), cache.latest()]) {
+    assert.equal(ageTradingData(entry, oldTime).accounts[0].positions.state, 'stale');
+    assert.equal(entry.data.accounts[0].positions.fetchedAt, time);
+  }
+  const pending = cache.beginRead();
+  assert.equal(ageTradingData(cache.get(7, 0), oldTime).accounts[0].positions.state, 'stale', 'online/read-start alone cannot restore freshness');
+  cache.accept(pending, state()); cache.finish(pending);
+  assert.equal(ageTradingData(cache.get(7, 0), oldTime).accounts[0].positions.state, 'live');
+  assert.equal(ageTradingData(cache.get(30, 0), oldTime).accounts[0].positions.state, 'stale');
+});
+
 test('session cache reuses exact range and server page without expanding ledger responses', () => {
   const cache = createTradingCache();
   const first = read(cache, state()), second = read(cache, state(7, 1)), month = read(cache, state(30));

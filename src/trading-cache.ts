@@ -83,6 +83,11 @@ export function createTradingCache() {
       if (entry) entry.failed = true;
       notify();
     },
+    markUnavailable() {
+      // Reconnecting permits a new read; it cannot revalidate pre-disconnect evidence.
+      for (const entry of [...pages.values(), ...latest.values()]) entry.failed = true;
+      notify();
+    },
     finish(request: Request) {
       requests.delete(request);
       if (mutation?.request === request) { mutation = null; notify(); }

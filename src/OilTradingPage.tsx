@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } 
 import type { FormEvent } from 'react';
 import { ChevronDown, CircleAlert, Link2, LoaderCircle, RefreshCw, ShieldCheck, Unplug } from 'lucide-react';
 import { api, ApiError } from './api';
+import { readTradingCache } from './trading-read';
 import { ageTradingData, pairExchanges, tradingCacheNow } from './trading-cache';
 import type { TradingCache } from './trading-cache';
 import TradingFundingChart from './TradingFundingChart';
@@ -195,7 +196,7 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
     setReading(true);
     const promise = (async () => {
       try {
-        const next = await api<TradingState>(`/api/trading?days=${requestedDays}&page=${requestedPage}&pair=${requestedPair}`, { signal: controller.signal, timeoutMs: 12_000 });
+        const next = await readTradingCache(api<TradingState>, `/api/trading?days=${requestedDays}&page=${requestedPage}&pair=${requestedPair}`, controller.signal);
         if (!mounted.current || version !== sequence.current || !cache.valid(request)) return;
         if (cache.accept(request, next)) {
           setError('');
@@ -338,6 +339,10 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
       {pairTab ? <div className="trading-pair-selector" role="group" aria-label="交易所组合">{(['binance,bybit', 'binance,okx', 'bybit,okx'] as const).map(value => <button key={value} type="button" aria-pressed={pair === value} disabled={!!busy} onClick={() => changePair(value)}>{pairExchanges(value).map(exchange => exchangeNames[exchange]).join(' + ')}</button>)}</div> : <p className="trading-toolbar-note"><ShieldCheck size={15} />只读观察账户：读取原油、海力士与 Anthropic 的仓位和资金费账单，不能下单</p>}
       {dataTab ? <button className="button secondary" onClick={() => void write('/api/trading/refresh', 'POST', {}, 'refresh')} disabled={!!busy || refreshing || !connected || offline}>{busy === 'refresh' || refreshing ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}{refreshing ? '同步中' : '刷新观察数据'}</button> : null}
     </div> : null}
+    <div hidden={section !== 'trade' && !dataTab}>
+      {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
+      {error && !offline ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>仓位同步中断：{error}{data ? ' 当前保留上次数据，正在自动重试。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
+    </div>
     <div className="trading-tab" hidden={section !== 'trade'}>
       <div className="trading-trade-top">
         <TradingSpread pair={pair} onPair={changePair} shares={shares} onShares={setShares} />
@@ -347,8 +352,6 @@ export default function OilTradingPage({ cache, onExpired, section, onSection }:
     </div>
     <div className="trading-tab" hidden={section !== 'auto'}><TradingAutoRules onExpired={onExpired} /></div>
     <div className="trading-tab" hidden={!dataTab}>
-    {offline ? <div className="trading-notice warning" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的数据；连接恢复后自动更新。</div> : null}
-    {error ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据。' : ''}</span><button className="button secondary" onClick={() => void load(true)} disabled={reading || !!busy}>重试读取</button></div> : null}
     {operationError ? <div className="trading-notice warning" role="alert"><CircleAlert size={17} /><span>{operationError}</span></div> : null}
     {notice ? <div className="trading-notice" role="status">{notice}</div> : null}
     {data ? <div className={`trading-notice trading-cache-status${oldCache || data.cache.error ? ' warning' : ''}`} role={data.cache.error ? 'alert' : 'status'}><span>{data.cache.error ? `${data.cache.error.message} 失败时间：${formatDate(data.cache.error.at)}（北京时间）。` : oldCache ? '当前显示旧缓存，等待更新。' : data.cache.rebuilding ? '后台正在更新缓存，当前显示上次数据。' : reading ? '已显示缓存，正在检查更新。' : '已显示缓存。'} 缓存生成：{formatDate(data.cache.builtAt)}{data.cache.builtAt ? '（北京时间）' : ''}</span></div> : null}
