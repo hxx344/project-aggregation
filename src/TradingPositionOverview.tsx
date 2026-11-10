@@ -1,10 +1,20 @@
 import { memo } from 'react';
 import { Layers } from 'lucide-react';
 import { amount, beijingTime, polarity, roundedAmount } from './trading-format';
+import { overviewPnl } from './trading-overview';
 import type { OverviewMarket } from './trading-overview';
 import type { TradingReadState } from './trading-types';
 
 const STATES: Record<TradingReadState, string> = { unconfigured: '未连接', loading: '同步中', live: '已同步', stale: '数据已过期', error: '读取失败' };
+
+function PositionTotal({ market }: { market: OverviewMarket }) {
+  const total = overviewPnl(market);
+  const paired = market.rows.length === 2 && market.rows[0].side !== market.rows[1].side;
+  return <tr className="trading-overview-total">
+    <th scope="row" colSpan={3}>{paired ? '双腿合计浮盈亏' : '持仓合计浮盈亏'}{total.note ? <small>{total.note}</small> : null}</th>
+    <td className={polarity(total.value)}>{roundedAmount(total.value, true)}{total.currency ? <small>{total.currency}</small> : null}</td><td />
+  </tr>;
+}
 
 /** Compact, read-only position summary shown beside the live spread; details stay in 套利仓位. */
 function TradingPositionOverview({ markets, onOpen }: { markets: OverviewMarket[]; onOpen: () => void }) {
@@ -21,6 +31,7 @@ function TradingPositionOverview({ markets, onOpen }: { markets: OverviewMarket[
           <td className={polarity(row.unrealizedPnl)}>{roundedAmount(row.unrealizedPnl, true)}</td>
           <td className={row.near ? 'trading-negative trading-overview-near' : ''}>{row.distancePercent === null ? '—' : `${row.distancePercent}%`}</td>
         </tr>) : <tr><td colSpan={5} className="trading-overview-empty">{market.empty}</td></tr>}
+        {market.rows.length ? <PositionTotal market={market} /> : null}
         {market.error ? <tr><td colSpan={5} className="trading-overview-error">{market.error}</td></tr> : null}
         {market.rows.length && market.summary ? <tr className="trading-overview-summary"><td colSpan={5}>{market.summary}</td></tr> : null}
       </tbody>)}

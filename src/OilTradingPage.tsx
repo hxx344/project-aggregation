@@ -34,7 +34,7 @@ const formatDate = (value: string | null) => beijingTime(value, '尚未同步', 
 
 const overviewRows = (legs: (PositionLeg & { positions: TradingPosition[] })[]): OverviewRow[] => legs.flatMap(leg => leg.positions.map(position => ({
   id: `${leg.id}-${position.id}`, exchange: exchangeNames[leg.exchange], symbol: position.instrumentId ?? leg.symbol, side: position.side,
-  quantity: position.quantity, unit: leg.exchange === 'okx' ? '张' : '', notional: position.notional, unrealizedPnl: position.unrealizedPnl,
+  quantity: position.quantity, unit: leg.exchange === 'okx' ? '张' : '', notional: position.notional, unrealizedPnl: position.unrealizedPnl, pnlCurrency: 'USDT',
   distancePercent: liquidationDistance(position.markPrice, position.liquidationPrice),
 })));
 const loadingMarket = (id: 'oil' | 'hynix', name: string, venues: string, error: string): OverviewMarket => ({ id, name, venues, state: error ? 'error' : 'loading', fetchedAt: null, rows: [], summary: null, error: null, empty: error || '正在读取…' });
