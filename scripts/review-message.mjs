@@ -21,7 +21,9 @@ function validNote(lines) {
 }
 
 function validEvidence(body) {
-  const lines = body.replace(/\r\n?/g, '\n').split('\n').filter(line => !line.startsWith('#'));
+  // A message file written by Windows PowerShell starts with an invisible BOM, which a merge
+  // carries to the first body line. publish-release.py drops it the same way.
+  const lines = body.replace(/\r\n?/g, '\n').split('\n').map(line => line.replace(/^\uFEFF/, '')).filter(line => !line.startsWith('#'));
   if (!validNote(lines)) return false;
   const text = lines.join('\n');
   const levels = [...text.matchAll(/^风险等级[ \t]*[:：][ \t]*([^\r\n]*)/gm)];
@@ -37,6 +39,10 @@ try {
   let entries;
   if (args.length === 3 && args[0] === '--staged' && args[1] === '--message') {
     entries = [{ paths: changedPaths('staged', null, true), body: readFileSync(args[2], 'utf8') }];
+  } else if (args.length === 4 && args[0] === '--range' && args[2] === '--message') {
+    // A pull request's description, checked as the commit message its merge will record.
+    diffArgs('range', args[1]);
+    entries = [{ paths: changedPaths('range', args[1], true), body: readFileSync(args[3], 'utf8') }];
   } else if (args.length === 2 && args[0] === '--range') {
     diffArgs('range', args[1]);
     const [, , , head] = /^(.+?)(\.{2,3})(.+)$/.exec(args[1]);
@@ -51,6 +57,6 @@ try {
     process.exitCode = 1;
   }
 } catch {
-  console.error('提交证据检查失败。用法：--staged --message <文件> 或 --range <base..head>。');
+  console.error('提交证据检查失败。用法：--staged --message <文件>、--range <base..head> 或 --range <base..head> --message <文件>。');
   process.exitCode = 2;
 }

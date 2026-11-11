@@ -18,7 +18,7 @@ FALLBACK_NOTES = '内部维护与稳定性改进，使用方式无变化。'
 
 def user_notes(message):
     """Only the commit's Chinese user-facing section reaches the update dialog."""
-    lines = message.splitlines()
+    lines = [line.removeprefix('\ufeff') for line in message.splitlines()]
     starts = [index for index, line in enumerate(lines) if NOTE_LABEL.match(line)]
     if len(starts) != 1:
         return FALLBACK_NOTES

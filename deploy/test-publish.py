@@ -148,6 +148,7 @@ class PublishRelease(unittest.TestCase):
         cases = [
             ('fix: one line\n\n更新说明：修复更新后交易模块停留在维护中\n\n风险等级：R2\n', '修复更新后交易模块停留在维护中\n'),
             ('fix: stop at evidence\n\n更新说明：第一条\n  - 第二条\n已运行：fixture\n', '第一条\n- 第二条\n'),
+            ('fix: byte order mark (#1)\n\n\ufeff更新说明：合并信息文件带 BOM 时仍显示本段\n风险等级：R2\n', '合并信息文件带 BOM 时仍显示本段\n'),
             ('docs: no section\n\nEnglish body only.\n', '内部维护与稳定性改进，使用方式无变化。\n'),
             ('fix: english\n\n更新说明：Fix the latch\n', '内部维护与稳定性改进，使用方式无变化。\n'),
             ('fix: duplicate\n\n更新说明：甲\n\n更新说明：乙\n', '内部维护与稳定性改进，使用方式无变化。\n'),

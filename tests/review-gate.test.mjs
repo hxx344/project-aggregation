@@ -88,7 +88,7 @@ test('commit evidence covers non-src modules, scripts, CI and deletion; docs rem
     f.put('message.txt', body);
     assert.equal(f.node('review-message.mjs', ['--staged', '--message', path.join(f.directory, 'message.txt')]).status, 1);
   }
-  for (const body of [evidence, evidence.replace(/\n/g, '\r\n'), withoutNote.replace('风险等级', `更新说明：\n- 修复 Aster 5x 维护状态\n- ${'好'.repeat(270)}\n风险等级`)]) {
+  for (const body of [evidence, evidence.replace(/\n/g, '\r\n'), evidence.replace('更新说明', '\uFEFF更新说明'), withoutNote.replace('风险等级', `更新说明：\n- 修复 Aster 5x 维护状态\n- ${'好'.repeat(270)}\n风险等级`)]) {
     f.put('message.txt', body);
     assert.equal(f.node('review-message.mjs', ['--staged', '--message', path.join(f.directory, 'message.txt')]).status, 0, body);
   }
@@ -154,6 +154,34 @@ test('CI entry uses push and PR ranges, checks commit evidence, and handles init
   assert.equal(f.node('review-ci.mjs', [], { GITHUB_EVENT_NAME: 'push', GITHUB_EVENT_PATH: event, GITHUB_SHA: noEvidence }).status, 1);
 });
 
+test('a pull request description is checked as the commit message its merge will record', t => {
+  const f = fixture(t);
+  const event = path.join(f.directory, 'event.json');
+  f.put('src/fixture.ts', 'export const value = 2;\n'); f.git('add', '.'); f.git('commit', '-qm', evidence);
+  const head = f.git('rev-parse', 'HEAD');
+  const body = evidence.split('\n').slice(2).join('\n');
+  const check = (pull, args = ['--pull-request-message'], name = 'pull_request') => {
+    f.put('event.json', JSON.stringify({ pull_request: { base: { sha: f.base }, head: { sha: head }, ...pull } }));
+    return f.node('review-ci.mjs', args, { GITHUB_EVENT_NAME: name, GITHUB_EVENT_PATH: event, GITHUB_SHA: head });
+  };
+  // The head commit carries valid evidence; only the description decides this check.
+  for (const pull of [{ title: 'feat: fixture', body: null }, { title: 'feat: fixture', body: '' }, { title: 'feat: fixture', body: '## Summary\n\nNo evidence here.' },
+    { title: 'feat: fixture', body: body.replace('风险等级：R2\n', '') }, { title: 'feat: fixture', body: `- ${body}` }]) {
+    const result = check(pull);
+    assert.equal(result.status, 1, JSON.stringify(pull));
+    assert.match(result.stderr, /PR 描述会成为合并后的提交信息/);
+  }
+  for (const pull of [{ title: 'feat: fixture', body }, { title: 'feat: fixture', body: `## Summary\n\nMarkdown around the evidence.\n\n\uFEFF${body.replace(/\n/g, '\r\n')}\n## Notes\n` }]) assert.equal(check(pull).status, 0, JSON.stringify(pull));
+  for (const pull of [{ body }, { title: 'feat: fixture', body: 7 }]) assert.equal(check(pull).status, 2);
+  assert.equal(check({ title: 'feat: fixture', body }, ['--pull-request-message'], 'push').status, 2);
+  assert.equal(check({ title: 'feat: fixture', body }, ['--unknown']).status, 2);
+  // The existing PR entry is unchanged: it never reads the description.
+  assert.equal(check({ title: 'feat: fixture', body: null }, []).status, 0);
+
+  f.git('reset', '--hard', '-q', f.base); f.put('docs/fixture.md', '# Documentation\n'); f.git('add', 'docs/fixture.md'); f.git('commit', '-qm', 'docs');
+  f.put('event.json', JSON.stringify({ pull_request: { base: { sha: f.base }, head: { sha: f.git('rev-parse', 'HEAD') }, title: 'docs: fixture', body: null } }));
+  assert.equal(f.node('review-ci.mjs', ['--pull-request-message'], { GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: event }).status, 0);
+});
 test('first push and manual CI dispatch can review a clean initial tree', t => {
   const f = fixture(t), event = path.join(f.directory, 'event.json');
   f.put('event.json', JSON.stringify({ before: '0'.repeat(40), after: f.base }));
