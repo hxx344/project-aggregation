@@ -189,9 +189,15 @@ export interface AdlDeps {
   isWriterLost(error: unknown): boolean;
   /** Current, readable margin-balance pairs. */
   pairs(): PairRecord[];
+  /** True while a margin transfer of the pair is being sent; no batch is sent meanwhile (one pair, one lock, as in the legacy system). */
+  transferSending?(pairId: string): boolean;
 }
 
-/** A reason to stop this pass and look again after adlRetryMs; never an exchange answer about an order. */
+const TRANSFER_SENDING = '配对的保证金划转正在发送，等划转有结果后再减仓';
+/** A transfer send ends within its call timeout; looking again each second keeps the reduction close behind it. */
+const TRANSFER_WAIT_MS = 1_000;
+
+/** A reason to stop this pass and look again after retryMs (adlRetryMs when not given); never an exchange answer about an order. */
 class Hold extends Error {
   readonly retryMs: number | null;
   constructor(message: string, retryMs: number | null = null) { super(message); this.retryMs = retryMs; }
@@ -205,7 +211,7 @@ const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '*
 const message = (error: unknown): string => error instanceof Error ? error.message.slice(0, 200) : '未知错误';
 const clientOrderId = (): string => `adl-${randomBytes(14).toString('hex')}`;
 
-export function createAdl({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost, pairs }: AdlDeps) {
+export function createAdl({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost, pairs, transferSending }: AdlDeps) {
   checkBudgets(budgets, connector);
   const tolerance = budgets.futureToleranceMs;
   /** Batches whose send or cancel runs in this process; any other prepared or sending row was interrupted. */
@@ -650,6 +656,8 @@ export function createAdl({ db, now, budgets, connector, controlled, write, asse
         write(() => { const incident = requireIncident(incidentId); if (incident.status === 'completed' || incident.status === 'watching' || incident.status === 'halted') return; incident.reason = '正在按原客户订单号核对减仓批次，确认结果后才发送下一批'; saveIncident(incident); });
         return;
       }
+      // A halted incident sends nothing either way, so a transfer on the wire does not replace its reason.
+      if (initial.status !== 'halted' && transferSending?.(pair.id)) throw new Hold(TRANSFER_SENDING, TRANSFER_WAIT_MS);
       const version = incidentVersion(incidentId), signature = evidenceSignature(pair.id);
       const incident = requireIncident(incidentId), symbols = incident.symbols;
       const snapshots = await readScene(pair, symbols);
@@ -726,6 +734,8 @@ export function createAdl({ db, now, budgets, connector, controlled, write, asse
       if (pairs().find(item => item.id === pair.id)?.identity !== pair.identity) return false;
       if (evidenceSignature(pair.id) !== signature) return false;
       if (openBatches(pair.id).some(item => item.state !== 'unknown-verified')) return false;
+      // A transfer that started while the scene was read: the next pass shows why it waits.
+      if (transferSending?.(pair.id)) return false;
       db.prepare('INSERT INTO adl_batches(id, incident_id, pair_id, client_order_id, state, settled, created_at, version, json) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?)')
         .run(batch.id, incidentId, pair.id, batch.clientOrderId, batch.state, at, JSON.stringify(batch));
       transition(incident, 'active');
@@ -981,6 +991,8 @@ export function createAdl({ db, now, budgets, connector, controlled, write, asse
 
   return {
     recover, tick, busy, setConfig, restart,
+    /** Why a batch of the pair is on the wire (persisted for sending, sent or resting), or null; the pair's transfers wait for it. */
+    sending: (pairId: string): string | null => db.prepare("SELECT 1 FROM adl_batches WHERE pair_id = ? AND settled = 0 AND state IN ('prepared', 'sending', 'open') LIMIT 1").get(pairId) ? 'ADL 减仓单正在发送或挂单' : null,
     pairs: () => { const list = pairs(); return list.map(pair => pairView(pair, list)); },
     incident: (id: string) => incidentView(requireIncident(id)),
     recent: (limit = 10) => (db.prepare('SELECT json FROM adl_incidents ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 50)) as { json: string }[])

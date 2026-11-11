@@ -66,41 +66,36 @@ async function main(): Promise<void> {
   // A new pair starts disabled; an existing one keeps its switch and settings.
   if (!executor.transferPairs().some(pair => pair.id === SIM_TRANSFER_PAIR.id) && !executor.corruptTransferPairs().includes(SIM_TRANSFER_PAIR.id)) executor.registerTransferPair(SIM_TRANSFER_PAIR);
 
-  // Lease renewal runs apart from the tick so a slow venue call cannot let the lease lapse.
+  // Lease renewal runs apart from the passes so a slow venue call cannot let the lease lapse.
   const heartbeat = setInterval(() => {
     try { if (!executor.acquire() && !stopping) { process.stderr.write('执行器已失去写入租约，停止\n'); process.exitCode = 1; void shutdown(); } }
     catch (error) { process.stderr.write(`续租失败：${error instanceof Error ? error.message : String(error)}\n`); }
   }, Math.floor(executor.budgets.leaseTtlMs / 3));
   let stopping = false;
+  let loops: Promise<void>[] = [];
+  // Waits that a shutdown cuts short, so no loop keeps the exit waiting out its spacing.
+  const sleepers = new Set<() => void>();
+  const pause = (ms: number) => new Promise<void>(resolve => {
+    const wake = () => { clearTimeout(timer); sleepers.delete(wake); resolve(); };
+    const timer = setTimeout(wake, ms);
+    sleepers.add(wake);
+  });
+  // Jobs, transfers and ADL each run on their own schedule, so a venue that answers slowly holds up only its own loop (2.4a).
   // A loop that no longer runs must not keep the lease alive: exit and let another instance take over.
-  const loop = (async () => {
+  const passLoop = (label: string, pass: () => Promise<void>) => (async () => {
     let failures = 0;
     while (!stopping && !executor.retired) {
-      try { await executor.tick(); failures = 0; }
+      try { await pass(); failures = 0; }
       catch (error) {
         failures += 1;
-        process.stderr.write(`执行循环失败（${failures}/${MAX_TICK_FAILURES}）：${error instanceof Error ? error.message : String(error)}\n`);
+        process.stderr.write(`${label}失败（${failures}/${MAX_TICK_FAILURES}）：${error instanceof Error ? error.message : String(error)}\n`);
         if (executor.retired || failures >= MAX_TICK_FAILURES) break;
       }
-      await new Promise(resolve => setTimeout(resolve, TICK_MS * (failures + 1)));
+      if (stopping || executor.retired) break;
+      await pause(TICK_MS * (failures + 1));
     }
     if (!stopping) { process.exitCode = 1; void shutdown(); }
   })();
-  // The position display reads on its own schedule, so a slow read neither waits for the tick nor holds it up (L049).
-  let wakePositions: (() => void) | null = null;
-  const positionsLoop = (async () => {
-    while (!stopping && !executor.retired) {
-      const started = Date.now();
-      try { await executor.refreshPositions(); }
-      catch (error) { process.stderr.write(`持仓读取轮失败：${error instanceof Error ? error.message : String(error)}\n`); }
-      // A shutdown that arrived during the round must not wait out another spacing.
-      if (stopping || executor.retired) break;
-      const wait = Math.max(TICK_MS, executor.budgets.positionsRefreshMs - (Date.now() - started));
-      await new Promise<void>(resolve => { const timer = setTimeout(resolve, wait); wakePositions = () => { clearTimeout(timer); resolve(); }; });
-      wakePositions = null;
-    }
-  })();
-
   const accessToken = randomBytes(32).toString('base64url');
   const server = createExecutorServer({ executor, accessToken });
   server.on('error', error => { process.stderr.write(`HTTP 监听失败：${error.message}\n`); process.exitCode = 1; void shutdown(); });
@@ -108,14 +103,28 @@ async function main(): Promise<void> {
     try { process.stdout.write(`执行器原型（模拟传输）已启动，登录链接已写入 ${writeAccessUrl(dir, port, accessToken)}\n`); }
     catch (error) { process.stderr.write(`写入登录链接失败：${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; void shutdown(); }
   });
+  // Started after the server exists; declared first, so a loop that ends at once can still shut everything down.
+  loops = [passLoop('两腿任务循环', executor.tickJobs), passLoop('划转循环', executor.tickTransfers), passLoop('ADL 循环', executor.tickAdl)];
+  // The position display reads on its own schedule, so a slow read neither waits for the passes nor holds them up (L049).
+  loops.push((async () => {
+    while (!stopping && !executor.retired) {
+      const started = Date.now();
+      try { await executor.refreshPositions(); }
+      catch (error) { process.stderr.write(`持仓读取轮失败：${error instanceof Error ? error.message : String(error)}\n`); }
+      // A shutdown that arrived during the round must not wait out another spacing.
+      if (stopping || executor.retired) break;
+      await pause(Math.max(TICK_MS, executor.budgets.positionsRefreshMs - (Date.now() - started)));
+    }
+  })());
+
   async function shutdown(): Promise<void> {
     if (stopping) return;
     stopping = true;
     clearInterval(heartbeat);
     executor.close();
     server.close();
-    wakePositions?.();
-    await Promise.all([loop, positionsLoop]);
+    for (const wake of [...sleepers]) wake();
+    await Promise.all(loops);
     store.close();
   }
   process.once('SIGINT', shutdown);
