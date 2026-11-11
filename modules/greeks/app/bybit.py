@@ -57,6 +57,44 @@ def is_rejection(ret_code: int, path: str) -> bool:
     return ret_code in REJECTED_COMMON_RET_CODES or ret_code in REJECTED_TRADE_RET_CODES.get(path, frozenset())
 
 
+# Fixed wording per documented code; the upstream body is never echoed, as it may carry request details.
+# Source: bybit-exchange/docs docs/v5/error.mdx at 6233a5a0 (HTTP codes and common 100xx table), checked 2026-11-11.
+_HTTP_FAILURE_CODES = {
+    10002: "请求时间戳超出接收窗口，请校准服务器时钟",
+    10003: "API 密钥无效或与环境不匹配",
+    10004: "签名校验失败，请核对 API 密钥与私钥",
+    10005: "API 密钥权限不足",
+    10006: "请求过于频繁，已被限频",
+    10009: "Bybit 服务受限，本服务器所在地区当前不可访问",
+    10010: "本服务器 IP 不在该 API 密钥的白名单内",
+    10024: "触发 Bybit 合规限制",
+}
+_HTTP_FAILURE_BODY_LIMIT = 65_536
+_HTTP_FAILURE_CODE_LIMIT = 10_000_000  # documented codes have at most seven digits; anything longer is not shown
+
+
+def http_failure_message(response, status: int) -> str:
+    """Why Bybit answered with an HTTP error, in fixed words: the envelope's code when there is one, the status otherwise."""
+    code = None
+    try:
+        content = response.content
+        if len(content) <= _HTTP_FAILURE_BODY_LIMIT:
+            data = json.loads(content)
+            if isinstance(data, dict) and type(data.get("retCode")) is int and 0 < data["retCode"] < _HTTP_FAILURE_CODE_LIMIT:
+                code = data["retCode"]
+    except Exception:
+        code = None
+    if code is not None:
+        reason = _HTTP_FAILURE_CODES.get(code)
+        return f"Bybit 返回 HTTP {status}（错误码 {code}）：{reason}" if reason else f"Bybit 返回 HTTP {status}（错误码 {code}，未收录的错误码）"
+    if status == 403:
+        return ("Bybit 拒绝了本服务器的请求（HTTP 403，响应不含错误码）。官方列出的可能原因：本服务器 IP 请求过于频繁被临时封禁"
+                "（可暂停访问一段时间后再试），或该 IP 所在地区受限")
+    if status == 429:
+        return "Bybit 返回 HTTP 429（响应不含错误码）：请求过于频繁，已被限频"
+    return f"Bybit 返回 HTTP {status}（响应不含错误码）"
+
+
 class BybitClient:
     def __init__(self, api_key: str = "", api_secret: str = "", testnet: bool = True, recv_window: int = 5000, market_testnet: bool = False):
         self.api_key = api_key
@@ -138,6 +176,10 @@ class BybitClient:
 
     @staticmethod
     def _response_result(response, path: str):
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int) and not 200 <= status < 300:
+            # Same exception type as raise_for_status, so every caller classifies it as before; only the wording changes.
+            raise httpx.HTTPStatusError(http_failure_message(response, status), request=response.request, response=response)
         response.raise_for_status()
         try:
             data = response.json()
