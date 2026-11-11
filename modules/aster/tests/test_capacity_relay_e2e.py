@@ -77,10 +77,17 @@ class RelayTLSEndToEndTests(unittest.TestCase):
                 self.snapshots.append(response.status_code)
             return response
 
-        self.server = uvicorn.Server(uvicorn.Config(
+        server_config = uvicorn.Config(
             app, host="127.0.0.1", port=self.port, ssl_certfile=self.cert,
             ssl_keyfile=self.key, log_level="critical", access_log=False,
-            lifespan="on", ws="websockets", timeout_graceful_shutdown=1))
+            lifespan="on", ws="websockets", timeout_graceful_shutdown=1)
+        server_config.load()
+        # On a zero-latency connection the threading client's reader can meet the
+        # TLS 1.3 session tickets while the upgrade request is being written, and
+        # OpenSSL then drops the request until open_timeout (openssl/openssl#7967,
+        # python-websockets/websockets#1779). Connections with latency are not affected.
+        server_config.ssl.num_tickets = 0
+        self.server = uvicorn.Server(server_config)
 
         def serve():
             try:
