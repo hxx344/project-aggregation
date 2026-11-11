@@ -118,6 +118,7 @@ const KEPT_HEADERS = /^(date|retry-after|x-mbx-used-weight.*|x-bapi-limit.*|x-ra
  */
 export async function exchange(url: string, init: { method: 'GET' | 'POST'; headers?: Record<string, string>; body?: string }, timeoutMs: number): Promise<HttpResult> {
   checkInterrupt();
+  waitSeam();
   const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeoutMs);
   const sentAt = Date.now();
   try {
@@ -150,8 +151,26 @@ export function watchSignals(): void {
 export function ignoreInterrupt(): void { honorInterrupt = false; }
 function checkInterrupt(): void { if (interrupted && honorInterrupt) throw new NotSent('收到中断信号'); }
 
+const WAIT_SEAM = Symbol.for('project-aggregation.contract-probes.wait-seam');
+type Pause = (ms: number) => Promise<void>;
+/**
+ * Test seam. The offline stand-in (platform/executor/test/contract-stub.ts, preloaded with `node --import`) replaces
+ * fetch and registers here that fetch with a pause that advances its own clock, so waits, deadlines and timestamps
+ * keep their real lengths without taking wall-clock time. The probes read no flag or environment variable to enable
+ * it: only preloaded code can register, and the workbench starts the probes with NODE_OPTIONS cleared. A registration whose fetch is not the one in use would put
+ * shortened waits in front of a real venue, so the run stops before its next request.
+ */
+function waitSeam(): Pause | null {
+  const seam = (globalThis as unknown as Record<symbol, unknown>)[WAIT_SEAM];
+  if (seam === undefined) return null;
+  const { fetch: paired, pause } = (seam ?? {}) as { fetch?: unknown; pause?: unknown };
+  if (paired !== globalThis.fetch || typeof pause !== 'function') throw new NotSent('检测到测试用的等待替换，但请求不会发往测试替身：拒绝运行');
+  return pause as Pause;
+}
+
 export async function sleep(ms: number): Promise<void> {
-  for (let rest = ms; rest > 0; rest -= 200) { checkInterrupt(); await new Promise(resolve => setTimeout(resolve, Math.min(rest, 200))); }
+  const pause: Pause = waitSeam() ?? (chunk => new Promise(resolve => setTimeout(resolve, chunk)));
+  for (let rest = ms; rest > 0; rest -= 200) { checkInterrupt(); await pause(Math.min(rest, 200)); }
   checkInterrupt();
 }
 

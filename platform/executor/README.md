@@ -28,7 +28,7 @@ node scripts/measure.ts                                        # 混合负载测
 
 ## 真实接口契约探测（阶段 2.6a/2.6b）
 
-`server/contract-probes/bybit-chase.ts` 与 `server/contract-probes/aster-transfer.ts`（仓库根目录下的工作台 `server/`，随发布包发布；共用代码在 `server/contract-probes/lib/`，其中 `decimal.ts` 是本目录 `src/decimal.ts` 的逐字节副本，由测试核对）是探测脚本，用真实账户核实执行器只在模拟器上成立的假设（盘点文档第 9 节第 38、39 项与 Bybit 原生追价一项）。它们不属于执行器：`src/` 仍只接受模拟传输，探测脚本不读写 `executor.sqlite`，也不经过共享写者登记。CI 只跑它们的离线测试（`test/contract.test.ts`：签名与 ethers、与工作台现有 Bybit 签名逐字节核对，写入守卫，报告脱敏，以及在替身接口上跑完整流程和故障分支），不连接任何交易所。
+`server/contract-probes/bybit-chase.ts` 与 `server/contract-probes/aster-transfer.ts`（仓库根目录下的工作台 `server/`，随发布包发布；共用代码在 `server/contract-probes/lib/`，其中 `decimal.ts` 是本目录 `src/decimal.ts` 的逐字节副本，由测试核对）是探测脚本，用真实账户核实执行器只在模拟器上成立的假设（盘点文档第 9 节第 38、39 项与 Bybit 原生追价一项）。它们不属于执行器：`src/` 仍只接受模拟传输，探测脚本不读写 `executor.sqlite`，也不经过共享写者登记。CI 只跑它们的离线测试（`test/contract.test.ts`：签名与 ethers、与工作台现有 Bybit 签名逐字节核对，写入守卫，报告脱敏，以及在替身接口上跑完整流程和故障分支），不连接任何交易所。替身（`test/contract-stub.ts`，以 `node --import` 预加载）替换 fetch，并通过 `lib/common.ts` 的等待接口让脚本的等待改走替身时钟：每次等待把时钟拨快同样时长而不占真实时间，轮询次数、截止时间与时间戳判断都与真实运行相同。这个接口只在登记的 fetch 正是当前使用的 fetch 时生效，否则脚本在发出请求前中止；脚本没有缩短等待的参数或环境变量，工作台启动探测时清空 `NODE_OPTIONS`。
 
 运行入口有两个，守卫相同：
 

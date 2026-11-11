@@ -10,6 +10,12 @@ const json = (body: unknown, status = 200): Response => new Response(JSON.string
 const accounts: { master: string; a: string; b: string } = JSON.parse(process.env.CONTRACT_STUB_ACCOUNTS ?? '{"master":"","a":"","b":""}');
 
 const faults = new Set((process.env.CONTRACT_STUB_FAULT ?? '').split(',').filter(Boolean));
+// The probe's waits run on this clock (see the seam at the end): each pause moves it forward instead of passing,
+// so the probe's polls, deadlines and timestamps and the stand-ins' own time checks see the intervals a real run would.
+// The report's `at` fields and the stand-ins' `date` header come from `new Date()` and stay on real time; nothing decides on them.
+let skewMs = 0;
+const wallClock = Date.now.bind(Date);
+Date.now = () => wallClock() + skewMs;
 const UNIT = 100_000_000n;
 const toUnits = (value: string): bigint => { const [whole, fraction = ''] = value.split('.'); return BigInt(whole!) * UNIT + BigInt(fraction.padEnd(8, '0')); };
 const fromUnits = (value: bigint): string => { const sign = value < 0n ? '-' : '', size = value < 0n ? -value : value; return sign + (size / UNIT) + '.' + String(size % UNIT).padStart(8, '0'); };
@@ -133,4 +139,11 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   // The first such write takes effect and its reply never arrives.
   if (method === 'POST' && effective && !lost && faults.has(LOST_REPLY[url.pathname] ?? '')) { lost = true; throw new TypeError('fetch failed'); }
   return response;
+};
+
+// server/contract-probes/lib/common.ts honours the pause only while the registered fetch is the one in use;
+// 'seam-unpaired' registers another one, as if requests would go to a real venue.
+(globalThis as unknown as Record<symbol, unknown>)[Symbol.for('project-aggregation.contract-probes.wait-seam')] = {
+  fetch: faults.has('seam-unpaired') ? async (): Promise<Response> => { throw new Error('not the fetch in use'); } : globalThis.fetch,
+  pause: async (ms: number): Promise<void> => { skewMs += ms; await new Promise(resolve => setImmediate(resolve)); },
 };
