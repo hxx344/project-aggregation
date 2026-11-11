@@ -144,7 +144,7 @@ const sameSet = (left: Set<string>, right: Set<string>): boolean => left.size ==
 function checkBudgets(budgets: TransferBudgets, connector: TransferConnector | null): void {
   const positive = (value: unknown): boolean => Number.isSafeInteger(value) && (value as number) > 0;
   for (const key of TRANSFER_BUDGET_KEYS) {
-    // The future tolerance is shared with the quote checks, where zero is a valid setting.
+    // The future tolerance is shared with the quote checks, where zero is a valid setting. It is also the clock allowance when an unknown transfer is matched to its rows.
     if (key === 'futureToleranceMs') { if (!Number.isSafeInteger(budgets[key]) || budgets[key] < 0) throw new ContractError(500, 'budget', `${key} 须为非负整数`); }
     else if (!positive(budgets[key])) throw new ContractError(500, 'budget', `${key} 须为正整数`);
   }
@@ -503,7 +503,8 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
     const suffix = unreadable ? `；${unreadable}` : '';
     if (!unreadable && oneToOne) {
       // Without the venue's own transaction id, a receipt older than the request may belong to an earlier transfer inside the clock-tolerance window.
-      const current = found(transfer.tranId ? from : Math.max(from, transfer.preparedAt));
+      // The venue stamps a row with the whole second it ran in, which can precede the send by up to a second, plus the clock allowance.
+      const current = found(transfer.tranId ? from : Math.max(from, Math.floor(transfer.preparedAt / 1000) * 1000 - budgets.futureToleranceMs));
       if (sameSet(current[0], source) && sameSet(current[1], destination)) {
         const snapshot = transfer.beforeReceipts.source && transfer.beforeReceipts.destination ? '' : '；缺少发送前流水快照';
         return finish(transfer.id, 'late_receipt_confirmed', common[0], transfer.tranId ? null : `无原交易编号，按金额与时间归属，可能误认其他同额划转${snapshot}`, evidence);
