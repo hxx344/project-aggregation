@@ -133,7 +133,7 @@ async (page) => {
   elapsed = await page.evaluate(() => Date.now()) - base + 50;
   await page.clock.pauseAt(new Date(base + elapsed));
   serverClock = { elapsed, mono: await page.evaluate(() => performance.now()) };
-  assert((await page.locator('.breadcrumb').innerText()).includes('监控'), 'the native route is in monitoring');
+  assert((await page.locator('.breadcrumb').innerText()).includes('研究室'), 'the native route is in the research workspace');
   assert(await page.getByRole('heading', { name: '对冲成本研究', exact: true }).count() === 1, 'native cost-lab route renders the research page');
   assert(await page.locator('.blc-scenarios tbody tr').count() === 3, 'BTC times three delays remain independent inventory accounts');
   assert((await page.locator('.blc-heading').innerText()).includes('BTC 永续') && !(await page.locator('.blc-heading').innerText()).includes('ETH'), 'new research is visibly limited to BTC');
