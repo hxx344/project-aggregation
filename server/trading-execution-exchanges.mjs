@@ -58,7 +58,8 @@ import { EXECUTION_VENUE_SYMBOLS, executionSymbols } from './trading-markets.mjs
  * original total quantity. Each amendment is a single native modify operation,
  * not an exchange-managed chase. A failed amendment can leave the original live;
  * reconcile that order instead of canceling and replacing it to chase prices.
- * Bybit: native chaseOrder, zero offset, maxChasePrice=stopPrice (omitted when
+ * Bybit: native chaseOrder, zero offset (chasePercentE4: 0; the venue refuses
+ * chaseDistance "0" with 10001), maxChasePrice=stopPrice (omitted when
  * the leg has no limit). There is no
  * documented client id / idempotency token for native strategy creation. An
  * uncertain create must never be retried or matched by approximate parameters.
@@ -284,6 +285,8 @@ function upstreamFailure(exchange, status, data, mutation) {
   // Only explicit parameter, permission, balance and limit rejections prove
   // non-execution. Never infer that property from a numeric error-code range:
   // duplicate, processing, completed/canceled and unknown codes remain uncertain.
+  // Bybit 60081 means another chase on the same symbol and side exists and this
+  // request created nothing: a create is re-sent only after a timestamp refusal.
   const knownRejection = exchange === 'binance'
     ? [
       -1002, -1003, -1008, -1013, -1015, -1020, -1022,
@@ -294,7 +297,7 @@ function upstreamFailure(exchange, status, data, mutation) {
     : [
       10001, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10017, 10024, 10027, 10028, 100029,
       110003, 110004, 110007, 110009, 110012, 110016, 110017, 110020, 110021, 110022, 110032, 110094,
-      60063, 60064, 60066, 60067, 60069, 60070, 60075, 60077, 60078, 60079,
+      60063, 60064, 60066, 60067, 60069, 60070, 60075, 60077, 60078, 60079, 60081,
     ].includes(providerCode);
   return new ExecutionExchangeError(knownRejection && status < 500 ? 'rejected' : 'upstream', {
     providerCode, uncertain: mutation && (status >= 500 || !knownRejection),
@@ -849,7 +852,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       category: 'UTA_USDT', symbol: spec.symbol, side: spec.side === 'buy' ? 'Buy' : 'Sell', size: spec.quantity,
       strategyType: 'chaseOrder', positionIdx: ['BOTH', 'LONG', 'SHORT'].indexOf(spec.positionSide),
       // maxChasePrice is optional: without it the strategy follows the book until filled or stopped.
-      reduceOnly: spec.reduceOnly, chaseDistance: '0', ...(spec.stopPrice === null ? {} : { maxChasePrice: spec.stopPrice }),
+      reduceOnly: spec.reduceOnly, chasePercentE4: 0, ...(spec.stopPrice === null ? {} : { maxChasePrice: spec.stopPrice }),
     };
     if (streams) { validateCredentials(credentials); invalidateStreamOrder(credentials, spec, options); }
     const result = await request(exchange === 'bybit' && market ? 'orderCreate' : 'create', credentials, parameters, options);

@@ -30,7 +30,7 @@ const TIMEOUT_MS = 12_000;
 const MAX_NOTIONAL_CAP = '200';
 /** Codes the old client treats as proof that a write did not execute; anything else stays uncertain there. */
 const OLD_REJECTIONS = new Set([10001, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10017, 10024, 10027, 10028, 100029,
-  110003, 110004, 110007, 110009, 110012, 110016, 110017, 110020, 110021, 110022, 110032, 110094, 60063, 60064, 60066, 60067, 60069, 60070, 60075, 60077, 60078, 60079]);
+  110003, 110004, 110007, 110009, 110012, 110016, 110017, 110020, 110021, 110022, 110032, 110094, 60063, 60064, 60066, 60067, 60069, 60070, 60075, 60077, 60078, 60079, 60081]);
 
 type Row = Record<string, unknown>;
 interface Reply { http: HttpResult; retCode: number | null; retMsg: unknown; result: Row | null }
@@ -318,9 +318,9 @@ async function main(): Promise<number> {
     armed = true;
 
     const base = { category: 'UTA_USDT', symbol, side: 'Buy', strategyType: 'chaseOrder', positionIdx, reduceOnly: false };
-    // How "no offset from the best bid" is written. The workbench sends chaseDistance "0", which the
-    // venue refused (10001, chase_distance params error) on 2026-11-12; the first accepted spelling is kept.
-    const OFFSETS: [string, Record<string, string | number>][] = [['chaseDistance "0"', { chaseDistance: '0' }], ['chasePercentE4 0', { chasePercentE4: 0 }], ['不带偏移参数', {}]];
+    // How "no offset from the best bid" is written. On 2026-11-12 the venue accepted chasePercentE4 0 (what the
+    // workbench sends) and refused chaseDistance "0" (10001, chase_distance params error); the first accepted spelling is kept.
+    const OFFSETS: [string, Record<string, string | number>][] = [['chasePercentE4 0', { chasePercentE4: 0 }], ['不带偏移参数', {}], ['chaseDistance "0"', { chaseDistance: '0' }]];
     let offset: Record<string, string | number> = OFFSETS[0]![1];
     const create = async (name: string, size: string, maxChasePrice: string, timestampShiftMs = 0): Promise<WriteResult> => {
       const preparedAt = Date.now();
