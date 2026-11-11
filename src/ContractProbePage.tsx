@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { CircleAlert, Download, LoaderCircle, Play, Square } from 'lucide-react';
 import { api, ApiError } from './api';
+import { useLiveResource } from './use-live-resource';
 import { beijingTime } from './trading-format';
 import './contract-probes.css';
 
@@ -68,49 +69,29 @@ function RunPanel({ run, state, busy, onLive, onStop, onDownload }: { run: Run; 
 }
 
 export default function ContractProbePage({ onExpired }: { onExpired: () => void }) {
-  const [state, setState] = useState<State | null>(null);
-  const [readError, setReadError] = useState(''), [writeError, setWriteError] = useState(''), [busy, setBusy] = useState(false);
+  const [writeError, setWriteError] = useState(''), [busy, setBusy] = useState(false), [running, setRunning] = useState(false);
   const [bybit, setBybit] = useState({ symbol: 'CLUSDT', maxNotional: '50', passiveBps: '200', settleTimeoutS: '60', allowFill: false });
   const [aster, setAster] = useState({ masterPrefix: '', aPrefix: '', bPrefix: '', amount: '1', probeNonce: '', balancerPaused: false, settleTimeoutS: '300', historyMinutes: '30' });
-  const mounted = useRef(false), reading = useRef<AbortController | null>(null), generation = useRef(0), running = useRef(false), writing = useRef(false), expires = useRef(onExpired);
+  const mounted = useRef(false), writing = useRef(false), expires = useRef(onExpired);
   expires.current = onExpired;
-  running.current = !!state?.running;
-  const load = useCallback(async () => {
-    if (reading.current || writing.current) return;
-    const controller = new AbortController(), version = generation.current;
-    reading.current = controller;
-    try {
-      const value = await api<State>(ROOT, { signal: controller.signal, timeoutMs: 12000 });
-      if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
-      setState(value); setReadError('');
-    } catch (failure) {
-      if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
-      if (failure instanceof ApiError && failure.status === 401) expires.current();
-      else setReadError(failure instanceof Error ? failure.message : '测试状态读取失败');
-    } finally { if (reading.current === controller) reading.current = null; }
-  }, []);
-  useEffect(() => {
-    mounted.current = true; void load();
-    let ticks = 0;
-    // Every 3 s while a probe runs, every 15 s otherwise.
-    const timer = setInterval(() => { ticks += 1; if (!document.hidden && (running.current || ticks % 5 === 0)) void load(); }, 3000);
-    const wake = () => { if (!document.hidden) void load(); };
-    document.addEventListener('visibilitychange', wake);
-    return () => { mounted.current = false; generation.current++; clearInterval(timer); reading.current?.abort(); reading.current = null; document.removeEventListener('visibilitychange', wake); };
-  }, [load]);
+  // 探测运行中每 3 秒读一次，否则 15 秒。写操作确认的结果直接成为当前值，之前发出的读取作废。
+  const probes = useLiveResource<State>(ROOT, { intervalMs: running ? 3000 : 15000, timeoutMs: 12000, onExpired });
+  const state = probes.data, readError = probes.error && !(probes.error instanceof ApiError && probes.error.status === 401) ? probes.error.message : '';
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  useEffect(() => { setRunning(!!state?.running); }, [state?.running]);
 
   async function write(path: string, body: unknown) {
     if (writing.current) return;
-    writing.current = true; generation.current++; reading.current?.abort(); reading.current = null;
+    writing.current = true;
     setBusy(true); setWriteError('');
     try {
       const value = await api<State>(ROOT + path, { method: 'POST', body: JSON.stringify(body), timeoutMs: 30000 });
-      if (mounted.current) { setState(value); setReadError(''); }
+      if (mounted.current) probes.commit(value);
     } catch (failure) {
       if (!mounted.current) return;
       if (failure instanceof ApiError && failure.status === 401) expires.current();
       else setWriteError(failure instanceof Error ? failure.message : '操作未完成，请刷新核对');
-    } finally { writing.current = false; if (mounted.current) { setBusy(false); void load(); } }
+    } finally { writing.current = false; if (mounted.current) { setBusy(false); void probes.refresh(); } }
   }
   function startBybit() {
     if (![bybit.passiveBps, bybit.settleTimeoutS].every(value => /^\d{1,4}$/.test(value)) || !/^\d{1,3}(?:\.\d{1,2})?$/.test(bybit.maxNotional)) { setWriteError('请填写有效的金额上限、价距与等待时间。'); return; }
@@ -153,7 +134,7 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
     <header><h1>接口实测</h1>
       <p>用真实账户核对交易所接口的实际行为。每项测试先做<strong>只读检查</strong>（不发任何委托或划转），通过后显示本次的确认内容，勾选确认才会<strong>真实运行</strong>。真实运行有固定上限：Bybit 单笔名义金额不超过 200 USDT，ASTER 单笔不超过 5 USD1。</p>
       <p>同一时刻只运行一项测试；真实运行期间系统更新会被挡住。测试结束后可下载报告（已隐去密钥、签名与账户编号）。</p></header>
-    {readError ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{readError}；页面内容可能已过期。<button onClick={() => void load()}>重试</button></div> : null}
+    {readError ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{readError}；页面内容可能已过期。<button onClick={() => void probes.refresh()}>重试</button></div> : null}
     {writeError ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{writeError}</div> : null}
     {!state ? <p role="status"><LoaderCircle size={15} className="spin" /> 正在读取测试状态…</p> : <>
       {state.maintenance ? <p className="probe-error" role="status">系统正在更新或等待确认更新结果，暂不能开始测试。</p> : null}

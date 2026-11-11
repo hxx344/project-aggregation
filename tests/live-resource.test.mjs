@@ -217,6 +217,54 @@ test('an expired session stays an error across hide and return', async () => {
   assert.equal(calls.length, 1);
 });
 
+test('retune changes the interval without aborting the read or dropping data', async () => {
+  const h = harness(), { calls, source: src } = source(15_000), w = watch();
+  const handle = h.store.subscribe('/probes', src, w.listener);
+  calls[0].resolve('idle'); await h.flush();
+  await h.advance(2_000);
+  handle.retune(3_000);
+  assert.equal(calls.length, 1, 'not yet due under the shorter interval');
+  await h.advance(1_000);
+  assert.equal(calls.length, 2, 'the shorter interval applies from the last read');
+  handle.retune(15_000);
+  assert.equal(calls[1].signal.aborted, false, 'an in-flight read survives retuning');
+  calls[1].resolve('running'); await h.flush();
+  await h.advance(14_000);
+  assert.equal(calls.length, 2);
+  await h.advance(1_000);
+  assert.equal(calls.length, 3);
+  assert.equal(w.last().data, 'running');
+});
+
+test('retune reads at once when already due, follows wake, and is ignored when stopped or left', async () => {
+  const h = harness(), { calls, source: src } = source(15_000), w = watch();
+  const handle = h.store.subscribe('/probes', src, w.listener);
+  calls[0].resolve('idle'); await h.flush();
+  await h.advance(4_000);
+  handle.retune(3_000);
+  assert.equal(calls.length, 2, 'a shorter interval that has already elapsed reads at once');
+  calls[1].resolve('running'); await h.flush();
+  await h.setHidden(true);
+  handle.retune(15_000);
+  assert.equal(calls.length, 2, 'retuning while hidden does not read');
+  await h.setHidden(false);
+  assert.equal(calls.length, 3, 'a polled resource reads on return');
+  calls[2].resolve('back'); await h.flush();
+  handle.retune(null);
+  await h.advance(60_000);
+  assert.equal(calls.length, 3, 'null stops polling');
+  assert.equal(h.timers.size, 0);
+  void h.store.refresh('/probes');
+  calls[3].reject(Object.assign(new Error('login'), { status: 401 })); await h.flush();
+  await h.advance(5_000);
+  handle.retune(1_000);
+  await h.advance(5_000);
+  assert.equal(calls.length, 4, 'an expired session is not retried by retune');
+  handle();
+  handle.retune(500);
+  assert.equal(h.timers.size, 0, 'retune after leaving has no effect');
+});
+
 test('subscribing while hidden waits for the page to become visible', async () => {
   const h = harness(), { calls, source: src } = source(5_000), w = watch();
   await h.setHidden(true);

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from './api';
-import { browserEnvironment, createResourceStore, type ResourceSnapshot } from './live-resource';
+import { browserEnvironment, createResourceStore, type ResourceSnapshot, type Subscription } from './live-resource';
 
 // 工作台只读页面的共享读取入口，调度与失效规则见 live-resource.ts。
 const store = createResourceStore(browserEnvironment());
@@ -13,7 +13,7 @@ export type LiveResource<T> = ResourceSnapshot<T> & {
 };
 
 type Options<T> = {
-  // null 表示只在打开时读取一次，之后靠 refresh。
+  // null 表示只在打开时读取一次，之后靠 refresh；变化时只调整计时。
   intervalMs: number | null;
   timeoutMs?: number;
   // 边界校验：抛错按读取失败处理，不覆盖上次结果。
@@ -34,6 +34,9 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
   const parser = useRef(parse);
   parser.current = parse;
   const handled = useRef<Error | null>(null);
+  const interval = useRef(intervalMs);
+  interval.current = intervalMs;
+  const subscription = useRef<Subscription | null>(null);
   useEffect(() => {
     if (!enabled) {
       setState(current => current.path === path ? (current.snapshot.status === 'paused' ? current : { path, snapshot: { ...current.snapshot, status: 'paused' } }) : { path, snapshot: initial<T>(false) });
@@ -43,7 +46,7 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
       const raw = await api<unknown>(path, { signal, timeoutMs });
       return parser.current ? parser.current(raw) : raw as T;
     };
-    return store.subscribe<T>(path, { read, intervalMs }, snapshot => {
+    const current = store.subscribe<T>(path, { read, intervalMs: interval.current }, snapshot => {
       if (snapshot.error instanceof ApiError && snapshot.error.status === 401 && snapshot.error !== handled.current) { handled.current = snapshot.error; expired.current(); }
       setState(current => {
         // 共享条目刚建立、还没有结果时，保留本组件上次看到的数据；状态以共享条目为准。
@@ -51,7 +54,11 @@ export function useLiveResource<T>(path: string, { intervalMs, timeoutMs = 10_00
         return { path, snapshot: keep ? { ...snapshot, data: current.snapshot.data, receivedAt: current.snapshot.receivedAt } : snapshot };
       });
     });
-  }, [path, enabled, intervalMs, timeoutMs]);
+    subscription.current = current;
+    return () => { if (subscription.current === current) subscription.current = null; current(); };
+  }, [path, enabled, timeoutMs]);
+  // 间隔随页面状态变化时只调整计时，不重新订阅。
+  useEffect(() => { subscription.current?.retune(intervalMs); }, [intervalMs]);
   const refresh = useCallback(() => store.refresh(path), [path]);
   const commit = useCallback((data: T) => store.commit(path, data), [path]);
   return { ...(state.path === path ? state.snapshot : initial<T>(enabled)), refresh, commit };

@@ -9,6 +9,7 @@
 export type ResourceStatus = 'loading' | 'ready' | 'error' | 'paused' | 'offline';
 export type ResourceSnapshot<T> = { data: T | null; error: Error | null; status: ResourceStatus; receivedAt: number | null };
 export type ResourceSource<T> = { read: (signal: AbortSignal) => Promise<T>; intervalMs: number | null };
+export type Subscription = (() => void) & { retune: (intervalMs: number | null) => void };
 
 export type ResourceEnvironment = {
   now: () => number;
@@ -112,6 +113,13 @@ export function createResourceStore(env: ResourceEnvironment) {
     const status: ResourceStatus = env.online() ? 'paused' : 'offline';
     if (entry.snapshot.status !== status) publish(entry, { status });
   };
+  // 新订阅者或更短的间隔：按当前最小间隔判断是否已到期，到期立即读，否则重排计时器。
+  const catchUp = (key: string, entry: Entry) => {
+    if (entry.request || entry.stopped) return;
+    const ms = interval(entry);
+    if (entry.lastAttemptAt === null || ms !== null && env.now() - entry.lastAttemptAt >= ms) void start(key, entry);
+    else schedule(key, entry);
+  };
   const wake = () => {
     for (const [key, entry] of entries) {
       if (!readable()) { suspend(entry); continue; }
@@ -128,7 +136,7 @@ export function createResourceStore(env: ResourceEnvironment) {
   };
 
   return {
-    subscribe<T>(key: string, source: ResourceSource<T>, listener: (snapshot: ResourceSnapshot<T>) => void): () => void {
+    subscribe<T>(key: string, source: ResourceSource<T>, listener: (snapshot: ResourceSnapshot<T>) => void): Subscription {
       let entry = entries.get(key);
       if (!entry) {
         entry = { read: source.read, subscribers: new Set(), snapshot: { data: null, error: null, status: 'loading', receivedAt: null }, generation: 0, request: null, timer: undefined, lastAttemptAt: null, stopped: false, interrupted: false };
@@ -139,19 +147,21 @@ export function createResourceStore(env: ResourceEnvironment) {
       entry.subscribers.add(subscriber);
       const current = entry;
       if (!readable()) suspend(current);
-      else if (!current.request && !current.stopped) {
-        // 新订阅者要求更短的间隔时，按新间隔判断是否已经到期。
-        const ms = interval(current);
-        if (current.lastAttemptAt === null || ms !== null && env.now() - current.lastAttemptAt >= ms) void start(key, current);
-        else schedule(key, current);
-      }
+      else catchUp(key, current);
       listener(current.snapshot as ResourceSnapshot<T>);
-      return () => {
+      const leave = () => {
         if (!current.subscribers.delete(subscriber)) return;
         if (current.subscribers.size) { schedule(key, current); return; }
         cancel(current); entries.delete(key);
         if (!entries.size) { unlisten?.(); unlisten = null; }
       };
+      // 调整本订阅者的间隔（如探测运行中改为 3 秒），不中止在途读取、不丢弃结果。
+      const retune = (ms: number | null) => {
+        if (subscriber.intervalMs === ms || !current.subscribers.has(subscriber)) return;
+        subscriber.intervalMs = ms;
+        if (readable()) catchUp(key, current);
+      };
+      return Object.assign(leave, { retune });
     },
     // 立即重新读取：之前发出的读取作废，结束后恢复轮询。
     refresh(key: string): Promise<void> {
