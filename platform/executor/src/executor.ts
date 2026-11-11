@@ -9,9 +9,10 @@ import {
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
-  type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type VenueConnector,
+  type ChaseConnector, type ChaseRequest, type OrderReport, type OrderRequest, type StrategyIdentity, type StrategyReport, type StrategyStatus, type TransferConnector, type VenueConnector,
 } from './connector.ts';
 import type { Store } from './store.ts';
+import { createTransfers } from './transfer.ts';
 import { ControlRefusal, MAX_OWNED_BUDGET_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /** Start values come from the legacy constants registered in plan 6.4; none of them is a met performance target. */
@@ -44,12 +45,35 @@ export interface Budgets {
   historyRetentionMs: number;
   pruneIntervalMs: number;
   pruneBatch: number;
+  /** A transfer without an answer is labeled once this long has passed since the send, or once the signed request has expired if that is later. */
+  transferHistorySpanMs: number;
+  /** How far the venue clock may differ: receipts are read from this long before the send, and the pre-send snapshot looks back this far. */
+  transferClockToleranceMs: number;
+  /** How long a label read that fails or is incomplete may be put off before the transfer is settled from what is known. */
+  transferLabelDeferMs: number;
+  /** Least cooldown after a transfer without an answer was settled, and the longer one when it is still open whether money moved. */
+  transferSettleCooldownMs: number;
+  transferUncertainCooldownMs: number;
+  /** Spacing of read-only retries: the balance refresh after an acknowledgement and a deferred label read. */
+  transferRetryMs: number;
+  /** Timeout of one transfer read (balance, sub-account list, label history). The send keeps callTimeoutMs, which is what a transfer's expiry counts on. */
+  transferReadTimeoutMs: number;
+  /** Timeout of the optional pre-send receipt snapshot; a side not read by then is sent without one. */
+  transferBaselineTimeoutMs: number;
+  /** A transfer is only planned and sent from balance snapshots received within this long. */
+  transferBalanceMaxAgeMs: number;
+  /** How long after its acknowledgement a transfer may wait for both balances to be read again before it is settled on the acknowledgement alone. */
+  transferRefreshDeferMs: number;
+  /** Once a pass has spent this long on transfers it starts no further transfer or pair; the rest goes first in the next pass. */
+  transferTickBudgetMs: number;
 }
 export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
   previewTtlMs: 30_000, previewQuoteMaxAgeMs: 10_000, sendQuoteMaxAgeMs: 10_000, futureToleranceMs: 1_000, callTimeoutMs: 35_000,
   createObserveMs: 120_000, createArrivalMarginMs: 60_000, absentChecks: 2, absentSpacingMs: 5_000, cancelAttempts: 5, cancelRetryMs: 10_000, leaseTtlMs: 60_000,
   unresolvedGraceMs: 60_000, maxSlippageBps: 50, pairQuoteWindowMs: 1_500, hedgeAttempts: 5, venueClockToleranceMs: 300_000, adoptSkewMs: 5_000,
   historyRetentionMs: 90 * 24 * 3_600_000, pruneIntervalMs: 3_600_000, pruneBatch: 500,
+  transferHistorySpanMs: 180_000, transferClockToleranceMs: 60_000, transferLabelDeferMs: 300_000, transferSettleCooldownMs: 30_000, transferUncertainCooldownMs: 300_000, transferRetryMs: 5_000,
+  transferReadTimeoutMs: 8_000, transferBaselineTimeoutMs: 1_500, transferBalanceMaxAgeMs: 8_000, transferRefreshDeferMs: 300_000, transferTickBudgetMs: 10_000,
 });
 
 export class WriterLostError extends ContractError { constructor(message: string) { super(503, 'writer_lost', message); } }
@@ -182,6 +206,8 @@ export interface ExecutorOptions {
   budgets?: Partial<Budgets>;
   /** Shared account-writer registry; absent means this executor writes no shared state. */
   control?: { writer: AccountWriterPort; environment: ControlEnvironment };
+  /** ASTER sub-account transfers. They are not recorded in the shared registry, so with control injected none is sent and no pair can be enabled. */
+  transfers?: TransferConnector;
 }
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -190,8 +216,9 @@ const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '*
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions }: ExecutorOptions) {
-  const budgets: Budgets = { ...DEFAULT_BUDGETS, ...overrides };
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector }: ExecutorOptions) {
+  // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
+  const budgets: Budgets = { ...DEFAULT_BUDGETS, ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)) };
   // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
   if (!Number.isSafeInteger(budgets.hedgeAttempts) || budgets.hedgeAttempts < 1 || budgets.hedgeAttempts > 99) throw new ContractError(500, 'budget', 'hedgeAttempts 须为 1–99');
   if (!Number.isSafeInteger(budgets.maxSlippageBps) || budgets.maxSlippageBps < 1 || budgets.maxSlippageBps > MAX_SLIPPAGE_BPS) throw new ContractError(500, 'budget', `maxSlippageBps 须为 1–${MAX_SLIPPAGE_BPS}`);
@@ -203,10 +230,13 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (venues.has(connector.venue)) throw new ContractError(500, 'duplicate_connector', `重复的 ${connector.venue} 连接器`);
     venues.set(connector.venue, connector);
   }
+  if (transferConnector && (transferConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;
   let ticking: Promise<void> | null = null;
+  /** The last transfer-pass failure written to the event log; the same reason is written at most once a minute. */
+  let transferTickFailure: { reason: string; at: number } | null = null;
   /** Operations whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
   /** Operations whose cancel is running in this process. */
@@ -268,6 +298,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (job.status === 'accepted' && !opsOf(job.id).length) finish(job, 'failed', '服务重启时任务尚未发送，已取消；请重新预览');
       else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = '服务恢复：核对已发送委托；首腿不再新发并撤销挂单，已成交部分按落盘进度补发对冲腿'; saveJob(job); event(job.id, 'job-held', {}); }
     }
+    transfers.recover();
   }
 
   // ---- persistence -------------------------------------------------------------
@@ -320,16 +351,17 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
 
   // ---- venue calls -------------------------------------------------------------
-  async function callVenue<T>(kind: 'read' | 'write', operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  async function callVenue<T>(kind: 'read' | 'write', operation: (signal: AbortSignal) => Promise<T>, timeoutMs = budgets.callTimeoutMs): Promise<T> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_resolve, fail) => {
-      timer = setTimeout(() => { controller.abort(); fail(new VenueError(kind === 'write' ? 'uncertain' : 'read-failed', `交易所调用超过 ${budgets.callTimeoutMs} 毫秒`)); }, budgets.callTimeoutMs);
+      timer = setTimeout(() => { controller.abort(); fail(new VenueError(kind === 'write' ? 'uncertain' : 'read-failed', `交易所调用超过 ${timeoutMs} 毫秒`)); }, timeoutMs);
       (timer as { unref?: () => void }).unref?.();
     });
     try { return await Promise.race([operation(controller.signal), deadline]); }
     finally { clearTimeout(timer); }
   }
+  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError });
   const readFailure = (error: unknown): never => {
     if (error instanceof ContractError) throw error;
     throw new ContractError(502, 'venue_read_failed', `交易所读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知错误'}`);
@@ -1205,14 +1237,17 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.job_id = j.id AND o.settled = 0)`;
   let prunedAt = 0;
   /** Deletes at most pruneBatch rows per table in one short transaction; returns what it removed. */
-  function prune(): { events: number; commands: number; previews: number } {
+  function prune(): { events: number; commands: number; previews: number; transfers: number } {
     const cutoff = now() - budgets.historyRetentionMs, limit = budgets.pruneBatch;
     return write(() => {
       const events = Number(db.prepare(`DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at < ? AND (job_id IS NULL OR job_id IN (${DONE_JOB})) ORDER BY seq LIMIT ?)`).run(cutoff, cutoff, limit).changes);
-      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND job_id IN (${DONE_JOB}) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
+      // Pair switches name a pair, not a job; past the retention period their request ids need no replay protection.
+      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND (kind = 'transfer-enable' OR job_id IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       const previews = Number(db.prepare(`DELETE FROM previews WHERE id IN (SELECT id FROM previews WHERE expires_at < ? AND (consumed_job IS NULL OR consumed_job IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
-      if (events + commands + previews) event(null, 'history-pruned', { events, commands, previews, before: cutoff });
-      return { events, commands, previews };
+      // A settled transfer is only history: used receipts, cooldown and pacing live on the pair, which is kept.
+      const transfers = Number(db.prepare('DELETE FROM transfers WHERE id IN (SELECT id FROM transfers WHERE settled = 1 AND created_at < ? ORDER BY created_at LIMIT ?)').run(cutoff, limit).changes);
+      if (events + commands + previews + transfers) event(null, 'history-pruned', { events, commands, previews, transfers, before: cutoff });
+      return { events, commands, previews, transfers };
     });
   }
 
@@ -1312,10 +1347,21 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         }
       } catch (error) { if (error instanceof WriterLostError) throw error; }
     }
+    // Transfers come last and must not cost the jobs above their pass, nor the registry its release below.
+    try { await transfers.tick(); }
+    catch (error) {
+      if (error instanceof WriterLostError) throw error;
+      const reason = error instanceof Error ? error.message.slice(0, 160) : '未知';
+      const at = now();
+      if (!transferTickFailure || transferTickFailure.reason !== reason || at - transferTickFailure.at >= 60_000) {
+        try { write(() => event(null, 'transfer-tick-failed', { reason })); transferTickFailure = { reason, at }; }
+        catch (inner) { if (inner instanceof WriterLostError) throw inner; }
+      }
+    }
     // Again at the end, so a result reconciled in this pass releases its account before the next one.
     settleControl();
   }
-  /** One serialized pass over unfinished jobs. */
+  /** One serialized pass over unfinished jobs, then over transfers. */
   function tick(): Promise<void> {
     if (!ticking) ticking = runTick().finally(() => { ticking = null; });
     return ticking;
@@ -1359,6 +1405,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     observe,
     tick,
     jobView,
+    registerTransferPair: transfers.registerPair,
+    setTransferEnabled: transfers.setEnabled,
+    transferPairs: transfers.pairs,
+    corruptTransferPairs: transfers.corruptPairs,
+    recentTransfers: transfers.recent,
     unfinished: () => unfinishedJobs().map(job => job.id),
     recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */

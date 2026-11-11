@@ -329,7 +329,7 @@ test('存储：已有 v1 库升级到 v2 保留数据并补齐索引', () => wit
   old.close();
   const store = openStore(file);
   try {
-    assert.equal(store.schemaVersion(), 2);
+    assert.equal(store.schemaVersion(), MIGRATIONS.at(-1)!.version);
     assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'legacy'").get() as { n: number }).n, 1);
     const indexes = (store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map(row => row.name);
     for (const name of ['events_at', 'commands_accepted', 'previews_consumed']) assert.ok(indexes.includes(name), name);
@@ -338,7 +338,7 @@ test('存储：已有 v1 库升级到 v2 保留数据并补齐索引', () => wit
 
 test('存储：WAL 截断上限与保留期索引迁移', () => withHarness(async h => {
   assert.equal((h.store.db.prepare('PRAGMA journal_size_limit').get() as { journal_size_limit: number }).journal_size_limit, WAL_SIZE_LIMIT_BYTES);
-  assert.equal(h.store.schemaVersion(), 2);
+  assert.equal(h.store.schemaVersion(), MIGRATIONS.at(-1)!.version);
   const indexes = (h.store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as { name: string }[]).map(row => row.name);
   for (const name of ['events_at', 'commands_accepted', 'previews_consumed']) assert.ok(indexes.includes(name), name);
 }));

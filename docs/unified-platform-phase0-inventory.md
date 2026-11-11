@@ -621,7 +621,7 @@ stateDiagram-v2
 | --- | --- | --- | --- |
 | `previewTtlMs` | 30 s | `platform/executor/src/executor.ts:31` | 同 `PREVIEW_TTL` |
 | `previewQuoteMaxAgeMs` / `sendQuoteMaxAgeMs` | 10 s / 10 s | `executor.ts:31` | 同 `QUOTE_MAX_AGE`；发送前守卫未用 1500 ms（首切片为手工任务） |
-| `futureToleranceMs` | 1 s | `executor.ts:31` | Hub 未见同名常量 |
+| `futureToleranceMs` | 1 s | `executor.ts:31` | Hub 未见同名常量；划转余额快照的接收时刻超前本机超过它同样拒绝（`platform/executor/src/transfer.ts`），须为非负整数 |
 | `callTimeoutMs` | 35 s | `executor.ts:31` | 同 `EXECUTION_CALL_TIMEOUT_MS` |
 | `createObserveMs` / `createArrivalMarginMs` | 120 s / 60 s | `executor.ts:32` | 同 Hub |
 | `absentChecks` / `absentSpacingMs` | 2 / 5 s | `executor.ts:32` | 同 Hub |
@@ -634,6 +634,13 @@ stateDiagram-v2
 | 任务 `timeoutMs` 范围 | 30 s – 1 h | `platform/executor/src/contracts.ts:212` | — |
 | SQLite `busy_timeout` / `synchronous` | 5000 ms / FULL | `platform/executor/src/store.ts:57,64` | 与 hub.sqlite 的 5000 ms 相同 |
 | 写锁等待分桶 / 样本上限 | [1,10,100,1000,5000] ms / 20000 | `platform/executor/src/store.ts:41-42` | 分桶同 `server/sqlite-writes.mjs`，另保留样本用于分位数 |
+| 划转 `transferHistorySpanMs` / 模拟 ASTER `requestValidityMs` | 180 s / 120 s | `platform/executor/src/executor.ts`；`platform/executor/src/sim-aster.ts` | 同 `TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS` / `TRANSFER_NONCE_EXPIRY_SECONDS`；到期取 max(调用超时 + 有效期, 历史跨度) |
+| 划转 `transferClockToleranceMs` / `transferLabelDeferMs` | 60 s / 300 s | `platform/executor/src/executor.ts` | 同 `TRANSFER_CLOCK_TOLERANCE_SECONDS` / `TRANSFER_LABEL_DEFER_SECONDS` |
+| 划转 `transferSettleCooldownMs` / `transferUncertainCooldownMs` / `transferRetryMs` | 30 s / 300 s / 5 s | `platform/executor/src/executor.ts` | 同 `TRANSFER_SETTLE_COOLDOWN_SECONDS` / `TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS`；只读重试间隔为新增 |
+| 划转 `transferReadTimeoutMs` / `transferBaselineTimeoutMs` / `transferBalanceMaxAgeMs` | 8 s / 1.5 s / 8 s | `platform/executor/src/executor.ts` | 读取超时为新增（发送仍用 `callTimeoutMs`）；后两项同 `TRANSFER_SNAPSHOT_TIMEOUT_SECONDS` / `ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS`（`modules/aster/trading/margin_balance.py:106,110`） |
+| 划转 `transferRefreshDeferMs` / `transferTickBudgetMs` | 300 s / 10 s | `platform/executor/src/executor.ts` | 新增：已回执后等待余额刷新的上限（到期按回执结清）；每轮划转处理的时间预算 |
+| 划转已用流水保留窗口 | 2 × `transferClockToleranceMs` + `transferHistorySpanMs` = 300 s | `platform/executor/src/transfer.ts` | 旧实现按条数保留；这里按时间，由上述预算导出，不单独配置 |
+| 划转配对默认配置 | 门槛 10、最小 1、单次上限 1000 USD1，保留比例 0.05，冷却 30 s，检查间隔 5 s | `platform/executor/src/contracts.ts` | 同 `DEFAULT_MARGIN`（绝对保留未迁移） |
 
 ### 7.3 与阶段 1 预算相关的非执行常量
 
@@ -723,6 +730,9 @@ CI 中测量步骤只在退出码 2（仅预算未达）时视为通过；任务
 阶段 2 第二批已处理（有测试覆盖）：
 25（部分）. ~~未建模 Bybit 原生追价策略（F04 要求）~~：Bybit 首腿可选原生追价。交易所不接受客户编号，本地客户订单号只用于登记；追价腿不带 `limitPrice`，`maxChasePrice` 取预览价格保护界限 `priceBound`。ACK 回报的策略编号经查询核对身份后才采用并按其核对与停止，截止、停止请求或暂停时停止并重查，终态子单未结清超过宽限转人工；创建结果未知（含回报编号已被认领、查无、身份不符或创建时间不在本次发送时段；以及 ACK 后查询失败、之后查无、身份不符、创建时间不符或超过宽限仍未核对）时不重发，回报编号先落盘供人工核对，人工填写策略编号认领、在观察窗后确认未创建（有发送时段前后创建或仍在运行的未认领策略、持仓或挂单不符即拒绝），或带风险确认强制释放（委托保持未知，登记按可能已执行结清）。子单结清依赖连接器回报，策略列表须由连接器分页读完；ACK 核对与认领的时钟偏差容限只有 `adoptSkewMs`（5 秒），接真实账户前须按交易所服务器时间校准。
 
+阶段 2 第三批已处理（有测试覆盖，仅模拟传输）：
+36. ASTER 配对保证金平衡划转的复杂恢复切片（S09，状态图见 6.4 的旧实现）：`platform/executor/src/transfer.ts` 与模拟连接器 `src/sim-aster.ts`。配对为同一主账户下的多侧与空侧子账户；规划沿用旧规则（差额须严格大于门槛，金额取差额一半、单次上限、转出侧可划上限、扣除现金保留后的可用四者最小值，向下取整到 1e-8，低于最小额不划）；发送前在动作内重读子账户归属与两侧余额并重新规划，尽力记录发送前同额流水基线，意图在发送前落盘。状态：`prepared` → `sending` →（`acknowledged` → `confirmed`）/ `rejected` / `not-sent` / `unknown`；`unknown` 到期后结算为 `confirmed`（`late_receipt_confirmed`）、`expired-not-executed`（`nonce_expired_no_receipt`）或 `expired-unverified`（部分匹配、归属歧义、不可读、身份已变）。已回执的划转只刷新余额、从不重发，刷新最多等到回执后 300 s（`transferRefreshDeferMs`），到期按回执结清并注明余额未刷新；规划与发送只用 8 s 内取得、且晚于本配对及共用账户配对上一笔划转结算时刻的余额，发送前基线每侧限时 1.5 s，余额在基线之后重读；结果未知的划转永不重发，到期（发送时刻 + max(调用超时 + 连接器请求有效期, 历史跨度 180 s)）后读一次两侧流水打标签并全自动结算，读取失败最多推迟 300 s，标签、终态、已用流水与配对冷却同一事务提交；冷却：回执或明确拒绝后从发送时刻起为配置冷却（同旧实现 `margin_balance.py:1795`）；未知结算后从结算时刻起，普通 30 s，部分匹配、歧义、不可读与无交易编号的确认 300 s，均与配置冷却取大（旧实现 `margin_balance.py:925-930` 只对部分匹配、歧义与无编号确认用 300 s，不可读为 30 s；这里不可读取 300 s，是保守偏离）；未发送按检查间隔指数退避，上限为配置冷却。已用流水按 300 s 时间窗口保留；已结清的划转记录超过保留期后删除；每轮划转处理有 10 s 时间预算，单笔或整体出错不影响两腿任务。接管时 `prepared` 记为未发送、`sending` 记为未知、`acknowledged` 继续刷新，未结清前所有配对不新发；同一配对或共用子账户的配对有未结清划转时不新发。与旧实现的差异：两侧各一笔但交易编号不同记为归属歧义（旧实现为部分匹配）；到期时刻计入调用超时；任何读取失败或不完整都推迟（旧实现只在限流时推迟）；未知结算的终态拆成已执行、未执行、未能确认三种；新增存储迁移 3（`transfer_pairs`、`transfers`）。
+
 仍待处理：
 21. `open` 操作查无时只写备注，人工处理接口未实现。
 24. `busy_timeout` 5000 ms 大于写锁等待预算最大值 1000 ms；本机测量最大等待约 17 ms，暂未触发，阶段 2 与写入线程方案一起定。
@@ -740,12 +750,30 @@ CI 中测量步骤只在退出码 2（仅预算未达）时视为通过；任务
     - 对冲腿不设价格上限（用户决定），残余风险是极端行情下市价对冲远离预览价成交。
     - 登记在准入之后、建单登记时才暂时拒绝（竞态，罕见）：该笔记为未发送，对冲腿计入补发次数，首腿则任务失败；方向安全，未发送任何委托。
     - 建单观察窗取各窗口最大值而非相加；接真实连接器时若签名时刻可能晚于 `sentAt`，改为与撤单窗口一致的相加口径。
+37. ASTER 划转未接入共享写者登记（用户决定，见下）：划转只在执行器内部按配对与子账户互斥；注入登记时执行器拒绝启用配对且不发送划转。接真实账户前须把划转接入登记，并让登记协议支持“结果未知、到期自动结算”的操作（现有协议的未知写入需逐笔结清，见第 25 项）。
+38. ASTER 划转的未验证假设（接真实账户前逐项核实）：
+    - nonce 有效窗口按文档 60 s，加 60 s 时钟偏差取 120 s，未在线上验证；模拟连接器按 120 s。
+    - 划转两侧流水的交易编号是否相同未验证；不同则结果未知的划转无法确认，一律记为归属歧义。
+    - 流水只能按侧、金额、时间归属，发送后出现的同额外部划转会造成错误的“已执行”标签或归属歧义，到期后才出现的流水会造成错误的“未执行”标签；无交易编号的回执不登记已用流水，之后同额同向的未知划转在无基线且交易所时钟超前时可能被前一笔流水误确认（同属“按侧、金额、时间归属”限制的一个情形）；最坏后果被论证为资金在配对自有子账户之间多移动或少移动一次，这是设计论证，不是交易所保证。
+    - 标签读取推迟上界 300 s、基线回看 60 s、历史跨度 180 s 沿用旧系统取值，未按真实接口重新论证。
+    - 流水完整性（分页读完、满页视为不完整）只在模拟连接器实现。
+39. 接真实 ASTER 账户前的前置项（均未做；完成前 `transfers` 只接受模拟传输）：
+    - 真实 ASTER 划转契约测试，逐项取得实测结论：nonce 有效期（现按 120 s）；回执是否带交易编号；两侧流水的交易编号是否相同；流水查询 `endTime` 的开闭；入账延迟上界（回执到两侧余额、流水可见的最长时间）。结论须回填到期公式、标签规则与 `transferRefreshDeferMs`、`transferLabelDeferMs` 的取值。
+    - 划转接入共享写者登记（第 37 项），含登记协议对“结果未知、到期自动结算”操作的支持。
+    - 余额时序校验在真实连接器上的验证：`transferBalanceMaxAgeMs` 与“快照须晚于上一笔划转结算时刻”按本机收到时刻判断，须确认真实接口在该时刻返回的余额已反映此前结算的划转，否则改用交易所数据时刻或加入账延迟余量。真实连接器的 `receivedAt` 必须是本机收到应答的时刻且不得超前（超前超过 `futureToleranceMs` 的余额快照被拒绝）。
+    - 把划转从任务 tick 拆出或并行化：现在划转在两腿任务循环末尾串行执行，按默认预算单个配对一轮评估最坏 68.5 s（余额 8 + 子账户列表 8 + 基线 1.5 + 重读余额 8 + 发送 35 + 刷新 8），一轮划转处理最长约 78.5 s，期间两腿任务循环被阻塞。
+    - 保留期清理查询无专用索引（`transfers` 按 `settled = 1 AND created_at` 删除，`commands` 按 `accepted_at` 删除）：原型数据量下无影响，接真实数据前评估加索引。
 
 **用户决定（2026-11-11）**
 
 - 接管或重启时首腿已成交、对冲腿未发：新写者按落盘进度自动补发对冲腿，仍经过账户绑定、数量和对冲守卫；价格偏离不作为补发的阻断条件（用户明确选择不设限制）。首腿发送前的价格保护（第 29 项）照常适用。阶段 2 实现并补接管补发测试。
 - 接真实账户的前置项全部放进阶段 2：接入 `execution-control.sqlite`（第 25 项）、Bybit 原生追价（第 25 项）、价格保护（第 29 项）、本地鉴权（第 31 项）、保留期与 WAL 上限（第 26 项）。
 - M15 随 ASTER 在阶段 3 迁移；Aero（D06–D12、S05）在阶段 3 迁移；ASTER S06 在阶段 3 随 ASTER 迁移。
+
+**用户决定（2026-11-11，阶段 2 第三批，ASTER 划转切片）**
+
+- 结果未知的划转全自动到期结算：永不重发，原请求过期后读两侧流水，照旧系统打标签并结算，没有人工环节（不做认领、确认未执行或强制释放）。
+- 本切片不接共享写者登记：划转只在执行器内部互斥；登记缺口登记为接真实账户前的前置项（第 37、39 项）。
 
 第 19–23 项及独立审查（R3）提出的 P1/P2 已在原型内修复：未知委托与对冲腿账户读取失败有界转人工、同实例结果未写入的恢复、入口循环失败交还租约退出、预览出口脱敏、页面确认重试保留按钮、数据目录按祖先与大小写检查、预览要求两腿桶数相等。
 

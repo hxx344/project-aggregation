@@ -13,6 +13,8 @@ const MAX_BODY_BYTES = 16 * 1024;
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
 
+const PAIR_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(enable|disable)$/;
+
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
   'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'",
@@ -78,7 +80,8 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
 
     if (request.method === 'GET' && url.pathname === '/api/state') {
-      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), jobs: executor.recentJobs(20) });
+      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), jobs: executor.recentJobs(20),
+        transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) } });
     }
     if (request.method === 'GET' && url.pathname === '/api/observe') {
       const venue = url.searchParams.get('venue') ?? '', symbol = url.searchParams.get('symbol') ?? '';
@@ -87,6 +90,11 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     }
     if (request.method === 'POST' && url.pathname === '/api/preview') return send(response, 200, executor.publicPreview(await executor.preview(await readJson(request), session)));
     if (request.method === 'POST' && url.pathname === '/api/confirm') return send(response, 200, executor.confirm(await readJson(request), session));
+    const pair = request.method === 'POST' ? PAIR_PATH.exec(url.pathname) : null;
+    if (pair) {
+      const body = exactKeys(await readJson(request), ['requestId']);
+      return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, session));
+    }
     const match = UUID_PATH.exec(url.pathname);
     // The path match is case-insensitive, so the action is compared lowercased; otherwise /STOP would fall through to acknowledge.
     const action = match?.[2]?.toLowerCase();

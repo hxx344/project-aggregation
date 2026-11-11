@@ -7,7 +7,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { openStore } from './store.ts';
 import { createExecutor } from './executor.ts';
-import { SIM_BINDINGS, createSimulatedVenues } from './simulation.ts';
+import { SIM_BINDINGS, SIM_TRANSFER_PAIR, createSimulatedVenues } from './simulation.ts';
 import { createExecutorServer } from './http.ts';
 
 const LEGACY_MARKERS = ['hub.sqlite', 'execution-control.sqlite', 'credentials.key', 'modules'];
@@ -59,10 +59,12 @@ async function main(): Promise<void> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const store = openStore(join(dir, 'executor.sqlite'));
-  const { binance, bybit } = createSimulatedVenues(Date.now);
-  const executor = createExecutor({ store, connectors: [binance, bybit] });
+  const { binance, bybit, aster } = createSimulatedVenues(Date.now);
+  const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster });
   if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
   for (const binding of SIM_BINDINGS) executor.registerAccount(binding);
+  // A new pair starts disabled; an existing one keeps its switch and settings.
+  if (!executor.transferPairs().some(pair => pair.id === SIM_TRANSFER_PAIR.id) && !executor.corruptTransferPairs().includes(SIM_TRANSFER_PAIR.id)) executor.registerTransferPair(SIM_TRANSFER_PAIR);
 
   // Lease renewal runs apart from the tick so a slow venue call cannot let the lease lapse.
   const heartbeat = setInterval(() => {

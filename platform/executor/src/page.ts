@@ -1,6 +1,7 @@
 // Minimal single-file page: preview, confirm (retries keep the same requestId),
 // the accepted job shown apart from the list, stop, acknowledge, adopting a Bybit
-// chase strategy, confirming it was not created or releasing it, and ANT read-only.
+// chase strategy, confirming it was not created or releasing it, ANT read-only,
+// and the ASTER margin-balance pairs with their transfers.
 export const PAGE = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>执行器原型（模拟）</title>
 <style>
@@ -26,6 +27,9 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 </fieldset>
 <h2>本次受理任务</h2><div id="accepted" class="muted">尚未提交</div>
 <h2>最近任务</h2><div id="jobs"></div>
+<h2>ASTER 保证金平衡（模拟）</h2>
+<p class="muted">在配对的多侧与空侧子账户之间划转 USD1。结果未知的划转不重发，原请求过期后核对两侧流水并自动结算。</p>
+<div id="pairs" class="muted">—</div><div id="transfers"></div>
 <h2>ANT 只读（Binance ANTHROPICUSDT）</h2><div id="ant" class="muted">—</div>
 <script>
 const $ = id => document.getElementById(id);
@@ -54,6 +58,24 @@ function strategyHtml(op) {
   if (op.kind !== 'strategy') return '';
   return ' · 追价策略 ' + (op.remoteId ? esc(op.remoteId) : '编号未知') + (op.strategyStatus ? ' ' + esc(STRATEGY_STATUS[op.strategyStatus] || op.strategyStatus) : '')
     + (op.strategyStatus === 'terminal' && op.childrenSettled === false ? '（子单未结清）' : '') + (op.adoptedAt ? '（人工认领）' : '') + (op.releasedAt ? '（已强制释放）' : '');
+}
+const SIDE = { long: '多侧', short: '空侧' };
+const TRANSFER_STATE = { prepared: '已落盘', sending: '发送中', acknowledged: '已回执，待刷新余额', unknown: '结果未知，待到期结算', confirmed: '已执行', rejected: '被拒绝', 'not-sent': '未发送', 'expired-not-executed': '到期结算：未执行', 'expired-unverified': '到期结算：是否执行未能确认' };
+// A switch keeps its requestId only while no answer arrived, so a lost response is replayed safely; any answer, refusals included, ends that request.
+const pairRequests = {};
+const clock = at => at ? new Date(at).toLocaleTimeString() : '—';
+function transferText(item) {
+  return esc(SIDE[item.sourceSide]) + ' → ' + esc(SIDE[item.destinationSide]) + ' ' + esc(item.amount) + ' ' + esc(item.asset) + ' · ' + esc(TRANSFER_STATE[item.state] || item.state)
+    + (item.readyAt ? '（' + esc(clock(item.readyAt)) + ' 后结算）' : '') + (item.recovered ? '（接管恢复）' : '');
+}
+function pairRow(pair) {
+  const side = name => pair.balances ? '可用 ' + esc(pair.balances[name].available) + ' / 权益 ' + esc(pair.balances[name].equity) + ' / 可划 ' + esc(pair.balances[name].maxWithdraw) : '未读取';
+  const wait = pair.blocked || (pair.cooldownUntil > Date.now() ? '冷却至 ' + clock(pair.cooldownUntil) : '');
+  return '<tr><td>' + esc(pair.id) + '<br><span class="muted">主 ' + esc(pair.mainAccountId) + '</span></td><td>' + (pair.enabled ? '已启用' : '已停用') + '</td><td>多侧 ' + esc(pair.long) + '：' + side('long') + '<br>空侧 ' + esc(pair.short) + '：' + side('short') + '</td><td>'
+    + (pair.current ? transferText(pair.current) : '无未结清划转') + '</td><td>' + esc(wait) + (wait && pair.note ? '；' : '') + esc(pair.note) + '</td><td><button data-pair="' + esc(pair.id) + '" data-enable="' + (pair.enabled ? '0' : '1') + '">' + (pair.enabled ? '停用' : '启用') + '</button></td></tr>';
+}
+function transferRow(item) {
+  return '<tr><td>' + esc(item.id.slice(0, 8)) + '</td><td>' + esc(item.pairId) + '</td><td>' + esc(clock(item.preparedAt)) + '</td><td>' + transferText(item) + '</td><td>' + esc(item.basis) + (item.receipt ? ' ' + esc(item.receipt) : '') + '</td><td>' + esc(item.labelNote || item.note) + '</td></tr>';
 }
 function jobRow(job) {
   const pending = job.status === 'attention' && job.strategyPending;
@@ -93,6 +115,19 @@ document.addEventListener('input', event => {
   if (id) strategyInputs[id] = event.target.value.trim();
 });
 document.addEventListener('click', async event => {
+  const { pair, enable } = event.target.dataset || {};
+  if (!pair) return;
+  const key = pair + ':' + enable;
+  try {
+    await api('/api/transfer-pairs/' + pair + (enable === '1' ? '/enable' : '/disable'), { requestId: pairRequests[key] || (pairRequests[key] = crypto.randomUUID()) });
+    delete pairRequests[key];
+    refresh();
+  } catch (error) {
+    if (error.status) delete pairRequests[key];
+    alert(error.message);
+  }
+});
+document.addEventListener('click', async event => {
   const { stop, ack, adopt, notcreated, release } = event.target.dataset || {};
   if (!stop && !ack && !adopt && !notcreated && !release) return;
   try {
@@ -121,6 +156,9 @@ async function refresh() {
     // Re-rendering while a strategy id is being typed would take the focus away.
     const typing = document.activeElement?.dataset?.strategyInput;
     if (!typing) $('jobs').innerHTML = '<table><tr><th>任务</th><th>状态</th><th>两腿</th><th>说明</th><th></th></tr>' + state.jobs.map(jobRow).join('') + '</table>';
+    $('pairs').innerHTML = state.transfers.pairs.length ? '<table><tr><th>配对</th><th>开关</th><th>两侧余额（USD1）</th><th>当前划转</th><th>说明</th><th></th></tr>' + state.transfers.pairs.map(pairRow).join('') + '</table>' : '没有划转配对';
+    if (state.transfers.corruptPairs.length) $('pairs').innerHTML += '<p>配对记录损坏，未列出也不会划转，需人工处置：' + esc(state.transfers.corruptPairs.join('，')) + '</p>';
+    $('transfers').innerHTML = state.transfers.recent.length ? '<table><tr><th>划转</th><th>配对</th><th>时间</th><th>方向、金额与状态</th><th>结算依据</th><th>备注</th></tr>' + state.transfers.recent.map(transferRow).join('') + '</table>' : '';
     if (acceptedJob) { const latest = state.jobs.find(job => job.id === acceptedJob.id); if (latest) { acceptedJob = latest; if (!typing) $('accepted').innerHTML = '<table>' + jobRow(latest) + '</table>'; } }
   } catch (error) {
     // A failed refresh never clears the accepted job or the last known list.

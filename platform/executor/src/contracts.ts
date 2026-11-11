@@ -227,3 +227,121 @@ export function parseConfirm(value: unknown): Confirm {
   if (raw.confirmLive !== true) reject('confirm_required', '请从有效预览明确确认执行');
   return { previewId: text(raw.previewId, '预览编号', UUID), requestId: text(raw.requestId, '请求编号', UUID), confirmLive: true };
 }
+
+// ---- ASTER margin-balance transfers ---------------------------------------------
+// ASTER is not a Venue: it lists no executable contract and takes no account binding, so the order side never sees it.
+export const TRANSFER_ASSET = 'USD1';
+/** Transfers are sized in whole multiples of this. */
+export const TRANSFER_UNIT = '0.00000001';
+const TRANSFER_AMOUNT_LIMIT = '1000000000';
+/** ASTER principals are wallet addresses; they are compared in lowercase only. */
+export const ASTER_ADDRESS = /^0x[0-9a-f]{40}$/;
+export const PAIR_ID = /^[0-9A-Za-z_-]{1,64}$/;
+export const TRAN_ID = /^[0-9A-Za-z_-]{1,64}$/;
+export type PairSide = 'long' | 'short';
+
+export interface TransferConfig {
+  /** No transfer unless the two sides' available balances differ by strictly more than this. */
+  threshold: string;
+  minTransfer: string;
+  maxTransfer: string;
+  /** Share of the source's equity that stays there as cash. */
+  bufferRatio: string;
+  cooldownMs: number;
+  checkIntervalMs: number;
+}
+/** Legacy defaults (modules/aster/trading/margin_balance.py DEFAULT_MARGIN). */
+export const DEFAULT_TRANSFER_CONFIG: Readonly<TransferConfig> = Object.freeze({ threshold: '10', minTransfer: '1', maxTransfer: '1000', bufferRatio: '0.05', cooldownMs: 30_000, checkIntervalMs: 5_000 });
+export function parseTransferConfig(value: unknown): TransferConfig {
+  const raw = exactKeys(value ?? {}, [], ['threshold', 'minTransfer', 'maxTransfer', 'bufferRatio', 'cooldownMs', 'checkIntervalMs']);
+  const amount = (key: 'threshold' | 'minTransfer' | 'maxTransfer' | 'bufferRatio', name: string, sign: 'positive' | 'nonnegative'): string => {
+    const parsed = decimalField(raw[key] ?? DEFAULT_TRANSFER_CONFIG[key], name, sign);
+    return cmp(parsed, TRANSFER_AMOUNT_LIMIT) > 0 ? reject('invalid_value', `${name}超出范围`) : parsed;
+  };
+  const config: TransferConfig = {
+    threshold: amount('threshold', '划转门槛', 'nonnegative'),
+    minTransfer: amount('minTransfer', '最小划转额', 'positive'),
+    maxTransfer: amount('maxTransfer', '单次划转上限', 'positive'),
+    bufferRatio: amount('bufferRatio', '现金保留比例', 'nonnegative'),
+    cooldownMs: integer(raw.cooldownMs ?? DEFAULT_TRANSFER_CONFIG.cooldownMs, 1_000, 86_400_000, '划转冷却毫秒数'),
+    checkIntervalMs: integer(raw.checkIntervalMs ?? DEFAULT_TRANSFER_CONFIG.checkIntervalMs, 1_000, 3_600_000, '检查间隔毫秒数'),
+  };
+  if (cmp(config.bufferRatio, '1') >= 0) reject('invalid_value', '现金保留比例须小于 1');
+  if (cmp(config.minTransfer, TRANSFER_UNIT) < 0 || cmp(config.maxTransfer, config.minTransfer) < 0) reject('invalid_value', `最小划转额至少为 ${TRANSFER_UNIT} USD1，且不得大于单次划转上限`);
+  return config;
+}
+
+/** A long-side and a short-side sub-account under one main account; funds only ever move between these two. */
+export interface TransferPairInput { id: string; mainAccountId: string; long: string; short: string; config: TransferConfig }
+export function parseTransferPair(value: unknown): TransferPairInput {
+  const raw = exactKeys(value, ['id', 'mainAccountId', 'long', 'short'], ['config']);
+  const pair: TransferPairInput = {
+    id: text(raw.id, '配对编号', PAIR_ID),
+    mainAccountId: text(raw.mainAccountId, '主账户地址', ASTER_ADDRESS),
+    long: text(raw.long, '多侧子账户地址', ASTER_ADDRESS),
+    short: text(raw.short, '空侧子账户地址', ASTER_ADDRESS),
+    config: parseTransferConfig(raw.config),
+  };
+  if (new Set([pair.mainAccountId, pair.long, pair.short]).size !== 3) reject('pair_accounts', '主账户、多侧与空侧须是三个不同的账户');
+  return pair;
+}
+
+export interface TransferBalance {
+  accountId: string;
+  asset: typeof TRANSFER_ASSET;
+  /** May be negative on a venue; a negative side has nothing to give. */
+  available: string;
+  /** May be negative on a venue; planning treats a negative equity as zero. */
+  equity: string;
+  /** The venue's own withdrawal limit, which already accounts for positions and reserved funds. */
+  maxWithdraw: string;
+  receivedAt: number;
+}
+export function parseTransferBalance(value: unknown, accountId: string): TransferBalance {
+  const raw = exactKeys(value, ['accountId', 'asset', 'available', 'equity', 'maxWithdraw', 'receivedAt']);
+  if (raw.accountId !== accountId) reject('balance_identity', '余额快照的账户与请求不一致', 502);
+  return {
+    accountId,
+    asset: oneOf(raw.asset, [TRANSFER_ASSET] as const, '余额资产'),
+    available: decimalField(raw.available, '可用余额', 'any'),
+    equity: decimalField(raw.equity, '账户权益', 'any'),
+    maxWithdraw: decimalField(raw.maxWithdraw, '可划上限', 'nonnegative'),
+    receivedAt: integer(raw.receivedAt, 0, Number.MAX_SAFE_INTEGER, '接收时间'),
+  };
+}
+
+export interface SubAccountList { mainAccountId: string; subAccounts: { accountId: string; frozen: boolean }[]; receivedAt: number }
+/** The listing must name the expected main account and list no sub-account twice; anything else proves no ownership. */
+export function parseSubAccountList(value: unknown, mainAccountId: string): SubAccountList {
+  const raw = exactKeys(value, ['mainAccountId', 'subAccounts', 'receivedAt']);
+  if (raw.mainAccountId !== mainAccountId) reject('sub_account_main', '子账户列表不属于所配置的主账户', 409);
+  if (!Array.isArray(raw.subAccounts)) return reject('sub_account_shape', '子账户列表结构无效', 502);
+  const seen = new Set<string>();
+  const subAccounts = raw.subAccounts.map(item => {
+    const row = exactKeys(item, ['accountId', 'frozen']);
+    const accountId = text(row.accountId, '子账户地址', ASTER_ADDRESS);
+    if (seen.has(accountId)) reject('sub_account_duplicate', '子账户列表包含重复账户', 502);
+    seen.add(accountId);
+    return { accountId, frozen: typeof row.frozen === 'boolean' ? row.frozen : reject('sub_account_shape', '子账户冻结标记无效', 502) };
+  });
+  return { mainAccountId, subAccounts, receivedAt: integer(raw.receivedAt, 0, Number.MAX_SAFE_INTEGER, '接收时间') };
+}
+
+/** One account's side of a movement. The venue gives a transfer no client id, so this is all that identifies it. */
+export interface TransferReceipt { tranId: string; asset: string; type: string; direction: 'in' | 'out'; amount: string; time: number }
+/** complete false: the window was not read in full, so the rows prove existence but never absence. */
+export interface TransferHistory { accountId: string; rows: TransferReceipt[]; complete: boolean }
+export function parseTransferHistory(value: unknown, accountId: string): TransferHistory {
+  const raw = exactKeys(value, ['accountId', 'rows', 'complete']);
+  if (raw.accountId !== accountId) reject('history_identity', '划转流水的账户与请求不一致', 502);
+  if (!Array.isArray(raw.rows) || typeof raw.complete !== 'boolean') return reject('history_shape', '划转流水结构无效', 502);
+  const rows = raw.rows.map(item => {
+    const row = exactKeys(item, ['tranId', 'asset', 'type', 'direction', 'amount', 'time']);
+    return {
+      tranId: text(row.tranId, '交易编号', TRAN_ID), asset: text(row.asset, '流水资产'), type: text(row.type, '流水类型'),
+      direction: oneOf(row.direction, ['in', 'out'] as const, '流水方向'), amount: decimalField(row.amount, '流水金额'),
+      time: integer(row.time, 0, Number.MAX_SAFE_INTEGER, '流水时间'),
+    };
+  });
+  return { accountId, rows, complete: raw.complete };
+}

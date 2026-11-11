@@ -37,8 +37,17 @@ CREATE INDEX events_at ON events(at);
 CREATE INDEX commands_accepted ON commands(accepted_at);
 CREATE INDEX previews_consumed ON previews(expires_at) WHERE consumed_job IS NOT NULL;
 `,
+}, {
+  version: 3,
+  name: 'aster-transfers',
+  sql: `
+CREATE TABLE transfer_pairs (id TEXT PRIMARY KEY, enabled INTEGER NOT NULL, version INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE TABLE transfers (id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES transfer_pairs(id), state TEXT NOT NULL, settled INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX transfers_unsettled ON transfers(created_at) WHERE settled = 0;
+CREATE INDEX transfers_pair ON transfers(pair_id, created_at);
+`,
 }]);
-
 export const sqlHash = (sql: string): string => createHash('sha256').update(sql).digest('hex');
 
 export class StoreError extends Error {

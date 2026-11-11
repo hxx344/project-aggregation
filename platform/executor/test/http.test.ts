@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import type { AddressInfo } from 'node:net';
 import { createExecutorServer, sessionCookieName } from '../src/http.ts';
 import { assertDedicatedDataDir, writeAccessUrl } from '../src/main.ts';
+import { SIM_TRANSFER_PAIR } from '../src/simulation.ts';
 import { bindAccounts, chaseIntent, createHarness, openIntent, settle } from './harness.ts';
 
 const TOKEN = 'http-access-token-0001';
@@ -172,6 +173,62 @@ test('入口：拒绝相对路径与工作台数据目录', () => {
     assert.equal(assertDedicatedDataDir(join(h.dir, 'fresh')), join(h.dir, 'fresh'));
   } finally { h.dispose(); }
 });
+
+test('HTTP：状态含划转配对与最近划转；启停走会话、请求标记与请求编号幂等，重放旧请求不改变当前开关', () => withServer(async (base, cookie, h) => {
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  const state = async () => (await (await fetch(base + '/api/state', { headers: { cookie } })).json()) as { transfers: { pairs: { id: string; enabled: boolean; long: string }[]; recent: { state: string; basis: string; amount: string }[] } };
+  assert.deepEqual((await state()).transfers, { pairs: [{ ...(await state()).transfers.pairs[0], id: SIM_TRANSFER_PAIR.id, enabled: false, long: '***bbbb' }], corruptPairs: [], recent: [] });
+  const path = `/api/transfer-pairs/${SIM_TRANSFER_PAIR.id}`;
+  assert.equal((await fetch(base + path + '/enable', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: '{}' })).status, 403);
+  assert.equal((await post(base, path + '/enable', { requestId: randomUUID() }, {})).status, 401);
+  assert.equal((await post(base, path + '/enable', { requestId: 'not-a-uuid' }, { cookie })).status, 400);
+  assert.equal((await post(base, path + '/enable', { requestId: randomUUID(), enabled: false }, { cookie })).status, 400);
+  assert.equal((await post(base, '/api/transfer-pairs/unknown/enable', { requestId: randomUUID() }, { cookie })).status, 404);
+  assert.equal((await post(base, path + '/toggle', { requestId: randomUUID() }, { cookie })).status, 404);
+  const requestId = randomUUID();
+  const enabled = await post(base, path + '/enable', { requestId }, { cookie });
+  assert.equal(enabled.status, 200);
+  assert.equal(((await enabled.json()) as { enabled: boolean }).enabled, true);
+  await h.ex.tick();
+  const after = await state();
+  assert.deepEqual(after.transfers.recent.map(item => [item.state, item.basis, item.amount]), [['confirmed', 'acknowledged', '100']]);
+  assert.equal(((await (await post(base, path + '/disable', { requestId: randomUUID() }, { cookie })).json()) as { enabled: boolean }).enabled, false);
+  const replay = await post(base, path + '/enable', { requestId }, { cookie });
+  assert.equal(replay.status, 200);
+  assert.equal(((await replay.json()) as { enabled: boolean }).enabled, false);
+  assert.equal((await post(base, path + '/disable', { requestId }, { cookie })).status, 409);
+  const page = await (await fetch(base + '/', { headers: { cookie } })).text();
+  assert.match(page, /ASTER 保证金平衡（模拟）/);
+}));
+
+test('HTTP：配对记录损坏时状态接口照常返回，其余配对列出并继续划转，损坏的按编号计入 corruptPairs', () => withServer(async (base, cookie, h) => {
+  const { mainAccountId, long } = SIM_TRANSFER_PAIR;
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  h.ex.registerTransferPair({ id: 'broken', mainAccountId, long, short: `0x${'d'.repeat(40)}` });
+  h.ex.registerTransferPair({ id: 'shapeless', mainAccountId, long, short: `0x${'e'.repeat(40)}` });
+  h.store.db.prepare("UPDATE transfer_pairs SET enabled = 1, json = '{' WHERE id = 'broken'").run();
+  h.store.db.prepare("UPDATE transfer_pairs SET enabled = 1, json = ? WHERE id = 'shapeless'").run(JSON.stringify({ id: 'shapeless', long }));
+  await h.ex.setTransferEnabled({ pairId: SIM_TRANSFER_PAIR.id, enabled: true, requestId: randomUUID() }, SESSION);
+  await h.ex.tick();
+  const response = await fetch(base + '/api/state', { headers: { cookie } });
+  assert.equal(response.status, 200);
+  const { transfers } = (await response.json()) as { transfers: { pairs: { id: string }[]; corruptPairs: string[]; recent: { pairId: string; state: string }[] } };
+  assert.deepEqual([transfers.pairs.map(pair => pair.id), transfers.corruptPairs], [[SIM_TRANSFER_PAIR.id], ['broken', 'shapeless']]);
+  assert.deepEqual(transfers.recent.map(item => [item.pairId, item.state]), [[SIM_TRANSFER_PAIR.id, 'confirmed']]);
+  assert.equal((h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'transfer-tick-failed'").get() as { n: number }).n, 0);
+}));
+
+test('HTTP：启用时子账户归属读不到返回 502，归属不符返回 409，配对保持停用', () => withServer(async (base, cookie, h) => {
+  h.ex.registerTransferPair(SIM_TRANSFER_PAIR);
+  const enable = () => post(base, `/api/transfer-pairs/${SIM_TRANSFER_PAIR.id}/enable`, { requestId: randomUUID() }, { cookie });
+  h.aster.inject({ operation: 'sub-accounts', mode: 'read-fail' });
+  const unreadable = await enable();
+  assert.deepEqual([unreadable.status, ((await unreadable.json()) as { code: string }).code], [502, 'venue_read_failed']);
+  h.aster.reassign(SIM_TRANSFER_PAIR.short, `0x${'f'.repeat(40)}`);
+  const foreign = await enable();
+  assert.deepEqual([foreign.status, ((await foreign.json()) as { code: string }).code], [409, 'sub_account_missing']);
+  assert.equal(h.ex.transferPairs()[0].enabled, false);
+}));
 
 test('HTTP：不同端口的实例 cookie 名不同，会话互不通用', async () => {
   const a = createHarness(), b = createHarness();

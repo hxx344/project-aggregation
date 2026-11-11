@@ -1,6 +1,9 @@
 // Venue connector contract. Each connector declares its real idempotency
 // identity and whether an uncertain result can be queried (plan 5.3).
-import { exactKeys, oneOf, text, integer, decimalField, reject, type AccountBinding, type AccountSnapshot, type Instrument, type OrderSide, type OrderType, type PositionSide, type Quote, type Venue } from './contracts.ts';
+import {
+  TRAN_ID, TRANSFER_ASSET, exactKeys, oneOf, text, integer, decimalField, reject,
+  type AccountBinding, type AccountSnapshot, type Instrument, type OrderSide, type OrderType, type PositionSide, type Quote, type SubAccountList, type TransferBalance, type TransferHistory, type Venue,
+} from './contracts.ts';
 import { cmp } from './decimal.ts';
 
 /**
@@ -178,3 +181,40 @@ export interface VenueConnector {
 export type ChaseConnector = VenueConnector & Required<Pick<VenueConnector, 'placeChase' | 'queryStrategy' | 'stopStrategy' | 'listStrategies'>>;
 export const supportsChase = (connector: VenueConnector): connector is ChaseConnector => connector.capabilities.chase === true
   && typeof connector.placeChase === 'function' && typeof connector.queryStrategy === 'function' && typeof connector.stopStrategy === 'function' && typeof connector.listStrategies === 'function';
+
+// ---- transfers --------------------------------------------------------------
+export interface TransferCapabilities {
+  transport: 'simulated';
+  /** The transfer endpoint takes no client id and no idempotency token: a send without a usable answer can never be retried or queried by identity. */
+  clientTransferId: false;
+  /** After this long past the send attempt the venue no longer accepts the signed request (nonce window plus clock skew). */
+  requestValidityMs: number;
+  /** A receipt can only be tied to a request by account side, amount and time, so another same-amount transfer looks the same. */
+  attribution: 'side-amount-time';
+}
+export interface TransferRequest { source: string; destination: string; asset: typeof TRANSFER_ASSET; amount: string }
+/**
+ * confirmed true: the venue answered success. confirmed false: it answered with a success code but did not
+ * confirm success, so the result is unknown; tranId is then only a hint for matching receipts later.
+ */
+export interface TransferAck { confirmed: boolean; tranId: string | null }
+export function parseTransferAck(value: unknown): TransferAck {
+  const raw = exactKeys(value, ['confirmed', 'tranId']);
+  return { confirmed: typeof raw.confirmed === 'boolean' ? raw.confirmed : reject('report_shape', '划转回执结构无效', 502), tranId: raw.tranId === null ? null : text(raw.tranId, '交易编号', TRAN_ID) };
+}
+
+/** Every call is made with the main account's authority; accountId names one of its sub-accounts. */
+export interface TransferConnector {
+  readonly venue: 'aster';
+  readonly capabilities: TransferCapabilities;
+  subAccounts(mainAccountId: string, options: CallOptions): Promise<SubAccountList>;
+  balance(mainAccountId: string, accountId: string, options: CallOptions): Promise<TransferBalance>;
+  /**
+   * The account's receipts with venue time in [from, to]; to null means up to the venue's own now.
+   * A window that could not be read in full (a full last page, a later page that failed) answers complete false
+   * with the rows that were read; a read with nothing usable throws a read failure.
+   */
+  history(mainAccountId: string, accountId: string, window: { from: number; to: number | null }, options: CallOptions): Promise<TransferHistory>;
+  /** Throws not-sent, rejected or uncertain like an order send; an answer is an acknowledgement, not proof that both receipts exist. */
+  transfer(mainAccountId: string, request: TransferRequest, options: SendOptions): Promise<TransferAck>;
+}
