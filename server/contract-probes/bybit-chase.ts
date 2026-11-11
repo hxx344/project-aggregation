@@ -392,6 +392,8 @@ async function main(): Promise<number> {
     await sleep(2_000);
     const firstChildren = await childOrders(credentials, symbol, firstId), resting = await openOrders(credentials, symbol);
     report.findings.children = { childRowKeys: [...new Set(firstChildren.rows.flatMap(child => Object.keys(child)))], childCount: firstChildren.rows.length,
+      // The workbench refuses a list whose reply lacks a string cursor, so the envelope is recorded for both lists.
+      childListKeys: firstChildren.resultKeys, childListComplete: firstChildren.complete, openOrderListKeys: resting.resultKeys, openOrderListComplete: resting.complete,
       openOrders: resting.rows.map(order => ({ orderId: order.orderId, orderLinkId: order.orderLinkId, price: order.price, qty: order.qty, orderType: order.orderType, timeInForce: order.timeInForce, positionIdx: order.positionIdx, reduceOnly: order.reduceOnly, orderStatus: order.orderStatus, createType: order.createType })),
       childIdsAppearInOpenOrders: firstChildren.rows.length > 0 && firstChildren.rows.every(child => resting.rows.some(order => text(order.orderId) === text(child.orderId))) };
     step(report, '创建 A：子单与账户挂单', { children: firstChildren.rows, ...(report.findings.children as Row) });
@@ -461,7 +463,8 @@ async function main(): Promise<number> {
           return settled(strategy, children);
         });
         if (filled.reachedAfterMs === null) await stopAndSettle('停止未在限时内结清的 C', takerId); else unsettled.delete(takerId);
-        report.findings.fill = { strategyFilledAfterAckMs: strategyFilledAfterMs, settledAfterAckMs: filled.reachedAfterMs, transitions: filled.transitions, finalStrategy: filled.lastStrategy, finalChildren: filled.lastChildren };
+        const filledList = await childOrders(credentials, symbol, takerId);
+        report.findings.fill = { childListKeys: filledList.resultKeys, childListComplete: filledList.complete, strategyFilledAfterAckMs: strategyFilledAfterMs, settledAfterAckMs: filled.reachedAfterMs, transitions: filled.transitions, finalStrategy: filled.lastStrategy, finalChildren: filled.lastChildren };
         step(report, '创建 C：成交与子单结清', report.findings.fill);
       }
     }

@@ -40,7 +40,7 @@ const RATE_LIMIT_CODES = new Set([-1003, 10006, 50011]);
 // Bybit strategy times come from the venue clock; allow the adapter's clock tolerance.
 const VENUE_CLOCK_TOLERANCE_MS = 300_000;
 // The client rounds the window out to whole seconds; stay inside its limit after rounding.
-const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 1000;
+const STRATEGY_QUERY_STEP_MS = MAX_STRATEGY_WINDOW - 2000;
 // Connecting reads the original oil scope so a newer market cannot block it; previews read their own symbols.
 // Hyperliquid and Lighter RH list no oil contract, so their connections read their own contracts.
 const connectSymbols = exchange => WALLET_VENUES.has(exchange) ? EXECUTION_VENUE_SYMBOLS[exchange] : EXECUTION_MARKETS.oil.symbols;

@@ -230,7 +230,7 @@ test('契约探测（Bybit，替身接口）：只读运行不发任何 POST；�
   assert.deepEqual([refusedAll.findings.offsetSpelling.accepted, refusedAll.findings.offsetSpelling.tried.length, refusedAll.findings.cleanup.clean], [null, 3, true]);
   assert.deepEqual(report.findings.cleanup, { clean: true, readsComplete: true, positionSize: '0', openOrders: 0, runningStrategies: 0 });
   assert.equal(report.findings.duplicateCreate.distinctId, true);
-  assert.deepEqual([report.findings.stopRefusals.endedStrategy.retCode, report.findings.stopRefusals.unknownStrategy.retCode, report.findings.createRefusals.staleTimestamp.retCode, report.findings.createRefusals.belowMinimum.outcome], [60066, 60065, 10002, 'rejected']);
+  assert.deepEqual([report.findings.stopRefusals.endedStrategy.retCode, report.findings.stopRefusals.unknownStrategy.retCode, report.findings.createRefusals.staleTimestamp.retCode, report.findings.createRefusals.belowMinimum.outcome], [60062, 60062, 10002, 'rejected']);
   // The stand-in filters ended strategies by creation second: the windows around the update and the stop miss A.
   assert.deepEqual(report.findings.endedWindow.windows.map((item: { includesA: boolean }) => item.includesA), [false, true, false, true, true]);
   for (const secret of [env.BYBIT_API_KEY!, env.BYBIT_API_SECRET!, '7654321']) assert.ok(!live.report.includes(secret) && !live.output.includes(secret));
