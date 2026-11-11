@@ -559,7 +559,9 @@ export function createTradingExchangeClient(exchange, { fetchImpl = fetch, now =
           modes.set(symbol, position.mode);
           ids.add(position.id); positions.push(position);
         }
-        cursor = exchange === 'bybit' ? cursorOf(data) : '';
+        // A page shorter than the limit is the last one; a cursor returned with it is not followed.
+        const next = exchange === 'bybit' ? cursorOf(data) : '';
+        cursor = rows.length >= 200 ? next : '';
         if (cursor) {
           if (cursors.has(cursor) || rows.length === 0) throw new TradingExchangeError('交易所仓位分页未取得进展', 'pagination');
           cursors.add(cursor);

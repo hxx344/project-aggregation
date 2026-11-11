@@ -561,6 +561,18 @@ test('Bybit account preserves zero-position mode and refuses empty or incomplete
   const snapshot = await healthy.client.account(credentials, { symbols: ['BZUSDT', 'CLUSDT'] });
   assert.deepEqual(snapshot.modes, { CLUSDT: 'hedge', BZUSDT: 'hedge' });
   assert.deepEqual(snapshot.positions, [{ symbol: 'CLUSDT', side: 'short', quantity: '3' }, { symbol: 'BZUSDT', side: 'short', quantity: '3' }]);
+  // A cursor returned with a single-symbol page is not followed, so a page returned again cannot look like duplicate positions.
+  const cursored = harness('bybit', call => call.url.pathname.endsWith('position/list') ? { category: 'linear',
+    list: [{ symbol: call.parameters.symbol, positionIdx: 0, side: 'Buy', size: '2' }], nextPageCursor: `${call.parameters.symbol}%2C1700000000000%2C0` } : undefined);
+  const single = await cursored.client.account(credentials, { symbols: ['CLUSDT'] });
+  assert.deepEqual([single.modes, single.positions], [{ CLUSDT: 'one-way' }, [{ symbol: 'CLUSDT', side: 'long', quantity: '2' }]]);
+  const positionCalls = cursored.calls.filter(call => call.url.pathname.endsWith('position/list'));
+  assert.equal(positionCalls.length, 1); assert.deepEqual(positionCalls[0].parameters, { category: 'linear', symbol: 'CLUSDT', limit: '200' });
+  const repeated = harness('bybit', call => call.url.pathname.endsWith('position/list') ? { category: 'linear', nextPageCursor: '',
+    list: [{ symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }, { symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }] } : undefined);
+  await assert.rejects(repeated.client.account(credentials, { symbols: ['CLUSDT'] }), error => isError('account_mode')(error) && /同一页返回了重复的持仓记录（持仓方向编号 0）/.test(error.message));
+  const foreign = harness('bybit', call => call.url.pathname.endsWith('position/list') ? { category: 'inverse', list: [{ symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }], nextPageCursor: '' } : undefined);
+  await assert.rejects(foreign.client.account(credentials, { symbols: ['CLUSDT'] }), isError('invalid_data'));
   for (const [list, expected] of [[[], /没有返回 CLUSDT 的持仓记录/], [[{ symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }], /持仓记录不完整（持仓方向编号 1）/],
     [[{ symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }, { symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }], /持仓方向编号 0、1/]]) {
     const incomplete = harness('bybit', call => call.url.pathname.endsWith('position/list') ? { category: 'linear', list, nextPageCursor: '' } : undefined);

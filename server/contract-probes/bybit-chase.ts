@@ -115,9 +115,11 @@ const childOrders = (credentials: Credentials, symbol: string, strategyId: strin
 const openOrders = (credentials: Credentials, symbol: string): Promise<Listing> => pages(credentials, '/v5/order/realtime', { category: 'linear', symbol }, 'nextPageCursor');
 
 async function positions(credentials: Credentials, symbol: string): Promise<Row[]> {
-  const listing = await pages(credentials, '/v5/position/list', { category: 'linear', symbol }, 'nextPageCursor');
-  if (listing.retCode !== 0 || !listing.complete) throw new ProbeAbort(`持仓读取失败或分页不完整：retCode ${listing.retCode}`);
-  return listing.rows;
+  // One symbol has at most three position rows, so one page is complete and its cursor is not
+  // followed: a page returned twice would count the same position twice.
+  const reply = await call(credentials, 'GET', '/v5/position/list', { category: 'linear', symbol, limit: '200' });
+  if (reply.http.status !== 200 || reply.retCode !== 0 || !reply.result || !Array.isArray(reply.result.list)) throw new ProbeAbort(`持仓读取失败：HTTP ${reply.http.status} retCode ${reply.retCode}`);
+  return reply.result.list.filter(isRow);
 }
 const positionSize = (rows: Row[]): string => add('0', ...rows.map(row => amount(row.size) ?? '0'));
 
