@@ -542,7 +542,10 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
     }
     const identity = identifier(info.userID);
     const config = requireObject(await request('config', credentials, {}, options));
-    if (![3, 4, 5, 6].includes(config.unifiedMarginStatus)) fail('account_mode');
+    if (![3, 4, 5, 6].includes(config.unifiedMarginStatus)) {
+      const status = config.unifiedMarginStatus;
+      fail('account_mode', { detail: status === 1 ? 'Bybit 账户为经典账户，请先在 Bybit 升级为统一交易账户' : Number.isSafeInteger(status) ? `Bybit 返回了未识别的账户状态 ${status}` : status === undefined ? 'Bybit 未返回账户状态' : 'Bybit 返回的账户状态格式无效' });
+    }
     return { identity, positionMode: null };
   }
 
@@ -680,7 +683,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
           requireObject(row);
           if (row.symbol !== symbol) fail();
           const idx = numericEnum(row.positionIdx, [0, 1, 2]);
-          if (indices.has(idx)) fail('account_mode');
+          if (indices.has(idx)) fail('account_mode', { detail: `Bybit 对 ${symbol} 返回了重复的持仓记录` });
           indices.add(idx);
           const quantity = amount(row.size, { nonnegative: true });
           if (quantity === '0') {
@@ -693,7 +696,7 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
         }
         if (indices.size === 1 && indices.has(0)) modes[symbol] = 'one-way';
         else if (indices.size === 2 && indices.has(1) && indices.has(2)) modes[symbol] = 'hedge';
-        else fail('account_mode');
+        else fail('account_mode', { detail: indices.size ? `Bybit 对 ${symbol} 返回的持仓记录不完整（持仓方向编号 ${[...indices].sort().join('、')}）` : `Bybit 没有返回 ${symbol} 的持仓记录，该账户可能不能交易这个合约` });
         const orders = await pages('openOrders', credentials, { category: 'linear', symbol, openOnly: '0', limit: '50' }, options, { category: 'linear' });
         for (const row of orders) {
           requireObject(row);

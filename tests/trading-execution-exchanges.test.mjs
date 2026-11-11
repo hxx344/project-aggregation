@@ -548,7 +548,11 @@ test('Bybit permission checks reject read-only, missing Wallet, withdrawal, tran
   assert.deepEqual(await good.client.verify(credentials), { identity: base.userID });
   assert.ok(!(JSON.stringify(await good.client.verify(credentials))).includes('must-not-be-returned'));
   const classic = harness('bybit', call => call.url.pathname === '/v5/account/info' ? { unifiedMarginStatus: 1 } : undefined);
-  await assert.rejects(classic.client.verify(credentials), isError('account_mode'));
+  await assert.rejects(classic.client.verify(credentials), error => isError('account_mode')(error) && /经典账户/.test(error.message));
+  for (const [status, expected] of [[7, /未识别的账户状态 7/], ['6', /账户状态格式无效/], [undefined, /未返回账户状态/]]) {
+    const odd = harness('bybit', call => call.url.pathname === '/v5/account/info' ? { unifiedMarginStatus: status } : undefined);
+    await assert.rejects(odd.client.verify(credentials), error => isError('account_mode')(error) && expected.test(error.message));
+  }
 });
 
 test('Bybit account preserves zero-position mode and refuses empty or incomplete hedge-mode evidence', async () => {
@@ -557,9 +561,10 @@ test('Bybit account preserves zero-position mode and refuses empty or incomplete
   const snapshot = await healthy.client.account(credentials, { symbols: ['BZUSDT', 'CLUSDT'] });
   assert.deepEqual(snapshot.modes, { CLUSDT: 'hedge', BZUSDT: 'hedge' });
   assert.deepEqual(snapshot.positions, [{ symbol: 'CLUSDT', side: 'short', quantity: '3' }, { symbol: 'BZUSDT', side: 'short', quantity: '3' }]);
-  for (const list of [[], [{ symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }], [{ symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }, { symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }]]) {
+  for (const [list, expected] of [[[], /没有返回 CLUSDT 的持仓记录/], [[{ symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }], /持仓记录不完整（持仓方向编号 1）/],
+    [[{ symbol: 'CLUSDT', positionIdx: 0, side: '', size: '0' }, { symbol: 'CLUSDT', positionIdx: 1, side: '', size: '0' }], /持仓方向编号 0、1/]]) {
     const incomplete = harness('bybit', call => call.url.pathname.endsWith('position/list') ? { category: 'linear', list, nextPageCursor: '' } : undefined);
-    await assert.rejects(incomplete.client.account(credentials), isError('account_mode'));
+    await assert.rejects(incomplete.client.account(credentials), error => isError('account_mode')(error) && expected.test(error.message));
   }
 });
 
