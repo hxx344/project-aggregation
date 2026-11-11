@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { Activity, CircleAlert, Clock, Cpu, HardDrive, LoaderCircle, MemoryStick, RefreshCw } from 'lucide-react';
+import { Activity, Clock, Cpu, HardDrive, MemoryStick, RefreshCw } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { EventLoopStatus, HostStatus } from './server-status-types';
 import { formatBytes, formatUptime, hostLevel, lagLevel } from './server-status-types';
 import './aero-lp.css';
 import './server-status.css';
+import { Callout, StatePanel } from './StateViews';
 
 const POLL_MS = 5_000;
 const time = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
@@ -84,8 +85,8 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
       {status ? <span className="ss-meta">读取于 {time.format(Date.parse(status.generatedAt))}</span> : null}
       <button className="button secondary" disabled={loading} onClick={() => void read()}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
     </div></header>
-    {error ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>状态读取失败：{error}。{status ? '下面是最后一次读取的数据，' : ''}稍后自动重试。</span></div> : null}
-    {!status ? <>{error ? null : <section className="panel lp-empty" role="status"><LoaderCircle className="spin" /><strong>正在读取服务器状态</strong></section>}
+    {error ? <Callout tone="warning">状态读取失败：{error}。{status ? '下面是最后一次读取的数据，' : ''}稍后自动重试。</Callout> : null}
+    {!status ? <>{error ? null : <StatePanel kind="loading" title="正在读取服务器状态" />}
       {loop ? <div className="ss-grid"><EventLoopCard status={loop} error={loopError} /></div> : null}</> : <div className="ss-grid">
       <Card icon={<Cpu size={16} />} title="CPU" percent={status.cpu.usagePercent} suffix={`${status.cpu.cores} 核`}>
         <Row label="负载（1/5/15 分钟）" value={status.cpu.loadAverage.map(value => value.toFixed(2)).join(' / ')} />

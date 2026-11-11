@@ -283,6 +283,19 @@ small{font-size:.75rem}
 .compact>svg{color:var(--text-tertiary)}
 .loading-state{background:var(--surface-2);border:1px solid var(--surface-4);border-radius:var(--radius-md);padding:48px 24px}
 
+/* ========== Shared state views (StateViews.tsx) ========== */
+.callout{display:flex;align-items:flex-start;gap:8px;border:1px solid var(--surface-5);background:var(--surface-1);color:var(--text-secondary);padding:10px 12px;border-radius:var(--radius-sm);font-size:.75rem;line-height:1.65;overflow-wrap:anywhere}
+.callout>svg{flex-shrink:0;margin-top:2px}
+.callout-body{flex:1;min-width:0}
+.callout-body p{margin-top:3px}
+.callout.info{color:var(--info);background:var(--info-soft);border-color:rgba(110,168,254,.3)}
+.callout.success{color:var(--emerald);background:var(--emerald-soft);border-color:rgba(45,190,135,.3)}
+.callout.warning{color:var(--warning);background:var(--warning-soft);border-color:var(--warning-border)}
+.callout.error{color:#FF9AA1;background:var(--error-soft);border-color:rgba(242,98,107,.3)}
+.callout-action{flex-shrink:0;border:0;background:none;color:inherit;text-decoration:underline;font:inherit;cursor:pointer;padding:0}
+.state-panel.error>svg{color:#FF9AA1}
+.table-empty{text-align:center;color:var(--text-tertiary);padding:18px 20px;font-size:.75rem}
+
 /* ========== Module settings ========== */
 .management-panel>.panel-heading{min-height:46px}
 .project-table-head,.project-table-row{display:grid;grid-template-columns:minmax(200px,1.65fr) minmax(120px,1fr) minmax(105px,.8fr) auto;gap:16px;align-items:center;padding:12px 14px}

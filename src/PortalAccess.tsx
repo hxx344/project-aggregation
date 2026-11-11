@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
 import { api, ApiError } from './api';
+import { Callout } from './StateViews';
 
 type Access = { id: string; projectId: string; projectName: string; scope: 'persistent' | 'instance'; expiresAt: string; status: 'active' | 'revoking' };
 type AccessState = { schemaVersion: 1; observedAt: string; instanceId: string; externalScope: 'current-api-instance'; truncated: boolean; grants: Access[] };
@@ -43,7 +44,7 @@ export default function PortalAccess({ onExpired }: { onExpired: () => void }) {
   return <section className="panel management-panel" aria-label="当前会话模块授权">
     <div className="panel-heading"><h2><ShieldCheck size={18} aria-hidden="true" /> 当前会话模块授权</h2><button className="button secondary" disabled={busy !== null} onClick={() => void load()}>{busy === 'read' ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}刷新</button></div>
     <p className="muted">撤销单条授权会关闭对应访问，其余模块授权继续有效。外部自动登录授权仅列出当前 API 实例持有的部分。</p>
-    {error ? <div className="error-box" role="alert">{error}</div> : null}
+    {error ? <Callout tone="error">{error}</Callout> : null}
     {notice ? <p role="status">{notice}</p> : null}
     {data?.grants.map(row => <div className="project-table-row" key={row.id}>
       <div><strong>{row.projectName}</strong><small className="table-time">授权 {row.id.slice(0, 10)}</small></div>
