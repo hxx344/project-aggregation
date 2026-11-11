@@ -483,48 +483,184 @@ test('ADL：落盘后发送前中断的批次记为未发送；发送中被接�
   assert.ok(balanced(h));
 }, { adlOrderTimeoutMs: 5_000 }));
 
-test('ADL：注入共享写者登记时只核对现场、不发送减仓单', async () => {
+/** A registry shared by every executor instance of one test, plus its rows, read straight from its database. */
+async function registry(options: { skipFirst?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'pa-adl-control-'));
   const { createAccountWriter } = await import(new URL('../../../server/execution/account-writer.mjs', import.meta.url).href) as { createAccountWriter(options: Record<string, unknown>): AccountWriterPort & { close(): void } };
   const writers: (AccountWriterPort & { close(): void })[] = [];
+  let instances = 0, latest = 0;
+  const path = join(dir, 'execution-control.sqlite');
+  return {
+    writers,
+    control: (clock: { now: number }) => {
+      if (options.skipFirst && instances++ === 0) return undefined;
+      // A restart replaces the process: only the newest executor's writer and other modules' writers are alive.
+      const pid = latest = 42_000 + writers.length;
+      const writer = createAccountWriter({ databasePath: path, moduleId: 'platform', runtimeId: randomUUID(), pid, now: () => clock.now, processAlive: (value: number) => value === latest || value === 49_000 });
+      writers.push(writer);
+      return { writer, environment: 'testnet' as const };
+    },
+    /** Another module's writer on the same registry. */
+    other: (clock: { now: number }) => { const writer = createAccountWriter({ databasePath: path, moduleId: 'other', runtimeId: randomUUID(), pid: 49_000, now: () => clock.now, processAlive: () => true }); writers.push(writer); return writer; },
+    rows: () => (writers[0] as unknown as { db: DatabaseSync }).db.prepare('SELECT operation_id, state, account_keys FROM aw_operations WHERE module_id = ? ORDER BY created_at, operation_id').all('platform') as { operation_id: string; state: string; account_keys: string }[],
+    dispose() { for (const writer of writers) try { writer.close(); } catch { /* a retired writer may refuse */ } rmSync(dir, { recursive: true, force: true }); },
+  };
+}
+
+test('ADL：注入共享写者登记时减仓单先登记（只占该子账户）再发送，成交后登记记为已执行，事件照常结束', async () => {
+  const r = await registry();
   try {
     await withAdl(async h => {
       h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
-      await run(h, 60_000, 10_000);
-      const open = current(h)!;
-      assert.equal(open.status, 'blocked');
-      assert.match(open.reason ?? '', /共享写者登记/);
-      assert.equal(h.asterTrading.calls.place, 0);
-    }, {}, clock => {
-      const writer = createAccountWriter({ databasePath: join(dir, 'execution-control.sqlite'), moduleId: 'platform', runtimeId: randomUUID(), pid: 42_000 + writers.length, now: () => clock.now, processAlive: () => true });
-      writers.push(writer);
-      return { writer, environment: 'testnet' };
-    });
-  } finally { for (const writer of writers) writer.close(); }
+      await h.ex.tick();
+      await untilClosed(h, 30, 1_000);
+      const batches = recent(h)[0].batches;
+      assert.ok(balanced(h));
+      assert.ok(batches.length >= 1);
+      const rows = r.rows();
+      assert.deepEqual(rows.map(row => [row.operation_id, row.state]).sort(), batches.map(batch => [`platform:adl:${batch.clientOrderId}`, 'confirmed']).sort());
+      assert.ok(rows.every(row => JSON.parse(row.account_keys).length === 1));
+      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
+    }, {}, r.control);
+  } finally { r.dispose(); }
 });
 
-test('ADL：无登记时留下的挂单批次，在注入共享写者登记后接管也不撤单', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'pa-adl-control-'));
-  const { createAccountWriter } = await import(new URL('../../../server/execution/account-writer.mjs', import.meta.url).href) as { createAccountWriter(options: Record<string, unknown>): AccountWriterPort & { close(): void } };
-  const writers: (AccountWriterPort & { close(): void })[] = [];
-  let instances = 0;
+test('ADL：减仓单结果未知时登记保持未知、挡住同账户其他写入，核对有结果后按本地事实结清', async () => {
+  const r = await registry();
+  try {
+    await withAdl(async h => {
+      h.asterTrading.inject({ operation: 'place', mode: 'lost-response' });
+      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+      await h.ex.tick();
+      const batch = current(h)!.batches[0];
+      assert.equal(batch.state, 'unknown');
+      assert.deepEqual(r.rows().map(row => [row.operation_id, row.state]), [[`platform:adl:${batch.clientOrderId}`, 'unknown']]);
+      await untilClosed(h, 30, 1_000);
+      assert.ok(r.rows().every(row => row.state === 'confirmed'));
+      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
+      assert.ok((h.store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'adl-control-resolved'").get() as { n: number }).n >= 1);
+    }, {}, r.control);
+  } finally { r.dispose(); }
+});
+
+test('ADL：子账户已被其他模块占用时登记拒绝，减仓批次记为未发送，传输未调用', async () => {
+  const r = await registry();
+  try {
+    await withAdl(async h => {
+      const other = r.other(h.clock);
+      const identity = { authority: 'aster', environment: 'testnet', accountId: SHORT } as const;
+      other.bind('other:aster', identity, 1);
+      other.claim([identity]);
+      other.bind('other:aster:long', { ...identity, accountId: LONG }, 1);
+      other.claim([{ ...identity, accountId: LONG }]);
+      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+      await run(h, 3_000, 1_000);
+      const batches = current(h)!.batches;
+      assert.ok(batches.length >= 1 && batches.every(batch => batch.state === 'not-sent'));
+      assert.match(batches[0].note ?? '', /ACCOUNT_PINNED/);
+      assert.equal(h.asterTrading.calls.place, 0);
+      assert.deepEqual(r.rows(), []);
+    }, {}, r.control);
+  } finally { r.dispose(); }
+});
+
+test('ADL：同配对的未知划转在登记里挡住子账户时，减仓等待而不计入连续未发送，过期后照常发出', async () => {
+  const r = await registry();
+  try {
+    await withAdl(async h => {
+      // An unknown transfer of this module on the pair's accounts, registered as the executor would.
+      const writer = r.writers[0], accounts = [LONG, SHORT, SIM_TRANSFER_PAIR.mainAccountId].map(accountId => ({ authority: 'aster', environment: 'testnet', accountId } as const));
+      for (const item of accounts) writer.bind(`platform:aster:${item.accountId}`, item, 1);
+      const [from, to, master] = accounts;
+      const payload = { marginTransfer: { version: 1, method: 'POST', path: '/fapi/v3/subAccountTransfer', params: { fromAccountAddress: from.accountId, toAccountAddress: to.accountId, asset: 'USD1', amount: '1', kindType: 'FUTURE_FUTURE' }, source: from, destination: to, master } };
+      writer.finish(writer.prepare(writer.claim(accounts), 'platform:transfer:outside', payload), 'unknown');
+      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+      await run(h, 90_000, 1_000);
+      const waiting = current(h)!;
+      assert.notEqual(waiting.status, 'halted');
+      assert.equal(h.asterTrading.calls.place, 0);
+      assert.ok(waiting.batches.length >= 1 && waiting.batches.every(batch => batch.state === 'not-sent' && /ACCOUNT_UNRESOLVED/.test(batch.note ?? '')));
+      await untilClosed(h, 120, 1_000);
+      assert.ok(balanced(h));
+      assert.ok(h.asterTrading.calls.place >= 1);
+    }, {}, r.control);
+  } finally { r.dispose(); }
+});
+
+test('ADL：无登记时留下的挂单批次，注入共享写者登记后接管照常撤单，撤单先登记，结束后记为已执行', async () => {
+  const r = await registry({ skipFirst: true });
   try {
     await withAdl(async h => {
       h.asterTrading.inject({ operation: 'place', mode: 'rest' });
       h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
       await h.ex.tick();
-      assert.equal(current(h)!.batches[0].state, 'open');
+      const batch = current(h)!.batches[0];
+      assert.equal(batch.state, 'open');
       takeover(h);
       await run(h, 60_000, 5_000);
+      assert.ok(h.asterTrading.calls.cancel >= 1);
+      const rows = r.rows();
+      assert.ok(rows.some(row => row.operation_id.startsWith(`platform:adl-cancel:${batch.clientOrderId}:`) && row.state === 'confirmed'));
+      assert.ok(!rows.some(row => row.operation_id === `platform:adl:${batch.clientOrderId}`), '登记前发出的原单不补登记');
+      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
+    }, {}, r.control);
+  } finally { r.dispose(); }
+});
+
+test('ADL：注入登记时撤单未发送，下次撤单换新登记编号再发，不被旧的已拒绝登记卡住', async () => {
+  const r = await registry();
+  try {
+    await withAdl(async h => {
+      h.asterTrading.inject({ operation: 'place', mode: 'rest' });
+      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+      await h.ex.tick();
+      const batch = current(h)!.batches[0];
+      assert.equal(batch.state, 'open');
+      h.asterTrading.inject({ operation: 'cancel', mode: 'not-sent' });
+      await run(h, 60_000, 1_000);
+      const cancels = r.rows().filter(row => row.operation_id.startsWith(`platform:adl-cancel:${batch.clientOrderId}:`));
+      assert.ok(cancels.length >= 2, '每次撤单尝试各自登记');
+      assert.equal(new Set(cancels.map(row => row.operation_id)).size, cancels.length);
+      assert.equal(cancels[0].state, 'rejected');
+      assert.ok(cancels.slice(1).some(row => row.state === 'confirmed'));
+      assert.ok(h.asterTrading.arrived.cancel >= 1, '第二次撤单到达交易所');
+      assert.notEqual(current(h)?.batches.find(item => item.id === batch.id)?.state, 'open');
+      assert.deepEqual(r.writers[0].pendingOperationIds(), []);
+    }, {}, r.control);
+  } finally { r.dispose(); }
+});
+
+test('ADL：残留挂单的撤单被登记长期拒绝（账户被其他模块固定）时停止事件交人工，不无限重试', async () => {
+  const r = await registry({ skipFirst: true });
+  try {
+    await withAdl(async h => {
+      h.asterTrading.inject({ operation: 'place', mode: 'rest' });
+      h.asterTrading.adl(LONG, SYMBOL, 'LONG', '0.02');
+      await h.ex.tick();
+      const batch = current(h)!.batches[0];
+      assert.equal(batch.state, 'open');
+      takeover(h);
+      // Pinned after the jump, so the other module's lease is fresh.
+      const other = r.other(h.clock);
+      for (const accountId of [LONG, SHORT]) {
+        const identity = { authority: 'aster', environment: 'testnet', accountId } as const;
+        other.bind(`other:aster:${accountId}`, identity, 1);
+        other.claim([identity]);
+      }
+      await run(h, 30_000, 1_000);
+      const incident = recent(h)[0];
+      assert.equal(incident.status, 'halted');
+      assert.match(incident.reason ?? '', /撤单被账户写入登记拒绝（ACCOUNT_PINNED）/);
       assert.equal(h.asterTrading.calls.cancel, 0);
-      assert.equal(h.asterTrading.calls.place, 1);
-    }, {}, clock => {
-      if (instances++ === 0) return undefined;
-      const writer = createAccountWriter({ databasePath: join(dir, 'execution-control.sqlite'), moduleId: 'platform', runtimeId: randomUUID(), pid: 43_000 + writers.length, now: () => clock.now, processAlive: () => true });
-      writers.push(writer);
-      return { writer, environment: 'testnet' };
-    });
-  } finally { for (const writer of writers) writer.close(); }
+      assert.equal(incident.batches.find(item => item.id === batch.id)?.state, 'open');
+      // The order is still queried while the cancel is refused: a person's cancel on the venue settles the batch.
+      const owner = [LONG, SHORT].find(accountId => { try { h.asterTrading.cancelOnVenue(accountId, batch.clientOrderId); return true; } catch { return false; } });
+      assert.ok(owner, '挂单仍在交易所');
+      await run(h, 40_000, 1_000);
+      assert.notEqual(recent(h)[0].batches.find(item => item.id === batch.id)?.state, 'open');
+      assert.equal(h.asterTrading.calls.cancel, 0);
+    }, {}, r.control);
+  } finally { r.dispose(); }
 });
 
 test('ADL：关闭自动减仓时只核对，两侧被手工平衡后事件自动完成；无交易权限时受阻不下单', async () => {

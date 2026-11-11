@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn, spawnSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
-import { accountKey, createAccountWriter, normalizeAccountIdentity } from '../server/execution/account-writer.mjs';
+import { ASTER_WRITE_EXPIRY_MS, accountKey, createAccountWriter, normalizeAccountIdentity } from '../server/execution/account-writer.mjs';
 
 const identity = (accountId = '918273645', extra = {}) => ({ authority: 'binance', environment: 'mainnet', accountId, ...extra });
 const code = (expected) => (error) => error.code === expected;
@@ -420,6 +420,36 @@ test('margin transfer rejects forged priority, invalid request semantics and inc
   assert.throws(() => writer.prepare(ticket, 'aster:transfer:fake', { purpose: 'margin' }), code('ACCOUNT_UNRESOLVED'));
   assert.throws(() => writer.prepare(ticket, 'valid-margin-blocked', marginPayload()), code('ACCOUNT_UNRESOLVED'));
   assert.equal(readRow(f.databasePath, 'SELECT intent_action FROM aw_operations WHERE operation_id=?', fake.operationId).intent_action, null);
+});
+
+test('platform margin transfers keep all three accounts in one environment and expire only against platform writes', (t) => {
+  const f = fixture(t); const writer = f.writer('platform');
+  const values = marginIdentities().map((value) => ({ ...value, environment: 'testnet' })); const ticket = bindClaim(writer, values);
+  const mixed = structuredClone(marginPayload(values)); mixed.marginTransfer.master.environment = 'demo';
+  assert.throws(() => writer.prepare(ticket, 'mixed', mixed), code('INVALID_MARGIN_TRANSFER'));
+  assert.throws(() => writer.prepare(ticket, 'mainnet-keys', marginPayload()), code('INVALID_MARGIN_TRANSFER'));
+  // The legacy module stays mainnet-only.
+  assert.throws(() => f.writer('aster').prepare(ticket, 'aster-testnet', marginPayload(values)), code('INVALID_MARGIN_TRANSFER'));
+  const transfer = writer.prepare(ticket, 'platform:transfer:a', marginPayload(values));
+  assert.equal(readRow(f.databasePath, 'SELECT intent_action FROM aw_operations WHERE operation_id=?', 'platform:transfer:a').intent_action, 'margin-transfer');
+  writer.finish(transfer, 'unknown');
+  const orderTicket = subsetTicket(ticket, [accountKey(values[0])]);
+  const adl = { groupId: 'platform:adl:b', action: 'create', venue: 'aster', clientOrderId: 'adl-1', symbol: 'BTCUSDT', side: 'sell', positionSide: 'LONG', quantity: '0.01', type: 'market', reduceOnly: true };
+  const age = (id) => writeRows(f.databasePath, 'UPDATE aw_operations SET created_at=created_at-?, updated_at=updated_at-? WHERE operation_id=?', ASTER_WRITE_EXPIRY_MS, ASTER_WRITE_EXPIRY_MS, id);
+  assert.throws(() => writer.prepare(orderTicket, 'platform:adl:early', adl), code('ACCOUNT_UNRESOLVED'));
+  age('platform:transfer:a');
+  const order = writer.prepare(orderTicket, 'platform:adl:after', adl);
+  writer.finish(order, 'unknown');
+  // An unknown ADL order gates a new transfer until it has expired too, and keeps gating other orders.
+  assert.throws(() => writer.prepare(ticket, 'platform:transfer:b', marginPayload(values)), code('ACCOUNT_UNRESOLVED'));
+  age('platform:adl:after');
+  writer.finish(writer.prepare(ticket, 'platform:transfer:b', marginPayload(values)), 'rejected');
+  assert.throws(() => writer.prepare(orderTicket, 'platform:adl:c', adl), code('ACCOUNT_UNRESOLVED'));
+  // Expiry never crosses modules, not even between the two margin modules.
+  for (const module of ['aster', 'hub']) {
+    writeRows(f.databasePath, 'UPDATE aw_operations SET module_id=? WHERE operation_id=?', module, 'platform:adl:after');
+    assert.throws(() => writer.prepare(ticket, `platform:transfer:${module}`, marginPayload(values)), code('ACCOUNT_UNRESOLVED'));
+  }
 });
 
 test('T0 final guard rechecks unknown classes and active versus fenced sending', (t) => {
@@ -867,5 +897,5 @@ test('Python registry contract and failure scenarios run under the normal Node t
   const result = spawnSync(pythonCommand, [fileURLToPath(new URL('./test_account_writer.py', import.meta.url))], { encoding: 'utf8', windowsHide: true, timeout: 30_000, maxBuffer: 1024 * 1024 });
   assert.equal(result.error, undefined, result.error?.message);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Ran 32 tests/);
+  assert.match(result.stderr, /Ran 33 tests/);
 });

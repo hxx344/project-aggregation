@@ -173,6 +173,43 @@ class AccountWriterTests(unittest.TestCase):
         self.assertTrue(writer.assert_owned(transfer))
         self.error("INVALID_INTENT_TARGET", lambda: writer.import_unknown(ticket, "forged-amend", {"intentAction": "amend", "intentTarget": {"accountKey": account_key(margin_identities()[0]), "symbol": "BTCUSDT", "clientOrderId": "old"}, "transfer": {"amount": "1"}}))
 
+    def test_platform_margin_transfers_stay_in_one_environment_and_expire_only_against_platform_writes(self):
+        writer = self.writer("platform")
+        values = [{**value, "environment": "testnet"} for value in margin_identities()]
+        ticket = self.ticket(writer, values)
+        mixed = margin_payload(values)
+        mixed["marginTransfer"]["master"]["environment"] = "demo"
+        self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(ticket, "mixed", mixed))
+        self.error("INVALID_MARGIN_TRANSFER", lambda: writer.prepare(ticket, "mainnet-keys", margin_payload()))
+        # The legacy module stays mainnet-only.
+        legacy = self.writer("aster")
+        self.error("INVALID_MARGIN_TRANSFER", lambda: legacy.prepare(ticket, "aster-testnet", margin_payload(values)))
+        writer.finish(writer.prepare(ticket, "platform:transfer:a", margin_payload(values)), "unknown")
+        order_ticket = subset_ticket(ticket, [account_key(values[0])])
+        adl = {"groupId": "platform:adl:b", "action": "create", "venue": "aster", "clientOrderId": "adl-1", "symbol": "BTCUSDT", "side": "sell", "positionSide": "LONG", "quantity": "0.01", "type": "market", "reduceOnly": True}
+
+        def run(sql, *args):
+            with closing(sqlite3.connect(self.database_path)) as database:
+                database.execute(sql, args)
+                database.commit()
+
+        def age(operation_id):
+            run("UPDATE aw_operations SET created_at=created_at-?, updated_at=updated_at-? WHERE operation_id=?", ASTER_WRITE_EXPIRY_MS, ASTER_WRITE_EXPIRY_MS, operation_id)
+
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(order_ticket, "platform:adl:early", adl))
+        age("platform:transfer:a")
+        writer.finish(writer.prepare(order_ticket, "platform:adl:after", adl), "unknown")
+        # An unknown ADL order gates a new transfer until it has expired too,
+        # and keeps gating other orders.
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, "platform:transfer:b", margin_payload(values)))
+        age("platform:adl:after")
+        writer.finish(writer.prepare(ticket, "platform:transfer:b", margin_payload(values)), "rejected")
+        self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(order_ticket, "platform:adl:c", adl))
+        # Expiry never crosses modules, not even between the two margin modules.
+        for module in ("aster", "hub"):
+            run(f"UPDATE aw_operations SET module_id='{module}' WHERE operation_id='platform:adl:after'")
+            self.error("ACCOUNT_UNRESOLVED", lambda: writer.prepare(ticket, f"platform:transfer:{module}", margin_payload(values)))
+
     def test_expired_aster_unknown_writes_stop_gating_margin_transfers(self):
         writer = self.writer("aster")
         values = margin_identities()

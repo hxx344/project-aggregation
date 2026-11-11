@@ -27,6 +27,9 @@ HEARTBEAT_MS = 5_000
 SAFETY_MS = 10_000
 # Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance.
 ASTER_WRITE_EXPIRY_MS = 120_000
+# Modules whose Aster margin transfers carry the margin-transfer intent: the legacy ASTER module (mainnet) and the
+# unified platform executor ("platform", any one environment per transfer). Expiry only ever applies within one module.
+MARGIN_MODULES = frozenset(("aster", "platform"))
 AUTHORITIES = frozenset(("binance", "bybit", "okx", "gate-crossex", "aster", "hyperliquid", "rh-lighter"))
 ENVIRONMENTS = frozenset(("mainnet", "testnet", "demo"))
 SECRET_KEY = re.compile(r"^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$", re.I)
@@ -145,7 +148,7 @@ def _positive_decimal(value):
 
 def _margin_metadata(module_id, keys, payload):
     transfer = payload["marginTransfer"]
-    if module_id != "aster" or not _exact_keys(payload, ("marginTransfer",)) or not _exact_keys(transfer, ("version", "method", "path", "params", "source", "destination", "master")) or type(transfer["version"]) not in (int, float) or transfer["version"] != 1 or transfer["method"] != "POST" or transfer["path"] != "/fapi/v3/subAccountTransfer":
+    if module_id not in MARGIN_MODULES or not _exact_keys(payload, ("marginTransfer",)) or not _exact_keys(transfer, ("version", "method", "path", "params", "source", "destination", "master")) or type(transfer["version"]) not in (int, float) or transfer["version"] != 1 or transfer["method"] != "POST" or transfer["path"] != "/fapi/v3/subAccountTransfer":
         _fail("INVALID_MARGIN_TRANSFER")
     params = transfer["params"]
     if not _exact_keys(params, ("fromAccountAddress", "toAccountAddress", "asset", "amount", "kindType")) or params["asset"] != "USD1" or params["kindType"] != "FUTURE_FUTURE" or not _positive_decimal(params["amount"]) or not re.fullmatch(r"(?:0|[1-9][0-9]{0,9})(?:\.[0-9]{1,8})?", params["amount"]):
@@ -154,8 +157,10 @@ def _margin_metadata(module_id, keys, payload):
     if int(whole) * 100_000_000 + int(fraction.ljust(8, "0")) > 100_000_000_000_000_000:
         _fail("INVALID_MARGIN_TRANSFER")
     identities = [transfer[role] for role in ("source", "destination", "master")]
+    # The legacy module only ever runs on mainnet; the platform keeps all three accounts in the one environment it runs in.
+    environment = "mainnet" if module_id == "aster" else (transfer["source"].get("environment") if isinstance(transfer["source"], dict) else None)
     for identity in identities:
-        if not _exact_keys(identity, ("authority", "environment", "accountId")) or identity["authority"] != "aster" or identity["environment"] != "mainnet" or not isinstance(identity["accountId"], str) or not re.fullmatch(r"0x[0-9a-f]{40}", identity["accountId"]):
+        if not _exact_keys(identity, ("authority", "environment", "accountId")) or identity["authority"] != "aster" or not isinstance(identity["environment"], str) or identity["environment"] not in ENVIRONMENTS or identity["environment"] != environment or not isinstance(identity["accountId"], str) or not re.fullmatch(r"0x[0-9a-f]{40}", identity["accountId"]):
             _fail("INVALID_MARGIN_TRANSFER")
     transfer_keys = sorted(account_key(identity) for identity in identities)
     if len(set(transfer_keys)) != 3 or keys != transfer_keys or params["fromAccountAddress"] != identities[0]["accountId"] or params["toAccountAddress"] != identities[1]["accountId"]:
@@ -264,7 +269,7 @@ def _expired_aster_write(operation, pending, current):
     window plus clock tolerance the original cannot execute. A new margin
     transfer ignores any such write; any new write ignores such a transfer.
     """
-    return (operation["module_id"] == "aster" and pending["module_id"] == "aster" and pending["state"] == "unknown"
+    return (operation["module_id"] == pending["module_id"] and pending["module_id"] in MARGIN_MODULES and pending["state"] == "unknown"
             and "margin-transfer" in (operation["intent_action"], pending["intent_action"])
             and current - max(pending["created_at"], pending["updated_at"]) >= ASTER_WRITE_EXPIRY_MS)
 

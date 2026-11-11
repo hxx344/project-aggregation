@@ -7,8 +7,13 @@ const TTL_MS = 60_000;
 export const RECOVERY_SCHEMA_VERSION = 1;
 const HEARTBEAT_MS = 5_000;
 const SAFETY_MS = 10_000;
-// Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance.
-const ASTER_WRITE_EXPIRY_MS = 120_000;
+/** Aster v3 nonce window (60 s around server time) plus 60 s clock tolerance. */
+export const ASTER_WRITE_EXPIRY_MS = 120_000;
+/**
+ * Modules whose Aster margin transfers carry the margin-transfer intent: the legacy ASTER module (mainnet) and the
+ * unified platform executor (`platform`, any one environment per transfer). Expiry only ever applies within one module.
+ */
+const MARGIN_MODULES = new Set(['aster', 'platform']);
 const AUTHORITIES = new Set(['binance', 'bybit', 'okx', 'gate-crossex', 'aster', 'hyperliquid', 'rh-lighter']);
 const ENVIRONMENTS = new Set(['mainnet', 'testnet', 'demo']);
 const SECRET_KEY = /^(?:api[_-]?key|api[_-]?secret|secret(?:[_-]?key)?|private[_-]?key|signer|signature|timestamp|nonce|passphrase|password|authorization|access[_-]?token|refresh[_-]?token|token)$/i;
@@ -96,14 +101,16 @@ const positiveDecimal = (value) => typeof value === 'string' && /^(?:0|[1-9][0-9
 function marginMetadata(moduleId, keys, payload) {
   const transfer = payload.marginTransfer;
   const invalid = () => fail('INVALID_MARGIN_TRANSFER');
-  if (moduleId !== 'aster' || !exactKeys(payload, ['marginTransfer']) || !exactKeys(transfer, ['version', 'method', 'path', 'params', 'source', 'destination', 'master']) || transfer.version !== 1 || transfer.method !== 'POST' || transfer.path !== '/fapi/v3/subAccountTransfer') invalid();
+  if (!MARGIN_MODULES.has(moduleId) || !exactKeys(payload, ['marginTransfer']) || !exactKeys(transfer, ['version', 'method', 'path', 'params', 'source', 'destination', 'master']) || transfer.version !== 1 || transfer.method !== 'POST' || transfer.path !== '/fapi/v3/subAccountTransfer') invalid();
   const params = transfer.params;
   if (!exactKeys(params, ['fromAccountAddress', 'toAccountAddress', 'asset', 'amount', 'kindType']) || params.asset !== 'USD1' || params.kindType !== 'FUTURE_FUTURE' || !positiveDecimal(params.amount) || !/^(?:0|[1-9][0-9]{0,9})(?:\.[0-9]{1,8})?$/.test(params.amount)) invalid();
   const [whole, fraction = ''] = params.amount.split('.');
   if (BigInt(whole) * 100_000_000n + BigInt(fraction.padEnd(8, '0')) > 100_000_000_000_000_000n) invalid();
   const identities = ['source', 'destination', 'master'].map((role) => {
     const identity = transfer[role];
-    if (!exactKeys(identity, ['authority', 'environment', 'accountId']) || identity.authority !== 'aster' || identity.environment !== 'mainnet' || typeof identity.accountId !== 'string' || !/^0x[0-9a-f]{40}$/.test(identity.accountId)) invalid();
+    // The legacy module only ever runs on mainnet; the platform keeps all three accounts in the one environment it runs in.
+    const environment = moduleId === 'aster' ? 'mainnet' : transfer.source?.environment;
+    if (!exactKeys(identity, ['authority', 'environment', 'accountId']) || identity.authority !== 'aster' || !ENVIRONMENTS.has(identity.environment) || identity.environment !== environment || typeof identity.accountId !== 'string' || !/^0x[0-9a-f]{40}$/.test(identity.accountId)) invalid();
     return identity;
   });
   const transferKeys = identities.map(accountKey).sort();
@@ -172,7 +179,7 @@ function intentMetadata(moduleId, keys, payload) {
 // window plus clock tolerance the original cannot execute. A new margin
 // transfer ignores any such write; any new write ignores such a transfer.
 function expiredAsterWrite(operation, pending, time) {
-  return operation.module_id === 'aster' && pending.module_id === 'aster' && pending.state === 'unknown'
+  return operation.module_id === pending.module_id && MARGIN_MODULES.has(pending.module_id) && pending.state === 'unknown'
     && (operation.intent_action === 'margin-transfer' || pending.intent_action === 'margin-transfer')
     && time - Math.max(pending.created_at, pending.updated_at) >= ASTER_WRITE_EXPIRY_MS;
 }
