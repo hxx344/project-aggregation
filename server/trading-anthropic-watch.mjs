@@ -1,6 +1,6 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { atomicJson } from '../tools/entropy-lighter-lab/core.mjs';
+import { atomicJson } from './atomic-json.mjs';
 import { HttpError } from './http-common.mjs';
 import { ExchangeResponseError, readJsonResponse } from './exchange-transport/response.mjs';
 import { postCard, validateChannel } from './automation/feishu-digest-core.mjs';

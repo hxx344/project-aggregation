@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
-import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
+import { atomicJson } from '../atomic-json.mjs';
 import { HttpError } from '../http-common.mjs';
 
 const DEFAULTS = Object.freeze({ interrupted: false, needs_review: false, recovered: false });

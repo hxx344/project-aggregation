@@ -97,6 +97,8 @@ ASTER 的 `ASTER_CAPACITY_RELAY_CA_FILE` 若引用外部 CA 文件，迁移只�
 
 安装器记录旧服务的运行及开机启动状态。候选启动失败时，先停止新工作台，隔离本次新建的模块数据，再恢复旧服务状态、旧程序和工作台配置。失败候选的数据保留在 `/opt/project-aggregation/failed-module-migration-*` 供排查；下一次重试会重新复制旧服务恢复运行后的最新数据。迁移记录位于 root 私有的 `.module-migration.json`，v2 成功记录使后续更新跳过复制。已有四模块 v1 成功记录会单独补迁移 ASTER；本次事务只管理 `aster-desk`，失败不会重启已退役的其他服务或隔离其他模块数据。
 
+Entropy / Lighter 研究模块已从工作台移除，安装器不处理它的遗留内容。曾用旧版 `install-entropy-lighter-lab.sh` 装过独立服务的机器，需要手动执行 `sudo systemctl disable --now entropy-lighter-lab`，再按需删除 `/etc/systemd/system/entropy-lighter-lab.service`、`/opt/entropy-lighter-lab`、`/etc/entropy-lighter-lab` 和 `/var/lib/entropy-lighter-lab`。工作台数据目录下的 `entropy-lighter/` 不会被自动删除，保留期间仍随数据目录进入备份；确认不再需要历史采样后可手动删除。
+
 ## 发布、验证与失败恢复
 
 GitHub Actions 只在 `ubuntu-24.04` 原生 x64 runner 构建一次，使用 Node.js 24.15.0 和 Python 3.12，与当前服务器的系统系列和 CPU 架构匹配。运行包包含完整 Next 运行依赖与 x64 原生库；ASTER 仅运行 `dashboard/dist/client` 静态页面和 Python 后端，其 vinext 构建依赖不进入生产依赖树，不标记为通用 `linux-any`。解压后的包需要启动工作台及五个模块完成验收。独立的安装器任务同样固定在 `ubuntu-24.04`，负责权限、systemd、增量更新与失败恢复检查，不再构建第二份应用。

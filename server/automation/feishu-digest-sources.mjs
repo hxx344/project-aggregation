@@ -104,18 +104,6 @@ export function executionSection(state) {
       rows('jobs', '进行中任务', active.slice(0, ROW_LIMIT).map(label), active.length)] });
 }
 
-const LAB_STATES = { starting: '正在启动', running: '运行中', stopped: '已停止', fault: '异常' };
-export function researchSection(state) {
-  const id = 'hub:research', name = 'Entropy / Lighter', status = LAB_STATES[state.state] ?? state.state;
-  if (!state.enabled && state.state === 'stopped') return section(id, name, 'idle', status);
-  const late = state.state === 'running' && state.stale;
-  const issues = [...(state.error ? [state.error] : []), ...(late ? ['研究报告已过期'] : [])];
-  const insights = state.insights;
-  return section(id, name, state.state === 'fault' ? 'alert' : issues.length ? 'warn' : state.state === 'running' ? 'ok' : 'notice', status, { asOf: stamp(insights?.asOf), issues, metrics: [
-    metric('summary', '结论', insights?.summary?.title ? clean(insights.summary.title, 160) : MISSING), metric('leader', '领先方向', insights?.leader?.title ? clean(insights.leader.title, 160) : MISSING),
-    metric('samples', '样本数', amount(insights?.leader?.samples))] });
-}
-
 // Same five contracts and share basis as 价差下单 (src/trading-anthropic.ts); the digest has no
 // per-browser share assumption, so it always converts with the page's default 12.7B / 16.7B.
 const ANT_SHARES = Object.freeze({ outstanding: '12.7', diluted: '16.7' });
@@ -227,7 +215,7 @@ function guarded(id, name, read, log) {
 const settle = async (read, part, log) => {
   try { return await read(); } catch (error) { log.warn({ err: error, section: 'hub:anthropic', part, type: 'feishu-digest' }, '飞书汇总读取 ANT 数据失败'); return { error: true }; }
 };
-export async function collectSections({ overview, positions, funding, execution, research, anthropic = null, log = console, now = Date.now }) {
+export async function collectSections({ overview, positions, funding, execution, anthropic = null, log = console, now = Date.now }) {
   const hub = await Promise.all([
     guarded('hub:positions', '交易所持仓', async () => positionsSection(await positions()), log),
     // Quotes and positions fail separately, so one missing half never hides the other.
@@ -238,7 +226,6 @@ export async function collectSections({ overview, positions, funding, execution,
     }, log)] : []),
     guarded('hub:funding', '原油四腿', () => fundingSection(funding()), log),
     guarded('hub:execution', '原生执行', () => executionSection(execution()), log),
-    guarded('hub:research', 'Entropy / Lighter', () => researchSection(research()), log),
   ]);
   const projects = overview().projects.filter(snapshot => snapshot.project.adapter !== 'link').map(snapshot => projectSection(snapshot, now()));
   return [...hub, ...projects];

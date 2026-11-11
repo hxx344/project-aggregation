@@ -2,7 +2,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { deliveryReview, publicDeliveryReviews } from './delivery-review.mjs';
-import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
+import { atomicJson } from '../atomic-json.mjs';
 import { HttpError } from '../http-common.mjs';
 import { DIGEST_DEFAULTS, buildDigest, latestSlot, nextSlot, postCard, renderCard, validateChannel, validateDigestConfig } from './feishu-digest-core.mjs';
 
