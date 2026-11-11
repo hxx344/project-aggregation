@@ -27,7 +27,6 @@ import { createTradingAutoExposure } from '../trading-auto-exposure.mjs';
 import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
 import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
-import { createEntropyLighterResearch } from '../research/entropy-lighter.mjs';
 import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
@@ -61,7 +60,6 @@ export function resolveWarmup({ warmupEnabled = process.env.WARMUP_ENABLED !== '
 // checked the session, origin and CSRF token. The API reports its overview
 // stream counts through reportApiStats() (design doc 5.8).
 export function createDataPlane({ db, control, catalog, encrypt, decrypt, embeddedModules, dataDir, log, accountWriter = null,
-  researchEnabledByDefault = embeddedModules,
   aeroMarketEnabledByDefault = embeddedModules && process.env.NODE_ENV !== 'test' && process.env.AERO_MARKET_SCAN !== 'false',
   refreshInterval = 30000, timeoutMs = 5000, summaryReader = readSummary, assetSyncIntervalMs = 60000, assetSyncReader = syncAsset,
   assetPositionsRequest, assetPositionsCacheMs, assetPositionsTimeoutMs, assetPositionsNow, assetFillsRequest, assetFillsCacheMs, assetFillsTimeoutMs, assetFillsNow,
@@ -73,7 +71,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const { stmt, sessions, projects } = control;
   const backupReadiness = createBackupReadiness({ getSetting: key => control.getSetting(key), setSetting: (key, value) => control.setSetting(key, value), transaction: action => immediate(db, action) });
   const { publicProject, getProjects, rowFor, projectRevision } = catalog;
-  const research = createEntropyLighterResearch({ dataDir, enabledByDefault: researchEnabledByDefault, log });
   const costResearch = createBinanceLighterCost({ dataDir, log });
   // 只读链上行情；测试、非内置实例与 AERO_MARKET_SCAN=false 时默认不扫描，避免启动即访问公共 RPC；页面保存的配置优先。
   const aeroMarket = createAeroMarket({ dataDir, enabledByDefault: aeroMarketEnabledByDefault, log });
@@ -161,7 +158,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     return attributeFills(data, native.source, execution.historyConnections());
   } });
   const feishuDigest = createFeishuDigest({ dataDir, encrypt, decrypt, log, readSections: () => collectSections({ overview, log,
-    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(), research: () => research.state(),
+    positions: () => assetPositions.state(), funding: () => trading.state(7), execution: () => execution.state(),
     anthropic: { quotes: () => execution.quotes(), positions: () => anthropicWatch.state() } }) });
   // All ANT observations use the same account and scope as the order unit.
   const executionPositions = createExecutionPositionWatch({ readConnections: () => execution.anthropicPositionConnections(),
@@ -316,35 +313,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       }
       if (Object.keys(body).length) throw new HttpError(400, '研究控制操作不接受额外参数');
       return reply(200, await costResearch[action](authorize));
-    }
-    if (pathname === '/api/research/entropy-lighter' || pathname.startsWith('/api/research/entropy-lighter/')) {
-      if (pathname === '/api/research/entropy-lighter/evidence') {
-        if (method !== 'GET') throw new HttpError(405, '研究证据仅支持只读导出');
-        const keys = [...url.searchParams.keys()];
-        if (keys.length !== 4 || new Set(keys).size !== 4 || keys.some(key => !['session', 'symbol', 'from', 'to'].includes(key))) throw new HttpError(400, '请提供会话、标的和起止时间');
-        const from = url.searchParams.get('from'), to = url.searchParams.get('to');
-        if (![from, to].every(value => /^\d{1,16}$/.test(value) && Number.isSafeInteger(Number(value)))) throw new HttpError(400, '起止时间必须为毫秒整数');
-        const data = await research.exportEvidence({ session: url.searchParams.get('session'), symbol: url.searchParams.get('symbol'), from: Number(from), to: Number(to) });
-        gone();
-        if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
-        return reply(200, data);
-      }
-      if (url.search) throw new HttpError(400, '研究接口不接受查询参数');
-      if (pathname === '/api/research/entropy-lighter' && method === 'GET') return reply(200, research.state());
-      if (pathname === '/api/research/entropy-lighter/report' && method === 'GET') return reply(200, { report: research.state().report });
-      const action = pathname === '/api/research/entropy-lighter/config' && method === 'PUT' ? 'save'
-        : pathname === '/api/research/entropy-lighter/start' && method === 'POST' ? 'start'
-          : pathname === '/api/research/entropy-lighter/stop' && method === 'POST' ? 'stop' : null;
-      if (!action) throw new HttpError(404, '研究接口不存在');
-      const body = await bodyOf();
-      const authorize = () => { if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); };
-      authorize();
-      if (action === 'save') {
-        if (Object.keys(body).length !== 1 || !Object.hasOwn(body, 'config')) throw new HttpError(400, '请提供研究配置');
-        return reply(200, await research.save(body.config, authorize));
-      }
-      if (Object.keys(body).length) throw new HttpError(400, '启动和停止不接受额外参数');
-      return reply(200, await research[action](authorize));
     }
     if (pathname === '/api/research/aero-market' || pathname.startsWith('/api/research/aero-market/')) {
       if (pathname === '/api/research/aero-market' && method === 'GET') {
@@ -627,7 +595,7 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
     prepareStop: async () => { await aeroSafe.prepareStop(); },
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await research.initialize(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); anthropicWatch.initialize(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); anthropicWatch.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -639,6 +607,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await research.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

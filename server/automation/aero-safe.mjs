@@ -9,7 +9,7 @@ import { Wallet, getAddress, parseUnits } from 'ethers';
 import { buildPermissions } from '../../tools/aero-roles/permissions.mjs';
 import { allowanceChanges, batchExecuteBefore, buildUpdateBatch, conditionUsage, toTransactionBuilderJson, updateBatchSize, utc } from '../../tools/aero-roles/roles-calls.mjs';
 import * as executor from '../../tools/aero-roles/executor.mjs';
-import { atomicJson } from '../../tools/entropy-lighter-lab/core.mjs';
+import { atomicJson } from '../atomic-json.mjs';
 import { HttpError } from '../http-common.mjs';
 import { AUTO_DEFAULTS, AUTO_HISTORY_LIMIT, centeredRange, deviationBps, evaluateAuto, fitToRoom, poolRoom, readAutoState, roomFullText, roomShortText, strictAutoConfig, stuckReason } from './aero-auto.mjs';
 import { POOL_STATE_LABELS, addBlockedReason, policyOf, readPolicy, strictPoolPolicy, withPoolPolicy } from './aero-policy.mjs';

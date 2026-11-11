@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { createApp } from '../server/app.mjs';
 import { DIGEST_DEFAULTS, buildDigest, latestSlot, localClock, nextSlot, postCard, renderCard, validateChannel, validateDigestConfig } from '../server/automation/feishu-digest-core.mjs';
 import { createFeishuDigest } from '../server/automation/feishu-digest.mjs';
-import { anthropicSection, collectSections, executionSection, fundingSection, positionsSection, projectSection, researchSection } from '../server/automation/feishu-digest-sources.mjs';
+import { anthropicSection, collectSections, executionSection, fundingSection, positionsSection, projectSection } from '../server/automation/feishu-digest-sources.mjs';
 import { loadCredentialCipher } from '../server/runtime/credentials.mjs';
 
 const silent = { info() {}, warn() {}, error() {}, debug() {} };
@@ -481,7 +481,7 @@ test('position totals stay per currency and say when they are incomplete', () =>
   assert.equal(positionsSection(positions([{ label: 'U', status: 'live', fetchedAt: null, positions: [] }])).metrics.at(-1).text, '无');
 });
 
-test('funding, execution, Aero and research sections show their own state', () => {
+test('funding and execution sections show their own state', () => {
   const account = { exchange: 'binance', name: 'Binance', connected: true, positions: { state: 'live', error: null }, funding: { state: 'live', error: null } };
   const funding = (extra = {}) => ({ strategy: { name: '原油四腿资金费套利' }, exchanges: ['binance', 'bybit'], accounts: [account, { ...account, exchange: 'bybit', name: 'Bybit' }], funding: { complete: true, net: '12.5', currency: 'USDT' }, pnl: { latest: { time: AT_NINE, unrealizedPnl: null, totalPnl: '30' } }, ...extra });
   const ok = fundingSection(funding());
@@ -502,10 +502,6 @@ test('funding, execution, Aero and research sections show their own state', () =
   const attention = executionSection(execution([job('attention', '委托待核对')]));
   assert.equal(attention.level, 'alert');
   assert.match(attention.issues[0], /委托待核对/);
-
-  assert.equal(researchSection({ enabled: false, state: 'stopped' }).level, 'idle');
-  assert.equal(researchSection({ enabled: true, state: 'running', stale: false, error: null, insights: { asOf: AT_NINE, summary: { title: '无优势' }, leader: { title: 'SNDK', samples: 12 } } }).metrics[2].text, '12');
-  assert.equal(researchSection({ enabled: true, state: 'running', stale: true, error: null, insights: null }).level, 'warn');
 });
 
 const NINE_ISO = new Date(AT_NINE).toISOString();
@@ -596,13 +592,13 @@ test('ANT section keeps one half when the other read fails', () => {
 test('one failing source costs only its own section', async () => {
   const sections = await collectSections({ log: silent, now: () => AT_NINE, overview: () => ({ projects: [project(), { ...project(), project: { id: 'link', name: 'Link', adapter: 'link', enabled: true } }] }),
     positions: async () => { throw new Error('secret upstream text'); }, funding: () => { throw new Error('boom'); }, execution: () => ({ connections: [], positions: [], jobs: [] }),
-    research: () => ({ enabled: false, state: 'stopped' }), anthropic: { quotes: async () => { throw new Error('secret quote text'); }, positions: () => { throw new Error('secret watch text'); } } });
-  assert.deepEqual(sections.map(item => item.id), ['hub:positions', 'hub:anthropic', 'hub:funding', 'hub:execution', 'hub:research', 'project:aster']);
+    anthropic: { quotes: async () => { throw new Error('secret quote text'); }, positions: () => { throw new Error('secret watch text'); } } });
+  assert.deepEqual(sections.map(item => item.id), ['hub:positions', 'hub:anthropic', 'hub:funding', 'hub:execution', 'project:aster']);
   assert.equal(sections[0].status, '读取失败');
   assert.equal(sections[1].status, '读取失败');
   assert.ok(!/secret (upstream|quote|watch) text/.test(JSON.stringify(sections)));
   const half = await collectSections({ log: silent, now: () => AT_NINE, overview: () => ({ projects: [] }), positions: async () => ({ sources: [] }), funding: () => { throw new Error('boom'); },
-    execution: () => ({ connections: [], positions: [], jobs: [] }), research: () => ({ enabled: false, state: 'stopped' }),
+    execution: () => ({ connections: [], positions: [], jobs: [] }),
     anthropic: { quotes: async () => antQuotes(), positions: () => { throw new Error('secret watch text'); } } });
   assert.equal(half[1].status, '仓位读取失败');
   assert.ok(!JSON.stringify(half).includes('secret watch text'));

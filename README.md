@@ -2,8 +2,6 @@
 
 统一交易与资产工作台：保留原生交易功能，内置 Market Monitor、Asset Ledger、Gate CrossEx、Greeks 和 ASTER。业务源码位于本仓库的 `modules/`；全部页面沿用工作台登录，只有工作台默认 `3100` 一个 TCP 入口。
 
-Entropy / Lighter 行情研究也已内置，统一更新后从侧栏 **监控 → Entropy / Lighter** 打开；支持持续采集、启动停止、配置、报告和图表，默认只采集公开行情。工具随工作台运行时管理，关闭页面或单独重启 API 不会中断采集。详见 [研究工具说明](docs/entropy-lighter-lab.md)。
-
 飞书定时汇总从侧栏 **系统 → 飞书汇总** 打开：配置机器人、发送时间和要包含的模块与指标，由服务器定时把各模块主要信息发到飞书群，详见 [飞书汇总](docs/feishu-digest.md)。
 
 给其它 agent 或脚本读取非私密数据的只读接口从侧栏 **系统 → Agent 数据接口** 管理：创建只读令牌后，agent 用 HTTP 读取数据目录与快照（服务器负载、模块运行状态、Monitor 行情指标、Aero 池子行情）；不含账户、持仓、余额与凭据，详见 [Agent 数据接口](docs/agent-feed.md)。
@@ -56,13 +54,10 @@ python -m venv .venv-aster
 | `modules/crossex/` | Gate CrossEx 页面与服务 |
 | `modules/greeks/` | Greeks Python 业务及页面 |
 | `modules/aster/` | ASTER Python 交易引擎与静态 dashboard |
-| `tools/entropy-lighter-lab/` | 内置 Entropy / Lighter 行情采集与纸面模拟 |
 | `deploy/` | 统一安装、迁移、打包与发布检查 |
 | `tests/` | 行为、集成及浏览器检查 |
 
 ## 检查与文档
-
-Entropy / Lighter 的 SNDK、ANTH 研究使用[工作台内置工具](docs/entropy-lighter-lab.md)，含延迟情景和返佣分账；纸面模拟需先核验合约并填写实付费率，ANTH 默认未核验。曾安装独立服务的用户先停止旧服务，避免重复采集；工作台不自动迁移其数据。
 
 `pnpm run check` 执行工作台类型检查，`pnpm test` 运行 Node 行为测试；模块集成测试需要先完成 workspace 安装与模块构建，并配置 Greeks 与 ASTER 的独立 Python 环境。Linux 安装、systemd 恢复与 x64 部署包验收由 GitHub Actions 执行。
 

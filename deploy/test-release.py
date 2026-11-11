@@ -70,17 +70,11 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
             end = installer.index('# END CI RELEASE HELPERS', start) + len('# END CI RELEASE HELPERS')
             self.assertEqual(installer[start:end], helper, name)
 
-    def test_source_publisher_includes_runnable_pinned_research_tool(self):
+    def test_source_publisher_includes_only_pinned_runtime_tool_files(self):
         source = self.root / 'source'
         (source / 'server').mkdir(parents=True)
         (source / 'server/index.mjs').write_text('export {};')
         (source / 'package.json').write_text('{"type":"module"}')
-        lab = source / 'tools/entropy-lighter-lab'
-        lab.mkdir(parents=True)
-        names = ('cli.mjs', 'core.mjs', 'feeds.mjs', 'binance-scalper.mjs', 'evidence.mjs', 'config.example.json')
-        for name in names:
-            shutil.copy2(ROOT / 'tools/entropy-lighter-lab' / name, lab / name)
-        (lab / 'config.json').write_text('private configuration must not ship')
         roles = source / 'tools/aero-roles'
         roles.mkdir(parents=True)
         roles_names = ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs')
@@ -92,7 +86,7 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
             subprocess.run(['git', '-C', str(source), *args], check=True, capture_output=True)
         commit = subprocess.check_output(['git', '-C', str(source), 'rev-parse', 'HEAD'], text=True).strip()
         subprocess.run(['git', 'clone', '-q', '--bare', str(source), str(self.root / 'repository.git')], check=True)
-        (lab / 'cli.mjs').write_text('throw new Error("uncommitted source must not ship");')
+        (roles / 'policy.mjs').write_text('throw new Error("uncommitted source must not ship");')
         publish = self.root / 'publish'; publish.mkdir()
         installer = (ROOT / 'deploy/install.sh').read_text(encoding='utf-8')
         commands = re.findall(r'^  (git --git-dir="\$APP_DIR/repository.git" archive "\$commit" .*?\| tar -x -C "\$work_dir/publish")$', installer, re.M)
@@ -101,13 +95,12 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
             env={**os.environ, 'APP_DIR': self.root.as_posix(), 'commit': commit, 'work_dir': self.root.as_posix()},
             capture_output=True, text=True)
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertEqual(set(names), {path.name for path in (publish / 'tools/entropy-lighter-lab').iterdir()})
         self.assertFalse((publish / 'tools/aero-lp').exists())
         self.assertEqual(set(roles_names), {path.name for path in (publish / 'tools/aero-roles').iterdir()})
-        result = subprocess.run(['node', str(publish / 'tools/entropy-lighter-lab/cli.mjs'), 'check'],
-                                cwd=publish, capture_output=True, text=True)
-        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
-        self.assertIn('Configuration valid', result.stdout)
+        committed = subprocess.check_output(['git', '-C', str(source), 'show', commit + ':tools/aero-roles/policy.mjs'])
+        published = (publish / 'tools/aero-roles/policy.mjs').read_bytes()
+        # A Windows checkout may publish CRLF; the content must still be the committed file.
+        self.assertEqual(committed.replace(b'\r\n', b'\n'), published.replace(b'\r\n', b'\n'))
 
     def archive(self, extra=None, wrong_commit=False):
         entries = [('.release-commit', ('c' * 40 if wrong_commit else self.commit).encode()),

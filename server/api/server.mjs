@@ -457,11 +457,6 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       if (req.headers.origin) sameOrigin(req);
       await forward(req, res, url, current, { costResearch: true }); return;
     }
-    if (pathname === '/api/research/entropy-lighter' || pathname.startsWith('/api/research/entropy-lighter/')) {
-      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取研究数据');
-      if (req.headers.origin) sameOrigin(req);
-      await forward(req, res, url, current); return;
-    }
     if (pathname === '/api/research/aero-market' || pathname.startsWith('/api/research/aero-market/')) {
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台读取市场数据');
       if (req.headers.origin) sameOrigin(req);

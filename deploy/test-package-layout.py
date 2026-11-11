@@ -149,7 +149,7 @@ class RuntimeDependencyTests(unittest.TestCase):
     def test_five_module_package_includes_aster_static_and_python_without_vinext(self):
         from unittest.mock import patch
         required = self.prepare_five_modules()
-        self.prepare_research_tool()
+        self.prepare_runtime_tools()
         with patch.object(module, 'read_runtime_lock', return_value=self.lock):
             module.stage_runtime(self.source, self.target)
         for name in required:
@@ -157,36 +157,25 @@ class RuntimeDependencyTests(unittest.TestCase):
         self.assertFalse((self.target / 'node_modules/vinext').exists())
         self.assertFalse((self.target / 'modules/aster/dashboard/node_modules').exists())
         self.assertTrue((self.target / 'node_modules/runtime/package.json').is_file())
-        self.assert_research_tool_runs(self.target)
+        self.assert_runtime_tools_staged(self.target)
 
-    def prepare_research_tool(self):
+    def prepare_runtime_tools(self):
         repository = Path(__file__).resolve().parent.parent
-        target = self.source / 'tools/entropy-lighter-lab'
-        target.mkdir(parents=True)
-        for name in module.LAB_RUNTIME_FILES:
-            shutil.copy2(repository / 'tools/entropy-lighter-lab' / name, target / name)
-        (target / 'config.json').write_text('private configuration must not ship')
-        (target / 'events-fixture.jsonl').write_text('research data must not ship')
         roles = self.source / 'tools/aero-roles'
         roles.mkdir(parents=True)
         for name in module.AERO_ROLES_RUNTIME_FILES:
             shutil.copy2(repository / 'tools/aero-roles' / name, roles / name)
         (roles / 'cli.mjs').write_text('operator CLI must not ship')
 
-    def assert_research_tool_runs(self, root):
-        directory = root / 'tools/entropy-lighter-lab'
-        self.assertEqual(set(module.LAB_RUNTIME_FILES), {path.name for path in directory.iterdir()})
+    def assert_runtime_tools_staged(self, root):
+        self.assertEqual({'aero-roles'}, {path.name for path in (root / 'tools').iterdir()})
         self.assertEqual(set(module.AERO_ROLES_RUNTIME_FILES), {path.name for path in (root / 'tools/aero-roles').iterdir()})
-        result = subprocess.run(['node', str(directory / 'cli.mjs'), 'check'], cwd=root,
-                                capture_output=True, text=True, check=True)
-        self.assertIn('Configuration valid', result.stdout)
 
-    def test_full_package_rejects_missing_research_runtime(self):
+    def test_full_package_rejects_missing_runtime_tool_file(self):
         from unittest.mock import patch
         self.prepare_five_modules()
-        self.prepare_research_tool()
-        for name in [*(f'tools/entropy-lighter-lab/{name}' for name in module.LAB_RUNTIME_FILES),
-                     *(f'tools/aero-roles/{name}' for name in module.AERO_ROLES_RUNTIME_FILES)]:
+        self.prepare_runtime_tools()
+        for name in [f'tools/aero-roles/{name}' for name in module.AERO_ROLES_RUNTIME_FILES]:
             with self.subTest(name=name):
                 file = self.source / name
                 content = file.read_bytes(); file.unlink()
@@ -194,19 +183,19 @@ class RuntimeDependencyTests(unittest.TestCase):
                     with patch.object(module, 'read_runtime_lock', return_value=self.lock):
                         with self.assertRaises(ValueError) as raised:
                             module.stage_runtime(self.source, self.target)
-                        self.assertEqual(str(raised.exception), 'Missing trusted research runtime file: ' + str(Path(name)))
+                        self.assertEqual(str(raised.exception), 'Missing trusted runtime tool file: ' + str(Path(name)))
                 finally:
                     file.write_bytes(content)
                     shutil.rmtree(self.target)
 
-    def test_full_package_rejects_linked_research_runtime_directory(self):
+    def test_full_package_rejects_linked_runtime_tool_directory(self):
         self.prepare_five_modules()
-        self.prepare_research_tool()
-        directory = self.source / 'tools/entropy-lighter-lab'
-        outside = self.source.parent / 'outside-lab'
+        self.prepare_runtime_tools()
+        directory = self.source / 'tools/aero-roles'
+        outside = self.source.parent / 'outside-roles'
         directory.rename(outside)
         self.link(directory, outside)
-        with self.assertRaisesRegex(ValueError, 'Missing trusted research runtime directory: tools/entropy-lighter-lab'):
+        with self.assertRaisesRegex(ValueError, 'Missing trusted runtime tool directory: tools/aero-roles'):
             module.stage_runtime(self.source, self.target)
 
     def test_embedded_stage_omits_hub_outputs_and_dependency_materialization(self):
@@ -276,7 +265,6 @@ class RuntimeDependencyTests(unittest.TestCase):
             self.assertNotEqual(changed, application, relative); self.assertEqual(same, runtime, relative)
             application = changed
         for relative in ('server/app.mjs', 'server/api-helpers.mjs', 'server/runtime/main.mjs', 'modules/greeks/main.py', 'package.json', 'tsconfig.json',
-                         *(f'tools/entropy-lighter-lab/{name}' for name in module.LAB_RUNTIME_FILES),
                          *(f'tools/aero-roles/{name}' for name in module.AERO_ROLES_RUNTIME_FILES)):
             changed, other = commit(relative, relative + ' changed')
             self.assertNotEqual(changed, application, relative)

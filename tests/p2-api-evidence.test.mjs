@@ -56,26 +56,6 @@ test('real API restricts module grant management to its current session and CSRF
   assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM portal_grants WHERE session_id=?').get(foreign.id).n, 1);
 });
 
-test('real research export route is authenticated, bounded and does not start collection', async t => {
-  const f = await fixture(t), auth = await f.login();
-  const query = new URLSearchParams({ session: randomUUID(), symbol: 'ANTH', from: '1794283200000', to: '1794283201000' });
-  const route = `/api/research/entropy-lighter/evidence?${query}`;
-  assert.equal((await f.request(route)).status, 401);
-  assert.equal((await f.request(route, { auth, headers: { Origin: 'https://foreign.invalid' } })).status, 403);
-  const before = await f.request('/api/research/entropy-lighter', { auth });
-  const result = await f.request(route, { auth });
-  assert.equal(result.status, 200, JSON.stringify(result.data));
-  assert.equal(typeof result.data.jsonl, 'string');
-  assert.ok(result.data.manifest);
-  assert.equal((await f.request(route + '&from=0', { auth })).status, 400);
-  assert.equal((await f.request(route.replace('from=1794283200000', 'from=1e3'), { auth })).status, 400);
-  assert.equal((await f.request(route, { method: 'POST', auth, data: {} })).status, 405);
-  const after = await f.request('/api/research/entropy-lighter', { auth });
-  assert.equal(result.data.manifest.collectionStarted, false);
-  assert.equal(before.data.state, 'stopped');
-  assert.equal(after.data.state, before.data.state);
-});
-
 test('real execution evidence route is authenticated and does not manufacture absent jobs', async t => {
   const f = await fixture(t), auth = await f.login();
   const route = `/api/trading/execution/jobs/${randomUUID()}/evidence`;

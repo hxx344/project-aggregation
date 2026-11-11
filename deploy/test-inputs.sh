@@ -57,16 +57,6 @@ echo test >> "$source_dir/tests/app.test.mjs"; refresh; compare 0 0 1 0 0
 capture
 echo backend >> "$source_dir/server/index.mjs"; refresh; compare 0 0 1 0 1
 capture
-# Research collection is a runtime input, independent of UI/module builds and dependencies.
-mkdir -p "$source_dir/tools/entropy-lighter-lab"
-for file in cli.mjs core.mjs feeds.mjs binance-scalper.mjs evidence.mjs config.example.json; do
-  embedded_before=$embedded_key
-  runtime_component_before=$runtime_component_key
-  echo research > "$source_dir/tools/entropy-lighter-lab/$file"; refresh; compare 0 0 1 0 1
-  compare_module_inputs 0 0 0 0
-  [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
-  capture
-done
 # The Safe + Roles executor is imported by the runtime unit as well.
 mkdir -p "$source_dir/tools/aero-roles"
 for file in addresses.mjs conditions.mjs executor.mjs permissions.mjs policy.mjs roles-calls.mjs; do

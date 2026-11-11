@@ -11,8 +11,6 @@ export FIXTURE_REAL_NODE=$(command -v node)
 mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/tests" "$fixture/source/public" "$fixture/source/deploy" "$fixture/source/scripts" "$fixture/runtime"
 cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-artifact-cache.py"
 cp "$repository/scripts/install-hooks.mjs" "$fixture/source/scripts/install-hooks.mjs"
-mkdir -p "$fixture/source/tools/entropy-lighter-lab"
-cp "$repository"/tools/entropy-lighter-lab/{cli.mjs,core.mjs,feeds.mjs,binance-scalper.mjs,evidence.mjs,config.example.json} "$fixture/source/tools/entropy-lighter-lab/"
 mkdir -p "$fixture/source/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$fixture/source/tools/aero-roles/"
 printf '{"name":"fixture","version":"1.0.0","type":"module","scripts":{"prepare":"node scripts/install-hooks.mjs"}}\n' > "$fixture/source/package.json"
@@ -401,10 +399,10 @@ new_calls | grep -qx "restart $service"
 [[ $(cat "$fixture/runtime-cwd") == "$(readlink "$fixture/application/current")" ]]
 calls=$(wc -l < "$fixture/systemctl.calls")
 tool_inputs_before="$(count install) $(count check) $(count build)"
-echo '// research runtime update' >> "$fixture/source/tools/entropy-lighter-lab/core.mjs"; commit_source research-runtime
+echo '// runtime tool update' >> "$fixture/source/tools/aero-roles/policy.mjs"; commit_source runtime-tool
 run_install
 new_calls | grep -qx "restart $service"
 [[ $(cat "$fixture/runtime-cwd") == "$(readlink "$fixture/application/current")" ]]
 [[ "$(count install) $(count check) $(count build)" == "$tool_inputs_before" ]]
-cmp -s "$fixture/source/tools/entropy-lighter-lab/core.mjs" "$fixture/application/current/tools/entropy-lighter-lab/core.mjs"
+cmp -s "$fixture/source/tools/aero-roles/policy.mjs" "$fixture/application/current/tools/aero-roles/policy.mjs"
 printf 'Incremental installer paths passed (docs/tests/backend/frontend/config, failures and environment).\n'

@@ -187,7 +187,7 @@
 
 **事件记录：** `embedded-import-ignore-20261013`；本轮一次已核实事件。
 
-**发布白名单补充（2026-11-10）：** P2 批次 `be01451` 的研究 CLI 新增导入 `evidence.mjs`，本地完整工作树可运行，但源码安装器、CI 打包器与独立研究安装器各自的运行文件白名单遗漏该文件。[CI 42824071840](https://github.com/hxx344/project-aggregation/actions/runs/42824071840) 在固定源码发布与真实 systemd 首次启动中报 `ERR_MODULE_NOT_FOUND`，阻止候选发布。新增运行时依赖要同时核对所有实际交付白名单及隔离夹具，不能以源码目录存在或模块构建通过代替。验证复用 `deploy/test-release.py` 的真实固定 Git 提取后 CLI 启动，以及 `deploy/test-package-layout.py` 的发布树启动和缺文件拒绝；独立安装与 systemd 由 Linux CI 执行。事件 `research-runtime-publication-allowlist-20261110`，为合入 main 后、正式发布前由 CI 捕获的交付遗漏；不推进历史复盘检查点。
+**发布白名单补充（2026-11-10）：** P2 批次 `be01451` 的研究 CLI 新增导入 `evidence.mjs`，本地完整工作树可运行，但源码安装器、CI 打包器与独立研究安装器各自的运行文件白名单遗漏该文件。[CI 42824071840](https://github.com/hxx344/project-aggregation/actions/runs/42824071840) 在固定源码发布与真实 systemd 首次启动中报 `ERR_MODULE_NOT_FOUND`，阻止候选发布。新增运行时依赖要同时核对所有实际交付白名单及隔离夹具，不能以源码目录存在或模块构建通过代替。验证复用 `deploy/test-release.py` 的真实固定 Git 提取后 CLI 启动，以及 `deploy/test-package-layout.py` 的发布树启动和缺文件拒绝；独立安装与 systemd 由 Linux CI 执行。事件 `research-runtime-publication-allowlist-20261110`，为合入 main 后、正式发布前由 CI 捕获的交付遗漏；不推进历史复盘检查点。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
 ### L012：可选本机辅助探测默认关闭，除非用户环境确实运行该服务
 
@@ -289,7 +289,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 本轮关联 `aster-adl-ui-entry-20261016`：同次 ADL 功能交付中的入口补全，设置、状态、报告及其连续修补不拆成多个事件；扩展本条经验，不另建重复条目或推进主线复盘检查点。
 
-**工作台原生入口补充（2026-10-27）：** `3e4de30` 已在聚合仓库交付 Entropy/Lighter 采集与模拟，却仅提供独立 CLI/systemd；用户随后明确要求在工作台内部使用。仓库与发布目标正确仍不足以完成产品接入。新增研究能力先核对侧栏入口、配置/报告路径、后台生命周期及正式包，不能从“Linux 常驻”自行推导为另装服务。本轮补齐原生研究页、已鉴权的 API、runtime 托管进程、四文件发布白名单及增量键；用 [工作台接口测试](tests/entropy-lighter-workbench.test.mjs)、[生产页面夹具](tests/entropy-lighter.browser.mjs) 和 [跨 API 重启用例](tests/process-split.test.mjs) 验证，其中 POSIX 路径在 Windows 跳过、等待 CI，不能描述为本地通过。事件 `research-workbench-entry-20261027`；不推进复盘检查点，历史事件的具体根因与适用边界仍须逐项核验，不仅按条目内日期数量升级规范。
+**工作台原生入口补充（2026-10-27）：** `3e4de30` 已在聚合仓库交付 Entropy/Lighter 采集与模拟，却仅提供独立 CLI/systemd；用户随后明确要求在工作台内部使用。仓库与发布目标正确仍不足以完成产品接入。新增研究能力先核对侧栏入口、配置/报告路径、后台生命周期及正式包，不能从“Linux 常驻”自行推导为另装服务。本轮补齐原生研究页、已鉴权的 API、runtime 托管进程、四文件发布白名单及增量键；用 [工作台接口测试](tests/entropy-lighter-workbench.test.mjs)、[生产页面夹具](tests/entropy-lighter.browser.mjs) 和 [跨 API 重启用例](tests/process-split.test.mjs) 验证，其中 POSIX 路径在 Windows 跳过、等待 CI，不能描述为本地通过。事件 `research-workbench-entry-20261027`；不推进复盘检查点，历史事件的具体根因与适用边界仍须逐项核验，不仅按条目内日期数量升级规范。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
 **双槽资源逃逸（2026-10-27）：** 审查已合入 `6ab243e` 确认：`84aa260` 的切流先移动 `current`，旧槽排空后才更新 `previous`；仅测试健康接口和目标 HTML，遗漏旧页面延迟分包与回滚后的新页面分包。实际资源查找复现两个方向 404，属于 P1 逃逸。资源来源须覆盖两个固定槽所引用的合法发布目录，仍拒绝任意其他版本和目录内链接；[资源 HTTP 回归](tests/release-assets.test.mjs) 与 [systemd 公共入口](deploy/test-slots-systemd.sh) 检查先取页面、再切流/回滚、最后请求分包及复用授权。事件 `api-slot-delayed-assets-20261027`；不推进复盘检查点。
 
@@ -1306,7 +1306,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **吞吐评估补充（#222，2026-11-06）：** 结论是不改调度。同帧带回早已实现：恢复发布整帧原始快照，并移出所有当时就绪的等待组合，#187 场景 4928 组合秒、178 次恢复，没有可增量。放行较新组合的三种规则都按 3600 秒回放实测：① 观测间隔全部超过 120 秒上限时取消预留，周期 121–140 秒加短周期组合的 60 个种子中，长周期组合最长缺席之和 99517 → 139488 秒，有组合不再出现（3561 秒）；② 预留持有者按已观测最短间隔推算的下次对齐晚于滚动预算恢复时放行，短周期组合明显受益，但长周期组合最长缺席之和 +17%，单个组合 824 → 2370 秒；③ 只在预留覆盖该推算对齐、且所有更早等待组合都推算赶不上时放行，随机 20–120 秒组的恢复次数 +11% 至 +14%、最长缺席之和 -7% 至 -10%，但与原测试“学到间隔后停止对齐的候选到 83 + 38 + 1 秒才释放”冲突：只观测一次间隔无法区分停止对齐与慢周期；要求至少两次观测后不再冲突，收益降到约 1%–2%，且仍有个别组合最长缺席多约 100 秒。按“收益可忽略或最坏情况变差就不做”全部不上线。以后再评估放行时，同时看总吞吐与逐组合最长缺席分布（最大值、p95）：总量改善常伴随个别长间隔组合被饿死；被推算的“下次对齐”只是观测，不是保证。验证：[显示调度测试](modules/monitor/tests/perpetual-display.test.mjs) 新增两个超上限长周期组合场景（各长周期组合最长缺席不超过 900 秒），规则 ①、② 下分别失败；原 57 项不变。
 
-**研究报告采样补充（2026-10-27）：** `075a335` 的 Entropy/Lighter 页面每 5 秒读取一份每 5 秒生成的报告，却用浏览器墙钟对报价接收时间套 750ms 模拟执行门槛；用户截图中六路同轮更新的报价常态全部标过期。采样展示须保留采集器生成时刻、单调接收年龄和严格执行质量，分别表达“最近采样有更新”“报告是否滞后”和“是否满足模拟准入”，页面使用服务器时间锚点与本地单调经过时间，不因展示周期放宽执行门槛。研究结论还须有独立的证据有效窗，不能让旧的正面或负面结论持续冒充当前判断。证据为 [采集器回归](tests/entropy-lighter-lab.test.mjs)、[结论回归](tests/entropy-lighter-insights.test.mjs) 与 [生产页面夹具](tests/entropy-lighter.browser.mjs)，覆盖双重 5 秒采样、偏钟、停更及在下次读取前撤回结论。事件 `research-report-display-expiry-20261027`，不推进复盘检查点。
+**研究报告采样补充（2026-10-27）：** `075a335` 的 Entropy/Lighter 页面每 5 秒读取一份每 5 秒生成的报告，却用浏览器墙钟对报价接收时间套 750ms 模拟执行门槛；用户截图中六路同轮更新的报价常态全部标过期。采样展示须保留采集器生成时刻、单调接收年龄和严格执行质量，分别表达“最近采样有更新”“报告是否滞后”和“是否满足模拟准入”，页面使用服务器时间锚点与本地单调经过时间，不因展示周期放宽执行门槛。研究结论还须有独立的证据有效窗，不能让旧的正面或负面结论持续冒充当前判断。证据为 [采集器回归](tests/entropy-lighter-lab.test.mjs)、[结论回归](tests/entropy-lighter-insights.test.mjs) 与 [生产页面夹具](tests/entropy-lighter.browser.mjs)，覆盖双重 5 秒采样、偏钟、停更及在下次读取前撤回结论。事件 `research-report-display-expiry-20261027`，不推进复盘检查点。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
 **成本研究显示逃逸（2026-11-05）：** PR #170 的 `632ac2c` 在新增成本研究页重复了报告采样与执行时效混用：网页每 5 秒读取报告，却将 `book.ageMs + 页面经过时间` 套入服务端 1 秒执行门槛。用户截图显示四路行情约 3 秒后全部“接收年龄超限”；该文案分支证明采样中的 `book.valid` 原为 true，不能据此判定 WS 停更。原浏览器回归只断言旧快照不再绿色，漏了区分“当前待更新”与“服务端样本无效”。修复把过去时的采样校验、当前页面年龄和报告停止更新分开，真实 `valid=false` 与旧样本继续告警，执行门槛不变。[成本研究页面回归](tests/binance-lighter-cost.browser.mjs) 覆盖正常轮询间隔、中性待更新、同报告重复读取、15 秒停更、实际校验失败和慢 HTTP；夹具的服务器时钟按每个请求实际虚拟时刻生成，不能预先跳到整段快进的终点。事件 `cost-lab-sampling-validity-display-20261105`，为发布后用户发现的展示缺陷；不推进复盘检查点。
 
@@ -1340,7 +1340,7 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `two-unit-entry-symlink-20261026`；实际发生日期 2026-10-26（Asia/Shanghai）；不推进全历史复盘检查点。
 
-**同类入口补充（2026-10-26）：** 新增 Entropy/Lighter 研究 CLI 的提交前独立审查，在 `tools/entropy-lighter-lab/cli.mjs` 再次发现手写路径比较；专用服务经 `current` 启动会跳过主块。改为 `import.meta.main`，新增 [研究工具真实入口测试](tests/entropy-lighter-cli.test.mjs)，在 Windows 同卷 junction 与 Linux symlink 下检查实际配置输出；Ubuntu CI 另跑真实 systemd 安装/回滚。事件 `research-cli-entry-symlink-20261026`，为同日独立入口，不额外增加规范升级日期计数；没有把本机桩检查描述成 Linux 验收。
+**同类入口补充（2026-10-26）：** 新增 Entropy/Lighter 研究 CLI 的提交前独立审查，在 `tools/entropy-lighter-lab/cli.mjs` 再次发现手写路径比较；专用服务经 `current` 启动会跳过主块。改为 `import.meta.main`，新增 [研究工具真实入口测试](tests/entropy-lighter-cli.test.mjs)，在 Windows 同卷 junction 与 Linux symlink 下检查实际配置输出；Ubuntu CI 另跑真实 systemd 安装/回滚。事件 `research-cli-entry-symlink-20261026`，为同日独立入口，不额外增加规范升级日期计数；没有把本机桩检查描述成 Linux 验收。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
 ### L079：新版发现不能读 CDN 缓存的 latest 接口，手动检查间隔须短于自动间隔
 
@@ -1366,9 +1366,9 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **以后做法：** 公共模式只使用官方公共费表及已核验的合约系数，明确标注默认档、无账户折扣和无附加 builder 费用；未知费用不得当作零。为费率记录来源、有效期和语义版本，每次评价及在途任务锁定当时快照；同版本刷新只续来源有效期，版本改变或到期后撤回当前结论并重新收集样本。返佣基数按已确认的渠道条款单独表达，本次 110% / 120% 为用户确认的全部 Entropy 手续费额外返佣，不能推广为官方规则。
 
-**如何验证：** [费率接入测试](tests/entropy-lighter-feeds.test.mjs) 覆盖公共费表与账户字段、费率单位及未知系数；[自动费率测试](tests/entropy-lighter-auto-fees.test.mjs) 覆盖逐标的费率、版本切换、单调时钟到期及历史快照；[生产页面夹具](tests/entropy-lighter.browser.mjs) 覆盖固定两档返佣和下次读取前费率到期时撤回当前结论。
+**如何验证：** [费率接入测试](tests/entropy-lighter-feeds.test.mjs) 覆盖公共费表与账户字段、费率单位及未知系数；[自动费率测试](tests/entropy-lighter-auto-fees.test.mjs) 覆盖逐标的费率、版本切换、单调时钟到期及历史快照；[生产页面夹具](tests/entropy-lighter.browser.mjs) 覆盖固定两档返佣和下次读取前费率到期时撤回当前结论。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
-**证据：** project-aggregation 基线 `0de9312` 的研究模块仍要求手填费用。2026-10-27 用户要求自动获取并确认渠道返佣按全部手续费计算；[官方 userFees 接口](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#query-a-users-fees)、[HIP-3 费用系数](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions) 及 [Entropy 官方返佣说明](https://docs.entropy.io/about-entropy/referrals) 与 [接入实现](tools/entropy-lighter-lab/feeds.mjs)、[快照实现](tools/entropy-lighter-lab/core.mjs) 对照核验。
+**证据：** project-aggregation 基线 `0de9312` 的研究模块仍要求手填费用。2026-10-27 用户要求自动获取并确认渠道返佣按全部手续费计算；[官方 userFees 接口](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint#query-a-users-fees)、[HIP-3 费用系数](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/hip-3-deployer-actions) 及 [Entropy 官方返佣说明](https://docs.entropy.io/about-entropy/referrals) 与 [接入实现](tools/entropy-lighter-lab/feeds.mjs)、[快照实现](tools/entropy-lighter-lab/core.mjs) 对照核验。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
 **事件记录：** `entropy-public-fees-and-rebate-basis-20261027`；实际发生日期 2026-10-27（Asia/Shanghai）；不推进全历史复盘检查点。
 
@@ -1380,9 +1380,9 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **以后做法：** 恢复检查跟随实际模拟功能而非总模式名称。暂停执行与保留证据分别处理：不把旧任务装入新引擎，继续投影原会话任务、统计、费率和观测时间，标明来源会话；所有未确认的总净收益及返佣后收益保持未知，已知费用、成交额和逐笔历史保留。连续重启不覆盖最初归档、不递归嵌套报告。正常新会话的指标明确本会话口径，不冒充全历史累计。
 
-**如何验证：** [真实 CLI 重启测试](tests/entropy-lighter-cli.test.mjs) 用带开仓、已平亏损、费用和成交额的报告验证重启后保留原状态，并覆盖首次定期快照前强杀及连续重启；[生产方向页夹具](tests/entropy-lighter-scalper.browser.mjs) 验证旧会话未决与无任务但未清洁结束时净收益未知、历史仍可见。
+**如何验证：** [真实 CLI 重启测试](tests/entropy-lighter-cli.test.mjs) 用带开仓、已平亏损、费用和成交额的报告验证重启后保留原状态，并覆盖首次定期快照前强杀及连续重启；[生产方向页夹具](tests/entropy-lighter-scalper.browser.mjs) 验证旧会话未决与无任务但未清洁结束时净收益未知、历史仍可见。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
-**证据：** 基于 project-aggregation `fea7af6` 的本次未发布剥头皮实现，2026-10-27 独立审查用真实 CLI 复现归档保留但页面投影 `openTasks=0/fees=0/turnover=0/net=0`。修复后连续两次重启保留原 `openTasks=1/completed=2/fees=0.15/turnover=300/settledNet=-3`，净收益及返佣后净收益保持 null；见 [恢复投影](tools/entropy-lighter-lab/cli.mjs) 与 [审查记录](docs/reviews/2026-10-27-binance-depth4-scalper.md)。不是基线正式版的逃逸缺陷。
+**证据：** 基于 project-aggregation `fea7af6` 的本次未发布剥头皮实现，2026-10-27 独立审查用真实 CLI 复现归档保留但页面投影 `openTasks=0/fees=0/turnover=0/net=0`。修复后连续两次重启保留原 `openTasks=1/completed=2/fees=0.15/turnover=300/settledNet=-3`，净收益及返佣后净收益保持 null；见 [恢复投影](tools/entropy-lighter-lab/cli.mjs) 与 [审查记录](docs/reviews/2026-10-27-binance-depth4-scalper.md)。不是基线正式版的逃逸缺陷。（Entropy / Lighter 模块已于 2026-11-11 移除，本段引用的该模块测试与文件不再存在，仅作历史证据。）
 
 **事件记录：** `scalper-restart-unresolved-visible-evidence-20261027`；实际发生日期 2026-10-27（Asia/Shanghai）；不推进全历史复盘检查点。
 
