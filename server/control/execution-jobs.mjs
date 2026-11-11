@@ -62,9 +62,34 @@ export function createExecutionEntries({ db, readMaintenance, refuse, log, now =
   if (typeof readMaintenance !== 'function' || typeof refuse !== 'function') throw new TypeError('createExecutionEntries requires readMaintenance and refuse');
   const insert = db.prepare('INSERT INTO execution_entries(id,created_at,expires_at) VALUES (?,?,?)');
   const remove = db.prepare('DELETE FROM execution_entries WHERE id=?');
+  const renew = db.prepare('UPDATE execution_entries SET expires_at=? WHERE id=?');
   return {
     // The runtime lock proves the previous runtime has exited, so its entries are void.
     clear: () => { db.exec('DELETE FROM execution_entries'); },
+    // An operation that outlives a request (a contract probe's live run): the same entry, renewed
+    // until release, so the update's idle check sees it for as long as it runs. An entry left by a
+    // runtime that died expires after holdMs.
+    hold({ holdMs = 120_000, renewMs = 30_000 } = {}) {
+      const id = randomUUID();
+      immediate(db, () => {
+        if (readMaintenance()) refuse();
+        const at = now(); insert.run(id, at, at + holdMs);
+      });
+      const timer = setInterval(() => {
+        try { renew.run(now() + holdMs, id); } catch (error) { log?.warn({ err: error, type: 'execution' }, '执行入口记录未能续期'); }
+      }, renewMs);
+      timer.unref?.();
+      let released = false;
+      return {
+        // The holder is closing while its operation may still run: stop renewing, let the entry expire.
+        abandon() { clearInterval(timer); },
+        release() {
+          if (released) return;
+          released = true; clearInterval(timer);
+          try { remove.run(id); } catch (error) { log?.warn({ err: error, type: 'execution' }, '执行入口记录未能删除，到期后自动失效'); }
+        },
+      };
+    },
     async run(operation) {
       const id = randomUUID();
       immediate(db, () => {

@@ -26,7 +26,8 @@ import { createAccountWriter, getAccountWriterDiagnostics } from '../execution/a
 import { createTradingAutoExposure } from '../trading-auto-exposure.mjs';
 import { HttpError, readJson, errorResponder } from '../http-common.mjs';
 import { RuntimeError } from './protocol.mjs';
-import { createExecutionEntries, EXECUTION_MAINTENANCE } from '../control/execution-jobs.mjs';
+import { createExecutionEntries, EXECUTION_MAINTENANCE, UNFINISHED_EXECUTION_JOB_SQL } from '../control/execution-jobs.mjs';
+import { createContractProbes } from '../contract-probes.mjs';
 import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
@@ -91,6 +92,15 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
   const autoExposure = createTradingAutoExposure({ execution, readRules: () => executionAuto.exposureSnapshot(), now: executionNow });
   const anthropicReduction = createAnthropicReduction({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 15_000 : 0, log });
+  // Real-venue contract probes started from the workbench page. A live run needs a normal recovery
+  // state and, for Bybit, no unfinished native job on the same account.
+  const contractProbes = createContractProbes({ dataDir, log, admit: () => executionEntries.hold(), readMaintenance: () => control.getSetting('updates-maintenance') === '1',
+    liveBlocker: probe => {
+      if (sharedAccountWriter && sharedAccountWriter.snapshot().recovery?.state !== 'normal') return '账户处于隔离恢复状态，暂不能发送真实请求';
+      if (probe !== 'bybit') return null;
+      try { return db.prepare(`SELECT COUNT(*) AS n FROM execution_jobs WHERE ${UNFINISHED_EXECUTION_JOB_SQL}`).get().n ? '有未结束的实盘执行任务，结束后再做 Bybit 真实测试' : null; }
+      catch { return '无法确认实盘执行任务状态，暂不能做 Bybit 真实测试'; }
+    } });
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   // Overview subscribers; wants() lets an in-process subscriber skip the projection while nobody listens.
   const subscribers = new Set();
@@ -277,6 +287,20 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
         return reply(200, backupReadiness.record(input));
       }
       throw new HttpError(405, '备份台账不支持此操作');
+    }
+    if (pathname === '/api/system/contract-probes' || pathname.startsWith('/api/system/contract-probes/')) {
+      if (url.search) throw new HttpError(400, '接口实测不接受查询参数');
+      const base = '/api/system/contract-probes';
+      if (pathname === base && method === 'GET') return reply(200, contractProbes.state());
+      // A logout while the body was arriving must not start a probe.
+      const signedBody = async () => { const body = await bodyOf(); if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录'); return body; };
+      if (pathname === `${base}/runs` && method === 'POST') { const body = await signedBody(); gone(); return reply(202, contractProbes.start(body)); }
+      const probeRun = pathname.match(/^\/api\/system\/contract-probes\/runs\/([0-9a-f-]{36})\/(live|stop|report)$/);
+      if (probeRun?.[2] === 'report' && method === 'GET') return reply(200, contractProbes.report(probeRun[1]));
+      if (probeRun?.[2] === 'live' && method === 'POST') { const body = await signedBody(); gone(); return reply(202, contractProbes.live(probeRun[1], body)); }
+      // A stop still runs for a caller that left.
+      if (probeRun?.[2] === 'stop' && method === 'POST') return reply(200, contractProbes.stop(probeRun[1], await signedBody()));
+      throw new HttpError(404, '接口实测接口不存在');
     }
     if (pathname === '/api/system/update-impact') {
       if (method !== 'GET' || url.search) throw new HttpError(400, '更新影响仅支持无参数只读查询');
@@ -607,6 +631,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); contractProbes.close(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }

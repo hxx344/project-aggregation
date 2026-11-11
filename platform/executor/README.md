@@ -28,7 +28,12 @@ node scripts/measure.ts                                        # 混合负载测
 
 ## 真实接口契约探测（阶段 2.6a/2.6b）
 
-`scripts/contract-bybit-chase.ts` 与 `scripts/contract-aster-transfer.ts` 是由操作者手动运行的探测脚本，用真实账户核实执行器只在模拟器上成立的假设（盘点文档第 9 节第 38、39 项与 Bybit 原生追价一项）。它们不属于执行器：`src/` 仍只接受模拟传输，探测脚本不读写 `executor.sqlite`，也不经过共享写者登记。CI 只跑它们的离线测试（`test/contract.test.ts`：签名与 ethers、与工作台现有 Bybit 签名逐字节核对，写入守卫，报告脱敏，以及在替身接口上跑完整流程和故障分支），不连接任何交易所。
+`server/contract-probes/bybit-chase.ts` 与 `server/contract-probes/aster-transfer.ts`（仓库根目录下的工作台 `server/`，随发布包发布；共用代码在 `server/contract-probes/lib/`，其中 `decimal.ts` 是本目录 `src/decimal.ts` 的逐字节副本，由测试核对）是探测脚本，用真实账户核实执行器只在模拟器上成立的假设（盘点文档第 9 节第 38、39 项与 Bybit 原生追价一项）。它们不属于执行器：`src/` 仍只接受模拟传输，探测脚本不读写 `executor.sqlite`，也不经过共享写者登记。CI 只跑它们的离线测试（`test/contract.test.ts`：签名与 ethers、与工作台现有 Bybit 签名逐字节核对，写入守卫，报告脱敏，以及在替身接口上跑完整流程和故障分支），不连接任何交易所。
+
+运行入口有两个，守卫相同：
+
+- 工作台页面「系统 → 接口实测」（`src/ContractProbePage.tsx`，服务端 `server/contract-probes.mjs`，盘点文档第 47 项）。页面先做只读检查，通过后显示确认内容，勾选确认才真实运行；真实运行只能来自同一接口最近一次、10 分钟内完成的只读检查，沿用其参数与脚本打印的确认短语。数据目录、凭据文件与报告路径由服务端固定，请求只能在白名单内选标的、账户前缀与数值。同一时刻只运行一项；真实运行期间占用执行入口，系统更新被挡住。Windows 上的工作台只能做只读检查（停止信号在 Windows 上会直接结束进程，脚本无法收尾）。报告与运行过程保存在数据目录 `contract-probes/`（保留最近 10 次），可在页面下载。Bybit 用交易中心保存的执行账户，ASTER 用模块 `.env` 中 `_USER`、`_SIGNER`、`_PRIVATE_KEY` 三项齐全的前缀。
+- 命令行（下文命令，在仓库根目录运行）。
 
 运行前的准备（脚本无法替操作者检查的部分）：
 
@@ -49,10 +54,9 @@ node scripts/measure.ts                                        # 混合负载测
 Bybit 原生追价（2.6a）：
 
 ```bash
-cd platform/executor
-node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录>        # 只读，打印确认短语
-node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录> --live --confirm <短语>
-node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录> --allow-fill --live --confirm <短语>
+node server/contract-probes/bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录>        # 只读，打印确认短语
+node server/contract-probes/bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录> --live --confirm <短语>
+node server/contract-probes/bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录> --allow-fill --live --confirm <短语>
 ```
 
 凭据从工作台数据目录的 `hub.sqlite` 与 `credentials.key` 只读解密（执行账户里的 Bybit 一行），或用环境变量 `BYBIT_API_KEY`、`BYBIT_API_SECRET`（可放在 `--env-file`，与 `--data-dir` 二选一；进程环境变量优先于文件中的同名项）。`--data-dir` 不会在数据目录里新建文件：数据库没有未合并的 WAL 时按不可变方式打开，有 WAL 时要求工作台正在运行，否则中止并提示改用环境变量。
@@ -64,14 +68,14 @@ node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据
 ASTER 子账户划转（2.6b）：
 
 ```bash
-node scripts/contract-aster-transfer.ts --env-file <ASTER 模块的 .env> --master-prefix <主账户前缀> --a-prefix <子账户 A 前缀> --b-prefix <子账户 B 前缀>
-node scripts/contract-aster-transfer.ts <同上> --amount 1 --live --confirm <短语>
-node scripts/contract-aster-transfer.ts <同上> --amount 1 --probe-nonce=-30,-59,-61,-90,-121,61 --live --confirm <短语>
+node server/contract-probes/aster-transfer.ts --env-file <ASTER 模块的 .env> --master-prefix <主账户前缀> --a-prefix <子账户 A 前缀> --b-prefix <子账户 B 前缀>
+node server/contract-probes/aster-transfer.ts <同上> --amount 1 --live --confirm <短语>
+node server/contract-probes/aster-transfer.ts <同上> --amount 1 --probe-nonce=-30,-59,-61,-90,-121,61 --live --confirm <短语>
 ```
 
 凭据按旧模块的约定读取 `<前缀>_USER`、`<前缀>_SIGNER`、`<前缀>_PRIVATE_KEY`（进程环境变量优先于 `--env-file` 中的同名项）。只读运行读取子账户列表、两侧余额、持仓数与最近流水（`--history-minutes`，默认 30；流水返回满 1000 行即视为不完整并中止）。`--live` 从 A 向 B 划 `--amount`（默认 1 USD1）再划回，每笔之后轮询两侧余额与流水直到全部可见或超过 `--settle-timeout-s`（默认 300 秒），并用新流水测 `endTime` 的开闭。
 
-`--probe-nonce`（必须写成 `--probe-nonce=…`）按给定的秒数偏移各发一笔 A→B 划转以探测 nonce 有效期，被接受的每一笔都是真实划转。偏移按从小到大发送，每笔金额不同、发送后单独按余额与流水核对；每笔发送前先等到它的 nonce 晚于主账户 signer 此前用过的所有 nonce（偏移 -N 秒至少等 N 秒），所以拒绝不会是 nonce 递增要求造成的。交易所返回清单外错误码（旧模块视为结果不确定的 -1000、-1001、-1006、-1007 除外）时，观察到该 nonce 按假设应已过期之后（75 秒加正偏移；`--settle-timeout-s` 小于这个时长时脚本在发送前中止，默认 300 秒下正偏移最大 225 秒，调到 900 秒时最大 825 秒），期间每次读取都成功且两侧无变化的记为 `refused-unlisted` 并继续；超时、5xx、不确定的错误码、观察期间有读取失败，或已回执却未在限时内可见，则停止探测，不自动划回。探测结束后把已入账的各笔按原金额逐笔划回，最后按流水净额核对，净额不为零以退出码 2 结束。EIP-712 签名为脚本自带的无依赖实现（`scripts/contract/eip712.ts`），不是恒定时间实现，只用于操作者在自己主机上的一次性探测。
+`--probe-nonce`（必须写成 `--probe-nonce=…`）按给定的秒数偏移各发一笔 A→B 划转以探测 nonce 有效期，被接受的每一笔都是真实划转。偏移按从小到大发送，每笔金额不同、发送后单独按余额与流水核对；每笔发送前先等到它的 nonce 晚于主账户 signer 此前用过的所有 nonce（偏移 -N 秒至少等 N 秒），所以拒绝不会是 nonce 递增要求造成的。交易所返回清单外错误码（旧模块视为结果不确定的 -1000、-1001、-1006、-1007 除外）时，观察到该 nonce 按假设应已过期之后（75 秒加正偏移；`--settle-timeout-s` 小于这个时长时脚本在发送前中止，默认 300 秒下正偏移最大 225 秒，调到 900 秒时最大 825 秒），期间每次读取都成功且两侧无变化的记为 `refused-unlisted` 并继续；超时、5xx、不确定的错误码、观察期间有读取失败，或已回执却未在限时内可见，则停止探测，不自动划回。探测结束后把已入账的各笔按原金额逐笔划回，最后按流水净额核对，净额不为零以退出码 2 结束。EIP-712 签名为脚本自带的无依赖实现（`server/contract-probes/lib/eip712.ts`），不是恒定时间实现，只用于操作者在自己主机上的一次性探测。
 ## 关键语义
 
 - 未知结果不重发：发送中断记为 `unknown`，按原客户订单号核对；过观察窗、间隔多次查无且账户无痕迹才判定 `not-created`。
