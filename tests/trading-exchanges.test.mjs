@@ -157,18 +157,17 @@ test('Binance preserves hedge sides and signed position direction while using ab
   assert.equal(rows.length, 2); assert.deepEqual(rows.map(row => row.side), ['long', 'short']); assert.deepEqual(rows.map(row => row.mode), ['hedge', 'hedge']); assert.equal(rows[1].quantity, '2'); assert.equal(rows[1].notional, '142.2');
 });
 
-test('Bybit symbol requests paginate with exact encoded signatures and keep both hedge sides', async () => {
+test('Bybit symbol requests keep both hedge sides and do not follow the cursor of a page shorter than the limit', async () => {
   const { client, calls } = harness('bybit', url => {
     if (!url.pathname.endsWith('position/list')) return;
     assert.equal(url.searchParams.get('category'), 'linear');
     const symbol = url.searchParams.get('symbol');
     if (symbol === 'BZUSDT') return { category: 'linear', list: [bybitPosition(symbol, { size: '0', side: '' })], nextPageCursor: '' };
-    if (!url.searchParams.get('cursor')) return { category: 'linear', list: [bybitPosition(symbol, { positionIdx: 1, side: 'Buy' })], nextPageCursor: 'opaque%3A1,2/+=' };
-    assert.equal(url.searchParams.get('cursor'), 'opaque%3A1,2/+=');
-    return { category: 'linear', list: [bybitPosition(symbol, { positionIdx: 2, side: 'Sell' })], nextPageCursor: '' };
+    assert.equal(url.searchParams.get('cursor'), null);
+    return { category: 'linear', list: [bybitPosition(symbol, { positionIdx: 1, side: 'Buy' }), bybitPosition(symbol, { positionIdx: 2, side: 'Sell' })], nextPageCursor: 'opaque%3A1,2/+=' };
   });
   const rows = (await client.positions(credentials)).positions;
-  assert.deepEqual(rows.map(row => row.side), ['long', 'short']); assert.deepEqual(rows.map(row => row.mode), ['hedge', 'hedge']); assert.equal(calls.filter(call => call.url.pathname.endsWith('position/list')).length, 3);
+  assert.deepEqual(rows.map(row => row.side), ['long', 'short']); assert.deepEqual(rows.map(row => row.mode), ['hedge', 'hedge']); assert.equal(calls.filter(call => call.url.pathname.endsWith('position/list')).length, 2);
 });
 
 test('wrong position identities, modes, currencies, malformed amounts and missing second symbol reject snapshot', async () => {

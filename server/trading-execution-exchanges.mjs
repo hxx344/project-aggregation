@@ -677,13 +677,17 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
         for (const row of conditional) if (!object(row) || row.symbol !== symbol) fail();
         if (conditional.length !== 0) fail('external_orders');
       } else {
-        const rows = await pages('positions', credentials, { category: 'linear', symbol, limit: '200' }, options, { category: 'linear', pageSize: 200 });
+        // One symbol has at most three position rows, so one page is complete and its cursor is
+        // not followed; the mode check below refuses a page that lacks a side.
+        const data = requireObject(await request('positions', credentials, { category: 'linear', symbol, limit: '200' }, options));
+        if (data.category !== 'linear') fail();
+        const rows = array(data.list, 200);
         const indices = new Set();
         for (const row of rows) {
           requireObject(row);
           if (row.symbol !== symbol) fail();
           const idx = numericEnum(row.positionIdx, [0, 1, 2]);
-          if (indices.has(idx)) fail('account_mode', { detail: `Bybit 对 ${symbol} 返回了重复的持仓记录` });
+          if (indices.has(idx)) fail('account_mode', { detail: `Bybit 对 ${symbol} 在同一页返回了重复的持仓记录（持仓方向编号 ${idx}）` });
           indices.add(idx);
           const quantity = amount(row.size, { nonnegative: true });
           if (quantity === '0') {
