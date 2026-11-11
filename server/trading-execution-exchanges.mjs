@@ -735,14 +735,15 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
   // Operator confirmation only. Ended strategies (status 3) are outside the
   // routine account snapshot, so a create that ended without a fill is looked
   // up in a bounded window around the request instead of scanning history.
-  // The venue takes whole seconds and does not say which timestamp it filters,
-  // so the caller's window spans creation through now and it filters by
+  // The venue takes whole seconds and filters by creation time; a window whose
+  // two ends are the creation second returned nothing, so an end may be
+  // exclusive and the window starts one second early. The caller filters by
   // creation time again; incomplete pagination fails.
   async function endedStrategies(credentials, { accountMode, signal, symbol, startTime, endTime } = {}) {
     if (exchange !== 'bybit' || !SYMBOLS.includes(symbol) || !Number.isSafeInteger(startTime) || !Number.isSafeInteger(endTime)
       || startTime < 0 || endTime <= startTime || endTime - startTime > MAX_STRATEGY_WINDOW) fail('input');
     const options = { accountMode: modeOf(accountMode), signal }, seen = new Set(), strategies = [];
-    const rows = await pages('strategies', credentials, { category: 'UTA_USDT', symbol, strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(startTime / 1000)), endTimeE0: String(Math.ceil(endTime / 1000)), pageSize: '50' }, options, { cursorField: 'nextCursor' });
+    const rows = await pages('strategies', credentials, { category: 'UTA_USDT', symbol, strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(startTime / 1000) - 1), endTimeE0: String(Math.ceil(endTime / 1000)), pageSize: '50' }, options, { cursorField: 'nextCursor' });
     for (const row of rows) {
       const strategy = parseStrategy(row);
       if (strategy.symbol !== symbol || seen.has(strategy.id)) fail();
@@ -966,7 +967,8 @@ export function createExecutionExchangeClient(exchange, { fetchImpl = fetch, now
       const id = identifier(child.orderId), positionSide = positionSideForIndex(child.positionIdx);
       const state = numericEnum(child.status, [2, 3, 4, 5, 6, 7]);
       const size = volumes(child.size, child.executedSize);
-      if (numericEnum(child.orderType, [1, 2]) !== 2 || positionSide !== spec.positionSide || state === 5 && size.quantity !== size.filledQuantity) fail();
+      // The venue reports the text UNKNOWN for a chase child (documented: 1 market, 2 limit), so this field no longer tells them apart.
+      if (child.orderType !== 'UNKNOWN' && numericEnum(child.orderType, [1, 2]) !== 2 || positionSide !== spec.positionSide || state === 5 && size.quantity !== size.filledQuantity) fail();
       const fingerprint = JSON.stringify({ positionSide, state, ...size });
       if (known.has(id)) { if (known.get(id).fingerprint !== fingerprint) fail(); continue; }
       known.set(id, { fingerprint, filledQuantity: size.filledQuantity });

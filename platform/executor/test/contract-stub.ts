@@ -93,7 +93,7 @@ function bybitReply(method: string, path: string, parameters: URLSearchParams, b
       const strategyId = randomUUID(), fills = Number(maxChasePrice) >= 60.01;
       bybit.strategies.set(strategyId, { strategyId, category: 'UTA_USDT', symbol: body.symbol, strategyType: 'chaseOrder', side, size, executedSize: fills ? size : '0', executedAvgPrice: fills ? '60.01' : '0',
         chaseOrderPrice: fills ? '60.01' : faults.has('bybit-rests-at-bid') ? '60' : String(maxChasePrice), status: fills ? 3 : 2, reduceOnly: body.reduceOnly, createdTimeE3: stamp, updatedTimeE3: stamp });
-      bybit.children.set(strategyId, [{ strategyId, symbol: body.symbol, side, orderId: 'o' + ++bybit.orders, orderType: 2, positionIdx: body.positionIdx, size, executedSize: fills ? size : '0', status: fills ? 5 : 2 }]);
+      bybit.children.set(strategyId, [{ strategyId, symbol: body.symbol, side, orderId: 'o' + ++bybit.orders, orderType: 'UNKNOWN', positionIdx: body.positionIdx, size, executedSize: fills ? size : '0', status: fills ? 5 : 2 }]);
       if (fills) bybit.position += Number(size);
       return strategyId;
     };
@@ -106,8 +106,8 @@ function bybitReply(method: string, path: string, parameters: URLSearchParams, b
   }
   if (method === 'POST' && path === '/v5/strategy/stop') {
     const row = bybit.strategies.get(String(body.strategyId));
-    if (!row) return refused(60065, 'strategy not found');
-    if (row.status !== 2) return refused(60066, 'strategy already ended');
+    // The venue answered 60062 for both on 2026-11-11.
+    if (!row || row.status !== 2) return refused(60062, 'Strategy has been terminated');
     // The first stop is acknowledged and has no effect.
     if (++bybit.stops === 1 && faults.has('bybit-stop-stuck')) return ok({ strategyId: body.strategyId });
     row.status = 3;

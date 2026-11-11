@@ -646,6 +646,29 @@ test('Bybit inspects every child page, deduplicates exact repeated orders, and c
   assert.equal(calls.length, 3); assert.equal(calls[2].parameters.cursor, 'page-2');
 });
 
+test('Bybit chase records shaped as the venue returned them on 2026-11-11: resting, stopped unfilled and filled', async () => {
+  // Built from the fields and types of a live run (CLUSDT, one-way); the list envelopes follow the strategy list's.
+  // The strategy row has no positionIdx; the child's orderType is the text UNKNOWN.
+  const row = overrides => ({ strategyId: STRATEGY, category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Buy', size: '0.07', duration: 0, status: 2, executedSize: '0', executedAvgPrice: '',
+    executedStartTimeE3: '1794424915958', executedEndTimeE3: '0', createdTimeE3: '1794424915958', updatedTimeE3: '1794424915958', limitPrice: '', reduceOnly: false, terminateType: 0,
+    strategyType: 'chaseOrder', chasePrice: 'Bid1', chasePercentE4: '0', chaseDistance: '0', maxChasePrice: '84.44', chaseOrderPrice: '84.44', postOnly: 0, orderType: 'UNKNOWN', ...overrides });
+  const filledChild = { strategyId: STRATEGY, orderId: 'b69833f1-9294-4576-80d6-20f862bf7096', symbol: 'CLUSDT', side: 'Buy', size: '0.07', price: '86.16', status: '5', executedSize: '0.07',
+    dealTimeE3: '1794424942407', parentOrderId: '', createdTimeE3: '1794424942407', updatedTimeE3: '1794424943831', code: 0, msg: '', category: 'UTA_USDT', positionIdx: 0, leverageType: 0,
+    tpPrice: '', slPrice: '', orderType: 'UNKNOWN', orderPriceOffset: '0', positionValue: '', filledPositionValue: '' };
+  const read = async (strategyRow, children) => {
+    const { client } = harness('bybit', call => call.url.pathname.endsWith('/strategy/list') ? { list: [strategyRow], nextCursor: '', prevCursor: '' }
+      : call.url.pathname.endsWith('/order-list') ? { list: children, nextCursor: '', prevCursor: '' } : undefined);
+    const result = await client.inspect(credentials, { ...spec, quantity: '0.07', id: STRATEGY });
+    return [result.status, result.filledQuantity, result.price, result.averagePrice, result.positionSide, result.childrenSettled];
+  };
+  assert.deepEqual(await read(row(), []), ['working', '0', '84.44', null, null, false]);
+  assert.deepEqual(await read(row({ status: 3, executedEndTimeE3: '1794424936315', terminateType: 1, chaseOrderPrice: '' }), []), ['terminal', '0', null, null, null, true]);
+  // The child reported its fill about a second before the strategy row did.
+  assert.deepEqual(await read(row({ maxChasePrice: '86.62', chaseOrderPrice: '' }), [filledChild]), ['working', '0', null, null, 'BOTH', false]);
+  assert.deepEqual(await read(row({ status: 3, executedSize: '0.07', executedAvgPrice: '86.16', terminateType: 2, maxChasePrice: '86.62', chaseOrderPrice: '' }), [filledChild]),
+    ['terminal', '0.07', null, '86.16', 'BOTH', true]);
+});
+
 test('Bybit refuses missing cursors, cursor cycles, and inconsistent or foreign child records', async () => {
   const variants = [() => ({ list: [child()] }), () => ({ list: [child()], nextCursor: 'same-cursor' }),
     () => ({ list: [child({ positionIdx: 2 })], nextCursor: '' }), () => ({ list: [child({ orderType: 1 })], nextCursor: '' }),
@@ -666,7 +689,7 @@ test('Bybit ended-strategy lookup is bounded to a creation window, status 3 and 
   const result = await client.endedStrategies(credentials, window);
   assert.deepEqual(result, [{ id: STRATEGY, symbol: 'CLUSDT', side: 'sell', quantity: '2', filledQuantity: '0', status: 'terminal', reduceOnly: false, createdAt: new Date(NOW).toISOString() }]);
   const query = calls.find(call => call.url.pathname === '/v5/strategy/list').parameters;
-  assert.deepEqual(query, { category: 'UTA_USDT', symbol: 'CLUSDT', strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(window.startTime / 1000)), endTimeE0: String(Math.ceil(window.endTime / 1000)), pageSize: '50' });
+  assert.deepEqual(query, { category: 'UTA_USDT', symbol: 'CLUSDT', strategyType: 'chaseOrder', status: '3', beginTimeE0: String(Math.floor(window.startTime / 1000) - 1), endTimeE0: String(Math.ceil(window.endTime / 1000)), pageSize: '50' });
   for (const invalid of [{ ...window, endTime: window.startTime + 7 * 86_400_000 + 1 }, { ...window, startTime: undefined }, { ...window, endTime: window.startTime }, { ...window, symbol: 'BTCUSDT' }]) {
     const rejected = harness('bybit');
     await assert.rejects(rejected.client.endedStrategies(credentials, invalid), isError('input'));
