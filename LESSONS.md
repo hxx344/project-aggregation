@@ -1040,6 +1040,8 @@ ADL 的相关验证使用 [配置校验](modules/aster/tests/test_adl_config.py)
 
 **事件记录：** `review-gate-entrypoint-20261018`；一次门禁机制审核及连续修正，不推进主线复盘检查点。
 
+**合并信息补充（2026-11-12）：** 2026-10-29 至 11-11 主分支 182 次 Checks 中有 8 次只因 `hygiene` 失败，PR 上的检查全部通过。已核对的 6 例分两类：合并时另写的合并信息没有证据段（`22f009e`、`0730711`、`b1e7cda`、`504a9e7`）；信息文件由 Windows PowerShell 写出，正文首行带不可见的 BOM，「更新说明」识别不到（`8d3cbfc`、`529603f`，后者的发布说明也因此落到兜底文案）。合并后的提交信息在 PR 阶段不存在，只查 PR head 提交拦不住它。现在仓库合并默认取 PR 标题与描述，[CI 入口](scripts/review-ci.mjs) 的 `--pull-request-message` 在 PR 阶段按同一规则检查它们，[证据检查](scripts/review-message.mjs) 与 [发布说明提取](deploy/publish-release.py) 忽略行首 BOM；[门禁回归](tests/review-gate.test.mjs) 与 [候选发布测试](deploy/test-publish.py) 覆盖。合并时另写正文或本地合并后推送不经过这项检查。其余 2 例（`7849f13`、`da95cfe`）未逐一查日志。
+
 ### L061：账户配置与只读预检证据须有界复用且不得授权执行
 
 **适用条件：** ADL/保证金等路径复用「账户配置」类证据（如持仓模式）降低 REST 权重，或用同次资金快照字段做 decline-only 划转预检；以及按事件标的缩小挂单查询范围。

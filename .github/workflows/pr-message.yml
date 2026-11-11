@@ -1,0 +1,33 @@
+name: Merge message
+
+# A merge takes its commit message from the PR title and description (repository
+# merge defaults), and Checks only sees that commit once it is on main. This
+# checks the description while it can still be edited; `edited` reruns it
+# without rerunning Checks.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+concurrency:
+  group: ${{ github.workflow }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  message:
+    name: Merge message (PR title and description)
+    # Editing a closed PR also fires `edited`, and its merge ref may be gone.
+    if: github.event.pull_request.state == 'open'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24.15.0'
+      - name: Check the PR description as the future commit message
+        run: node scripts/review-ci.mjs --pull-request-message
