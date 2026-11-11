@@ -4,7 +4,7 @@
 
 ## 边界
 
-- 只有进程内模拟场所，没有真实交易所传输；契约层拒绝任何非模拟传输或非模拟环境。
+- 只有进程内模拟场所，没有真实交易所传输；契约层拒绝任何非模拟传输或非模拟环境。唯一连接真实交易所的是操作者手动运行的两个契约探测脚本（见“真实接口契约探测”），它们不属于执行器。
 - 独立入口、独立数据目录 `executor.sqlite`；拒绝含 `hub.sqlite`、`execution-control.sqlite`、`credentials.key` 或 `modules` 的目录，不读写工作台数据。
 - 共享写者登记（`execution-control.sqlite` 协议，实现为 `server/execution/account-writer.mjs`）只能通过 `createExecutor({ control })` 注入；入口 `main.ts` 不接入，测试只用临时目录里的登记库。模拟传输下只允许以 `testnet` 或 `demo` 身份登记，因为登记会把账户永久钉选给首个认领的模块。
 - 不在工作台发布包内（`deploy/package-release.py` 不打包 `platform/`），也不注册任何服务。
@@ -26,6 +26,52 @@ node scripts/measure.ts                                        # 混合负载测
 
 测量脚本在同一进程里同时跑两腿任务、4 个模拟配对的保证金划转（每配对 10 次）与 ADL 事件（每配对 10 次），三个循环按入口方式分开调度；结果为 JSON，含各循环单轮耗时、ADL 发现/首次下单/结束耗时与划转发送/结清耗时。常用参数：`--jobs`、`--pairs`、`--adl-events`、`--transfers`、`--aster-latency-ms`（给每次模拟 ASTER 调用加延迟，看慢 ASTER 是否拖住两腿任务；延迟不响应中止，须小于 ADL 下单时限 `adlOrderTimeoutMs` 3 秒，否则下单按超时处理、事件等满观察窗，运行以退出码 3 结束）、`--loop-spacing-ms`。读线程默认把历史表扫描按主键每 20000 行切成一片，每片一次读取（`--scan-chunk-rows`，0 为整表一次读取）；主线程按入口的方式每秒调用一次 WAL 维护（`--no-wal-reset` 关闭）。`--scan-chunk-rows 0 --no-wal-reset` 还原 2.5 之前的行为，用于对照。结果中的 `walReset` 为截断次数、放弃次数与耗时，`checkpointsIncomplete` 为回填线程被动 checkpoint 未能完成的次数，`readerSnapshotMaxMs` 为读线程单次读取最长占用快照的时间。数据库建在系统临时目录（可用 `TMPDIR` 指到数据盘），结束后删除，`--keep` 保留。未达建议预算时退出码 2，任务、ADL 事件或划转未全部完成时退出码 3。
 
+## 真实接口契约探测（阶段 2.6a/2.6b）
+
+`scripts/contract-bybit-chase.ts` 与 `scripts/contract-aster-transfer.ts` 是由操作者手动运行的探测脚本，用真实账户核实执行器只在模拟器上成立的假设（盘点文档第 9 节第 38、39 项与 Bybit 原生追价一项）。它们不属于执行器：`src/` 仍只接受模拟传输，探测脚本不读写 `executor.sqlite`，也不经过共享写者登记。CI 只跑它们的离线测试（`test/contract.test.ts`：签名与 ethers、与工作台现有 Bybit 签名逐字节核对，写入守卫，报告脱敏，以及在替身接口上跑完整流程和故障分支），不连接任何交易所。
+
+运行前的准备（脚本无法替操作者检查的部分）：
+
+- 运行期间旧系统不得在同一标的（Bybit）或同一对子账户（ASTER）上下单、追价或划转。ASTER 的 A、B 有持仓时，先暂停该配对的保证金平衡，再加 `--balancer-paused`；否则脚本拒绝发送。
+- ASTER 的请求权重按 IP 计。脚本每次流水读取权重 30，生产 ASTER 模块与它共用出口 IP 时可能一起触发限流：在生产主机上运行时先暂停生产 ASTER 模块的轮询，或换一个出口 IP 运行。脚本看到已用权重达到 1200 时暂停读取 5 秒，报告的 `requestWeight` 记录峰值。
+- `--probe-nonce` 用主账户 API signer 发送带偏移的 nonce。交易所若要求同一 signer 的 nonce 递增，一笔被接受的未来 nonce 会让生产划转在这段时间内被拒；探测期间生产划转应保持暂停，正偏移不要超过能接受的暂停时长。
+
+共同规则：
+
+- 默认只读。发送真实委托或划转必须同时带 `--live` 与 `--confirm <短语>`；短语由只读运行打印，Bybit 的短语包含标的、数量与被动价距离，ASTER 的短语包含金额、A/B 凭据前缀与各个 nonce 偏移，参数变了短语随之改变。
+- 硬上限写在脚本里：ASTER 的 `--amount` 不超过 5 USD1，nonce 探测最多 8 笔（每笔在 `--amount` 上依次多 0.01，单笔最多 5.08，逐笔划回；探测期间 B 上累计最多约 40.4 USD1）；Bybit 只用最小下单量，同时最多两笔挂着，两笔的名义金额超过 `--max-notional`（默认 50 USDT，最高 200）即中止，标的限 CLUSDT、BZUSDT、SKHYUSDT、SKHYNIXUSDT。
+- 结果未知的写请求不重发：脚本停止后续写入，以退出码 2 结束（ASTER 划转超时或返回不确定的应答时先按余额与流水观察；被网关拦截时直接停止，不再读取）。只有旧客户端拒绝码清单内的错误码算明确拒绝，其余错误码、超时、5xx 与网关拦截都按结果未知处理。唯一的例外是 Bybit 收尾会对仍未结束的自有策略再发一次停止。
+- 每次请求固定超时（ASTER 读 8 秒、划转 15 秒；Bybit 12 秒），不自动重试，不跟随重定向；遇到 HTTP 403、418、429 或 ASTER 限流错误码（-1003、-1015）立即停止。
+- 报告文件在发出第一个请求前创建（当前目录的 `contract-*.json`，`--out` 可改；文件已存在即中止），已隐去密钥、签名、账户编号与长十六进制串，钱包地址只保留首尾；余额、数量、价格、策略编号与订单号保留。
+- 第一次 Ctrl-C 停止后续步骤：Bybit 照常收尾（仍会访问交易所），ASTER 只写报告、不自动划回。第二次立即退出，报告文件留空。
+- 退出码：0 正常结束；1 未发出任何写请求即中止（含发送前被中断）；2 已发送过写请求但未正常收尾、有写请求结果未知，或收尾后未能确认无残留，须在交易所核对。
+
+Bybit 原生追价（2.6a）：
+
+```bash
+cd platform/executor
+node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录>        # 只读，打印确认短语
+node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录> --live --confirm <短语>
+node scripts/contract-bybit-chase.ts --symbol CLUSDT --data-dir <工作台数据目录> --allow-fill --live --confirm <短语>
+```
+
+凭据从工作台数据目录的 `hub.sqlite` 与 `credentials.key` 只读解密（执行账户里的 Bybit 一行），或用环境变量 `BYBIT_API_KEY`、`BYBIT_API_SECRET`（可放在 `--env-file`，与 `--data-dir` 二选一；进程环境变量优先于文件中的同名项）。`--data-dir` 不会在数据目录里新建文件：数据库没有未合并的 WAL 时按不可变方式打开，有 WAL 时要求工作台正在运行，否则中止并提示改用环境变量。
+
+`--live` 先要求该标的没有持仓、挂单和运行中的追价策略，然后创建买入追价（最高追价低于买一 `--passive-bps`，默认 200 个基点，不预期成交）、查询、重复创建、停止、重复停止，并各发一笔数量低于最小量和时间戳过期的创建以记录拒绝码。`--allow-fill` 另发一笔最高追价高于卖一的追价（预期成交）。任何一次停止之后 `--settle-timeout-s`（默认 60 秒）内未确认策略已结束且子单结清，脚本不再创建新策略，直接进入收尾。
+
+收尾只处理能确认属于本次运行的东西：停止回执带回编号的策略；某笔创建结果未知（应答丢失、被网关拦截或返回清单外错误码）时，另外接管在该请求可能到达的时间窗内创建、买入开仓且数量相同的运行中策略，扫描持续到该请求最晚可能到达之后 10 秒，这种运行即使收尾干净也以退出码 2 结束（同一时间窗内他人创建的同方向同数量策略无法区分，所以运行期间该标的不得有其他追价）；然后用只减仓市价单平掉这些策略回报的已成交数量（不超过当时持仓），被动追价意外成交时同样平掉。收尾的任何一次列表读取失败或分页不完整都不算“无残留”，以退出码 2 结束。
+
+ASTER 子账户划转（2.6b）：
+
+```bash
+node scripts/contract-aster-transfer.ts --env-file <ASTER 模块的 .env> --master-prefix <主账户前缀> --a-prefix <子账户 A 前缀> --b-prefix <子账户 B 前缀>
+node scripts/contract-aster-transfer.ts <同上> --amount 1 --live --confirm <短语>
+node scripts/contract-aster-transfer.ts <同上> --amount 1 --probe-nonce=-30,-59,-61,-90,-121,61 --live --confirm <短语>
+```
+
+凭据按旧模块的约定读取 `<前缀>_USER`、`<前缀>_SIGNER`、`<前缀>_PRIVATE_KEY`（进程环境变量优先于 `--env-file` 中的同名项）。只读运行读取子账户列表、两侧余额、持仓数与最近流水（`--history-minutes`，默认 30；流水返回满 1000 行即视为不完整并中止）。`--live` 从 A 向 B 划 `--amount`（默认 1 USD1）再划回，每笔之后轮询两侧余额与流水直到全部可见或超过 `--settle-timeout-s`（默认 300 秒），并用新流水测 `endTime` 的开闭。
+
+`--probe-nonce`（必须写成 `--probe-nonce=…`）按给定的秒数偏移各发一笔 A→B 划转以探测 nonce 有效期，被接受的每一笔都是真实划转。偏移按从小到大发送，每笔金额不同、发送后单独按余额与流水核对；每笔发送前先等到它的 nonce 晚于主账户 signer 此前用过的所有 nonce（偏移 -N 秒至少等 N 秒），所以拒绝不会是 nonce 递增要求造成的。交易所返回清单外错误码（旧模块视为结果不确定的 -1000、-1001、-1006、-1007 除外）时，观察到该 nonce 按假设应已过期之后（75 秒加正偏移；`--settle-timeout-s` 小于这个时长时脚本在发送前中止，默认 300 秒下正偏移最大 225 秒，调到 900 秒时最大 825 秒），期间每次读取都成功且两侧无变化的记为 `refused-unlisted` 并继续；超时、5xx、不确定的错误码、观察期间有读取失败，或已回执却未在限时内可见，则停止探测，不自动划回。探测结束后把已入账的各笔按原金额逐笔划回，最后按流水净额核对，净额不为零以退出码 2 结束。EIP-712 签名为脚本自带的无依赖实现（`scripts/contract/eip712.ts`），不是恒定时间实现，只用于操作者在自己主机上的一次性探测。
 ## 关键语义
 
 - 未知结果不重发：发送中断记为 `unknown`，按原客户订单号核对；过观察窗、间隔多次查无且账户无痕迹才判定 `not-created`。
