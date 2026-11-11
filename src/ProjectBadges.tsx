@@ -2,8 +2,6 @@ import { Activity, FolderKanban, Gauge, Wallet } from 'lucide-react';
 import { statusText } from './check-notice';
 import type { Adapter, Category, Snapshot } from './types';
 
-export const groupLabels: Record<Category, string> = { trading: '交易', monitoring: '监控', assets: '资产', other: '其他' };
-
 export function ProjectIcon({ category, size = 22 }: { category: Category; size?: number }) {
   return category === 'assets' ? <Wallet size={size} /> : category === 'monitoring' ? <Activity size={size} /> : category === 'trading' ? <Gauge size={size} /> : <FolderKanban size={size} />;
 }
