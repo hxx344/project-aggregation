@@ -2,6 +2,7 @@
 // the entry point gives it a dedicated data directory (plan 1, 6.3).
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
+import { statSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 
 export interface Migration { version: number; name: string; sql: string }
@@ -76,8 +77,15 @@ export class StoreError extends Error {
 
 export const WAIT_BUCKETS_MS = [1, 10, 100, 1000, 5000] as const;
 export const WAL_SIZE_LIMIT_BYTES = 64 * 1024 * 1024;
+/** Above this the owner truncates the WAL itself; automatic checkpoints alone never reset it while some reader is always active. */
+export const WAL_RESET_BYTES = 16 * 1024 * 1024;
+/** Longest one lock wait of a WAL reset. The reset holds the write lock while it waits, so this also bounds what it adds to a write. */
+export const WAL_RESET_WAIT_MS = 250;
+const WAL_RESET_RETRY_MS = 1_000, WAL_RESET_RETRY_MAX_MS = 60_000;
 const SAMPLE_LIMIT = 20_000;
 export interface WriteStats { transactions: number; busy: number; waitBuckets: number[]; maxWaitMs: number; maxHoldMs: number; waits: number[]; holds: number[] }
+/** `reset`: WAL truncated. `busy`: a reader or writer outlasted the wait, retried later with a growing delay. `waiting`: inside that delay. */
+export interface WalMaintenance { action: 'idle' | 'reset' | 'busy' | 'waiting'; walBytes: number; ms: number }
 
 export interface Store {
   readonly db: DatabaseSync;
@@ -86,19 +94,24 @@ export interface Store {
   /** Short IMMEDIATE transaction. The callback must be synchronous: no network or timers inside. */
   tx<T>(operation: () => T): T;
   stats(): WriteStats;
+  walBytes(): number;
+  /** Call periodically from the owning process, outside any transaction. Synchronous: blocks the caller for at most a few lock waits plus the copy. */
+  maintainWal(now?: number): WalMaintenance;
   close(): void;
 }
 
 const isBusy = (error: unknown): boolean => (error as { code?: string; errcode?: number })?.code === 'ERR_SQLITE_ERROR' && (((error as { errcode?: number }).errcode ?? 0) & 0xff) === 5;
 
-export function openStore(file: string, { busyTimeoutMs = 5000 }: { busyTimeoutMs?: number } = {}): Store {
+export interface StoreOptions { busyTimeoutMs?: number; walResetBytes?: number; walResetWaitMs?: number }
+
+export function openStore(file: string, { busyTimeoutMs = 5000, walResetBytes = WAL_RESET_BYTES, walResetWaitMs = WAL_RESET_WAIT_MS }: StoreOptions = {}): Store {
   const db = new DatabaseSync(file);
   const stats: WriteStats = { transactions: 0, busy: 0, waitBuckets: Array(WAIT_BUCKETS_MS.length + 1).fill(0), maxWaitMs: 0, maxHoldMs: 0, waits: [], holds: [] };
   const sample = (list: number[], value: number) => { if (list.length >= SAMPLE_LIMIT) list.splice(0, list.length - SAMPLE_LIMIT + 1); list.push(value); };
   try {
     const mode = (db.prepare('PRAGMA journal_mode=WAL').get() as { journal_mode: string }).journal_mode;
     if (mode !== 'wal') throw new StoreError('journal_mode', `数据库未能进入 WAL 模式：${mode}`);
-    // journal_size_limit truncates the WAL back to 64 MiB after a checkpoint; it does not cap a WAL a long reader keeps growing.
+    // journal_size_limit truncates the WAL back to 64 MiB after a checkpoint; it does not cap a WAL that readers keep from being reset (see maintainWal).
     db.exec(`PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=${Math.trunc(busyTimeoutMs)}; PRAGMA journal_size_limit=${WAL_SIZE_LIMIT_BYTES};`);
   } catch (error) { db.close(); throw error; }
 
@@ -126,11 +139,32 @@ export function openStore(file: string, { busyTimeoutMs = 5000 }: { busyTimeoutM
     }
   }
 
+  const walBytes = (): number => statSync(`${file}-wal`, { throwIfNoEntry: false })?.size ?? 0;
+  let walRetryAt = 0, walRetryMs = WAL_RESET_RETRY_MS;
+  function maintainWal(now = performance.now()): WalMaintenance {
+    const size = walBytes();
+    if (size <= walResetBytes) { walRetryAt = 0; walRetryMs = WAL_RESET_RETRY_MS; return { action: 'idle', walBytes: size, ms: 0 }; }
+    if (db.isTransaction || now < walRetryAt) return { action: 'waiting', walBytes: size, ms: 0 };
+    const started = performance.now();
+    let busy = true;
+    // TRUNCATE waits for readers on older snapshots while holding the write lock, so the wait is kept short and restored afterwards.
+    db.exec(`PRAGMA busy_timeout=${Math.trunc(walResetWaitMs)}`);
+    try { busy = (db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number }).busy !== 0; }
+    catch (error) { if (!isBusy(error)) throw error; }
+    finally {
+      db.exec(`PRAGMA busy_timeout=${Math.trunc(busyTimeoutMs)}`);
+      // Any failure, not only a busy one, is retried with the growing delay.
+      if (busy) { walRetryAt = now + walRetryMs; walRetryMs = Math.min(walRetryMs * 2, WAL_RESET_RETRY_MAX_MS); }
+      else { walRetryAt = 0; walRetryMs = WAL_RESET_RETRY_MS; }
+    }
+    return { action: busy ? 'busy' : 'reset', walBytes: walBytes(), ms: performance.now() - started };
+  }
+
   try { migrate(db, tx); } catch (error) { db.close(); throw error; }
   return {
     db, file,
     schemaVersion: () => (db.prepare('SELECT IFNULL(MAX(version), 0) AS version FROM schema_migrations').get() as { version: number }).version,
-    tx,
+    tx, walBytes, maintainWal,
     stats: () => ({ ...stats, waitBuckets: [...stats.waitBuckets], waits: [...stats.waits], holds: [...stats.holds] }),
     close: () => { if (db.isOpen) db.close(); },
   };
