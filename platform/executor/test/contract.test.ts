@@ -11,9 +11,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { TypedDataEncoder, Wallet, keccak256 as ethersKeccak, recoverAddress } from 'ethers';
 import { bybitAuthHeaders } from '../../../server/exchange-transport/bybit.mjs';
-import { addressOf, asterDigest, keccak256, pythonUrlencode, signAsterMessage } from '../scripts/contract/eip712.ts';
-import { bybitHeaders } from '../scripts/contract/bybit-sign.ts';
-import { ProbeAbort, liveAllowed, parseEnvFile, positiveDecimal, redact } from '../scripts/contract/common.ts';
+import { addressOf, asterDigest, keccak256, pythonUrlencode, signAsterMessage } from '../../../server/contract-probes/lib/eip712.ts';
+import { bybitHeaders } from '../../../server/contract-probes/lib/bybit-sign.ts';
+import { ProbeAbort, liveAllowed, parseEnvFile, positiveDecimal, redact } from '../../../server/contract-probes/lib/common.ts';
 
 const hex = (bytes: Uint8Array): string => '0x' + Buffer.from(bytes).toString('hex');
 const DOMAIN = { name: 'AsterSignTransaction', version: '1', chainId: 1666, verifyingContract: '0x0000000000000000000000000000000000000000' };
@@ -69,7 +69,7 @@ test('契约探测：env 文件解析与金额校验', () => {
 });
 
 const run = (script: string, args: string[], env: Record<string, string> = {}): { status: number | null; output: string } => {
-  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/' + script, import.meta.url)), ...args], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '', ...env }, timeout: 30_000 });
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../../../server/contract-probes/' + script, import.meta.url)), ...args], { encoding: 'utf8', env: { PATH: process.env.PATH ?? '', ...env }, timeout: 30_000 });
   return { status: result.status, output: result.stdout + result.stderr };
 };
 
@@ -77,30 +77,30 @@ test('契约探测：参数不合格时在发出任何请求前中止', () => {
   const wallet = Wallet.createRandom(), other = Wallet.createRandom();
   const master = { MA_USER: other.address, MA_SIGNER: wallet.address, MA_PRIVATE_KEY: wallet.privateKey };
   // The sub-account key does not match its signer.
-  let result = run('contract-aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB'], { ...master, SA_USER: wallet.address, SA_SIGNER: other.address, SA_PRIVATE_KEY: wallet.privateKey, SB_USER: wallet.address, SB_SIGNER: wallet.address, SB_PRIVATE_KEY: wallet.privateKey });
+  let result = run('aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB'], { ...master, SA_USER: wallet.address, SA_SIGNER: other.address, SA_PRIVATE_KEY: wallet.privateKey, SB_USER: wallet.address, SB_SIGNER: wallet.address, SB_PRIVATE_KEY: wallet.privateKey });
   assert.equal(result.status, 1);
   assert.match(result.output, /已中止：.*signer 不匹配/);
   // Amount over the hard cap.
   const subs = Object.fromEntries(['SA', 'SB'].flatMap(prefix => { const sub = Wallet.createRandom(), signer = Wallet.createRandom(); return [[prefix + '_USER', sub.address], [prefix + '_SIGNER', signer.address], [prefix + '_PRIVATE_KEY', signer.privateKey]]; }));
-  result = run('contract-aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB', '--amount', '5.01'], { ...master, ...subs });
+  result = run('aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB', '--amount', '5.01'], { ...master, ...subs });
   assert.equal(result.status, 1);
   assert.match(result.output, /不能超过 5 USD1/);
-  // Nonce probes need --live, and --live needs the phrase.
-  result = run('contract-aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB', '--probe-nonce=-30', '--live'], { ...master, ...subs });
+  // --live needs the phrase, and the phrase names the nonce offsets.
+  result = run('aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB', '--probe-nonce=-30', '--live'], { ...master, ...subs });
   assert.equal(result.status, 1);
   assert.match(result.output, /--live 需要 --confirm aster-transfer-1-USD1-SA-SB-nonce-30（/);
   // A refused probe is watched until its nonce should have expired, which must fit in the settle limit.
-  result = run('contract-aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB', '--probe-nonce=300', '--live'], { ...master, ...subs });
+  result = run('aster-transfer.ts', ['--master-prefix', 'MA', '--a-prefix', 'SA', '--b-prefix', 'SB', '--probe-nonce=300', '--live'], { ...master, ...subs });
   assert.equal(result.status, 1);
   assert.match(result.output, /--settle-timeout-s 调到至少 375/);
 
-  result = run('contract-bybit-chase.ts', ['--symbol', 'BTCUSDT'], { BYBIT_API_KEY: 'k', BYBIT_API_SECRET: 's' });
+  result = run('bybit-chase.ts', ['--symbol', 'BTCUSDT'], { BYBIT_API_KEY: 'k', BYBIT_API_SECRET: 's' });
   assert.equal(result.status, 1);
   assert.match(result.output, /--symbol 必须是/);
-  result = run('contract-bybit-chase.ts', ['--symbol', 'CLUSDT', '--max-notional', '201'], { BYBIT_API_KEY: 'k', BYBIT_API_SECRET: 's' });
+  result = run('bybit-chase.ts', ['--symbol', 'CLUSDT', '--max-notional', '201'], { BYBIT_API_KEY: 'k', BYBIT_API_SECRET: 's' });
   assert.equal(result.status, 1);
   assert.match(result.output, /不能超过 200 USDT/);
-  result = run('contract-bybit-chase.ts', ['--symbol', 'CLUSDT']);
+  result = run('bybit-chase.ts', ['--symbol', 'CLUSDT']);
   assert.equal(result.status, 1);
   assert.match(result.output, /缺少 BYBIT_API_KEY/);
 });
@@ -109,7 +109,7 @@ const stubbed = (script: string, args: string[], env: Record<string, string>): {
   const directory = mkdtempSync(join(tmpdir(), 'pa-contract-')), log = join(directory, 'requests.log'), out = join(directory, 'report.json');
   try {
     writeFileSync(log, '');
-    const result = spawnSync(process.execPath, ['--import', new URL('./contract-stub.ts', import.meta.url).href, fileURLToPath(new URL('../scripts/' + script, import.meta.url)), ...args, '--out', out],
+    const result = spawnSync(process.execPath, ['--import', new URL('./contract-stub.ts', import.meta.url).href, fileURLToPath(new URL('../../../server/contract-probes/' + script, import.meta.url)), ...args, '--out', out],
       { encoding: 'utf8', env: { PATH: process.env.PATH ?? '', CONTRACT_STUB_LOG: log, ...env }, timeout: 150_000 });
     return { status: result.status, output: result.stdout + result.stderr, requests: readFileSync(log, 'utf8').split('\n').filter(Boolean), report: existsSync(out) ? readFileSync(out, 'utf8') : '' };
   } finally { rmSync(directory, { recursive: true, force: true }); }
@@ -128,19 +128,24 @@ const ASTER_PHRASE = 'aster-transfer-1.5-USD1-SA-SB-noncenone';
 
 test('契约探测（ASTER，替身接口）：只读运行不发任何 POST；真实划转来回各一笔，nonce 探测每笔金额不同、逐笔划回已入账的部分，净额为零，报告不含密钥', () => {
   const { env, secrets } = asterEnv();
-  const dry = stubbed('contract-aster-transfer.ts', ASTER_BASE, env);
+  const dry = stubbed('aster-transfer.ts', ASTER_BASE, env);
   assert.equal(dry.status, 0, dry.output);
   assert.ok(dry.requests.length > 0 && dry.requests.every(line => line.startsWith('GET ')), dry.requests.join());
   assert.equal(phraseOf(dry.output), ASTER_PHRASE);
+  // Offsets given to a read-only run only shape the phrase it prints; nothing is sent.
+  const dryNonce = stubbed('aster-transfer.ts', [...ASTER_BASE, '--probe-nonce=-8,3'], env);
+  assert.equal(dryNonce.status, 0, dryNonce.output);
+  assert.ok(dryNonce.requests.length > 0 && dryNonce.requests.every(line => line.startsWith('GET ')), dryNonce.requests.join());
+  assert.equal(phraseOf(dryNonce.output), 'aster-transfer-1.5-USD1-SA-SB-nonce-8_3');
 
   // A phrase for other parameters stops before the first request.
-  const refused = stubbed('contract-aster-transfer.ts', [...ASTER_BASE, '--probe-nonce=-8', '--live', '--confirm', ASTER_PHRASE], env);
+  const refused = stubbed('aster-transfer.ts', [...ASTER_BASE, '--probe-nonce=-8', '--live', '--confirm', ASTER_PHRASE], env);
   assert.equal(refused.status, 1);
   assert.deepEqual(refused.requests, []);
 
   // The stand-in accepts increasing nonces within 4 s: -2 and +3 execute, -8 is refused with an unlisted code.
   // Without the wait before each probe, -8 and -2 would not be newer than the signer's earlier nonces.
-  const live = stubbed('contract-aster-transfer.ts', [...ASTER_BASE, '--settle-timeout-s', '80', '--probe-nonce=-2,-8,3', '--live', '--confirm', 'aster-transfer-1.5-USD1-SA-SB-nonce-8_-2_3'], { ...env, CONTRACT_STUB_NONCE_WINDOW_MS: '4000' });
+  const live = stubbed('aster-transfer.ts', [...ASTER_BASE, '--settle-timeout-s', '80', '--probe-nonce=-2,-8,3', '--live', '--confirm', 'aster-transfer-1.5-USD1-SA-SB-nonce-8_-2_3'], { ...env, CONTRACT_STUB_NONCE_WINDOW_MS: '4000' });
   assert.equal(live.status, 0, live.output);
   assert.equal(count(live.requests, 'POST /fapi/v3/subAccountTransfer'), 7);
   assert.equal(live.requests.filter(line => line.startsWith('POST ')).length, 7);
@@ -161,7 +166,7 @@ test('契约探测（ASTER，替身接口）：只读运行不发任何 POST；�
 
 test('契约探测（ASTER，替身接口）：划转应答丢失或被网关拦截时不重发并以退出码 2 结束；账户有持仓时不发送', () => {
   const { env } = asterEnv(), live = [...ASTER_BASE, '--live', '--confirm', ASTER_PHRASE];
-  const lost = stubbed('contract-aster-transfer.ts', live, { ...env, CONTRACT_STUB_FAULT: 'aster-lost-transfer' });
+  const lost = stubbed('aster-transfer.ts', live, { ...env, CONTRACT_STUB_FAULT: 'aster-lost-transfer' });
   assert.equal(lost.status, 2, lost.output);
   assert.equal(lost.requests.filter(line => line.startsWith('POST ')).length, 1);
   const report = JSON.parse(lost.report);
@@ -169,12 +174,12 @@ test('契约探测（ASTER，替身接口）：划转应答丢失或被网关拦
   // The transfer did run: the watch found it and the net amount is left for the operator.
   assert.deepEqual([report.findings.transfers['划转 A→B'].tranIds.bothSidesEqual, report.findings.net.a, report.writes[0].outcome], [true, '-1.5', 'unknown']);
 
-  const blocked = stubbed('contract-aster-transfer.ts', live, { ...env, CONTRACT_STUB_FAULT: 'aster-429' });
+  const blocked = stubbed('aster-transfer.ts', live, { ...env, CONTRACT_STUB_FAULT: 'aster-429' });
   assert.equal(blocked.status, 2, blocked.output);
   assert.equal(blocked.requests.filter(line => line.startsWith('POST ')).length, 1);
   assert.equal(JSON.parse(blocked.report).writes[0].outcome, 'unknown');
 
-  const holding = stubbed('contract-aster-transfer.ts', live, { ...env, CONTRACT_STUB_FAULT: 'aster-positions' });
+  const holding = stubbed('aster-transfer.ts', live, { ...env, CONTRACT_STUB_FAULT: 'aster-positions' });
   assert.equal(holding.status, 1, holding.output);
   assert.match(holding.output, /--balancer-paused/);
   assert.ok(holding.requests.every(line => line.startsWith('GET ')));
@@ -186,18 +191,18 @@ const bybitPosts = (requests: string[]): number[] => ['/v5/strategy/create', '/v
 
 test('契约探测（Bybit，替身接口）：只读运行不发任何 POST；真实运行创建并停止全部策略、成交一笔后平仓，收尾无残留，报告不含密钥与账户编号', () => {
   const env = bybitEnv(), base = ['--symbol', 'CLUSDT', '--allow-fill'];
-  const dry = stubbed('contract-bybit-chase.ts', base, env);
+  const dry = stubbed('bybit-chase.ts', base, env);
   assert.equal(dry.status, 0, dry.output);
   assert.ok(dry.requests.length > 0 && dry.requests.every(line => line.startsWith('GET ')), dry.requests.join());
   // 5 USDT minimum at the resting price 58.80 is 0.09 after rounding up, plus one step.
   assert.equal(phraseOf(dry.output), BYBIT_PHRASE + '-fill');
 
   // The phrase names the distance below the bid: another distance needs another phrase.
-  const refused = stubbed('contract-bybit-chase.ts', [...base, '--passive-bps', '300', '--live', '--confirm', BYBIT_PHRASE + '-fill'], env);
+  const refused = stubbed('bybit-chase.ts', [...base, '--passive-bps', '300', '--live', '--confirm', BYBIT_PHRASE + '-fill'], env);
   assert.equal(refused.status, 1);
   assert.ok(refused.requests.every(line => line.startsWith('GET ')));
 
-  const live = stubbed('contract-bybit-chase.ts', [...base, '--live', '--confirm', BYBIT_PHRASE + '-fill'], env);
+  const live = stubbed('bybit-chase.ts', [...base, '--live', '--confirm', BYBIT_PHRASE + '-fill'], env);
   assert.equal(live.status, 0, live.output);
   const report = JSON.parse(live.report);
   assert.equal(report.outcome, 'complete');
@@ -213,14 +218,14 @@ test('契约探测（Bybit，替身接口）：只读运行不发任何 POST；�
 
 test('契约探测（Bybit，替身接口）：创建应答丢失时不重发，收尾只接管并停止与该请求相符的策略，不动数量不同或方向不同的外来策略', () => {
   const live = ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE];
-  const lost = stubbed('contract-bybit-chase.ts', live, { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-lost-create' });
+  const lost = stubbed('bybit-chase.ts', live, { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-lost-create' });
   assert.equal(lost.status, 2, lost.output);
   assert.deepEqual(bybitPosts(lost.requests), [1, 1, 0]);
   let report = JSON.parse(lost.report);
   assert.deepEqual([report.findings.cleanup.clean, report.findings.cleanup.runningStrategies], [true, 0]);
   assert.match(report.outcome, /结果未知/);
 
-  const foreign = stubbed('contract-bybit-chase.ts', live, { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-lost-create,bybit-foreign-on-create' });
+  const foreign = stubbed('bybit-chase.ts', live, { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-lost-create,bybit-foreign-on-create' });
   assert.equal(foreign.status, 2, foreign.output);
   assert.deepEqual(bybitPosts(foreign.requests), [1, 1, 0]);
   report = JSON.parse(foreign.report);
@@ -228,14 +233,14 @@ test('契约探测（Bybit，替身接口）：创建应答丢失时不重发，
 });
 
 test('契约探测（Bybit，替身接口）：创建被网关拦截时停止后续步骤，收尾接管并停止那笔其实已创建的策略；双向持仓按多头仓位下单与平仓；收尾列表读取失败不算无残留', () => {
-  const blocked = stubbed('contract-bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-429-create' });
+  const blocked = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-429-create' });
   assert.equal(blocked.status, 2, blocked.output);
   // A and the blocked duplicate, which did run: both are stopped.
   assert.deepEqual(bybitPosts(blocked.requests), [2, 2, 0]);
   assert.equal(JSON.parse(blocked.report).findings.cleanup.clean, true);
 
   // The stand-in refuses any create or close that does not carry positionIdx 1 in hedge mode.
-  const hedge = stubbed('contract-bybit-chase.ts', ['--symbol', 'CLUSDT', '--allow-fill', '--live', '--confirm', BYBIT_PHRASE + '-fill'], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-hedge,bybit-list-fail' });
+  const hedge = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--allow-fill', '--live', '--confirm', BYBIT_PHRASE + '-fill'], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-hedge,bybit-list-fail' });
   assert.equal(hedge.status, 2, hedge.output);
   assert.deepEqual(bybitPosts(hedge.requests), [5, 4, 1]);
   const report = JSON.parse(hedge.report);
@@ -244,7 +249,7 @@ test('契约探测（Bybit，替身接口）：创建被网关拦截时停止后
 });
 
 test('契约探测（Bybit，替身接口）：停止后未确认结清时不再创建新策略，收尾再次停止并核对', () => {
-  const stuck = stubbed('contract-bybit-chase.ts', ['--symbol', 'CLUSDT', '--settle-timeout-s', '10', '--live', '--confirm', BYBIT_PHRASE], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-stop-stuck' });
+  const stuck = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--settle-timeout-s', '10', '--live', '--confirm', BYBIT_PHRASE], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-stop-stuck' });
   assert.equal(stuck.status, 2, stuck.output);
   // A and its duplicate only; the wind-down stops A again and then the duplicate.
   assert.deepEqual(bybitPosts(stuck.requests), [2, 3, 0]);
@@ -262,9 +267,14 @@ test('契约探测（Bybit）：--data-dir 只读解密工作台保存的执行�
     database.exec('CREATE TABLE execution_accounts (exchange TEXT PRIMARY KEY, credentials TEXT NOT NULL)');
     database.prepare('INSERT INTO execution_accounts VALUES (?, ?)').run('bybit', Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64'));
     database.close();
-    const dry = stubbed('contract-bybit-chase.ts', ['--symbol', 'CLUSDT', '--data-dir', directory], {});
+    const dry = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--data-dir', directory], {});
     assert.equal(dry.status, 0, dry.output);
     assert.ok(dry.requests.includes('GET /v5/user/query-api') && !dry.report.includes(apiKey));
     assert.deepEqual(readdirSync(directory).sort(), ['credentials.key', 'hub.sqlite']);
   } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('契约探测：随工作台发布的十进制运算与执行器的 src/decimal.ts 逐字节相同', () => {
+  // server/ is what the release package ships; platform/ is not, so the probes carry their own copy.
+  assert.equal(readFileSync(new URL('../../../server/contract-probes/lib/decimal.ts', import.meta.url), 'utf8'), readFileSync(new URL('../src/decimal.ts', import.meta.url), 'utf8'));
 });

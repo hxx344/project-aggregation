@@ -355,6 +355,17 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       if (req.headers.origin) sameOrigin(req);
       await forward(req, res, url, current); return;
     }
+    if (pathname === '/api/system/contract-probes' || pathname.startsWith('/api/system/contract-probes/')) {
+      if (url.search) throw new HttpError(400, '接口实测不接受查询参数');
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台操作接口实测');
+      if (req.headers.origin) sameOrigin(req);
+      // A live run sends real orders or transfers: admitted like a native execution start.
+      if (req.method === 'POST' && pathname.endsWith('/live')) {
+        const { raw } = await readJsonBody(req.headers['content-type'], req);
+        await updates.withExecutionEntry(() => forward(req, res, url, current, { body: [raw] }), native); return;
+      }
+      await forward(req, res, url, current); return;
+    }
     if (pathname === '/api/portal/grants' || pathname.startsWith('/api/portal/grants/')) {
       if (url.search) throw new HttpError(400, '模块授权接口不接受查询参数');
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台管理模块授权');

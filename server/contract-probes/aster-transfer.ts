@@ -9,10 +9,10 @@
 // transfer attempt per listed nonce offset and returns whatever was accepted. A transfer whose
 // outcome is unknown is never resent: the run stops sending, labels it from income and exits 2.
 // Endpoints, parameters and signing follow modules/aster/trading (exchange.py, margin_balance.py).
-import { addressOf, pythonUrlencode, signAsterMessage } from './contract/eip712.ts';
-import { HttpFailure, NotSent, ProbeAbort, boundedInteger, createReport, environment, exchange, ignoreInterrupt, liveAllowed, positiveDecimal, readFlags, registerSecrets, reserveReport, safeText, saveReport, sleep, step, watchSignals } from './contract/common.ts';
-import type { HttpResult, Report } from './contract/common.ts';
-import { add, cmp, mul, sub } from '../src/decimal.ts';
+import { addressOf, pythonUrlencode, signAsterMessage } from './lib/eip712.ts';
+import { HttpFailure, NotSent, ProbeAbort, boundedInteger, createReport, environment, exchange, ignoreInterrupt, liveAllowed, positiveDecimal, readFlags, registerSecrets, reserveReport, safeText, saveReport, sleep, step, watchSignals } from './lib/common.ts';
+import type { HttpResult, Report } from './lib/common.ts';
+import { add, cmp, mul, sub } from './lib/decimal.ts';
 
 const BASE = 'https://fapi.asterdex.com';
 const ASSET = 'USD1';
@@ -247,7 +247,7 @@ async function endTimeProbe(credentials: Credentials, row: Row): Promise<unknown
 async function main(): Promise<number> {
   const flags = readFlags(process.argv.slice(2), ['env-file', 'master-prefix', 'a-prefix', 'b-prefix', 'amount', 'probe-nonce', 'settle-timeout-s', 'history-minutes', 'out', 'confirm'], ['live', 'balancer-paused', 'help']);
   if (flags.help) {
-    process.stdout.write('用法：node scripts/contract-aster-transfer.ts --master-prefix <前缀> --a-prefix <前缀> --b-prefix <前缀> [--env-file <.env>] [--amount 1]\n'
+    process.stdout.write('用法：node server/contract-probes/aster-transfer.ts --master-prefix <前缀> --a-prefix <前缀> --b-prefix <前缀> [--env-file <.env>] [--amount 1]\n'
       + '      [--live --confirm <短语>] [--balancer-paused] [--probe-nonce=-30,-59,-61,-90,-121,61] [--settle-timeout-s 300] [--history-minutes 30] [--out 报告.json]\n'
       + '不带 --live 只做签名读取；确认短语由只读运行打印。A 或 B 有持仓时，须先暂停该配对的保证金平衡并加 --balancer-paused。\n');
     return 0;
@@ -273,8 +273,8 @@ async function main(): Promise<number> {
   const horizonMs = NONCE_HORIZON_MS + Math.max(0, ...nonceOffsets) * 1000;
   if (nonceOffsets.length && horizonMs > settleLimitMs) throw new ProbeAbort(`--probe-nonce 的最大正偏移加 ${NONCE_HORIZON_MS / 1000} 秒超过 --settle-timeout-s：请把 --settle-timeout-s 调到至少 ${Math.ceil(horizonMs / 1000)}（上限 900）或减小偏移`);
   const phrase = `aster-transfer-${amount}-${ASSET}-${a.prefix}-${b.prefix}-nonce${nonceOffsets.length ? nonceOffsets.join('_') : 'none'}`;
+  // Without --live the offsets only shape the phrase: a read-only run sends no transfer.
   const live = liveAllowed(flags, phrase);
-  if (nonceOffsets.length && !live) throw new ProbeAbort('--probe-nonce 只在 --live 下有效');
 
   const report = createReport('aster-transfer', live ? 'live' : 'read-only', { amount, asset: ASSET, nonceOffsets, probeAmounts, settleLimitMs, historyMs, balancerPaused: flags['balancer-paused'] === true, prefixes: { master: master.prefix, a: a.prefix, b: b.prefix } });
   const out = (flags.out as string | undefined) ?? `contract-aster-transfer-${report.startedAt.replace(/[:.]/g, '-')}.json`;

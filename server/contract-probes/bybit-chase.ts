@@ -16,11 +16,11 @@ import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { HttpFailure, NotSent, ProbeAbort, boundedInteger, createReport, environment, exchange, ignoreInterrupt, liveAllowed, positiveDecimal, readFlags, registerSecrets, reserveReport, safeText, saveReport, sleep, step, watchSignals } from './contract/common.ts';
-import type { HttpResult, Report } from './contract/common.ts';
-import { bybitHeaders } from './contract/bybit-sign.ts';
-import type { BybitCredentials as Credentials } from './contract/bybit-sign.ts';
-import { add, cmp, floorToStep, fromUnits, isZero, mul, sub, units } from '../src/decimal.ts';
+import { HttpFailure, NotSent, ProbeAbort, boundedInteger, createReport, environment, exchange, ignoreInterrupt, liveAllowed, positiveDecimal, readFlags, registerSecrets, reserveReport, safeText, saveReport, sleep, step, watchSignals } from './lib/common.ts';
+import type { HttpResult, Report } from './lib/common.ts';
+import { bybitHeaders } from './lib/bybit-sign.ts';
+import type { BybitCredentials as Credentials } from './lib/bybit-sign.ts';
+import { add, cmp, floorToStep, fromUnits, isZero, mul, sub, units } from './lib/decimal.ts';
 
 const BASE = 'https://api.bybit.com';
 const SYMBOLS = ['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT'];
@@ -177,7 +177,7 @@ function quantityFor(notional: string, price: string, step: string): string {
 async function main(): Promise<number> {
   const flags = readFlags(process.argv.slice(2), ['env-file', 'data-dir', 'symbol', 'max-notional', 'passive-bps', 'settle-timeout-s', 'out', 'confirm'], ['live', 'allow-fill', 'help']);
   if (flags.help) {
-    process.stdout.write('用法：node scripts/contract-bybit-chase.ts --symbol <CLUSDT|BZUSDT|SKHYUSDT|SKHYNIXUSDT> (--data-dir <工作台数据目录> | --env-file <文件>)\n'
+    process.stdout.write('用法：node server/contract-probes/bybit-chase.ts --symbol <CLUSDT|BZUSDT|SKHYUSDT|SKHYNIXUSDT> (--data-dir <工作台数据目录> | --env-file <文件>)\n'
       + '      [--max-notional 50] [--passive-bps 200] [--settle-timeout-s 60] [--live --confirm <短语>] [--allow-fill] [--out 报告.json]\n'
       + '不带 --live 只读取；确认短语由只读运行打印。凭据也可用环境变量 BYBIT_API_KEY / BYBIT_API_SECRET。\n');
     return 0;
