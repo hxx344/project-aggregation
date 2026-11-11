@@ -464,3 +464,40 @@ small{font-size:.75rem}
 }
 @media(max-width:540px){.overview-strip{grid-template-columns:repeat(3,minmax(0,1fr))}.overview-strip .kpi:nth-child(n){border-bottom:0;border-right:1px solid var(--surface-4)}.overview-strip .kpi:first-child{grid-column:1/-1;border-right:0;border-bottom:1px solid var(--surface-4)}.overview-strip .kpi:last-child{border-right:0}.kpi{padding:10px 12px}.kpi-value{font-size:1.0625rem}.project-table-head{display:none}.project-table-row{grid-template-columns:1fr auto;gap:12px;padding:12px 14px}.table-project{grid-column:1/-1}.table-project>div>span{white-space:normal;overflow-wrap:anywhere}.project-table-row>div:nth-child(3){grid-column:1}.row-actions{grid-column:2}.editor-dialog{width:calc(100vw - 16px);max-height:calc(100dvh - 16px)}.editor-dialog>form{max-height:calc(100dvh - 18px)}.form-grid{grid-template-columns:1fr}.original-page-actions{justify-content:flex-end;width:100%}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}
+
+/* ========== Shared page kit（工作台页面骨架；lp-* 为 Aero 尚未迁移前的别名，统一平台方案 v0.9 第 7.1 节第 3 批时移除） ========== */
+.wb-page,.lp-page{display:flex;flex-direction:column;gap:16px;min-width:0}
+.wb-heading,.lp-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.wb-heading h1,.lp-heading h1{font-size:1.25rem;font-weight:650}
+.wb-heading p,.lp-heading p{margin-top:5px;color:var(--text-secondary);font-size:.8125rem}
+.wb-toolbar,.lp-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.wb-status,.lp-status{padding:18px 20px}
+.wb-state-line,.lp-state-line{display:flex;align-items:center;gap:12px;flex-wrap:wrap;color:var(--text-secondary);font-size:.75rem}
+.wb-state,.lp-state{display:inline-flex;align-items:center;gap:7px;font-size:.8125rem;font-weight:600;color:var(--text-primary)}
+.wb-state.running,.lp-state.running{color:var(--emerald)}
+.wb-state.starting,.wb-state.stopping,.wb-paused,.lp-state.starting,.lp-state.stopping,.lp-paused{color:var(--warning)}
+.wb-state.fault,.lp-state.fault{color:var(--error)}
+.wb-section,.lp-section{min-width:0;overflow:hidden}
+.wb-section fieldset,.lp-section fieldset{margin:0;border:0;padding:0 20px;min-width:0}
+.wb-section h3,.lp-section h3{font-size:.8125rem;font-weight:600;margin:18px 0 12px}
+.wb-grid,.lp-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px 20px}
+.wb-field,.lp-field{display:flex;flex-direction:column;gap:6px;min-width:0;font-size:.75rem;color:var(--text-secondary)}
+.wb-field.wide,.lp-field.wide{grid-column:span 3}
+.wb-field input,.lp-field input{width:100%;min-width:0;height:36px;border:1px solid var(--surface-5);border-radius:var(--radius-sm);padding:7px 10px;color:var(--text-primary);background:var(--surface-1);font-variant-numeric:tabular-nums}
+.wb-field input:disabled,.lp-field input:disabled{color:var(--text-tertiary);background:var(--surface-2)}
+.wb-field small,.lp-field small{font-size:.6875rem;line-height:1.65;color:var(--text-tertiary)}
+.wb-key-actions,.lp-key-actions{display:flex;gap:8px;flex-wrap:wrap}
+.wb-key,.lp-key{display:flex;flex-direction:column;gap:12px;padding:0 20px 18px}
+.wb-events,.lp-events{list-style:none;margin:0;padding:0 20px 14px;max-height:420px;overflow-y:auto}
+.wb-events li,.lp-events li{display:grid;grid-template-columns:120px 90px minmax(0,1fr);gap:10px;padding:8px 0;border-bottom:1px solid var(--surface-4);font-size:.75rem;align-items:baseline}
+.wb-events li:last-child,.lp-events li:last-child{border-bottom:0}
+.wb-events time,.lp-events time{color:var(--text-tertiary);font-variant-numeric:tabular-nums}
+.wb-events li.bad strong,.lp-events li.bad strong{color:var(--error)}
+@media(max-width:1100px){.wb-grid,.lp-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.wb-field.wide,.lp-field.wide{grid-column:span 2}}
+@media(max-width:650px){
+  .wb-heading,.lp-heading{flex-direction:column}.wb-status,.lp-status{padding:16px}
+  .wb-grid,.lp-grid{grid-template-columns:minmax(0,1fr);gap:14px}.wb-field.wide,.lp-field.wide{grid-column:auto}.wb-field input,.lp-field input{height:40px;font-size:16px}
+  .wb-section fieldset,.wb-key,.wb-events,.lp-section fieldset,.lp-key,.lp-events{padding-left:16px;padding-right:16px}
+  .wb-events li,.lp-events li{grid-template-columns:minmax(0,1fr);gap:2px}
+}
+@media(prefers-reduced-motion:reduce){.wb-page .spin,.lp-page .spin{animation:none}}
