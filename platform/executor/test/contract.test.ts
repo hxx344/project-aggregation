@@ -206,8 +206,26 @@ test('契约探测（Bybit，替身接口）：只读运行不发任何 POST；�
   assert.equal(live.status, 0, live.output);
   const report = JSON.parse(live.report);
   assert.equal(report.outcome, 'complete');
-  // Creates: A, duplicate, below minimum, stale timestamp, C. Stops: A, duplicate, A again, unknown id. One closing order.
-  assert.deepEqual(bybitPosts(live.requests), [5, 4, 1]);
+  // Creates: A as the workbench spells it (refused), A, duplicate, below minimum, stale timestamp, C. Stops: A, duplicate, A again, unknown id. One closing order.
+  assert.deepEqual(bybitPosts(live.requests), [6, 4, 1]);
+  assert.deepEqual(report.findings.offsetSpelling, { tried: [{ spelling: 'chaseDistance "0"', outcome: 'rejected', retCode: 10001, retMsg: 'chaseOrder chase_distance params error' }, { spelling: 'chasePercentE4 0', outcome: 'accepted', retCode: 0, retMsg: 'OK' }], accepted: 'chasePercentE4 0' });
+
+  // The next spelling is tried only after a parameter refusal; when none is accepted nothing was created and nothing is left.
+  const plain = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE], { ...env, CONTRACT_STUB_FAULT: 'bybit-percent-refused' });
+  assert.equal(plain.status, 0, plain.output);
+  assert.equal(JSON.parse(plain.report).findings.offsetSpelling.accepted, '不带偏移参数');
+  assert.deepEqual(bybitPosts(plain.requests), [6, 4, 0]);
+  const none = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE], { ...env, CONTRACT_STUB_FAULT: 'bybit-percent-refused,bybit-plain-refused' });
+  assert.equal(none.status, 2, none.output);
+  assert.deepEqual(bybitPosts(none.requests), [3, 0, 0]);
+  // A that rests above its cap could fill: without --allow-fill it is stopped and nothing else is created.
+  const high = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE], { ...env, CONTRACT_STUB_FAULT: 'bybit-rests-at-bid' });
+  assert.equal(high.status, 2, high.output);
+  assert.deepEqual(bybitPosts(high.requests), [2, 1, 0]);
+  assert.match(JSON.parse(high.report).outcome, /没有停在最高追价/);
+  assert.equal(JSON.parse(high.report).findings.cleanup.clean, true);
+  const refusedAll = JSON.parse(none.report);
+  assert.deepEqual([refusedAll.findings.offsetSpelling.accepted, refusedAll.findings.offsetSpelling.tried.length, refusedAll.findings.cleanup.clean], [null, 3, true]);
   assert.deepEqual(report.findings.cleanup, { clean: true, readsComplete: true, positionSize: '0', openOrders: 0, runningStrategies: 0 });
   assert.equal(report.findings.duplicateCreate.distinctId, true);
   assert.deepEqual([report.findings.stopRefusals.endedStrategy.retCode, report.findings.stopRefusals.unknownStrategy.retCode, report.findings.createRefusals.staleTimestamp.retCode, report.findings.createRefusals.belowMinimum.outcome], [60066, 60065, 10002, 'rejected']);
@@ -220,14 +238,14 @@ test('契约探测（Bybit，替身接口）：创建应答丢失时不重发，
   const live = ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE];
   const lost = stubbed('bybit-chase.ts', live, { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-lost-create' });
   assert.equal(lost.status, 2, lost.output);
-  assert.deepEqual(bybitPosts(lost.requests), [1, 1, 0]);
+  assert.deepEqual(bybitPosts(lost.requests), [2, 1, 0]);
   let report = JSON.parse(lost.report);
   assert.deepEqual([report.findings.cleanup.clean, report.findings.cleanup.runningStrategies], [true, 0]);
   assert.match(report.outcome, /结果未知/);
 
   const foreign = stubbed('bybit-chase.ts', live, { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-lost-create,bybit-foreign-on-create' });
   assert.equal(foreign.status, 2, foreign.output);
-  assert.deepEqual(bybitPosts(foreign.requests), [1, 1, 0]);
+  assert.deepEqual(bybitPosts(foreign.requests), [2, 1, 0]);
   report = JSON.parse(foreign.report);
   assert.deepEqual([report.findings.cleanup.clean, report.findings.cleanup.runningStrategies, report.findings.cleanup.openOrders], [false, 2, 2]);
 });
@@ -236,13 +254,13 @@ test('契约探测（Bybit，替身接口）：创建被网关拦截时停止后
   const blocked = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-429-create' });
   assert.equal(blocked.status, 2, blocked.output);
   // A and the blocked duplicate, which did run: both are stopped.
-  assert.deepEqual(bybitPosts(blocked.requests), [2, 2, 0]);
+  assert.deepEqual(bybitPosts(blocked.requests), [3, 2, 0]);
   assert.equal(JSON.parse(blocked.report).findings.cleanup.clean, true);
 
   // The stand-in refuses any create or close that does not carry positionIdx 1 in hedge mode.
   const hedge = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--allow-fill', '--live', '--confirm', BYBIT_PHRASE + '-fill'], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-hedge,bybit-list-fail' });
   assert.equal(hedge.status, 2, hedge.output);
-  assert.deepEqual(bybitPosts(hedge.requests), [5, 4, 1]);
+  assert.deepEqual(bybitPosts(hedge.requests), [6, 4, 1]);
   const report = JSON.parse(hedge.report);
   assert.deepEqual(report.findings.cleanup, { clean: false, readsComplete: false, positionSize: '0', openOrders: 0, runningStrategies: 0 });
   assert.match(report.outcome, /^complete；收尾后未能确认无残留.*有读取失败/);
@@ -252,7 +270,7 @@ test('契约探测（Bybit，替身接口）：停止后未确认结清时不再
   const stuck = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--settle-timeout-s', '10', '--live', '--confirm', BYBIT_PHRASE], { ...bybitEnv(), CONTRACT_STUB_FAULT: 'bybit-stop-stuck' });
   assert.equal(stuck.status, 2, stuck.output);
   // A and its duplicate only; the wind-down stops A again and then the duplicate.
-  assert.deepEqual(bybitPosts(stuck.requests), [2, 3, 0]);
+  assert.deepEqual(bybitPosts(stuck.requests), [3, 3, 0]);
   const report = JSON.parse(stuck.report);
   assert.match(report.outcome, /未确认策略已结束/);
   assert.equal(report.findings.cleanup.clean, true);

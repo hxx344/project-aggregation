@@ -79,11 +79,14 @@ function bybitReply(method: string, path: string, parameters: URLSearchParams, b
     if (Math.abs(Number(headers.get('x-bapi-timestamp')) - Date.now()) > 5_000) return refused(10002, 'invalid request, please check your server timestamp');
     if (Number(body.size) < 0.02) return refused(10001, 'size too small');
     if (body.positionIdx !== ownIdx) return refused(10001, 'position idx not match position mode');
-    bybit.creates++;
+    // As the venue answered on 2026-11-12; the other spellings are refused only on request.
+    if (body.chaseDistance === '0' || 'chasePercentE4' in body && faults.has('bybit-percent-refused') || !('chaseDistance' in body) && !('chasePercentE4' in body) && faults.has('bybit-plain-refused'))
+      return refused(10001, 'chaseOrder chase_distance params error');
+    bybit.creates++; effective = true;
     const add = (size: string, maxChasePrice: unknown, side: unknown = body.side): string => {
       const strategyId = randomUUID(), fills = Number(maxChasePrice) >= 60.01;
       bybit.strategies.set(strategyId, { strategyId, category: 'UTA_USDT', symbol: body.symbol, strategyType: 'chaseOrder', side, size, executedSize: fills ? size : '0', executedAvgPrice: fills ? '60.01' : '0',
-        chaseOrderPrice: fills ? '60.01' : String(maxChasePrice), status: fills ? 3 : 2, reduceOnly: body.reduceOnly, createdTimeE3: stamp, updatedTimeE3: stamp });
+        chaseOrderPrice: fills ? '60.01' : faults.has('bybit-rests-at-bid') ? '60' : String(maxChasePrice), status: fills ? 3 : 2, reduceOnly: body.reduceOnly, createdTimeE3: stamp, updatedTimeE3: stamp });
       bybit.children.set(strategyId, [{ strategyId, symbol: body.symbol, side, orderId: 'o' + ++bybit.orders, orderType: 2, positionIdx: body.positionIdx, size, executedSize: fills ? size : '0', status: fills ? 5 : 2 }]);
       if (fills) bybit.position += Number(size);
       return strategyId;
@@ -114,6 +117,8 @@ function bybitReply(method: string, path: string, parameters: URLSearchParams, b
   return refused(10001, 'unexpected ' + path);
 }
 
+// Whether the create being answered took effect; a refused one has no reply worth losing.
+let effective = false;
 const LOST_REPLY: Record<string, string> = { '/fapi/v3/subAccountTransfer': 'aster-lost-transfer', '/v5/strategy/create': 'bybit-lost-create' };
 let lost = false;
 
@@ -121,10 +126,11 @@ globalThis.fetch = async (input: string | URL | Request, init?: RequestInit): Pr
   const url = new URL(String(input)), method = init?.method ?? 'GET', headers = new Headers(init?.headers);
   appendFileSync(process.env.CONTRACT_STUB_LOG!, `${method} ${url.pathname}\n`);
   let response: Response;
+  effective = url.pathname !== '/v5/strategy/create';
   if (url.hostname === 'fapi.asterdex.com') response = asterReply(method, url.pathname, method === 'POST' ? new URLSearchParams(String(init?.body)) : url.searchParams);
   else if (url.hostname === 'api.bybit.com') response = bybitReply(method, url.pathname, url.searchParams, method === 'POST' ? JSON.parse(String(init?.body)) as Row : {}, headers);
   else throw new Error('unexpected host ' + url.hostname);
   // The first such write takes effect and its reply never arrives.
-  if (method === 'POST' && !lost && faults.has(LOST_REPLY[url.pathname] ?? '')) { lost = true; throw new TypeError('fetch failed'); }
+  if (method === 'POST' && effective && !lost && faults.has(LOST_REPLY[url.pathname] ?? '')) { lost = true; throw new TypeError('fetch failed'); }
   return response;
 };

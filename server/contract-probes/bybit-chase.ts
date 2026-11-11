@@ -10,7 +10,8 @@
 // to fill. On the way out it stops every strategy it created and closes, with a reduce-only
 // market order, exactly the quantity those strategies report as executed; it never resends a
 // create whose outcome is unknown, and never touches a strategy it cannot tie to its own requests.
-// Endpoints, parameters and signing follow server/trading-execution-exchanges.mjs.
+// Endpoints, parameters and signing follow server/trading-execution-exchanges.mjs, except the
+// offset from the best bid: the first create tries its spellings in turn until one is accepted.
 import { createDecipheriv, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -316,11 +317,15 @@ async function main(): Promise<number> {
     if (busy) throw new ProbeAbort(`${symbol} 上已有持仓、挂单或运行中的追价策略（或读取失败）：为避免与现有任务混淆，不发送任何委托`);
     armed = true;
 
-    const base = { category: 'UTA_USDT', symbol, side: 'Buy', strategyType: 'chaseOrder', positionIdx, reduceOnly: false, chaseDistance: '0' };
+    const base = { category: 'UTA_USDT', symbol, side: 'Buy', strategyType: 'chaseOrder', positionIdx, reduceOnly: false };
+    // How "no offset from the best bid" is written. The workbench sends chaseDistance "0", which the
+    // venue refused (10001, chase_distance params error) on 2026-11-12; the first accepted spelling is kept.
+    const OFFSETS: [string, Record<string, string | number>][] = [['chaseDistance "0"', { chaseDistance: '0' }], ['chasePercentE4 0', { chasePercentE4: 0 }], ['不带偏移参数', {}]];
+    let offset: Record<string, string | number> = OFFSETS[0]![1];
     const create = async (name: string, size: string, maxChasePrice: string, timestampShiftMs = 0): Promise<WriteResult> => {
       const preparedAt = Date.now();
       let result: WriteResult;
-      try { result = await write(report, credentials, name, '/v5/strategy/create', { ...base, size, maxChasePrice }, 'strategyId', timestampShiftMs); }
+      try { result = await write(report, credentials, name, '/v5/strategy/create', { ...base, ...offset, size, maxChasePrice }, 'strategyId', timestampShiftMs); }
       // A gateway block (403/429) on the create says nothing about whether it ran.
       catch (error) { if (!(error instanceof NotSent)) { unconfirmed.push({ size, from: preparedAt, until: Date.now() }); lostReplies++; } throw error; }
       if (result.id !== null) { created.set(result.id, size); unsettled.add(result.id); }
@@ -340,8 +345,17 @@ async function main(): Promise<number> {
     };
 
     // A: a strategy that should rest below the book.
-    const first = await create('创建追价 A（低于买一，不预期成交）', quantity, passivePrice);
-    step(report, '创建 A：回执', first);
+    // A parameter refusal (10001) is a definite "not created", so the next spelling may be tried; any other answer ends the run.
+    let first!: WriteResult;
+    const spellings: Row[] = [];
+    for (const [label, parameters] of OFFSETS) {
+      offset = parameters;
+      first = await create(`创建追价 A（低于买一，不预期成交；${label}）`, quantity, passivePrice);
+      spellings.push({ spelling: label, outcome: first.outcome, retCode: first.retCode, retMsg: first.retMsg });
+      if (first.outcome !== 'rejected' || first.retCode !== 10001 || !/chase/i.test(String(first.retMsg))) break;
+    }
+    report.findings.offsetSpelling = { tried: spellings, accepted: first.outcome === 'accepted' ? spellings.at(-1)!.spelling : null };
+    step(report, '创建 A：回执', { ...first, offsetSpelling: report.findings.offsetSpelling });
     if (first.outcome !== 'accepted' || first.id === null) throw new ProbeAbort(`创建 A 未被接受（${first.outcome}，retCode ${first.retCode}）`);
     const firstId = first.id, ackAt = first.receivedAt ?? first.sentAt;
     let visible: Listing | null = null, emptyPolls = 0, lastEmptyAfterMs: number | null = null;
@@ -366,6 +380,14 @@ async function main(): Promise<number> {
     };
     step(report, '创建 A：按编号查询', { row, ...(report.findings.create as Row) });
     if (!row) throw new ProbeAbort('创建 A 后 10 秒内按编号查不到该策略');
+    // A is meant to rest at its cap, below the book. If the venue rests it higher it can fill, which only --allow-fill agreed to.
+    const capped = async (price: unknown, executed: unknown): Promise<void> => {
+      const restingAt = amount(price);
+      if (allowFill || isZero(amount(executed) ?? '0') && (restingAt === null || cmp(restingAt, passivePrice) <= 0)) return;
+      step(report, '停止 A（未停在最高追价）', await stopAndSettle('停止 A（未停在最高追价）', firstId));
+      throw new ProbeAbort(`A 没有停在最高追价 ${passivePrice}（挂单价 ${text(price)}，已成交 ${text(executed)}）：可能成交，已停止。如接受成交，请勾选成交测试后重新运行`);
+    };
+    await capped(row.chaseOrderPrice, row.executedSize);
 
     await sleep(2_000);
     const firstChildren = await childOrders(credentials, symbol, firstId), resting = await openOrders(credentials, symbol);
@@ -373,6 +395,8 @@ async function main(): Promise<number> {
       openOrders: resting.rows.map(order => ({ orderId: order.orderId, orderLinkId: order.orderLinkId, price: order.price, qty: order.qty, orderType: order.orderType, timeInForce: order.timeInForce, positionIdx: order.positionIdx, reduceOnly: order.reduceOnly, orderStatus: order.orderStatus, createType: order.createType })),
       childIdsAppearInOpenOrders: firstChildren.rows.length > 0 && firstChildren.rows.every(child => resting.rows.some(order => text(order.orderId) === text(child.orderId))) };
     step(report, '创建 A：子单与账户挂单', { children: firstChildren.rows, ...(report.findings.children as Row) });
+    // The strategy row can lag its first child order; the order book side of it is checked as well.
+    for (const order of resting.rows) await capped(order.price, order.cumExecQty ?? '0');
 
     const createdSecond = Math.floor(createdE3 / 1000), activeStatus = String(row.status);
     const window = async (status: string, name: string, begin: number, end: number): Promise<unknown> => {
