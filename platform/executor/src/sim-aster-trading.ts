@@ -193,8 +193,8 @@ export class SimulatedAsterTrading implements AdlConnector, AsterPositionsConnec
     let quantity = min(request.quantity, held);
     if (fault?.mode === 'partial') quantity = min(quantity, fault.fraction ?? '0');
     if (!isZero(quantity)) this.execute(account, order, quantity);
-    order.status = cmp(order.filled, request.quantity) === 0 ? 'filled' : 'expired';
-    order.updateTime = this.clock();
+    // A full fill keeps the time it filled at, as the position does; only expiring the rest comes after it.
+    if (order.status !== 'filled') { order.status = 'expired'; order.updateTime = this.clock(); }
     if (fault?.mode === 'lost-response') throw new VenueError('uncertain', '模拟回报丢失（交易所已处理）');
     return this.report(order);
   }
