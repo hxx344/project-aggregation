@@ -257,6 +257,26 @@ test('未知划转：流水延迟可见，到期前出现则确认；到期后�
   });
 });
 
+test('未知划转：流水时刻截断到整秒、早于落盘时刻不足一秒仍确认；早于下界的不确认', async () => {
+  // Measured on the venue (2026-11-11): the receipt carries no transaction id and the rows were stamped 396 ms and 25 ms before the send.
+  const floor = (preparedAt: number) => Math.floor(preparedAt / 1000) * 1000 - 1_000;
+  for (const [stamp, expected] of [
+    [(preparedAt: number) => preparedAt - 396, ['confirmed', 'late_receipt_confirmed']],
+    [floor, ['confirmed', 'late_receipt_confirmed']],
+    [(preparedAt: number) => floor(preparedAt) - 1, ['expired-unverified', 'nonce_expired_partial_receipt']],
+  ] as const) {
+    await withHarness(async h => {
+      // The request is lost and the rows are written afterwards, so the only thing deciding is their stamped time.
+      h.advance(600);
+      const sent = await sendUnknown(h, 'lost-request');
+      assert.equal(sent.preparedAt % 1000, 600);
+      h.aster.addExternalTransfer(LONG, SHORT, '100', stamp(sent.preparedAt));
+      await run(h, READY_MS);
+      assert.deepEqual([last(h).state, last(h).basis], expected);
+    });
+  }
+});
+
 test('未知划转：发送前已有的同额外部划转被基线排除；没有基线时也不拿早于本次请求的流水确认', async () => {
   await withHarness(async h => {
     h.aster.addExternalTransfer(LONG, SHORT, '100', h.clock.now - 10_000);
