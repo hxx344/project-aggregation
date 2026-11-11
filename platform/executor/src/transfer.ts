@@ -103,6 +103,8 @@ export interface TransferDeps {
   callVenue<T>(kind: 'read' | 'write', operation: (signal: AbortSignal) => Promise<T>, timeoutMs?: number): Promise<T>;
   event(jobId: string | null, type: string, detail?: Record<string, unknown>): void;
   isWriterLost(error: unknown): boolean;
+  /** Why a pair's accounts cannot be changed now (ADL still works on them), or null. */
+  busy?(pairId: string): string | null;
 }
 
 export type TransferPlan = { source: PairSide; destination: PairSide; amount: string };
@@ -146,7 +148,7 @@ function checkBudgets(budgets: TransferBudgets, connector: TransferConnector | n
   if (budgets.transferClockToleranceMs >= budgets.transferHistorySpanMs) throw new ContractError(500, 'budget', 'transferClockToleranceMs 须小于 transferHistorySpanMs');
 }
 
-export function createTransfers({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost }: TransferDeps) {
+export function createTransfers({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost, busy }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
@@ -624,6 +626,8 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
         db.prepare('INSERT INTO transfer_pairs(id, enabled, version, updated_at, json) VALUES (?, 0, 1, ?, ?)').run(pair.id, now(), JSON.stringify(pair));
       } else {
         const changed = existing.identity !== identity;
+        const reason = changed ? busy?.(parsed.id) ?? null : null;
+        if (reason) reject('adl_incident_open', reason, 409);
         Object.assign(existing, parsed, { identity }, changed ? { enabled: false, balances: null, note: '配对账户已更换，已停用；核对后重新启用' } : {});
         savePair(existing);
       }
@@ -676,6 +680,8 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
   return {
     recover, tick, registerPair, setEnabled,
     pairs: () => listPairs().pairs.map(pairView),
+    /** Readable pair records, for the ADL handling of the same sub-accounts. */
+    records: () => listPairs().pairs,
     corruptPairs: () => listPairs().corrupt,
     recent: (limit = 20) => (db.prepare('SELECT json FROM transfers ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { json: string }[])
       .flatMap(row => { try { return [transferView(JSON.parse(row.json) as Transfer)]; } catch { return []; } }),

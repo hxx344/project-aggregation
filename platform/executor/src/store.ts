@@ -47,6 +47,25 @@ CREATE TABLE transfers (id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES tr
 CREATE INDEX transfers_unsettled ON transfers(created_at) WHERE settled = 0;
 CREATE INDEX transfers_pair ON transfers(pair_id, created_at);
 `,
+}, {
+  version: 4,
+  name: 'aster-adl',
+  sql: `
+CREATE TABLE adl_pairs (pair_id TEXT PRIMARY KEY REFERENCES transfer_pairs(id), version INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE TABLE adl_evidence (key TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES transfer_pairs(id), pending INTEGER NOT NULL, updated_at INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX adl_evidence_pending ON adl_evidence(pair_id) WHERE pending = 1;
+CREATE INDEX adl_evidence_pair ON adl_evidence(pair_id, updated_at);
+CREATE TABLE adl_incidents (id TEXT PRIMARY KEY, pair_id TEXT NOT NULL REFERENCES transfer_pairs(id), status TEXT NOT NULL, final INTEGER NOT NULL,
+  created_at INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE UNIQUE INDEX adl_incidents_open ON adl_incidents(pair_id) WHERE final = 0;
+CREATE INDEX adl_incidents_pair ON adl_incidents(pair_id, created_at);
+CREATE INDEX adl_incidents_created ON adl_incidents(created_at);
+CREATE TABLE adl_batches (id TEXT PRIMARY KEY, incident_id TEXT NOT NULL REFERENCES adl_incidents(id), pair_id TEXT NOT NULL, client_order_id TEXT NOT NULL UNIQUE,
+  state TEXT NOT NULL, settled INTEGER NOT NULL, created_at INTEGER NOT NULL, version INTEGER NOT NULL, json TEXT NOT NULL);
+CREATE INDEX adl_batches_incident ON adl_batches(incident_id, created_at);
+CREATE INDEX adl_batches_open ON adl_batches(pair_id) WHERE settled = 0;
+CREATE INDEX adl_batches_pair ON adl_batches(pair_id, created_at);
+`,
 }]);
 export const sqlHash = (sql: string): string => createHash('sha256').update(sql).digest('hex');
 

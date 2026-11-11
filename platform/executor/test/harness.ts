@@ -8,6 +8,7 @@ import { openStore, type Store } from '../src/store.ts';
 import { createExecutor, type Budgets, type Executor, type ExecutorOptions } from '../src/executor.ts';
 import type { SimulatedVenue } from '../src/sim-venue.ts';
 import type { SimulatedAster } from '../src/sim-aster.ts';
+import type { SimulatedAsterTrading } from '../src/sim-aster-trading.ts';
 import { SIM_BINDINGS, createSimulatedVenues } from '../src/simulation.ts';
 
 export const SESSION = 'test-session-0001';
@@ -20,6 +21,7 @@ export interface Harness {
   binance: SimulatedVenue;
   bybit: SimulatedVenue;
   aster: SimulatedAster;
+  asterTrading: SimulatedAsterTrading;
   store: Store;
   ex: Executor;
   /** Moves the clock forward in lease-safe steps, renewing the lease like the entry heartbeat does. */
@@ -31,23 +33,32 @@ export interface Harness {
 
 export const FAST: Partial<Budgets> = { callTimeoutMs: 50 };
 
+/** README 《回滚（存储迁移 4）》, kept verbatim: back to migration 3. */
+export const ADL_ROLLBACK_SQL = `
+DROP TABLE IF EXISTS adl_batches;
+DROP TABLE IF EXISTS adl_incidents;
+DROP TABLE IF EXISTS adl_evidence;
+DROP TABLE IF EXISTS adl_pairs;
+DELETE FROM commands WHERE kind IN ('adl-config', 'adl-restart');
+DELETE FROM schema_migrations WHERE version = 4;`;
+
 /** control is called once per executor instance, so each restart gets its own registry writer. */
 export function createHarness({ budgets = {}, control }: { budgets?: Partial<Budgets>; control?: (clock: { now: number }) => ExecutorOptions['control'] } = {}): Harness {
   const dir = mkdtempSync(join(tmpdir(), 'pa-executor-'));
   const file = join(dir, 'executor.sqlite');
   const clock = { now: START };
   const now = () => clock.now;
-  const { binance, bybit, aster } = createSimulatedVenues(now);
+  const { binance, bybit, aster, asterTrading } = createSimulatedVenues(now);
   const stores: Store[] = [];
   const make = (extra: Partial<Budgets> = {}) => {
     const store = openStore(file);
     stores.push(store);
-    return { store, ex: createExecutor({ store, connectors: [binance, bybit], transfers: aster, now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock) }) };
+    return { store, ex: createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock) }) };
   };
   const first = make();
   first.ex.acquire();
   const harness: Harness = {
-    dir, file, clock, binance, bybit, aster, store: first.store, ex: first.ex,
+    dir, file, clock, binance, bybit, aster, asterTrading, store: first.store, ex: first.ex,
     advance(ms) {
       let left = ms;
       while (left > 0) { const step = Math.min(left, 10_000); clock.now += step; left -= step; harness.ex.acquire(); }

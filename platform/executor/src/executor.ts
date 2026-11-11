@@ -13,10 +13,13 @@ import {
 } from './connector.ts';
 import type { Store } from './store.ts';
 import { createTransfers } from './transfer.ts';
+import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
+import type { AdlConnector } from './adl-contracts.ts';
 import { ControlRefusal, MAX_OWNED_BUDGET_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /** Start values come from the legacy constants registered in plan 6.4; none of them is a met performance target. */
-export interface Budgets {
+/** The ADL budgets are documented in adl.ts. */
+export interface Budgets extends AdlBudgets {
   previewTtlMs: number;
   previewQuoteMaxAgeMs: number;
   sendQuoteMaxAgeMs: number;
@@ -74,6 +77,7 @@ export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
   historyRetentionMs: 90 * 24 * 3_600_000, pruneIntervalMs: 3_600_000, pruneBatch: 500,
   transferHistorySpanMs: 180_000, transferClockToleranceMs: 60_000, transferLabelDeferMs: 300_000, transferSettleCooldownMs: 30_000, transferUncertainCooldownMs: 300_000, transferRetryMs: 5_000,
   transferReadTimeoutMs: 8_000, transferBaselineTimeoutMs: 1_500, transferBalanceMaxAgeMs: 8_000, transferRefreshDeferMs: 300_000, transferTickBudgetMs: 10_000,
+  ...DEFAULT_ADL_BUDGETS,
 });
 
 export class WriterLostError extends ContractError { constructor(message: string) { super(503, 'writer_lost', message); } }
@@ -208,6 +212,8 @@ export interface ExecutorOptions {
   control?: { writer: AccountWriterPort; environment: ControlEnvironment };
   /** ASTER sub-account transfers. They are not recorded in the shared registry, so with control injected none is sent and no pair can be enabled. */
   transfers?: TransferConnector;
+  /** ASTER ADL emergency handling of the same pairs. Its orders are not recorded in the shared registry either, so with control injected it reconciles and waits but sends none. */
+  adl?: AdlConnector;
 }
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -216,7 +222,7 @@ const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '*
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector }: ExecutorOptions) {
   // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
   const budgets: Budgets = { ...DEFAULT_BUDGETS, ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)) };
   // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
@@ -231,12 +237,13 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     venues.set(connector.venue, connector);
   }
   if (transferConnector && (transferConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
+  if (adlConnector && (adlConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;
   let ticking: Promise<void> | null = null;
   /** The last transfer-pass failure written to the event log; the same reason is written at most once a minute. */
-  let transferTickFailure: { reason: string; at: number } | null = null;
+  let transferTickFailure: { reason: string; at: number } | null = null, adlTickFailure: { reason: string; at: number } | null = null;
   /** Operations whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
   /** Operations whose cancel is running in this process. */
@@ -299,6 +306,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       else if (!job.holdNewSends) { job.holdNewSends = true; job.reason = '服务恢复：核对已发送委托；首腿不再新发并撤销挂单，已成交部分按落盘进度补发对冲腿'; saveJob(job); event(job.id, 'job-held', {}); }
     }
     transfers.recover();
+    adl.recover();
   }
 
   // ---- persistence -------------------------------------------------------------
@@ -361,7 +369,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     try { return await Promise.race([operation(controller.signal), deadline]); }
     finally { clearTimeout(timer); }
   }
-  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError });
+  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+    busy: pairId => adl.busy(pairId) });
+  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records });
   const readFailure = (error: unknown): never => {
     if (error instanceof ContractError) throw error;
     throw new ContractError(502, 'venue_read_failed', `交易所读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知错误'}`);
@@ -1237,17 +1247,25 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     AND NOT EXISTS (SELECT 1 FROM operations o WHERE o.job_id = j.id AND o.settled = 0)`;
   let prunedAt = 0;
   /** Deletes at most pruneBatch rows per table in one short transaction; returns what it removed. */
-  function prune(): { events: number; commands: number; previews: number; transfers: number } {
+  function prune(): { events: number; commands: number; previews: number; transfers: number; adl: number } {
     const cutoff = now() - budgets.historyRetentionMs, limit = budgets.pruneBatch;
     return write(() => {
       const events = Number(db.prepare(`DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE at < ? AND (job_id IS NULL OR job_id IN (${DONE_JOB})) ORDER BY seq LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       // Pair switches name a pair, not a job; past the retention period their request ids need no replay protection.
-      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND (kind = 'transfer-enable' OR job_id IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
+      const commands = Number(db.prepare(`DELETE FROM commands WHERE request_id IN (SELECT request_id FROM commands WHERE accepted_at < ? AND (kind IN ('transfer-enable', 'adl-config', 'adl-restart') OR job_id IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       const previews = Number(db.prepare(`DELETE FROM previews WHERE id IN (SELECT id FROM previews WHERE expires_at < ? AND (consumed_job IS NULL OR consumed_job IN (${DONE_JOB})) LIMIT ?)`).run(cutoff, cutoff, limit).changes);
       // A settled transfer is only history: used receipts, cooldown and pacing live on the pair, which is kept.
       const transfers = Number(db.prepare('DELETE FROM transfers WHERE id IN (SELECT id FROM transfers WHERE settled = 1 AND created_at < ? ORDER BY created_at LIMIT ?)').run(cutoff, limit).changes);
-      if (events + commands + previews + transfers) event(null, 'history-pruned', { events, commands, previews, transfers, before: cutoff });
-      return { events, commands, previews, transfers };
+      // ADL history: settled batches of closed incidents, then the closed incidents left without batches, then handled evidence.
+      // Settings and scan progress live on adl_pairs, which is kept; recent fills (24 h) are far inside the retention period.
+      const adlBatches = Number(db.prepare(`DELETE FROM adl_batches WHERE id IN (SELECT b.id FROM adl_batches b JOIN adl_incidents i ON i.id = b.incident_id
+        WHERE b.settled = 1 AND i.final = 1 AND b.created_at < ? ORDER BY b.created_at LIMIT ?)`).run(cutoff, limit).changes);
+      const adlIncidents = Number(db.prepare(`DELETE FROM adl_incidents WHERE id IN (SELECT i.id FROM adl_incidents i WHERE i.final = 1 AND i.created_at < ?
+        AND NOT EXISTS (SELECT 1 FROM adl_batches b WHERE b.incident_id = i.id) ORDER BY i.created_at LIMIT ?)`).run(cutoff, limit).changes);
+      const adlEvidence = Number(db.prepare('DELETE FROM adl_evidence WHERE key IN (SELECT key FROM adl_evidence WHERE pending = 0 AND updated_at < ? ORDER BY updated_at LIMIT ?)').run(cutoff, limit).changes);
+      const adl = adlBatches + adlIncidents + adlEvidence;
+      if (events + commands + previews + transfers + adl) event(null, 'history-pruned', { events, commands, previews, transfers, adl, before: cutoff });
+      return { events, commands, previews, transfers, adl };
     });
   }
 
@@ -1358,10 +1376,21 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         catch (inner) { if (inner instanceof WriterLostError) throw inner; }
       }
     }
+    // ADL after transfers: it reads the same pairs and must not cost the jobs their pass either.
+    try { await adl.tick(); }
+    catch (error) {
+      if (error instanceof WriterLostError) throw error;
+      const reason = error instanceof Error ? error.message.slice(0, 160) : '未知';
+      const at = now();
+      if (!adlTickFailure || adlTickFailure.reason !== reason || at - adlTickFailure.at >= 60_000) {
+        try { write(() => event(null, 'adl-tick-failed', { reason })); adlTickFailure = { reason, at }; }
+        catch (inner) { if (inner instanceof WriterLostError) throw inner; }
+      }
+    }
     // Again at the end, so a result reconciled in this pass releases its account before the next one.
     settleControl();
   }
-  /** One serialized pass over unfinished jobs, then over transfers. */
+  /** One serialized pass over unfinished jobs, then over transfers and ADL incidents. */
   function tick(): Promise<void> {
     if (!ticking) ticking = runTick().finally(() => { ticking = null; });
     return ticking;
@@ -1410,6 +1439,11 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     transferPairs: transfers.pairs,
     corruptTransferPairs: transfers.corruptPairs,
     recentTransfers: transfers.recent,
+    adlPairs: adl.pairs,
+    adlIncident: adl.incident,
+    recentAdlIncidents: adl.recent,
+    setAdlConfig: adl.setConfig,
+    restartAdl: adl.restart,
     unfinished: () => unfinishedJobs().map(job => job.id),
     recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
@@ -1422,6 +1456,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     close() {
       if (closed) return;
       closed = true;
+      adl.close();
       if (held && !retired) {
         store.tx(() => db.prepare('UPDATE writer SET expires_at = ? WHERE id = 1 AND owner = ? AND generation = ?').run(now(), owner, generation));
         retired = true;

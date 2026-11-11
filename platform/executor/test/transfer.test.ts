@@ -16,7 +16,7 @@ import { SimulatedAster } from '../src/sim-aster.ts';
 import type { AccountWriterPort } from '../src/account-control.ts';
 import type { PairRecord } from '../src/transfer.ts';
 import { SIM_TRANSFER_PAIR } from '../src/simulation.ts';
-import { SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
+import { ADL_ROLLBACK_SQL, SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
 
 const { id: PAIR, mainAccountId: MAIN, long: LONG, short: SHORT } = SIM_TRANSFER_PAIR;
 const THIRD = `0x${'d'.repeat(40)}`, FOURTH = `0x${'e'.repeat(40)}`, OTHER_MAIN = `0x${'f'.repeat(40)}`;
@@ -1097,6 +1097,8 @@ test('存储：已有 v2 库升级到 v3 只新增划转的两张表与两个索
   const added = ['transfer_pairs', 'transfers', 'transfers_pair', 'transfers_unsettled'];
   const store = openStore(file);
   try {
+    // Migration 4 (ADL) has its own upgrade test; this one checks migration 3 alone.
+    store.db.exec(ADL_ROLLBACK_SQL);
     assert.equal(store.schemaVersion(), 3);
     assert.deepEqual(names(store.db), [...before, ...added].sort());
     assert.equal((store.db.prepare("SELECT COUNT(*) AS n FROM events WHERE type = 'legacy'").get() as { n: number }).n, 1);

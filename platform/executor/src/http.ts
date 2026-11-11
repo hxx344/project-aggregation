@@ -14,6 +14,8 @@ const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
 const UUID_PATH = /^\/api\/jobs\/([0-9a-f-]{36})(?:\/(stop|acknowledge|adopt-strategy|confirm-not-created|release-strategy))?$/i;
 
 const PAIR_PATH = /^\/api\/transfer-pairs\/([0-9A-Za-z_-]{1,64})\/(enable|disable)$/;
+const ADL_CONFIG_PATH = /^\/api\/adl\/pairs\/([0-9A-Za-z_-]{1,64})\/config$/;
+const ADL_RESTART_PATH = /^\/api\/adl\/incidents\/([0-9a-f-]{36})\/restart$/;
 
 const PAGE_HEADERS = {
   'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff', 'x-frame-options': 'DENY', 'referrer-policy': 'no-referrer',
@@ -81,7 +83,8 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
 
     if (request.method === 'GET' && url.pathname === '/api/state') {
       return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), jobs: executor.recentJobs(20),
-        transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) } });
+        transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
+        adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) } });
     }
     if (request.method === 'GET' && url.pathname === '/api/observe') {
       const venue = url.searchParams.get('venue') ?? '', symbol = url.searchParams.get('symbol') ?? '';
@@ -94,6 +97,16 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (pair) {
       const body = exactKeys(await readJson(request), ['requestId']);
       return send(response, 200, await executor.setTransferEnabled({ pairId: pair[1], enabled: pair[2] === 'enable', requestId: body.requestId }, session));
+    }
+    const adlConfig = request.method === 'POST' ? ADL_CONFIG_PATH.exec(url.pathname) : null;
+    if (adlConfig) {
+      const body = exactKeys(await readJson(request), ['requestId', 'autoReduce', 'batchNotional']);
+      return send(response, 200, executor.setAdlConfig({ pairId: adlConfig[1], ...body }, session));
+    }
+    const adlRestart = request.method === 'POST' ? ADL_RESTART_PATH.exec(url.pathname) : null;
+    if (adlRestart) {
+      const body = exactKeys(await readJson(request), ['requestId']);
+      return send(response, 200, executor.restartAdl({ incidentId: adlRestart[1], requestId: body.requestId }, session));
     }
     const match = UUID_PATH.exec(url.pathname);
     // The path match is case-insensitive, so the action is compared lowercased; otherwise /STOP would fall through to acknowledge.

@@ -59,8 +59,8 @@ async function main(): Promise<void> {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const store = openStore(join(dir, 'executor.sqlite'));
-  const { binance, bybit, aster } = createSimulatedVenues(Date.now);
-  const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster });
+  const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
+  const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading });
   if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
   for (const binding of SIM_BINDINGS) executor.registerAccount(binding);
   // A new pair starts disabled; an existing one keeps its switch and settings.

@@ -1,7 +1,7 @@
 // Minimal single-file page: preview, confirm (retries keep the same requestId),
 // the accepted job shown apart from the list, stop, acknowledge, adopting a Bybit
 // chase strategy, confirming it was not created or releasing it, ANT read-only,
-// and the ASTER margin-balance pairs with their transfers.
+// the ASTER margin-balance pairs with their transfers, and their ADL emergency handling.
 export const PAGE = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>执行器原型（模拟）</title>
 <style>
@@ -30,6 +30,9 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <h2>ASTER 保证金平衡（模拟）</h2>
 <p class="muted">在配对的多侧与空侧子账户之间划转 USD1。结果未知的划转不重发，原请求过期后核对两侧流水并自动结算。</p>
 <div id="pairs" class="muted">—</div><div id="transfers"></div>
+<h2>ASTER ADL 应急处理（模拟）</h2>
+<p class="muted">交易所自动减仓使配对两侧多空总量不一致时，按只减仓市价单分批减少多出的一侧，直到总量一致后自动结束。结果未知的减仓单不重发，有界核对后按新现场继续；不足最小下单量的残差记为完成。</p>
+<div id="adlPairs" class="muted">—</div><div id="adlRecent"></div>
 <h2>ANT 只读（Binance ANTHROPICUSDT）</h2><div id="ant" class="muted">—</div>
 <script>
 const $ = id => document.getElementById(id);
@@ -63,6 +66,38 @@ const SIDE = { long: '多侧', short: '空侧' };
 const TRANSFER_STATE = { prepared: '已落盘', sending: '发送中', acknowledged: '已回执，待刷新余额', unknown: '结果未知，待到期结算', confirmed: '已执行', rejected: '被拒绝', 'not-sent': '未发送', 'expired-not-executed': '到期结算：未执行', 'expired-unverified': '到期结算：是否执行未能确认' };
 // A switch keeps its requestId only while no answer arrived, so a lost response is replayed safely; any answer, refusals included, ends that request.
 const pairRequests = {};
+const ADL_STATUS = { active: '处理中', blocked: '受阻（保留现场）', halted: '已停止自动减仓', watching: '已平衡，观察未知原单', completed: '已结束' };
+const ADL_PROGRESS = { balanced: '已平衡', residual: '残差（记为完成）', reducing: '本批减仓', pending: '待减仓', blocked: '受阻', held: '暂停', manual: '待手工平衡' };
+const ADL_BATCH = { prepared: '已落盘', sending: '发送中', open: '交易所挂单中', unknown: '结果未知，核对中', 'unknown-verified': '多次核对无回执，观察中', done: '已结束', rejected: '被拒绝', 'not-sent': '未发送', 'unknown-closed': '观察期满，结果未知' };
+const DIRECTION = { long: '多', short: '空' };
+// Typed ADL settings survive the periodic re-render; a request keeps its id until an answer arrives, like the pair switch.
+const adlInputs = {}, adlRequests = {};
+const adlRequestId = (key, input) => { const saved = adlRequests[key]; if (!saved || saved.input !== input) adlRequests[key] = { input, requestId: crypto.randomUUID() }; return adlRequests[key].requestId; };
+function adlProgress(incident) {
+  const rows = Object.entries(incident.progress || {});
+  return rows.length ? rows.map(([symbol, entry]) => esc(symbol) + ' ' + esc(ADL_PROGRESS[entry.status] || entry.status) + (entry.direction ? ' · 多出' + esc(DIRECTION[entry.direction]) + '仓 ' + esc(entry.residual) : '') + (entry.reason ? '<br><span class="muted">' + esc(entry.reason) + '</span>' : '')).join('<br>') : '<span class="muted">尚未读取现场</span>';
+}
+function adlBatchRows(incident) {
+  if (!incident.batches.length) return '<span class="muted">没有减仓批次</span>';
+  return '<table><tr><th>时间</th><th>侧</th><th>合约</th><th>减仓</th><th>成交</th><th>状态</th><th>备注</th></tr>' + incident.batches.map(batch => '<tr><td>' + esc(clock(batch.sentAt || batch.preparedAt)) + '</td><td>' + esc(SIDE[batch.side]) + ' ' + esc(batch.account) + '</td><td>' + esc(batch.symbol) + ' ' + esc(batch.positionSide) + '</td><td>'
+    + esc(batch.orderSide === 'sell' ? '卖' : '买') + ' ' + esc(batch.quantity) + '</td><td>' + esc(batch.filledQuantity ?? '—') + (batch.averagePrice ? ' @ ' + esc(batch.averagePrice) : '') + '</td><td>' + esc(ADL_BATCH[batch.state] || batch.state) + (batch.recovered ? '（接管恢复）' : '') + (batch.cancelRequested ? '（已撤单）' : '') + '</td><td>' + esc(batch.note) + '</td></tr>').join('') + '</table>';
+}
+function adlIncidentHtml(incident) {
+  const residuals = incident.residuals.length ? '<br>残差：' + incident.residuals.map(item => esc(item.symbol) + ' 多出' + esc(DIRECTION[item.direction]) + '仓 ' + esc(item.quantity)).join('、') : '';
+  const evidence = incident.evidence.map(item => esc(SIDE[item.side]) + ' ' + esc(item.symbol) + ' ' + esc(item.positionSide || '') + ' ADL 成交 ' + esc(item.filledQuantity) + (item.conflict ? ' <span class="err">' + esc(item.conflict) + '</span>' : '')).join('<br>');
+  return '<div data-adl-incident="' + esc(incident.id) + '"><b>' + esc(ADL_STATUS[incident.status] || incident.status) + '</b> · 事件 ' + esc(incident.id.slice(0, 8)) + ' · 合约 ' + esc(incident.symbols.join('、')) + ' · 处理时长 ' + esc(Math.round(incident.activeMs / 1000)) + ' 秒 · 本轮批次 ' + esc(incident.batchesSinceRestart)
+    + (incident.restarts ? ' · 已重新开始 ' + esc(incident.restarts) + ' 次' : '') + (incident.watchUntil ? ' · 观察至 ' + esc(clock(incident.watchUntil)) : '')
+    + '<br>' + esc(incident.reason) + residuals
+    + (incident.status === 'halted' ? '<br><button data-adl-restart="' + esc(incident.id) + '">重新开始自动减仓</button><span class="muted">（重置时限与批次计数，所有安全检查照常）</span>' : '')
+    + '<br><span class="muted">ADL 证据：</span><br>' + (evidence || '—') + '<br><span class="muted">各合约进度：</span><br>' + adlProgress(incident) + adlBatchRows(incident) + '</div>';
+}
+function adlPairRow(pair) {
+  const input = adlInputs[pair.pairId] || { autoReduce: pair.config.autoReduce, batchNotional: pair.config.batchNotional };
+  const scan = pair.scans ? ['long', 'short'].map(side => esc(SIDE[side]) + ' 已查至 ' + esc(clock(pair.scans[side].coveredUntil)) + (pair.scans[side].pendingWindows ? ' 待查 ' + esc(pair.scans[side].pendingWindows) + ' 段' : '') + (pair.scans[side].note ? ' <span class="err">' + esc(pair.scans[side].note) + '</span>' : '')).join('<br>') : '尚未开始';
+  return '<tr><td>' + esc(pair.pairId) + '<br><span class="muted">多 ' + esc(pair.long) + ' / 空 ' + esc(pair.short) + '</span>' + (pair.shared ? '<br><span class="err">' + esc(pair.shared) + '</span>' : '') + '</td>'
+    + '<td><label><input type="checkbox" style="width:auto" data-adl-auto="' + esc(pair.pairId) + '"' + (input.autoReduce ? ' checked' : '') + '> 自动减仓</label><br>单批上限 <input data-adl-notional="' + esc(pair.pairId) + '" value="' + esc(input.batchNotional) + '"> USDT <button data-adl-save="' + esc(pair.pairId) + '">保存</button></td>'
+    + '<td>' + scan + '</td><td>' + (pair.incident ? adlIncidentHtml(pair.incident) : '<span class="muted">无进行中的 ADL 事件</span>') + '</td></tr>';
+}
 const clock = at => at ? new Date(at).toLocaleTimeString() : '—';
 function transferText(item) {
   return esc(SIDE[item.sourceSide]) + ' → ' + esc(SIDE[item.destinationSide]) + ' ' + esc(item.amount) + ' ' + esc(item.asset) + ' · ' + esc(TRANSFER_STATE[item.state] || item.state)
@@ -113,6 +148,31 @@ async function confirmPreview() {
 document.addEventListener('input', event => {
   const id = event.target.dataset?.strategyInput;
   if (id) strategyInputs[id] = event.target.value.trim();
+  const auto = event.target.dataset?.adlAuto, notional = event.target.dataset?.adlNotional, pairId = auto || notional;
+  if (pairId) {
+    const row = event.target.closest('tr');
+    adlInputs[pairId] = { autoReduce: row.querySelector('[data-adl-auto]').checked, batchNotional: row.querySelector('[data-adl-notional]').value.trim() };
+  }
+});
+document.addEventListener('click', async event => {
+  const { adlSave, adlRestart } = event.target.dataset || {};
+  if (!adlSave && !adlRestart) return;
+  const key = adlSave ? 'config:' + adlSave : 'restart:' + adlRestart;
+  try {
+    if (adlSave) {
+      const row = event.target.closest('tr'), input = { autoReduce: row.querySelector('[data-adl-auto]').checked, batchNotional: row.querySelector('[data-adl-notional]').value.trim() };
+      await api('/api/adl/pairs/' + adlSave + '/config', { requestId: adlRequestId(key, JSON.stringify(input)), ...input });
+      delete adlInputs[adlSave];
+    } else {
+      if (!confirm('重新开始自动减仓：重置处理时限与批次计数，重新核对现场后继续分批市价减仓。确定？')) return;
+      await api('/api/adl/incidents/' + adlRestart + '/restart', { requestId: adlRequestId(key, '') });
+    }
+    delete adlRequests[key];
+    refresh();
+  } catch (error) {
+    if (error.status) delete adlRequests[key];
+    alert(error.message);
+  }
 });
 document.addEventListener('click', async event => {
   const { pair, enable } = event.target.dataset || {};
@@ -159,6 +219,11 @@ async function refresh() {
     $('pairs').innerHTML = state.transfers.pairs.length ? '<table><tr><th>配对</th><th>开关</th><th>两侧余额（USD1）</th><th>当前划转</th><th>说明</th><th></th></tr>' + state.transfers.pairs.map(pairRow).join('') + '</table>' : '没有划转配对';
     if (state.transfers.corruptPairs.length) $('pairs').innerHTML += '<p>配对记录损坏，未列出也不会划转，需人工处置：' + esc(state.transfers.corruptPairs.join('，')) + '</p>';
     $('transfers').innerHTML = state.transfers.recent.length ? '<table><tr><th>划转</th><th>配对</th><th>时间</th><th>方向、金额与状态</th><th>结算依据</th><th>备注</th></tr>' + state.transfers.recent.map(transferRow).join('') + '</table>' : '';
+    // Like the strategy id, the ADL settings are not re-rendered while one of them has the focus.
+    const editingAdl = document.activeElement?.dataset?.adlNotional || document.activeElement?.dataset?.adlAuto;
+    if (!editingAdl) $('adlPairs').innerHTML = state.adl.pairs.length ? '<table><tr><th>配对</th><th>设置</th><th>ADL 历史扫描</th><th>当前事件</th></tr>' + state.adl.pairs.map(adlPairRow).join('') + '</table>' : '没有划转配对';
+    const finished = state.adl.recent.filter(incident => incident.status === 'completed');
+    $('adlRecent').innerHTML = finished.length ? '<h3 style="font-size:14px">最近结束的 ADL 事件</h3><table><tr><th>事件</th><th>开始</th><th>结束</th><th>合约</th><th>结论</th><th>批次</th></tr>' + finished.map(incident => '<tr><td>' + esc(incident.id.slice(0, 8)) + (incident.parentId ? '<br><span class="muted">续 ' + esc(incident.parentId.slice(0, 8)) + '</span>' : '') + '</td><td>' + esc(clock(incident.createdAt)) + '</td><td>' + esc(clock(incident.closedAt)) + '</td><td>' + esc(incident.symbols.join('、')) + '</td><td>' + esc(incident.reason) + '</td><td>' + esc(incident.totalBatches) + '</td></tr>').join('') + '</table>' : '';
     if (acceptedJob) { const latest = state.jobs.find(job => job.id === acceptedJob.id); if (latest) { acceptedJob = latest; if (!typing) $('accepted').innerHTML = '<table>' + jobRow(latest) + '</table>'; } }
   } catch (error) {
     // A failed refresh never clears the accepted job or the last known list.
