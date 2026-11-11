@@ -13,7 +13,7 @@ import { TypedDataEncoder, Wallet, keccak256 as ethersKeccak, recoverAddress } f
 import { bybitAuthHeaders } from '../../../server/exchange-transport/bybit.mjs';
 import { addressOf, asterDigest, keccak256, pythonUrlencode, signAsterMessage } from '../../../server/contract-probes/lib/eip712.ts';
 import { bybitHeaders } from '../../../server/contract-probes/lib/bybit-sign.ts';
-import { ProbeAbort, liveAllowed, parseEnvFile, positiveDecimal, redact } from '../../../server/contract-probes/lib/common.ts';
+import { ProbeAbort, liveAllowed, parseEnvFile, positiveDecimal, redact, sleep } from '../../../server/contract-probes/lib/common.ts';
 
 const hex = (bytes: Uint8Array): string => '0x' + Buffer.from(bytes).toString('hex');
 const DOMAIN = { name: 'AsterSignTransaction', version: '1', chainId: 1666, verifyingContract: '0x0000000000000000000000000000000000000000' };
@@ -155,6 +155,8 @@ test('契约探测（ASTER，替身接口）：只读运行不发任何 POST；�
   const probes = report.findings.nonce.probes as { offsetSeconds: number; amount: string; outcome: string; landed: boolean; nonceAheadOfEarlierMs: number }[];
   assert.deepEqual(probes.map(probe => [probe.offsetSeconds, probe.amount, probe.outcome, probe.landed]), [[-8, '1.51', 'refused-unlisted', false], [-2, '1.52', 'accepted', true], [3, '1.53', 'accepted', true]]);
   assert.ok(probes.every(probe => probe.nonceAheadOfEarlierMs > 0), JSON.stringify(probes));
+  // Waits run on the stand-in's clock, not shortened: the refused probe was still watched for the whole 75 s nonce horizon.
+  assert.ok((report.findings.nonce.probes[0].watchedMs as number) >= 75_000, JSON.stringify(probes));
   assert.ok('划回 nonce 探测 1.52 B→A' in report.findings.transfers && '划回 nonce 探测 1.53 B→A' in report.findings.transfers);
   assert.deepEqual(report.writes.map((write: { outcome: string }) => write.outcome), ['accepted', 'accepted', 'refused-unlisted', 'accepted', 'accepted', 'accepted', 'accepted']);
   const first = report.findings.transfers['划转 A→B'];
@@ -256,6 +258,21 @@ test('契约探测（Bybit，替身接口）：停止后未确认结清时不再
   const report = JSON.parse(stuck.report);
   assert.match(report.outcome, /未确认策略已结束/);
   assert.equal(report.findings.cleanup.clean, true);
+});
+
+test('契约探测：等待替换只对测试替身生效，指向其他 fetch 时在发出请求前中止；没有替换时等待按真实时长', async () => {
+  const { env } = asterEnv();
+  for (const [script, args] of [['aster-transfer.ts', [...ASTER_BASE, '--live', '--confirm', ASTER_PHRASE]], ['bybit-chase.ts', ['--symbol', 'CLUSDT']], ['bybit-chase.ts', ['--symbol', 'CLUSDT', '--live', '--confirm', BYBIT_PHRASE]]] as const) {
+    const result = stubbed(script, [...args], { ...(script === 'aster-transfer.ts' ? env : bybitEnv()), CONTRACT_STUB_FAULT: 'seam-unpaired' });
+    assert.equal(result.status, 1, result.output);
+    assert.deepEqual(result.requests, []);
+    assert.match(result.output, /已中止：检测到测试用的等待替换，但请求不会发往测试替身/);
+    assert.deepEqual(JSON.parse(result.report).writes, []);
+  }
+  // This process has no stand-in: three 200 ms-or-less timer waits.
+  const started = performance.now();
+  await sleep(450);
+  assert.ok(performance.now() - started >= 400);
 });
 
 test('契约探测（Bybit）：--data-dir 只读解密工作台保存的执行账户，不在数据目录里留下任何新文件', () => {
