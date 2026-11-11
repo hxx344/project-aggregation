@@ -24,6 +24,9 @@ case "$lane" in
   all|behavior|package) ;;
   *) echo 'INSTALL_TEST_LANE must be all, behavior or package.' >&2; exit 1 ;;
 esac
+# CI spreads the root behavior tests over runners by file: node's --test-shard value (index/total).
+shard=${INSTALL_TEST_SHARD:-}
+[[ -z $shard || $shard =~ ^[1-9][0-9]*/[1-9][0-9]*$ ]] || { echo 'INSTALL_TEST_SHARD must be index/total.' >&2; exit 1; }
 work_dir="$test_root/work"
 mkdir -p "$APP_DIR/build-home" "$APP_DIR/cache" "$APP_DIR/releases" "$work_dir"
 chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/build-home"
@@ -95,7 +98,14 @@ workspace_root_tests() {
   module_outputs_prepared=()
   prepare_build_cache_helper
   prepare_module_builds
-  (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
+  if [[ -z $shard ]]; then
+    (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" "$PNPM_BIN" test)
+  else
+    # node reads options only before the file list, so a shard cannot go through `pnpm test`.
+    # Refuse to run if the script no longer is the command repeated here.
+    grep -qF '"test": "node --test tests/*.test.mjs"' "$work_dir/source/package.json" || { echo 'The root test script changed; update the sharded command.' >&2; return 1; }
+    (cd "$work_dir/source"; run_as_service env GREEKS_PYTHON="$test_root/python/bin/python" ASTER_PYTHON="$test_root/python-aster/bin/python" "$NODE_BIN" --test --test-shard="$shard" tests/*.test.mjs)
+  fi
 }
 workspace_reuse_check() {
   # A fresh extraction on the next upgrade must hydrate all four module outputs
@@ -199,7 +209,8 @@ workspace_export_module_caches() {
 prepare_build_cache_helper
 if [[ -n ${INSTALL_TEST_MODULE_CACHE:-} ]]; then workspace_import_module_caches "$INSTALL_TEST_MODULE_CACHE"; fi
 workspace_start_job python-setup workspace_python_setup
-if [[ $lane != package ]]; then workspace_start_job frontend-checks workspace_frontend_checks; fi
+# With shards, the first one runs the frontend checks.
+if [[ $lane != package && ( -z $shard || $shard == 1/* ) ]]; then workspace_start_job frontend-checks workspace_frontend_checks; fi
 for module in "${MODULE_BUILD_IDS[@]}"; do
   workspace_start_job "module-build-$module" workspace_module_build "$module"
 done

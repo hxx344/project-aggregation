@@ -36,15 +36,21 @@ permissions:
 
 jobs:
   app:
-    name: App ${{ matrix.lane }} (Ubuntu 24.04 x64, Node 24.15.0)
+    name: App ${{ matrix.lane }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }} (Ubuntu 24.04 x64, Node 24.15.0)
     # Match the deployment server: Ubuntu 24.04 LTS / x86_64.
     runs-on: ubuntu-24.04
     strategy:
       matrix:
-        # Both lanes run the real installer path on their own runner: package
-        # assembles, packages and verifies the release; behavior runs the
-        # frontend checks and root behavior tests.
-        lane: [package, behavior]
+        # Every entry runs the real installer path on its own runner: package
+        # assembles, packages and verifies the release; behavior runs the root
+        # behavior tests, split by file over two runners (node --test-shard),
+        # and its first shard also runs the frontend checks.
+        include:
+          - lane: package
+          - lane: behavior
+            shard: 1/2
+          - lane: behavior
+            shard: 2/2
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -90,7 +96,7 @@ jobs:
           module_cache="$RUNNER_TEMP/module-cache"
           mkdir -p "$module_cache"
           pip_cache="$(python -m pip cache dir)"
-          sudo env WORKSPACE_DISPOSABLE_CI=1 GITHUB_ACTIONS=true GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" GITHUB_JOB="app-${{ matrix.lane }}" INSTALL_TEST_EVIDENCE_DIR="$RUNNER_TEMP/deployment-evidence" INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" INSTALL_TEST_MODULE_CACHE="$module_cache" INSTALL_TEST_MODULE_CACHE_EXPORT="${{ matrix.lane == 'package' && '1' || '0' }}" bash deploy/test-workspace.sh
+          sudo env WORKSPACE_DISPOSABLE_CI=1 GITHUB_ACTIONS=true GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" GITHUB_JOB="app-${{ matrix.lane }}" INSTALL_TEST_EVIDENCE_DIR="$RUNNER_TEMP/deployment-evidence" INSTALL_TEST_LANE="${{ matrix.lane }}" INSTALL_TEST_SHARD="${{ matrix.shard }}" INSTALL_TEST_PACKAGE="${{ matrix.lane == 'package' && '1' || '0' }}" INSTALL_TEST_NODE="$(command -v node)" INSTALL_TEST_PNPM="${{ steps.pnpm.outputs.dest }}/node_modules/pnpm/bin/pnpm.mjs" INSTALL_TEST_PYTHON="$(command -v python)" INSTALL_TEST_PIP_CACHE="$pip_cache" INSTALL_TEST_PNPM_STORE="${{ steps.pnpm-store.outputs.root }}" INSTALL_TEST_MODULE_CACHE="$module_cache" INSTALL_TEST_MODULE_CACHE_EXPORT="${{ matrix.lane == 'package' && '1' || '0' }}" bash deploy/test-workspace.sh
           if [[ -f "$module_cache.updated" ]]; then echo "module-cache-updated=1" >> "$GITHUB_OUTPUT"; fi
       - name: Save rebuilt module builds for later runs
         if: steps.workspace.outputs.module-cache-updated == '1'
