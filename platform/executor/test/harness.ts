@@ -53,7 +53,7 @@ export function createHarness({ budgets = {}, control }: { budgets?: Partial<Bud
   const make = (extra: Partial<Budgets> = {}) => {
     const store = openStore(file);
     stores.push(store);
-    return { store, ex: createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock) }) };
+    return { store, ex: createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading, now, budgets: { ...FAST, ...budgets, ...extra }, control: control?.(clock) }) };
   };
   const first = make();
   first.ex.acquire();

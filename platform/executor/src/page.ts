@@ -30,6 +30,9 @@ table{border-collapse:collapse;width:100%} td,th{border-bottom:1px solid #eaeef2
 <h2>ASTER 保证金平衡（模拟）</h2>
 <p class="muted">在配对的多侧与空侧子账户之间划转 USD1。结果未知的划转不重发，原请求过期后核对两侧流水并自动结算。</p>
 <div id="pairs" class="muted">—</div><div id="transfers"></div>
+<h2>ASTER 账户持仓（模拟，只读）</h2>
+<p class="muted">定时读取每个配对多侧与空侧子账户的全部持仓，只展示，不下单。某次读取失败时继续显示上次结果并注明，超过有效期后不再显示；两侧最新读取都成功时才判断多空总量是否一致。</p>
+<div id="positionsNotice"></div><div id="positions" class="muted">—</div>
 <h2>ASTER ADL 应急处理（模拟）</h2>
 <p class="muted">交易所自动减仓使配对两侧多空总量不一致时，按只减仓市价单分批减少多出的一侧，直到总量一致后自动结束。结果未知的减仓单不重发，有界核对后按新现场继续；不足最小下单量的残差记为完成。</p>
 <div id="adlPairs" class="muted">—</div><div id="adlRecent"></div>
@@ -99,6 +102,28 @@ function adlPairRow(pair) {
     + '<td>' + scan + '</td><td>' + (pair.incident ? adlIncidentHtml(pair.incident) : '<span class="muted">无进行中的 ADL 事件</span>') + '</td></tr>';
 }
 const clock = at => at ? new Date(at).toLocaleTimeString() : '—';
+const POSITION_STATE = { pending: '尚未读取', fresh: '最新', retained: '最近一次读取失败，显示上次结果', unavailable: '不可用' };
+let positionsShownAt = null, positionsCurrent = false;
+function positionSide(name, side) {
+  const head = esc(SIDE[name]) + ' ' + esc(side.account) + ' · <span class="' + (side.state === 'fresh' ? 'ok' : side.state === 'pending' ? 'muted' : 'err') + '">' + esc(POSITION_STATE[side.state] || side.state) + '</span>'
+    + (side.sampledAt ? ' · 采样于 ' + esc(clock(side.sampledAt)) + '（' + esc(Math.round(side.ageMs / 1000)) + ' 秒前）' : '') + (side.note ? '<br><span class="muted">' + esc(side.note) + '</span>' : '');
+  if (!side.positions.length) return head + (side.state === 'fresh' || side.state === 'retained' ? '<br><span class="muted">无持仓</span>' : '');
+  return head + '<table><tr><th>合约</th><th>方向</th><th>数量</th><th>开仓均价</th><th>标记价</th><th>名义价值</th><th>未实现盈亏</th><th>交易所更新</th></tr>'
+    + side.positions.map(row => '<tr><td>' + esc(row.symbol) + '</td><td>' + esc(DIRECTION[row.direction]) + (row.positionSide === 'BOTH' ? '（单向持仓模式）' : '') + '</td><td>' + esc(row.quantity) + '</td><td>' + esc(row.entryPrice) + '</td><td>' + esc(row.markPrice)
+      + '</td><td>' + esc(row.notional) + '</td><td>' + esc(row.unrealizedProfit) + '</td><td>' + esc(clock(row.updateTime)) + '</td></tr>').join('') + '</table>';
+}
+function positionTotals(pair) {
+  if (!pair.totals) return '<span class="muted">两侧持仓都有效时才汇总</span>';
+  if (!pair.totals.length) return '<span class="muted">两侧均无持仓</span>';
+  return '<table><tr><th>合约</th><th>多侧账户净持仓</th><th>空侧账户净持仓</th><th>两侧合计</th><th>多空总量</th></tr>' + pair.totals.map(row => '<tr><td>' + esc(row.symbol) + '</td><td>' + esc(row.long) + '</td><td>' + esc(row.short) + '</td><td>' + esc(row.total) + '</td><td>'
+    + (row.balanced === null ? '<span class="muted">未判断（' + esc(pair.verdictNote) + '）</span>' : row.balanced ? '<span class="ok">一致</span>' : '<span class="err">不一致</span>') + '</td></tr>').join('') + '</table>';
+}
+function positionsHtml(view) {
+  if (!view.available) return '未接入 ASTER 持仓读取';
+  if (!view.pairs.length) return '没有划转配对';
+  return '<p class="muted">每 ' + esc(Math.round(view.refreshMs / 1000)) + ' 秒读取一次，有效期 ' + esc(Math.round(view.maxAgeMs / 1000)) + ' 秒；数量为基础币，价格与金额为计价币。</p>'
+    + view.pairs.map(pair => '<div data-positions-pair="' + esc(pair.pairId) + '"><b>' + esc(pair.pairId) + '</b>' + (pair.enabled ? '' : '<span class="muted">（划转已停用）</span>') + '<br>' + positionSide('long', pair.long) + '<br>' + positionSide('short', pair.short) + '<br><span class="muted">按合约汇总：</span>' + positionTotals(pair) + '</div>').join('<hr>');
+}
 function transferText(item) {
   return esc(SIDE[item.sourceSide]) + ' → ' + esc(SIDE[item.destinationSide]) + ' ' + esc(item.amount) + ' ' + esc(item.asset) + ' · ' + esc(TRANSFER_STATE[item.state] || item.state)
     + (item.readyAt ? '（' + esc(clock(item.readyAt)) + ' 后结算）' : '') + (item.recovered ? '（接管恢复）' : '');
@@ -210,6 +235,8 @@ document.addEventListener('click', async event => {
   catch (error) { alert(error.message); }
 });
 async function refresh() {
+  // Set once this refresh has rendered the positions, so a later failure in the same refresh does not call them stale.
+  positionsCurrent = false;
   try {
     const state = await api('/api/state');
     $('status').textContent = '写者代次 ' + state.generation + (state.retired ? '（已失去写入权，请重启）' : '') + ' · 传输 ' + state.transport + ' · 账户 ' + state.accounts.map(a => a.venue + ' ' + a.accountMode + ' ' + a.accountId + ' v' + a.credentialVersion).join('，');
@@ -218,6 +245,7 @@ async function refresh() {
     if (!typing) $('jobs').innerHTML = '<table><tr><th>任务</th><th>状态</th><th>两腿</th><th>说明</th><th></th></tr>' + state.jobs.map(jobRow).join('') + '</table>';
     $('pairs').innerHTML = state.transfers.pairs.length ? '<table><tr><th>配对</th><th>开关</th><th>两侧余额（USD1）</th><th>当前划转</th><th>说明</th><th></th></tr>' + state.transfers.pairs.map(pairRow).join('') + '</table>' : '没有划转配对';
     if (state.transfers.corruptPairs.length) $('pairs').innerHTML += '<p>配对记录损坏，未列出也不会划转，需人工处置：' + esc(state.transfers.corruptPairs.join('，')) + '</p>';
+    $('positions').innerHTML = positionsHtml(state.positions); positionsShownAt = state.positions.checkedAt; positionsCurrent = true; $('positionsNotice').innerHTML = '';
     $('transfers').innerHTML = state.transfers.recent.length ? '<table><tr><th>划转</th><th>配对</th><th>时间</th><th>方向、金额与状态</th><th>结算依据</th><th>备注</th></tr>' + state.transfers.recent.map(transferRow).join('') + '</table>' : '';
     // Like the strategy id, the ADL settings are not re-rendered while one of them has the focus.
     const editingAdl = document.activeElement?.dataset?.adlNotional || document.activeElement?.dataset?.adlAuto;
@@ -228,6 +256,8 @@ async function refresh() {
   } catch (error) {
     // A failed refresh never clears the accepted job or the last known list.
     $('status').innerHTML = '<span class="err">刷新失败：' + esc(error.message) + '</span>';
+    // The rows below stay, but must not read as current.
+    if (positionsShownAt && !positionsCurrent) $('positionsNotice').innerHTML = '<span class="err">页面刷新失败，下方持仓停留在 ' + esc(clock(positionsShownAt)) + ' 的结果，不代表当前</span>';
   }
   try {
     const ant = await api('/api/observe?venue=binance&symbol=ANTHROPICUSDT');

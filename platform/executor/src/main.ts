@@ -60,7 +60,7 @@ async function main(): Promise<void> {
 
   const store = openStore(join(dir, 'executor.sqlite'));
   const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
-  const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading });
+  const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });
   if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
   for (const binding of SIM_BINDINGS) executor.registerAccount(binding);
   // A new pair starts disabled; an existing one keeps its switch and settings.
@@ -86,6 +86,20 @@ async function main(): Promise<void> {
     }
     if (!stopping) { process.exitCode = 1; void shutdown(); }
   })();
+  // The position display reads on its own schedule, so a slow read neither waits for the tick nor holds it up (L049).
+  let wakePositions: (() => void) | null = null;
+  const positionsLoop = (async () => {
+    while (!stopping && !executor.retired) {
+      const started = Date.now();
+      try { await executor.refreshPositions(); }
+      catch (error) { process.stderr.write(`持仓读取轮失败：${error instanceof Error ? error.message : String(error)}\n`); }
+      // A shutdown that arrived during the round must not wait out another spacing.
+      if (stopping || executor.retired) break;
+      const wait = Math.max(TICK_MS, executor.budgets.positionsRefreshMs - (Date.now() - started));
+      await new Promise<void>(resolve => { const timer = setTimeout(resolve, wait); wakePositions = () => { clearTimeout(timer); resolve(); }; });
+      wakePositions = null;
+    }
+  })();
 
   const accessToken = randomBytes(32).toString('base64url');
   const server = createExecutorServer({ executor, accessToken });
@@ -100,7 +114,8 @@ async function main(): Promise<void> {
     clearInterval(heartbeat);
     executor.close();
     server.close();
-    await loop;
+    wakePositions?.();
+    await Promise.all([loop, positionsLoop]);
     store.close();
   }
   process.once('SIGINT', shutdown);

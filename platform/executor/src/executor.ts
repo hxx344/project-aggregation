@@ -15,11 +15,12 @@ import type { Store } from './store.ts';
 import { createTransfers } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
+import { DEFAULT_POSITIONS_BUDGETS, createPositions, type AsterPositionsConnector, type PositionsBudgets } from './positions.ts';
 import { ControlRefusal, MAX_OWNED_BUDGET_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /** Start values come from the legacy constants registered in plan 6.4; none of them is a met performance target. */
 /** The ADL budgets are documented in adl.ts. */
-export interface Budgets extends AdlBudgets {
+export interface Budgets extends AdlBudgets, PositionsBudgets {
   previewTtlMs: number;
   previewQuoteMaxAgeMs: number;
   sendQuoteMaxAgeMs: number;
@@ -78,6 +79,7 @@ export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
   transferHistorySpanMs: 180_000, transferClockToleranceMs: 60_000, transferLabelDeferMs: 300_000, transferSettleCooldownMs: 30_000, transferUncertainCooldownMs: 300_000, transferRetryMs: 5_000,
   transferReadTimeoutMs: 8_000, transferBaselineTimeoutMs: 1_500, transferBalanceMaxAgeMs: 8_000, transferRefreshDeferMs: 300_000, transferTickBudgetMs: 10_000,
   ...DEFAULT_ADL_BUDGETS,
+  ...DEFAULT_POSITIONS_BUDGETS,
 });
 
 export class WriterLostError extends ContractError { constructor(message: string) { super(503, 'writer_lost', message); } }
@@ -214,6 +216,8 @@ export interface ExecutorOptions {
   transfers?: TransferConnector;
   /** ASTER ADL emergency handling of the same pairs. Its orders are not recorded in the shared registry either, so with control injected it reconciles and waits but sends none. */
   adl?: AdlConnector;
+  /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the tick. */
+  positions?: AsterPositionsConnector;
 }
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -222,7 +226,7 @@ const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '*
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector }: ExecutorOptions) {
   // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
   const budgets: Budgets = { ...DEFAULT_BUDGETS, ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)) };
   // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
@@ -238,6 +242,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   }
   if (transferConnector && (transferConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
   if (adlConnector && (adlConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
+  if (positionsConnector && (positionsConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;
@@ -372,6 +377,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
     busy: pairId => adl.busy(pairId) });
   const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records });
+  const positions = createPositions({ connector: positionsConnector ?? null, now, budgets, pairs: transfers.records, callVenue });
   const readFailure = (error: unknown): never => {
     if (error instanceof ContractError) throw error;
     throw new ContractError(502, 'venue_read_failed', `交易所读取失败：${error instanceof Error ? error.message.slice(0, 160) : '未知错误'}`);
@@ -1444,6 +1450,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     recentAdlIncidents: adl.recent,
     setAdlConfig: adl.setConfig,
     restartAdl: adl.restart,
+    /** One read round of every paired ASTER account; never part of the tick, so a slow read cannot hold up the jobs. */
+    refreshPositions: positions.refresh,
+    asterPositions: positions.view,
     unfinished: () => unfinishedJobs().map(job => job.id),
     recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
@@ -1457,6 +1466,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
       if (closed) return;
       closed = true;
       adl.close();
+      positions.close();
       if (held && !retired) {
         store.tx(() => db.prepare('UPDATE writer SET expires_at = ? WHERE id = 1 AND owner = ? AND generation = ?').run(now(), owner, generation));
         retired = true;

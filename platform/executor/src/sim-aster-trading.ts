@@ -3,11 +3,12 @@
 // history), for offline simulation and fault injection of the ADL handling.
 // It has no network code.
 import { randomBytes } from 'node:crypto';
-import { add, cmp, isZero, min, sub } from './decimal.ts';
+import { add, cmp, isZero, min, mul, sub } from './decimal.ts';
 import { VenueError, type CallOptions, type SendOptions } from './connector.ts';
 import { ADL_CLIENT_ID, type AdlCapabilities, type AdlConnector, type AdlOrderRequest, type AdlPositionSide } from './adl-contracts.ts';
+import type { AsterPositionsConnector } from './positions.ts';
 
-export type AdlOperation = 'account' | 'rule' | 'place' | 'query' | 'cancel' | 'history';
+export type AdlOperation = 'account' | 'positions' | 'rule' | 'place' | 'query' | 'cancel' | 'history';
 /**
  * reject: definitive venue refusal. not-sent: refused before transmission.
  * lost-request: uncertain failure, the venue never saw it. lost-response: applied, the caller gets an uncertain failure.
@@ -20,16 +21,16 @@ export type AdlOperation = 'account' | 'rule' | 'place' | 'query' | 'cancel' | '
 export type AdlFaultMode = 'reject' | 'not-sent' | 'lost-request' | 'lost-response' | 'rest' | 'zero-fill' | 'partial' | 'read-fail' | 'not-found' | 'malformed' | 'hang';
 export interface AdlFault { operation: AdlOperation; mode: AdlFaultMode; times?: number; accountId?: string; fraction?: string }
 
-interface SimPosition { amount: string; updateTime: number }
+interface SimPosition { amount: string; updateTime: number; entryPrice: string }
 interface SimOrder { request: AdlOrderRequest; orderId: string; filled: string; averagePrice: string | null; status: 'new' | 'partially-filled' | 'filled' | 'canceled' | 'expired'; updateTime: number }
 interface SimAccount { canTrade: boolean; positions: Map<string, SimPosition>; orders: Map<string, SimOrder>; extraOpenOrders: { symbol: string; clientOrderId: string }[]; frozenView: Map<string, SimPosition> | null }
 interface SimRule { symbol: string; quantityStep: string; minQuantity: string; maxMarketQuantity: string; tradable: boolean; quoteAsset: string }
 interface AdlRow { accountId: string; row: Record<string, unknown> }
 
-export class SimulatedAsterTrading implements AdlConnector {
+export class SimulatedAsterTrading implements AdlConnector, AsterPositionsConnector {
   readonly venue = 'aster' as const;
   readonly capabilities: AdlCapabilities;
-  readonly calls: Record<AdlOperation, number> = { account: 0, rule: 0, place: 0, query: 0, cancel: 0, history: 0 };
+  readonly calls: Record<AdlOperation, number> = { account: 0, positions: 0, rule: 0, place: 0, query: 0, cancel: 0, history: 0 };
   /** Orders that reached the venue. */
   readonly arrived = { place: 0, cancel: 0 };
   private readonly accounts = new Map<string, SimAccount>();
@@ -60,9 +61,9 @@ export class SimulatedAsterTrading implements AdlConnector {
   }
   setRule(symbol: string, change: Partial<SimRule>): void { Object.assign(this.requireRule(symbol), change); }
   setMark(symbol: string, markPrice: string): void { this.requireRule(symbol); this.marks.set(symbol, markPrice); }
-  /** amount is signed: positive long, negative short. */
-  setPosition(accountId: string, symbol: string, positionSide: AdlPositionSide, amount: string, updateTime = this.clock()): void {
-    this.requireAccount(accountId).positions.set(`${symbol}|${positionSide}`, { amount, updateTime });
+  /** amount is signed: positive long, negative short. The entry price defaults to the current mark. */
+  setPosition(accountId: string, symbol: string, positionSide: AdlPositionSide, amount: string, updateTime = this.clock(), entryPrice = this.marks.get(symbol) ?? '0'): void {
+    this.requireAccount(accountId).positions.set(`${symbol}|${positionSide}`, { amount, updateTime, entryPrice });
   }
   position(accountId: string, symbol: string, positionSide: AdlPositionSide): string { return this.requireAccount(accountId).positions.get(`${symbol}|${positionSide}`)?.amount ?? '0'; }
   /** Account reads keep answering the positions as they are now, with their old update times, until thawed. */
@@ -106,7 +107,7 @@ export class SimulatedAsterTrading implements AdlConnector {
     const account = this.requireAccount(accountId), key = `${symbol}|${positionSide}`, current = account.positions.get(key);
     if (!current) throw new Error(`no position ${key}`);
     const long = cmp(current.amount, '0') > 0;
-    account.positions.set(key, { amount: long ? sub(current.amount, filled) : add(current.amount, filled), updateTime: at });
+    account.positions.set(key, { ...current, amount: long ? sub(current.amount, filled) : add(current.amount, filled), updateTime: at });
     const orderId = String(this.nextOrderId++);
     const row = {
       clientOrderId: ADL_CLIENT_ID, symbol, orderId, positionSide, side: long ? 'sell' : 'buy', quantity, filledQuantity: filled,
@@ -139,7 +140,7 @@ export class SimulatedAsterTrading implements AdlConnector {
     for (const symbol of symbols) {
       if (!this.marks.has(symbol)) continue;
       for (const positionSide of ['LONG', 'SHORT'] as const) {
-        const row = view.get(`${symbol}|${positionSide}`) ?? { amount: '0', updateTime: 0 };
+        const row = view.get(`${symbol}|${positionSide}`) ?? { amount: '0', updateTime: 0, entryPrice: '0' };
         positions.push({ symbol, positionSide, amount: row.amount, markPrice: this.marks.get(symbol), updateTime: row.updateTime });
       }
     }
@@ -148,6 +149,19 @@ export class SimulatedAsterTrading implements AdlConnector {
       .concat(account.extraOpenOrders.filter(order => symbols.includes(order.symbol)));
     if (fault?.mode === 'malformed') return { accountId, canTrade: account.canTrade, positions: [{ symbol: 'X' }], openOrders, receivedAt: now };
     return { accountId, canTrade: account.canTrade, positions, openOrders, receivedAt: now };
+  }
+  /** Every stored row of the account, zero rows included, as the venue's position list answers. */
+  async positions(accountId: string, { signal }: CallOptions): Promise<unknown> {
+    const fault = this.enter('positions', signal, accountId);
+    await this.readFault(fault, '模拟持仓读取失败');
+    const account = this.requireAccount(accountId), view = account.frozenView ?? account.positions;
+    // Like account(), a symbol without a listed mark is left out.
+    const positions = [...view].filter(([key]) => this.marks.has(key.split('|')[0])).map(([key, row]) => {
+      const [symbol, positionSide] = key.split('|'), markPrice = this.marks.get(symbol)!;
+      return { symbol, positionSide, amount: row.amount, entryPrice: row.entryPrice, markPrice, unrealizedProfit: mul(sub(markPrice, row.entryPrice), row.amount), updateTime: row.updateTime };
+    });
+    if (fault?.mode === 'malformed') return { accountId, positions: [{ symbol: 'X' }], receivedAt: this.clock() };
+    return { accountId, positions, receivedAt: this.clock() };
   }
   async rule(symbol: string, { signal }: CallOptions): Promise<unknown> {
     const fault = this.enter('rule', signal);
@@ -219,7 +233,7 @@ export class SimulatedAsterTrading implements AdlConnector {
     const key = `${order.request.symbol}|${order.request.positionSide}`, position = account.positions.get(key);
     if (!position) throw new Error(`no position ${key}`);
     const now = this.clock();
-    account.positions.set(key, { amount: cmp(position.amount, '0') < 0 ? add(position.amount, quantity) : sub(position.amount, quantity), updateTime: now });
+    account.positions.set(key, { ...position, amount: cmp(position.amount, '0') < 0 ? add(position.amount, quantity) : sub(position.amount, quantity), updateTime: now });
     order.filled = add(order.filled, quantity);
     order.averagePrice = this.marks.get(order.request.symbol) ?? null;
     order.status = cmp(order.filled, order.request.quantity) === 0 ? 'filled' : 'partially-filled';

@@ -84,7 +84,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && url.pathname === '/api/state') {
       return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), jobs: executor.recentJobs(20),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
-        adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) } });
+        adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
     }
     if (request.method === 'GET' && url.pathname === '/api/observe') {
       const venue = url.searchParams.get('venue') ?? '', symbol = url.searchParams.get('symbol') ?? '';
