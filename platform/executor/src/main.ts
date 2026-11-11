@@ -5,13 +5,14 @@ import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { openStore } from './store.ts';
+import { WAL_SIZE_LIMIT_BYTES, openStore } from './store.ts';
 import { createExecutor } from './executor.ts';
 import { SIM_BINDINGS, SIM_TRANSFER_PAIR, createSimulatedVenues } from './simulation.ts';
 import { createExecutorServer } from './http.ts';
 
 const LEGACY_MARKERS = ['hub.sqlite', 'execution-control.sqlite', 'credentials.key', 'modules'];
 const TICK_MS = 1_000;
+const WAL_CHECK_MS = 1_000;
 /** Consecutive failed passes before the entry gives up the lease and exits, so another instance can take over. */
 const MAX_TICK_FAILURES = 5;
 
@@ -71,6 +72,18 @@ async function main(): Promise<void> {
     try { if (!executor.acquire() && !stopping) { process.stderr.write('执行器已失去写入租约，停止\n'); process.exitCode = 1; void shutdown(); } }
     catch (error) { process.stderr.write(`续租失败：${error instanceof Error ? error.message : String(error)}\n`); }
   }, Math.floor(executor.budgets.leaseTtlMs / 3));
+  // Automatic checkpoints cannot reset the WAL while some reader is always active; the owner truncates it past a threshold.
+  let walOverLimit = false;
+  const walCheck = setInterval(() => {
+    // An instance that lost the lease leaves the database to its new owner.
+    if (stopping || executor.retired) return;
+    try {
+      const { walBytes } = store.maintainWal();
+      const over = walBytes > WAL_SIZE_LIMIT_BYTES;
+      if (over && !walOverLimit) process.stderr.write(`WAL 已达 ${Math.round(walBytes / 2 ** 20)} MiB，超过 64 MiB 上限：有读取方长时间占用快照，截断无法完成\n`);
+      walOverLimit = over;
+    } catch (error) { process.stderr.write(`WAL 维护失败：${error instanceof Error ? error.message : String(error)}\n`); }
+  }, WAL_CHECK_MS);
   let stopping = false;
   let loops: Promise<void>[] = [];
   // Waits that a shutdown cuts short, so no loop keeps the exit waiting out its spacing.
@@ -121,6 +134,7 @@ async function main(): Promise<void> {
     if (stopping) return;
     stopping = true;
     clearInterval(heartbeat);
+    clearInterval(walCheck);
     executor.close();
     server.close();
     for (const wake of [...sleepers]) wake();

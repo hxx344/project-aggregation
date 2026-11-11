@@ -4,6 +4,10 @@
 // several simulated pairs, with the jobs, transfer and ADL passes scheduled apart
 // as the entry does; `--aster-latency-ms` delays every simulated ASTER call to
 // show that a slow ASTER holds up only its own loops.
+// Since 2.5 the readers' history scan runs in id slices (`--scan-chunk-rows`), each its own
+// short read (so `readerLongScan` now includes yields between slices), as the frozen storage rules require of every reader of this database; 0 scans
+// the whole table under one snapshot, as the runs before 2.5 did. The main thread also runs the
+// store's WAL maintenance once a second, as the entry does; `--no-wal-reset` turns it off.
 // Results describe this machine only; they are not a target-server baseline.
 import { mkdtempSync, rmSync, statSync, existsSync } from 'node:fs';
 import { tmpdir, cpus, totalmem, platform, release } from 'node:os';
@@ -39,7 +43,7 @@ db.exec('PRAGMA busy_timeout=5000; PRAGMA synchronous=FULL;');
 const insert = db.prepare('INSERT INTO load_backfill(at, payload) VALUES (?, ?)');
 const payload = 'x'.repeat(workerData.rowBytes);
 const waits = [], holds = [], checkpoints = [];
-let stop = false, backupMs = null, batches = 0, lastCheckpoint = performance.now();
+let stop = false, backupMs = null, batches = 0, lastCheckpoint = performance.now(), checkpointsIncomplete = 0, backlogFrames = 0;
 parentPort.on('message', message => { if (message === 'stop') stop = true; if (message === 'backup') pendingBackup = true; });
 let pendingBackup = false;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -52,12 +56,19 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
     for (let i = 0; i < workerData.batchRows; i++) insert.run(Date.now(), payload);
     db.exec('COMMIT');
     waits.push(acquired - requested); holds.push(performance.now() - acquired); batches++;
-    if (performance.now() - lastCheckpoint > 2000) { const t = performance.now(); db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get(); checkpoints.push(performance.now() - t); lastCheckpoint = performance.now(); }
+    if (performance.now() - lastCheckpoint > 2000) {
+      const t = performance.now();
+      // A passive checkpoint stops at the oldest snapshot a reader still holds: frames past it stay in the WAL.
+      const state = db.prepare('PRAGMA wal_checkpoint(PASSIVE)').get();
+      checkpoints.push(performance.now() - t); lastCheckpoint = performance.now();
+      if (state.checkpointed < state.log) { checkpointsIncomplete++; backlogFrames = Math.max(backlogFrames, state.log - state.checkpointed); }
+    }
     if (pendingBackup) { pendingBackup = false; const t = performance.now(); db.exec("VACUUM INTO '" + workerData.backup.replace(/'/g, "''") + "'"); backupMs = performance.now() - t; }
     await sleep(workerData.intervalMs);
   }
+  const backlogBytes = backlogFrames * db.prepare('PRAGMA page_size').get().page_size;
   db.close();
-  parentPort.postMessage({ waits, holds, checkpoints, backupMs, batches });
+  parentPort.postMessage({ waits, holds, checkpoints, backupMs, batches, checkpointsIncomplete, backlogBytes });
 })();
 `;
 const READER = `
@@ -69,18 +80,29 @@ db.exec('PRAGMA busy_timeout=5000;');
 const recent = db.prepare('SELECT json FROM jobs ORDER BY created_at DESC LIMIT 50');
 const events = db.prepare('SELECT COUNT(*) AS n, MAX(seq) AS seq FROM events');
 const scan = db.prepare("SELECT COUNT(*) AS n FROM load_backfill WHERE payload LIKE '%y%'");
+const lastId = db.prepare('SELECT IFNULL(MAX(id), 0) AS id FROM load_backfill');
+const scanSlice = db.prepare("SELECT COUNT(*) AS n FROM load_backfill WHERE id > ? AND id <= ? AND payload LIKE '%y%'");
 const quick = [], long = [];
-let stop = false, round = 0;
+// Each statement is its own read transaction, so its duration is how long one snapshot keeps the WAL from being reset.
+let stop = false, round = 0, snapshotMaxMs = 0;
+const timed = read => { const t = performance.now(); read(); const ms = performance.now() - t; snapshotMaxMs = Math.max(snapshotMaxMs, ms); return ms; };
 parentPort.on('message', message => { if (message === 'stop') stop = true; });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 (async () => {
   while (!stop) {
-    let t = performance.now(); recent.all(); events.get(); quick.push(performance.now() - t);
-    if (++round % 40 === 0) { t = performance.now(); scan.get(); long.push(performance.now() - t); }
+    quick.push(timed(() => recent.all()) + timed(() => events.get()));
+    if (++round % 40 === 0) {
+      const t = performance.now();
+      if (workerData.scanChunkRows > 0) {
+        const end = lastId.get().id;
+        for (let from = 0; from < end && !stop; from += workerData.scanChunkRows) { timed(() => scanSlice.get(from, from + workerData.scanChunkRows)); await new Promise(setImmediate); }
+      } else timed(() => scan.get());
+      long.push(performance.now() - t);
+    }
     await sleep(5);
   }
   db.close();
-  parentPort.postMessage({ quick, long });
+  parentPort.postMessage({ quick, long, snapshotMaxMs });
 })();
 `;
 
@@ -124,12 +146,12 @@ async function main(): Promise<void> {
     jobs: { type: 'string', default: '200' }, 'batch-rows': { type: 'string', default: '500' }, 'row-bytes': { type: 'string', default: '256' },
     'interval-ms': { type: 'string', default: '20' }, readers: { type: 'string', default: '2' }, keep: { type: 'boolean', default: false }, 'no-backfill': { type: 'boolean', default: false },
     pairs: { type: 'string', default: '4' }, 'adl-events': { type: 'string', default: '10' }, transfers: { type: 'string', default: '10' },
-    'aster-latency-ms': { type: 'string', default: '0' }, 'loop-spacing-ms': { type: 'string', default: '1000' },
+    'aster-latency-ms': { type: 'string', default: '0' }, 'loop-spacing-ms': { type: 'string', default: '1000' }, 'scan-chunk-rows': { type: 'string', default: '20000' }, 'no-wal-reset': { type: 'boolean', default: false },
   } });
   const jobs = Number(values.jobs), readers = Number(values.readers);
   const pairs = Number(values.pairs), adlEvents = Number(values['adl-events']), transferCycles = Number(values.transfers);
-  const asterLatencyMs = Number(values['aster-latency-ms']), loopSpacingMs = Number(values['loop-spacing-ms']);
-  for (const [name, value] of Object.entries({ jobs, readers, pairs, 'adl-events': adlEvents, transfers: transferCycles, 'aster-latency-ms': asterLatencyMs, 'loop-spacing-ms': loopSpacingMs })) {
+  const asterLatencyMs = Number(values['aster-latency-ms']), loopSpacingMs = Number(values['loop-spacing-ms']), scanChunkRows = Number(values['scan-chunk-rows']);
+  for (const [name, value] of Object.entries({ jobs, readers, pairs, 'adl-events': adlEvents, transfers: transferCycles, 'aster-latency-ms': asterLatencyMs, 'loop-spacing-ms': loopSpacingMs, 'scan-chunk-rows': scanChunkRows })) {
     if (!Number.isSafeInteger(value) || value < 0) throw new Error(`--${name} 须为非负整数`);
   }
   const dir = mkdtempSync(join(tmpdir(), 'pa-executor-load-'));
@@ -171,9 +193,17 @@ async function main(): Promise<void> {
   let rssPeak = process.memoryUsage().rss, walPeak = 0, dbPeak = 0;
   const sampler = setInterval(() => { rssPeak = Math.max(rssPeak, process.memoryUsage().rss); walPeak = Math.max(walPeak, sizeOf(`${file}-wal`)); dbPeak = Math.max(dbPeak, sizeOf(file)); }, 100);
   const heartbeat = setInterval(() => executor.acquire(), 10_000);
+  // The entry's WAL maintenance, on the same schedule; `--no-wal-reset` leaves the WAL to automatic checkpoints as before 2.5.
+  const walReset = { resets: 0, busy: 0, seenBytes: 0, ms: [] as number[] };
+  const walCheck = values['no-wal-reset'] ? null : setInterval(() => {
+    walReset.seenBytes = Math.max(walReset.seenBytes, store.walBytes());
+    const result = store.maintainWal();
+    if (result.action === 'reset') { walReset.resets++; walReset.ms.push(result.ms); }
+    else if (result.action === 'busy') { walReset.busy++; walReset.ms.push(result.ms); }
+  }, 1_000);
 
   const backfill = new Worker(BACKFILL, { eval: true, workerData: { file, backup: join(dir, 'backup.sqlite'), batchRows: Number(values['batch-rows']), rowBytes: Number(values['row-bytes']), intervalMs: Number(values['interval-ms']), disabled: values['no-backfill'] } });
-  const readerWorkers = Array.from({ length: readers }, () => new Worker(READER, { eval: true, workerData: { file } }));
+  const readerWorkers = Array.from({ length: readers }, () => new Worker(READER, { eval: true, workerData: { file, scanChunkRows } }));
   const result = (worker: Worker) => new Promise<any>((resolve, fail) => { worker.once('message', resolve); worker.once('error', fail); });
   const backfillDone = result(backfill), readersDone = readerWorkers.map(result);
 
@@ -268,7 +298,7 @@ async function main(): Promise<void> {
   try { await Promise.all([drive('CLUSDT', Math.ceil(jobs / 2)), drive('BZUSDT', Math.floor(jobs / 2)), ...assetPairs.flatMap(pair => [driveAdl(pair), driveTransfers(pair)])]); }
   catch (error) {
     // The other drivers would go on waiting out their limits, and workers and timers keep the process alive: clean up and exit now.
-    running = false; sampling = false; clearInterval(sampler); clearInterval(heartbeat);
+    running = false; sampling = false; clearInterval(sampler); clearInterval(heartbeat); if (walCheck) clearInterval(walCheck);
     await Promise.all([backfill, ...readerWorkers].map(worker => worker.terminate()));
     executor.close(); store.close();
     if (!values.keep) rmSync(dir, { recursive: true, force: true });
@@ -280,7 +310,7 @@ async function main(): Promise<void> {
   backfill.postMessage('stop'); for (const worker of readerWorkers) worker.postMessage('stop');
   const [fill, ...reads] = await Promise.all([backfillDone, ...readersDone]);
   await Promise.all([backfill, ...readerWorkers].map(worker => worker.terminate()));
-  clearInterval(sampler); clearInterval(heartbeat); loop.disable(); sampling = false;
+  clearInterval(sampler); clearInterval(heartbeat); if (walCheck) clearInterval(walCheck); loop.disable(); sampling = false;
   const stats = store.stats();
   const waits = stats.waits.slice(baseline.waits.length), holds = stats.holds.slice(baseline.holds.length);
   executor.close(); store.close();
@@ -291,8 +321,9 @@ async function main(): Promise<void> {
     passJobs: summary(passMs.jobs), passTransfers: summary(passMs.transfers), passAdl: summary(passMs.adl),
     adlDetect: summary(adl.detectMs), adlFirstSend: summary(adl.firstSendMs), adlClose: summary(adl.closeMs), adlStatuses: adl.statuses, adlUnfinished: adl.unfinished,
     transferSend: summary(transfer.sendMs), transferSettle: summary(transfer.settleMs), transferStatuses: transfer.statuses,
-    backfillWait: summary(fill.waits), backfillHold: summary(fill.holds), backfillBatches: fill.batches, checkpoint: summary(fill.checkpoints), backupMs: fill.backupMs === null ? null : round(fill.backupMs),
-    readerQuick: summary(reads.flatMap(r => r.quick)), readerLongScan: summary(reads.flatMap(r => r.long)),
+    backfillWait: summary(fill.waits), backfillHold: summary(fill.holds), backfillBatches: fill.batches, checkpoint: summary(fill.checkpoints), checkpointsIncomplete: fill.checkpointsIncomplete, checkpointBacklogMiB: round(fill.backlogBytes / 2 ** 20),
+    walReset: { resets: walReset.resets, busy: walReset.busy, seenMiB: round(walReset.seenBytes / 2 ** 20), ...summary(walReset.ms) }, backupMs: fill.backupMs === null ? null : round(fill.backupMs),
+    readerQuick: summary(reads.flatMap(r => r.quick)), readerLongScan: summary(reads.flatMap(r => r.long)), readerSnapshotMaxMs: round(Math.max(0, ...reads.map(r => r.snapshotMaxMs))),
     eventLoopBlocking: summary(blocked),
     timerDelay: { p50: round(loop.percentile(50) / 1e6), p99: round(loop.percentile(99) / 1e6), max: round(loop.max / 1e6) },
     timerDelayIdle: { p50: round(idle.percentile(50) / 1e6), p99: round(idle.percentile(99) / 1e6), max: round(idle.max / 1e6) },
@@ -312,7 +343,7 @@ async function main(): Promise<void> {
     note: '本机测量，仅作原型证据；不是目标服务器基线，建议预算未经用户确认',
     environment: { platform: platform(), release: release(), cpu: cpus()[0]?.model ?? 'unknown', cpus: cpus().length, memoryGiB: round(totalmem() / 2 ** 30), node: process.version },
     load: { jobs, readers, batchRows: Number(values['batch-rows']), rowBytes: Number(values['row-bytes']), intervalMs: Number(values['interval-ms']), backfill: !values['no-backfill'], venues: 'simulated in-process',
-      pairs, adlEvents, transferCycles, asterLatencyMs, loopSpacingMs },
+      pairs, adlEvents, transferCycles, asterLatencyMs, loopSpacingMs, scanChunkRows, walReset: !values['no-wal-reset'] },
     budgets: BUDGETS, measured, withinSuggestedBudget: checks,
   };
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
