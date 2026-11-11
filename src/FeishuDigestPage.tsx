@@ -4,6 +4,7 @@ import { BellRing, KeyRound, LoaderCircle, RefreshCw, Save, Send, Trash2 } from 
 import { api, ApiError } from './api';
 import type { DigestConfig, DigestGroup, DigestHistoryEntry, DigestLevel, DigestMetric, DigestPreview, DigestSection, DigestSnapshot } from './feishu-digest-types';
 import './feishu-digest.css';
+import { useLiveResource } from './use-live-resource';
 import { Callout, StatePanel, TableEmpty } from './StateViews';
 
 const ROOT = '/api/automation/feishu-digest';
@@ -47,12 +48,12 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   const [previewError, setPreviewError] = useState('');
   const [previewing, setPreviewing] = useState(false);
   const [busy, setBusy] = useState('');
-  const [loadError, setLoadError] = useState('');
   const [actionError, setActionError] = useState('');
   const [notice, setNotice] = useState('');
   const [reviewId, setReviewId] = useState(''), [reviewNote, setReviewNote] = useState(''), [reviewSource, setReviewSource] = useState('');
   const lifetime = useRef<AbortController | null>(null);
-  const generation = useRef(0);
+  // 最后交给表单的快照：轮询结果与写入结果都经 accept 进入表单，同一份数据只接收一次。
+  const lastAccepted = useRef<DigestSnapshot | null>(null);
   const previewGeneration = useRef(0);
   const dirty = !!snapshot && !!draft && JSON.stringify(draft) !== JSON.stringify(snapshot.config);
   const dirtyRef = useRef(false);
@@ -64,22 +65,20 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   const fail = useCallback((reason: unknown, show: (text: string) => void) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else show(message(reason)); }, [onExpired]);
   // An unsaved draft stays; polling refreshes only the send records and channel state.
   const accept = useCallback((data: DigestSnapshot, replace?: boolean) => {
-    setSnapshot(data); setLoadError('');
+    lastAccepted.current = data; setSnapshot(data);
     if (replace ?? !dirtyRef.current) { setDraft(data.config); setTimesText(data.config.schedule.times.join(', ')); }
   }, []);
-  const read = useCallback(async () => {
-    const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted || busyRef.current) return;
-    const version = ++generation.current;
-    try { const data = await api<DigestSnapshot>(ROOT, { signal, timeoutMs: 10_000 }); if (!signal.aborted && version === generation.current) accept(data); }
-    catch (reason) { if (!signal.aborted && version === generation.current) fail(reason, setLoadError); }
-  }, [accept, fail]);
+  const digest = useLiveResource<DigestSnapshot>(ROOT, { intervalMs: 30_000, timeoutMs: 10_000, onExpired });
+  const loadError = digest.error && !(digest.error instanceof ApiError && digest.error.status === 401) ? digest.error.message : '';
+  // 写入进行中不接收读取结果：写入成功后由 commit 作废之前的读取，失败时再接收期间读到的数据。
+  useEffect(() => {
+    if (busy || !digest.data || digest.data === lastAccepted.current) return;
+    accept(digest.data);
+  }, [digest.data, busy, accept]);
   useEffect(() => {
     const controller = new AbortController(); lifetime.current = controller;
-    void read();
-    const poll = setInterval(() => { if (!busyRef.current && !document.hidden) void read(); }, 30_000);
-    return () => { controller.abort(); clearInterval(poll); };
-  }, [read]);
+    return () => { controller.abort(); };
+  }, []);
   const loadPreview = useCallback(async (config: DigestConfig, fresh = false) => {
     const signal = lifetime.current?.signal, version = ++previewGeneration.current;
     if (!signal) return;
@@ -99,13 +98,12 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     const signal = lifetime.current?.signal;
     if (!signal || signal.aborted || busyRef.current) return null;
     busyRef.current = true;
-    // A GET started before this write must not replace its confirmed snapshot or clean draft.
-    generation.current++;
     setBusy(name); setActionError(''); setNotice('');
     try {
       const data = await api<DigestSnapshot>(ROOT + path, { method, body: JSON.stringify(body), signal, timeoutMs: 30_000 });
       if (signal.aborted) return null;
-      accept(data, replace()); setNotice(done);
+      // 写入结果成为共享读取的当前值，写入前发出的读取作废，迟到的旧响应不能覆盖它（L089）。
+      accept(data, replace()); digest.commit(data); setNotice(done);
       return data;
     } catch (reason) { if (!signal.aborted) fail(reason, setActionError); return null; }
     finally { busyRef.current = false; if (!signal.aborted) setBusy(''); }
@@ -131,7 +129,7 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     else setActionError(data.result.error ?? '发送未完成');
   };
   const heading = <header className="wb-heading"><div><h1>飞书汇总</h1><p>由工作台服务器定时发送，不需要打开页面；只读取各模块已有状态，不下单、不改设置</p></div><div className="wb-toolbar">
-    <button className="button secondary" disabled={!!busy || previewing} onClick={() => { void read(); if (draft) void loadPreview(draft, true); }}><RefreshCw size={15} className={previewing ? 'spin' : ''} />刷新</button>
+    <button className="button secondary" disabled={!!busy || previewing} onClick={() => { void digest.refresh(); if (draft) void loadPreview(draft, true); }}><RefreshCw size={15} className={previewing ? 'spin' : ''} />刷新</button>
     <button className="button secondary" disabled={!snapshot?.channel.configured || dirty || !!busy} title={dirty ? '请先保存设置' : !snapshot?.channel.configured ? '请先保存机器人' : undefined} onClick={() => void send()}>{busy === 'send' ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}立即发送</button>
     <button className="button primary" disabled={!dirty || !!busy} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
   </div></header>;

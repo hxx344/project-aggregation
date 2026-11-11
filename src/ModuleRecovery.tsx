@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { CircleAlert, LoaderCircle, RotateCcw } from 'lucide-react';
 import { api, ApiError } from './api';
+import { useLiveResource } from './use-live-resource';
 
 type ModuleRow = {
   moduleId: string;
@@ -20,44 +21,23 @@ const names: Record<string, string> = { monitor: 'Market Monitor', asset: 'Asset
 
 /** Supervisor state of one built-in module, with the operator restart for a faulted module. */
 export default function ModuleRecovery({ moduleId, name, active, onRecovered, onExpired }: { moduleId: string; name: string; active: boolean; onRecovered: () => void; onExpired: () => void }) {
-  const [rows, setRows] = useState<ModuleRow[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState('');
-  const [revision, setRevision] = useState(0);
   // Set by an operator restart; the page reloads once that instance is ready.
   const awaitingReady = useRef(false);
-  const latest = useRef({ onRecovered, onExpired });
-  latest.current = { onRecovered, onExpired };
-
+  const latest = useRef(onRecovered);
+  latest.current = onRecovered;
+  // The interval follows the last read row; read failures stay silent and retry on that interval.
+  const [recovering, setRecovering] = useState(false);
+  const status = useLiveResource<{ enabled: boolean; modules: ModuleRow[] }>('/api/system/modules', { intervalMs: recovering ? RECOVERING_MS : IDLE_MS, timeoutMs: 15_000, enabled: active, onExpired });
+  const rows = status.data?.enabled ? status.data.modules : [];
+  const row = rows.find(item => item.moduleId === moduleId);
+  const nextRecovering = !!row && (RECOVERING.has(row.state) || row.maintenanceConfirmed === false);
+  useEffect(() => { setRecovering(nextRecovering); }, [nextRecovering]);
+  // Every successful read publishes a new object, so this runs once per read.
   useEffect(() => {
-    if (!active) return;
-    const controller = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let reading = false;
-    const schedule = (delay: number) => { clearTimeout(timer); timer = setTimeout(() => void read(), delay); };
-    async function read() {
-      // A hidden page waits; visibilitychange reads again as soon as it shows.
-      if (document.visibilityState !== 'visible' || reading) return;
-      reading = true;
-      try {
-        const data = await api<{ enabled: boolean; modules: ModuleRow[] }>('/api/system/modules', { signal: controller.signal });
-        if (controller.signal.aborted) return;
-        const all = data.enabled ? data.modules : [];
-        const next = all.find(item => item.moduleId === moduleId) ?? null;
-        setRows(all);
-        if (awaitingReady.current && next?.state === 'ready') { awaitingReady.current = false; latest.current.onRecovered(); }
-        schedule(next && (RECOVERING.has(next.state) || next.maintenanceConfirmed === false) ? RECOVERING_MS : IDLE_MS);
-      } catch (reason) {
-        if (controller.signal.aborted) return;
-        if (reason instanceof ApiError && reason.status === 401) { latest.current.onExpired(); return; }
-        schedule(IDLE_MS);
-      } finally { reading = false; }
-    }
-    const visible = () => { if (document.visibilityState === 'visible') void read(); };
-    document.addEventListener('visibilitychange', visible);
-    void read();
-    return () => { controller.abort(); clearTimeout(timer); document.removeEventListener('visibilitychange', visible); };
-  }, [active, moduleId, revision]);
+    if (awaitingReady.current && row?.state === 'ready') { awaitingReady.current = false; latest.current(); }
+  }, [status.data]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function restart() {
     setPending(true); setError('');
@@ -69,10 +49,9 @@ export default function ModuleRecovery({ moduleId, name, active, onRecovered, on
       // 409 means the module already left fault; the next read shows where it is.
       if (!(reason instanceof ApiError && reason.status === 409)) setError(reason instanceof Error ? reason.message : '恢复请求未完成，请稍后重试');
     }
-    setPending(false); setRevision(value => value + 1);
+    setPending(false); void status.refresh();
   }
 
-  const row = rows.find(item => item.moduleId === moduleId);
   if (!row) return null;
   if (row.state === 'fault') {
     const cause = row.faultReason === 'process-tree' ? '旧进程未能结束，为避免与新实例同时运行，已停止自动重启。' : `连续 ${row.consecutiveFailures} 次启动失败或运行不足 10 分钟即退出，已停止自动重启。`;
