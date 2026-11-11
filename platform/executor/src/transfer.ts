@@ -12,6 +12,7 @@ import {
   type PairSide, type TransferBalance, type TransferConfig, type TransferPairInput, type TransferReceipt,
 } from './contracts.ts';
 import { VenueError, parseTransferAck, type TransferAck, type TransferConnector } from './connector.ts';
+import { ControlRefusal, TRANSFER_OPERATION_PREFIX, type AccountControl, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /**
  * prepared: persisted, transport not called. sending: transport may have been called.
@@ -96,8 +97,11 @@ export interface TransferDeps {
   now: () => number;
   budgets: TransferBudgets;
   connector: TransferConnector | null;
-  /** A shared account-writer registry is injected. Transfers are not registered there, so none is sent. */
-  controlled: boolean;
+  /**
+   * The shared account-writer registry, when injected: each transfer is registered there after its local record and
+   * before the send, checked again inside beforeSend, finished after its local result, and resolved from local facts.
+   */
+  control: AccountControl | null;
   write<T>(operation: () => T): T;
   assertWriter(): void;
   callVenue<T>(kind: 'read' | 'write', operation: (signal: AbortSignal) => Promise<T>, timeoutMs?: number): Promise<T>;
@@ -153,7 +157,18 @@ function checkBudgets(budgets: TransferBudgets, connector: TransferConnector | n
   if (budgets.transferClockToleranceMs >= budgets.transferHistorySpanMs) throw new ContractError(500, 'budget', 'transferClockToleranceMs 须小于 transferHistorySpanMs');
 }
 
-export function createTransfers({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending }: TransferDeps) {
+/**
+ * What a transfer's local state proves for its registry entry: rejected when it never left (or provably never executed),
+ * confirmed when it took effect or may have (an unverified expiry stops gating only once it is settled as executed),
+ * null while the result is still open.
+ */
+export function transferRegistryOutcome(state: TransferState): 'confirmed' | 'rejected' | null {
+  if (state === 'prepared' || state === 'not-sent' || state === 'rejected' || state === 'expired-not-executed') return 'rejected';
+  if (state === 'acknowledged' || state === 'confirmed' || state === 'expired-unverified') return 'confirmed';
+  return null;
+}
+
+export function createTransfers({ db, now, budgets, connector, control, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
@@ -227,7 +242,6 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
 
   /** Why this pair may not send now, or null. One unsettled transfer blocks its own pair and every pair sharing an account with it. */
   function blockedBy(pair: PairRecord): string | null {
-    if (controlled) return '已注入共享写者登记，划转尚未接入登记，不发送';
     const open = unsettled();
     const recovered = open.filter(item => item.transfer?.recoveredAt != null);
     if (recovered.length) {
@@ -389,10 +403,28 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
       return null;
     });
     if (refusal) { defer(pair, refusal); return; }
-    write(() => { const sentAt = now(); Object.assign(transfer, { state: 'sending', sentAt, readyAt: sentAt + expiryMs(target) }); saveTransfer(transfer); });
+    let registered: WriterOperation | null = null;
+    if (control) {
+      try { registered = control.prepareTransfer({ id: transfer.id, mainAccountId: transfer.mainAccountId, source: transfer.source, destination: transfer.destination, amount: transfer.amount }); }
+      catch (error) {
+        if (!(error instanceof ControlRefusal)) throw error;
+        write(() => {
+          const current = readTransfer(transfer.id), owner = readPair(current.pairId), at = now();
+          Object.assign(current, { state: 'not-sent', settledAt: at, note: error.message.slice(0, 200) });
+          saveTransfer(current);
+          if (owner) { backOff(owner, at); savePair(owner); }
+          event(null, 'transfer-sent', { pair: current.pairId, transfer: current.id, state: current.state, control: error.registryCode });
+        });
+        return;
+      }
+    }
+    // A registered entry whose send never starts is rejected here; settleRegistry repeats it if this finish fails.
+    try { write(() => { const sentAt = now(); Object.assign(transfer, { state: 'sending', sentAt, readyAt: sentAt + expiryMs(target) }); saveTransfer(transfer); }); }
+    catch (error) { if (registered) control?.finish(registered, 'rejected'); throw error; }
     let ack: TransferAck | null = null, failure: unknown = null;
     const { source, destination, asset, amount } = transfer;
-    try { ack = parseTransferAck(await callVenue('write', signal => target.transfer(transfer.mainAccountId, { source, destination, asset, amount }, { signal, beforeSend: assertWriter }))); }
+    const beforeSend = registered ? () => { assertWriter(); control?.assertSend(registered, budgets.callTimeoutMs); } : assertWriter;
+    try { ack = parseTransferAck(await callVenue('write', signal => target.transfer(transfer.mainAccountId, { source, destination, asset, amount }, { signal, beforeSend }))); }
     catch (error) { failure = error; }
     const state = write(() => {
       const current = readTransfer(transfer.id);
@@ -417,6 +449,7 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
       event(null, 'transfer-sent', { pair: current.pairId, transfer: current.id, state: current.state, ...(current.tranId ? { tranId: current.tranId } : {}) });
       return current.state;
     });
+    if (registered) control?.finish(registered, (transferRegistryOutcome(state) ?? 'unknown') satisfies WriteOutcome);
     if (state === 'acknowledged') await refresh(readTransfer(transfer.id));
   }
 
@@ -577,8 +610,32 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
    * The pass stops starting new work once its time budget is spent and the next one picks up after the last item
    * done, so one slow pair cannot keep the others waiting, and a pass returns (to see a lost lease or a shutdown) within the budget plus one item.
    */
+  /**
+   * Resolves this module's open registry entries of transfers from local facts: after a failed finish, a takeover, or once
+   * an unknown transfer is settled. An entry whose transfer is being sent, is still open, or has no local record stays.
+   */
+  function settleRegistry(): void {
+    if (!control) return;
+    let ids: string[];
+    try { ids = control.asterPending().filter(id => id.startsWith(TRANSFER_OPERATION_PREFIX)); }
+    catch (error) { if (isWriterLost(error)) throw error; return; }
+    for (const operationId of ids) {
+      const id = operationId.slice(TRANSFER_OPERATION_PREFIX.length);
+      if (inFlight.has(id)) continue;
+      const row = db.prepare('SELECT json FROM transfers WHERE id = ?').get(id) as { json: string } | undefined;
+      if (!row) continue;
+      let transfer: Transfer;
+      try { transfer = JSON.parse(row.json) as Transfer; } catch { continue; }
+      const outcome = transferRegistryOutcome(transfer.state);
+      if (!outcome) continue;
+      try { control.asterResolve([transfer.mainAccountId, transfer.source, transfer.destination], operationId, outcome); write(() => event(null, 'transfer-control-resolved', { pair: transfer.pairId, transfer: id, outcome })); }
+      catch (error) { if (isWriterLost(error) || !(error instanceof ControlRefusal)) throw error; }
+    }
+  }
+
   async function tick(): Promise<void> {
     if (!connector) return;
+    settleRegistry();
     const deadline = performance.now() + budgets.transferTickBudgetMs;
     const open = db.prepare('SELECT id, pair_id FROM transfers WHERE settled = 0 ORDER BY created_at, rowid').all() as { id: string; pair_id: string }[];
     for (const id of [...settleFailures.keys()]) if (!open.some(row => row.id === id)) settleFailures.delete(id);
@@ -590,9 +647,10 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
     resumeAfter = null;
     const ordered = [...work.slice(start), ...work.slice(0, start)];
     for (const [index, item] of ordered.entries()) {
-      if (index > 0 && performance.now() >= deadline) { resumeAfter = ordered[index - 1].key; return; }
+      if (index > 0 && performance.now() >= deadline) { resumeAfter = ordered[index - 1].key; break; }
       await item.run();
     }
+    settleRegistry();
   }
 
   // ---- pairs and views ---------------------------------------------------------
@@ -659,7 +717,6 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
     if (replayed()) return pairView(requirePair(pairId));
     const pair = requirePair(pairId);
     if (enabled) {
-      if (controlled) reject('transfer_control_unsupported', '已注入共享写者登记，划转尚未接入登记，不能启用', 409);
       await verifyOwnership(pair);
     }
     return write(() => {

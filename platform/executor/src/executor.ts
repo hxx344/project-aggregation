@@ -16,7 +16,7 @@ import { createTransfers } from './transfer.ts';
 import { DEFAULT_ADL_BUDGETS, createAdl, type Adl, type AdlBudgets } from './adl.ts';
 import type { AdlConnector } from './adl-contracts.ts';
 import { DEFAULT_POSITIONS_BUDGETS, createPositions, type AsterPositionsConnector, type PositionsBudgets } from './positions.ts';
-import { ControlRefusal, MAX_OWNED_BUDGET_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
+import { ControlRefusal, MAX_OWNED_BUDGET_MS, REGISTRY_ASTER_EXPIRY_MS, createAccountControl, parseOperationId, type AccountWriterPort, type ControlEnvironment, type WriteOutcome, type WriterOperation } from './account-control.ts';
 
 /** Start values come from the legacy constants registered in plan 6.4; none of them is a met performance target. */
 /** The ADL budgets are documented in adl.ts. */
@@ -214,9 +214,13 @@ export interface ExecutorOptions {
   budgets?: Partial<Budgets>;
   /** Shared account-writer registry; absent means this executor writes no shared state. */
   control?: { writer: AccountWriterPort; environment: ControlEnvironment };
-  /** ASTER sub-account transfers. They are not recorded in the shared registry, so with control injected none is sent and no pair can be enabled. */
+  /**
+   * ASTER sub-account transfers. With control injected each is registered under the registry's margin-transfer intent
+   * (the pair's main account and both sub-accounts), so the transfer connector's signed requests must expire within the
+   * registry's ASTER expiry.
+   */
   transfers?: TransferConnector;
-  /** ASTER ADL emergency handling of the same pairs. Its orders are not recorded in the shared registry either, so with control injected it reconciles and waits but sends none. */
+  /** ASTER ADL emergency handling of the same pairs. With control injected each reduction order and cancel is registered on its sub-account. */
   adl?: AdlConnector;
   /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the other passes. */
   positions?: AsterPositionsConnector;
@@ -234,7 +238,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
   if (!Number.isSafeInteger(budgets.hedgeAttempts) || budgets.hedgeAttempts < 1 || budgets.hedgeAttempts > 99) throw new ContractError(500, 'budget', 'hedgeAttempts 须为 1–99');
   if (!Number.isSafeInteger(budgets.maxSlippageBps) || budgets.maxSlippageBps < 1 || budgets.maxSlippageBps > MAX_SLIPPAGE_BPS) throw new ContractError(500, 'budget', `maxSlippageBps 须为 1–${MAX_SLIPPAGE_BPS}`);
-  if (controlOptions && budgets.callTimeoutMs > MAX_OWNED_BUDGET_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求单次调用不超过 ${MAX_OWNED_BUDGET_MS} 毫秒`);
+  if (controlOptions && Math.max(budgets.callTimeoutMs, budgets.adlOrderTimeoutMs) > MAX_OWNED_BUDGET_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求单次调用不超过 ${MAX_OWNED_BUDGET_MS} 毫秒`);
+  // The registry stops gating on an unknown ASTER transfer this long after it; a request still valid then could land unseen.
+  if (controlOptions && transferConnector && transferConnector.capabilities.requestValidityMs > REGISTRY_ASTER_EXPIRY_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求划转请求有效期不超过 ${REGISTRY_ASTER_EXPIRY_MS} 毫秒`);
   const venues = new Map<Venue, VenueConnector>();
   for (const connector of connectors) {
     // The prototype must not be able to reach a real venue by configuration mistake.
@@ -384,9 +390,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     try { return await Promise.race([operation(controller.signal), deadline]); }
     finally { clearTimeout(timer); }
   }
-  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
+  const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
     busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId) });
-  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records,
+  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, control, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records,
     transferSending: pairId => transfers.sending(pairId) });
   const positions = createPositions({ connector: positionsConnector ?? null, now, budgets, pairs: transfers.records, callVenue });
   const readFailure = (error: unknown): never => {
