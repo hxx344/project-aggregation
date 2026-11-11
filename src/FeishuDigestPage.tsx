@@ -3,7 +3,6 @@ import type { FormEvent } from 'react';
 import { BellRing, KeyRound, LoaderCircle, RefreshCw, Save, Send, Trash2 } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { DigestConfig, DigestGroup, DigestHistoryEntry, DigestLevel, DigestMetric, DigestPreview, DigestSection, DigestSnapshot } from './feishu-digest-types';
-import './aero-lp.css';
 import './feishu-digest.css';
 import { Callout, StatePanel, TableEmpty } from './StateViews';
 
@@ -131,12 +130,12 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     if (data.result.status === 'sent') setNotice('已发送到飞书');
     else setActionError(data.result.error ?? '发送未完成');
   };
-  const heading = <header className="lp-heading"><div><h1>飞书汇总</h1><p>由工作台服务器定时发送，不需要打开页面；只读取各模块已有状态，不下单、不改设置</p></div><div className="lp-toolbar">
+  const heading = <header className="wb-heading"><div><h1>飞书汇总</h1><p>由工作台服务器定时发送，不需要打开页面；只读取各模块已有状态，不下单、不改设置</p></div><div className="wb-toolbar">
     <button className="button secondary" disabled={!!busy || previewing} onClick={() => { void read(); if (draft) void loadPreview(draft, true); }}><RefreshCw size={15} className={previewing ? 'spin' : ''} />刷新</button>
     <button className="button secondary" disabled={!snapshot?.channel.configured || dirty || !!busy} title={dirty ? '请先保存设置' : !snapshot?.channel.configured ? '请先保存机器人' : undefined} onClick={() => void send()}>{busy === 'send' ? <LoaderCircle size={15} className="spin" /> : <Send size={15} />}立即发送</button>
     <button className="button primary" disabled={!dirty || !!busy} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle size={15} className="spin" /> : <Save size={15} />}保存设置</button>
   </div></header>;
-  return <div className="lp-page">
+  return <div className="wb-page">
     {heading}
     {actionError ? <Callout tone="error">{actionError}</Callout> : null}
     {notice ? <Callout tone="success">{notice}</Callout> : null}
@@ -145,30 +144,30 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
     {snapshot?.channel.error ? <Callout tone="warning">{snapshot.channel.error}</Callout> : null}
     {!snapshot || !draft ? <StatePanel kind="loading" title="正在读取状态" /> : <div className="fd-layout">
       <div className="fd-column">
-        <section className="panel lp-status" aria-label="运行状态"><div className="lp-state-line"><span className={`lp-state ${draft.enabled ? 'running' : ''}`}><BellRing size={16} />{snapshot.config.enabled ? '定时发送已开启' : '定时发送已关闭'}</span>
-          <span>下次发送：{snapshot.nextAt ? when(snapshot.nextAt) : '—'}</span>{dirty ? <span className="lp-paused">有未保存的修改</span> : null}</div>
+        <section className="panel wb-status" aria-label="运行状态"><div className="wb-state-line"><span className={`wb-state ${draft.enabled ? 'running' : ''}`}><BellRing size={16} />{snapshot.config.enabled ? '定时发送已开启' : '定时发送已关闭'}</span>
+          <span>下次发送：{snapshot.nextAt ? when(snapshot.nextAt) : '—'}</span>{dirty ? <span className="wb-paused">有未保存的修改</span> : null}</div>
           <label className="checkbox-field fd-enable"><input type="checkbox" checked={draft.enabled} onChange={e => change({ enabled: e.target.checked })} />开启定时发送</label></section>
-        <section className="panel lp-section" aria-label="飞书机器人"><div className="panel-heading"><h2>飞书机器人</h2><span className="muted">{snapshot.channel.configured ? `已配置 ${snapshot.channel.host}` : '尚未配置'}</span></div>
-          <form className="lp-key" onSubmit={e => void saveChannel(e)} autoComplete="off">
-            <label className="lp-field wide"><span>{snapshot.channel.configured ? '更换 Webhook' : 'Webhook 地址'}</span><input type="password" value={webhookUrl} onChange={e => setWebhookUrl(e.target.value)} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" autoComplete="off" /><small>在飞书群添加「自定义机器人」后获得；加密保存，不在页面回显，也不与 Monitor 告警共用。</small></label>
-            <label className="lp-field wide"><span>签名密钥（可选）</span><input type="password" value={signingSecret} onChange={e => setSigningSecret(e.target.value)} autoComplete="new-password" /><small>机器人开启「签名校验」时填写；更换 Webhook 时需要一并重填。开启「关键词」时请把关键词写进标题。</small></label>
-            <div className="lp-key-actions"><button className="button primary" type="submit" disabled={!!busy || !webhookUrl.trim()}>{busy === 'channel' ? <LoaderCircle size={15} className="spin" /> : <KeyRound size={15} />}保存机器人</button>
+        <section className="panel wb-section" aria-label="飞书机器人"><div className="panel-heading"><h2>飞书机器人</h2><span className="muted">{snapshot.channel.configured ? `已配置 ${snapshot.channel.host}` : '尚未配置'}</span></div>
+          <form className="wb-key" onSubmit={e => void saveChannel(e)} autoComplete="off">
+            <label className="wb-field wide"><span>{snapshot.channel.configured ? '更换 Webhook' : 'Webhook 地址'}</span><input type="password" value={webhookUrl} onChange={e => setWebhookUrl(e.target.value)} placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/…" autoComplete="off" /><small>在飞书群添加「自定义机器人」后获得；加密保存，不在页面回显，也不与 Monitor 告警共用。</small></label>
+            <label className="wb-field wide"><span>签名密钥（可选）</span><input type="password" value={signingSecret} onChange={e => setSigningSecret(e.target.value)} autoComplete="new-password" /><small>机器人开启「签名校验」时填写；更换 Webhook 时需要一并重填。开启「关键词」时请把关键词写进标题。</small></label>
+            <div className="wb-key-actions"><button className="button primary" type="submit" disabled={!!busy || !webhookUrl.trim()}>{busy === 'channel' ? <LoaderCircle size={15} className="spin" /> : <KeyRound size={15} />}保存机器人</button>
               {snapshot.channel.configured ? <button type="button" className="button secondary" disabled={!!busy} onClick={() => void execute('clear', '/channel/clear', 'POST', {}, '机器人已清除，定时发送已关闭')}><Trash2 size={15} />清除</button> : null}</div>
           </form></section>
-        <section className="panel lp-section" aria-label="发送时间"><div className="panel-heading"><h2>发送时间</h2></div>
+        <section className="panel wb-section" aria-label="发送时间"><div className="panel-heading"><h2>发送时间</h2></div>
           <fieldset><div className="fd-modes" role="radiogroup" aria-label="发送方式">
             <label><input type="radio" name="fd-mode" checked={draft.schedule.mode === 'times'} onChange={() => changeSchedule({ mode: 'times' })} />每天固定时间</label>
             <label><input type="radio" name="fd-mode" checked={draft.schedule.mode === 'interval'} onChange={() => changeSchedule({ mode: 'interval' })} />按固定间隔</label></div>
-            <div className="lp-grid fd-grid">
-              {draft.schedule.mode === 'times' ? <label className="lp-field"><span>时间（24 小时制）</span><input value={timesText} onChange={e => { setTimesText(e.target.value); changeSchedule({ times: timeList(e.target.value) }); }} placeholder="09:00, 21:00" /><small>多个时间用逗号分隔，最多 24 个。</small></label>
-                : <label className="lp-field"><span>间隔（分钟）</span><input type="number" min={5} max={720} value={draft.schedule.intervalMinutes} onChange={e => changeSchedule({ intervalMinutes: Number(e.target.value) })} /><small>5–720 分钟，从当天 00:00 起算。</small></label>}
-              <label className="lp-field"><span>时区</span><input value={draft.schedule.timezone} onChange={e => changeSchedule({ timezone: e.target.value })} /><small>消息中的时间也按此时区显示。</small></label>
+            <div className="wb-grid fd-grid">
+              {draft.schedule.mode === 'times' ? <label className="wb-field"><span>时间（24 小时制）</span><input value={timesText} onChange={e => { setTimesText(e.target.value); changeSchedule({ times: timeList(e.target.value) }); }} placeholder="09:00, 21:00" /><small>多个时间用逗号分隔，最多 24 个。</small></label>
+                : <label className="wb-field"><span>间隔（分钟）</span><input type="number" min={5} max={720} value={draft.schedule.intervalMinutes} onChange={e => changeSchedule({ intervalMinutes: Number(e.target.value) })} /><small>5–720 分钟，从当天 00:00 起算。</small></label>}
+              <label className="wb-field"><span>时区</span><input value={draft.schedule.timezone} onChange={e => changeSchedule({ timezone: e.target.value })} /><small>消息中的时间也按此时区显示。</small></label>
             </div>
             <div className="fd-days" role="group" aria-label="发送日">{WEEKDAYS.map((label, index) => <label key={label}><input type="checkbox" checked={draft.schedule.weekdays.includes(index + 1)} onChange={e => changeSchedule({ weekdays: e.target.checked ? [...draft.schedule.weekdays, index + 1].sort() : draft.schedule.weekdays.filter(day => day !== index + 1) })} />{label}</label>)}</div>
           </fieldset></section>
-        <section className="panel lp-section" aria-label="消息内容"><div className="panel-heading"><h2>消息内容</h2></div>
+        <section className="panel wb-section" aria-label="消息内容"><div className="panel-heading"><h2>消息内容</h2></div>
           <fieldset>
-            <div className="lp-grid fd-grid"><label className="lp-field"><span>标题</span><input value={draft.title} maxLength={60} onChange={e => change({ title: e.target.value })} /></label></div>
+            <div className="wb-grid fd-grid"><label className="wb-field"><span>标题</span><input value={draft.title} maxLength={60} onChange={e => change({ title: e.target.value })} /></label></div>
             <div className="fd-options">
               <label className="checkbox-field"><input type="checkbox" checked={draft.onlyOnAttention} onChange={e => change({ onlyOnAttention: e.target.checked })} />仅在有模块需要关注时才发送</label>
               <label className="checkbox-field"><input type="checkbox" checked={draft.showIssues} onChange={e => change({ showIssues: e.target.checked })} />在开头列出问题明细</label>
@@ -190,17 +189,17 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
               {preview.digest.sections.map(section => <PreviewSection key={section.id} section={section} />)}
               {preview.omitted ? <p className="fd-omitted">另有 {preview.omitted} 个模块超出飞书长度限制，不会显示。</p> : null}</div></div> : <TableEmpty>{previewing ? '正在生成预览' : '暂无预览'}</TableEmpty>}
         </section>
-        <section className="panel lp-section" aria-label="发送记录"><div className="panel-heading"><h2>发送记录</h2><span className="muted">最近 {snapshot.history.length} 次</span></div>
+        <section className="panel wb-section" aria-label="发送记录"><div className="panel-heading"><h2>发送记录</h2><span className="muted">最近 {snapshot.history.length} 次</span></div>
           <p className="as-muted">这里核对飞书汇总投递；Monitor 合约机会告警在其提醒记录内核对。人工说明不修改渠道结果、不重发消息。</p>
           {snapshot.reviewError ? <p role="alert">{snapshot.reviewError}</p> : null}
-          {snapshot.history.length ? <ol className="lp-events">{snapshot.history.map((entry, index) => <li key={entry.id ?? `${entry.at}:${index}`} className={entry.status === 'failed' || entry.status === 'uncertain' ? 'bad' : ''}><time>{when(entry.at)}</time><span>{RESULTS[entry.status]}</span><span>{entry.kind === 'manual' ? '手动' : '定时'}{entry.attention ? ` · ${entry.attention} 个模块需关注` : ''}{entry.error ? ` · ${entry.error}` : ''}
+          {snapshot.history.length ? <ol className="wb-events">{snapshot.history.map((entry, index) => <li key={entry.id ?? `${entry.at}:${index}`} className={entry.status === 'failed' || entry.status === 'uncertain' ? 'bad' : ''}><time>{when(entry.at)}</time><span>{RESULTS[entry.status]}</span><span>{entry.kind === 'manual' ? '手动' : '定时'}{entry.attention ? ` · ${entry.attention} 个模块需关注` : ''}{entry.error ? ` · ${entry.error}` : ''}
             {entry.stages?.length ? <small>{entry.stages.map(stage => `${RESULTS[stage.status as DigestHistoryEntry['status']] ?? stage.status} ${when(stage.at)}`).join(' → ')}</small> : null}
             {entry.reviews?.map(review => <p key={review.id}>人工核对 · {review.actor} · {when(review.at)}：{review.note}（来源：{review.source}）</p>)}
             {entry.id ? <button type="button" className="as-link" onClick={() => { setReviewId(entry.id!); setReviewNote(''); setReviewSource(''); }}>记录核对说明</button> : null}
           </span></li>)}</ol> : <TableEmpty>尚无发送记录。</TableEmpty>}
           {reviewId ? <form onSubmit={event => { event.preventDefault(); void execute('review', '/reviews', 'POST', { id: reviewId, note: reviewNote, source: reviewSource }, '核对说明已保存').then(result => { if (result) setReviewId(''); }); }}>
-            <p>投递编号：{reviewId}</p><label className="lp-field">人工核对说明<input required maxLength={500} value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></label>
-            <label className="lp-field">证据来源（勿填写凭据）<input required maxLength={200} value={reviewSource} onChange={event => setReviewSource(event.target.value)} /></label>
+            <p>投递编号：{reviewId}</p><label className="wb-field">人工核对说明<input required maxLength={500} value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></label>
+            <label className="wb-field">证据来源（勿填写凭据）<input required maxLength={200} value={reviewSource} onChange={event => setReviewSource(event.target.value)} /></label>
             <button type="submit" className="button secondary" disabled={!!busy}>保存核对说明</button></form> : null}
         </section>
       </div>

@@ -4,7 +4,6 @@ import { Activity, Clock, Cpu, HardDrive, MemoryStick, RefreshCw } from 'lucide-
 import { api, ApiError } from './api';
 import type { EventLoopStatus, HostStatus } from './server-status-types';
 import { formatBytes, formatUptime, hostLevel, lagLevel } from './server-status-types';
-import './aero-lp.css';
 import './server-status.css';
 import { Callout, StatePanel } from './StateViews';
 
@@ -80,8 +79,8 @@ export default function ServerStatusPage({ onExpired }: { onExpired: () => void 
   }, [read]);
 
   const swap = status?.memory.swap;
-  return <div className="lp-page">
-    <header className="lp-heading"><div><h1>服务器状态</h1><p>工作台所在服务器的 CPU、内存、磁盘与数据面卡顿，页面打开时每 5 秒刷新</p></div><div className="lp-toolbar">
+  return <div className="wb-page">
+    <header className="wb-heading"><div><h1>服务器状态</h1><p>工作台所在服务器的 CPU、内存、磁盘与数据面卡顿，页面打开时每 5 秒刷新</p></div><div className="wb-toolbar">
       {status ? <span className="ss-meta">读取于 {time.format(Date.parse(status.generatedAt))}</span> : null}
       <button className="button secondary" disabled={loading} onClick={() => void read()}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
     </div></header>
