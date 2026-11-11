@@ -1,36 +1,20 @@
-import { useEffect, useRef, useState } from 'react';
+import { useRef } from 'react';
 import { Server } from 'lucide-react';
-import { api, ApiError } from './api';
 import { formatBytes, formatUptime, hostLevel } from './server-status-types';
 import type { HostStatus } from './server-status-types';
+import { useLiveResource } from './use-live-resource';
 
 const POLL_MS = 15_000;
 const pct = (value: number | null | undefined) => value == null ? '—' : `${Math.round(value)}%`;
 const time = (iso: string) => new Date(iso).toLocaleTimeString('zh-CN', { hour12: false });
 
-// Compact server load next to the connection status; polls only while the page is visible.
+// Compact server load next to the connection status.
 export default function HostStatusBadge({ onOpen, onExpired }: { onOpen: () => void; onExpired: () => void }) {
-  const [status, setStatus] = useState<HostStatus | null>(null);
-  const [failed, setFailed] = useState(false);
   const details = useRef<HTMLDetailsElement>(null);
-  const expired = useRef(onExpired);
-  expired.current = onExpired;
-  useEffect(() => {
-    const controller = new AbortController();
-    let busy = false, poll: ReturnType<typeof setInterval> | undefined;
-    const read = async () => {
-      if (busy || document.hidden || controller.signal.aborted) return;
-      busy = true;
-      try { const data = await api<HostStatus>('/api/system/host', { signal: controller.signal, timeoutMs: 10_000 }); if (!controller.signal.aborted) { setStatus(data); setFailed(false); } }
-      catch (reason) { if (!controller.signal.aborted) { if (reason instanceof ApiError && reason.status === 401) expired.current(); else setFailed(true); } }
-      finally { busy = false; }
-    };
-    // Restart the interval on every read from the foreground, so returning to the page does not read twice in a row.
-    const restart = () => { clearInterval(poll); if (!document.hidden) { void read(); poll = setInterval(() => void read(), POLL_MS); } };
-    restart();
-    document.addEventListener('visibilitychange', restart);
-    return () => { controller.abort(); clearInterval(poll); document.removeEventListener('visibilitychange', restart); };
-  }, []);
+  // 与服务器状态页共享同一份读取：页面打开时按 5 秒间隔，平时 15 秒，后台暂停。
+  const host = useLiveResource<HostStatus>('/api/system/host', { intervalMs: POLL_MS, onExpired });
+  // 失败标记保留到下一次读取成功，重试期间仍提示显示的是旧数据。
+  const status = host.data, failed = !!host.error;
   // On narrow screens both topbar panels anchor to the same corner: opening one closes the other.
   const toggle = () => { if (details.current?.open) details.current.closest('.topbar-right')?.querySelectorAll('details[open]').forEach(other => { if (other !== details.current) (other as HTMLDetailsElement).open = false; }); };
   const disk = (status?.disks ?? []).reduce<number | null>((worst, item) => item.usedPercent == null ? worst : Math.max(worst ?? 0, item.usedPercent), null);

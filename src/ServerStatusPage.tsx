@@ -1,16 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Activity, Clock, Cpu, HardDrive, MemoryStick, RefreshCw } from 'lucide-react';
-import { api, ApiError } from './api';
 import type { EventLoopStatus, HostStatus } from './server-status-types';
 import { formatBytes, formatUptime, hostLevel, lagLevel } from './server-status-types';
 import './server-status.css';
 import { Callout, StatePanel } from './StateViews';
+import { useLiveResource } from './use-live-resource';
 
 const POLL_MS = 5_000;
 const time = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 const bootTime = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
-const message = (reason: unknown) => reason instanceof Error ? reason.message : '请求失败，请重试。';
 const level = hostLevel;
 
 function Card({ icon, title, percent, suffix, children }: { icon: ReactNode; title: string; percent: number | null | undefined; suffix?: string; children: ReactNode }) {
@@ -44,45 +42,20 @@ function EventLoopCard({ status, error }: { status: EventLoopStatus | null; erro
 }
 
 export default function ServerStatusPage({ onExpired }: { onExpired: () => void }) {
-  const [status, setStatus] = useState<HostStatus | null>(null);
-  const [error, setError] = useState('');
-  const [loop, setLoop] = useState<EventLoopStatus | null>(null);
-  const [loopError, setLoopError] = useState('');
-  const [loading, setLoading] = useState(false);
-  const lifetime = useRef<AbortController | null>(null);
-  // Bound to the lifetime that started it, so a remount (StrictMode) is not blocked by the aborted read.
-  const inFlight = useRef<Record<'host' | 'loop', AbortSignal | null>>({ host: null, loop: null });
-  const read = useCallback(async () => {
-    const signal = lifetime.current?.signal;
-    if (!signal || signal.aborted) return;
-    // Independent reads: the control plane answers host status itself, the data
-    // plane answers the event loop, and a stalled data plane must not hold the host cards back.
-    async function one<T>(key: 'host' | 'loop', path: string, apply: (data: T) => void, fail: (text: string) => void) {
-      if (!signal || inFlight.current[key] === signal) return;
-      inFlight.current[key] = signal; if (key === 'host') setLoading(true);
-      try { const data = await api<T>(path, { signal, timeoutMs: 10_000 }); if (!signal.aborted) apply(data); }
-      catch (reason) { if (!signal.aborted) { if (reason instanceof ApiError && reason.status === 401) onExpired(); else fail(message(reason)); } }
-      finally { if (inFlight.current[key] === signal) inFlight.current[key] = null; if (key === 'host' && !signal.aborted) setLoading(false); }
-    }
-    await Promise.all([
-      one<HostStatus>('host', '/api/system/host', data => { setStatus(data); setError(''); }, setError),
-      one<EventLoopStatus>('loop', '/api/system/event-loop', data => { setLoop(data); setLoopError(''); }, setLoopError),
-    ]);
-  }, [onExpired]);
-  useEffect(() => {
-    const controller = new AbortController(); lifetime.current = controller;
-    void read();
-    const poll = setInterval(() => { if (!document.hidden) void read(); }, POLL_MS);
-    const visible = () => { if (!document.hidden) void read(); };
-    document.addEventListener('visibilitychange', visible);
-    return () => { controller.abort(); clearInterval(poll); document.removeEventListener('visibilitychange', visible); };
-  }, [read]);
+  // 控制面答复主机状态，数据面答复事件循环；两者独立读取，数据面卡住不拖住主机卡片。
+  // 主机状态与顶栏负载徽标共享同一份读取。
+  const host = useLiveResource<HostStatus>('/api/system/host', { intervalMs: POLL_MS, onExpired });
+  const eventLoop = useLiveResource<EventLoopStatus>('/api/system/event-loop', { intervalMs: POLL_MS, onExpired });
+  const status = host.data, error = host.error?.message ?? '';
+  const loop = eventLoop.data, loopError = eventLoop.error?.message ?? '';
+  const loading = host.status === 'loading';
+  const read = () => { void host.refresh(); void eventLoop.refresh(); };
 
   const swap = status?.memory.swap;
   return <div className="wb-page">
     <header className="wb-heading"><div><h1>服务器状态</h1><p>工作台所在服务器的 CPU、内存、磁盘与数据面卡顿，页面打开时每 5 秒刷新</p></div><div className="wb-toolbar">
       {status ? <span className="ss-meta">读取于 {time.format(Date.parse(status.generatedAt))}</span> : null}
-      <button className="button secondary" disabled={loading} onClick={() => void read()}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
+      <button className="button secondary" disabled={loading} onClick={read}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新</button>
     </div></header>
     {error ? <Callout tone="warning">状态读取失败：{error}。{status ? '下面是最后一次读取的数据，' : ''}稍后自动重试。</Callout> : null}
     {!status ? <>{error ? null : <StatePanel kind="loading" title="正在读取服务器状态" />}

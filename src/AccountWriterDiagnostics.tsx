@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
 import { RefreshCw, Shield } from 'lucide-react';
-import { api, ApiError } from './api';
 import { parseWriterDiagnostics, type WriterDiagnostics, type WriterModule } from './account-writer-diagnostics';
+import { useLiveResource } from './use-live-resource';
 
 const moduleNames: Record<WriterModule, string> = { hub: '工作台', aster: 'ASTER', greeks: 'Greeks', crossex: 'CrossEx', other: '其他模块' };
 const reasons: Record<string, string> = { 'recovery-quarantine': '恢复隔离', 'authority-retired': '写入权威已退役', 'writer-retired': '当前读取方已退役', 'account-isolated': '账户隔离', 'owner-missing': 'Owner 记录缺失', 'owner-closed': 'Owner 已关闭', 'owner-unknown': 'Owner 状态未知', 'lease-missing': '未观测到租约', 'lease-expired': '租约已过期', 'lease-unknown': '租约状态未知', 'lease-conflict': '其他模块持有租约记录', sending: '请求发送中', 'unknown-result': '写入结果未知' };
@@ -10,56 +9,16 @@ const leaseNames = { active: '采样时截止未到', expired: '已过期', miss
 const isolationNames = { 'legacy-conflict': '历史写入冲突', 'identity-conflict': '身份冲突', 'manual-isolation': '人工隔离', unknown: '原因未知' };
 const registryErrors: Record<string, string> = { REGISTRY_MISSING: '注册库或保护标记缺失', REGISTRY_REPLACED: '注册库身份不一致', REGISTRY_BUSY: '注册库忙，请等待下次读取', WRITER_CLOSED: '当前读取方已关闭', INVALID_CLOCK: '诊断时钟异常', INVALID_RECOVERY_STATE: '恢复状态无法校验', UNSUPPORTED_RECOVERY_SCHEMA: '恢复状态版本不受支持', REGISTRY_UNAVAILABLE: '注册库无法读取' };
 const formatTime = (value: number | null) => value === null ? '未知' : new Date(value).toLocaleString('zh-CN', { hour12: false });
-type ReadPhase = 'loading' | 'ready' | 'error' | 'offline' | 'paused';
 
 export default function AccountWriterDiagnostics({ active, onExpired }: { active: boolean; onExpired: () => void }) {
-  const [snapshot, setSnapshot] = useState<WriterDiagnostics | null>(null);
-  const [phase, setPhase] = useState<ReadPhase>('paused');
-  const [refresh, setRefresh] = useState(0);
-  const expired = useRef(onExpired);
-  expired.current = onExpired;
-
-  useEffect(() => {
-    let stopped = false;
-    let request: AbortController | null = null;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let generation = 0;
-    const readable = () => active && !document.hidden && navigator.onLine;
-    const suspend = () => {
-      generation++; clearTimeout(timer); request?.abort(); request = null;
-      setPhase(!navigator.onLine ? 'offline' : 'paused');
-    };
-    const read = async () => {
-      if (stopped || !readable() || request) return;
-      clearTimeout(timer);
-      const controller = new AbortController(); request = controller;
-      const version = ++generation;
-      setPhase('loading');
-      try {
-        const result = parseWriterDiagnostics(await api<unknown>('/api/system/accounts', { signal: controller.signal, timeoutMs: 10_000 }));
-        if (stopped || controller.signal.aborted || version !== generation) return;
-        setSnapshot(result); setPhase('ready');
-      } catch (error) {
-        if (stopped || controller.signal.aborted || version !== generation) return;
-        setPhase('error');
-        if (error instanceof ApiError && error.status === 401) { stopped = true; expired.current(); }
-      } finally {
-        if (request === controller) request = null;
-        if (!stopped && version === generation && readable()) timer = setTimeout(() => void read(), 15_000);
-      }
-    };
-    const sync = () => { if (readable()) void read(); else suspend(); };
-    sync();
-    document.addEventListener('visibilitychange', sync);
-    window.addEventListener('online', sync); window.addEventListener('offline', sync);
-    window.addEventListener('focus', sync); window.addEventListener('pageshow', sync);
-    return () => { stopped = true; generation++; clearTimeout(timer); request?.abort(); document.removeEventListener('visibilitychange', sync); window.removeEventListener('online', sync); window.removeEventListener('offline', sync); window.removeEventListener('focus', sync); window.removeEventListener('pageshow', sync); };
-  }, [active, refresh]);
-
+  // 只在诊断页可见时读取；隐藏、离线时暂停，恢复后旧证据只作历史显示，等新的读取完成。
+  const writer = useLiveResource<WriterDiagnostics>('/api/system/accounts', { intervalMs: 15_000, parse: parseWriterDiagnostics, enabled: active, onExpired });
+  const snapshot = writer.data;
+  const phase = writer.status;
   const current = active && phase === 'ready';
   const status = phase === 'offline' ? '已离线，当前保护状态未知' : phase === 'error' ? '读取失败，当前保护状态未知' : phase === 'paused' ? '读取已暂停' : phase === 'loading' ? '正在读取，等待最新保护证据' : snapshot?.registry === 'disabled' ? '账户写入保护未启用，状态未知' : snapshot?.registry === 'unavailable' ? `${registryErrors[snapshot.errorCode ?? ''] ?? '注册库无法读取'}，状态未知` : '已读取注册库观测记录';
   return <section className="diagnostic-endpoints account-writer-diagnostics" aria-labelledby="account-writer-heading">
-    <div className="diagnostic-controls"><h3 id="account-writer-heading"><Shield size={18} aria-hidden="true" /> 账户写入保护</h3><button className="button secondary" disabled={!active || phase === 'loading' || phase === 'offline'} onClick={() => setRefresh(value => value + 1)}><RefreshCw size={16} />刷新保护诊断</button></div>
+    <div className="diagnostic-controls"><h3 id="account-writer-heading"><Shield size={18} aria-hidden="true" /> 账户写入保护</h3><button className="button secondary" disabled={!active || phase === 'loading' || phase === 'offline'} onClick={() => void writer.refresh()}><RefreshCw size={16} />刷新保护诊断</button></div>
     <p role="status" data-writer-status={current ? snapshot?.registry : phase}>{status}</p>
     <p className="diagnostic-explanation">只读展示共享注册库已观测到的记录，不证明账户可写，也不代替模块私有日志与交易所核对。Owner 的 active 仅为持久记录，模块是否在线仍未知。未决数量按账户统计，同一账户的多模块行不能相加。</p>
     {snapshot ? <>

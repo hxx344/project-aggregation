@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useState } from 'react';
 import { api, ApiError } from './api';
 import './backup-readiness.css';
+import { useLiveResource } from './use-live-resource';
 
 type RetrievalState = 'unchecked' | 'retrieved' | 'missing';
 type Drill = { kind: 'none' | 'ci-fixture' | 'independent'; result: 'not-run' | 'passed' | 'failed' | 'unknown'; at: string | null; isolation: 'unknown' | 'isolated' | 'not-isolated'; durationSeconds: number | null; coverage: string[] };
@@ -58,30 +59,14 @@ function localInput(value: string) {
 }
 
 export default function BackupReadiness({ onExpired }: { onExpired: () => void }) {
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const [error, setError] = useState('');
-  const [revision, setRevision] = useState(0);
-  const callback = useRef(onExpired);
-  const readGeneration = useRef(0);
-  const activeRead = useRef<AbortController | null>(null);
-  callback.current = onExpired;
-  useEffect(() => {
-    const controller = new AbortController();
-    const generation = ++readGeneration.current;
-    activeRead.current = controller;
-    setError('');
-    void api<Snapshot>('/api/system/backup-readiness', { signal: controller.signal }).then(value => { if (!controller.signal.aborted && generation === readGeneration.current) setSnapshot(value); }).catch(reason => {
-      if (controller.signal.aborted || generation !== readGeneration.current) return;
-      if (reason instanceof ApiError && reason.status === 401) callback.current();
-      setError(reason instanceof Error ? reason.message : '读取失败');
-    });
-    return () => controller.abort();
-  }, [revision]);
-  const saved = (value: Snapshot) => { readGeneration.current += 1; activeRead.current?.abort(); setSnapshot(value); setError(''); };
+  // 打开时读取一次，之后靠刷新按钮；登记保存的结果直接成为当前值，之前发出的读取作废。
+  const ledger = useLiveResource<Snapshot>('/api/system/backup-readiness', { intervalMs: null, timeoutMs: 15_000, onExpired });
+  const snapshot = ledger.data, error = ledger.error?.message ?? '';
+  const saved = ledger.commit;
   return <section className="backup-readiness" aria-labelledby="backup-readiness-title">
     <h2 id="backup-readiness-title">备份取回与恢复就绪</h2>
     <p>归档认证仅验证双密钥认证与密文摘要，不代表恢复成功。CI 夹具耗时不代表生产恢复时间。</p>
-    <button className="button secondary" onClick={() => setRevision(value => value + 1)}>刷新备份台账</button>
+    <button className="button secondary" onClick={() => void ledger.refresh()}>刷新备份台账</button>
     {error ? <p role="alert">{error}；已有内容可能过期。</p> : null}
     {!snapshot ? <p>正在读取…</p> : <>
       <p>本地计划：{snapshot.schedule.enabled ? `${snapshot.schedule.start}–${snapshot.schedule.end}（${snapshot.schedule.timezone}），保留 ${snapshot.schedule.keep} 个有效包` : '未启用'}。快照时间：{date(snapshot.observedAt)}。</p>
