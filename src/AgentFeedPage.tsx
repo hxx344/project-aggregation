@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Copy, KeyRound, LoaderCircle, Trash2 } from 'lucide-react';
 import { api, ApiError } from './api';
 import './agent-feed.css';
 import { Callout, StatePanel, TableEmpty } from './StateViews';
+import { useLiveResource } from './use-live-resource';
 
 type Scope = 'public' | 'system';
 type Token = { id: string; label: string; scopes: Scope[]; createdAt: string; lastUsedAt: string | null };
@@ -16,35 +17,33 @@ const time = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit'
 const message = (reason: unknown) => reason instanceof Error ? reason.message : '请求失败，请重试。';
 
 export default function AgentFeedPage({ onExpired }: { onExpired: () => void }) {
-  const [state, setState] = useState<State | null>(null);
-  const [error, setError] = useState('');
+  // 打开时读取一次；创建、撤销确认后重读，之前发出的读取作废。
+  const feed = useLiveResource<State>('/api/system/agent-feed', { intervalMs: null, timeoutMs: 15_000, onExpired });
+  const state = feed.data;
+  const [actionError, setActionError] = useState('');
+  const error = actionError || (feed.error?.message ?? '');
   const [busy, setBusy] = useState('');
   const [label, setLabel] = useState('');
   const [scopes, setScopes] = useState<Scope[]>(['public', 'system']);
   const [created, setCreated] = useState<Created | null>(null);
   const [copied, setCopied] = useState(false);
-  const fail = useCallback((reason: unknown) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else setError(message(reason)); }, [onExpired]);
-  const load = useCallback(async (signal?: AbortSignal) => {
-    try { const data = await api<State>('/api/system/agent-feed', { signal }); if (!signal?.aborted) { setState(data); setError(''); } }
-    catch (reason) { if (!signal?.aborted) fail(reason); }
-  }, [fail]);
-  useEffect(() => { const controller = new AbortController(); void load(controller.signal); return () => controller.abort(); }, [load]);
+  const fail = (reason: unknown) => { if (reason instanceof ApiError && reason.status === 401) onExpired(); else setActionError(message(reason)); };
 
   async function create(event: FormEvent) {
     event.preventDefault(); setBusy('create'); setCopied(false);
     try {
       const result = await api<Created>('/api/system/agent-feed/tokens', { method: 'POST', body: JSON.stringify({ label: label.trim(), scopes }) });
-      setCreated(result); setLabel(''); setError(''); await load();
+      setCreated(result); setLabel(''); setActionError(''); await feed.refresh();
     } catch (reason) { fail(reason); } finally { setBusy(''); }
   }
   async function revoke(token: Token) {
     if (!window.confirm(`撤销令牌「${token.label}」？使用它的 agent 会立即失去访问。`)) return;
     setBusy(token.id);
-    try { await api(`/api/system/agent-feed/tokens/${token.id}`, { method: 'DELETE' }); if (created?.entry.id === token.id) setCreated(null); setError(''); await load(); }
+    try { await api(`/api/system/agent-feed/tokens/${token.id}`, { method: 'DELETE' }); if (created?.entry.id === token.id) setCreated(null); setActionError(''); await feed.refresh(); }
     catch (reason) { fail(reason); } finally { setBusy(''); }
   }
   async function copy(text: string) {
-    try { await navigator.clipboard.writeText(text); setCopied(true); } catch { setCopied(false); setError('浏览器不允许写入剪贴板，请手动选中复制。'); }
+    try { await navigator.clipboard.writeText(text); setCopied(true); } catch { setCopied(false); setActionError('浏览器不允许写入剪贴板，请手动选中复制。'); }
   }
   const toggle = (scope: Scope) => setScopes(current => current.includes(scope) ? current.filter(item => item !== scope) : [...current, scope]);
   const example = `curl -H "Authorization: Bearer ${created?.token ?? '<令牌>'}" ${location.origin}/api/agent/v1/catalog`;
