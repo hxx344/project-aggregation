@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { BellRing, CircleAlert, KeyRound, LoaderCircle, RefreshCw, Save, Send, Trash2 } from 'lucide-react';
+import { BellRing, KeyRound, LoaderCircle, RefreshCw, Save, Send, Trash2 } from 'lucide-react';
 import { api, ApiError } from './api';
 import type { DigestConfig, DigestGroup, DigestHistoryEntry, DigestLevel, DigestMetric, DigestPreview, DigestSection, DigestSnapshot } from './feishu-digest-types';
 import './aero-lp.css';
 import './feishu-digest.css';
+import { Callout, StatePanel, TableEmpty } from './StateViews';
 
 const ROOT = '/api/automation/feishu-digest';
 const WEEKDAYS = ['周一', '周二', '周三', '周四', '周五', '周六', '周日'];
@@ -137,12 +138,12 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
   </div></header>;
   return <div className="lp-page">
     {heading}
-    {actionError ? <div className="error-box" role="alert">{actionError}</div> : null}
-    {notice ? <div className="lp-callout success" role="status">{notice}</div> : null}
-    {loadError ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>状态读取失败：{loadError}。保留最后读取的数据，稍后自动重试。</span></div> : null}
-    {snapshot?.loadError ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{snapshot.loadError}</span></div> : null}
-    {snapshot?.channel.error ? <div className="lp-callout warning" role="alert"><CircleAlert size={16} /><span>{snapshot.channel.error}</span></div> : null}
-    {!snapshot || !draft ? <section className="panel lp-empty" role="status"><LoaderCircle className="spin" /><strong>正在读取状态</strong></section> : <div className="fd-layout">
+    {actionError ? <Callout tone="error">{actionError}</Callout> : null}
+    {notice ? <Callout tone="success">{notice}</Callout> : null}
+    {loadError ? <Callout tone="warning">状态读取失败：{loadError}。保留最后读取的数据，稍后自动重试。</Callout> : null}
+    {snapshot?.loadError ? <Callout tone="warning">{snapshot.loadError}</Callout> : null}
+    {snapshot?.channel.error ? <Callout tone="warning">{snapshot.channel.error}</Callout> : null}
+    {!snapshot || !draft ? <StatePanel kind="loading" title="正在读取状态" /> : <div className="fd-layout">
       <div className="fd-column">
         <section className="panel lp-status" aria-label="运行状态"><div className="lp-state-line"><span className={`lp-state ${draft.enabled ? 'running' : ''}`}><BellRing size={16} />{snapshot.config.enabled ? '定时发送已开启' : '定时发送已关闭'}</span>
           <span>下次发送：{snapshot.nextAt ? when(snapshot.nextAt) : '—'}</span>{dirty ? <span className="lp-paused">有未保存的修改</span> : null}</div>
@@ -177,17 +178,17 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
               const setting = draft.sections[item.id] ?? { enabled: true, hidden: [] };
               return <li key={item.id}><div className="fd-section-row"><label className="checkbox-field"><input type="checkbox" checked={setting.enabled} onChange={e => changeSection(item.id, { enabled: e.target.checked })} />{item.name}</label><span className={`fd-level ${item.level}`}>{item.status}</span></div>
                 {item.metrics.length && setting.enabled ? <details><summary>选择指标（已选 {item.metrics.filter(metric => !setting.hidden.includes(metric.key)).length}/{item.metrics.length}）</summary><div className="fd-metrics">{item.metrics.map(metric => <label key={metric.key}><input type="checkbox" checked={!setting.hidden.includes(metric.key)} onChange={e => changeSection(item.id, { hidden: e.target.checked ? setting.hidden.filter(key => key !== metric.key) : [...setting.hidden, metric.key] })} />{metric.label}</label>)}</div></details> : null}</li>;
-            })}</ul> : <p className="lp-table-empty">{previewError || '正在读取模块'}</p>}
+            })}</ul> : <TableEmpty>{previewError || '正在读取模块'}</TableEmpty>}
           </fieldset></section>
       </div>
       <div className="fd-column">
         <section className="panel fd-preview" aria-label="消息预览"><div className="panel-heading"><h2>消息预览</h2><span className="muted">{preview ? `${(preview.bytes / 1024).toFixed(1)} KB` : ''}{previewing ? ' · 更新中' : ''}</span></div>
-          {previewError ? <div className="lp-callout warning fd-preview-error" role="alert"><CircleAlert size={16} /><span>{previewError}</span></div> : null}
+          {previewError ? <Callout tone="warning" className="fd-preview-error">{previewError}</Callout> : null}
           {preview ? <div className="fd-card"><div className={`fd-card-header ${preview.digest.level}`}>{preview.digest.title} {preview.digest.clock}</div>
             <div className="fd-card-body"><p className="fd-summary">{preview.digest.attention.length ? `${preview.digest.attention.length} 个模块需要关注` : `没有需要处理的问题，共 ${preview.digest.sections.length} 个模块`}</p>
               {draft.showIssues && preview.digest.attention.length ? <ul className="fd-issues">{preview.digest.attention.flatMap(item => (item.issues.length ? item.issues : [item.status]).map(issue => <li key={`${item.name}:${issue}`}><span className={`fd-level ${item.level}`}>{LEVELS[item.level]}</span>{item.name}：{issue}</li>))}</ul> : null}
               {preview.digest.sections.map(section => <PreviewSection key={section.id} section={section} />)}
-              {preview.omitted ? <p className="fd-omitted">另有 {preview.omitted} 个模块超出飞书长度限制，不会显示。</p> : null}</div></div> : <p className="lp-table-empty">{previewing ? '正在生成预览' : '暂无预览'}</p>}
+              {preview.omitted ? <p className="fd-omitted">另有 {preview.omitted} 个模块超出飞书长度限制，不会显示。</p> : null}</div></div> : <TableEmpty>{previewing ? '正在生成预览' : '暂无预览'}</TableEmpty>}
         </section>
         <section className="panel lp-section" aria-label="发送记录"><div className="panel-heading"><h2>发送记录</h2><span className="muted">最近 {snapshot.history.length} 次</span></div>
           <p className="as-muted">这里核对飞书汇总投递；Monitor 合约机会告警在其提醒记录内核对。人工说明不修改渠道结果、不重发消息。</p>
@@ -196,7 +197,7 @@ export default function FeishuDigestPage({ onExpired }: { onExpired: () => void 
             {entry.stages?.length ? <small>{entry.stages.map(stage => `${RESULTS[stage.status as DigestHistoryEntry['status']] ?? stage.status} ${when(stage.at)}`).join(' → ')}</small> : null}
             {entry.reviews?.map(review => <p key={review.id}>人工核对 · {review.actor} · {when(review.at)}：{review.note}（来源：{review.source}）</p>)}
             {entry.id ? <button type="button" className="as-link" onClick={() => { setReviewId(entry.id!); setReviewNote(''); setReviewSource(''); }}>记录核对说明</button> : null}
-          </span></li>)}</ol> : <p className="lp-table-empty">尚无发送记录。</p>}
+          </span></li>)}</ol> : <TableEmpty>尚无发送记录。</TableEmpty>}
           {reviewId ? <form onSubmit={event => { event.preventDefault(); void execute('review', '/reviews', 'POST', { id: reviewId, note: reviewNote, source: reviewSource }, '核对说明已保存').then(result => { if (result) setReviewId(''); }); }}>
             <p>投递编号：{reviewId}</p><label className="lp-field">人工核对说明<input required maxLength={500} value={reviewNote} onChange={event => setReviewNote(event.target.value)} /></label>
             <label className="lp-field">证据来源（勿填写凭据）<input required maxLength={200} value={reviewSource} onChange={event => setReviewSource(event.target.value)} /></label>

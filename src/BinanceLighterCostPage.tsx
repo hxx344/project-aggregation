@@ -1,10 +1,11 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Archive, CircleAlert, Download, LoaderCircle, Play, RefreshCw, Save, Square } from 'lucide-react';
+import { Archive, Download, LoaderCircle, Play, RefreshCw, Save, Square } from 'lucide-react';
 import { CartesianGrid, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { api, ApiError } from './api';
 import type { CostBook, CostConfig, CostQuote, CostReport, CostScenario, CostScenarioDetail, CostSnapshot, CostSymbol } from './binance-lighter-cost-types';
 import './binance-lighter-cost.css';
+import { Callout } from './StateViews';
 
 const ROOT = '/api/research/binance-lighter-cost';
 const SOURCE_CLOCK_TOLERANCE_MS = 250;
@@ -293,12 +294,12 @@ export default function BinanceLighterCostPage({ onExpired }: { onExpired: () =>
   const writeDisabled = !!busy || uncertain || offline || !snapshot;
   return <div className="blc-page"><div className="blc-heading"><div><h1>对冲成本研究</h1><p>BN 双边库存报价 × Lighter 净对冲 · BTC 永续</p></div><div className="blc-toolbar"><button className="button secondary" disabled={loading || !!busy || offline} onClick={() => void read(true)}><RefreshCw size={15} className={loading ? 'spin' : ''} />刷新状态</button><button className="button secondary" disabled={!!busy || offline || !snapshot || (!report && !snapshot.archives.length)} onClick={() => void execute('download')}><Download size={15} />导出报告</button>{active ? <button className="button secondary" disabled={writeDisabled} onClick={() => void execute('stop')}><Square size={15} />停止模拟</button> : <button className="button primary" disabled={writeDisabled || dirty || exposures.length > 0 || !!report?.interrupted} onClick={() => void execute('start')}><Play size={15} />启动模拟</button>}</div></div>
     <div className="blc-identity"><strong>仅模拟 · 真实订单 0</strong><span>活动资格、有效成交额与奖励待确认；不作为真实成交证明。</span></div>
-    {loadError ? <div className="blc-callout warning" role="alert">研究数据读取失败：{loadError} 历史记录仍保留。</div> : null}
-    {actionError ? <div className="blc-callout warning" role="alert">{actionError}</div> : null}
-    {uncertain ? <div className="blc-callout warning" role="status">操作结果尚未确认，正在读取核对；确认前不会重复提交。</div> : null}
-    {notice ? <div className="blc-callout" role="status">{notice}</div> : null}
+    {loadError ? <Callout tone="warning">研究数据读取失败：{loadError} 历史记录仍保留。</Callout> : null}
+    {actionError ? <Callout tone="warning">{actionError}</Callout> : null}
+    {uncertain ? <Callout tone="warning" role="status">操作结果尚未确认，正在读取核对；确认前不会重复提交。</Callout> : null}
+    {notice ? <Callout tone="info">{notice}</Callout> : null}
     <section className="panel blc-status"><div className="blc-status-line"><strong className={`blc-state ${snapshot?.state || 'loading'}`}>{snapshot ? stateLabels[snapshot.state] : '正在读取状态'}</strong><span>{offline ? '浏览器离线，保留历史记录' : active && report && reportElapsed > 15_000 ? '研究报告超过 15 秒未更新' : historical && report ? '当前显示历史观测' : '页面每 5 秒读取聚合报告'}</span>{snapshot?.error ? <span className="blc-warning-text">{snapshot.error}</span> : null}</div><dl><div><dt>当前会话</dt><dd>{report ? time(report.startedAt, true) : '尚无会话'}<small>{report?.sessionId || '启动后建立独立记录'}</small></dd></div><div><dt>计价单位</dt><dd>USDC 名义结算单位<small>不是 USD 法币估值</small></dd></div><div><dt>实际资金费</dt><dd>未知<small>可配置支出情景，未核验实际结算</small></dd></div><div><dt>运行方式</dt><dd>服务器持续模拟<small>关闭页面不会停止模拟</small></dd></div></dl></section>
-    {report && !active && (exposures.length > 0 || report.interrupted) ? <div className="blc-callout warning blc-stopped-exposure" role="status"><CircleAlert size={18} /><div><strong>停止后库存保留，开始新会话前须归档</strong><p>{report.interrupted ? '上次会话中断。' : ''} {exposures.length} 个独立情景保留库存或在途对冲。归档仅保存记录，不代表这些库存已平仓。</p></div></div> : null}
+    {report && !active && (exposures.length > 0 || report.interrupted) ? <Callout tone="warning" role="status" className="blc-stopped-exposure"><strong>停止后库存保留，开始新会话前须归档</strong><p>{report.interrupted ? '上次会话中断。' : ''} {exposures.length} 个独立情景保留库存或在途对冲。归档仅保存记录，不代表这些库存已平仓。</p></Callout> : null}
     <InventoryTable scenarios={scenarios} selected={selected?.id || ''} onSelect={selectScenario} snapshotLabel={snapshotLabel} />
     <ScenarioTable scenarios={scenarios} selected={selected?.id || ''} snapshotLabel={snapshotLabel} />
     <ScenarioDetails scenario={selected} detail={selectedDetail} loading={detailLoading} error={detailError?.key === detailKey ? detailError.message : ''} stale={detailStale || historical} />
