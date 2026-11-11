@@ -9,9 +9,9 @@
 - 根项目和 Crossex 的 TypeScript 检查将增量信息保存在各自
   `.build-cache/.tsbuildinfo`。重复检查可以复用结果，源码变化仍执行类型验证；
   缓存缺失时正常进行完整检查。它不等同于跨 GitHub Actions 运行的产物缓存。
-- CI 用 `INSTALL_TEST_LANE` 把 `deploy/test-workspace.sh` 分到三台 runner，每台都走真实
+- CI 用 `INSTALL_TEST_LANE` 把 `deploy/test-workspace.sh` 分到四台 runner，每台都走真实
   冻结安装和模块生产构建：`package` 组装、打包并验收发布包；`behavior` 运行根行为测试，并用
-  `INSTALL_TEST_SHARD`（Node 的 `--test-shard`，按测试文件划分）拆成两台，前端检查只在第一个
+  `INSTALL_TEST_SHARD`（Node 的 `--test-shard`，按测试文件划分）拆成三台，前端检查只在第一个
   分片运行；本地默认 `all` 且不分片，全部都跑。夹具内按依赖并行：Python 环境准备、前端检查和四个模块
   各自的构建同时运行；根行为测试在另一份固定 Git 提取中运行，模块产物从已校验缓存恢复
   （与开启 `PROJECT_DEPLOY_TESTS=1` 的升级相同）。组装完成后，源码发布目录检查和跨目录

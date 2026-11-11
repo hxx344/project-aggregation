@@ -43,14 +43,16 @@ jobs:
       matrix:
         # Every entry runs the real installer path on its own runner: package
         # assembles, packages and verifies the release; behavior runs the root
-        # behavior tests, split by file over two runners (node --test-shard),
+        # behavior tests, split by file over three runners (node --test-shard),
         # and its first shard also runs the frontend checks.
         include:
           - lane: package
           - lane: behavior
-            shard: 1/2
+            shard: 1/3
           - lane: behavior
-            shard: 2/2
+            shard: 2/3
+          - lane: behavior
+            shard: 3/3
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7

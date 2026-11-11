@@ -18,7 +18,7 @@ PNPM_BIN=$(realpath "${INSTALL_TEST_PNPM:?Pass the pnpm JavaScript entry file (n
   echo "INSTALL_TEST_PNPM must be the pnpm $PNPM_VERSION JavaScript entry file executable by INSTALL_TEST_NODE." >&2
   exit 1
 }
-# CI runs the two halves on separate runners; local runs default to both.
+# CI runs each lane on its own runners; local runs default to both.
 lane=${INSTALL_TEST_LANE:-all}
 case "$lane" in
   all|behavior|package) ;;
