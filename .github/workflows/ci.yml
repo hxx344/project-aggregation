@@ -152,7 +152,8 @@ jobs:
         with:
           node-version: '24.15.0'
           cache: pnpm
-      # Only the root TypeScript compiler is needed; the prototype has no dependencies.
+      # The executor has no runtime dependencies; the root install supplies the TypeScript
+      # compiler and ethers, which the contract probe tests use as an independent reference.
       - run: pnpm install --frozen-lockfile
         working-directory: .
       - name: Type check
