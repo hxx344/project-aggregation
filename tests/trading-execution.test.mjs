@@ -494,6 +494,23 @@ test('unknown native create never retries or guesses identity, and explicit ID m
   assert.equal(f.creates.length, 2);
 });
 
+test('a resting native strategy without child orders reports no position side and can still be claimed by ID', async t => {
+  const f = await fixture(t);
+  f.handlers['bybit:create'] = async (_credentials, spec) => {
+    f.records.set('native-resting', { ...spec, id: 'native-resting', kind: 'strategy', status: 'working', terminal: false, childrenSettled: false, filledQuantity: '0', price: '70', positionSide: null, createdAt: new Date(f.time).toISOString() });
+    throw new ExecutionExchangeError('network', { uncertain: true });
+  };
+  f.start(await f.preview(intent({ batchCount: 1 }))); await f.service.tick();
+  assert.equal(f.job.status, 'attention');
+  const leg = f.job.legs.find(row => row.exchange === 'bybit'), record = f.records.get('native-resting');
+  record.positionSide = 'LONG';
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: leg.id, strategyId: record.id, acknowledge: true }), /不一致/);
+  record.positionSide = null; record.createdAt = new Date(f.time - 60_000).toISOString();
+  await assert.rejects(f.service.reconcile(f.job.id, { legId: leg.id, strategyId: record.id, acknowledge: true }), /创建时间不匹配/);
+  record.createdAt = new Date(f.time).toISOString();
+  await f.service.reconcile(f.job.id, { legId: leg.id, strategyId: record.id, acknowledge: true });
+  assert.equal(f.job.status, 'paused'); assert.equal(f.creates.length, 2);
+});
 test('ambiguous Binance create uses exact client ID query, never blind resubmission', async t => {
   const f = await fixture(t);
   f.handlers['binance:create'] = async (_credentials, spec) => {

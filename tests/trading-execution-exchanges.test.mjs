@@ -282,7 +282,7 @@ test('Bybit chase legs create a native chase strategy and sign its exact JSON bo
   assert.deepEqual(await client.create(credentials, { ...close, url: 'https://untrusted.invalid' }), { id: STRATEGY, kind: 'strategy' });
   assert.equal(calls.length, 1); authenticatedSignature('bybit', calls[0]);
   assert.equal(calls[0].url.pathname, '/v5/strategy/create'); assert.equal(calls[0].init.method, 'POST');
-  assert.deepEqual(calls[0].parameters, { category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Sell', size: '2', strategyType: 'chaseOrder', positionIdx: 1, reduceOnly: true, chaseDistance: '0', maxChasePrice: '70' });
+  assert.deepEqual(calls[0].parameters, { category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Sell', size: '2', strategyType: 'chaseOrder', positionIdx: 1, reduceOnly: true, chasePercentE4: 0, maxChasePrice: '70' });
   assert.equal(calls[0].init.headers['Content-Type'], 'application/json');
 });
 
@@ -317,7 +317,7 @@ for (const exchange of ['binance', 'bybit']) {
     const codes = exchange === 'binance'
       ? [-1000, -1006, -1007, -1199, -2000, -2010, -2011, -2013, -2099, -4000, -4111, -4116, -4999, -5026, -5047, -9999]
       : [10000, 10014, 10016, 110008, 110010, 110030, 110072, 110079, 110114, 110199,
-        60061, 60062, 60065, 60068, 60071, 60072, 60073, 60074, 60080, 60081, 60099];
+        60061, 60062, 60065, 60068, 60071, 60072, 60073, 60074, 60080, 60099];
     for (const code of codes) for (const operation of ['create', 'stop']) {
       const { client, calls } = harness(exchange, () => exchange === 'binance' ? json({ code }, 400) : json({ retCode: code }));
       const input = operation === 'create' ? spec : { ...spec, id: exchange === 'binance' ? ORDER : STRATEGY };
@@ -331,7 +331,7 @@ for (const exchange of ['binance', 'bybit']) {
   });
 
   test(`${exchange} explicit permission, parameter, balance and limit errors remain certain only below HTTP 500`, async () => {
-    const codes = exchange === 'binance' ? [-1022, -1102, -2015, -2019, -4004, -4164, -5022] : [10001, 10005, 110004, 110094, 60063, 60066];
+    const codes = exchange === 'binance' ? [-1022, -1102, -2015, -2019, -4004, -4164, -5022] : [10001, 10005, 110004, 110094, 60063, 60066, 60081];
     for (const code of codes) for (const status of [exchange === 'binance' ? 400 : 200, 503]) {
       const { client, calls } = harness(exchange, () => json(exchange === 'binance' ? { code } : { retCode: code }, status));
       await assert.rejects(client.create(credentials, spec), isError(status < 500 ? 'rejected' : 'upstream', status >= 500));
@@ -623,6 +623,13 @@ test('Bybit terminal status alone cannot settle a child with open or missing fil
     : call.url.pathname.endsWith('/order-list') ? { list: [], nextCursor: '' } : undefined);
   const result = await lagged.client.inspect(credentials, { ...spec, id: STRATEGY });
   assert.equal(result.childrenSettled, false); assert.equal(result.positionSide, null);
+  // A chase that rested and was stopped unfilled never lists a child: the strategy row alone settles it.
+  for (const [status, settled] of [[2, false], [3, true]]) {
+    const empty = harness('bybit', call => call.url.pathname.endsWith('/strategy/list') ? { list: [strategy({ status })], nextCursor: '' }
+      : call.url.pathname.endsWith('/order-list') ? { list: [], nextCursor: '' } : undefined);
+    const unfilled = await empty.client.inspect(credentials, { ...spec, id: STRATEGY });
+    assert.deepEqual([unfilled.childrenSettled, unfilled.positionSide, unfilled.filledQuantity], [settled, null, '0']);
+  }
 });
 
 test('Bybit inspects every child page, deduplicates exact repeated orders, and counts partial cancellation correctly', async () => {
@@ -825,5 +832,5 @@ test('Bybit market inspection rejects foreign orders and reports an unknown orde
 test('Bybit chase legs without a limit omit maxChasePrice', async () => {
   const { client, calls } = harness('bybit');
   assert.deepEqual(await client.create(credentials, { ...spec, stopPrice: null }), { id: STRATEGY, kind: 'strategy' });
-  assert.deepEqual(calls[0].parameters, { category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Buy', size: '2', strategyType: 'chaseOrder', positionIdx: 0, reduceOnly: false, chaseDistance: '0' });
+  assert.deepEqual(calls[0].parameters, { category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Buy', size: '2', strategyType: 'chaseOrder', positionIdx: 0, reduceOnly: false, chasePercentE4: 0 });
 });

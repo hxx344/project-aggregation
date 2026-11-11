@@ -968,7 +968,9 @@ export function createTradingExecution({ db, stmt, encrypt, decrypt, clientFacto
     if (!value || typeof value.id !== 'string' || !value.id || (order.remoteId && value.id !== order.remoteId) || value.symbol !== order.spec.symbol || value.side !== order.spec.side || value.reduceOnly !== order.spec.reduceOnly || (value.positionSide !== null && value.positionSide !== order.spec.positionSide) || value.kind !== order.kind || !reducedOriginal && compareDecimals(value.quantity, order.spec.quantity) !== 0) throw new ExecutionError(409, '委托身份或数量与本任务不一致，禁止认领或补单');
     const filled = decimal(value.filledQuantity, { nonnegative: true });
     if (compareDecimals(filled, order.filledQuantity) < 0 || compareDecimals(filled, order.spec.quantity) > 0 || typeof value.terminal !== 'boolean' || typeof value.childrenSettled !== 'boolean') throw new ExecutionError(409, '委托成交记录不一致，暂停自动执行');
-    if (explicit && (value.positionSide === null || !value.createdAt || !Number.isFinite(Date.parse(value.createdAt)) || Date.parse(value.createdAt) < Date.parse(order.createdAt) - 5000 || Date.parse(value.createdAt) > Date.parse(order.createdAt) + callTimeoutMs + 5000)) throw new ExecutionError(409, '策略方向或创建时间不匹配，禁止认领其他策略');
+    // A native strategy row has no position side; it comes from child orders, and a resting chase lists none.
+    // Side and reduceOnly, both checked above, already fix the position side in either position mode.
+    if (explicit && (!value.createdAt || !Number.isFinite(Date.parse(value.createdAt)) || Date.parse(value.createdAt) < Date.parse(order.createdAt) - 5000 || Date.parse(value.createdAt) > Date.parse(order.createdAt) + callTimeoutMs + 5000)) throw new ExecutionError(409, '策略创建时间不匹配，禁止认领其他策略');
     return filled;
   }
   function lighterAmendVisible(order, value) {
