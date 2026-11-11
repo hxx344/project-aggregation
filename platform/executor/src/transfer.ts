@@ -105,6 +105,11 @@ export interface TransferDeps {
   isWriterLost(error: unknown): boolean;
   /** Why a pair's accounts cannot be changed now (ADL still works on them), or null. */
   busy?(pairId: string): string | null;
+  /**
+   * Why the pair's ADL reduction is on the wire now (a batch being sent or resting), or null. A transfer is not sent
+   * meanwhile: the legacy system ran margin balance and ADL of one pair under one lock (inventory 6.5).
+   */
+  adlSending?(pairId: string): string | null;
 }
 
 export type TransferPlan = { source: PairSide; destination: PairSide; amount: string };
@@ -148,7 +153,7 @@ function checkBudgets(budgets: TransferBudgets, connector: TransferConnector | n
   if (budgets.transferClockToleranceMs >= budgets.transferHistorySpanMs) throw new ContractError(500, 'budget', 'transferClockToleranceMs 须小于 transferHistorySpanMs');
 }
 
-export function createTransfers({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost, busy }: TransferDeps) {
+export function createTransfers({ db, now, budgets, connector, controlled, write, assertWriter, callVenue, event, isWriterLost, busy, adlSending }: TransferDeps) {
   checkBudgets(budgets, connector);
   /** Transfers whose send is running in this process; any other prepared or sending row was interrupted. */
   const inFlight = new Set<string>();
@@ -335,6 +340,8 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
   async function evaluate(pairId: string): Promise<void> {
     const pair = readPair(pairId), at = now();
     if (!pair || !pair.enabled || at < pair.cooldownUntil || at < pair.nextCheckAt || blockedBy(pair)) return;
+    const reducing = adlSending?.(pair.id);
+    if (reducing) { defer(pair, `${reducing}，本轮不划转`); return; }
     let balances: Record<PairSide, TransferBalance>;
     try { balances = await readBalances(pair); }
     catch (error) { defer(pair, `余额读取失败，未划转：${why(error)}`); return; }
@@ -372,7 +379,7 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
       if (!current || !current.enabled || current.identity !== transfer.identity || now() < current.cooldownUntil) return '配对状态已变化，本次不划转';
       // The amount was planned under the settings read when this evaluation began.
       if (JSON.stringify(current.config) !== JSON.stringify(pair.config)) return '配对配置在评估途中已更改，本次不划转，下一轮按新配置规划';
-      const blocked = blockedBy(current) ?? staleness(current, balances);
+      const blocked = blockedBy(current) ?? staleness(current, balances) ?? adlSending?.(current.id);
       if (blocked) return `${blocked}，本次不划转`;
       const at = now();
       current.usedReceipts = current.usedReceipts.filter(item => item.at + usedReceiptWindowMs > at);
@@ -567,7 +574,7 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
   /**
    * Settles what is open first, then plans; a transfer settled in this pass still leaves its pair in cooldown.
    * The pass stops starting new work once its time budget is spent and the next one picks up after the last item
-   * done, so a venue that answers slowly delays the job loop by at most the budget plus one item.
+   * done, so one slow pair cannot keep the others waiting, and a pass returns (to see a lost lease or a shutdown) within the budget plus one item.
    */
   async function tick(): Promise<void> {
     if (!connector) return;
@@ -679,6 +686,8 @@ export function createTransfers({ db, now, budgets, connector, controlled, write
 
   return {
     recover, tick, registerPair, setEnabled,
+    /** True while a transfer of the pair is persisted for sending or on the wire; the pair's ADL batches wait for it. */
+    sending: (pairId: string): boolean => !!db.prepare("SELECT 1 FROM transfers WHERE pair_id = ? AND settled = 0 AND state IN ('prepared', 'sending') LIMIT 1").get(pairId),
     pairs: () => listPairs().pairs.map(pairView),
     /** Readable pair records, for the ADL handling of the same sub-accounts. */
     records: () => listPairs().pairs,

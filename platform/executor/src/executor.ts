@@ -84,6 +84,8 @@ export const DEFAULT_BUDGETS: Readonly<Budgets> = Object.freeze({
 
 export class WriterLostError extends ContractError { constructor(message: string) { super(503, 'writer_lost', message); } }
 
+/** The passes the entry schedules apart: two-leg jobs, margin transfers and ADL incidents. */
+export type LoopName = 'jobs' | 'transfers' | 'adl';
 export type JobStatus = 'accepted' | 'running' | 'completed' | 'failed' | 'stopped' | 'attention';
 const FINAL_JOB = new Set<JobStatus>(['completed', 'failed', 'stopped', 'attention']);
 /**
@@ -216,7 +218,7 @@ export interface ExecutorOptions {
   transfers?: TransferConnector;
   /** ASTER ADL emergency handling of the same pairs. Its orders are not recorded in the shared registry either, so with control injected it reconciles and waits but sends none. */
   adl?: AdlConnector;
-  /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the tick. */
+  /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the other passes. */
   positions?: AsterPositionsConnector;
 }
 
@@ -246,7 +248,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;
-  let ticking: Promise<void> | null = null;
+  /** One pass at a time per loop; a second call while one runs joins it. */
+  const passes: Record<'all' | LoopName, Promise<void> | null> = { all: null, jobs: null, transfers: null, adl: null };
+  const singleFlight = (name: 'all' | LoopName, run: () => Promise<void>): Promise<void> => {
+    const current = passes[name];
+    if (current) return current;
+    const next = run().finally(() => { passes[name] = null; });
+    passes[name] = next;
+    return next;
+  };
   /** The last transfer-pass failure written to the event log; the same reason is written at most once a minute. */
   let transferTickFailure: { reason: string; at: number } | null = null, adlTickFailure: { reason: string; at: number } | null = null;
   /** Operations whose send is running in this process; any other prepared or sending row was interrupted. */
@@ -375,8 +385,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     finally { clearTimeout(timer); }
   }
   const transfers = createTransfers({ db, now, budgets, connector: transferConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError,
-    busy: pairId => adl.busy(pairId) });
-  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records });
+    busy: pairId => adl.busy(pairId), adlSending: pairId => adl.sending(pairId) });
+  const adl: Adl = createAdl({ db, now, budgets, connector: adlConnector ?? null, controlled: !!controlOptions, write, assertWriter, callVenue, event, isWriterLost: error => error instanceof WriterLostError, pairs: transfers.records,
+    transferSending: pairId => transfers.sending(pairId) });
   const positions = createPositions({ connector: positionsConnector ?? null, now, budgets, pairs: transfers.records, callVenue });
   const readFailure = (error: unknown): never => {
     if (error instanceof ContractError) throw error;
@@ -1333,7 +1344,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     return op.state === 'open' && op.cancelRequestedAt !== null && op.openCheckedFrom != null && op.openCheckedFrom >= cancelSettledAt(op) ? 'rejected' : null;
   }
 
-  async function runTick(): Promise<void> {
+  /** Two-leg jobs: reconcile, hedge, cancel and release registry entries. Transfers and ADL run in passes of their own. */
+  async function runJobs(): Promise<void> {
     if (!acquire()) return;
     settleControl();
     if (now() - prunedAt >= budgets.pruneIntervalMs) {
@@ -1371,7 +1383,15 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         }
       } catch (error) { if (error instanceof WriterLostError) throw error; }
     }
-    // Transfers come last and must not cost the jobs above their pass, nor the registry its release below.
+    // Again at the end, so a result reconciled in this pass releases its account before the next one.
+    settleControl();
+  }
+  /**
+   * Margin transfers. A slow venue holds up only this pass: it is scheduled apart from the jobs and from ADL,
+   * which share nothing with it but the lease and append-only event rows.
+   */
+  async function runTransfers(): Promise<void> {
+    if (!acquire()) return;
     try { await transfers.tick(); }
     catch (error) {
       if (error instanceof WriterLostError) throw error;
@@ -1382,7 +1402,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         catch (inner) { if (inner instanceof WriterLostError) throw inner; }
       }
     }
-    // ADL after transfers: it reads the same pairs and must not cost the jobs their pass either.
+  }
+  /** ADL incidents, on their own schedule so neither a slow transfer nor a slow job delays the emergency reduction. */
+  async function runAdl(): Promise<void> {
+    if (!acquire()) return;
     try { await adl.tick(); }
     catch (error) {
       if (error instanceof WriterLostError) throw error;
@@ -1393,13 +1416,13 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         catch (inner) { if (inner instanceof WriterLostError) throw inner; }
       }
     }
-    // Again at the end, so a result reconciled in this pass releases its account before the next one.
-    settleControl();
   }
-  /** One serialized pass over unfinished jobs, then over transfers and ADL incidents. */
+  const tickJobs = (): Promise<void> => singleFlight('jobs', runJobs);
+  const tickTransfers = (): Promise<void> => singleFlight('transfers', runTransfers);
+  const tickAdl = (): Promise<void> => singleFlight('adl', runAdl);
+  /** One pass of each loop in turn, as tests and the measurement script drive it; the entry schedules the three apart. */
   function tick(): Promise<void> {
-    if (!ticking) ticking = runTick().finally(() => { ticking = null; });
-    return ticking;
+    return singleFlight('all', async () => { await tickJobs(); await tickTransfers(); await tickAdl(); });
   }
 
   function jobView(id: string) {
@@ -1439,6 +1462,9 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     releaseStrategy,
     observe,
     tick,
+    tickJobs,
+    tickTransfers,
+    tickAdl,
     jobView,
     registerTransferPair: transfers.registerPair,
     setTransferEnabled: transfers.setEnabled,
@@ -1450,7 +1476,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     recentAdlIncidents: adl.recent,
     setAdlConfig: adl.setConfig,
     restartAdl: adl.restart,
-    /** One read round of every paired ASTER account; never part of the tick, so a slow read cannot hold up the jobs. */
+    /** One read round of every paired ASTER account; never part of tick(), so a slow read cannot hold up the jobs, transfers or ADL. */
     refreshPositions: positions.refresh,
     asterPositions: positions.view,
     unfinished: () => unfinishedJobs().map(job => job.id),
