@@ -60,3 +60,35 @@ test('repeated reads pick up new samples and notice rows removed outside record(
     assert.deepEqual(pnl.read(entries, base - 100000, base + 30000).points.map(point => point.time), [base]);
   } finally { db.close(); }
 });
+
+test('cached reads downsample like the string reducer and reload on a new revision or earlier window', () => {
+  const db = new DatabaseSync(':memory:'), pnl = createTradingPnl(db);
+  const base = Date.UTC(2026, 10, 1), minute = 60000, count = 1500, coverage = [{ start: base - 100000, end: base + 2 * count * minute }];
+  const entries = ['binance', 'bybit'].map(exchange => ({ row: { exchange, credentials: 'fixture', revision: 1 },
+    snapshot: { positions: { rows: [], error: null }, funding: { events: [], coverage }, trades: { events: [], coverage } } }));
+  const sample = (index, value) => {
+    entries[0].snapshot.positions.rows = [{ unrealizedPnl: value }]; entries[1].snapshot.positions.rows = [{ unrealizedPnl: '0' }];
+    for (const entry of entries) entry.snapshot.positions.fetchedAt = new Date(base + index * minute).toISOString();
+    assert.equal(pnl.record(entries, base + index * minute), true);
+  };
+  const value = index => `${(index * 37) % 101 - 50}.${index % 7}`;
+  try {
+    for (let index = 0; index < count; index++) sample(index, value(index));
+    const end = base + (count - 1) * minute;
+    const expected = Array.from({ length: count }, (_, index) => {
+      const pnlValue = value(index).replace(/\.0$/, '');
+      return { time: base + index * minute, unrealizedPnl: pnlValue, fundingPnl: '0', realizedPnl: '0', feePnl: '0', totalPnl: pnlValue };
+    });
+    assert.equal(JSON.stringify(pnl.read(entries, base + 200 * minute, end).points), JSON.stringify(reducePnlPoints(expected.slice(200))));
+    // An earlier window than the cached one adds the older samples.
+    const state = pnl.read(entries, base - 100000, end);
+    assert.equal(state.pointCount, count);
+    assert.equal(JSON.stringify(state.points), JSON.stringify(reducePnlPoints(expected)));
+    // A new account revision starts a fresh series.
+    for (const entry of entries) entry.row.revision = 2;
+    sample(count, '4.5');
+    const fresh = pnl.read(entries, base - 100000, base + count * minute);
+    assert.equal(fresh.pointCount, 1);
+    assert.equal(fresh.latest.totalPnl, '4.5');
+  } finally { db.close(); }
+});

@@ -92,11 +92,12 @@ export function createTradingPnl(db, stmt) {
 
   // Lazy-load prepared statements to avoid triggering them during initialization
   const latestRow = ({ pairKey, revisionKey }) => stmt.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? ORDER BY time DESC LIMIT 1').get(pairKey, revisionKey);
-  let insertSample, deleteSamples, selectSamples, countSamples, selectFirstTime;
+  let insertSample, deleteSamples, selectSamples, selectBefore, countSamples, selectFirstTime;
   // Parsed samples per pair, so each minute's view rebuild reads only the rows
   // recorded since the last read instead of re-parsing a month of samples.
-  // record() only appends rows newer than the latest one; a row count check on
-  // every read catches retention deletes or any other change, and reloads.
+  // record() only appends rows newer than the latest one and deletes only rows
+  // past retention or of an older revision; a count and first/last time check on
+  // every read catches anything else changing the window, and reloads.
   const sampleCache = new Map();
 
   function record(entries, current) {
@@ -126,11 +127,19 @@ export function createTradingPnl(db, stmt) {
       while (lo < hi) { const mid = (lo + hi) >> 1; if (cache.time[mid] < time) lo = mid + 1; else hi = mid; }
       return lo;
     };
-    const append = after => {
-      for (const row of selectSamples.all(pairKey, revisionKey, after + 1, current)) {
-        cache.time.push(row.time); cache.firstAt.push(row.first_at); cache.secondAt.push(row.second_at);
-        cache.units.push(row.unrealized_pnl === null ? null : decimalUnits(row.unrealized_pnl));
+    const parse = (rows, into) => {
+      for (const row of rows) {
+        into.time.push(row.time); into.firstAt.push(row.first_at); into.secondAt.push(row.second_at);
+        into.units.push(row.unrealized_pnl === null ? null : decimalUnits(row.unrealized_pnl));
       }
+    };
+    const append = after => parse(selectSamples.all(pairKey, revisionKey, after + 1, current), cache);
+    const prepend = () => {
+      // An earlier window than cached reads only the missing older rows.
+      const older = { time: [], firstAt: [], secondAt: [], units: [] };
+      parse(selectBefore.all(pairKey, revisionKey, start, cache.from), older);
+      for (const key of Object.keys(older)) cache[key] = older[key].concat(cache[key]);
+      cache.from = start;
     };
     const reload = () => {
       sampleCache.delete(pairKey);
@@ -144,18 +153,24 @@ export function createTradingPnl(db, stmt) {
       for (const key of ['time', 'firstAt', 'secondAt', 'units']) cache[key].splice(0, keep);
       cache.from = current - 31 * DAY;
     }
-    if (!cache || cache.revisionKey !== revisionKey || start < cache.from) reload();
-    else append(cache.time.length ? cache.time.at(-1) : cache.from - 1);
-    let from = bound(start), to = bound(current + 1);
-    if (to - from !== countSamples.get(pairKey, revisionKey, start, current).count) {
-      reload(); from = bound(start); to = bound(current + 1);
+    if (!cache || cache.revisionKey !== revisionKey) reload();
+    else {
+      if (start < cache.from) prepend();
+      append(cache.time.length ? cache.time.at(-1) : cache.from - 1);
     }
+    let from = bound(start), to = bound(current + 1);
+    const matches = () => {
+      const stored = countSamples.get(pairKey, revisionKey, start, current);
+      return to - from === stored.count && (to > from ? cache.time[from] : null) === stored.first && (to > from ? cache.time[to - 1] : null) === stored.last;
+    };
+    if (!matches()) { reload(); from = bound(start); to = bound(current + 1); }
     return { ...cache, from, to };
   }
   function read(entries, start, current) {
     if (!selectSamples) {
       selectSamples = stmt.prepare('SELECT time, first_at, second_at, unrealized_pnl FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time');
-      countSamples = stmt.prepare('SELECT COUNT(*) AS count FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=?');
+      selectBefore = stmt.prepare('SELECT time, first_at, second_at, unrealized_pnl FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<? ORDER BY time');
+      countSamples = stmt.prepare('SELECT COUNT(*) AS count, MIN(time) AS first, MAX(time) AS last FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=?');
       selectFirstTime = stmt.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND unrealized_pnl IS NOT NULL');
     }
     const pair = pairSource(entries);
