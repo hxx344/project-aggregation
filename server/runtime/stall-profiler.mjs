@@ -42,10 +42,11 @@ export function summarizeProfile(profile, { windowMs, root = APP_ROOT, topFuncti
   for (const node of profile.nodes) for (const child of node.children || []) parents.set(child, node.id);
   const from = profile.endTime - windowMs * 1000, selfUs = new Map();
   let time = profile.startTime, previous = null;
-  // Each sample's interval is attributed to the sample that ends it, like DevTools.
+  // The interval after each sample belongs to that sample (forward attribution, like DevTools).
   for (let index = 0; index < profile.samples.length; index += 1) {
-    time += profile.timeDeltas[index];
-    if (previous !== null && time > from) selfUs.set(previous.id, (selfUs.get(previous.id) || 0) + Math.min(profile.timeDeltas[index], time - from));
+    const delta = Math.max(0, profile.timeDeltas[index]);
+    time += delta;
+    if (previous !== null && time > from) selfUs.set(previous.id, (selfUs.get(previous.id) || 0) + Math.min(delta, time - from));
     previous = nodes.get(profile.samples[index]) || null;
   }
   const functions = new Map();
@@ -84,7 +85,9 @@ export function createStallProfiler({ log, triggerMs = STALL_PROFILE_TRIGGER_MS,
       await opened.post('Profiler.setSamplingInterval', { interval: samplingUs });
       await opened.post('Profiler.start');
     } catch (error) { opened.disconnect(); throw error; }
+    if (stopped) { opened.disconnect(); return; }
     session = opened;
+    // handle() clears this timer whenever it ends a session, so a busy skip cannot leave sampling running.
     expiry = setTimer(() => { if (!busy) { busy = true; void end().catch(() => {}).finally(() => { busy = false; }); } }, armedMs);
     expiry.unref?.();
   }
@@ -112,7 +115,11 @@ export function createStallProfiler({ log, triggerMs = STALL_PROFILE_TRIGGER_MS,
     stall(lagMs) {
       if (stopped || busy || lagMs < triggerMs) return;
       busy = true;
-      void handle(lagMs).catch(error => log.warn({ err: error, type: 'event-loop' }, '卡顿采样失败'))
+      void handle(lagMs).catch(error => {
+        // A profiler that cannot start rests too, instead of logging on every stall.
+        restUntil = mono() + cooldownMs;
+        log.warn({ err: error, type: 'event-loop' }, '卡顿采样失败');
+      })
         .finally(() => { busy = false; });
     },
     stop() { stopped = true; void end().catch(() => {}); },

@@ -73,6 +73,8 @@ test('an inspector failure is logged once and never escapes into the stall monit
   assert.doesNotThrow(() => profiler.stall(5_000));
   await settle();
   assert.deepEqual(logs, ['数据面卡顿 5000 ms，开始 CPU 采样以定位下一次卡顿', '卡顿采样失败']);
+  profiler.stall(5_000); await settle();
+  assert.equal(logs.length, 2, 'a failed start rests instead of logging on every stall');
   lag.stop();
 });
 
