@@ -215,6 +215,7 @@ cp "$case_root/release/server/update-service/"*.py "$source_dir/server/update-se
 cp "$repository/deploy/build-artifact-cache.py" "$source_dir/deploy/build-artifact-cache.py"
 mkdir -p "$source_dir/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$source_dir/tools/aero-roles/"
+mkdir -p "$source_dir/platform/executor" && cp -a "$repository/platform/executor/src" "$repository/platform/executor/package.json" "$source_dir/platform/executor/"
 printf '{"name":"source-permission-fixture"}\n' > "$source_dir/package.json"
 printf '#!/bin/sh\nexit 0\n' > "$source_dir/server/executable.sh"
 chmod 0755 "$source_dir/server/executable.sh"
@@ -222,7 +223,7 @@ printf '<html>verified cached build</html>\n' > "$source_dir/dist/index.html"
 git -C "$source_dir" init -q -b main
 git -C "$source_dir" config user.name fixture
 git -C "$source_dir" config user.email fixture@example.invalid
-git -C "$source_dir" add server package.json deploy tools
+git -C "$source_dir" add server package.json deploy tools platform
 git -C "$source_dir" commit -qm source-permission-fixture
 git clone -q --bare "$source_dir" "$APP_DIR/repository.git"
 git --git-dir="$APP_DIR/repository.git" config tar.umask 0002

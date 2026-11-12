@@ -107,7 +107,7 @@ export async function holdAccountLocks(accounts: readonly AccountBinding[]): Pro
  * Live connectors whose key resolves only for the configured account and credential version, so a stale binding in the
  * database can never borrow the key of another account.
  */
-export function createLiveConnectors(config: LiveConfig, keys: Map<Venue, LiveCredentials>, options: { fetchImpl?: FetchLike; now?: () => number } = {}): VenueConnector[] {
+export function createLiveConnectors(config: Pick<LiveConfig, 'accounts'>, keys: Map<Venue, LiveCredentials>, options: { fetchImpl?: FetchLike; now?: () => number } = {}): VenueConnector[] {
   const credentials = (binding: AccountBinding): LiveCredentials => {
     const account = config.accounts.find(item => item.venue === binding.venue);
     const key = keys.get(binding.venue);
@@ -118,7 +118,7 @@ export function createLiveConnectors(config: LiveConfig, keys: Map<Venue, LiveCr
 }
 
 /** Every configured account passes its venue's key and identity check, one after another, before any is registered. */
-export async function preflightLive(config: LiveConfig, connectors: readonly VenueConnector[], timeoutMs = PREFLIGHT_TIMEOUT_MS): Promise<void> {
+export async function preflightLive(config: Pick<LiveConfig, 'accounts'>, connectors: readonly VenueConnector[], timeoutMs = PREFLIGHT_TIMEOUT_MS): Promise<void> {
   for (const account of config.accounts) {
     const connector = connectors.find(item => item.venue === account.venue);
     if (!connector?.preflight) throw new Error(`${account.venue} 连接器没有启动检查，拒绝实盘启动`);
