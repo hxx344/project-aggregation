@@ -12,7 +12,8 @@ function scaled(value) {
   const negative = value.startsWith('-');
   const [integer, fraction = ''] = (negative ? value.slice(1) : value).split('.');
   if (integer.length > MAX_DIGITS) throw new TypeError('金额超出支持范围');
-  const magnitude = BigInt(integer) * SCALE + BigInt(fraction.padEnd(18, '0'));
+  // One BigInt parse of the digits with the fraction padded to 18 places (leading zeros stay decimal).
+  const magnitude = BigInt(integer + fraction.padEnd(18, '0'));
   return negative ? -magnitude : magnitude;
 }
 
@@ -41,3 +42,7 @@ export function compareDecimals(a, b) {
   const left = scaled(a), right = scaled(b);
   return left < right ? -1 : left > right ? 1 : 0;
 }
+
+// Exact fixed-point units (value × 10^18) for hot loops that add or compare many
+// values; format the result once instead of round-tripping every step through strings.
+export { scaled as decimalUnits, formatted as formatDecimalUnits };

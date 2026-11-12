@@ -33,3 +33,30 @@ test('reducing a month of points retains valid extrema and does not expand short
     assert.equal(reduced[index + 1].time, point.time + 1);
   }
 });
+
+test('repeated reads pick up new samples and notice rows removed outside record()', () => {
+  const db = new DatabaseSync(':memory:'), pnl = createTradingPnl(db);
+  const base = Date.UTC(2026, 10, 1), coverage = [{ start: base - 100000, end: base + 10 * 60000 }];
+  const entries = ['binance', 'bybit'].map(exchange => ({ row: { exchange, credentials: 'fixture', revision: 1 },
+    snapshot: { positions: { rows: [{ unrealizedPnl: '1.5' }], error: null }, funding: { events: [], coverage }, trades: { events: [], coverage } } }));
+  const sample = offset => {
+    for (const entry of entries) entry.snapshot.positions.fetchedAt = new Date(base + offset).toISOString();
+    assert.equal(pnl.record(entries, base + offset), true);
+  };
+  try {
+    sample(0); sample(60000);
+    assert.deepEqual(pnl.read(entries, base - 100000, base + 60000).points.map(point => point.totalPnl), ['3', '3']);
+    entries[0].snapshot.positions.rows = [{ unrealizedPnl: '-0.25' }];
+    sample(120000);
+    let state = pnl.read(entries, base - 100000, base + 120000);
+    assert.deepEqual(state.points.map(point => point.totalPnl), ['3', '3', '1.25']);
+    assert.equal(state.latest.unrealizedPnl, '1.25');
+    db.prepare('DELETE FROM trading_pnl_samples_v2 WHERE time = ?').run(base + 60000);
+    state = pnl.read(entries, base - 100000, base + 120000);
+    assert.equal(state.pointCount, 2);
+    assert.deepEqual(state.points.map(point => point.time), [base, base + 120000]);
+    // A narrower or older window is served from the same samples.
+    assert.deepEqual(pnl.read(entries, base + 60000, base + 120000).points.map(point => point.time), [base + 120000]);
+    assert.deepEqual(pnl.read(entries, base - 100000, base + 30000).points.map(point => point.time), [base]);
+  } finally { db.close(); }
+});

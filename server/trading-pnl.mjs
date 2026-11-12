@@ -1,4 +1,4 @@
-import { addDecimals, compareDecimals, decimal } from './trading-decimal.mjs';
+import { addDecimals, compareDecimals, decimalUnits, formatDecimalUnits } from './trading-decimal.mjs';
 import { createStatementCache } from './db-cache.mjs';
 
 
@@ -51,11 +51,11 @@ function migrateSamples(db, stmt) {
 
 // Reduce continuous runs independently. Keep every gap boundary, even if highly
 // intermittent data needs more than the usual 1,200 display points.
-export function reducePnlPoints(points) {
+function reducePoints(points, compare) {
   if (points.length <= 1200) return points;
   const width = Math.ceil(points.length / 180), result = [];
   for (let offset = 0; offset < points.length;) {
-    const mask = point => `${point.unrealizedPnl === null}:${point.fundingPnl === null}:${point.realizedPnl === null}:${point.totalPnl === null}`;
+    const mask = point => (point.unrealizedPnl === null) | (point.fundingPnl === null) << 1 | (point.realizedPnl === null) << 2 | (point.totalPnl === null) << 3;
     let end = offset + 1;
     while (end < points.length && end - offset < width && mask(points[end]) === mask(points[offset])) end++;
     const bucket = points.slice(offset, end);
@@ -65,13 +65,24 @@ export function reducePnlPoints(points) {
       if (bucket[0][key] === null) continue;
       let min = 0, max = 0;
       for (let i = 1; i < bucket.length; i++) {
-        if (compareDecimals(bucket[i][key], bucket[min][key]) < 0) min = i;
-        if (compareDecimals(bucket[i][key], bucket[max][key]) > 0) max = i;
+        if (compare(bucket[i][key], bucket[min][key]) < 0) min = i;
+        if (compare(bucket[i][key], bucket[max][key]) > 0) max = i;
       }
       selected.add(min); selected.add(max);
     }
     for (const index of [...selected].sort((a, b) => a - b)) result.push(bucket[index]);
   }
+  return result;
+}
+export const reducePnlPoints = points => reducePoints(points, compareDecimals);
+
+// read() keeps values as exact fixed-point units: rebuilding a month of minute
+// samples through decimal strings blocked the shared runtime for seconds.
+const compareUnits = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+const POINT_VALUES = ['unrealizedPnl', 'fundingPnl', 'realizedPnl', 'feePnl', 'totalPnl'];
+function formatPoint(point) {
+  const result = { time: point.time };
+  for (const key of POINT_VALUES) result[key] = point[key] === null ? null : formatDecimalUnits(point[key]);
   return result;
 }
 
@@ -81,7 +92,12 @@ export function createTradingPnl(db, stmt) {
 
   // Lazy-load prepared statements to avoid triggering them during initialization
   const latestRow = ({ pairKey, revisionKey }) => stmt.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? ORDER BY time DESC LIMIT 1').get(pairKey, revisionKey);
-  let insertSample, deleteSamples, selectSamples, selectFirstTime;
+  let insertSample, deleteSamples, selectSamples, countSamples, selectFirstTime;
+  // Parsed samples per pair, so each minute's view rebuild reads only the rows
+  // recorded since the last read instead of re-parsing a month of samples.
+  // record() only appends rows newer than the latest one; a row count check on
+  // every read catches retention deletes or any other change, and reloads.
+  const sampleCache = new Map();
 
   function record(entries, current) {
     if (!insertSample) {
@@ -103,48 +119,95 @@ export function createTradingPnl(db, stmt) {
     deleteSamples.run(pair.pairKey, current - 31 * DAY, pair.revisionKey);
     return true;
   }
+  function samples({ pairKey, revisionKey }, start, current) {
+    let cache = sampleCache.get(pairKey);
+    const bound = time => {
+      let lo = 0, hi = cache.time.length;
+      while (lo < hi) { const mid = (lo + hi) >> 1; if (cache.time[mid] < time) lo = mid + 1; else hi = mid; }
+      return lo;
+    };
+    const append = after => {
+      for (const row of selectSamples.all(pairKey, revisionKey, after + 1, current)) {
+        cache.time.push(row.time); cache.firstAt.push(row.first_at); cache.secondAt.push(row.second_at);
+        cache.units.push(row.unrealized_pnl === null ? null : decimalUnits(row.unrealized_pnl));
+      }
+    };
+    const reload = () => {
+      sampleCache.delete(pairKey);
+      cache = { revisionKey, from: start, time: [], firstAt: [], secondAt: [], units: [] };
+      append(start - 1);
+      sampleCache.set(pairKey, cache);
+    };
+    if (cache?.revisionKey === revisionKey && current - 31 * DAY > cache.from) {
+      // Retention keeps 31 days (see record); drop older rows as the database does.
+      const keep = bound(current - 31 * DAY);
+      for (const key of ['time', 'firstAt', 'secondAt', 'units']) cache[key].splice(0, keep);
+      cache.from = current - 31 * DAY;
+    }
+    if (!cache || cache.revisionKey !== revisionKey || start < cache.from) reload();
+    else append(cache.time.length ? cache.time.at(-1) : cache.from - 1);
+    let from = bound(start), to = bound(current + 1);
+    if (to - from !== countSamples.get(pairKey, revisionKey, start, current).count) {
+      reload(); from = bound(start); to = bound(current + 1);
+    }
+    return { ...cache, from, to };
+  }
   function read(entries, start, current) {
     if (!selectSamples) {
-      selectSamples = stmt.prepare('SELECT * FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time');
+      selectSamples = stmt.prepare('SELECT time, first_at, second_at, unrealized_pnl FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=? ORDER BY time');
+      countSamples = stmt.prepare('SELECT COUNT(*) AS count FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND time>=? AND time<=?');
       selectFirstTime = stmt.prepare('SELECT MIN(time) AS time FROM trading_pnl_samples_v2 WHERE pair_key=? AND revision_key=? AND unrealized_pnl IS NOT NULL');
     }
     const pair = pairSource(entries);
     entries = pair.entries;
     const connected = entries.every(({ row }) => !!row.credentials);
-    const records = connected ? selectSamples.all(pair.pairKey, pair.revisionKey, start, current) : [];
+    const records = connected ? samples(pair, start, current) : null;
+    const count = records ? records.to - records.from : 0;
     const first = connected ? selectFirstTime.get(pair.pairKey, pair.revisionKey).time : null;
-    const since = rows => rows.filter(row => stamp(row.time) >= start).sort((a, b) => stamp(a.time) - stamp(b.time));
+    // Ledger rows since the period start, oldest first, each with its parsed time.
+    const since = rows => rows.map(row => ({ at: stamp(row.time), row })).filter(item => item.at >= start).sort((a, b) => a.at - b.at);
     const events = since(entries.flatMap(({ snapshot }) => snapshot.funding.events));
     // Closing PnL and fees move value out of unrealized PnL into the account
     // balance; without them a reduction would read as a loss.
     // Each exchange's trades stop at its own position read time, so a fill between
     // the two reads is never counted both as closing PnL and as unrealized PnL.
     const trades = entries.map(({ snapshot }) => since(snapshot.trades?.events ?? [])), tradeIndex = trades.map(() => 0);
-    let eventIndex = 0, accumulated = '0', realized = '0', fees = '0';
+    let eventIndex = 0, accumulated = 0n, realized = 0n, fees = 0n;
     const points = [], gap = time => ({ time, unrealizedPnl: null, fundingPnl: null, realizedPnl: null, feePnl: null, totalPnl: null });
-    const coveredAt = (ledger, time) => entries.every(({ snapshot }) => (ledger(snapshot)?.coverage ?? []).some(range => range.start <= start && range.end >= time));
-    for (const row of records) {
-      const previous = points.at(-1);
-      if (previous && row.time - previous.time > PNL_INTERVAL * 2.5) points.push(gap(previous.time + PNL_INTERVAL));
-      while (eventIndex < events.length && stamp(events[eventIndex].time) < row.time) accumulated = addDecimals([accumulated, events[eventIndex++].amount]);
+    // A ledger covers a sample when, on every exchange, one of its ranges spans
+    // from the period start to the sample time: time <= the reach computed here.
+    const coveredUntil = ledger => {
+      let reach = Infinity;
+      for (const { snapshot } of entries) {
+        let best = -Infinity;
+        for (const range of ledger(snapshot)?.coverage ?? []) if (range.start <= start && range.end > best) best = range.end;
+        if (best < reach) reach = best;
+      }
+      return reach;
+    };
+    const fundingUntil = coveredUntil(snapshot => snapshot.funding), tradesUntil = coveredUntil(snapshot => snapshot.trades);
+    let recorded = false;
+    for (let sample = records?.from ?? 0; sample < (records?.to ?? 0); sample++) {
+      const time = records.time[sample], previous = points.at(-1);
+      if (previous && time - previous.time > PNL_INTERVAL * 2.5) points.push(gap(previous.time + PNL_INTERVAL));
+      while (eventIndex < events.length && events[eventIndex].at < time) accumulated += decimalUnits(events[eventIndex++].row.amount);
       for (const [index, rows] of trades.entries()) {
-        const cutoff = [row.first_at, row.second_at][index] ?? row.time;
-        while (tradeIndex[index] < rows.length && stamp(rows[tradeIndex[index]].time) < cutoff) {
-          const trade = rows[tradeIndex[index]++];
-          if (trade.kind === 'fee') fees = addDecimals([fees, trade.amount]); else realized = addDecimals([realized, trade.amount]);
+        const cutoff = (index === 0 ? records.firstAt[sample] : index === 1 ? records.secondAt[sample] : undefined) ?? time;
+        while (tradeIndex[index] < rows.length && rows[tradeIndex[index]].at < cutoff) {
+          const trade = rows[tradeIndex[index]++].row;
+          if (trade.kind === 'fee') fees += decimalUnits(trade.amount); else realized += decimalUnits(trade.amount);
         }
       }
-      const known = coveredAt(snapshot => snapshot.funding, row.time), tradesKnown = coveredAt(snapshot => snapshot.trades, row.time);
-      const unrealizedPnl = row.unrealized_pnl === null ? null : decimal(row.unrealized_pnl);
+      const known = time <= fundingUntil, tradesKnown = time <= tradesUntil, unrealizedPnl = records.units[sample];
+      if (unrealizedPnl !== null) recorded = true;
       const fundingPnl = known ? accumulated : null, realizedPnl = tradesKnown ? realized : null, feePnl = tradesKnown ? fees : null;
-      const parts = [unrealizedPnl, fundingPnl, realizedPnl, feePnl];
-      points.push({ time: row.time, unrealizedPnl, fundingPnl, realizedPnl, feePnl, totalPnl: parts.every(value => value !== null) ? addDecimals(parts) : null });
+      points.push({ time, unrealizedPnl, fundingPnl, realizedPnl, feePnl, totalPnl: unrealizedPnl !== null && fundingPnl !== null && realizedPnl !== null && feePnl !== null ? unrealizedPnl + fundingPnl + realizedPnl + feePnl : null });
     }
     if (points.length && current - points.at(-1).time > MAX_AGE) points.push(gap(current));
-    const latest = points.at(-1) ?? null;
+    const latest = points.length ? formatPoint(points.at(-1)) : null;
     return { currency: 'USDT', intervalMs: PNL_INTERVAL, cumulativeStart: start, end: current, recordingStartedAt: first,
-      pointCount: records.length, points: reducePnlPoints(points), latest,
-      status: !records.some(row => row.unrealized_pnl !== null) ? 'collecting' : latest?.totalPnl === null ? 'incomplete' : 'ready' };
+      pointCount: count, points: reducePoints(points, compareUnits).map(formatPoint), latest,
+      status: !recorded ? 'collecting' : latest?.totalPnl === null ? 'incomplete' : 'ready' };
   }
   return { record, read, sourceKey: entries => latestRow(pairSource(entries))?.time ?? null };
 }
