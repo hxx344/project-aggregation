@@ -27,7 +27,9 @@ export const RULES = [
   // Python locks feed the pip caches and the relay installer.
   { match: /^modules\/(.*\/)?(package\.json|\.npmrc|requirements[^/]*\.(lock|txt))$/, jobs: JOBS },
   { match: /^modules\/asset\/(scripts\/prepare-ledger\.mjs|lib\/example-ledger\.json)$/, jobs: JOBS },
-  // Imports server/ only; nothing else reads the prototype.
+  // The executor's source ships in the release package: server/contract-probes
+  // imports it and the installer tests copy it. Its tests and scripts stay local.
+  { match: /^platform\/executor\/(src\/|package\.json$)/, jobs: ['app', 'platform-executor', 'installer-release', 'installer-slots', 'installer-deploy'] },
   { match: /^platform\/executor\//, jobs: ['platform-executor'] },
   { match: /^tools\/options-backtest\//, jobs: ['options-backtest'] },
   { match: /^tools\/main-watch\//, jobs: ['main-watch'] },

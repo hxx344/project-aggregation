@@ -12,7 +12,10 @@ const script = path.join(root, 'scripts', 'ci-select.mjs');
 const pick = (...paths) => selectJobs(paths).jobs;
 
 test('traced paths select only the jobs that read them', () => {
-  assert.deepEqual(pick('platform/executor/src/live/http.ts'), ['platform-executor']);
+  assert.deepEqual(pick('platform/executor/test/adl.test.ts', 'platform/executor/scripts/measure.ts', 'platform/executor/README.md'), ['platform-executor']);
+  for (const name of ['platform/executor/src/live/canary.ts', 'platform/executor/package.json']) {
+    assert.deepEqual(pick(name), ['app', 'platform-executor', 'installer-release', 'installer-slots', 'installer-deploy'], name);
+  }
   assert.deepEqual(pick('tools/options-backtest/optbt/spec.py'), ['options-backtest']);
   assert.deepEqual(pick('tools/main-watch/main_watch.py'), ['main-watch']);
   assert.deepEqual(pick('test-download-speed.sh'), ['installer-release', 'release-mirror']);
@@ -47,7 +50,7 @@ test('untraced paths, dependency manifests and an empty change list run every jo
     'server', 'srcx/a.ts', 'Tests/a.mjs', 'nested/README.md', 'LICENSE',
   ]) {
     assert.deepEqual(pick(name), JOBS, name);
-    assert.deepEqual(pick('platform/executor/src/a.ts', name), JOBS, name);
+    assert.deepEqual(pick('platform/executor/test/a.test.ts', name), JOBS, name);
   }
   assert.deepEqual(selectJobs(['tools/new-tool/main.py', 'src/a.ts']).unknown, ['tools/new-tool/main.py']);
   assert.deepEqual(pick(), JOBS);
@@ -75,7 +78,7 @@ function fixture(t) {
   };
   git('init', '-q', '-b', 'main');
   git('config', 'core.hooksPath', path.join(directory, 'empty-hooks'));
-  put('platform/executor/src/a.ts', 'export const a = 1;\n'); put('tools/main-watch/old.py', 'old\n'); put('deploy/install.sh', 'true\n');
+  put('platform/executor/test/a.ts', 'export const a = 1;\n'); put('tools/main-watch/old.py', 'old\n'); put('deploy/install.sh', 'true\n');
   git('add', '.'); git('commit', '-qm', 'base');
   return { directory, git, put, select };
 }
@@ -83,7 +86,7 @@ function fixture(t) {
 test('the command reads the pull request merge commit, including deletions, renames and base-only changes', t => {
   const f = fixture(t);
   f.git('checkout', '-q', '-b', 'topic');
-  f.put('platform/executor/src/a.ts', 'export const a = 2;\n'); f.git('add', '.'); f.git('commit', '-qm', 'topic change');
+  f.put('platform/executor/test/a.ts', 'export const a = 2;\n'); f.git('add', '.'); f.git('commit', '-qm', 'topic change');
   // A change that only the base has must not count as the pull request's.
   f.git('checkout', '-q', 'main');
   f.put('deploy/install.sh', 'false\n'); f.git('add', '.'); f.git('commit', '-qm', 'base moves on');
@@ -98,7 +101,7 @@ test('the command reads the pull request merge commit, including deletions, rena
   // Moving a file out of a traced directory must still count its old location.
   f.git('checkout', '-q', 'topic');
   mkdirSync(path.join(f.directory, 'docs'));
-  f.git('mv', 'platform/executor/src/a.ts', 'docs/a.md'); f.git('commit', '-qm', 'move');
+  f.git('mv', 'platform/executor/test/a.ts', 'docs/a.md'); f.git('commit', '-qm', 'move');
   f.git('checkout', '-q', 'main'); f.git('reset', '-q', '--hard', 'HEAD^1'); f.git('merge', '-q', '--no-ff', '-m', 'merge', 'topic');
   assert.deepEqual(f.select().jobs, ['platform-executor', 'main-watch']);
 });
