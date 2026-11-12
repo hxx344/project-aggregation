@@ -228,6 +228,20 @@ export function parseConfirm(value: unknown): Confirm {
   return { previewId: text(raw.previewId, '预览编号', UUID), requestId: text(raw.requestId, '请求编号', UUID), confirmLive: true };
 }
 
+/**
+ * Hard notional caps in USDT for jobs on real accounts (plan 7, 3.0). perJob bounds one job; totalOpen bounds the sum over
+ * every opening job this data directory has accepted. Both are fixed at startup; nothing on the page or the API changes them.
+ */
+export interface NotionalLimits { perJob: string; totalOpen: string }
+const NOTIONAL_LIMIT_CEILING = '1000000000';
+export function parseNotionalLimits(value: unknown): NotionalLimits {
+  const raw = exactKeys(value, ['perJob', 'totalOpen']);
+  const limits: NotionalLimits = { perJob: decimalField(raw.perJob, '单笔名义金额上限'), totalOpen: decimalField(raw.totalOpen, '累计开仓名义金额上限') };
+  if (cmp(limits.totalOpen, NOTIONAL_LIMIT_CEILING) > 0) reject('invalid_value', '累计开仓名义金额上限超出范围');
+  if (cmp(limits.perJob, limits.totalOpen) > 0) reject('invalid_value', '单笔名义金额上限不得大于累计开仓名义金额上限');
+  return limits;
+}
+
 // ---- ASTER margin-balance transfers ---------------------------------------------
 // ASTER is not a Venue: it lists no executable contract and takes no account binding, so the order side never sees it.
 export const TRANSFER_ASSET = 'USD1';

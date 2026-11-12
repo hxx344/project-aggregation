@@ -239,7 +239,8 @@ async function refresh() {
   positionsCurrent = false;
   try {
     const state = await api('/api/state');
-    $('status').textContent = '写者代次 ' + state.generation + (state.retired ? '（已失去写入权，请重启）' : '') + ' · 传输 ' + state.transport + ' · 账户 ' + state.accounts.map(a => a.venue + ' ' + a.accountMode + ' ' + a.accountId + ' v' + a.credentialVersion).join('，');
+    $('status').textContent = '写者代次 ' + state.generation + (state.retired ? '（已失去写入权，请重启）' : '') + ' · 传输 ' + state.transport + ' · 账户 ' + state.accounts.map(a => a.venue + ' ' + a.accountMode + ' ' + a.accountId + ' v' + a.credentialVersion).join('，')
+      + (state.notionalLimits ? ' · 名义金额上限 单笔 ' + state.notionalLimits.perJob + ' USDT，累计开仓 ' + state.notionalLimits.openUsed + ' / ' + state.notionalLimits.totalOpen + ' USDT' : '');
     // Re-rendering while a strategy id is being typed would take the focus away.
     const typing = document.activeElement?.dataset?.strategyInput;
     if (!typing) $('jobs').innerHTML = '<table><tr><th>任务</th><th>状态</th><th>两腿</th><th>说明</th><th></th></tr>' + state.jobs.map(jobRow).join('') + '</table>';
