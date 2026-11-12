@@ -27,6 +27,7 @@ from .engine import Engine
 from .hub_summary import hub_summary
 from .models import TIERS, TradingError
 from .pair_symbols import DEFAULT_PAIR_SYMBOL, PairSymbol, supported_symbols_list
+from .slow_requests import SlowRequestMonitor
 from .store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -327,6 +328,8 @@ def create_app(engine=None, *, demo=False, start_engine=True, workspace_secret=N
             engine.scheduler_event.set()
         app.state.begin_workspace_shutdown = begin_workspace_shutdown
     app.add_middleware(RequestSecurityMiddleware, workspace_secret=workspace_secret)
+    # Outermost, so a stall anywhere in the request (including body reads) is timed.
+    app.add_middleware(SlowRequestMonitor)
 
     def session_token(previous):
         # Server-side expiry makes logout and login rotation revoke copied cookies too.
