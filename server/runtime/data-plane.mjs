@@ -94,13 +94,14 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const autoExposure = createTradingAutoExposure({ execution, readRules: () => executionAuto.exposureSnapshot(), now: executionNow });
   const anthropicReduction = createAnthropicReduction({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 15_000 : 0, log });
   // Real-venue contract probes started from the workbench page. A live run needs a normal recovery
-  // state and, for Bybit, no unfinished native job on the same account.
+  // state and, for Bybit and the oil canary, no unfinished job of the trading center's own executor.
   const contractProbes = createContractProbes({ dataDir, log, admit: () => executionEntries.hold(), readMaintenance: () => control.getSetting('updates-maintenance') === '1',
     liveBlocker: probe => {
       if (sharedAccountWriter && sharedAccountWriter.snapshot().recovery?.state !== 'normal') return '账户处于隔离恢复状态，暂不能发送真实请求';
-      if (probe !== 'bybit') return null;
-      try { return db.prepare(`SELECT COUNT(*) AS n FROM execution_jobs WHERE ${UNFINISHED_EXECUTION_JOB_SQL}`).get().n ? '有未结束的实盘执行任务，结束后再做 Bybit 真实测试' : null; }
-      catch { return '无法确认实盘执行任务状态，暂不能做 Bybit 真实测试'; }
+      if (probe === 'aster') return null;
+      const name = probe === 'canary' ? '原油金丝雀' : 'Bybit';
+      try { return db.prepare(`SELECT COUNT(*) AS n FROM execution_jobs WHERE ${UNFINISHED_EXECUTION_JOB_SQL}`).get().n ? `有未结束的实盘执行任务，结束后再做${name}真实测试` : null; }
+      catch { return `无法确认实盘执行任务状态，暂不能做${name}真实测试`; }
     } });
   const states = new Map(); const pending = new Map(); const controllers = new Set();
   // Overview subscribers; wants() lets an in-process subscriber skip the projection while nobody listens.

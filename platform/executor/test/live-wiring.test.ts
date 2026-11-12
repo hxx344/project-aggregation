@@ -211,7 +211,7 @@ test('数据目录环境标记：新目录记下首次环境；模拟用过的�
 test('执行器实盘环境：拒绝共享写者登记、模拟连接器与 ASTER 划转/ADL/持仓；页面与状态标明实盘', () => {
   const h = createHarness();
   try {
-    const [binance, bybit] = createLiveConnectors({ notionalLimits: LIMITS, credentialsFile: '/unused', accounts: ACCOUNTS }, new Map(Object.entries(KEYS)) as never);
+    const [binance, bybit] = createLiveConnectors({ accounts: ACCOUNTS }, new Map(Object.entries(KEYS)) as never);
     const base = { store: h.store, connectors: [binance, bybit], environment: 'mainnet' as const, notionalLimits: LIMITS };
     const ex = createExecutor(base);
     assert.equal(ex.environment, 'mainnet');
@@ -275,7 +275,7 @@ test('端到端：执行器用真实连接器对替身交易所跑完两腿开�
 
 test('HTTP：实盘执行器下发实盘页面，状态里的传输为 live 并带名义金额上限；模拟执行器仍是模拟页面', async () => {
   const h = createHarness();
-  const [binance, bybit] = createLiveConnectors({ notionalLimits: LIMITS, credentialsFile: '/unused', accounts: ACCOUNTS }, new Map(Object.entries(KEYS)) as never);
+  const [binance, bybit] = createLiveConnectors({ accounts: ACCOUNTS }, new Map(Object.entries(KEYS)) as never);
   const servers = [createExecutorServer({ executor: createExecutor({ store: h.store, connectors: [binance, bybit], environment: 'mainnet', notionalLimits: LIMITS }), accessToken: 'live-token', session: 'live-session-value' }),
     createExecutorServer({ executor: h.ex, accessToken: 'sim-token', session: 'sim-session-value' })];
   try {

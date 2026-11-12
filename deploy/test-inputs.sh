@@ -67,6 +67,16 @@ for file in addresses.mjs conditions.mjs executor.mjs permissions.mjs policy.mjs
   [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
   capture
 done
+# The workbench's oil canary probe runs the executor from source in the runtime unit.
+mkdir -p "$source_dir/platform/executor/src"
+for file in src/main.ts package.json; do
+  embedded_before=$embedded_key
+  runtime_component_before=$runtime_component_key
+  echo executor > "$source_dir/platform/executor/$file"; refresh; compare 0 0 1 0 1
+  compare_module_inputs 0 0 0 0
+  [[ $runtime_component_key != "$runtime_component_before" && $embedded_key == "$embedded_before" && $runtime_dependency_key == "$runtime_before" ]]
+  capture
+done
 runtime_component_before=$runtime_component_key
 echo frontend >> "$source_dir/src/app.ts"; refresh; compare 0 1 1 1 1
 [[ $runtime_component_key == "$runtime_component_before" ]]

@@ -20,6 +20,7 @@ MODULES = ('monitor', 'asset', 'crossex', 'greeks', 'aster')
 # Its vinext/React build graph must not become server runtime dependencies.
 IMPORTERS = ('.', 'modules/monitor', 'modules/asset', 'modules/crossex')
 # Safe + Roles executor the runtime unit imports (server/automation/aero-safe.mjs); the CLI, fork test and docs stay out.
+EXECUTOR_RUNTIME_DIRS = ('platform/executor/src',)
 AERO_ROLES_RUNTIME_FILES = ('addresses.mjs', 'conditions.mjs', 'executor.mjs', 'permissions.mjs', 'policy.mjs', 'roles-calls.mjs')
 EXCLUDED = {'node_modules', '.git', '.venv', '.venv-aster', '.vinext', '.wrangler', '__pycache__', '.pytest_cache', '.module-cache', '.build-cache',
             '.mypy_cache', 'tests', 'test-results', 'output', 'runtime-data', '.data',
@@ -301,6 +302,15 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
                 if not origin.is_file() or is_link(origin):
                     raise ValueError('Missing trusted runtime tool file: ' + str(lab / name))
                 shutil.copy2(origin, stage / lab / name)
+        # The workbench's oil canary probe runs the new executor from source (server/contract-probes/oil-canary.ts).
+        for relative in EXECUTOR_RUNTIME_DIRS:
+            if not (source / relative).is_dir() or is_link(source / relative):
+                raise ValueError('Missing executor runtime directory: ' + relative)
+            shutil.copytree(source / relative, stage / relative, ignore=checked_ignore({'__pycache__'}))
+        executor_package = source / 'platform/executor/package.json'
+        if not executor_package.is_file() or is_link(executor_package):
+            raise ValueError('Missing executor runtime file: platform/executor/package.json')
+        shutil.copy2(executor_package, stage / 'platform/executor/package.json')
         for notice in ('LICENSE', 'NOTICE.md', 'THIRD_PARTY_NOTICES.md'):
             if (source / notice).is_file():
                 shutil.copy2(source / notice, stage / notice)
@@ -326,7 +336,7 @@ def stage_runtime(source, stage, dependency_roots=(), node='node', parser_user=N
     shutil.copy2(diagnostic, stage / 'deploy/diagnose-aster-margin.py')
 
 
-APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'tools/aero-roles', 'scripts/modules.mjs',
+APPLICATION_INPUTS = ('server', 'src', 'public', 'modules', 'tools/aero-roles', 'platform/executor/src', 'platform/executor/package.json', 'scripts/modules.mjs',
                       'package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'index.html',
                       'tsconfig.json', 'tsconfig.app.json', 'tsconfig.node.json', 'vite.config.ts',
                       '.npmrc', '.env', '.env.local', '.env.production', '.env.production.local',

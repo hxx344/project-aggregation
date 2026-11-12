@@ -299,8 +299,9 @@ test('契约探测（Bybit）：--data-dir 只读解密工作台保存的执行�
     const cipher = createCipheriv('aes-256-gcm', key, iv), body = Buffer.concat([cipher.update(JSON.stringify({ purpose: 'execution', exchange: 'bybit', apiKey, apiSecret: randomBytes(16).toString('hex') })), cipher.final()]);
     writeFileSync(join(directory, 'credentials.key'), key);
     const database = new DatabaseSync(join(directory, 'hub.sqlite'));
-    database.exec('CREATE TABLE execution_accounts (exchange TEXT PRIMARY KEY, credentials TEXT NOT NULL)');
-    database.prepare('INSERT INTO execution_accounts VALUES (?, ?)').run('bybit', Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64'));
+    // The columns server/trading-execution.mjs creates.
+    database.exec('CREATE TABLE execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT)');
+    database.prepare('INSERT INTO execution_accounts(exchange, revision, credentials, account_mode) VALUES (?, 1, ?, ?)').run('bybit', Buffer.concat([iv, cipher.getAuthTag(), body]).toString('base64'), 'unified');
     database.close();
     const dry = stubbed('bybit-chase.ts', ['--symbol', 'CLUSDT', '--data-dir', directory], {});
     assert.equal(dry.status, 0, dry.output);
@@ -309,7 +310,26 @@ test('契约探测（Bybit）：--data-dir 只读解密工作台保存的执行�
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
 
+test('原油金丝雀探测：参数越界在读取账户前中止；工作台缺少任一执行账户时中止且不建金丝雀目录', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pa-canary-data-'));
+  try {
+    const args = ['--data-dir', directory, '--step', 'check', '--symbol', 'CLUSDT', '--lead', 'binance', '--lead-side', 'long', '--lead-order', 'market', '--quantity', '1',
+      '--per-job', '100', '--total-open', '300', '--timeout-s', '60', '--out', join(directory, 'report.json')];
+    let result = run('oil-canary.ts', args.map(value => value === '100' ? '201' : value));
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, /单笔名义金额上限不得超过 200/);
+    writeFileSync(join(directory, 'credentials.key'), randomBytes(32));
+    const database = new DatabaseSync(join(directory, 'hub.sqlite'));
+    database.exec('CREATE TABLE execution_accounts (exchange TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0, credentials TEXT, account_mode TEXT NOT NULL, identity TEXT, key_label TEXT, verified_at TEXT, snapshot TEXT)');
+    database.close();
+    result = run('oil-canary.ts', args);
+    assert.equal(result.status, 1, result.output);
+    assert.match(result.output, /工作台没有保存 Binance 执行账户/);
+    assert.ok(!existsSync(join(directory, 'executor-canary')));
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});
+
 test('契约探测：随工作台发布的十进制运算与执行器的 src/decimal.ts 逐字节相同', () => {
-  // server/ is what the release package ships; platform/ is not, so the probes carry their own copy.
+  // The Bybit and ASTER probes keep their own copy so they do not depend on platform/ (only the oil canary loads the executor).
   assert.equal(readFileSync(new URL('../../../server/contract-probes/lib/decimal.ts', import.meta.url), 'utf8'), readFileSync(new URL('../src/decimal.ts', import.meta.url), 'utf8'));
 });

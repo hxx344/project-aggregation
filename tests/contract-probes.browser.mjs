@@ -9,7 +9,7 @@ async (page) => {
   const at = offset => new Date(Date.now() + offset).toISOString();
   const run = (overrides = {}) => ({ id: '11111111-1111-4111-8111-111111111111', probe: 'bybit', mode: 'read-only', status: 'running', startedAt: at(-5000), endedAt: null, exitCode: null, phrase: null, outcome: null, error: null,
     params: { symbol: 'BZUSDT', maxNotional: '80', passiveBps: 200, allowFill: true, settleTimeoutS: 60 }, stopRequestedAt: null, forced: false, usedForLive: false, hasReport: false, log: ['[t] 读取行情'], ...overrides });
-  let state = { observedAt: at(0), running: null, maintenance: false, liveWindowMs: 600000, options: { bybit: { symbols: ['CLUSDT', 'BZUSDT'] }, aster: { prefixes: [] } }, liveBlocked: { bybit: null, aster: null }, runs: [] };
+  let state = { observedAt: at(0), running: null, maintenance: false, liveWindowMs: 600000, options: { bybit: { symbols: ['CLUSDT', 'BZUSDT'] }, aster: { prefixes: [] }, canary: { symbols: ['CLUSDT', 'BZUSDT'] } }, liveBlocked: { bybit: null, aster: null, canary: null }, runs: [] };
   let refuse = null;
   const external = route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort();
   const handler = async route => {
@@ -104,6 +104,39 @@ async (page) => {
     await page.waitForFunction(() => true);
     await view.getByText('只读检查中').waitFor();
     assert(JSON.stringify(writes.at(-1).body) === JSON.stringify({ probe: 'aster', params: { masterPrefix: 'MA', aPrefix: 'SA', bPrefix: 'SB', amount: '1', probeNonce: [-30, -59, -61, -90, -121, 61], balancerPaused: false, settleTimeoutS: 300, historyMinutes: 30 } }), 'ASTER body: ' + JSON.stringify(writes.at(-1).body));
+
+    // Oil canary: four step buttons share one form; a check has no live offer, a preview offers live with its own confirmations.
+    state = { ...state, running: null, runs: [] };
+    await page.reload();
+    const canary = view.locator('section').filter({ has: page.getByRole('heading', { name: '原油双腿金丝雀（新执行器）' }) });
+    await canary.getByLabel('首腿交易所').waitFor();
+    assert(await canary.getByLabel('首腿下单方式').isDisabled(), 'chase is offered only with a Bybit lead');
+    await canary.getByRole('button', { name: '开仓预览' }).click();
+    await view.getByRole('alert').filter({ hasText: '请填写每腿数量' }).waitFor();
+    const before = writes.length;
+    await canary.getByLabel('合约').selectOption('BZUSDT');
+    await canary.getByLabel('首腿交易所').selectOption('bybit');
+    await canary.getByLabel('首腿下单方式').selectOption('chase');
+    await canary.getByLabel('每腿数量').fill('0.5');
+    await canary.getByLabel('价格保护').fill('40');
+    await canary.getByRole('button', { name: '开仓预览' }).click();
+    await view.getByText('只读检查中').waitFor();
+    assert(writes.length === before + 1 && JSON.stringify(writes.at(-1).body) === JSON.stringify({ probe: 'canary', params: { step: 'open', symbol: 'BZUSDT', lead: 'bybit', leadSide: 'long', leadOrder: 'chase', quantity: '0.5', perJob: '100', totalOpen: '300', timeoutS: 120, maxSlippageBps: 40 } }),
+      'canary body: ' + JSON.stringify(writes.at(-1).body));
+    const canaryRun = overrides => run({ id: '33333333-3333-4333-8333-333333333333', probe: 'canary', status: 'completed', endedAt: at(0), exitCode: 0, log: ['[t] Binance 账户 ***1234'],
+      params: { step: 'check', symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', leadOrder: 'market', quantity: '1', perJob: '100', totalOpen: '300', timeoutS: 120, maxSlippageBps: null }, ...overrides });
+    state = { ...state, running: null, runs: [canaryRun({ outcome: '检查通过：账户持仓与金丝雀记录一致（Binance 0、Bybit 0）' })] };
+    await canary.getByText('检查完成，未发送任何写请求').waitFor({ timeout: 20000 });
+    assert(await canary.getByRole('button', { name: '开始真实运行' }).count() === 0, 'a check offers no live run');
+    state = { ...state, runs: [canaryRun({ id: '44444444-4444-4444-8444-444444444444', phrase: 'oil-canary-close-CLUSDT-binance-long-market-1-0123456789', params: { ...canaryRun().params, step: 'close' } })] };
+    await canary.getByText('预览完成，未发送任何写请求').waitFor({ timeout: 20000 });
+    assert(await canary.getByText('平仓 · CLUSDT · 首腿 Binance（方向取金丝雀持仓） 市价 · 每腿 1 桶').isVisible(), 'the close summary names the derived direction');
+    await canary.getByLabel('我确认用真实账户发送上述委托').check();
+    await canary.getByLabel('测试期间旧系统（含自动规则）和人工都不对这两个账户的该合约下单').check();
+    await canary.getByRole('button', { name: '开始真实运行' }).click();
+    await page.waitForFunction(() => true);
+    await view.getByText('真实运行中').waitFor();
+    assert(JSON.stringify(writes.at(-1).body) === JSON.stringify({ confirmLive: true, phrase: 'oil-canary-close-CLUSDT-binance-long-market-1-0123456789' }), 'canary live body: ' + JSON.stringify(writes.at(-1)));
 
     await page.setViewportSize({ width: 390, height: 844 });
     await page.waitForFunction(() => true);

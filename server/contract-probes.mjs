@@ -20,16 +20,24 @@ import { HttpError } from './http-common.mjs';
 const SCRIPTS = Object.freeze({
   bybit: fileURLToPath(new URL('./contract-probes/bybit-chase.ts', import.meta.url)),
   aster: fileURLToPath(new URL('./contract-probes/aster-transfer.ts', import.meta.url)),
+  canary: fileURLToPath(new URL('./contract-probes/oil-canary.ts', import.meta.url)),
 });
 export const BYBIT_PROBE_SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT']);
-const PROBES = ['bybit', 'aster'];
+// The canary's executor code sits under platform/ of the install, outside the probe directory.
+const INSTALL_DIRECTORY = fileURLToPath(new URL('..', import.meta.url));
+const PROBES = ['bybit', 'aster', 'canary'];
+export const CANARY_SYMBOLS = Object.freeze(['CLUSDT', 'BZUSDT']);
+const CANARY_STEPS = ['check', 'open', 'close', 'settle'];
 const KEEP_RUNS = 10;
 export const LIVE_WINDOW_MS = 10 * 60_000;
 // Upper bound of a run that goes well, plus ten minutes; past it the probe is asked to stop once.
 // Bybit: at most eight waits of the settle limit. ASTER: two transfers, and per nonce offset one
 // probe and one return, each up to the settle limit plus two minutes of reads and send timeout;
 // a stale offset first waits its own length and a refused one is watched 75 s plus its offset.
+// Canary: the wait for a lapsed executor lease, a minute of preflight and reads, then the job's time
+// limit (a settle step drives earlier jobs, each at most 600 s) and three minutes to make it final.
 function runLimitMs(probe, params) {
+  if (probe === 'canary') return 65_000 + 60_000 + (params.step === 'settle' ? 600 : params.timeoutS) * 1000 + 180_000 + 600_000;
   const settle = params.settleTimeoutS * 1000;
   if (probe === 'bybit') return 8 * settle + 600_000;
   const offsets = params.probeNonce;
@@ -79,6 +87,29 @@ function asterParams(input, prefixes) {
     balancerPaused: flag(body.balancerPaused, '保证金平衡'), settleTimeoutS: integer(body.settleTimeoutS, 300, '入账等待', 10, 900), historyMinutes: integer(body.historyMinutes, 30, '流水回看', 1, 1440) };
 }
 
+// The probe checks the same bounds again (platform/executor/src/live/canary.ts); these give the page a 400 instead of a failed run.
+function canaryParams(input) {
+  const body = fields(input, ['step', 'symbol', 'lead', 'leadSide', 'leadOrder', 'quantity', 'perJob', 'totalOpen', 'timeoutS', 'maxSlippageBps', 'strategy', 'strategyId']);
+  const pick = (value, allowed, name) => { if (!allowed.includes(value)) throw bad(`请选择${name}`); return value; };
+  const step = pick(body.step, CANARY_STEPS, '金丝雀步骤');
+  // A check or a settle places nothing new; the probe still parses a quantity, so they get a fixed one.
+  const params = { step, symbol: pick(body.symbol, CANARY_SYMBOLS, '合约'), lead: pick(body.lead, ['binance', 'bybit'], '首腿交易所'),
+    leadSide: pick(body.leadSide, ['long', 'short'], '首腿方向'), leadOrder: pick(body.leadOrder ?? 'market', ['market', 'chase'], '首腿下单方式'),
+    quantity: decimal(step === 'open' || step === 'close' ? body.quantity : body.quantity ?? '1', undefined, '每腿数量', 10_000, 8), perJob: decimal(body.perJob, '100', '单笔名义金额上限', 200, 2),
+    totalOpen: decimal(body.totalOpen, '300', '累计开仓名义金额上限', 500, 2), timeoutS: integer(body.timeoutS, 120, '最长执行秒数', 30, 600),
+    maxSlippageBps: body.maxSlippageBps === undefined || body.maxSlippageBps === null ? null : integer(body.maxSlippageBps, null, '价格保护基点', 1, 200),
+    strategy: pick(body.strategy ?? 'auto', ['auto', 'adopt', 'release'], '追价策略处理方式'), strategyId: null };
+  if (params.strategy !== 'auto' && step !== 'settle') throw bad('认领或强制释放追价策略只在「收尾」里做');
+  if (params.strategy === 'adopt') {
+    if (typeof body.strategyId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(body.strategyId.trim())) throw bad('认领追价策略须填写策略编号（字母、数字、下划线或连字符）');
+    params.strategyId = body.strategyId.trim();
+  }
+  if (params.quantity === undefined) throw bad('请填写每腿数量');
+  if (params.leadOrder === 'chase' && params.lead !== 'bybit') throw bad('只有 Bybit 首腿可以用原生追价');
+  if (Number(params.perJob) > Number(params.totalOpen)) throw bad('单笔名义金额上限不得大于累计开仓上限');
+  return params;
+}
+
 function tail(file, bytes) {
   let fd;
   try {
@@ -98,7 +129,7 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
   const fileOf = (id, kind) => path.join(directory, `${id}.${kind}`);
   // What the page sees of a run's output carries neither the data directory nor the install directory.
   const scriptDirectory = path.dirname(scripts.bybit);
-  const pathless = text => text.replaceAll(directory + path.sep, '').replaceAll(dataDir, '数据目录').replaceAll(scriptDirectory, '程序目录');
+  const pathless = text => text.replaceAll(directory + path.sep, '').replaceAll(dataDir, '数据目录').replaceAll(scriptDirectory, '程序目录').replaceAll(INSTALL_DIRECTORY, '安装目录' + path.sep);
   // Windows cannot deliver a stop signal a process can handle: a stop would end the probe without its wind-down.
   const blocker = probe => platform === 'win32' ? '真实运行只能在 Linux 服务器上的工作台进行：Windows 上停止会直接结束探测进程，无法收尾' : liveBlocker(probe);
   let runs = [], active = null, closed = false, prefixCache = { stamp: null, value: [] };
@@ -141,6 +172,10 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
   }
   function args(probe, params, reportFile, phrase) {
     const live = phrase ? ['--live', '--confirm', phrase] : [];
+    if (probe === 'canary') return ['--data-dir', dataDir, '--step', params.step, '--symbol', params.symbol, '--lead', params.lead, '--lead-side', params.leadSide,
+      '--lead-order', params.leadOrder, '--quantity', params.quantity, '--per-job', params.perJob, '--total-open', params.totalOpen, '--timeout-s', String(params.timeoutS),
+      ...(params.maxSlippageBps === null ? [] : ['--max-slippage-bps', String(params.maxSlippageBps)]),
+      ...(params.strategy === 'auto' ? [] : ['--strategy', params.strategy]), ...(params.strategyId === null ? [] : ['--strategy-id', params.strategyId]), '--out', reportFile, ...live];
     if (probe === 'bybit') return ['--symbol', params.symbol, '--data-dir', dataDir, '--max-notional', params.maxNotional, '--passive-bps', String(params.passiveBps),
       '--settle-timeout-s', String(params.settleTimeoutS), '--out', reportFile, ...(params.allowFill ? ['--allow-fill'] : []), ...live];
     return ['--env-file', asterEnv, '--master-prefix', params.masterPrefix, '--a-prefix', params.aPrefix, '--b-prefix', params.bPrefix, '--amount', params.amount,
@@ -163,7 +198,7 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
     const descriptor = openSync(fileOf(run.id, 'log'), 'wx', 0o600);
     let child;
     try {
-      // The probe reads its credentials itself (Bybit from the data directory, ASTER from the module's env file); none is passed here.
+      // The probe reads its credentials itself (Bybit and the canary from the data directory, ASTER from the module's env file); none is passed here.
       child = spawn(execPath, [scripts[probe], ...args(probe, params, fileOf(run.id, 'json'), phrase)], { cwd: directory, windowsHide: true, stdio: ['ignore', descriptor, descriptor],
         env: { PATH: environment.PATH ?? '', NODE_OPTIONS: '', NODE_PATH: '', ...(environment.SystemRoot ? { SystemRoot: environment.SystemRoot } : {}) } });
     } finally { closeSync(descriptor); }
@@ -175,7 +210,8 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
       const sent = mode === 'live' && !failure && code !== 1;
       Object.assign(run, parsed, { endedAt: iso(), exitCode: Number.isInteger(code) ? code : null,
         phrase: mode === 'read-only' && code === 0 ? parsed.phrase : null,
-        status: code === 0 && (mode === 'live' || parsed.phrase) ? 'completed' : sent ? 'needs-check' : mode === 'live' ? 'not-sent' : 'failed',
+        // A canary check, or a settle with nothing to settle, completes read-only without offering a live run.
+        status: code === 0 && (mode === 'live' || parsed.phrase || probe === 'canary') ? 'completed' : sent ? 'needs-check' : mode === 'live' ? 'not-sent' : 'failed',
         error: failure ?? parsed.error });
       save();
       log?.info?.({ type: 'contract-probe', id: run.id, probe, mode, status: run.status, exitCode: run.exitCode }, '接口实测已结束');
@@ -204,7 +240,7 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
   function state() {
     const latest = new Set(PROBES.map(probe => runs.find(run => run.probe === probe)?.id));
     return { observedAt: iso(), running: active?.run.id ?? null, maintenance: readMaintenance(), liveWindowMs: LIVE_WINDOW_MS,
-      options: { bybit: { symbols: BYBIT_PROBE_SYMBOLS }, aster: { prefixes: asterPrefixes() } },
+      options: { bybit: { symbols: BYBIT_PROBE_SYMBOLS }, aster: { prefixes: asterPrefixes() }, canary: { symbols: CANARY_SYMBOLS } },
       liveBlocked: Object.fromEntries(PROBES.map(probe => [probe, blocker(probe)])),
       runs: runs.map(run => visible(run, latest.has(run.id))) };
   }
@@ -216,7 +252,7 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
     start(input) {
       const body = fields(input, ['probe', 'params']);
       if (!PROBES.includes(body.probe)) throw bad('请选择要测试的接口');
-      const params = body.probe === 'bybit' ? bybitParams(body.params) : asterParams(body.params, asterPrefixes());
+      const params = body.probe === 'bybit' ? bybitParams(body.params) : body.probe === 'canary' ? canaryParams(body.params) : asterParams(body.params, asterPrefixes());
       ready();
       if (readMaintenance()) throw new HttpError(409, '系统正在更新或等待确认更新结果，暂不能开始测试');
       launch(body.probe, 'read-only', params, null, null);
