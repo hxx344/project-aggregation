@@ -4,9 +4,9 @@
 
 ## 边界
 
-- 只有进程内模拟场所，没有真实交易所传输；契约层拒绝任何非模拟传输或非模拟环境。唯一连接真实交易所的是操作者手动运行的两个契约探测脚本（见“真实接口契约探测”），它们不属于执行器。
+- 默认只有进程内模拟场所。带 `--live-config` 启动为实盘金丝雀模式（3.0c，见“实盘金丝雀模式”）：只接 Binance、Bybit 两家真实下单连接器与名义金额上限，不接共享写者登记、ASTER 划转、ADL 与持仓展示。执行器拒绝混用：实盘环境只接受 `transport: 'live'` 的连接器，模拟环境只接受模拟传输；ASTER 三类连接器只接模拟（实盘留到阶段 3.3）。另有操作者手动运行的两个契约探测脚本（见“真实接口契约探测”），不属于执行器。
 - 独立入口、独立数据目录 `executor.sqlite`；拒绝含 `hub.sqlite`、`execution-control.sqlite`、`credentials.key` 或 `modules` 的目录，不读写工作台数据。
-- 共享写者登记（`execution-control.sqlite` 协议，实现为 `server/execution/account-writer.mjs`）只能通过 `createExecutor({ control })` 注入；入口 `main.ts` 不接入，测试只用临时目录里的登记库。模拟传输下只允许以 `testnet` 或 `demo` 身份登记，因为登记会把账户永久钉选给首个认领的模块。
+- 共享写者登记（`execution-control.sqlite` 协议，实现为 `server/execution/account-writer.mjs`）只能通过 `createExecutor({ control })` 注入；入口 `main.ts` 不接入，测试只用临时目录里的登记库；实盘环境注入登记直接拒绝启动（`control_mainnet`）。模拟传输下只允许以 `testnet` 或 `demo` 身份登记，因为登记会把账户永久钉选给首个认领的模块。
 - 不在工作台发布包内（`deploy/package-release.py` 不打包 `platform/`），也不注册任何服务。
 - HTTP 只监听 `127.0.0.1`，校验 Host；启动时把本次进程有效的登录链接写入数据目录的 `access-url`（权限 0600），`GET /login?token=` 换取会话 cookie `pa_executor_session_<端口>`（HttpOnly + SameSite=Strict，按端口隔离），无会话的页面与接口返回 401；写请求需 `x-pa-executor: 1` 与 JSON 体，体积上限 16 KiB。
 - ANT（ANTHROPICUSDT）只读，且只有 Binance 可读。
@@ -23,6 +23,37 @@ node src/main.ts --data-dir D:\tmp\pa-executor --port 4710   # 打开数据目�
 node --test test/*.test.ts                                     # 行为、恢复、故障注入与 HTTP 边界测试
 node scripts/measure.ts                                        # 混合负载测量；未达建议预算时退出码 2
 ```
+
+### 实盘金丝雀模式（3.0c）
+
+只在用户当次授权账户、合约与金额后运行；代码已接线，尚未连过真实账户。只支持 Linux。
+
+```bash
+node src/main.ts --data-dir /home/<用户>/pa-executor-live --port 4711 --live-config /home/<用户>/pa-executor-live.json
+```
+
+配置文件（JSON，须为当前用户所有且权限 600）：
+
+```json
+{
+  "notionalLimits": { "perJob": "50", "totalOpen": "100" },
+  "credentialsFile": "/home/<用户>/pa-executor-keys.json",
+  "accounts": [
+    { "venue": "binance", "accountId": "<Binance UID>", "accountMode": "standard", "credentialVersion": 1 },
+    { "venue": "bybit", "accountId": "<Bybit userID>", "accountMode": "unified", "credentialVersion": 1 }
+  ]
+}
+```
+
+密钥文件同样须为当前用户所有且权限 600：`{ "binance": { "apiKey": "…", "apiSecret": "…" }, "bybit": { "apiKey": "…", "apiSecret": "…" } }`。换密钥时把配置里的 `credentialVersion` 加 1 再重启（不能回退）。
+
+启动顺序：读配置 → 按账户取本机进程锁 → 读密钥文件 → 逐个账户做启动检查（每个账户 30 秒上限）→ 建数据目录并核对环境标记 → 打开库、登记账户 → 监听。任何一步失败都拒绝启动并说明原因，启动检查失败时数据目录不被创建或改动；登记账户失败时立即交还写入租约。进程锁是 Linux 抽象套接字 `pa-executor-live/<交易所>/<账户>`，进程结束由内核释放：同一真实账户在本机只能有一个实盘执行器，换数据目录也不行（两个实例会各算各的名义金额累计，并把对方的委托当外部委托）。配置与密钥文件以非阻塞方式打开、最多读 64 KiB；密钥文件格式错误时报错不回显字段名或内容。启动检查沿用工作台执行客户端的规则：
+
+- 两家都要求密钥绑定 IP（比工作台执行客户端更严）：Binance `ipRestrict` 须为真，Bybit `ips` 须非空且不含 `*`。
+- Binance：`/sapi/v1/account/apiRestrictions` 只允许读取与所选账户模式的合约交易权限（`standard` 要“允许合约”，`portfolio-margin` 要“开启统一账户交易”），提现、划转、杠杆、期权、现货等其它 `enable*`/`permits*` 项只要不是 `false` 就要求关闭，关键项缺失也拒绝；合约账户 `canTrade` 须为真；`/api/v3/account` 的 UID 须等于配置的 `accountId`。
+- Bybit：`/v5/user/query-api` 须为读写密钥，ContractTrade、Derivatives、Wallet、Spot、Options 五类权限都须列出，ContractTrade 至少含 Order、只可含 Order 与 Position，Derivatives 只可含 DerivativesTrade，其余任何类别必须为空；`/v5/account/info` 的 `unifiedMarginStatus` 须为 3–6（统一交易账户）；`userID` 须等于配置的 `accountId`。
+
+实盘库名为 `executor-live.sqlite`（模拟仍是 `executor.sqlite`），回退到不认环境标记的旧代码时，旧代码在实盘目录里只会打开一个空的模拟库，不会拿模拟场所核对真实任务。数据目录首次使用时写入并落盘环境标记文件 `environment`（`simulated` 或 `mainnet`）；没有标记时按库文件判断（有 `executor-live.sqlite` 为实盘，有 `executor.sqlite` 为模拟）。已用于模拟的目录不能以实盘启动，实盘目录也不能以模拟启动：模拟任务与真实任务的账本、名义金额累计不能混在一个库里。连接器只把密钥交给配置里的账户与凭据版本，库里残留的其它绑定拿不到密钥（不发送任何请求）。页面标题与横幅标明实盘，确认按钮为“确认执行（实盘）”，`/api/state` 的 `transport` 为 `live`。
 
 测量脚本在同一进程里同时跑两腿任务、4 个模拟配对的保证金划转（每配对 10 次）与 ADL 事件（每配对 10 次），三个循环按入口方式分开调度；结果为 JSON，含各循环单轮耗时、ADL 发现/首次下单/结束耗时与划转发送/结清耗时。常用参数：`--jobs`、`--pairs`、`--adl-events`、`--transfers`、`--aster-latency-ms`（给每次模拟 ASTER 调用加延迟，看慢 ASTER 是否拖住两腿任务；延迟不响应中止，须小于 ADL 下单时限 `adlOrderTimeoutMs` 3 秒，否则下单按超时处理、事件等满观察窗，运行以退出码 3 结束）、`--loop-spacing-ms`。读线程默认把历史表扫描按主键每 20000 行切成一片，每片一次读取（`--scan-chunk-rows`，0 为整表一次读取）；主线程按入口的方式每秒调用一次 WAL 维护（`--no-wal-reset` 关闭）。`--scan-chunk-rows 0 --no-wal-reset` 还原 2.5 之前的行为，用于对照。结果中的 `walReset` 为截断次数、放弃次数与耗时，`checkpointsIncomplete` 为回填线程被动 checkpoint 未能完成的次数，`readerSnapshotMaxMs` 为读线程单次读取最长占用快照的时间。数据库建在系统临时目录（可用 `TMPDIR` 指到数据盘），结束后删除，`--keep` 保留。未达建议预算时退出码 2，任务、ADL 事件或划转未全部完成时退出码 3。
 
@@ -88,7 +119,7 @@ node server/contract-probes/aster-transfer.ts <同上> --amount 1 --probe-nonce=
 - `attention`（敞口不平衡、对冲腿被拒、对冲补发用尽、撤单用尽或被登记阻止超时、委托过观察窗仍未知、对冲腿账户读取或登记持续失败）保留合约锁并继续核对，人工确认后才释放。
 - 预览要求两腿桶数完全相等；对冲量按首腿实际成交换算并向下取整到对冲所步长。
 - 名义金额硬上限（3.0a，`createExecutor({ notionalLimits: { perJob, totalOpen } })`，USDT）：启动时固定，页面与接口不能修改；`mainnet` 环境有下单连接器而未配置时拒绝启动，模拟默认不设。任务名义金额取两腿中较高的一腿，按“价格保护界限、卖一价、限价”中最高者乘桶数计；预览与确认事务内各核一次，超限返回 `notional_job_cap` / `notional_total_cap`，不建任务、不下单。累计只计开仓任务：从确认起计入，成交、撤单、平仓都不退回；只有没有任何委托离开进程就结束的任务（委托全为 `not-sent` 或没有委托，如接管时尚未发送）不计。平仓只受单笔上限。累计每次从库内任务重算，重启与改上限后仍有效。对冲腿市价补发不设价格上限，真实成交金额可能高于估算。配置上限时拒绝卖出方向的追价首腿（`notional_chase_sell`）：它只有最低价，可在整个任务时限内向上追。
-- 真实连接器（3.0b，`src/live/binance.ts`、`src/live/bybit.ts`，`transport: 'live'`）：执行器在实盘接线（3.0c）之前仍以 `live_transport_refused` 拒绝启动，目前只由替身测试覆盖，未连过真实账户。端点、拒绝码清单与时间戳码沿用生产客户端 `server/trading-execution-exchanges.mjs`（未修改它），签名与有上限的 JSON 读取复用 `server/exchange-transport`。分类：发送前守卫（`beforeSend`）拒绝、凭据缺失、本地参数无效与持仓模式读不到才报 `not-sent`；`fetch` 调用之后的任何失败（超时、中止、重定向、应答过大或无法解析）对写入一律 `uncertain`、对读取一律 `read-failed`；只有清单内的拒绝码报 `rejected`，其余码与 5xx 为 `uncertain`。时间戳被拒（Binance -1021、Bybit 10002）证明未执行：同步一次服务器时钟（偏差上限 300 秒）后用同一参数重发一次，重发前守卫再跑一次；再被拒、同步失败或守卫拒绝重发都报 `rejected`。账户快照每个合约先读委托（Bybit 还读状态 2/4/5/6 的追价策略，记为外部委托 `chase-<编号>`）、后读持仓，读的间隙成交的委托会体现在后读的持仓里；账户编号取 Binance `uid` / Bybit `userID` 的全部位数，60 秒内复用。下单前按 60 秒内的持仓模式缓存（换密钥即失效，过期则现读）：双向持仓时只减仓标记必须与仓位方向一致，否则不发送；Bybit 单向持仓还要求仓位方向能由买卖方向与只减仓标记推出。回报逐项核对客户订单号、合约、方向、类型、限价与有效方式、仓位方向、只减仓与数量，不符时写入应答报 `uncertain`、查询报 `read-failed`。Bybit 下单与撤单只回执编号：下单后读一次委托，读不到就按已受理、未成交报告；撤单后读不到则报 `uncertain`。查单先查 `/v5/order/realtime` 再查 `/v5/order/history`。Bybit 追价按盘点第 47 项的真实形状：`chasePercentE4: 0`，策略记录没有 `positionIdx`（仓位方向由买卖方向与只减仓推出），子单 `orderType` 接受文本 `UNKNOWN`，只有状态 3（已结束；状态 4 仍在结束中）、无挂着的子单、子单成交合计等于策略成交量，且 `/v5/order/realtime` 里该合约同方向没有未结束的追价挂单（`createType: CreateByChaseOrder` 或不带客户订单号）才算结清——挂单期间子单列表为空，挂单只在 realtime 里；策略编号不是本进程创建的就逐个执行合约查找（查无编号返回空列表）。`listStrategies` 读状态 2/4/5/6 全部（4 只保留时间窗内创建的）与状态 3 的时间窗，后者同生产客户端按 7 天减 2 秒分段（每段起点提前 1 秒、终点向上取整），总时间窗超过 366 天报读取失败；账户快照对外部策略只取编号与合约。Bybit 下单后的跟进读取只在读取失败或查无时退回按回执报告，查到但不符或编号不同报 `uncertain`。凭据格式同生产客户端（密钥为可见 ASCII、密文不含换行），不符时不发送。分页游标重复、满页无游标、超过 40 页均报读取失败。
+- 真实连接器（3.0b，`src/live/binance.ts`、`src/live/bybit.ts`，`transport: 'live'`）：由实盘金丝雀模式（3.0c）接入，目前只由替身测试覆盖（含在替身交易所上驱动执行器跑完两腿开仓与 Bybit 追价平仓的端到端用例），未连过真实账户。端点、拒绝码清单与时间戳码沿用生产客户端 `server/trading-execution-exchanges.mjs`（未修改它），签名与有上限的 JSON 读取复用 `server/exchange-transport`。分类：发送前守卫（`beforeSend`）拒绝、凭据缺失、本地参数无效与持仓模式读不到才报 `not-sent`；`fetch` 调用之后的任何失败（超时、中止、重定向、应答过大或无法解析）对写入一律 `uncertain`、对读取一律 `read-failed`；只有清单内的拒绝码报 `rejected`，其余码与 5xx 为 `uncertain`。时间戳被拒（Binance -1021、Bybit 10002）证明未执行：同步一次服务器时钟（偏差上限 300 秒）后用同一参数重发一次，重发前守卫再跑一次；再被拒、同步失败或守卫拒绝重发都报 `rejected`。账户快照每个合约先读委托（Bybit 还读状态 2/4/5/6 的追价策略，记为外部委托 `chase-<编号>`）、后读持仓，读的间隙成交的委托会体现在后读的持仓里；账户编号取 Binance `uid` / Bybit `userID` 的全部位数，60 秒内复用。下单前按 60 秒内的持仓模式缓存（换密钥即失效，过期则现读）：双向持仓时只减仓标记必须与仓位方向一致，否则不发送；Bybit 单向持仓还要求仓位方向能由买卖方向与只减仓标记推出。回报逐项核对客户订单号、合约、方向、类型、限价与有效方式、仓位方向、只减仓与数量，不符时写入应答报 `uncertain`、查询报 `read-failed`。Bybit 下单与撤单只回执编号：下单后读一次委托，读不到就按已受理、未成交报告；撤单后读不到则报 `uncertain`。查单先查 `/v5/order/realtime` 再查 `/v5/order/history`。Bybit 追价按盘点第 47 项的真实形状：`chasePercentE4: 0`，策略记录没有 `positionIdx`（仓位方向由买卖方向与只减仓推出），子单 `orderType` 接受文本 `UNKNOWN`，只有状态 3（已结束；状态 4 仍在结束中）、无挂着的子单、子单成交合计等于策略成交量，且 `/v5/order/realtime` 里该合约同方向没有未结束的追价挂单（`createType: CreateByChaseOrder` 或不带客户订单号）才算结清——挂单期间子单列表为空，挂单只在 realtime 里；策略编号不是本进程创建的就逐个执行合约查找（查无编号返回空列表）。`listStrategies` 读状态 2/4/5/6 全部（4 只保留时间窗内创建的）与状态 3 的时间窗，后者同生产客户端按 7 天减 2 秒分段（每段起点提前 1 秒、终点向上取整），总时间窗超过 366 天报读取失败；账户快照对外部策略只取编号与合约。Bybit 下单后的跟进读取只在读取失败或查无时退回按回执报告，查到但不符或编号不同报 `uncertain`。凭据格式同生产客户端（密钥为可见 ASCII、密文不含换行），不符时不发送。分页游标重复、满页无游标、超过 40 页均报读取失败。
 - 调度：入口 `main.ts` 把两腿任务（`tickJobs`）、保证金划转（`tickTransfers`）与 ADL 应急处理（`tickAdl`）作为三个循环分别调度，每轮结束后间隔 1 秒（连续失败时逐次加长），持仓展示另有自己的循环；一个循环里的交易所调用变慢只拖住它自己。每个循环同一时刻只有一轮，重复调用并入在途轮次。三个循环共用写入租约、事件表与命令表（只新增行），在途时不改写彼此的记录：ADL 只读取配对记录，两腿任务循环里的保留期清理只删除超过保留期且已结清或已结束的划转与 ADL 记录。旧系统同一配对的保证金平衡与 ADL 在一把配对锁内串行（盘点文档 6.5），这里按发送互斥保留这一点：配对有划转处于 `prepared` 或 `sending` 时，ADL 不发新批次，事件记为受阻（“配对的保证金划转正在发送……”），每秒重看一次，受阻时间不计入 1800 秒处理时限；配对有 ADL 减仓单处于 `prepared`、`sending` 或 `open` 时，划转本轮不发（“ADL 减仓单正在发送或挂单，本轮不划转”），按检查间隔再看。ADL 在读取现场前、划转在读取余额前各查一次，落盘事务内再各查一次；等待通常以划转发送时限（`callTimeoutMs`）和减仓单的撤单周期（最多 3 次、每次间隔 `adlCancelAfterMs`，再加一次查询）为上界，但撤单次数用尽后仍挂着的减仓单会一直阻挡划转，直到慢速核对（`adlActiveQueryMs`，30 秒）确认它已在交易所结束或被人工撤掉；结果未知的划转或减仓单不互相阻挡。`tick()` 依次跑三个循环各一轮，供测试使用。
 - 入口任一执行循环连续失败 5 次或失去租约时交还租约并以非零码退出，由外部重启接管；关闭时打断各循环的等待间隔，只等在途轮次结束。
 - 数量与价格用精确十进制字符串，不经过浮点。
@@ -201,13 +232,12 @@ DELETE FROM schema_migrations WHERE version = 4;
   - 每次读取 `/api/state` 都从库内全部开仓任务重算累计，任务从不清理；金丝雀规模下可忽略。
 - 真实连接器（3.0b）接真实账户（3.0c）前须核实或补齐：
   - 两个连接器都没在真实账户上跑过；Binance 统一账户（`portfolio-margin`）的 `papi` 端点照搬生产客户端，未经本模块验证。
-  - 热路径不检查 API 密钥权限（提币权限、IP 白名单），留给 3.0c 的接入步骤。
+  - 密钥权限、账户可交易状态与账户身份只在启动时检查一次（3.0c），运行中不复查；运行中有人改了密钥权限或账户状态，要到下次启动才发现。IP 白名单只核对“已绑定”，不核对绑定的是不是本机出口 IP。名义金额上限没有代码内硬顶（只受 `NOTIONAL_LIMIT_CEILING`），数值以配置为准、启动时打印。
   - Bybit 仍未核实（盘点第 47 项）：`/v5/strategy/order-list` 外层是否带 `nextCursor`（缺它时满页报读取失败，短页视为读完）；双向持仓账户上的策略与子单形状；部分成交后停止时子单的状态与数量；策略结束后其挂单是否短暂留在 `/v5/order/realtime`（会使下一批的发单前检查报外部委托）；多页时的分页；不带时间参数的运行中策略列表是否有时间限制。
   - Bybit 追价创建回执之后、策略记录可见之前若有延迟，执行器 ACK 后的首次查询会查无并按创建结果未知处理（见上文 ACK 后查询一条）。
   - Bybit 下单后的首个状态来自紧接着的一次查询，查不到时报为未成交的新委托，之后靠按客户订单号查询收敛；IOC 单在这段时间里实际已结束。
-  - 测试只直接调用连接器（输出经执行器同一套 `parse*` 校验），没有在替身交易所上驱动执行器跑完整任务；真实连接器的端到端用例随 3.0c 接线补上（执行器要求账户环境与自身一致，接线前无法不改执行器就把 mainnet 连接器挂上）。
-  - 单次写入的最坏耗时可超过执行器 `callTimeoutMs`（35 秒）：Binance 读持仓模式与下单各可能含一次时间戳重发，每次请求上限 10 秒；Bybit 创建后还有跟进读取。超出时执行器按结果未知核对，方向安全但会多出待核对的委托；3.0c 接线时按实际耗时收紧。
-  - Bybit 只认绑定声明的 `unified`，不向交易所核对统一账户状态（生产客户端读 `/v5/account/info` 的 `unifiedMarginStatus`）；与 API 密钥权限检查一起留给 3.0c。
+  - 端到端用例（`test/live-wiring.test.ts`）的替身交易所让每笔委托立即全部成交、追价由测试一次性结束，测不到部分成交、追价中途停止与对冲腿失败在真实账户上的形状。
+  - 单次写入的最坏耗时可超过执行器 `callTimeoutMs`（35 秒）：Binance 读持仓模式与下单各可能含一次时间戳重发，每次请求上限 10 秒；Bybit 创建后还有跟进读取。超出时执行器按结果未知核对，方向安全但会多出待核对的委托；3.0c 接线没有收紧（没有真实耗时数据），金丝雀运行后按实测决定。
   - 时间戳重发时测得的交易所时钟偏移只用于签名，没有交给执行器；`adoptSkewMs` 仍用本机时钟比较交易所的策略创建时间（见上文追价 ACK 一条）。
   - Bybit `/v5/order/history` 不带时间参数只覆盖最近一段时间，很旧的委托会查无（同生产客户端），由执行器的持仓无痕迹核对兜底。
 - 登录令牌不是一次性的，进程运行期间可重复使用；Windows 上文件权限 0600/0700 不生效，已存在的数据目录不改权限。

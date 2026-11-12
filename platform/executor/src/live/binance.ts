@@ -6,6 +6,7 @@ import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBi
 import { VenueError, type CallOptions, type ConnectorCapabilities, type OrderReport, type OrderRequest, type OrderStatus, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
+import { PreflightError, binanceIpProblem, binancePermissionProblem } from './permissions.ts';
 import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export type { LiveCredentials } from './values.ts';
@@ -49,6 +50,7 @@ function endpoints(accountMode: string) {
   const at = (path: string, method: Endpoint['method'] = 'GET', base = host): Endpoint => ({ host: base, path, method });
   return {
     identity: at('/api/v3/account', 'GET', SPOT_HOST),
+    permissions: at('/sapi/v1/account/apiRestrictions', 'GET', SPOT_HOST),
     config: at(`${prefix}/accountConfig`),
     positions: at(portfolio ? `${prefix}/positionRisk` : '/fapi/v3/positionRisk'),
     openOrders: at(`${prefix}/openOrders`),
@@ -249,6 +251,17 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
   return {
     venue: 'binance',
     capabilities,
+
+    preflight: (binding: AccountBinding, { signal }: CallOptions) => reading(async () => {
+      const routes = endpoints(binding.accountMode);
+      const restrictions = record(await signed(binding, routes.permissions, {}, { signal }), '密钥权限');
+      const problem = binancePermissionProblem(restrictions, binding.accountMode) ?? binanceIpProblem(restrictions);
+      if (problem) throw new PreflightError(`Binance 密钥权限不符合要求：${problem}`);
+      if (record(await signed(binding, routes.config, {}, { signal }), '账户配置').canTrade !== true) throw new PreflightError('Binance 合约账户当前不可交易');
+      await readMode(binding, signal);
+      const uid = await readIdentity(binding, signal);
+      if (uid !== binding.accountId) throw new PreflightError(`Binance 密钥属于 UID ${uid}，与配置的账户 ${binding.accountId} 不一致`);
+    }),
 
     instrument: (symbol: string, { signal }: CallOptions) => reading(async () => {
       if (!VENUE_READ_SYMBOLS.binance.includes(symbol)) throw new VenueError('read-failed', `${symbol} 不在 Binance 可读合约内`);
