@@ -523,7 +523,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
             : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
         '对冲腿按市价发送；首腿成交后，包括服务重启接管后，按已落盘成交量补发对冲腿，补发不设价格限制。',
         ...(limits ? [`名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`] : []),
-        '模拟传输：不会访问任何真实交易所。',
+        environment === 'mainnet' ? '实盘传输：确认后委托会发送到真实交易所账户。' : '模拟传输：不会访问任何真实交易所。',
       ],
     };
     write(() => {
