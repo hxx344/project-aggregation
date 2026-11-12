@@ -63,6 +63,9 @@ cutover_previous=-
 resumed_cutover_release=
 slot_instance=
 probe_failures=
+# Assigned here on every run and never read from the environment; only a
+# test that sources this file lowers it.
+slot_probe_attempts=60
 activation_scope=
 pending_activation_scope=
 # An interrupted activation's .pending-previous for the release current names,
@@ -3102,11 +3105,12 @@ slot_probe() {
   fi
   slot_instance=$(json_field instanceId <<< "$output")
 }
-# Up to 60 s for slot $1 to pass the probe as release $2 in mode $3.
+# Up to slot_probe_attempts probes, a second apart, for slot $1 to pass as
+# release $2 in mode $3.
 wait_slot() {
   local attempt
   probe_failures=
-  for attempt in {1..60}; do
+  for (( attempt = 1; attempt <= slot_probe_attempts; attempt++ )); do
     if slot_probe "$@"; then return 0; fi
     sleep 1
   done

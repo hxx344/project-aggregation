@@ -255,7 +255,13 @@ public_session check
 # stops it and the serving slot never changed.
 old_slot_record=$(read_slot_record) cutover_committed=0
 start_load
+# The asset is missing for good: 15 probes outlast the slot's start, and the
+# installer's 60 would only repeat the same answer. The refusal must name the
+# asset alone, which also shows the slot was up and otherwise sound.
+installer_probe_attempts=$slot_probe_attempts slot_probe_attempts=15
 if api_cutover a "$release_bad"; then echo 'A broken candidate took the traffic' >&2; exit 1; fi
+slot_probe_attempts=$installer_probe_attempts
+[[ "$probe_failures" == *'"failures":["GET /assets/app-bad.js 返回 404"]'* ]]
 (( ! cutover_committed ))
 api_cutover_rollback
 check_load 'failed candidate'
