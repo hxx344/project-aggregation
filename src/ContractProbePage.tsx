@@ -6,7 +6,8 @@ import { beijingTime } from './trading-format';
 import './contract-probes.css';
 
 const ROOT = '/api/system/contract-probes';
-type Probe = 'bybit' | 'aster';
+type Probe = 'bybit' | 'aster' | 'canary';
+type CanaryStep = 'check' | 'open' | 'close' | 'settle';
 type Run = {
   id: string; probe: Probe; mode: 'read-only' | 'live'; params: Record<string, unknown>;
   status: 'running' | 'completed' | 'failed' | 'not-sent' | 'needs-check' | 'interrupted';
@@ -15,13 +16,16 @@ type Run = {
 };
 type State = {
   observedAt: string; running: string | null; maintenance: boolean; liveWindowMs: number;
-  options: { bybit: { symbols: string[] }; aster: { prefixes: string[] } }; liveBlocked: Record<Probe, string | null>; runs: Run[];
+  options: { bybit: { symbols: string[] }; aster: { prefixes: string[] }; canary?: { symbols: string[] } }; liveBlocked: Record<Probe, string | null>; runs: Run[];
 };
-const NAMES: Record<Probe, string> = { bybit: 'Bybit 原生追价', aster: 'ASTER 子账户划转' };
+const NAMES: Record<Probe, string> = { bybit: 'Bybit 原生追价', aster: 'ASTER 子账户划转', canary: '原油双腿金丝雀（新执行器）' };
+const STEP_NAMES: Record<CanaryStep, string> = { check: '启动检查与核对', open: '开仓', close: '平仓', settle: '收尾' };
+const VENUES: Record<string, string> = { binance: 'Binance', bybit: 'Bybit' };
 const NONCE_PRESET = '-30,-59,-61,-90,-121,61';
 
 function verdict(run: Run) {
   if (run.status === 'running') return run.stopRequestedAt ? '已请求停止，正在收尾' : run.mode === 'live' ? '真实运行中' : '只读检查中';
+  if (run.status === 'completed' && run.probe === 'canary') return run.mode === 'live' ? '真实运行完成，任务已到终态' : run.phrase ? '预览完成，未发送任何写请求' : '检查完成，未发送任何写请求（结论见下方结果）';
   if (run.status === 'completed') return run.mode === 'live' ? '真实运行完成，收尾正常' : '只读检查通过，未发送任何写请求';
   if (run.status === 'failed') return '只读检查未通过，未发送任何写请求';
   if (run.status === 'not-sent') return '真实运行未发出任何写请求';
@@ -31,6 +35,11 @@ function verdict(run: Run) {
 const tone = (run: Run) => run.status === 'completed' ? 'ok' : run.status === 'running' ? 'busy' : run.status === 'needs-check' || run.status === 'interrupted' && run.mode === 'live' ? 'bad' : 'warn';
 function summary(run: Run) {
   const p = run.params;
+  if (run.probe === 'canary') {
+    const step = p.step as CanaryStep, caps = `单笔上限 ${p.perJob} / 累计开仓上限 ${p.totalOpen} USDT`;
+    if (step === 'check' || step === 'settle') return `${STEP_NAMES[step]} · ${p.symbol} · ${caps}`;
+    return `${STEP_NAMES[step]} · ${p.symbol} · 首腿 ${VENUES[String(p.lead)]}${step === 'open' ? (p.leadSide === 'long' ? ' 做多' : ' 做空') : '（方向取金丝雀持仓）'}${p.leadOrder === 'chase' ? ' 原生追价' : ' 市价'} · 每腿 ${p.quantity} 桶 · ${caps} · 最长 ${p.timeoutS} 秒${p.maxSlippageBps ? ` · 价格保护 ${p.maxSlippageBps} bps` : ''}`;
+  }
   if (run.probe === 'bybit') return `${p.symbol} · 名义金额上限 ${p.maxNotional} USDT · 被动价距 ${p.passiveBps} bps · 结清等待 ${p.settleTimeoutS} 秒 · ${p.allowFill ? '含成交与平仓测试' : '只测不成交的追价'}`;
   const offsets = Array.isArray(p.probeNonce) ? p.probeNonce : [];
   return `主账户 ${p.masterPrefix} · A ${p.aPrefix} ⇄ B ${p.bPrefix} · 每笔 ${p.amount} USD1 · ${offsets.length ? `nonce 偏移 ${offsets.join('、')} 秒` : '不探测 nonce'} · 入账等待 ${p.settleTimeoutS} 秒${p.balancerPaused ? ' · 已声明暂停保证金平衡' : ''}`;
@@ -57,11 +66,15 @@ function RunPanel({ run, state, busy, onLive, onStop, onDownload }: { run: Run; 
     </div>
     {offer ? <div className="probe-live">
       <strong>真实运行</strong>
-      <p>将按上面这组参数向{run.probe === 'bybit' ? ' Bybit 发送真实追价委托' : ' ASTER 发起真实划转（A→B 后划回）'}。确认内容：<code>{run.phrase}</code></p>
+      <p>将按上面这组参数{run.probe === 'bybit' ? '向 Bybit 发送真实追价委托' : run.probe === 'aster' ? '向 ASTER 发起真实划转（A→B 后划回）' : run.params.step === 'settle' ? '把剩余的金丝雀任务核对到终态（首腿撤挂单、不再新发，已成交部分可能补发对冲腿）' : `在 Binance 与 Bybit 各下一腿真实${run.params.step === 'open' ? '开仓' : '平仓'}委托`}。确认内容：<code>{run.phrase}</code></p>
       {run.probe === 'bybit' && run.params.allowFill ? <p className="probe-error">已选择成交与平仓测试：会真实成交一笔并随后市价平仓，产生手续费与价差损耗。</p> : null}
       {run.probe === 'aster' && Array.isArray(run.params.probeNonce) && run.params.probeNonce.length ? <p className="probe-error">已选择 nonce 探测：被交易所接受的每一笔都是真实划转，会逐笔划回。</p> : null}
-      <label><input type="checkbox" checked={confirmed} disabled={!!blocked} onChange={event => setConfirmed(event.target.checked)} />我确认用真实账户发送上述{run.probe === 'bybit' ? '委托' : '划转'}</label>
-      <label><input type="checkbox" checked={exclusive} disabled={!!blocked} onChange={event => setExclusive(event.target.checked)} />{run.probe === 'bybit' ? '测试期间不在其他系统对该 Bybit 账户的这个标的下单' : '测试期间旧系统不对这两个子账户做划转，且不触发 ASTER 限频'}</label>
+      {run.probe === 'canary' && run.params.step !== 'settle' ? <p className="probe-error">真实运行前会按当时行情重新预览；价格变化后名义金额上限仍然生效，超限即不下单。</p> : null}
+      <label><input type="checkbox" checked={confirmed} disabled={!!blocked} onChange={event => setConfirmed(event.target.checked)} />我确认用真实账户发送上述{run.probe === 'aster' ? '划转' : '委托'}</label>
+      <label><input type="checkbox" checked={exclusive} disabled={!!blocked} onChange={event => setExclusive(event.target.checked)} />{run.probe === 'bybit' ? '测试期间不在其他系统对该 Bybit 账户的这个标的下单'
+        : run.probe === 'aster' ? '测试期间旧系统不对这两个子账户做划转，且不触发 ASTER 限频'
+        : run.params.step === 'settle' ? '我已看过上方待收尾的任务，需要人工处理的剩余敞口已在交易所处理'
+        : '测试期间旧系统（含自动规则）和人工都不对这两个账户的该合约下单'}</label>
       {blocked ? <p className="probe-error">{blocked}</p> : null}
       <button className="button probe-live-button" disabled={busy || !!blocked || !confirmed || !exclusive} onClick={() => onLive(run)}><Play size={15} />开始真实运行</button>
     </div> : null}
@@ -71,6 +84,7 @@ function RunPanel({ run, state, busy, onLive, onStop, onDownload }: { run: Run; 
 export default function ContractProbePage({ onExpired }: { onExpired: () => void }) {
   const [writeError, setWriteError] = useState(''), [busy, setBusy] = useState(false), [running, setRunning] = useState(false);
   const [bybit, setBybit] = useState({ symbol: 'CLUSDT', maxNotional: '50', passiveBps: '200', settleTimeoutS: '60', allowFill: false });
+  const [canary, setCanary] = useState({ symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', leadOrder: 'market', quantity: '', perJob: '100', totalOpen: '300', timeoutS: '120', maxSlippageBps: '' });
   const [aster, setAster] = useState({ masterPrefix: '', aPrefix: '', bPrefix: '', amount: '1', probeNonce: '', balancerPaused: false, settleTimeoutS: '300', historyMinutes: '30' });
   const mounted = useRef(false), writing = useRef(false), expires = useRef(onExpired);
   expires.current = onExpired;
@@ -104,9 +118,18 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
     void write('/runs', { probe: 'aster', params: { masterPrefix: aster.masterPrefix, aPrefix: aster.aPrefix, bPrefix: aster.bPrefix, amount: aster.amount, probeNonce: offsets.map(Number),
       balancerPaused: aster.balancerPaused, settleTimeoutS: Number(aster.settleTimeoutS), historyMinutes: Number(aster.historyMinutes) } });
   }
+  function startCanary(step: CanaryStep) {
+    const placing = step === 'open' || step === 'close';
+    if (placing && !/^\d{1,6}(?:\.\d{1,8})?$/.test(canary.quantity)) { setWriteError('请填写每腿数量（桶）。'); return; }
+    if (![canary.perJob, canary.totalOpen].every(value => /^\d{1,3}(?:\.\d{1,2})?$/.test(value)) || !/^\d{1,3}$/.test(canary.timeoutS) || !/^(?:\d{1,3})?$/.test(canary.maxSlippageBps)) { setWriteError('请填写有效的金额上限、执行时长与价格保护。'); return; }
+    void write('/runs', { probe: 'canary', params: { step, symbol: canary.symbol, lead: canary.lead, leadSide: canary.leadSide, leadOrder: canary.lead === 'bybit' ? canary.leadOrder : 'market',
+      ...(placing ? { quantity: canary.quantity } : {}), perJob: canary.perJob, totalOpen: canary.totalOpen, timeoutS: Number(canary.timeoutS),
+      ...(canary.maxSlippageBps ? { maxSlippageBps: Number(canary.maxSlippageBps) } : {}) } });
+  }
   const live = (run: Run) => { if (run.phrase) void write(`/runs/${run.id}/live`, { confirmLive: true, phrase: run.phrase }); };
   const stop = (run: Run, force: boolean) => {
-    if (!window.confirm(force ? '强制结束会跳过收尾：可能在交易所留下未撤的追价、挂单、持仓或未划回的资金，须自行核对处理。确定强制结束？' : run.probe === 'bybit' ? '停止后探测不再创建新追价，并收尾（停止自己的追价、平掉自己成交的数量）。确定停止？' : '停止后探测不再发起新的划转，但不会自动划回：已划到子账户 B 的金额须按报告自行核对并划回。确定停止？')) return;
+    if (!window.confirm(force ? '强制结束会跳过收尾：可能在交易所留下未撤的追价、挂单、持仓或未划回的资金，须自行核对处理。确定强制结束？' : run.probe === 'bybit' ? '停止后探测不再创建新追价，并收尾（停止自己的追价、平掉自己成交的数量）。确定停止？'
+      : run.probe === 'canary' ? '停止后不再创建新任务；已在运行的任务交给执行器收尾（首腿撤挂单，已成交部分按需补发对冲腿），之后请做启动检查核对。确定停止？' : '停止后探测不再发起新的划转，但不会自动划回：已划到子账户 B 的金额须按报告自行核对并划回。确定停止？')) return;
     void write(`/runs/${run.id}/stop`, force ? { force: true } : {});
   };
   async function download(run: Run) {
@@ -123,7 +146,7 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
   }
 
   const latest = (probe: Probe) => state?.runs.find(run => run.probe === probe);
-  const shown = new Set([latest('bybit')?.id, latest('aster')?.id]);
+  const shown = new Set([latest('bybit')?.id, latest('aster')?.id, latest('canary')?.id]);
   const earlier = state?.runs.filter(run => !shown.has(run.id)) ?? [];
   const locked = busy || !state || !!state.running || state.maintenance;
   const prefixes = state?.options.aster.prefixes ?? [];
@@ -132,7 +155,7 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
     <option value="">请选择</option>{prefixes.map(prefix => <option key={prefix} value={prefix}>{prefix}</option>)}</select></label>;
   return <div className="contract-probes">
     <header><h1>接口实测</h1>
-      <p>用真实账户核对交易所接口的实际行为。每项测试先做<strong>只读检查</strong>（不发任何委托或划转），通过后显示本次的确认内容，勾选确认才会<strong>真实运行</strong>。真实运行有固定上限：Bybit 单笔名义金额不超过 200 USDT，ASTER 单笔不超过 5 USD1。</p>
+      <p>用真实账户核对交易所接口的实际行为。每项测试先做<strong>只读检查</strong>（不发任何委托或划转），通过后显示本次的确认内容，勾选确认才会<strong>真实运行</strong>。真实运行有固定上限：Bybit 单笔名义金额不超过 200 USDT，ASTER 单笔不超过 5 USD1，原油金丝雀单笔不超过 200 USDT、累计开仓不超过 500 USDT。</p>
       <p>同一时刻只运行一项测试；真实运行期间系统更新会被挡住。测试结束后可下载报告（已隐去密钥、签名与账户编号）。</p></header>
     {readError ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{readError}；页面内容可能已过期。<button onClick={() => void probes.refresh()}>重试</button></div> : null}
     {writeError ? <div className="error-box inline-error" role="alert"><CircleAlert size={18} />{writeError}</div> : null}
@@ -164,6 +187,28 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
           </div>
           <button className="button primary" disabled={locked} onClick={startAster}><Play size={15} />只读检查</button></>}
         {panel('aster')}
+      </section>
+      <section aria-labelledby="probe-canary-title"><h2 id="probe-canary-title">{NAMES.canary}</h2>
+        <p>使用交易中心已保存的 Binance 与 Bybit 执行账户，由新执行器在原油合约上做跨所双腿开平仓；执行记录单独存放在数据目录的 executor-canary 下，平仓只平金丝雀自己开的仓位。建议顺序：启动检查 → 开仓预览并真实开仓 → 平仓预览并真实平仓 → 再做一次启动检查核对。某一步被中断或有任务待人工确认时，先做收尾。两个密钥都须绑定本机出口 IP，否则启动检查不通过。</p>
+        <div className="probe-form">
+          <label>合约<select aria-label="合约" value={canary.symbol} disabled={locked} onChange={event => setCanary({ ...canary, symbol: event.target.value })}>{(state.options.canary?.symbols ?? ['CLUSDT', 'BZUSDT']).map(symbol => <option key={symbol} value={symbol}>{symbol}</option>)}</select></label>
+          <label>首腿交易所<select aria-label="首腿交易所" value={canary.lead} disabled={locked} onChange={event => setCanary({ ...canary, lead: event.target.value })}><option value="binance">Binance</option><option value="bybit">Bybit</option></select></label>
+          <label>首腿方向（开仓用）<select aria-label="首腿方向" value={canary.leadSide} disabled={locked} onChange={event => setCanary({ ...canary, leadSide: event.target.value })}><option value="long">做多</option><option value="short">做空</option></select></label>
+          <label>首腿下单方式<select aria-label="首腿下单方式" value={canary.lead === 'bybit' ? canary.leadOrder : 'market'} disabled={locked || canary.lead !== 'bybit'} onChange={event => setCanary({ ...canary, leadOrder: event.target.value })}><option value="market">市价</option><option value="chase">Bybit 原生追价（只限买入方向）</option></select></label>
+          <label>每腿数量（桶）<input aria-label="每腿数量" inputMode="decimal" value={canary.quantity} disabled={locked} placeholder="开平仓必填" onChange={event => setCanary({ ...canary, quantity: event.target.value.trim() })} /></label>
+          <label>单笔上限（USDT，≤200）<input aria-label="单笔上限" inputMode="decimal" value={canary.perJob} disabled={locked} onChange={event => setCanary({ ...canary, perJob: event.target.value.trim() })} /></label>
+          <label>累计开仓上限（USDT，≤500）<input aria-label="累计开仓上限" inputMode="decimal" value={canary.totalOpen} disabled={locked} onChange={event => setCanary({ ...canary, totalOpen: event.target.value.trim() })} /></label>
+          <label>最长执行（秒，30–600）<input aria-label="最长执行" inputMode="numeric" value={canary.timeoutS} disabled={locked} onChange={event => setCanary({ ...canary, timeoutS: event.target.value.trim() })} /></label>
+          <label>价格保护（bps，1–200，留空用默认）<input aria-label="价格保护" inputMode="numeric" value={canary.maxSlippageBps} disabled={locked} placeholder="默认" onChange={event => setCanary({ ...canary, maxSlippageBps: event.target.value.trim() })} /></label>
+        </div>
+        <p>平仓时方向取自金丝雀记录的持仓，与上面的首腿方向无关；累计开仓上限按金丝雀已开过的所有任务计，平仓不退回。</p>
+        <div className="probe-actions">
+          <button className="button primary" disabled={locked} onClick={() => startCanary('check')}><Play size={15} />启动检查与核对</button>
+          <button className="button secondary" disabled={locked} onClick={() => startCanary('open')}><Play size={15} />开仓预览</button>
+          <button className="button secondary" disabled={locked} onClick={() => startCanary('close')}><Play size={15} />平仓预览</button>
+          <button className="button secondary" disabled={locked} onClick={() => startCanary('settle')}><Play size={15} />收尾</button>
+        </div>
+        {panel('canary')}
       </section>
       {earlier.length ? <section aria-labelledby="probe-history-title"><h2 id="probe-history-title">较早的测试</h2>
         <div className="probe-table"><table><thead><tr><th>开始（北京时间）</th><th>接口</th><th>方式</th><th>结论</th><th>报告</th></tr></thead>

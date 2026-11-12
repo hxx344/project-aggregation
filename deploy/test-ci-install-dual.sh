@@ -17,6 +17,7 @@ export FIXTURE_ROOT=$fixture
 mkdir -p "$fixture/source/src" "$fixture/source/server" "$fixture/source/deploy" "$fixture/runtime" "$fixture/updater"
 mkdir -p "$fixture/source/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$fixture/source/tools/aero-roles/"
+mkdir -p "$fixture/source/platform/executor" && cp -a "$repository/platform/executor/src" "$repository/platform/executor/package.json" "$fixture/source/platform/executor/"
 printf '{"name":"fixture","version":"1.0.0","type":"module"}\n' > "$fixture/source/package.json"
 printf 'frontend\n' > "$fixture/source/src/app.ts"
 printf 'backend\n' > "$fixture/source/server/index.mjs"

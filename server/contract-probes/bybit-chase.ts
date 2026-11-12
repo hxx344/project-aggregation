@@ -12,14 +12,11 @@
 // create whose outcome is unknown, and never touches a strategy it cannot tie to its own requests.
 // Endpoints, parameters and signing follow server/trading-execution-exchanges.mjs, except the
 // offset from the best bid: the first create tries its spellings in turn until one is accepted.
-import { createDecipheriv, randomUUID } from 'node:crypto';
-import { readFileSync, statSync } from 'node:fs';
-import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { DatabaseSync } from 'node:sqlite';
+import { randomUUID } from 'node:crypto';
 import { HttpFailure, NotSent, ProbeAbort, boundedInteger, createReport, environment, exchange, ignoreInterrupt, liveAllowed, positiveDecimal, readFlags, registerSecrets, reserveReport, safeText, saveReport, sleep, step, watchSignals } from './lib/common.ts';
 import type { HttpResult, Report } from './lib/common.ts';
 import { bybitHeaders } from './lib/bybit-sign.ts';
+import { readWorkbenchAccounts } from './lib/workbench-accounts.ts';
 import type { BybitCredentials as Credentials } from './lib/bybit-sign.ts';
 import { add, cmp, floorToStep, fromUnits, isZero, mul, sub, units } from './lib/decimal.ts';
 
@@ -45,30 +42,8 @@ function loadCredentials(dataDir: string | undefined, env: Record<string, string
     if (!apiKey || !apiSecret) throw new ProbeAbort('缺少 BYBIT_API_KEY / BYBIT_API_SECRET（或用 --data-dir 读取工作台已保存的执行账户）');
     return { apiKey, apiSecret };
   }
-  // Same layout as server/runtime/credentials.mjs (iv 12 | tag 16 | ciphertext, AES-256-GCM), read-only:
-  // that loader would create a key file when none exists, which a probe must never do.
-  const key = readFileSync(join(dataDir, 'credentials.key'));
-  if (key.length !== 32) throw new ProbeAbort('credentials.key 长度不正确');
-  // A read-only connection to a cold WAL database can leave -wal/-shm files owned by whoever runs this (LESSONS L063),
-  // which stops the workbench service from opening it. Without pending WAL pages the file is read as immutable; with
-  // them the workbench must be running, so its -shm exists and nothing new is created.
-  const file = join(dataDir, 'hub.sqlite'), size = (suffix: string): number | null => { try { return statSync(file + suffix).size; } catch { return null; } };
-  if (size('') === null) throw new ProbeAbort('数据目录中没有 hub.sqlite');
-  if (size('-journal')) throw new ProbeAbort('hub.sqlite 有未完成的回滚日志，请改用环境变量提供凭据');
-  const pending = Boolean(size('-wal'));
-  if (pending && size('-shm') === null) throw new ProbeAbort('hub.sqlite 有未合并的 WAL 而工作台未在运行：请先启动工作台，或改用环境变量提供凭据');
-  const database = new DatabaseSync(pending ? file : pathToFileURL(file).href + '?immutable=1', { readOnly: true });
-  let stored: unknown;
-  try { database.exec('PRAGMA query_only=ON; PRAGMA busy_timeout=750'); stored = database.prepare("SELECT credentials FROM execution_accounts WHERE exchange = 'bybit'").get()?.credentials; }
-  finally { database.close(); }
-  if (typeof stored !== 'string' || !stored) throw new ProbeAbort('工作台没有保存 Bybit 执行账户');
-  try {
-    const buffer = Buffer.from(stored, 'base64'), decipher = createDecipheriv('aes-256-gcm', key, buffer.subarray(0, 12));
-    decipher.setAuthTag(buffer.subarray(12, 28));
-    const value: unknown = JSON.parse(Buffer.concat([decipher.update(buffer.subarray(28)), decipher.final()]).toString());
-    if (!isRow(value) || typeof value.apiKey !== 'string' || typeof value.apiSecret !== 'string' || !value.apiKey || !value.apiSecret) throw new Error();
-    return { apiKey: value.apiKey, apiSecret: value.apiSecret };
-  } catch { throw new ProbeAbort('无法解密工作台保存的 Bybit 执行账户'); }
+  const [account] = readWorkbenchAccounts(dataDir, ['bybit']);
+  return { apiKey: account.apiKey, apiSecret: account.apiSecret };
 }
 
 /** Venue clock minus local clock, from /v5/market/time. */

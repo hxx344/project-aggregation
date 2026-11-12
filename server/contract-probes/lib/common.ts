@@ -147,6 +147,8 @@ export function watchSignals(): void {
     process.stderr.write('收到中断信号：停止后续步骤并收尾，再按一次立即退出\n');
   });
 }
+/** Whether Ctrl-C or SIGTERM arrived, for code that winds down by itself instead of through sleep(). */
+export const interruptRequested = (): boolean => interrupted;
 /** Wind-down code calls this so its own requests are not refused by the pending interrupt. */
 export function ignoreInterrupt(): void { honorInterrupt = false; }
 function checkInterrupt(): void { if (interrupted && honorInterrupt) throw new NotSent('收到中断信号'); }

@@ -81,6 +81,11 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         for name in roles_names:
             shutil.copy2(ROOT / 'tools/aero-roles' / name, roles / name)
         shutil.copy2(ROOT / 'tools/aero-roles/cli.mjs', roles / 'cli.mjs')
+        executor = source / 'platform/executor'
+        (executor / 'src').mkdir(parents=True); (executor / 'test').mkdir()
+        (executor / 'src/main.ts').write_text('export {};')
+        (executor / 'test/main.test.ts').write_text('tests must not ship')
+        (executor / 'package.json').write_text('{"type":"module"}')
         for args in (('init', '-q'), ('config', 'core.autocrlf', 'false'), ('config', 'user.name', 'fixture'),
                      ('config', 'user.email', 'fixture@example.invalid'), ('add', '.'), ('commit', '-qm', 'pinned runtime')):
             subprocess.run(['git', '-C', str(source), *args], check=True, capture_output=True)
@@ -97,6 +102,7 @@ ci_release_extract "$FIXTURE/cache" "$FIXTURE/extracted"
         self.assertEqual(0, result.returncode, result.stdout + result.stderr)
         self.assertFalse((publish / 'tools/aero-lp').exists())
         self.assertEqual(set(roles_names), {path.name for path in (publish / 'tools/aero-roles').iterdir()})
+        self.assertEqual({'package.json', 'src'}, {path.name for path in (publish / 'platform/executor').iterdir()})
         committed = subprocess.check_output(['git', '-C', str(source), 'show', commit + ':tools/aero-roles/policy.mjs'])
         published = (publish / 'tools/aero-roles/policy.mjs').read_bytes()
         # A Windows checkout may publish CRLF; the content must still be the committed file.

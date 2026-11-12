@@ -24,6 +24,7 @@ const report = outcome => writeFileSync(out, JSON.stringify({ argv, cwd: process
 process.stdout.write('[t] 读取账户\\n');
 const done = (code, outcome) => { report(outcome); process.stdout.write('\\n结果：' + outcome + '\\n报告已写入 ' + out + '\\n'); process.exit(code); };
 if (!live) {
+  if (value('--step') === 'check') { report('read-only'); process.stdout.write('\\n结果：检查通过\\n'); process.exit(0); }
   if (mode === '14') { process.stderr.write('已中止：没有保存账户\\n'); process.exit(1); }
   report('read-only');
   process.stdout.write('\\n只读检查完成，未发送任何委托。真实追价需加：--live --confirm ' + phrase + '（加 --allow-fill 会另发一笔）\\n');
@@ -40,12 +41,13 @@ async function fixture(t, options = {}) {
   const script = path.join(dataDir, 'fake-probe.mjs');
   await writeFile(script, FAKE);
   const holds = [];
+  const f_probes = [];
   let clock = Date.UTC(2026, 10, 12, 3), maintenance = false, blocked = null, refuse = false;
-  const create = () => createContractProbes({ dataDir, scripts: { bybit: script, aster: script }, now: () => clock, readMaintenance: () => maintenance, liveBlocker: () => blocked, platform: 'linux',
+  const create = () => createContractProbes({ dataDir, scripts: { bybit: script, aster: script, canary: script }, now: () => clock, readMaintenance: () => maintenance, liveBlocker: probe => (f_probes.push(probe), blocked), platform: 'linux',
     admit: () => { if (refuse) throw Object.assign(new Error('maintenance'), { status: 409 }); const hold = { released: false, abandoned: false, release() { hold.released = true; }, abandon() { hold.abandoned = true; } }; holds.push(hold); return hold; }, ...options });
   let probes = create();
   t.after(async () => { await probes.idle(); probes.close(); await rm(dataDir, { recursive: true, force: true }); });
-  return { dataDir, holds, options, get probes() { return probes; }, reopen() { probes.close(); probes = create(); return probes; },
+  return { dataDir, holds, options, blockerCalls: f_probes, get probes() { return probes; }, reopen() { probes.close(); probes = create(); return probes; },
     advance(ms) { clock += ms; }, set maintenance(value) { maintenance = value; }, set blocked(value) { blocked = value; }, set refuse(value) { refuse = value; },
     async readOnly(params = { symbol: 'CLUSDT' }, probe = 'bybit') { probes.start({ probe, params }); await probes.idle(); return probes.state().runs[0]; } };
 }
@@ -281,7 +283,7 @@ test('接口实测的 HTTP 接口需要登录、同源与 CSRF；真实探测脚
   auth = { cookie: login.headers.get('set-cookie').split(';')[0], csrf: login.data.csrfToken };
   const idle = await request(route);
   assert.equal(idle.status, 200); assert.deepEqual(idle.data.runs, []); assert.deepEqual(idle.data.options.bybit.symbols, ['CLUSDT', 'BZUSDT', 'SKHYUSDT', 'SKHYNIXUSDT']);
-  if (process.platform === 'win32') assert.match(idle.data.liveBlocked.bybit, /Linux/); else assert.deepEqual(idle.data.liveBlocked, { bybit: null, aster: null });
+  if (process.platform === 'win32') assert.match(idle.data.liveBlocked.bybit, /Linux/); else assert.deepEqual(idle.data.liveBlocked, { bybit: null, aster: null, canary: null });
   assert.equal((await request(`${route}?x=1`)).status, 400);
   assert.equal((await request(route, { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 403);
   assert.equal((await request(route, { headers: { 'Sec-Fetch-Site': 'same-site', Origin: '' } })).status, 403);
@@ -301,4 +303,35 @@ test('接口实测的 HTTP 接口需要登录、同源与 CSRF；真实探测脚
   const refused = await request(`${route}/runs/${ended.runs[0].id}/live`, { method: 'POST', data: { confirmLive: true, phrase: 'bybit-chase-CLUSDT-1-bps200' } });
   assert.equal(refused.status, 409);
   assert.equal((await request(route)).data.runs.length, 1);
+});
+
+test('原油金丝雀：参数白名单与上限；检查只读完成且不提供真实运行；开仓预览给出短语后按同一参数真实运行，受实盘守卫约束', async t => {
+  const f = await fixture(t);
+  const base = { step: 'open', symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', quantity: '1' };
+  for (const params of [{ ...base, perJob: '200.01' }, { ...base, totalOpen: '500.5' }, { ...base, perJob: '150', totalOpen: '100' }, { ...base, leadOrder: 'chase' },
+    { ...base, symbol: 'SKHYUSDT' }, { ...base, quantity: undefined }, { ...base, timeoutS: 601 }, { ...base, timeoutS: '60' }, { ...base, maxSlippageBps: 201 }, { ...base, step: 'adl' },
+    { ...base, dataDir: '/tmp' }, { ...base, confirm: 'x' }, { ...base, quantity: 1 }])
+    status(() => f.probes.start({ probe: 'canary', params }), 400);
+  assert.deepEqual(f.probes.state().options.canary.symbols, ['CLUSDT', 'BZUSDT']);
+
+  const check = await f.readOnly({ step: 'check', symbol: 'BZUSDT', lead: 'bybit', leadSide: 'short', leadOrder: 'chase' }, 'canary');
+  assert.equal(check.status, 'completed', JSON.stringify(check)); assert.equal(check.phrase, null); assert.equal(check.outcome, '检查通过');
+  assert.deepEqual(check.params, { step: 'check', symbol: 'BZUSDT', lead: 'bybit', leadSide: 'short', leadOrder: 'chase', quantity: '1', perJob: '100', totalOpen: '300', timeoutS: 120, maxSlippageBps: null });
+  status(() => f.probes.live(check.id, { confirmLive: true, phrase: 'fake-BZUSDT' }), 409);
+
+  const preview = await f.readOnly({ ...base, quantity: '2.5', perJob: '150', totalOpen: '400', timeoutS: 90, maxSlippageBps: 40 }, 'canary');
+  assert.equal(preview.status, 'completed'); assert.equal(preview.phrase, 'fake-CLUSDT');
+  const argv = ['--data-dir', f.dataDir, '--step', 'open', '--symbol', 'CLUSDT', '--lead', 'binance', '--lead-side', 'long', '--lead-order', 'market', '--quantity', '2.5',
+    '--per-job', '150', '--total-open', '400', '--timeout-s', '90', '--max-slippage-bps', '40', '--out', path.join(f.dataDir, 'contract-probes', `${preview.id}.json`)];
+  assert.deepEqual(f.probes.report(preview.id).report.argv, argv);
+  f.blocked = '有未结束的实盘执行任务，结束后再做原油金丝雀真实测试';
+  status(() => f.probes.live(preview.id, { confirmLive: true, phrase: preview.phrase }), 409);
+  assert.equal(f.blockerCalls.at(-1), 'canary');
+  f.blocked = null;
+  f.probes.live(preview.id, { confirmLive: true, phrase: preview.phrase });
+  await f.probes.idle();
+  const run = f.probes.state().runs[0];
+  assert.equal(run.mode, 'live'); assert.equal(run.status, 'completed');
+  assert.deepEqual(f.probes.report(run.id).report.argv, [...argv.slice(0, -1), path.join(f.dataDir, 'contract-probes', `${run.id}.json`), '--live', '--confirm', 'fake-CLUSDT']);
+  assert.equal(f.holds.length, 1); assert.ok(f.holds[0].released);
 });

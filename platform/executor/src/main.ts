@@ -4,15 +4,17 @@
 // live canary (3.0c): one Binance and one Bybit account, notional caps, no
 // shared writer registry and no ASTER transfers or ADL.
 import { randomBytes } from 'node:crypto';
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { WAL_SIZE_LIMIT_BYTES, openStore } from './store.ts';
 import { createExecutor, type Executor } from './executor.ts';
-import type { Environment } from './contracts.ts';
+import { DATABASE_FILES, claimDataDirEnvironment } from './data-dir.ts';
 import { createLiveConnectors, holdAccountLocks, loadLiveConfig, loadLiveCredentials, preflightLive } from './live/setup.ts';
 import { SIM_BINDINGS, SIM_TRANSFER_PAIR, createSimulatedVenues } from './simulation.ts';
 import { createExecutorServer } from './http.ts';
+
+export { DATABASE_FILES, claimDataDirEnvironment };
 
 const LEGACY_MARKERS = ['hub.sqlite', 'execution-control.sqlite', 'credentials.key', 'modules'];
 const TICK_MS = 1_000;
@@ -38,37 +40,6 @@ export function assertDedicatedDataDir(dir: string): string {
     if (dirname(current) === current) break;
   }
   return path;
-}
-
-const ENVIRONMENT_MARKER = 'environment';
-/**
- * The live database has its own name, so code that predates the marker (a rollback) opens an empty database in a live
- * directory instead of reconciling real jobs against simulated venues.
- */
-export const DATABASE_FILES: Readonly<Record<Environment, string>> = { simulated: 'executor.sqlite', mainnet: 'executor-live.sqlite' };
-/**
- * Binds the data directory to one environment for good: jobs, accounts and ledgers of simulated venues must never be read
- * as real ones, nor the other way round. A directory used before the marker existed ran simulated venues only.
- */
-export function claimDataDirEnvironment(dir: string, environment: Environment): void {
-  const marker = join(dir, ENVIRONMENT_MARKER);
-  let recorded: string | null = null;
-  try { recorded = readFileSync(marker, 'utf8').trim(); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`数据目录环境标记无法读取：${(error as Error).message}`); }
-  // Without a marker the database file tells: one predating the marker, or a marker lost in a crash before it reached disk.
-  const current = recorded ?? (existsSync(join(dir, DATABASE_FILES.mainnet)) ? 'mainnet' : existsSync(join(dir, DATABASE_FILES.simulated)) ? 'simulated' : null);
-  if (current !== null && current !== environment) throw new Error(`数据目录已用于${current === 'mainnet' ? '实盘' : current === 'simulated' ? '模拟' : `未知环境（${current.slice(0, 32)}）`}，不能以${environment === 'mainnet' ? '实盘' : '模拟'}模式启动；请另用一个数据目录`);
-  if (recorded !== null) return;
-  let fd: number;
-  try { fd = openSync(marker, 'wx', 0o600); }
-  catch (error) {
-    // Another start wrote it first: judge again by what it wrote.
-    if ((error as NodeJS.ErrnoException).code === 'EEXIST') return claimDataDirEnvironment(dir, environment);
-    throw new Error(`数据目录环境标记无法写入：${(error as Error).message}`);
-  }
-  try { writeSync(fd, `${environment}\n`); fsyncSync(fd); } finally { closeSync(fd); }
-  const dirFd = openSync(dir, 'r');
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
 }
 
 /**

@@ -13,6 +13,7 @@ cp "$repository/deploy/build-artifact-cache.py" "$fixture/source/deploy/build-ar
 cp "$repository/scripts/install-hooks.mjs" "$fixture/source/scripts/install-hooks.mjs"
 mkdir -p "$fixture/source/tools/aero-roles"
 cp "$repository"/tools/aero-roles/{addresses.mjs,conditions.mjs,executor.mjs,permissions.mjs,policy.mjs,roles-calls.mjs} "$fixture/source/tools/aero-roles/"
+mkdir -p "$fixture/source/platform/executor" && cp -a "$repository/platform/executor/src" "$repository/platform/executor/package.json" "$fixture/source/platform/executor/"
 printf '{"name":"fixture","version":"1.0.0","type":"module","scripts":{"prepare":"node scripts/install-hooks.mjs"}}\n' > "$fixture/source/package.json"
 printf '{}\n' > "$fixture/source/pnpm-lock.yaml"
 printf 'packages: []\n' > "$fixture/source/pnpm-workspace.yaml"

@@ -166,10 +166,17 @@ class RuntimeDependencyTests(unittest.TestCase):
         for name in module.AERO_ROLES_RUNTIME_FILES:
             shutil.copy2(repository / 'tools/aero-roles' / name, roles / name)
         (roles / 'cli.mjs').write_text('operator CLI must not ship')
+        executor = self.source / 'platform/executor'
+        shutil.copytree(repository / 'platform/executor/src', executor / 'src')
+        shutil.copy2(repository / 'platform/executor/package.json', executor / 'package.json')
+        (executor / 'test').mkdir()
+        (executor / 'test/fake.test.ts').write_text('executor tests must not ship')
 
     def assert_runtime_tools_staged(self, root):
         self.assertEqual({'aero-roles'}, {path.name for path in (root / 'tools').iterdir()})
         self.assertEqual(set(module.AERO_ROLES_RUNTIME_FILES), {path.name for path in (root / 'tools/aero-roles').iterdir()})
+        self.assertEqual({'package.json', 'src'}, {path.name for path in (root / 'platform/executor').iterdir()})
+        self.assertTrue((root / 'platform/executor/src/live/canary.ts').is_file())
 
     def test_full_package_rejects_missing_runtime_tool_file(self):
         from unittest.mock import patch
@@ -187,6 +194,13 @@ class RuntimeDependencyTests(unittest.TestCase):
                 finally:
                     file.write_bytes(content)
                     shutil.rmtree(self.target)
+
+    def test_full_package_rejects_missing_executor_runtime(self):
+        self.prepare_five_modules()
+        self.prepare_runtime_tools()
+        shutil.rmtree(self.source / 'platform/executor/src')
+        with self.assertRaisesRegex(ValueError, 'Missing executor runtime directory: platform/executor/src'):
+            module.stage_runtime(self.source, self.target)
 
     def test_full_package_rejects_linked_runtime_tool_directory(self):
         self.prepare_five_modules()
@@ -265,6 +279,7 @@ class RuntimeDependencyTests(unittest.TestCase):
             self.assertNotEqual(changed, application, relative); self.assertEqual(same, runtime, relative)
             application = changed
         for relative in ('server/app.mjs', 'server/api-helpers.mjs', 'server/runtime/main.mjs', 'modules/greeks/main.py', 'package.json', 'tsconfig.json',
+                         'platform/executor/src/live/canary.ts', 'platform/executor/package.json',
                          *(f'tools/aero-roles/{name}' for name in module.AERO_ROLES_RUNTIME_FILES)):
             changed, other = commit(relative, relative + ' changed')
             self.assertNotEqual(changed, application, relative)
