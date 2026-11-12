@@ -42,19 +42,21 @@ TRANSFER_HISTORY_QUERY_LIMIT = 3
 TRANSFER_HISTORY_WAIT_SECONDS = 120
 # Aster v3 accepts a signed write only while its microsecond nonce is within
 # 60 s of server time; there is no recvWindow (API docs; live enforcement not
-# probed). The nonce is signed just before dispatch and the shared row turns
-# unknown only after the send attempt ended, so 60 s after the row's last
-# update, plus 15 s for clock skew (an NTP-synced host is off by well under a
-# second), the original can no longer execute. The span adds 15 s past that
-# for /income visibility (observed within 0.2 s live, 2026-11-11). An
-# expired unknown transfer is then settled without further evidence: one
-# history read over [created - TOLERANCE, max(created + SPAN, expiry)] only labels it
-# confirmed (one-to-one receipts) or rejected (anything else, including a
-# failed read). The label records evidence and selects the cooldown; balances
-# are re-read either way, and a wrong rejection at worst moves funds between
-# the pair's own sub-accounts.
-TRANSFER_NONCE_EXPIRY_SECONDS = 75
-TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 90
+# probed). The settle delay below is deliberately SHORTER than that window
+# (user decision 2026-11-12: a blocked pair costs more than a rare extra
+# transfer): an unknown transfer settles 10 s after the shared row's last
+# update (the send attempt has ended by then) and at least 20 s after it was
+# created, so the original CAN still execute after settlement. If it does,
+# the balances re-read after settlement show it and the next plan corrects
+# the extra move; funds only ever move between the pair's own sub-accounts.
+# /income was visible within 0.2 s of the receipt live (2026-11-11). One
+# history read over [created - TOLERANCE, max(created + SPAN, expiry)] only
+# labels the write confirmed (one-to-one receipts) or rejected (anything
+# else, including a failed read); the label records evidence and selects the
+# cooldown, balances are re-read either way. The names keep "expiry" because
+# the shared registry and the follow-up records use that term.
+TRANSFER_NONCE_EXPIRY_SECONDS = 10
+TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 20
 TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
 # /income returns at most one page of 1000 rows per window and an active
 # account may fill it with commissions and fills. A full page is split by
@@ -912,7 +914,7 @@ class MarginBalancer:
                     # Keep receipts the deferred read already saw.
                     self.store.put(key, state)
                     self._swept_at.pop(pair["id"], None)
-                    return view("unknown", "上次划转（" + record["request_id"][:8] + "）已过有效期，流水读取等待限流（"
+                    return view("unknown", "上次划转（" + record["request_id"][:8] + "）已到结算时间，流水读取等待限流（"
                         + api_wait_notice(exc)["text"] + "），稍后自动结算；" + SETTLE_WAIT)
                 record["label"] = label = {**({"receipt": list(receipt)} if receipt is not None else {}),
                                            **({"note": note} if note else {}), "basis": basis}
@@ -1008,7 +1010,7 @@ class MarginBalancer:
         # one: balances may have moved, so wait a cooldown and read them again.
         self._invalidate(members)
         outcome = ("已由两侧流水核实到账" if settled == ["confirmed"] and not weak
-                   else "已按两侧同额流水记为到账" if settled == ["confirmed"] else "已过有效期并自动结算")
+                   else "已按两侧同额流水记为到账" if settled == ["confirmed"] else "已到结算时间并自动结算")
         return self._view(state, config, "cooldown", "上次结果未知的划转" + outcome
                           + ("；无原交易编号，仅按金额与时间归属，可能为其他同额划转，延长冷却" if weak else "")
                           + ("；已见一侧流水，可能为迟到到账，延长冷却" if in_flight else "")
