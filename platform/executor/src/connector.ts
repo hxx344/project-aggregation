@@ -19,8 +19,8 @@ export class VenueError extends Error {
 }
 
 export interface ConnectorCapabilities {
-  /** Only simulated transports exist in the phase 1 prototype. */
-  transport: 'simulated';
+  /** live: a real venue (3.0b). The executor still refuses every transport but simulated until live wiring (3.0c). */
+  transport: 'simulated' | 'live';
   /** Orders carry a client order id the venue indexes and returns. */
   clientOrderId: true;
   queryByClientOrderId: true;
