@@ -59,7 +59,18 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
   validateBaselineInterval(intervalMs);
   db.exec('CREATE TABLE IF NOT EXISTS platform_baseline_samples (bucket_ms INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, json TEXT NOT NULL)');
   const insert = db.prepare('INSERT INTO platform_baseline_samples(bucket_ms,schema_version,json) VALUES (?,1,?) ON CONFLICT(bucket_ms) DO UPDATE SET schema_version=excluded.schema_version,json=excluded.json');
-  const prune = db.prepare('DELETE FROM platform_baseline_samples WHERE bucket_ms<? OR bucket_ms IN (SELECT bucket_ms FROM platform_baseline_samples ORDER BY bucket_ms DESC LIMIT -1 OFFSET ?)');
+  // Retention by time is a primary-key range delete. The bucket cap needs the
+  // ordered subquery, which scans every table page, so it runs only when the
+  // compact index count shows more rows than the cap; the sampler's own whole-minute
+  // rows inside the window never exceed it, so this is a defensive branch for rows
+  // written by something else.
+  const pruneOld = db.prepare('DELETE FROM platform_baseline_samples WHERE bucket_ms<?');
+  const stored = db.prepare('SELECT COUNT(*) AS count FROM platform_baseline_samples');
+  const pruneExcess = db.prepare('DELETE FROM platform_baseline_samples WHERE bucket_ms IN (SELECT bucket_ms FROM platform_baseline_samples ORDER BY bucket_ms DESC LIMIT -1 OFFSET ?)');
+  const prune = earliest => {
+    pruneOld.run(earliest);
+    if (stored.get().count > BASELINE_MAX_BUCKETS) pruneExcess.run(BASELINE_MAX_BUCKETS);
+  };
   const counts = ['summaries.eligible', 'summaries.fresh', 'summaries.stale', 'summaries.missing', 'summaries.static', 'summaries.excluded', 'summaries.unhealthy', 'summaryReads.success', 'summaryReads.failed', 'sse.activeConnections', 'sse.slowConsumerDisconnects'];
   const numeric = field => `json_type(json,'$.${field}') IN ('integer','real') AND json_extract(json,'$.${field}') BETWEEN 0 AND 9007199254740991`;
   // CASE guards every JSON extraction, including malformed rows outside the recent read window.
@@ -121,7 +132,7 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
         if (newest.get().last > bucket) { lastError = { code: 'clock_regressed', at: new Date(at).toISOString() }; return null; }
         const json = JSON.stringify(value);
         if (Buffer.byteLength(json) > 16 * 1024) throw new Error('Baseline sample exceeds limit');
-        immediate(db, () => { insert.run(bucket, json); prune.run(bucket - BASELINE_RETENTION_MS + BASELINE_INTERVAL_MS, BASELINE_MAX_BUCKETS); });
+        immediate(db, () => { insert.run(bucket, json); prune(bucket - BASELINE_RETENTION_MS + BASELINE_INTERVAL_MS); });
         lastError = null;
         logger.info?.({ type: 'architecture_baseline', ...value }, '架构基线采样');
         return value;
