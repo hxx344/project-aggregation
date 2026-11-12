@@ -35,6 +35,13 @@ function world() {
   return { dir, binance, bybit, clock, sync, connectors, deps, lines, writes, setStop: (value: boolean) => { stop = value; }, onWait: (fn: () => void) => { onWait = fn; },
     cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
+/** The workbench now uses another Binance account. */
+function moved(w: ReturnType<typeof world>): CanaryDeps {
+  const accounts = [{ ...ACCOUNTS[0], accountId: '777000111' }, ACCOUNTS[1]];
+  const connectors = createLiveConnectors({ accounts }, new Map(Object.entries(KEYS)) as never,
+    { fetchImpl: (url, init) => (new URL(url).hostname.endsWith('bybit.com') ? w.bybit : w.binance).fetch(url, init), now: () => w.clock.now });
+  return { ...w.deps, accounts, connectors };
+}
 async function run(w: ReturnType<typeof world>, p: CanaryParams) {
   const prepared = await prepareCanary(p, w.deps);
   try { return { prepared, outcome: prepared.phrase ? await prepared.execute() : null }; } finally { prepared.close(); }
@@ -185,15 +192,11 @@ test('金丝雀换账户与手工平仓：自有持仓只算当前绑定账户�
     await assert.rejects(prepareCanary(params({ step: 'close' }), w.deps), /Binance 账户持仓 0 不足以按金丝雀记录 1 平 1/);
     w.binance.net.set('CLUSDT', 1);
     // The workbench now uses another Binance account: the canary's long there is no longer its to close.
-    const accounts = [{ ...ACCOUNTS[0], accountId: '777000111' }, ACCOUNTS[1]];
-    const connectors = createLiveConnectors({ accounts }, new Map(Object.entries(KEYS)) as never,
-      { fetchImpl: (url, init) => (new URL(url).hostname.endsWith('bybit.com') ? w.bybit : w.binance).fetch(url, init), now: () => w.clock.now });
-    const moved = { ...w.deps, accounts, connectors };
-    const check = await prepareCanary(params({ step: 'check' }), moved);
+    const check = await prepareCanary(params({ step: 'check' }), moved(w));
     check.close();
     assert.match(check.summary, /有 1 个 CLUSDT 金丝雀任务做在此前绑定的执行账户上/);
     assert.deepEqual((check.findings as { canaryNet: unknown }).canaryNet, { binance: '0', bybit: '-1' });
-    await assert.rejects(prepareCanary(params({ step: 'close' }), moved), /金丝雀在 Binance 没有可平的 CLUSDT 仓位/);
+    await assert.rejects(prepareCanary(params({ step: 'close' }), moved(w)), /金丝雀在 Binance 没有可平的 CLUSDT 仓位/);
     assert.ok(w.lines.every(line => !line.includes('777000111')));
   } finally { w.cleanup(); }
 });
@@ -213,14 +216,19 @@ test('金丝雀收尾：Bybit 追价首腿创建无回应停在待人工确认�
     await unanswered();
     const early = await run(w, params({ step: 'settle' }));
     assert.equal(early.outcome?.settled, false);
-    assert.match(early.outcome!.summary, /仍可能送达交易所.*认领/);
+    assert.match(early.outcome!.summary, /仍可能送达交易所/);
+    assert.doesNotMatch(early.outcome!.summary, /可在 Bybit 查到策略编号/, '观察窗内只需等待，不提示强制释放');
     w.clock.now += 125_000; w.sync();
     const late = await run(w, params({ step: 'settle' }));
     assert.equal(late.outcome?.settled, true, late.outcome?.summary);
     assert.equal((await preview(w, params({ step: 'settle' }))).phrase, null);
 
     await unanswered();
-    await assert.rejects(prepareCanary(params({ step: 'settle', strategy: 'adopt', strategyId: 'x1' }), w.deps).then(p => p.close()).then(() => { throw new Error('ok'); }), /^Error: ok$/);
+    // The old Binance binding holds the unacknowledged job, so the canary cannot move to another account yet.
+    await assert.rejects(prepareCanary(params({ step: 'check' }), moved(w)), /请先在交易中心换回原账户/);
+    const unknownId = await run(w, params({ step: 'settle', strategy: 'adopt', strategyId: 'x1' }));
+    assert.deepEqual([unknownId.outcome?.sent, unknownId.outcome?.settled], [true, false], '认领可能撤策略，按已发送报告');
+    assert.match(unknownId.outcome!.summary, /查无该策略编号/);
     const released = await run(w, params({ step: 'settle', strategy: 'release' }));
     assert.equal(released.outcome?.settled, false);
     assert.match(released.outcome!.summary, /已强制释放追价策略，到交易所处理后再做一次收尾/);

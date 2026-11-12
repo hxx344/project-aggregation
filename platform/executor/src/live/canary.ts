@@ -6,7 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { add, cmp, sub } from '../decimal.ts';
-import { OIL_SYMBOLS, accountKey, type AccountBinding, type NotionalLimits } from '../contracts.ts';
+import { ContractError, OIL_SYMBOLS, accountKey, type AccountBinding, type NotionalLimits } from '../contracts.ts';
 import { STRATEGY_ID, type VenueConnector } from '../connector.ts';
 import { DATABASE_FILES, claimDataDirEnvironment } from '../data-dir.ts';
 import { createExecutor, type Executor } from '../executor.ts';
@@ -166,7 +166,14 @@ export async function prepareCanary(params: CanaryParams, deps: CanaryDeps): Pro
     // seen by drive, which checks it before every pass.
     heartbeat = setInterval(() => { try { ex.acquire(); } catch { /* drive reports it */ } }, Math.floor(ex.budgets.leaseTtlMs / 3));
     heartbeat.unref();
-    for (const account of accounts) ex.registerAccount(account);
+    for (const account of accounts) {
+      try { ex.registerAccount(account); }
+      catch (error) {
+        // The workbench switched accounts while a canary job still holds the old one: only the old binding can settle it.
+        if (error instanceof ContractError && error.code === 'account_busy') throw new CanaryRefusal(`此前绑定的 ${VENUE_NAMES[account.venue as CanaryVenue]} 执行账户上还有未收尾的金丝雀任务：请先在交易中心换回原账户，做完收尾再换`);
+        throw error;
+      }
+    }
     const plan = await planStep(ex, store, params, accounts, deps, now);
     return { ...plan, close };
   } catch (error) { close(); throw error; }
@@ -190,7 +197,7 @@ async function planStep(ex: Executor, store: Store, params: CanaryParams, accoun
   const keysOf = (jobId: string): string[] => keys.get(jobId) ?? (keys.set(jobId, legAccounts(store, jobId)), keys.get(jobId)!);
   const netOf = (list: readonly JobView[]) => ownNet(list, params.symbol, keysOf, current);
   const net = netOf(jobs);
-  // Rebinding is refused while a job holds the account, so these are final jobs on an account the workbench no longer uses.
+  // Rebinding is refused while a job holds the account (unfinished, or attention not yet acknowledged), so these jobs hold no lock.
   const foreign = jobs.filter(job => job.legs.some(leg => leg.symbol === params.symbol) && keysOf(job.id).some(key => !current.has(key)));
   const foreignNote = foreign.length ? `有 ${foreign.length} 个 ${params.symbol} 金丝雀任务做在此前绑定的执行账户上（执行账户已更换），自有持仓只统计当前账户，旧账户上的仓位请到交易所核对` : null;
   const unfinished = jobs.filter(job => !FINAL.has(job.status));
@@ -223,35 +230,42 @@ async function planStep(ex: Executor, store: Store, params: CanaryParams, accoun
     if (params.strategy !== 'auto' && orphans.length !== 1) throw new CanaryRefusal(`认领或强制释放须恰好有一个追价策略创建结果未知的任务，现有 ${orphans.length} 个`);
     for (const job of [...unfinished, ...attention]) deps.log(`待收尾：${jobLine(job)}${job.strategyPending ? '（追价策略创建结果未知）' : ''}`);
     const ids = [...unfinished, ...attention].map(job => job.id);
-    const phrase = `oil-canary-settle-${pending}-${digest({ ids, fingerprint, strategy: params.strategy, strategyId: params.strategyId })}`;
+    // The phrase changes when a job's state does, e.g. one that was running at the preview and waits on an unknown chase now.
+    const states = [...unfinished, ...attention].map(job => [job.id, job.status, job.strategyPending]);
+    const phrase = `oil-canary-settle-${pending}-${digest({ states, fingerprint, strategy: params.strategy, strategyId: params.strategyId })}`;
+    // An adopted strategy the executor could not stop keeps trading after the job is acknowledged.
+    const running = attention.filter(job => job.legs.some(leg => leg.operation?.adoptedAt && leg.operation.strategyStatus !== 'terminal'));
     const recovery = !orphans.length ? '' : params.strategy === 'adopt' ? `；追价策略按编号 ${params.strategyId} 认领（停掉仍在运行的部分），认领后的敞口处理完再做一次收尾确认`
       : params.strategy === 'release' ? '；追价策略强制释放（策略可能已成交，由人工在交易所处理），处理完再做一次收尾确认'
         : `；其中 ${orphans.length} 个追价策略创建结果未知，先自动核对未创建（创建请求已不可能送达、交易所无同时段策略、持仓与挂单与已知成交一致才通过）`;
-    const summary = `可收尾：${unfinished.length} 个未结束任务继续核对到终态（首腿不再新发、撤其挂单，首腿已成交部分补发对冲腿），${attention.length} 个待人工确认任务将标记为已确认（请先到交易所处理剩余敞口）${recovery}`;
+    const stillRunning = running.length ? `；注意：${running.length} 个任务认领的追价策略最后记录仍未结束，确认前须已在 Bybit 停掉` : '';
+    const summary = `可收尾：${unfinished.length} 个未结束任务继续核对到终态（首腿不再新发、撤其挂单，首腿已成交部分补发对冲腿），${attention.length} 个待人工确认任务将标记为已确认（请先到交易所处理剩余敞口）${recovery}${stillRunning}`;
     return { phrase, summary, findings: base, execute: async () => {
       const deadline = Math.max(now(), ...unfinished.map(job => job.deadlineAt)) + SETTLE_GRACE_MS;
       let driven: JobView[] = [];
       try { driven = unfinished.length ? await drive(ex, unfinished.map(job => job.id), deps, deadline, now) : []; }
       catch (error) { return { sent: unfinished.length > 0, settled: false, summary: `收尾中断，请到交易所核对：${describe(error)}`, findings: base }; }
       const errors: string[] = [], notes: string[] = [];
+      let adopting = false;
       for (const job of attention) {
         try {
           if (job.strategyPending) {
             const request = { jobId: job.id, requestId: randomUUID() };
             // A claimed or released strategy may have traded: its exposure is seen and handled before the next settle acknowledges it.
-            if (params.strategy === 'adopt') { await ex.adoptStrategy({ ...request, strategyId: params.strategyId }, SESSION); notes.push('已认领追价策略，处理其敞口后再做一次收尾'); continue; }
+            // Adoption stops a strategy still running, which is a write to the venue even when it then fails.
+            if (params.strategy === 'adopt') { adopting = true; await ex.adoptStrategy({ ...request, strategyId: params.strategyId }, SESSION); notes.push('已认领追价策略，处理其敞口后再做一次收尾'); continue; }
             if (params.strategy === 'release') { ex.releaseStrategy({ ...request, acknowledgeRisk: true }, SESSION); notes.push('已强制释放追价策略，到交易所处理后再做一次收尾'); continue; }
             await ex.confirmNotCreated(request, SESSION);
           }
           ex.acknowledge(job.id, randomUUID(), SESSION);
         } catch (error) {
-          errors.push(`任务 ${job.id.slice(0, 8)} 确认失败：${describe(error)}${job.strategyPending && params.strategy === 'auto' ? '（可在 Bybit 查到策略编号后用收尾认领，或确认风险后强制释放）' : ''}`);
+          errors.push(`任务 ${job.id.slice(0, 8)} 确认失败：${describe(error)}${job.strategyPending && params.strategy === 'auto' && !(error instanceof ContractError && error.code === 'create_window') ? '（可在 Bybit 查到策略编号后用收尾认领，或确认风险后强制释放）' : ''}`);
         }
       }
       const after = ids.map(id => ex.jobView(id));
       const left = after.filter(job => !FINAL.has(job.status) || (job.status === 'attention' && job.acknowledgedAt === null));
       const lines = [...after.map(jobLine), ...notes, ...errors];
-      return { sent: driven.length > 0, settled: left.length === 0 && errors.length === 0,
+      return { sent: driven.length > 0 || adopting, settled: left.length === 0 && errors.length === 0,
         summary: left.length || errors.length ? `收尾未完成：${lines.join('；')}` : `收尾完成：${lines.join('；')}`, findings: { ...base, after: after.map(jobFinding), errors } };
     } };
   }

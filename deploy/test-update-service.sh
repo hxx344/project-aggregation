@@ -223,7 +223,7 @@ printf '<html>verified cached build</html>\n' > "$source_dir/dist/index.html"
 git -C "$source_dir" init -q -b main
 git -C "$source_dir" config user.name fixture
 git -C "$source_dir" config user.email fixture@example.invalid
-git -C "$source_dir" add server package.json deploy tools
+git -C "$source_dir" add server package.json deploy tools platform
 git -C "$source_dir" commit -qm source-permission-fixture
 git clone -q --bare "$source_dir" "$APP_DIR/repository.git"
 git --git-dir="$APP_DIR/repository.git" config tar.umask 0002
