@@ -423,7 +423,7 @@ stateDiagram-v2
 ```
 
 - `acknowledged`/`unknown` 到 `skipped` 的转移按结算结果集合推定。
-- 未知不重发：nonce 有效期 120 s，历史等待 120 s，未知跨度 180 s，时钟容差 60 s（`modules/aster/trading/margin_balance.py:40-118`）。
+- 未知不重发：nonce 有效期 75 s（2026-11-12 前为 120 s），历史等待 120 s，未知跨度 90 s（原 180 s），流水读取起点容差 60 s（`modules/aster/trading/margin_balance.py:40-118`）。
 - 共享写者操作 ID 前缀 `aster:transfer:`；ASTER 未知写入 120 s 后才视为过期（`server/execution/account-writer.mjs:11,175-177`）。
 - 跳过的划转归档到 `pair_margin_skipped:<pair>:<request>`。
 
@@ -616,7 +616,7 @@ stateDiagram-v2
 | ASTER BBO / 标记价 / 账户快照 | 3 s / 3 s / 8 s | `modules/aster/trading/models.py:168,202,305` | 开仓证据年龄 |
 | ASTER 快速额度采样 | 0.2 s | `modules/aster/trading/engine.py:42`（方案登记） | 额度监控（新平台不再用于触发开仓） |
 | ASTER HTTP 超时；ADL 下单与查询 | 8 s（连接 4 s）；3 s | `modules/aster/trading/exchange.py:415`；`modules/aster/trading/adl.py:781` | HTTP 客户端参数，不是端到端截止 |
-| ASTER 划转 nonce / 历史等待 / 未知跨度 / 时钟容差 / 结算冷却 | 120 / 120 / 180 / 60 / 30 s | `modules/aster/trading/margin_balance.py:40-118` | 划转未知窗 |
+| ASTER 划转 nonce / 历史等待 / 未知跨度 / 时钟容差 / 结算冷却 | 75 / 120 / 90 / 60 / 30 s（2026-11-12 前 nonce 120、跨度 180） | `modules/aster/trading/margin_balance.py:40-118` | 划转未知窗 |
 | ASTER ADL 扫描 / 最长 / 恢复查询 / 观察 / 撤单 | 60 s / 1800 s / 3 次 / 120 s / 10 s | `modules/aster/trading/adl.py:28-37`；`modules/aster/trading/adl_recovery.py:11-14` | ADL |
 | ASTER 单账户恢复观察 / 最少检查 / 杠杆冷却 | 120 s / 3 / 300 s | `modules/aster/trading/recovery.py:12-14` | 意图恢复 |
 | Greeks `PLAN_TTL_SECONDS` / `RFQ_CREATION_CHECK_SECONDS` | 30 s / 120 s | `modules/greeks/app/trade_tasks.py:16`；`modules/greeks/app/rfq.py:17` | 计划有效期 / RFQ 未创建判定 |
@@ -646,7 +646,7 @@ stateDiagram-v2
 | SQLite `busy_timeout` / `synchronous` | 5000 ms / FULL | `platform/executor/src/store.ts:57,64` | 与 hub.sqlite 的 5000 ms 相同 |
 | WAL 截断阈值 / 单次锁等待 / 放弃后重试 / 告警上限 | 16 MiB / 250 ms / 1 s 起逐次加倍，最长 60 s / 64 MiB | `platform/executor/src/store.ts`（`maintainWal`）；入口每 1 s 检查一次（`main.ts`） | Hub 无对应机制；perpetual 库只设 `journal_size_limit` 4 MiB |
 | 写锁等待分桶 / 样本上限 | [1,10,100,1000,5000] ms / 20000 | `platform/executor/src/store.ts:41-42` | 分桶同 `server/sqlite-writes.mjs`，另保留样本用于分位数 |
-| 划转 `transferHistorySpanMs` / 模拟 ASTER `requestValidityMs` | 180 s / 120 s | `platform/executor/src/executor.ts`；`platform/executor/src/sim-aster.ts` | 同 `TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS` / `TRANSFER_NONCE_EXPIRY_SECONDS`；到期取 max(调用超时 + 有效期, 历史跨度) |
+| 划转 `transferHistorySpanMs` / 模拟 ASTER `requestValidityMs` | 180 s / 120 s | `platform/executor/src/executor.ts`；`platform/executor/src/sim-aster.ts` | 原同旧实现 `TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS` / `TRANSFER_NONCE_EXPIRY_SECONDS`，旧实现 2026-11-12 起改为 90 s / 75 s，这里未改；到期取 max(调用超时 + 有效期, 历史跨度) |
 | 划转 `transferClockToleranceMs` / `transferLabelDeferMs` | 60 s / 300 s | `platform/executor/src/executor.ts` | 同 `TRANSFER_CLOCK_TOLERANCE_SECONDS` / `TRANSFER_LABEL_DEFER_SECONDS` |
 | 划转 `transferSettleCooldownMs` / `transferUncertainCooldownMs` / `transferRetryMs` | 30 s / 300 s / 5 s | `platform/executor/src/executor.ts` | 同 `TRANSFER_SETTLE_COOLDOWN_SECONDS` / `TRANSFER_PARTIAL_SETTLE_COOLDOWN_SECONDS`；只读重试间隔为新增 |
 | 划转 `transferReadTimeoutMs` / `transferBaselineTimeoutMs` / `transferBalanceMaxAgeMs` | 8 s / 1.5 s / 8 s | `platform/executor/src/executor.ts` | 读取超时为新增（发送仍用 `callTimeoutMs`）；后两项同 `TRANSFER_SNAPSHOT_TIMEOUT_SECONDS` / `ACCOUNT_SNAPSHOT_MAX_AGE_SECONDS`（`modules/aster/trading/margin_balance.py:106,110`） |

@@ -540,9 +540,11 @@ class ManagedMarginTransferTests(unittest.TestCase):
                          ("rejected", "rejected", "unknown"))
         # The archive of a swept write records that no read was made.
         self.assertEqual(self.settlement(operation_id)["basis"], "nonce_expired_no_follow_up")
-        # The remaining unknown non-transfer write has expired as well, so it
-        # no longer blocks the next transfer (ordinary orders stay blocked).
-        self.due()
+        # The remaining unknown non-transfer write is only released by the
+        # shared registry's own (longer) expiry; once past it, it no longer
+        # blocks the next transfer (ordinary orders stay blocked).
+        shared_expiry = inspect.getmodule(type(self.writer.registry)).ASTER_WRITE_EXPIRY_MS / 1000
+        self.due(shared_expiry - margin_balance.TRANSFER_NONCE_EXPIRY_SECONDS)
         result = self.balancer.tick(self.pair, self.snapshots())
         self.assertEqual((result["status"], len(self.posts())), ("acknowledged", 2), result)
 
@@ -1146,7 +1148,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         pending = state["pending"]
         operation_id = "aster:transfer:" + pending["request_id"]
         pending["status"] = "accepted"
-        pending["created_at"] -= self.SPAN + 1
+        pending["created_at"] -= margin_balance.TRANSFER_HISTORY_WAIT_SECONDS + 1
         pending["history_recovery"] = {"first_observed_at": pending["created_at"], "query_rounds": 2}
         row = {"asset": "USD1", "incomeType": "TRANSFER", "tranId": "legacy-debit",
                "time": int(pending["created_at"] * 1000) + 5000, "income": "-1000.00000000"}

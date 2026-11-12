@@ -44,15 +44,17 @@ TRANSFER_HISTORY_WAIT_SECONDS = 120
 # 60 s of server time; there is no recvWindow (API docs; live enforcement not
 # probed). The nonce is signed just before dispatch and the shared row turns
 # unknown only after the send attempt ended, so 60 s after the row's last
-# update, plus 60 s for clock skew, the original can no longer execute. An
+# update, plus 15 s for clock skew (an NTP-synced host is off by well under a
+# second), the original can no longer execute. The span adds 15 s past that
+# for /income visibility (observed within 0.2 s live, 2026-11-11). An
 # expired unknown transfer is then settled without further evidence: one
-# history read over [created - TOLERANCE, created + SPAN] only labels it
+# history read over [created - TOLERANCE, max(created + SPAN, expiry)] only labels it
 # confirmed (one-to-one receipts) or rejected (anything else, including a
 # failed read). The label records evidence and selects the cooldown; balances
 # are re-read either way, and a wrong rejection at worst moves funds between
 # the pair's own sub-accounts.
-TRANSFER_NONCE_EXPIRY_SECONDS = 120
-TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 180
+TRANSFER_NONCE_EXPIRY_SECONDS = 75
+TRANSFER_UNKNOWN_HISTORY_SPAN_SECONDS = 90
 TRANSFER_CLOCK_TOLERANCE_SECONDS = 60
 # /income returns at most one page of 1000 rows per window and an active
 # account may fill it with commissions and fills. A full page is split by
