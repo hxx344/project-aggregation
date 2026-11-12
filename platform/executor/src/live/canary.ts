@@ -218,6 +218,25 @@ async function planStep(ex: Executor, store: Store, params: CanaryParams, accoun
   deps.log(`金丝雀记录的自有持仓：${netText}；累计开仓已用 ${limits.openUsed} / ${limits.totalOpen} USDT，单笔上限 ${limits.perJob} USDT`);
   if (foreignNote) deps.log(foreignNote);
   const refuseNew = (): void => { if (pending) throw new CanaryRefusal(`有 ${pending} 个未结束或待人工确认的金丝雀任务，请先做「收尾」`); };
+  /**
+   * What the venues hold once this step's jobs stopped moving: one read per account (ACCOUNT_READ_MS each), never retried.
+   * It is evidence for the report only: a failed read or a position off the expected one is said in the summary and leaves
+   * sent and settled as the jobs decided them, because a venue may publish a fill's position a moment after the fill.
+   */
+  const readBack = async (expected: Record<CanaryVenue, string> | null) => {
+    try {
+      const after = await readAccounts(params, accounts, deps);
+      const off = expected ? after.filter(venue => cmp(venue.position, expected[venue.venue]) !== 0) : [];
+      const line = `执行后账户回读：${after.map(venue => `${VENUE_NAMES[venue.venue]} ${params.symbol} 持仓 ${venue.position}、挂单 ${venue.openOrders} 笔`).join('；')}`
+        + (off.length ? `；${off.map(venue => `${VENUE_NAMES[venue.venue]} 持仓 ${venue.position} 与按本次成交推算的 ${expected![venue.venue]} 不一致`).join('，')}（交易所持仓可能尚未更新，或该合约有其他来源的成交），请再做一次「启动检查与核对」` : '');
+      deps.log(line);
+      return { line, findings: { accountsAfter: after, accountsAfterMismatch: off.map(venue => venue.venue) } };
+    } catch (error) {
+      const line = `执行后账户回读失败（${describe(error)}），请做一次「启动检查与核对」`;
+      deps.log(line);
+      return { line, findings: { accountsAfter: null, accountsAfterMismatch: [] } };
+    }
+  };
 
   if (params.step === 'check') {
     const problems = [
@@ -270,9 +289,11 @@ async function planStep(ex: Executor, store: Store, params: CanaryParams, accoun
       }
       const after = ids.map(id => ex.jobView(id));
       const left = after.filter(job => !FINAL.has(job.status) || (job.status === 'attention' && job.acknowledgedAt === null));
-      const lines = [...after.map(jobLine), ...notes, ...errors];
+      // Jobs of the other contract are not covered: the step reads the contract it was started for.
+      const read = driven.length > 0 || adopting ? await readBack(null) : null;
+      const lines = [...after.map(jobLine), ...notes, ...errors, ...(read ? [read.line] : [])];
       return { sent: driven.length > 0 || adopting, settled: left.length === 0 && errors.length === 0,
-        summary: left.length || errors.length ? `收尾未完成：${lines.join('；')}` : `收尾完成：${lines.join('；')}`, findings: { ...base, after: after.map(jobFinding), errors } };
+        summary: left.length || errors.length ? `收尾未完成：${lines.join('；')}` : `收尾完成：${lines.join('；')}`, findings: { ...base, after: after.map(jobFinding), errors, ...read?.findings } };
     } };
   }
 
@@ -324,9 +345,12 @@ async function planStep(ex: Executor, store: Store, params: CanaryParams, accoun
         const after = netOf(ex.recentJobs(RECENT_JOBS));
         const used = ex.notionalLimits()!;
         const done = view.status === 'completed';
+        // Each account should have moved by what this job filled there, whatever else it held before.
+        const expected = Object.fromEntries(venues.map(venue => [venue.venue, add(venue.position, sub(after[venue.venue], net[venue.venue]))])) as Record<CanaryVenue, string>;
+        const read = await readBack(expected);
         return { sent: true, settled: done,
-          summary: `${done ? `${action}完成` : `${action}未正常完成，请到交易所核对`}：${jobLine(view)}；金丝雀自有持仓 ${CANARY_VENUES.map(venue => `${VENUE_NAMES[venue]} ${after[venue]}`).join('、')}；累计开仓已用 ${used.openUsed} / ${used.totalOpen} USDT`,
-          findings: { ...base, preview: ex.publicPreview(fresh), job: jobFinding(view), canaryNetAfter: after, openUsedAfter: used.openUsed } };
+          summary: `${done ? `${action}完成` : `${action}未正常完成，请到交易所核对`}：${jobLine(view)}；金丝雀自有持仓 ${CANARY_VENUES.map(venue => `${VENUE_NAMES[venue]} ${after[venue]}`).join('、')}；累计开仓已用 ${used.openUsed} / ${used.totalOpen} USDT；${read.line}`,
+          findings: { ...base, preview: ex.publicPreview(fresh), job: jobFinding(view), canaryNetAfter: after, openUsedAfter: used.openUsed, ...read.findings } };
       } catch (error) { return { sent: true, settled: false, summary: `${action}执行中断，请到交易所核对：${describe(error)}`, findings: { ...base, jobId: job.id } }; }
     },
   };

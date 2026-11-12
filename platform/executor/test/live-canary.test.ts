@@ -109,6 +109,9 @@ test('金丝雀开仓与平仓：预览不发单并给出确认短语；实盘�
     assert.deepEqual([w.binance.net.get('CLUSDT'), w.bybit.net.get('CLUSDT')], [1, -1]);
     const used = (opened.outcome!.findings as { openUsedAfter: string }).openUsedAfter;
     assert.ok(Number(used) > 0 && Number(used) <= 150, used);
+    assert.match(opened.outcome!.summary, /执行后账户回读：Binance CLUSDT 持仓 1、挂单 0 笔；Bybit CLUSDT 持仓 -1、挂单 0 笔$/);
+    assert.ok(opened.prepared.findings.preview && (opened.prepared.findings.preview as { notes: string[] }).notes.some(note => note.startsWith('实盘传输')), '实盘预览不说模拟传输');
+    assert.ok(w.lines.every(line => !line.includes('模拟传输')), w.lines.join('\n'));
 
     // The account also holds 3 more of the old system's long on Binance: the canary closes only its own 1.
     w.binance.net.set('CLUSDT', 4);
@@ -121,9 +124,42 @@ test('金丝雀开仓与平仓：预览不发单并给出确认短语；实盘�
     assert.equal(closed.outcome?.settled, true, closed.outcome?.summary);
     assert.deepEqual([w.binance.net.get('CLUSDT'), w.bybit.net.get('CLUSDT')], [3, 0]);
     assert.match(closed.outcome!.summary, /金丝雀自有持仓 Binance 0、Bybit 0/);
+    // Read after the close, not the 4 / -1 the step started from; the old system's 3 are expected to stay.
+    const after = closed.outcome!.findings as { accountsAfter: { venue: string; position: string }[]; accountsAfterMismatch: string[] };
+    assert.deepEqual(after.accountsAfter.map(venue => [venue.venue, venue.position]), [['binance', '3'], ['bybit', '0']]);
+    assert.deepEqual(after.accountsAfterMismatch, []);
+    assert.ok(w.lines.every(line => !line.includes(ACCOUNTS[0].accountId) && !line.includes(ACCOUNTS[1].accountId)));
     await assert.rejects(prepareCanary(params({ step: 'close' }), w.deps), /没有可平的 CLUSDT 仓位/);
     const check = await preview(w, params({ step: 'check' }));
     assert.match(check.summary, /Binance 账户持仓 3 与金丝雀记录 0 不一致/);
+  } finally { w.cleanup(); }
+});
+
+test('金丝雀执行后回读：账户持仓与本次成交不符时写进结果，回读失败只报告；两者都不改变任务结论', async () => {
+  const w = world();
+  try {
+    // Another writer buys 2 more on Binance while the canary's own order fills.
+    const set = w.binance.net.set.bind(w.binance.net);
+    w.binance.net.set = (symbol, size) => set(symbol, size + 2);
+    const opened = await run(w, params());
+    w.binance.net.set = set;
+    assert.deepEqual([opened.outcome?.sent, opened.outcome?.settled], [true, true], opened.outcome?.summary);
+    assert.match(opened.outcome!.summary, /Binance 持仓 3 与按本次成交推算的 1 不一致.*请再做一次「启动检查与核对」$/);
+    assert.deepEqual((opened.outcome!.findings as { accountsAfterMismatch: string[] }).accountsAfterMismatch, ['binance']);
+
+    // Every Binance account read fails once the hedge has filled.
+    let down = false;
+    const move = w.bybit.move.bind(w.bybit);
+    w.bybit.move = (symbol, side, quantity) => { move(symbol, side, quantity); down = true; };
+    const connectors = w.deps.connectors.map(connector => connector.venue !== 'binance' ? connector
+      : Object.assign(Object.create(connector) as typeof connector, { account: (async (...args) => { if (down) throw new Error('read timed out'); return connector.account(...args); }) as typeof connector.account }));
+    const closing = await prepareCanary(params({ step: 'close' }), { ...w.deps, connectors });
+    try {
+      const closed = await closing.execute();
+      assert.deepEqual([closed.sent, closed.settled], [true, true], closed.summary);
+      assert.match(closed.summary, /^平仓完成.*执行后账户回读失败（.*read timed out.*），请做一次「启动检查与核对」$/);
+      assert.equal((closed.findings as { accountsAfter: unknown }).accountsAfter, null);
+    } finally { closing.close(); }
   } finally { w.cleanup(); }
 });
 
@@ -174,7 +210,7 @@ test('金丝雀收尾：上一进程留下未结束任务时开平仓拒绝；�
       assert.match(settle.phrase!, /^oil-canary-settle-1-[0-9a-f]{10}$/);
       const outcome = await settle.execute();
       assert.equal(outcome.settled, true, outcome.summary);
-      assert.match(outcome.summary, /^收尾完成/);
+      assert.match(outcome.summary, /^收尾完成.*执行后账户回读：Binance CLUSDT 持仓 1、挂单 0 笔；Bybit CLUSDT 持仓 -1、挂单 0 笔$/);
     } finally { settle.close(); }
     assert.equal(w.binance.count('POST /fapi/v1/order'), leadSent, '接管后首腿不再新发');
     assert.equal(w.bybit.count('POST /v5/order/create'), 1, '首腿已成交部分补发对冲腿');
