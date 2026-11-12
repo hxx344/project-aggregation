@@ -33,6 +33,7 @@ import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
 import { createEventLoopLag } from './event-loop-lag.mjs';
+import { createStallProfiler } from './stall-profiler.mjs';
 import { createRuntimeFeed } from '../agent-feed/runtime-feed.mjs';
 import { collectSections } from '../automation/feishu-digest-sources.mjs';
 import { createModuleUpdateGuard } from '../modules/updates.mjs';
@@ -606,11 +607,13 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const heartbeat = setInterval(publish, 15000); heartbeat.unref();
   const first = refreshInterval > 0 ? setTimeout(() => { if (!closed) void refresh(); }, 100) : null; first?.unref();
   // All collectors, WS feeds and research share this process's single thread.
-  const eventLoop = createEventLoopLag(); eventLoop.start();
+  // A long stall arms CPU sampling so the next one is logged with the code behind it.
+  const stallProfiler = createStallProfiler({ log });
+  const eventLoop = createEventLoopLag({ onStall: lag => stallProfiler.stall(lag) }); eventLoop.start();
   // The agent feed's datasets from this process's memory (docs/agent-feed.md): no request is started for it.
   const agentFeed = createRuntimeFeed({ readOverview: overview, readEventLoop: () => eventLoop.read(), readAero: () => aeroMarket.state(), log });
 
-  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); executionAuto.stop(); anthropicReduction.stop(); anthropicHistory.stop(); }
+  function stop() { closed = true; clearInterval(interval); clearInterval(heartbeat); clearTimeout(first); eventLoop.stop(); stallProfiler.stop(); executionAuto.stop(); anthropicReduction.stop(); anthropicHistory.stop(); }
   return {
     trading, execution, assetSync, check, refresh, overview, projectChanged, coordinateAssetSync, handle, agentFeed,
     get baseline() { return baseline; },
