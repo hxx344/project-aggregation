@@ -169,8 +169,14 @@ export async function prepareCanary(params: CanaryParams, deps: CanaryDeps): Pro
     for (const account of accounts) {
       try { ex.registerAccount(account); }
       catch (error) {
-        // The workbench switched accounts while a canary job still holds the old one: only the old binding can settle it.
-        if (error instanceof ContractError && error.code === 'account_busy') throw new CanaryRefusal(`此前绑定的 ${VENUE_NAMES[account.venue as CanaryVenue]} 执行账户上还有未收尾的金丝雀任务：请先在交易中心换回原账户，做完收尾再换`);
+        // A canary job still holds the binding: only the old binding can settle it, and the executor takes no new one meanwhile.
+        if (error instanceof ContractError && error.code === 'account_busy') {
+          const bound = store.db.prepare('SELECT account_id FROM accounts WHERE venue = ? AND environment = ?').get(account.venue, 'mainnet') as { account_id: string } | undefined;
+          const name = VENUE_NAMES[account.venue as CanaryVenue];
+          throw new CanaryRefusal(bound && bound.account_id !== account.accountId
+            ? `此前绑定的 ${name} 执行账户上还有未收尾的金丝雀任务：请先在交易中心换回原账户，做完收尾再换`
+            : `${name} 执行账户的凭据或账户模式在金丝雀任务未收尾时被更新，执行器拒绝换绑：请到交易所核对并处理该合约的仓位与挂单，再改用新的金丝雀目录（移走数据目录下的 executor-canary）`);
+        }
         throw error;
       }
     }

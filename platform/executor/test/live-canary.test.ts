@@ -226,6 +226,7 @@ test('金丝雀收尾：Bybit 追价首腿创建无回应停在待人工确认�
     await unanswered();
     // The old Binance binding holds the unacknowledged job, so the canary cannot move to another account yet.
     await assert.rejects(prepareCanary(params({ step: 'check' }), moved(w)), /请先在交易中心换回原账户/);
+    await assert.rejects(prepareCanary(params({ step: 'check' }), { ...w.deps, accounts: [{ ...ACCOUNTS[0], credentialVersion: 2 }, ACCOUNTS[1]] }), /凭据或账户模式在金丝雀任务未收尾时被更新/);
     const unknownId = await run(w, params({ step: 'settle', strategy: 'adopt', strategyId: 'x1' }));
     assert.deepEqual([unknownId.outcome?.sent, unknownId.outcome?.settled], [true, false], '认领可能撤策略，按已发送报告');
     assert.match(unknownId.outcome!.summary, /查无该策略编号/);
