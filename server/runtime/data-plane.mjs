@@ -32,6 +32,7 @@ import { createBinanceLighterCost } from '../research/binance-lighter-cost.mjs';
 import { createAeroMarket } from '../research/aero-market.mjs';
 import { createAeroSafe } from '../automation/aero-safe.mjs';
 import { createFeishuDigest } from '../automation/feishu-digest.mjs';
+import { createOndoMarketMaker } from '../automation/ondo-mm.mjs';
 import { createEventLoopLag } from './event-loop-lag.mjs';
 import { createStallProfiler } from './stall-profiler.mjs';
 import { createRuntimeFeed } from '../agent-feed/runtime-feed.mjs';
@@ -93,6 +94,11 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
   const executionAuto = createTradingAuto({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 2000 : 0, log });
   const autoExposure = createTradingAutoExposure({ execution, readRules: () => executionAuto.exposureSnapshot(), now: executionNow });
   const anthropicReduction = createAnthropicReduction({ db, execution, admit: operation => executionEntries.run(operation), readMaintenance: () => control.getSetting('updates-maintenance') === '1', now: executionNow, intervalMs: executionIntervalMs > 0 ? 15_000 : 0, log });
+  // Ondo Perps resting quotes for liquidity rewards. A live start passes the same maintenance entry as a
+  // manual execution start; while running it withdraws its orders during maintenance or quarantine recovery.
+  const ondoMm = createOndoMarketMaker({ dataDir, encrypt, decrypt, log, admit: operation => executionEntries.run(operation),
+    readMaintenance: () => control.getSetting('updates-maintenance') === '1', readAdmission: () => !sharedAccountWriter || sharedAccountWriter.snapshot().recovery?.state === 'normal',
+    intervalMs: executionIntervalMs > 0 ? 250 : 0 });
   // Real-venue contract probes started from the workbench page. A live run needs a normal recovery
   // state and, for Bybit and the oil canary, no unfinished job of the trading center's own executor.
   const contractProbes = createContractProbes({ dataDir, log, admit: () => executionEntries.hold(), readMaintenance: () => control.getSetting('updates-maintenance') === '1',
@@ -411,6 +417,22 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
       if (Object.keys(body).length) throw new HttpError(400, '该操作不接受额外参数');
       return reply(200, await aeroSafe[action](authorize, { deadline }));
     }
+    if (pathname === '/api/automation/ondo-mm' || pathname.startsWith('/api/automation/ondo-mm/')) {
+      if (url.search) throw new HttpError(400, 'Ondo 挂单接口不接受查询参数');
+      if (pathname === '/api/automation/ondo-mm' && method === 'GET') return reply(200, ondoMm.state());
+      const action = { 'PUT /config': 'save', 'PUT /credentials': 'setKey', 'POST /credentials/clear': 'clearKey', 'POST /start': 'start', 'POST /stop': 'stop',
+        'POST /cleanup': 'cleanup', 'POST /recovery/discard': 'discardRecovery' }[`${method} ${pathname.slice('/api/automation/ondo-mm'.length)}`];
+      if (!action) throw new HttpError(404, 'Ondo 挂单接口不存在');
+      const body = await bodyOf();
+      if (!sessions.isActive(sessionId)) throw new HttpError(401, '登录已失效，请重新登录');
+      const only = (...keys) => { if (Object.keys(body).some(key => !keys.includes(key))) throw new HttpError(400, '请求包含未知字段'); };
+      if (action === 'save') { only('config'); return reply(200, ondoMm.save(body.config)); }
+      if (action === 'setKey') { only('keyId', 'secret'); return reply(200, ondoMm.setKey(body)); }
+      if (action === 'start') { only('revision', 'confirmLive', 'adoptPositions'); gone(); return reply(200, await ondoMm.start(body, { signal })); }
+      only();
+      // A stop or cleanup still runs for a caller that left.
+      return reply(200, await ondoMm[action]());
+    }
     if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {
       if (url.search) throw new HttpError(400, '汇总接口不接受查询参数');
       if (pathname === '/api/automation/feishu-digest' && method === 'GET') return reply(200, feishuDigest.state());
@@ -622,8 +644,8 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     // The first event of a new socket subscriber; revisions stay monotonic across subscribers.
     overviewEvent: () => ({ revision: ++overviewRevision, overview: overview() }),
     reportApiStats,
-    prepareStop: async () => { await aeroSafe.prepareStop(); },
-    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); anthropicWatch.initialize(); },
+    prepareStop: async () => { await aeroSafe.prepareStop(); await ondoMm.prepareStop(); },
+    initialize: async () => { executionEntries.clear(); await execution.initializeProtection(); await costResearch.initialize(); await aeroMarket.initialize(); await aeroSafe.initialize(); feishuDigest.initialize(); ondoMm.initialize(); anthropicWatch.initialize(); },
     startBaseline() {
       baseline = createBaseline({ db, intervalMs: baselineIntervalMs, now: baselineNow, logger: log, readCapabilities: capabilities,
         readSnapshot: () => ({ accountWriterVersion: embeddedModules && sharedAccountWriter ? 1 : null, sseConnections: readConnections(), projects: getProjects().map(project => ({ project,
@@ -635,6 +657,6 @@ export function createDataPlane({ db, control, catalog, encrypt, decrypt, embedd
     },
     // stop() ends the timers at once; close() then releases every service.
     stop,
-    async close() { stop(); subscribers.clear(); contractProbes.close(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await feishuDigest.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
+    async close() { stop(); subscribers.clear(); contractProbes.close(); await anthropicHistory.close(); await anthropicReduction.close(); await anthropicWatch.close(); await ondoMm.close(); await feishuDigest.close(); await costResearch.close(); await aeroMarket.close(); await aeroSafe.close(); await baseline?.close(); await executionAuto.close(); await execution.close(); sharedAccountWriter?.close(); await tradingImporter.close(); await assetPositions.close(); await assetFills.close(); await trading.close(); await assetSync.close(); for (const controller of controllers) controller.abort(); await Promise.allSettled([...pending.values()]); },
   };
 }
