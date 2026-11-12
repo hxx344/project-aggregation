@@ -6,7 +6,7 @@ import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBi
 import { VenueError, type CallOptions, type ConnectorCapabilities, type OrderReport, type OrderRequest, type OrderStatus, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
-import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, type LiveCredentials } from './values.ts';
+import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export type { LiveCredentials } from './values.ts';
 export interface BinanceConnectorOptions {
@@ -89,7 +89,7 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
     if (binding.accountMode !== 'standard' && binding.accountMode !== 'portfolio-margin') fail(`Binance 账户模式 ${binding.accountMode} 无效`);
     let credentials: LiveCredentials;
     try { credentials = options.credentials(binding); } catch (error) { return fail(`Binance 凭据不可用：${describe(error)}`); }
-    if (typeof credentials?.apiKey !== 'string' || typeof credentials.apiSecret !== 'string' || !credentials.apiKey || !credentials.apiSecret) fail('Binance 凭据不完整');
+    if (!validCredentials(credentials)) fail('Binance 凭据不完整或格式无效');
     return credentials;
   }
 
@@ -125,7 +125,8 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
       try {
         const signedQuery = binanceSignedQuery(credentials, params, { timestamp: String(now() + offset), recvWindow: RECV_WINDOW });
         request = { url: `${endpoint.host}${endpoint.path}?${signedQuery.query}`, method: endpoint.method, headers: { ...signedQuery.headers } };
-      } catch (error) { throw new VenueError(mutation ? 'not-sent' : 'read-failed', `Binance 请求签名失败：${describe(error)}`); }
+      } catch (error) { // A resend follows a refusal of the first transmission, so that refusal is the answer.
+        throw new VenueError(!mutation ? 'read-failed' : attempt > 0 ? 'rejected' : 'not-sent', `Binance 请求签名失败：${describe(error)}`); }
       let reply: HttpReply;
       try { reply = await exchange(fetchImpl, timeoutMs, request, { signal, ...(mutation ? { beforeSend: beforeSend ?? (() => undefined) } : {}) }); }
       catch (error) {

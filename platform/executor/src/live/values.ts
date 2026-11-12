@@ -33,5 +33,8 @@ export function identifier(value: unknown, name: string): string {
 export const describe = (error: unknown): string => error instanceof Error ? error.message.slice(0, 160) : '未知错误';
 
 export interface LiveCredentials { apiKey: string; apiSecret: string }
+/** Same rule as the production client: a key that cannot be a header value is refused before anything is sent. */
+export const validCredentials = (value: LiveCredentials | null | undefined): boolean => typeof value?.apiKey === 'string' && /^[\x21-\x7e]{1,512}$/.test(value.apiKey)
+  && typeof value.apiSecret === 'string' && value.apiSecret.trim() !== '' && value.apiSecret.length <= 1024 && !/[\r\n\0]/.test(value.apiSecret);
 /** In hedge mode the position side alone says whether an order opens or closes: selling a long or buying a short closes. */
 export const hedgeClose = (side: 'buy' | 'sell', positionSide: 'long' | 'short'): boolean => (positionSide === 'long') === (side === 'sell');

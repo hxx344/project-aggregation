@@ -10,7 +10,7 @@ import {
 } from '../connector.ts';
 import { add, cmp, isZero } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
-import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, type LiveCredentials } from './values.ts';
+import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export interface BybitConnectorOptions {
   /** Resolves the key for one binding; a throw refuses the call before anything is sent. */
@@ -29,7 +29,10 @@ const IDENTITY_TTL_MS = 60_000;
 const MODE_TTL_MS = 60_000;
 const MAX_PAGES = 40;
 const PAGE_SIZE = 50;
-const MAX_STRATEGY_WINDOW_MS = 7 * 86_400_000;
+/** The venue lists ended strategies for at most 7 days per query; segments leave 2 s for the widened whole-second bounds. */
+const STRATEGY_SEGMENT_MS = 7 * 86_400_000 - 2_000;
+const MAX_STRATEGY_WINDOW_MS = 366 * 86_400_000;
+const MAX_REMEMBERED_STRATEGIES = 1_000;
 const ORDER_LINK_ID = /^[A-Za-z0-9_-]{1,36}$/;
 const ORDER_TERMINAL: Record<string, OrderStatus> = { Filled: 'filled', Cancelled: 'canceled', PartiallyFilledCanceled: 'canceled', Deactivated: 'canceled', Rejected: 'rejected' };
 const ORDER_WORKING: Record<string, OrderStatus> = { Created: 'new', New: 'new', PartiallyFilled: 'partially-filled' };
@@ -89,7 +92,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     if (binding.venue !== 'bybit' || binding.environment !== 'mainnet' || binding.accountMode !== 'unified') fail('Bybit 实盘连接器只接受 mainnet 的 Bybit 统一账户');
     let credentials: LiveCredentials;
     try { credentials = options.credentials(binding); } catch (error) { return fail(`Bybit 凭据不可用：${describe(error)}`); }
-    if (typeof credentials?.apiKey !== 'string' || typeof credentials.apiSecret !== 'string' || !credentials.apiKey || !credentials.apiSecret) fail('Bybit 凭据不完整');
+    if (!validCredentials(credentials)) fail('Bybit 凭据不完整或格式无效');
     return credentials;
   }
 
@@ -122,7 +125,8 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     for (let attempt = 0; ; attempt++) {
       let headers: Record<string, string>;
       try { headers = { ...bybitAuthHeaders(credentials, { timestamp: String(now() + offset), recvWindow: RECV_WINDOW, payload: body ?? query }), ...(mutation ? { 'Content-Type': 'application/json' } : {}) }; }
-      catch (error) { throw new VenueError(mutation ? 'not-sent' : 'read-failed', `Bybit 请求签名失败：${describe(error)}`); }
+      catch (error) { // A resend follows a refusal of the first transmission, so that refusal is the answer.
+        throw new VenueError(!mutation ? 'read-failed' : attempt > 0 ? 'rejected' : 'not-sent', `Bybit 请求签名失败：${describe(error)}`); }
       let reply: HttpReply;
       try { reply = await exchange(fetchImpl, timeoutMs, { url: `${HOST}${path}${query ? `?${query}` : ''}`, method, headers, ...(body === undefined ? {} : { body }) }, { signal, ...(mutation ? { beforeSend: beforeSend ?? (() => undefined) } : {}) }); }
       catch (error) {
@@ -238,6 +242,15 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     }
   }
   /** Recent orders (open or closed) come from realtime, older ones from history; both are keyed by orderLinkId. */
+  /** A working order on this symbol and side that a chase placed, or that carries no client id (an unattributed one counts too). */
+  async function chaseOrderOpen(binding: AccountBinding, symbol: string, side: 'buy' | 'sell', signal: AbortSignal): Promise<boolean> {
+    for (const item of await pages(binding, '/v5/order/realtime', { category: 'linear', symbol, openOnly: '0', limit: String(PAGE_SIZE) }, 'nextPageCursor', signal, 'linear')) {
+      const row = record(item, '活动委托');
+      if (row.symbol !== symbol || Object.hasOwn(ORDER_TERMINAL, row.orderStatus as string) || sideOf(row.side) !== side) continue;
+      if (row.createType === 'CreateByChaseOrder' || typeof row.orderLinkId !== 'string' || row.orderLinkId === '') return true;
+    }
+    return false;
+  }
   async function findOrder(binding: AccountBinding, request: OrderRequest, signal: AbortSignal): Promise<unknown | null> {
     const params = { category: 'linear', symbol: request.symbol, orderLinkId: request.clientOrderId, limit: String(PAGE_SIZE) };
     let rows = await reading(() => pages(binding, '/v5/order/realtime', params, 'nextPageCursor', signal, 'linear'));
@@ -256,6 +269,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
     if (cmp(filledQuantity, quantity) > 0) throw new ShapeError('策略成交数量超过策略数量');
     const averagePrice = isZero(filledQuantity) ? null : optionalPrice(row.executedAvgPrice, '策略成交均价');
     if (!isZero(filledQuantity) && averagePrice === null) throw new ShapeError('策略有成交但没有成交均价');
+    // Status 4 is still ending and may have a resting order, so only status 3 can settle.
     const terminal = state === 3 || state === 4, createdAt = millis(row.createdTimeE3, '策略创建时间');
     let childrenSettled = false;
     if (children) {
@@ -279,7 +293,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       const childFilled = add('0', ...[...known.values()].map(item => item.filled));
       if (cmp(childFilled, quantity) > 0) throw new ShapeError('子单成交合计超过策略数量');
       // REST snapshots race: release only when the strategy has ended, no child is open and the totals agree.
-      childrenSettled = terminal && !open && cmp(childFilled, filledQuantity) === 0;
+      childrenSettled = state === 3 && !open && cmp(childFilled, filledQuantity) === 0;
     }
     return {
       strategyId, symbol: row.symbol as string, side, positionSide, reduceOnly: row.reduceOnly, quantity, filledQuantity, averagePrice,
@@ -361,8 +375,9 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
         // production client), so every one of them counts as foreign activity.
         for (const status of ['2', '4', '5', '6']) {
           for (const item of await pages(binding, '/v5/strategy/list', strategyQuery(symbol, { status }), 'nextCursor', signal)) {
-            const strategy = strategyReport(item, null);
-            if (strategy.symbol !== symbol) throw new ShapeError('策略合约与请求不一致');
+            // Only the id and symbol are needed here; a strategy created elsewhere may lack fields the executor's own need.
+            const strategy = record(item, '策略');
+            if (strategy.symbol !== symbol || typeof strategy.strategyId !== 'string' || !STRATEGY_ID.test(strategy.strategyId)) throw new ShapeError('策略合约或编号无效');
             // A strategy can move between status buckets during this snapshot.
             if (seenStrategies.has(strategy.strategyId)) continue;
             seenStrategies.add(strategy.strategyId);
@@ -398,13 +413,15 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       } catch (error) { throw new VenueError('uncertain', `Bybit 下单回执无法使用：${describe(error)}`); }
       // The create answers only an acknowledgement. One read gives the first state; when it fails the acceptance is
       // reported as a new order with nothing filled, which the executor reconciles by client id like any working order.
-      try {
-        const row = await findOrder(binding, request, signal);
-        if (row !== null) {
-          const report = orderReport(row, request, 'uncertain');
-          if (report.remoteId === remoteId) return report;
-        }
-      } catch { /* the acknowledgement stands */ }
+      // An order that is found but does not match is an identity conflict, not a fallback.
+      let row: unknown = null;
+      try { row = await findOrder(binding, request, signal); }
+      catch (error) { if (!(error instanceof VenueError && error.kind === 'read-failed')) throw error; }
+      if (row !== null) {
+        const report = orderReport(row, request, 'uncertain');
+        if (report.remoteId !== remoteId) throw new VenueError('uncertain', 'Bybit 同一客户订单号查到的委托编号与下单回执不一致');
+        return report;
+      }
       return { clientOrderId: request.clientOrderId, remoteId, symbol: request.symbol, side: request.side, quantity: request.quantity, filledQuantity: '0', averagePrice: null, status: 'new', terminal: false, updatedAt: now() + offset };
     },
 
@@ -439,6 +456,8 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
       const ack = await signed(binding, 'POST', '/v5/strategy/create', body, { signal, beforeSend });
       if (ack.result !== null || typeof ack.strategyId !== 'string' || !STRATEGY_ID.test(ack.strategyId)) throw new VenueError('uncertain', 'Bybit 追价策略回执无法使用');
       strategySymbols.set(ack.strategyId, request.symbol);
+      // Bounded: a forgotten id is found again by trying every execution symbol.
+      if (strategySymbols.size > MAX_REMEMBERED_STRATEGIES) strategySymbols.delete(strategySymbols.keys().next().value!);
       return { strategyId: ack.strategyId };
     },
 
@@ -453,6 +472,9 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
         const children = await pages(binding, '/v5/strategy/order-list', { strategyId, symbol, strategyType: 'chaseOrder', pageSize: String(PAGE_SIZE) }, 'nextCursor', signal);
         const report = strategyReport(rows[0], children);
         if (report.strategyId !== strategyId || report.symbol !== symbol) throw new ShapeError('策略记录的编号或合约与查询不一致');
+        // While a chase rests its order is listed only in realtime, never as a child (inventory item 47), and it may
+        // linger there after the strategy ends: any working chase-created order on this side holds the release.
+        if (report.childrenSettled && await chaseOrderOpen(binding, symbol, report.side, signal)) return { ...report, childrenSettled: false };
         return report;
       }
       return null;
@@ -489,10 +511,14 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
           if (inWindow(report)) keep(report);
         }
       }
-      const range = { beginTimeE0: String(Math.floor(window.from / 1000) - 1), endTimeE0: String(Math.ceil(window.to / 1000)) };
-      for (const item of await pages(binding, '/v5/strategy/list', strategyQuery(symbol, { status: '3', ...range }), 'nextCursor', signal)) {
-        const report = strategyReport(item, null);
-        if (inWindow(report)) keep(report);
+      for (let from = window.from; from <= window.to; from += STRATEGY_SEGMENT_MS) {
+        const to = Math.min(from + STRATEGY_SEGMENT_MS, window.to);
+        const range = { beginTimeE0: String(Math.floor(from / 1000) - 1), endTimeE0: String(Math.ceil(to / 1000)) };
+        for (const item of await pages(binding, '/v5/strategy/list', strategyQuery(symbol, { status: '3', ...range }), 'nextCursor', signal)) {
+          const report = strategyReport(item, null);
+          if (inWindow(report)) keep(report);
+        }
+        if (to === window.to) break;
       }
       return [...found.values()];
     }),

@@ -258,6 +258,13 @@ test('Binance 连接器：发送前守卫拒绝或已取消时不发出请求，
   await assert.rejects(connector.place(binding(), order({ type: 'market', limitPrice: null, timeInForce: 'gtc' }), send()), kind('not-sent'));
   credentials.value = null;
   await assert.rejects(connector.place(binding({ credentialVersion: 2 }), order(), send()), kind('not-sent'));
+  // A key that cannot be a header value is refused before anything leaves.
+  for (const value of [{ apiKey: 'bad key', apiSecret: SECRET }, { apiKey: KEY, apiSecret: 'two\nlines' }]) {
+    credentials.value = value;
+    const before = venue.calls.length;
+    await assert.rejects(connector.place(binding({ credentialVersion: 3 }), order(), send()), kind('not-sent'));
+    assert.equal(venue.calls.length, before, '连持仓模式也不读');
+  }
   credentials.value = { apiKey: KEY, apiSecret: SECRET };
   assert.equal(posts(), 0);
 
