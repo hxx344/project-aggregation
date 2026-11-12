@@ -84,7 +84,7 @@ function RunPanel({ run, state, busy, onLive, onStop, onDownload }: { run: Run; 
 export default function ContractProbePage({ onExpired }: { onExpired: () => void }) {
   const [writeError, setWriteError] = useState(''), [busy, setBusy] = useState(false), [running, setRunning] = useState(false);
   const [bybit, setBybit] = useState({ symbol: 'CLUSDT', maxNotional: '50', passiveBps: '200', settleTimeoutS: '60', allowFill: false });
-  const [canary, setCanary] = useState({ symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', leadOrder: 'market', quantity: '', perJob: '100', totalOpen: '300', timeoutS: '120', maxSlippageBps: '' });
+  const [canary, setCanary] = useState({ symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', leadOrder: 'market', quantity: '', perJob: '100', totalOpen: '300', timeoutS: '120', maxSlippageBps: '', strategy: 'auto', strategyId: '' });
   const [aster, setAster] = useState({ masterPrefix: '', aPrefix: '', bPrefix: '', amount: '1', probeNonce: '', balancerPaused: false, settleTimeoutS: '300', historyMinutes: '30' });
   const mounted = useRef(false), writing = useRef(false), expires = useRef(onExpired);
   expires.current = onExpired;
@@ -122,9 +122,12 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
     const placing = step === 'open' || step === 'close';
     if (placing && !/^\d{1,6}(?:\.\d{1,8})?$/.test(canary.quantity)) { setWriteError('请填写每腿数量（桶）。'); return; }
     if (![canary.perJob, canary.totalOpen].every(value => /^\d{1,3}(?:\.\d{1,2})?$/.test(value)) || !/^\d{1,3}$/.test(canary.timeoutS) || !/^(?:\d{1,3})?$/.test(canary.maxSlippageBps)) { setWriteError('请填写有效的金额上限、执行时长与价格保护。'); return; }
+    const recovering = step === 'settle' && canary.strategy !== 'auto';
+    if (recovering && canary.strategy === 'adopt' && !/^[A-Za-z0-9_-]{1,100}$/.test(canary.strategyId)) { setWriteError('认领追价策略须填写 Bybit 策略编号。'); return; }
     void write('/runs', { probe: 'canary', params: { step, symbol: canary.symbol, lead: canary.lead, leadSide: canary.leadSide, leadOrder: canary.lead === 'bybit' ? canary.leadOrder : 'market',
       ...(placing ? { quantity: canary.quantity } : {}), perJob: canary.perJob, totalOpen: canary.totalOpen, timeoutS: Number(canary.timeoutS),
-      ...(canary.maxSlippageBps ? { maxSlippageBps: Number(canary.maxSlippageBps) } : {}) } });
+      ...(canary.maxSlippageBps ? { maxSlippageBps: Number(canary.maxSlippageBps) } : {}),
+      ...(recovering ? { strategy: canary.strategy, ...(canary.strategy === 'adopt' ? { strategyId: canary.strategyId } : {}) } : {}) } });
   }
   const live = (run: Run) => { if (run.phrase) void write(`/runs/${run.id}/live`, { confirmLive: true, phrase: run.phrase }); };
   const stop = (run: Run, force: boolean) => {
@@ -200,7 +203,10 @@ export default function ContractProbePage({ onExpired }: { onExpired: () => void
           <label>累计开仓上限（USDT，≤500）<input aria-label="累计开仓上限" inputMode="decimal" value={canary.totalOpen} disabled={locked} onChange={event => setCanary({ ...canary, totalOpen: event.target.value.trim() })} /></label>
           <label>最长执行（秒，30–600）<input aria-label="最长执行" inputMode="numeric" value={canary.timeoutS} disabled={locked} onChange={event => setCanary({ ...canary, timeoutS: event.target.value.trim() })} /></label>
           <label>价格保护（bps，1–200，留空用默认）<input aria-label="价格保护" inputMode="numeric" value={canary.maxSlippageBps} disabled={locked} placeholder="默认" onChange={event => setCanary({ ...canary, maxSlippageBps: event.target.value.trim() })} /></label>
+          <label>未知追价策略（收尾用）<select aria-label="未知追价策略" value={canary.strategy} disabled={locked} onChange={event => setCanary({ ...canary, strategy: event.target.value })}><option value="auto">自动核对未创建</option><option value="adopt">按策略编号认领</option><option value="release">强制释放（策略可能已成交）</option></select></label>
+          <label>策略编号（认领用）<input aria-label="策略编号" value={canary.strategyId} disabled={locked || canary.strategy !== 'adopt'} placeholder="Bybit 策略编号" onChange={event => setCanary({ ...canary, strategyId: event.target.value.trim() })} /></label>
         </div>
+        <p>Bybit 追价首腿的创建请求没有得到回应时，任务会停在待人工确认：收尾默认自动核对策略未创建；核对不通过时，到 Bybit 查到策略编号后按编号认领，查不到又无法证明未创建时才强制释放。认领或强制释放后，先到交易所处理敞口，再做一次收尾确认。</p>
         <p>平仓时方向取自金丝雀记录的持仓，与上面的首腿方向无关；累计开仓上限按金丝雀已开过的所有任务计，平仓不退回。</p>
         <div className="probe-actions">
           <button className="button primary" disabled={locked} onClick={() => startCanary('check')}><Play size={15} />启动检查与核对</button>

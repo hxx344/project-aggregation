@@ -89,7 +89,7 @@ function asterParams(input, prefixes) {
 
 // The probe checks the same bounds again (platform/executor/src/live/canary.ts); these give the page a 400 instead of a failed run.
 function canaryParams(input) {
-  const body = fields(input, ['step', 'symbol', 'lead', 'leadSide', 'leadOrder', 'quantity', 'perJob', 'totalOpen', 'timeoutS', 'maxSlippageBps']);
+  const body = fields(input, ['step', 'symbol', 'lead', 'leadSide', 'leadOrder', 'quantity', 'perJob', 'totalOpen', 'timeoutS', 'maxSlippageBps', 'strategy', 'strategyId']);
   const pick = (value, allowed, name) => { if (!allowed.includes(value)) throw bad(`请选择${name}`); return value; };
   const step = pick(body.step, CANARY_STEPS, '金丝雀步骤');
   // A check or a settle places nothing new; the probe still parses a quantity, so they get a fixed one.
@@ -97,7 +97,13 @@ function canaryParams(input) {
     leadSide: pick(body.leadSide, ['long', 'short'], '首腿方向'), leadOrder: pick(body.leadOrder ?? 'market', ['market', 'chase'], '首腿下单方式'),
     quantity: decimal(step === 'open' || step === 'close' ? body.quantity : body.quantity ?? '1', undefined, '每腿数量', 10_000, 8), perJob: decimal(body.perJob, '100', '单笔名义金额上限', 200, 2),
     totalOpen: decimal(body.totalOpen, '300', '累计开仓名义金额上限', 500, 2), timeoutS: integer(body.timeoutS, 120, '最长执行秒数', 30, 600),
-    maxSlippageBps: body.maxSlippageBps === undefined || body.maxSlippageBps === null ? null : integer(body.maxSlippageBps, null, '价格保护基点', 1, 200) };
+    maxSlippageBps: body.maxSlippageBps === undefined || body.maxSlippageBps === null ? null : integer(body.maxSlippageBps, null, '价格保护基点', 1, 200),
+    strategy: pick(body.strategy ?? 'auto', ['auto', 'adopt', 'release'], '追价策略处理方式'), strategyId: null };
+  if (params.strategy !== 'auto' && step !== 'settle') throw bad('认领或强制释放追价策略只在「收尾」里做');
+  if (params.strategy === 'adopt') {
+    if (typeof body.strategyId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(body.strategyId.trim())) throw bad('认领追价策略须填写策略编号（字母、数字、下划线或连字符）');
+    params.strategyId = body.strategyId.trim();
+  }
   if (params.quantity === undefined) throw bad('请填写每腿数量');
   if (params.leadOrder === 'chase' && params.lead !== 'bybit') throw bad('只有 Bybit 首腿可以用原生追价');
   if (Number(params.perJob) > Number(params.totalOpen)) throw bad('单笔名义金额上限不得大于累计开仓上限');
@@ -168,7 +174,8 @@ export function createContractProbes({ dataDir, admit, readMaintenance, liveBloc
     const live = phrase ? ['--live', '--confirm', phrase] : [];
     if (probe === 'canary') return ['--data-dir', dataDir, '--step', params.step, '--symbol', params.symbol, '--lead', params.lead, '--lead-side', params.leadSide,
       '--lead-order', params.leadOrder, '--quantity', params.quantity, '--per-job', params.perJob, '--total-open', params.totalOpen, '--timeout-s', String(params.timeoutS),
-      ...(params.maxSlippageBps === null ? [] : ['--max-slippage-bps', String(params.maxSlippageBps)]), '--out', reportFile, ...live];
+      ...(params.maxSlippageBps === null ? [] : ['--max-slippage-bps', String(params.maxSlippageBps)]),
+      ...(params.strategy === 'auto' ? [] : ['--strategy', params.strategy]), ...(params.strategyId === null ? [] : ['--strategy-id', params.strategyId]), '--out', reportFile, ...live];
     if (probe === 'bybit') return ['--symbol', params.symbol, '--data-dir', dataDir, '--max-notional', params.maxNotional, '--passive-bps', String(params.passiveBps),
       '--settle-timeout-s', String(params.settleTimeoutS), '--out', reportFile, ...(params.allowFill ? ['--allow-fill'] : []), ...live];
     return ['--env-file', asterEnv, '--master-prefix', params.masterPrefix, '--a-prefix', params.aPrefix, '--b-prefix', params.bPrefix, '--amount', params.amount,

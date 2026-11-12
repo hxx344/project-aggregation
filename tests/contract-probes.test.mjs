@@ -310,14 +310,17 @@ test('原油金丝雀：参数白名单与上限；检查只读完成且不提�
   const base = { step: 'open', symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', quantity: '1' };
   for (const params of [{ ...base, perJob: '200.01' }, { ...base, totalOpen: '500.5' }, { ...base, perJob: '150', totalOpen: '100' }, { ...base, leadOrder: 'chase' },
     { ...base, symbol: 'SKHYUSDT' }, { ...base, quantity: undefined }, { ...base, timeoutS: 601 }, { ...base, timeoutS: '60' }, { ...base, maxSlippageBps: 201 }, { ...base, step: 'adl' },
-    { ...base, dataDir: '/tmp' }, { ...base, confirm: 'x' }, { ...base, quantity: 1 }])
+    { ...base, dataDir: '/tmp' }, { ...base, confirm: 'x' }, { ...base, quantity: 1 }, { ...base, strategy: 'release' }, { ...base, step: 'settle', strategy: 'adopt' },
+    { ...base, step: 'settle', strategy: 'adopt', strategyId: 'a b' }, { ...base, step: 'settle', strategy: 'keep' }])
     status(() => f.probes.start({ probe: 'canary', params }), 400);
   assert.deepEqual(f.probes.state().options.canary.symbols, ['CLUSDT', 'BZUSDT']);
 
   const check = await f.readOnly({ step: 'check', symbol: 'BZUSDT', lead: 'bybit', leadSide: 'short', leadOrder: 'chase' }, 'canary');
   assert.equal(check.status, 'completed', JSON.stringify(check)); assert.equal(check.phrase, null); assert.equal(check.outcome, '检查通过');
-  assert.deepEqual(check.params, { step: 'check', symbol: 'BZUSDT', lead: 'bybit', leadSide: 'short', leadOrder: 'chase', quantity: '1', perJob: '100', totalOpen: '300', timeoutS: 120, maxSlippageBps: null });
+  assert.deepEqual(check.params, { step: 'check', symbol: 'BZUSDT', lead: 'bybit', leadSide: 'short', leadOrder: 'chase', quantity: '1', perJob: '100', totalOpen: '300', timeoutS: 120, maxSlippageBps: null, strategy: 'auto', strategyId: null });
   status(() => f.probes.live(check.id, { confirmLive: true, phrase: 'fake-BZUSDT' }), 409);
+  const adopt = await f.readOnly({ step: 'settle', symbol: 'CLUSDT', lead: 'binance', leadSide: 'long', strategy: 'adopt', strategyId: ' abc_1 ' }, 'canary');
+  assert.deepEqual(f.probes.report(adopt.id).report.argv.slice(-6, -2), ['--strategy', 'adopt', '--strategy-id', 'abc_1']);
 
   const preview = await f.readOnly({ ...base, quantity: '2.5', perJob: '150', totalOpen: '400', timeoutS: 90, maxSlippageBps: 40 }, 'canary');
   assert.equal(preview.status, 'completed'); assert.equal(preview.phrase, 'fake-CLUSDT');

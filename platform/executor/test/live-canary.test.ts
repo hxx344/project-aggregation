@@ -51,6 +51,8 @@ test('金丝雀参数：单笔 ≤200、累计 ≤500 USDT 且单笔不大于累
     [{ perJob: '200.01' }, /单笔名义金额上限不得超过 200/], [{ totalOpen: '501' }, /累计开仓名义金额上限不得超过 500/], [{ perJob: '300', totalOpen: '250' }, /不得超过 200/],
     [{ perJob: '150', totalOpen: '100' }, /单笔名义金额上限不得大于累计开仓上限/], [{ leadOrder: 'chase' }, /只有 Bybit 首腿可以用原生追价/], [{ timeoutS: '29' }, /30 至 600/],
     [{ timeoutS: '601' }, /30 至 600/], [{ symbol: 'SKHYUSDT' }, /合约须为/], [{ quantity: '0' }, /每腿数量须为正/], [{ step: 'adl' }, /步骤须为/], [{ maxSlippageBps: '201' }, /1 至 200/],
+    [{ strategy: 'release' }, /只在「收尾」里做/], [{ step: 'settle', strategy: 'adopt' }, /须填写策略编号/], [{ step: 'settle', strategyId: 'abc' }, /只有认领追价策略时填写/],
+    [{ step: 'settle', strategy: 'adopt', strategyId: 'a b' }, /策略编号只能是/], [{ step: 'settle', strategy: 'keep' }, /追价策略处理方式须为/],
   ] as [Record<string, string>, RegExp][]) assert.throws(() => params(overrides), (error: unknown) => error instanceof CanaryRefusal && pattern.test(error.message), JSON.stringify(overrides));
 });
 
@@ -171,5 +173,60 @@ test('金丝雀收尾：上一进程留下未结束任务时开平仓拒绝；�
     assert.equal(w.bybit.count('POST /v5/order/create'), 1, '首腿已成交部分补发对冲腿');
     assert.deepEqual([w.binance.net.get('CLUSDT'), w.bybit.net.get('CLUSDT')], [1, -1]);
     assert.equal((await preview(w, params({ step: 'settle' }))).phrase, null);
+  } finally { w.cleanup(); }
+});
+
+test('金丝雀换账户与手工平仓：自有持仓只算当前绑定账户的腿；账户实际持仓不足以平金丝雀记录时拒绝平仓', async () => {
+  const w = world();
+  try {
+    assert.equal((await run(w, params())).outcome?.settled, true);
+    // Someone closed the Binance side by hand: the record says long 1, the account holds nothing.
+    w.binance.net.set('CLUSDT', 0);
+    await assert.rejects(prepareCanary(params({ step: 'close' }), w.deps), /Binance 账户持仓 0 不足以按金丝雀记录 1 平 1/);
+    w.binance.net.set('CLUSDT', 1);
+    // The workbench now uses another Binance account: the canary's long there is no longer its to close.
+    const accounts = [{ ...ACCOUNTS[0], accountId: '777000111' }, ACCOUNTS[1]];
+    const connectors = createLiveConnectors({ accounts }, new Map(Object.entries(KEYS)) as never,
+      { fetchImpl: (url, init) => (new URL(url).hostname.endsWith('bybit.com') ? w.bybit : w.binance).fetch(url, init), now: () => w.clock.now });
+    const moved = { ...w.deps, accounts, connectors };
+    const check = await prepareCanary(params({ step: 'check' }), moved);
+    check.close();
+    assert.match(check.summary, /有 1 个 CLUSDT 金丝雀任务做在此前绑定的执行账户上/);
+    assert.deepEqual((check.findings as { canaryNet: unknown }).canaryNet, { binance: '0', bybit: '-1' });
+    await assert.rejects(prepareCanary(params({ step: 'close' }), moved), /金丝雀在 Binance 没有可平的 CLUSDT 仓位/);
+    assert.ok(w.lines.every(line => !line.includes('777000111')));
+  } finally { w.cleanup(); }
+});
+
+test('金丝雀收尾：Bybit 追价首腿创建无回应停在待人工确认；观察窗内拒绝确认，之后自动核对未创建再确认；也可强制释放后再收尾', async () => {
+  const w = world();
+  try {
+    const chase = params({ lead: 'bybit', leadOrder: 'chase', timeoutS: '30' });
+    const unanswered = async () => {
+      w.bybit.scripted.set('POST /v5/strategy/create', [() => { throw new TypeError('fetch failed'); }]);
+      const opened = await run(w, chase);
+      assert.deepEqual([opened.outcome?.sent, opened.outcome?.settled], [true, false], opened.outcome?.summary);
+      const check = (await preview(w, params({ step: 'check' }))).findings as { attention: { strategyPending: boolean }[] };
+      assert.deepEqual(check.attention.map(job => job.strategyPending), [true]);
+      await assert.rejects(prepareCanary(params(), w.deps), /请先做「收尾」/);
+    };
+    await unanswered();
+    const early = await run(w, params({ step: 'settle' }));
+    assert.equal(early.outcome?.settled, false);
+    assert.match(early.outcome!.summary, /仍可能送达交易所.*认领/);
+    w.clock.now += 125_000; w.sync();
+    const late = await run(w, params({ step: 'settle' }));
+    assert.equal(late.outcome?.settled, true, late.outcome?.summary);
+    assert.equal((await preview(w, params({ step: 'settle' }))).phrase, null);
+
+    await unanswered();
+    await assert.rejects(prepareCanary(params({ step: 'settle', strategy: 'adopt', strategyId: 'x1' }), w.deps).then(p => p.close()).then(() => { throw new Error('ok'); }), /^Error: ok$/);
+    const released = await run(w, params({ step: 'settle', strategy: 'release' }));
+    assert.equal(released.outcome?.settled, false);
+    assert.match(released.outcome!.summary, /已强制释放追价策略，到交易所处理后再做一次收尾/);
+    const after = await run(w, params({ step: 'settle' }));
+    assert.equal(after.outcome?.settled, true, after.outcome?.summary);
+    assert.equal(w.bybit.count('POST /v5/strategy/create'), 2, '收尾从不重发追价');
+    assert.equal((await preview(w, params({ step: 'settle', strategy: 'release' }))).phrase, null, '没有待收尾任务时什么都不做');
   } finally { w.cleanup(); }
 });

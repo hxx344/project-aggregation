@@ -17,14 +17,15 @@ import { readWorkbenchAccounts } from './lib/workbench-accounts.ts';
 
 const CANARY_DIR = 'executor-canary';
 const VENUES = ['binance', 'bybit'] as const;
-const STRINGS = ['data-dir', 'step', 'symbol', 'lead', 'lead-side', 'lead-order', 'quantity', 'per-job', 'total-open', 'timeout-s', 'max-slippage-bps', 'out', 'confirm'] as const;
+const STRINGS = ['data-dir', 'step', 'symbol', 'lead', 'lead-side', 'lead-order', 'quantity', 'per-job', 'total-open', 'timeout-s', 'max-slippage-bps', 'strategy', 'strategy-id', 'out', 'confirm'] as const;
 
 async function main(): Promise<number> {
   const flags = readFlags(process.argv.slice(2), STRINGS, ['live', 'help']);
   if (flags.help) {
     process.stdout.write('用法：node server/contract-probes/oil-canary.ts --data-dir <工作台数据目录> --step <check|open|close|settle> --symbol <CLUSDT|BZUSDT>\n'
       + '  --lead <binance|bybit> --lead-side <long|short> --lead-order <market|chase> --quantity <每腿数量>\n'
-      + '  --per-job <单笔上限 USDT，≤200> --total-open <累计开仓上限 USDT，≤500> --timeout-s <30–600> [--max-slippage-bps <1–200>] --out <报告文件> [--live --confirm <短语>]\n');
+      + '  --per-job <单笔上限 USDT，≤200> --total-open <累计开仓上限 USDT，≤500> --timeout-s <30–600> [--max-slippage-bps <1–200>] --out <报告文件> [--live --confirm <短语>]\n'
+      + '  收尾时处理创建结果未知的追价策略：[--strategy <auto|adopt|release>] [--strategy-id <策略编号，仅 adopt>]\n');
     return 0;
   }
   const dataDir = flags['data-dir'], out = flags.out;
@@ -34,7 +35,8 @@ async function main(): Promise<number> {
   let params;
   try {
     params = parseCanaryParams({ step: text('step'), symbol: text('symbol'), lead: text('lead'), leadSide: text('lead-side'), leadOrder: text('lead-order'), quantity: text('quantity'),
-      perJob: text('per-job'), totalOpen: text('total-open'), timeoutS: text('timeout-s'), maxSlippageBps: text('max-slippage-bps') });
+      perJob: text('per-job'), totalOpen: text('total-open'), timeoutS: text('timeout-s'), maxSlippageBps: text('max-slippage-bps'),
+      strategy: text('strategy'), strategyId: text('strategy-id') });
   } catch (error) { throw new ProbeAbort(safeText(error)); }
   const live = flags.live === true;
   const report = createReport('oil-canary', live ? 'live' : 'read-only', { ...params });
@@ -43,7 +45,8 @@ async function main(): Promise<number> {
   let exitCode = 1, prepared: PreparedCanary | null = null, locks: { release(): void } | null = null;
   try {
     const saved = readWorkbenchAccounts(dataDir, VENUES);
-    for (const account of saved) registerSecrets(account.apiKey, account.apiSecret);
+    // The account id goes too: a failed preflight names it, and the page shows only its last four digits elsewhere.
+    for (const account of saved) registerSecrets(account.apiKey, account.apiSecret, account.identity ?? '');
     const accounts: AccountBinding[] = saved.map(account => {
       if (!account.identity) throw new ProbeAbort(`交易中心尚未核验 ${account.exchange} 账户的真实身份，请先在交易中心重新保存该账户`);
       try { return parseBinding({ venue: account.exchange, environment: 'mainnet', accountId: account.identity, accountMode: account.accountMode, credentialVersion: account.revision }); }
