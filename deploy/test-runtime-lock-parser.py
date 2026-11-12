@@ -160,6 +160,7 @@ exports.parse = content => ({ ...JSON.parse(content), parserProbe });
                     'modules/asset/.next/BUILD_ID', 'modules/crossex/dist/index.html',
                     'modules/greeks/requirements.lock', 'modules/aster/dashboard/dist/client/index.html',
                     'modules/aster/requirements.lock', 'deploy/migrate-modules.py', 'deploy/diagnose-aster-margin.py',
+                    'platform/executor/src/main.ts', 'platform/executor/package.json',
                     *(f'tools/aero-roles/{name}' for name in package_release.AERO_ROLES_RUNTIME_FILES))
         for relative in required:
             target = self.source / relative
