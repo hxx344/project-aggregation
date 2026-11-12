@@ -60,8 +60,10 @@ export function createBaseline({ db, readSnapshot, readCapabilities = async () =
   db.exec('CREATE TABLE IF NOT EXISTS platform_baseline_samples (bucket_ms INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL, json TEXT NOT NULL)');
   const insert = db.prepare('INSERT INTO platform_baseline_samples(bucket_ms,schema_version,json) VALUES (?,1,?) ON CONFLICT(bucket_ms) DO UPDATE SET schema_version=excluded.schema_version,json=excluded.json');
   // Retention by time is a primary-key range delete. The bucket cap needs the
-  // ordered subquery, which reads every stored payload, so it runs only when the
-  // compact index count shows more rows than the cap (e.g. after a clock change).
+  // ordered subquery, which scans every table page, so it runs only when the
+  // compact index count shows more rows than the cap; the sampler's own whole-minute
+  // rows inside the window never exceed it, so this is a defensive branch for rows
+  // written by something else.
   const pruneOld = db.prepare('DELETE FROM platform_baseline_samples WHERE bucket_ms<?');
   const stored = db.prepare('SELECT COUNT(*) AS count FROM platform_baseline_samples');
   const pruneExcess = db.prepare('DELETE FROM platform_baseline_samples WHERE bucket_ms IN (SELECT bucket_ms FROM platform_baseline_samples ORDER BY bucket_ms DESC LIMIT -1 OFFSET ?)');

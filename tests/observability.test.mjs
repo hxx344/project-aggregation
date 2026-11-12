@@ -86,6 +86,13 @@ test('restart retains observations, damaged samples are skipped, and retention h
   f.db.exec('COMMIT');
   await reopened.sample();
   assert.equal(f.db.prepare('SELECT COUNT(*) AS count FROM platform_baseline_samples').get().count, BASELINE_MAX_BUCKETS);
+  // The cap keeps the newest buckets and drops the oldest ones.
+  const kept = f.db.prepare('SELECT MIN(bucket_ms) AS low, MAX(bucket_ms) AS high FROM platform_baseline_samples').get();
+  assert.equal(kept.high, time);
+  assert.equal(kept.low, time - BASELINE_MAX_BUCKETS + 1);
+  // The per-minute count reads the compact index, not the stored payloads.
+  const plan = f.db.prepare('EXPLAIN QUERY PLAN SELECT COUNT(*) AS count FROM platform_baseline_samples').all().map(row => row.detail).join('\n');
+  assert.match(plan, /COVERING INDEX platform_baseline_valid_bucket/);
   await reopened.close();
 });
 
