@@ -8,6 +8,7 @@ locals, arguments, headers or query strings.
 """
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -21,6 +22,20 @@ SLOW_SECONDS = 3.0
 STALL_SECONDS = 8.0
 DUMP_INTERVAL_SECONDS = 60.0
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__)) + os.sep
+
+
+def safe_text(value, limit=200):
+    """Escape control characters so a decoded request path cannot forge journal lines."""
+    text = value if isinstance(value, str) else str(value)
+    return re.sub(r"[\x00-\x1f\x7f]", lambda match: f"\\x{ord(match.group()):02x}", text[:limit])
+
+
+def _borrowed(limiter):
+    # A plain read of the limiter's borrower count; a stale value is harmless here.
+    try:
+        return limiter.borrowed_tokens if limiter is not None else None
+    except Exception:
+        return None
 
 
 def _frame(entry):
@@ -74,12 +89,12 @@ class SlowRequestMonitor:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         try:
-            busy = anyio.to_thread.current_default_thread_limiter().borrowed_tokens
+            limiter = anyio.to_thread.current_default_thread_limiter()
         except Exception:
-            busy = None
+            limiter = None
         token, started, status = object(), self.clock(), [None]
-        request = {"method": scope.get("method", ""), "path": scope.get("path", ""),
-                   "started": started, "busy": busy, "reported": False}
+        request = {"method": safe_text(scope.get("method", "")), "path": safe_text(scope.get("path", "")),
+                   "started": started, "busy": _borrowed(limiter), "limiter": limiter, "reported": False}
 
         async def tracked_send(message):
             if message["type"] == "http.response.start":
@@ -89,8 +104,13 @@ class SlowRequestMonitor:
         with self.lock:
             self.active[token] = request
             if self.watchdog is None:
-                self.watchdog = threading.Thread(target=self._watch, name="slow-request-watchdog", daemon=True)
-                self.watchdog.start()
+                watchdog = threading.Thread(target=self._watch, name="slow-request-watchdog", daemon=True)
+                try:
+                    watchdog.start()
+                    self.watchdog = watchdog
+                except Exception:
+                    # Diagnostics must never fail a request; the next request retries.
+                    log.exception("慢请求诊断线程启动失败")
         try:
             await self.app(scope, receive, tracked_send)
         finally:
@@ -99,7 +119,7 @@ class SlowRequestMonitor:
             elapsed = self.clock() - started
             if elapsed >= self.slow_seconds:
                 log.warning("慢请求 %s %s 状态 %s 用时 %.1f 秒（开始时线程池占用 %s）",
-                            request["method"], request["path"], status[0], elapsed, busy)
+                            request["method"], request["path"], status[0], elapsed, request["busy"])
 
     def check(self):
         """Log requests newly past the stall threshold, with thread positions at most once per interval."""
@@ -114,8 +134,9 @@ class SlowRequestMonitor:
             if dump:
                 self.last_dump = now
         for request in stalled:
-            log.warning("请求停滞 %s %s 已 %.1f 秒未完成（进行中 %d 个，开始时线程池占用 %s）",
-                        request["method"], request["path"], now - request["started"], in_flight, request["busy"])
+            log.warning("请求停滞 %s %s 已 %.1f 秒未完成（进行中 %d 个，线程池占用 开始时 %s / 当前 %s）",
+                        request["method"], request["path"], now - request["started"], in_flight,
+                        request["busy"], _borrowed(request["limiter"]))
         if dump:
             try:
                 log.warning("请求停滞时的线程位置：\n%s", "\n".join(self.stacks()))

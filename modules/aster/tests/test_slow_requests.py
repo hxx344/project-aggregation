@@ -23,11 +23,11 @@ class SlowRequestMonitorTests(unittest.TestCase):
         self.clock = Clock()
         self.dumps = 0
 
-    def monitor(self, app, **options):
+    def monitor(self, app, poll_seconds=0.01):
         def stacks():
             self.dumps += 1
             return ["MainThread: engine.py:1 state"]
-        return SlowRequestMonitor(app, clock=self.clock, stacks=stacks, poll_seconds=0.01, **options)
+        return SlowRequestMonitor(app, clock=self.clock, stacks=stacks, poll_seconds=poll_seconds)
 
     def test_stalled_request_is_reported_once_and_stack_dump_is_rate_limited(self):
         release, entered = asyncio.Event(), []
@@ -42,7 +42,8 @@ class SlowRequestMonitorTests(unittest.TestCase):
             pass
 
         async def run():
-            monitor = self.monitor(app)
+            # Only the explicit check() calls below may report; the watchdog stays asleep.
+            monitor = self.monitor(app, poll_seconds=3600)
             first = asyncio.create_task(monitor(scope(), None, noop))
             second = asyncio.create_task(monitor(scope("/api/hub/summary"), None, noop))
             while len(entered) < 2:
@@ -84,6 +85,46 @@ class SlowRequestMonitorTests(unittest.TestCase):
                 self.assertFalse(watchdog.is_alive())
         self.assertIsNone(monitor.watchdog)
         self.assertEqual(self.dumps, 0)
+
+    def test_downstream_error_propagates_and_request_is_released(self):
+        async def app(scope, receive, send):
+            raise RuntimeError("boom")
+
+        monitor = self.monitor(app)
+        with self.assertRaisesRegex(RuntimeError, "boom"):
+            asyncio.run(monitor(scope(), None, None))
+        self.assertEqual(monitor.active, {})
+
+    def test_watchdog_start_failure_does_not_fail_the_request_and_is_retried(self):
+        served = []
+
+        async def app(scope, receive, send):
+            served.append(scope["path"])
+
+        monitor = self.monitor(app)
+        real_start = threading.Thread.start
+        threading.Thread.start = lambda thread: (_ for _ in ()).throw(RuntimeError("can't start new thread"))
+        try:
+            with self.assertLogs("aster.slow_requests", "ERROR"):
+                asyncio.run(monitor(scope(), None, None))
+        finally:
+            threading.Thread.start = real_start
+        self.assertEqual(served, ["/api/state"])
+        self.assertEqual(monitor.active, {})
+        self.assertIsNone(monitor.watchdog)
+        asyncio.run(monitor(scope(), None, None))
+        self.assertEqual(len(served), 2)
+
+    def test_control_characters_in_path_are_escaped(self):
+        async def app(scope, receive, send):
+            self.clock.value += 9
+
+        monitor = self.monitor(app)
+        with self.assertLogs("aster.slow_requests", "WARNING") as logs:
+            asyncio.run(monitor(scope("/api/pairs/x\nFORGED"), None, None))
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("/api/pairs/x\\x0aFORGED", logs.records[0].getMessage())
+        self.assertNotIn("\n", logs.records[0].getMessage())
 
     def test_thread_stacks_name_the_package_frame_and_the_wait(self):
         lock, ready = threading.Lock(), threading.Event()
