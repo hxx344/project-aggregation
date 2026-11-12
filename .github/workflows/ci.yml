@@ -35,7 +35,41 @@ permissions:
   contents: read
 
 jobs:
+  # Pull requests run only the jobs that read the paths they change; the rules
+  # and their evidence live in scripts/ci-select.mjs. Pushes to main and manual
+  # runs skip this job and run everything, so a release candidate is always
+  # fully verified. Jobs skip only on an explicit 'false', so a selection that
+  # fails or writes nothing runs them all.
+  changes:
+    name: Select checks for the changed paths
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.select.outputs.app }}
+      build-tooling: ${{ steps.select.outputs.build-tooling }}
+      platform-executor: ${{ steps.select.outputs.platform-executor }}
+      aster-python: ${{ steps.select.outputs.aster-python }}
+      module-units: ${{ steps.select.outputs.module-units }}
+      installer-release: ${{ steps.select.outputs.installer-release }}
+      installer-slots: ${{ steps.select.outputs.installer-slots }}
+      installer-deploy: ${{ steps.select.outputs.installer-deploy }}
+      aster-relay: ${{ steps.select.outputs.aster-relay }}
+      options-backtest: ${{ steps.select.outputs.options-backtest }}
+      main-watch: ${{ steps.select.outputs.main-watch }}
+      release-mirror: ${{ steps.select.outputs.release-mirror }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The merge commit and its parents: the first parent is the PR base.
+          fetch-depth: 2
+      - name: Select jobs from the paths this pull request changes
+        id: select
+        run: node scripts/ci-select.mjs
+
   app:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.app != 'false') }}
     name: App ${{ matrix.lane }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }} (Ubuntu 24.04 x64, Node 24.15.0)
     # Match the deployment server: Ubuntu 24.04 LTS / x86_64.
     runs-on: ubuntu-24.04
@@ -124,6 +158,8 @@ jobs:
           if-no-files-found: error
 
   build-tooling:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.build-tooling != 'false') }}
     name: Module selection and incremental type checks
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -139,6 +175,8 @@ jobs:
         run: node --test --test-concurrency=2 deploy/test-module-builds.mjs deploy/test-typecheck-cache.mjs
 
   platform-executor:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.platform-executor != 'false') }}
     name: Unified platform executor prototype (simulated venues only)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -167,6 +205,8 @@ jobs:
         run: node scripts/measure.ts || test $? -eq 2
 
   aster-python:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.aster-python != 'false') }}
     name: Aster Python unit tests (${{ matrix.part }}, locked dependencies)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -187,6 +227,8 @@ jobs:
         run: ASTER_TEST_PART="${{ matrix.part }}" ASTER_TEST_PYTHON="$(command -v python)" bash deploy/test-aster-python.sh
 
   module-units:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.module-units != 'false') }}
     name: Module unit tests (Monitor, Crossex, Asset, Greeks)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -225,6 +267,8 @@ jobs:
           node scripts/review-ci.mjs
 
   installer-release:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.installer-release != 'false') }}
     name: Installer (recovery, release and updater)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -304,6 +348,8 @@ jobs:
           sudo env AGG_UPDATER_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-update-systemd.sh
 
   installer-slots:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.installer-slots != 'false') }}
     name: Installer (dual-slot units under real systemd)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -322,6 +368,8 @@ jobs:
           sudo env SLOTS_TEST_NODE="$(command -v node)" AGG_SLOTS_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-slots-systemd.sh
 
   installer-deploy:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.installer-deploy != 'false') }}
     name: Installer (activation, incremental and stack)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -352,6 +400,8 @@ jobs:
         run: sudo bash deploy/test-stack-ci.sh
 
   aster-relay:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.aster-relay != 'false') }}
     name: Aster relay (Ubuntu 26.04 system Python)
     runs-on: ubuntu-26.04
     timeout-minutes: 15
@@ -383,6 +433,8 @@ jobs:
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_RELAY_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-aster-relay-systemd.sh
 
   main-watch:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.main-watch != 'false') }}
     name: Main server watch (Ubuntu 24.04 systemd)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -406,6 +458,8 @@ jobs:
         run: sudo env PATH=/usr/sbin:/usr/bin:/sbin:/bin AGG_WATCH_DISPOSABLE_CI=1 GITHUB_ACTIONS=true bash deploy/test-main-watch-systemd.sh
 
   options-backtest:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.options-backtest != 'false') }}
     name: Options backtest engine
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -420,6 +474,8 @@ jobs:
           "$RUNNER_TEMP/optbt/bin/python" -m unittest discover -s tools/options-backtest/tests -v
 
   release-mirror:
+    needs: changes
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.changes.outputs.release-mirror != 'false') }}
     name: Release mirror (real Nginx and verified downloads)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -440,7 +496,10 @@ jobs:
 
   release:
     needs: [app, build-tooling, platform-executor, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, options-backtest, main-watch, release-mirror]
-    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # A status function is required here: changes is skipped outside pull
+    # requests, and the default success() would then skip this job too. Every
+    # listed job must have succeeded, so a skipped one never publishes.
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
