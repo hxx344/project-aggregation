@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { ArrowUpRight, ChevronDown, CircleAlert, LoaderCircle, RefreshCw, ShieldCheck, Wallet } from 'lucide-react';
+import { ArrowUpRight, ChevronDown, CircleAlert, LoaderCircle, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Callout, StatePanel } from './StateViews';
 import { usePositionsCache } from './positions-cache-context';
 import { amount, beijingTime } from './trading-format';
 import type { AssetPosition, PositionAccount, PositionScope, PositionScopeStatus, PositionSource } from './trading-positions-types';
@@ -144,9 +145,9 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
   const issues = sources.some(source => sourceStale(source) || source.data?.exchanges.some(exchange => exchange.accounts.some(account => account.scopes.some(scope => scope.status !== 'live' || oldTime(scope.fetchedAt, now)))));
   return <div className="positions-page">
     <div className="trading-toolbar"><p className="positions-readonly"><ShieldCheck size={15} /><span>Asset 中全部交易所账户的持仓 · 只读查看，账户在 Asset 管理</span></p><button className="button secondary" onClick={() => void load(true)} disabled={reading || offline}>{reading ? <LoaderCircle size={16} className="spin" /> : <RefreshCw size={16} />}刷新仓位</button></div>
-    {offline ? <div className="positions-notice" role="status"><CircleAlert size={17} />网络已断开，当前显示最后读取的旧值；连接恢复后自动更新。</div> : null}
-    {error ? <div className="positions-notice" role="alert"><CircleAlert size={17} /><span>{error}{data ? ' 当前保留上次数据，已标记为旧值。' : ''}</span></div> : null}
-    {data && reading ? <div className="positions-notice" role="status">已显示上次读取的仓位，正在后台更新。</div> : null}
+    {offline ? <Callout tone="warning" role="status">网络已断开，当前显示最后读取的旧值；连接恢复后自动更新。</Callout> : null}
+    {error ? <Callout tone="warning">{error}{data ? ' 当前保留上次数据，已标记为旧值。' : ''}</Callout> : null}
+    {data && reading ? <Callout tone="info">已显示上次读取的仓位，正在后台更新。</Callout> : null}
     {data ? <>
       <div className={`positions-overview ${stale || issues ? 'attention' : ''}`} role="status"><span>{stale ? '当前显示旧值' : issues ? '部分账户或来源待核对' : sources.length ? '仓位状态已更新' : '尚未接入 Asset 来源'}</span><small>工作台读取：{formatDate(data.generatedAt)}（北京时间）· 每 5 秒检查更新</small></div>
       <div className="positions-sources" aria-label="Asset 数据来源">{sources.map(source => <section className="positions-source" key={source.projectId}><div><strong>{source.name}</strong><span className={`positions-status ${source.status === 'ready' ? sourceStale(source) ? 'stale' : 'live' : source.status === 'unconfigured' ? 'unconfigured' : 'error'}`}>{source.status === 'ready' && sourceStale(source) ? '来源旧值' : sourceNames[source.status]}</span></div><p>来源读取：{formatDate(source.checkedAt)}（北京时间）</p>{source.error ? <p className="positions-warning">{source.error}</p> : null}<button className="positions-project-link" type="button" onClick={() => onProject(source.projectId)} aria-label={`在 ${source.name} 管理账户`}>在 Asset 管理账户<ArrowUpRight size={15} /></button></section>)}</div>
@@ -156,9 +157,9 @@ export default function TradingPositions({ onExpired, onProject, navigationSearc
         <label>账户<select value={filters.account} onChange={event => changeFilter('account', event.target.value)}><option value="">全部账户</option>{filters.account && !accountOptions.some(account => account.id === filters.account) ? <option value={filters.account}>账户已变更</option> : null}{accountOptions.map(account => <option key={account.id} value={account.id}>{account.label}</option>)}</select></label>
         {filters.source || filters.exchange || filters.account ? <button className="button secondary" onClick={() => updateFilters({ source: '', exchange: '', account: '' })}>清除筛选</button> : null}
       </div> : null}
-      {invalidFilter ? <div className="positions-notice" role="status">所选来源、交易所或账户已变更，请清除筛选后重新选择。</div> : null}
+      {invalidFilter ? <Callout tone="warning" role="status">所选来源、交易所或账户已变更，请清除筛选后重新选择。</Callout> : null}
       {visibleGroups.map(({ source, exchange, accounts }) => <section className="positions-exchange" key={`${source.projectId}:${exchange.id}`} aria-label={`${source.name} · ${exchange.name}`}><div className="positions-exchange-heading"><h2>{exchange.name}</h2><span>{source.name}</span></div>{accounts.map(account => <section className="positions-account" key={account.id}><div className="positions-account-heading"><h3>{account.name}</h3>{!account.configured ? <span className="positions-status unconfigured">未配置账户</span> : null}</div>{account.scopes.length ? account.scopes.map(scope => <ScopePositions key={scope.id} scope={scope} stale={sourceStale(source)} now={now} context={`${exchange.name} · ${account.name}`} />) : <p className="positions-scope-empty">{account.configured ? 'Asset 尚未提供此账户的产品范围。' : '在 Asset 配置此账户后显示仓位。'}</p>}</section>)}</section>)}
-      {!visibleGroups.length ? <div className="positions-empty"><Wallet size={27} /><h2>{!sources.length ? '尚未接入 Asset 来源' : invalidFilter ? '没有符合筛选的账户' : '暂未取得账户目录'}</h2><p>{!sources.length ? '在项目管理中添加 Asset 项目并配置登录连接，仓位目录会自动显示。' : invalidFilter ? '清除筛选后查看当前可用账户。' : '可进入上方 Asset 项目检查连接与账户配置。'}</p></div> : <p className="positions-footnote">数量和金额沿用交易所单位；不同币种分别显示。仅“已同步”的产品范围可确认空仓，旧值与读取失败不代表无持仓。</p>}
-    </> : <div className="positions-empty" role="status">{reading ? <><LoaderCircle className="spin" size={24} /><p>正在读取 Asset 仓位目录…</p></> : <><Wallet size={27} /><p>尚未取得仓位数据</p></>}</div>}
+      {!visibleGroups.length ? <StatePanel kind="empty" title={!sources.length ? '尚未接入 Asset 来源' : invalidFilter ? '没有符合筛选的账户' : '暂未取得账户目录'} detail={!sources.length ? '在项目管理中添加 Asset 项目并配置登录连接，仓位目录会自动显示。' : invalidFilter ? '清除筛选后查看当前可用账户。' : '可进入上方 Asset 项目检查连接与账户配置。'} /> : <p className="positions-footnote">数量和金额沿用交易所单位；不同币种分别显示。仅“已同步”的产品范围可确认空仓，旧值与读取失败不代表无持仓。</p>}
+    </> : reading ? <StatePanel kind="loading" title="正在读取 Asset 仓位目录…" /> : <StatePanel kind="empty" title="尚未取得仓位数据" />}
   </div>;
 }
