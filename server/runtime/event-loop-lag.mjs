@@ -13,7 +13,7 @@ const MAX_STALLS = 20;
 const round = value => Math.round(value);
 
 export function createEventLoopLag({ mono = () => performance.now(), now = Date.now, tickMs = EVENT_LOOP_TICK_MS, stallMs = EVENT_LOOP_STALL_MS,
-  setTimer = setInterval, clearTimer = clearInterval } = {}) {
+  setTimer = setInterval, clearTimer = clearInterval, onStall = () => {} } = {}) {
   let last = null, timer = null, startedAt = null;
   // Each bucket covers BUCKET_MS of monotonic time; old ones fall out of the window.
   const buckets = [], stalls = [];
@@ -28,6 +28,8 @@ export function createEventLoopLag({ mono = () => performance.now(), now = Date.
     const endedAt = now();
     stalls.push({ endedAt: new Date(endedAt).toISOString(), durationMs: round(lag) });
     if (stalls.length > MAX_STALLS) stalls.shift();
+    // Diagnostics only; a failing observer must not stop stall accounting.
+    try { onStall(lag); } catch { /* ignored */ }
   }
   function observe() {
     const at = mono();
