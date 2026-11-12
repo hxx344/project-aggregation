@@ -1,5 +1,5 @@
 import { createTradingExchangeClient, TradingExchangeError, MAX_FUNDING_EVENTS } from './trading-exchanges.mjs';
-import { decimal, addDecimals, negateDecimal, compareDecimals } from './trading-decimal.mjs';
+import { decimal, addDecimals, negateDecimal, decimalUnits, formatDecimalUnits } from './trading-decimal.mjs';
 import { normalizeTradingDiagnostic, formatTradingDiagnostic } from './trading-diagnostics.mjs';
 import { createTradingPnl } from './trading-pnl.mjs';
 import { createHash } from 'node:crypto';
@@ -15,7 +15,7 @@ const POSITION_STALE = 75_000, FUNDING_STALE = 900_000;
 const PAGE_SIZE = 50;
 const HYNIX_NAMES = Object.freeze({ SKHYUSDT: 'SKHY · ADR', SKHYNIXUSDT: 'SKHYNIX · 正股' });
 const iso = time => new Date(time).toISOString();
-const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+const timeOf = value => { const time = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(time) ? time : null; };
 
 export class TradingError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -117,7 +117,25 @@ function normalizeReceipts(events, exchange, start = 0, end = Infinity, ledger =
     result.set(row.id, row);
     if (result.size > MAX_FUNDING_EVENTS) throw new Error('Invalid funding event count');
   }
-  return [...result.values()].sort((a, b) => timeOf(a.time) - timeOf(b.time) || a.id.localeCompare(b.id));
+  return sortReceipts([...result.values()]);
+}
+// Oldest first (direction -1: newest first), ties by id ascending; each time is
+// parsed once instead of in every comparison.
+function sortReceipts(rows, direction = 1) {
+  return rows.map(row => ({ at: timeOf(row.time), row })).sort((a, b) => direction * (a.at - b.at) || a.row.id.localeCompare(b.row.id)).map(item => item.row);
+}
+// Adds normalized receipts to an already normalized ledger: only the new rows
+// were validated, and a conflicting duplicate is still rejected.
+function mergeReceipts(rows, added) {
+  if (rows.length + added.length > MAX_FUNDING_EVENTS * 2) throw new Error('Invalid funding events');
+  const result = new Map(rows.map(row => [row.id, row]));
+  for (const row of added) {
+    const previous = result.get(row.id);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(row)) throw new Error('Conflicting funding receipt');
+    result.set(row.id, row);
+    if (result.size > MAX_FUNDING_EVENTS) throw new Error('Invalid funding event count');
+  }
+  return sortReceipts([...result.values()]);
 }
 // Position-only sections read beside the oil ledger, by snapshot key.
 const SIDE_MARKETS = Object.freeze({ hynix: { symbols: HYNIX_SYMBOLS, name: '海力士' }, anthropic: { symbols: ANTHROPIC_SYMBOLS, name: 'Anthropic' } });
@@ -180,9 +198,12 @@ function sumOrUnknown(positions, field, signed = false) {
 }
 function cashTotals(events, known) {
   if (!known && !events.length) return { income: null, expense: null, net: null };
-  const income = addDecimals(events.filter(row => compareDecimals(row.amount, '0') > 0).map(row => row.amount));
-  const expense = negateDecimal(addDecimals(events.filter(row => compareDecimals(row.amount, '0') < 0).map(row => row.amount)));
-  return { income, expense, net: addDecimals(events.map(row => row.amount)) };
+  let income = 0n, expense = 0n;
+  for (const row of events) {
+    const amount = decimalUnits(row.amount);
+    if (amount > 0n) income += amount; else expense -= amount;
+  }
+  return { income: formatDecimalUnits(income), expense: formatDecimalUnits(expense), net: formatDecimalUnits(income - expense) };
 }
 function structure(legs) {
   if (legs.some(leg => leg.state !== 'live')) return { state: 'unknown', message: '等待两所最新仓位，暂不判断四腿结构' };
@@ -294,7 +315,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
       if (incomingCoverage.some(item => item.start < start || item.end > end) || result.complete && !covered(incomingCoverage, start, end)) throw new Error('Invalid funding coverage');
       const diagnostic = progress || result.complete ? null : normalizeTradingDiagnostic(result.diagnostic);
       write(exchange, row.revision, snapshot => {
-        const events = normalizeReceipts([...snapshot[kind].events.filter(item => timeOf(item.time) >= end - 31 * DAY), ...added], exchange, 0, Infinity, kind);
+        const events = mergeReceipts(snapshot[kind].events.filter(item => timeOf(item.time) >= end - 31 * DAY), added);
         const coverage = mergeCoverage([...snapshot[kind].coverage, ...incomingCoverage]).filter(item => item.end > end - 31 * DAY).map(item => ({ start: Math.max(item.start, end - 31 * DAY), end: item.end }));
         return { ...snapshot, [kind]: { ...snapshot[kind], events, coverage, fetchedAt: result.fetchedAt, diagnostic,
           error: progress || result.complete ? null : formatTradingDiagnostic(diagnostic) || `${ledger.name}记录未取全，当前仅显示已获取记录，请刷新重试` } };
@@ -348,7 +369,7 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
           complete: fundingState === 'live' && covered(snapshot.funding.coverage, start, end) },
         trades: tradesStatus(connected, snapshot.trades, current) };
     });
-    const events = entries.filter(({ row }) => row.credentials).flatMap(({ snapshot }) => snapshot.funding.events).filter(item => timeOf(item.time) >= start && timeOf(item.time) < end).sort((a, b) => timeOf(b.time) - timeOf(a.time) || a.id.localeCompare(b.id));
+    const events = sortReceipts(entries.filter(({ row }) => row.credentials).flatMap(({ snapshot }) => snapshot.funding.events).filter(item => timeOf(item.time) >= start && timeOf(item.time) < end), -1);
     const complete = accounts.every(account => account.funding.complete);
     const totals = cashTotals(events, complete);
     const legs = pair.flatMap(exchange => SYMBOLS.map(symbol => {
@@ -438,7 +459,8 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
         const value = unpackTradingView(saved.json, days, now(), pair);
         const start = timeOf(value.period.start), end = timeOf(value.period.end);
         value.funding.events = entriesFor(pair).filter(({ row }) => row.credentials).flatMap(({ snapshot }) => snapshot.funding.events)
-          .filter(event => timeOf(event.time) >= start && timeOf(event.time) < end).sort((a, b) => timeOf(b.time) - timeOf(a.time) || a.id.localeCompare(b.id));
+          .filter(event => timeOf(event.time) >= start && timeOf(event.time) < end);
+        value.funding.events = sortReceipts(value.funding.events, -1);
         restored.set(`${pairKey}:${days}`, value);
       } catch { return false; }
     }
