@@ -6,7 +6,7 @@ import { VENUE_EXECUTION_SYMBOLS, VENUE_READ_SYMBOLS, accountKey, type AccountBi
 import { VenueError, type CallOptions, type ConnectorCapabilities, type OrderReport, type OrderRequest, type OrderStatus, type SendOptions, type VenueConnector } from '../connector.ts';
 import { cmp, isZero, sub } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
-import { PreflightError, binancePermissionProblem } from './permissions.ts';
+import { PreflightError, binanceIpProblem, binancePermissionProblem } from './permissions.ts';
 import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export type { LiveCredentials } from './values.ts';
@@ -254,7 +254,8 @@ export function createBinanceConnector(options: BinanceConnectorOptions): VenueC
 
     preflight: (binding: AccountBinding, { signal }: CallOptions) => reading(async () => {
       const routes = endpoints(binding.accountMode);
-      const problem = binancePermissionProblem(record(await signed(binding, routes.permissions, {}, { signal }), '密钥权限'), binding.accountMode);
+      const restrictions = record(await signed(binding, routes.permissions, {}, { signal }), '密钥权限');
+      const problem = binancePermissionProblem(restrictions, binding.accountMode) ?? binanceIpProblem(restrictions);
       if (problem) throw new PreflightError(`Binance 密钥权限不符合要求：${problem}`);
       if (record(await signed(binding, routes.config, {}, { signal }), '账户配置').canTrade !== true) throw new PreflightError('Binance 合约账户当前不可交易');
       await readMode(binding, signal);

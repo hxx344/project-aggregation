@@ -10,7 +10,7 @@ import {
 } from '../connector.ts';
 import { add, cmp, isZero } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
-import { PreflightError, bybitAccountProblem, bybitPermissionProblem } from './permissions.ts';
+import { PreflightError, bybitAccountProblem, bybitIpProblem, bybitPermissionProblem } from './permissions.ts';
 import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export interface BybitConnectorOptions {
@@ -325,7 +325,7 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
 
     preflight: (binding: AccountBinding, { signal }: CallOptions) => reading(async () => {
       const info = await signed(binding, 'GET', '/v5/user/query-api', {}, { signal });
-      const problem = bybitPermissionProblem(info);
+      const problem = bybitPermissionProblem(info) ?? bybitIpProblem(info);
       if (problem) throw new PreflightError(`Bybit 密钥权限不符合要求：${problem}`);
       const accountProblem = bybitAccountProblem((await signed(binding, 'GET', '/v5/account/info', {}, { signal })).unifiedMarginStatus);
       if (accountProblem) throw new PreflightError(accountProblem);

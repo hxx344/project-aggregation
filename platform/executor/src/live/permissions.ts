@@ -63,6 +63,19 @@ export function bybitPermissionProblem(info: Record<string, unknown>): string | 
   return null;
 }
 
+/**
+ * A live key must be bound to the host's egress IPs, so a leaked key cannot trade from elsewhere (stricter than the
+ * workbench client, which does not check this).
+ */
+export function binanceIpProblem(info: Record<string, unknown>): string | null {
+  return info.ipRestrict === true ? null : '密钥未限制访问 IP，请在 Binance API 管理里只允许本机出口 IP';
+}
+export function bybitIpProblem(info: Record<string, unknown>): string | null {
+  const ips = info.ips;
+  if (!Array.isArray(ips) || ips.length === 0 || ips.some(ip => typeof ip !== 'string' || ip.trim() === '' || ip.trim() === '*')) return '密钥未绑定 IP，请在 Bybit API 管理里只允许本机出口 IP';
+  return null;
+}
+
 /** Bybit /v5/account/info unifiedMarginStatus: 3–6 are unified trading accounts, 1 is a classic account. */
 export function bybitAccountProblem(status: unknown): string | null {
   if (status === 3 || status === 4 || status === 5 || status === 6) return null;

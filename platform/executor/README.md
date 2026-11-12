@@ -26,7 +26,7 @@ node scripts/measure.ts                                        # 混合负载测
 
 ### 实盘金丝雀模式（3.0c）
 
-只在用户当次授权账户、合约与金额后运行；代码已接线，尚未连过真实账户。
+只在用户当次授权账户、合约与金额后运行；代码已接线，尚未连过真实账户。只支持 Linux。
 
 ```bash
 node src/main.ts --data-dir /home/<用户>/pa-executor-live --port 4711 --live-config /home/<用户>/pa-executor-live.json
@@ -47,12 +47,13 @@ node src/main.ts --data-dir /home/<用户>/pa-executor-live --port 4711 --live-c
 
 密钥文件同样须为当前用户所有且权限 600：`{ "binance": { "apiKey": "…", "apiSecret": "…" }, "bybit": { "apiKey": "…", "apiSecret": "…" } }`。换密钥时把配置里的 `credentialVersion` 加 1 再重启（不能回退）。
 
-启动顺序：读配置与密钥文件 → 逐个账户做启动检查（每个账户 30 秒上限）→ 建数据目录并核对环境标记 → 打开库、登记账户 → 监听。任何一步失败都拒绝启动并说明原因，启动检查失败时数据目录不被创建或改动。启动检查沿用工作台执行客户端的规则：
+启动顺序：读配置 → 按账户取本机进程锁 → 读密钥文件 → 逐个账户做启动检查（每个账户 30 秒上限）→ 建数据目录并核对环境标记 → 打开库、登记账户 → 监听。任何一步失败都拒绝启动并说明原因，启动检查失败时数据目录不被创建或改动；登记账户失败时立即交还写入租约。进程锁是 Linux 抽象套接字 `pa-executor-live/<交易所>/<账户>`，进程结束由内核释放：同一真实账户在本机只能有一个实盘执行器，换数据目录也不行（两个实例会各算各的名义金额累计，并把对方的委托当外部委托）。配置与密钥文件以非阻塞方式打开、最多读 64 KiB；密钥文件格式错误时报错不回显字段名或内容。启动检查沿用工作台执行客户端的规则：
 
+- 两家都要求密钥绑定 IP（比工作台执行客户端更严）：Binance `ipRestrict` 须为真，Bybit `ips` 须非空且不含 `*`。
 - Binance：`/sapi/v1/account/apiRestrictions` 只允许读取与所选账户模式的合约交易权限（`standard` 要“允许合约”，`portfolio-margin` 要“开启统一账户交易”），提现、划转、杠杆、期权、现货等其它 `enable*`/`permits*` 项只要不是 `false` 就要求关闭，关键项缺失也拒绝；合约账户 `canTrade` 须为真；`/api/v3/account` 的 UID 须等于配置的 `accountId`。
 - Bybit：`/v5/user/query-api` 须为读写密钥，ContractTrade、Derivatives、Wallet、Spot、Options 五类权限都须列出，ContractTrade 至少含 Order、只可含 Order 与 Position，Derivatives 只可含 DerivativesTrade，其余任何类别必须为空；`/v5/account/info` 的 `unifiedMarginStatus` 须为 3–6（统一交易账户）；`userID` 须等于配置的 `accountId`。
 
-数据目录首次使用时写入环境标记文件 `environment`（`simulated` 或 `mainnet`）。已标记为模拟、或没有标记但已有 `executor.sqlite`（标记出现之前的模拟目录）的目录不能以实盘启动，实盘目录也不能以模拟启动：模拟任务与真实任务的账本、名义金额累计不能混在一个库里。连接器只把密钥交给配置里的账户与凭据版本，库里残留的其它绑定拿不到密钥（不发送任何请求）。页面标题与横幅标明实盘，确认按钮为“确认执行（实盘）”，`/api/state` 的 `transport` 为 `live`。
+实盘库名为 `executor-live.sqlite`（模拟仍是 `executor.sqlite`），回退到不认环境标记的旧代码时，旧代码在实盘目录里只会打开一个空的模拟库，不会拿模拟场所核对真实任务。数据目录首次使用时写入并落盘环境标记文件 `environment`（`simulated` 或 `mainnet`）；没有标记时按库文件判断（有 `executor-live.sqlite` 为实盘，有 `executor.sqlite` 为模拟）。已用于模拟的目录不能以实盘启动，实盘目录也不能以模拟启动：模拟任务与真实任务的账本、名义金额累计不能混在一个库里。连接器只把密钥交给配置里的账户与凭据版本，库里残留的其它绑定拿不到密钥（不发送任何请求）。页面标题与横幅标明实盘，确认按钮为“确认执行（实盘）”，`/api/state` 的 `transport` 为 `live`。
 
 测量脚本在同一进程里同时跑两腿任务、4 个模拟配对的保证金划转（每配对 10 次）与 ADL 事件（每配对 10 次），三个循环按入口方式分开调度；结果为 JSON，含各循环单轮耗时、ADL 发现/首次下单/结束耗时与划转发送/结清耗时。常用参数：`--jobs`、`--pairs`、`--adl-events`、`--transfers`、`--aster-latency-ms`（给每次模拟 ASTER 调用加延迟，看慢 ASTER 是否拖住两腿任务；延迟不响应中止，须小于 ADL 下单时限 `adlOrderTimeoutMs` 3 秒，否则下单按超时处理、事件等满观察窗，运行以退出码 3 结束）、`--loop-spacing-ms`。读线程默认把历史表扫描按主键每 20000 行切成一片，每片一次读取（`--scan-chunk-rows`，0 为整表一次读取）；主线程按入口的方式每秒调用一次 WAL 维护（`--no-wal-reset` 关闭）。`--scan-chunk-rows 0 --no-wal-reset` 还原 2.5 之前的行为，用于对照。结果中的 `walReset` 为截断次数、放弃次数与耗时，`checkpointsIncomplete` 为回填线程被动 checkpoint 未能完成的次数，`readerSnapshotMaxMs` 为读线程单次读取最长占用快照的时间。数据库建在系统临时目录（可用 `TMPDIR` 指到数据盘），结束后删除，`--keep` 保留。未达建议预算时退出码 2，任务、ADL 事件或划转未全部完成时退出码 3。
 
@@ -231,7 +232,7 @@ DELETE FROM schema_migrations WHERE version = 4;
   - 每次读取 `/api/state` 都从库内全部开仓任务重算累计，任务从不清理；金丝雀规模下可忽略。
 - 真实连接器（3.0b）接真实账户（3.0c）前须核实或补齐：
   - 两个连接器都没在真实账户上跑过；Binance 统一账户（`portfolio-margin`）的 `papi` 端点照搬生产客户端，未经本模块验证。
-  - 密钥权限、账户可交易状态与账户身份只在启动时检查一次（3.0c），运行中不复查；运行中有人改了密钥权限或账户状态，要到下次启动才发现。IP 白名单不检查（Binance `ipRestrict`、Bybit `ips` 只记不判）。
+  - 密钥权限、账户可交易状态与账户身份只在启动时检查一次（3.0c），运行中不复查；运行中有人改了密钥权限或账户状态，要到下次启动才发现。IP 白名单只核对“已绑定”，不核对绑定的是不是本机出口 IP。名义金额上限没有代码内硬顶（只受 `NOTIONAL_LIMIT_CEILING`），数值以配置为准、启动时打印。
   - Bybit 仍未核实（盘点第 47 项）：`/v5/strategy/order-list` 外层是否带 `nextCursor`（缺它时满页报读取失败，短页视为读完）；双向持仓账户上的策略与子单形状；部分成交后停止时子单的状态与数量；策略结束后其挂单是否短暂留在 `/v5/order/realtime`（会使下一批的发单前检查报外部委托）；多页时的分页；不带时间参数的运行中策略列表是否有时间限制。
   - Bybit 追价创建回执之后、策略记录可见之前若有延迟，执行器 ACK 后的首次查询会查无并按创建结果未知处理（见上文 ACK 后查询一条）。
   - Bybit 下单后的首个状态来自紧接着的一次查询，查不到时报为未成交的新委托，之后靠按客户订单号查询收敛；IOC 单在这段时间里实际已结束。

@@ -52,7 +52,7 @@ export class FakeBybit {
   nextOrder = 1;
   /** query-api answer of a key that may trade contracts only. */
   apiInfo: Row = {
-    id: '1', apiKey: KEY, readOnly: 0, userID: 9_007_199_254_740_993n, ips: ['*'], type: 1,
+    id: '1', apiKey: KEY, readOnly: 0, userID: 9_007_199_254_740_993n, ips: ['203.0.113.7'], type: 1,
     permissions: { ContractTrade: ['Order', 'Position'], Derivatives: ['DerivativesTrade'], Wallet: [], Spot: [], Options: [], Exchange: [], CopyTrading: [], BlockTrade: [], NFT: [], Affiliate: [], Earn: [] },
   };
   unifiedMarginStatus: unknown = 5;

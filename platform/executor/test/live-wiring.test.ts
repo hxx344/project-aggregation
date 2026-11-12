@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,11 +14,11 @@ import { VenueError } from '../src/connector.ts';
 import { createBinanceConnector } from '../src/live/binance.ts';
 import { createBybitConnector } from '../src/live/bybit.ts';
 import { PreflightError, binancePermissionProblem, bybitPermissionProblem } from '../src/live/permissions.ts';
-import { createLiveConnectors, loadLiveConfig, loadLiveCredentials, preflightLive, type LiveConfig } from '../src/live/setup.ts';
+import { createLiveConnectors, holdAccountLocks, loadLiveConfig, loadLiveCredentials, preflightLive, type LiveConfig } from '../src/live/setup.ts';
 import { openStore } from '../src/store.ts';
 import { createExecutorServer } from '../src/http.ts';
 import type { AddressInfo } from 'node:net';
-import { claimDataDirEnvironment } from '../src/main.ts';
+import { DATABASE_FILES, claimDataDirEnvironment } from '../src/main.ts';
 import { LIVE_PAGE, PAGE } from '../src/page.ts';
 import { chaseIntent, createHarness, openIntent } from './harness.ts';
 import { FakeBinance, KEY as BINANCE_KEY, SECRET as BINANCE_SECRET, binding as binanceBinding } from './live-fake-binance.ts';
@@ -63,6 +64,8 @@ test('实盘启动检查（Binance）：只开读取与合约的密钥通过；�
     [{ enableFutures: false }, /请开启：允许合约/],
     [{ enablePortfolioMarginTrading: true }, /请将账户模式改为 portfolio-margin/],
     [{ enableMargin: undefined }, /未返回权限状态：允许杠杆借贷/],
+    [{ ipRestrict: false }, /未限制访问 IP/],
+    [{ ipRestrict: undefined }, /未限制访问 IP/],
   ] as const) {
     venue.restrictions = { ...base, ...change };
     await assert.rejects(connector.preflight!(binanceBinding(), { signal: signal() }), preflightError(pattern), JSON.stringify(change));
@@ -97,6 +100,10 @@ test('实盘启动检查（Bybit）：只开合约订单与持仓的读写密钥
     [{ ...base, permissions: { ...scopes, Exchange: ['ExchangeHistory'] } }, /请关闭：Exchange - ExchangeHistory/],
     [{ ...base, permissions: { ...scopes, ContractTrade: ['Position'] } }, /请开启：合约交易 - 订单/],
     [{ ...base, permissions: { ...scopes, Spot: [1] } }, /格式无效/],
+    [{ ...base, ips: ['*'] }, /未绑定 IP/],
+    [{ ...base, ips: ['203.0.113.7', ' * '] }, /未绑定 IP/],
+    [{ ...base, ips: [] }, /未绑定 IP/],
+    [{ ...base, ips: undefined }, /未绑定 IP/],
   ] as const) {
     venue.apiInfo = info as Record<string, unknown>;
     await assert.rejects(connector.preflight!(bybitBinding(), { signal: signal() }), preflightError(pattern), pattern.source);
@@ -133,7 +140,15 @@ test('实盘配置与密钥文件：只认属主本人且 600 权限的文件；
     assert.throws(() => loadLiveCredentials(broken), (error: unknown) => error instanceof Error && error.message === '密钥文件不是有效的 JSON');
     const badKey = privateFile(dir, 'bad-key.json', { ...KEYS, bybit: { apiKey: 'has space', apiSecret: BYBIT_SECRET } });
     assert.throws(() => loadLiveCredentials(badKey), (error: unknown) => error instanceof Error && /bybit 的密钥不完整/.test(error.message) && !error.message.includes(BYBIT_SECRET));
-    assert.throws(() => loadLiveCredentials(privateFile(dir, 'extra.json', { ...KEYS, aster: KEYS.bybit })), /不支持的字段：aster/);
+    assert.throws(() => loadLiveCredentials(privateFile(dir, 'extra.json', { ...KEYS, aster: KEYS.bybit })), /顶层的字段须恰好为 binance、bybit/);
+    // A key pasted in place of a field name never reaches the message.
+    assert.throws(() => loadLiveCredentials(privateFile(dir, 'pasted.json', { ...KEYS, binance: { [BINANCE_SECRET]: BINANCE_KEY, apiSecret: BINANCE_SECRET } })),
+      (error: unknown) => error instanceof Error && /binance 的字段须恰好为 apiKey、apiSecret/.test(error.message) && !error.message.includes(BINANCE_SECRET) && !error.message.includes(BINANCE_KEY));
+    const big = privateFile(dir, 'big.json', JSON.stringify({ ...KEYS, pad: 'x'.repeat(70_000) }));
+    assert.throws(() => loadLiveCredentials(big), /超过 64 KiB/);
+    const fifo = join(dir, 'fifo.json');
+    execFileSync('mkfifo', ['-m', '600', fifo]);
+    assert.throws(() => loadLiveCredentials(fifo), /不是普通文件/);
 
     for (const [change, pattern] of [
       [{ accounts: config.accounts.slice(0, 1) }, /各一个账户/],
@@ -166,8 +181,9 @@ test('实盘连接器的密钥只给配置里的账户与凭据版本；启动�
 test('数据目录环境标记：新目录记下首次环境；模拟用过的目录（含无标记的旧库）不能跑实盘，实盘目录也不能跑模拟', () => {
   const dir = tempDir();
   try {
-    const fresh = join(dir, 'fresh'), legacy = join(dir, 'legacy'), live = join(dir, 'live');
-    for (const path of [fresh, legacy, live]) mkdirSync(path);
+    const fresh = join(dir, 'fresh'), legacy = join(dir, 'legacy'), live = join(dir, 'live'), unmarked = join(dir, 'unmarked');
+    for (const path of [fresh, legacy, live, unmarked]) mkdirSync(path);
+    assert.deepEqual(DATABASE_FILES, { simulated: 'executor.sqlite', mainnet: 'executor-live.sqlite' });
     claimDataDirEnvironment(fresh, 'simulated');
     assert.equal(readFileSync(join(fresh, 'environment'), 'utf8'), 'simulated\n');
     claimDataDirEnvironment(fresh, 'simulated');
@@ -183,6 +199,12 @@ test('数据目录环境标记：新目录记下首次环境；模拟用过的�
     assert.throws(() => claimDataDirEnvironment(live, 'simulated'), /已用于实盘，不能以模拟模式启动/);
     writeFileSync(join(live, 'environment'), 'testnet\n');
     assert.throws(() => claimDataDirEnvironment(live, 'mainnet'), /未知环境（testnet）/);
+
+    // A live database whose marker never reached the disk still marks the directory live.
+    writeFileSync(join(unmarked, 'executor-live.sqlite'), '');
+    assert.throws(() => claimDataDirEnvironment(unmarked, 'simulated'), /已用于实盘/);
+    claimDataDirEnvironment(unmarked, 'mainnet');
+    assert.equal(readFileSync(join(unmarked, 'environment'), 'utf8'), 'mainnet\n');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -271,4 +293,18 @@ test('HTTP：实盘执行器下发实盘页面，状态里的传输为 live 并�
     await Promise.all(servers.map(server => new Promise(resolve => server.close(resolve))));
     h.dispose();
   }
+});
+
+test('实盘账户进程锁：同一账户在本机只能有一个实盘执行器，与数据目录无关；释放后可再取', async () => {
+  const accounts = [binanceBinding({ accountId: `lock-${process.pid}` }), bybitBinding({ accountId: `lock-${process.pid}` })];
+  const first = await holdAccountLocks(accounts);
+  try {
+    await assert.rejects(holdAccountLocks([accounts[1]]), new RegExp(`bybit 账户 lock-${process.pid} 已被本机另一个实盘执行器占用`));
+    // A partly taken set is handed back: the binance lock of a second account must be free again afterwards.
+    const other = binanceBinding({ accountId: `lock-other-${process.pid}` });
+    await assert.rejects(holdAccountLocks([other, accounts[0]]), /binance 账户 .* 已被本机另一个实盘执行器占用/);
+    (await holdAccountLocks([other])).release();
+  } finally { first.release(); }
+  await new Promise(resolve => setImmediate(resolve));
+  (await holdAccountLocks(accounts)).release();
 });

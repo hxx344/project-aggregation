@@ -1,6 +1,7 @@
 // Live canary wiring (3.0c): the operator's config file, the key file and the startup checks. Keys stay in memory only;
 // no message built here carries a key, a secret or a fragment of the key file.
-import { closeSync, fstatSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
+import { createServer } from 'node:net';
 import { isAbsolute } from 'node:path';
 import { ContractError, exactKeys, parseBinding, parseNotionalLimits, type AccountBinding, type NotionalLimits, type Venue } from '../contracts.ts';
 import type { VenueConnector } from '../connector.ts';
@@ -19,16 +20,21 @@ export interface LiveConfig { notionalLimits: NotionalLimits; credentialsFile: s
 /** Reads a small regular file this user owns and nobody else can read or write; the open descriptor is checked, not the path. */
 function readPrivateFile(path: string, name: string): string {
   if (!isAbsolute(path)) throw new Error(`${name}必须是绝对路径`);
-  if (process.platform === 'win32' || typeof process.getuid !== 'function') throw new Error('实盘模式只在 Linux 或 macOS 上运行（需要检查文件属主与权限）');
+  if (process.platform !== 'linux' || typeof process.getuid !== 'function') throw new Error('实盘模式只在 Linux 上运行（需要检查文件属主与权限、按账户加进程锁）');
   let fd: number;
-  try { fd = openSync(path, 'r'); } catch (error) { throw new Error(`${name}无法打开：${(error as NodeJS.ErrnoException).code ?? '未知错误'}`); }
+  // Non-blocking, so a FIFO in place of the file fails the regular-file check instead of hanging the start.
+  try { fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK); } catch (error) { throw new Error(`${name}无法打开：${(error as NodeJS.ErrnoException).code ?? '未知错误'}`); }
   try {
     const stat = fstatSync(fd);
     if (!stat.isFile()) throw new Error(`${name}不是普通文件`);
     if (stat.uid !== process.getuid()) throw new Error(`${name}不属于当前用户`);
     if ((stat.mode & 0o077) !== 0) throw new Error(`${name}权限过宽，须为 600（chmod 600 ${path}）`);
-    if (stat.size > MAX_FILE_BYTES) throw new Error(`${name}超过 64 KiB`);
-    return readFileSync(fd, 'utf8');
+    // Bounded read: the file can still grow after fstat.
+    const buffer = Buffer.alloc(MAX_FILE_BYTES + 1);
+    let length = 0;
+    for (let read; length < buffer.length && (read = readSync(fd, buffer, length, buffer.length - length, null)) > 0;) length += read;
+    if (length > MAX_FILE_BYTES) throw new Error(`${name}超过 64 KiB`);
+    return buffer.toString('utf8', 0, length);
   } finally { closeSync(fd); }
 }
 /** JSON.parse messages quote the text around the error, so they never reach the operator for a file that may hold keys. */
@@ -58,17 +64,43 @@ export function loadLiveConfig(path: string): LiveConfig {
 /** The key file: { binance: { apiKey, apiSecret }, bybit: { apiKey, apiSecret } }. */
 export function loadLiveCredentials(path: string): Map<Venue, LiveCredentials> {
   const raw = parsePrivateJson(readPrivateFile(path, '密钥文件'), '密钥文件');
+  // Field names are never echoed: a key pasted in place of a name would otherwise reach the message.
+  const exactly = (value: unknown, names: readonly string[], where: string): Record<string, unknown> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.keys(value).length !== names.length || !names.every(name => Object.hasOwn(value, name))) throw new Error(`密钥文件无效：${where}的字段须恰好为 ${names.join('、')}`);
+    return value as Record<string, unknown>;
+  };
+  const value = exactly(raw, LIVE_VENUES, '顶层');
   const keys = new Map<Venue, LiveCredentials>();
-  try {
-    const value = exactKeys(raw, LIVE_VENUES);
-    for (const venue of LIVE_VENUES) {
-      const entry = exactKeys(value[venue], ['apiKey', 'apiSecret']);
-      const credentials = { apiKey: entry.apiKey, apiSecret: entry.apiSecret } as LiveCredentials;
-      if (!validCredentials(credentials)) throw new Error(`${venue} 的密钥不完整或格式无效`);
-      keys.set(venue, credentials);
-    }
-  } catch (error) { throw explain(error, '密钥文件'); }
+  for (const venue of LIVE_VENUES) {
+    const entry = exactly(value[venue], ['apiKey', 'apiSecret'], ` ${venue} `);
+    const credentials = { apiKey: entry.apiKey, apiSecret: entry.apiSecret } as LiveCredentials;
+    if (!validCredentials(credentials)) throw new Error(`密钥文件无效：${venue} 的密钥不完整或格式无效`);
+    keys.set(venue, credentials);
+  }
   return keys;
+}
+
+/**
+ * One live executor per real account on this host, whatever its data directory: two instances would each keep their own
+ * notional total and treat the other's orders as foreign. The lock is a Linux abstract socket, released by the kernel
+ * when the process ends, so a crash leaves no stale lock.
+ */
+export async function holdAccountLocks(accounts: readonly AccountBinding[]): Promise<{ release(): void }> {
+  if (process.platform !== 'linux') throw new Error('实盘模式只在 Linux 上运行（按账户加进程锁）');
+  const servers: ReturnType<typeof createServer>[] = [];
+  const release = () => { for (const server of servers) server.close(); };
+  try {
+    for (const account of accounts) {
+      const server = createServer(socket => socket.destroy());
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', error => reject((error as NodeJS.ErrnoException).code === 'EADDRINUSE' ? new Error(`${account.venue} 账户 ${account.accountId} 已被本机另一个实盘执行器占用`) : error));
+        server.listen(`\0pa-executor-live/${account.venue}/${account.accountId}`, () => resolve());
+      });
+      server.unref();
+      servers.push(server);
+    }
+  } catch (error) { release(); throw error; }
+  return { release };
 }
 
 /**
