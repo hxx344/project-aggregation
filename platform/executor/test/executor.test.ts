@@ -84,7 +84,7 @@ test('C01 能力与身份：ANT 不可执行、Bybit ANT 不可读、跨所与�
 test('C01 原型拒绝任何非模拟传输或非模拟环境', () => withHarness(async h => {
   const live = { ...h.binance, venue: 'binance', capabilities: { ...h.binance.capabilities, transport: 'live' } } as unknown as typeof h.binance;
   assert.throws(() => createExecutor({ store: h.store, connectors: [live] }), code('live_transport_refused'));
-  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance], environment: 'mainnet' }), code('live_transport_refused'));
+  assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance], environment: 'mainnet', notionalLimits: { perJob: '1', totalOpen: '1' } }), code('live_transport_refused'));
   assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance, h.binance] }), code('duplicate_connector'));
 }));
 

@@ -82,7 +82,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
 
     if (request.method === 'GET' && url.pathname === '/api/state') {
-      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), jobs: executor.recentJobs(20),
+      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
         adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
     }

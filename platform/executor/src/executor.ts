@@ -4,8 +4,8 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { add, bandEdge, cmp, floorToStep, isMultiple, isZero, mul, sub, units, fromUnits } from './decimal.ts';
 import {
-  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseQuote, positionOf, reject, text,
-  type AccountBinding, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type Venue,
+  ContractError, MAX_SLIPPAGE_BPS, UUID, VENUE_NAMES, VENUE_READ_SYMBOLS, accountKey, checkQuoteFresh, exactKeys, orderSideOf, parseAccountSnapshot, parseBinding, parseConfirm, parseInstrument, parseIntent, parseNotionalLimits, parseQuote, positionOf, reject, text,
+  type AccountBinding, type NotionalLimits, type AccountSnapshot, type Action, type Environment, type Instrument, type Intent, type LegOrderType, type OrderSide, type PositionSide, type Quote, type Venue,
 } from './contracts.ts';
 import {
   STRATEGY_ID, VenueError, parseOrderReport, parseStrategyAck, parseStrategyReport, strategyRequestOf, supportsChase,
@@ -123,6 +123,8 @@ export interface Preview {
   writerGeneration: number;
   intent: Intent;
   legs: [PlannedLeg, PlannedLeg];
+  /** USDT, as counted against the notional limits; recomputed from the legs at confirm, never trusted from here. */
+  notional: string;
   notes: string[];
 }
 export interface Job {
@@ -224,15 +226,30 @@ export interface ExecutorOptions {
   adl?: AdlConnector;
   /** Read-only display of the pairs' ASTER positions; read by `refreshPositions`, which the entry schedules apart from the other passes. */
   positions?: AsterPositionsConnector;
+  /** Hard notional caps checked at preview and again inside the confirm transaction; required on mainnet. */
+  notionalLimits?: NotionalLimits;
 }
 
 const digest = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const exposure = (quantity: string, instrument: Instrument): string => mul(quantity, instrument.contractSize);
 const maskId = (id: string): string => id.length > 4 ? `***${id.slice(-4)}` : '***';
+const maxOf = (...values: string[]): string => values.reduce((top, value) => cmp(value, top) > 0 ? value : top);
+/**
+ * A leg's notional at the highest price the plan admits for it: the preview bound, the book's ask or the limit, whichever is
+ * highest, so a sell is not undercounted at its lower bound. The market hedge carries no venue-enforced price limit, so its
+ * real fill can still cost more than this.
+ */
+const legNotional = (leg: Pick<PlannedLeg, 'quantity' | 'instrument' | 'priceBound' | 'quote' | 'limitPrice'>): string =>
+  mul(exposure(leg.quantity, leg.instrument), maxOf(leg.priceBound ?? '0', leg.quote.ask, leg.limitPrice ?? '0'));
+/** Both legs carry the same barrels, so the job's notional is the dearer leg, not their sum. */
+const jobNotional = (legs: readonly PlannedLeg[]): string => maxOf(...legs.map(legNotional));
 /** `pa1-` + 24 hex + `-` + leg index, plus `r` + attempt for a resumed hedge (at most two digits). */
 const CLIENT_ORDER_ID_LENGTH = 33;
 
-export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector }: ExecutorOptions) {
+export function createExecutor({ store, connectors, environment = 'simulated', now = Date.now, budgets: overrides = {}, control: controlOptions, transfers: transferConnector, adl: adlConnector, positions: positionsConnector, notionalLimits }: ExecutorOptions) {
+  // Jobs never run on a real account without hard caps; a malformed cap stops the start instead of being ignored.
+  if (environment === 'mainnet' && connectors.length > 0 && !notionalLimits) throw new ContractError(500, 'notional_limits_required', '真实账户执行必须配置单笔与累计名义金额上限');
+  const limits = notionalLimits ? parseNotionalLimits(notionalLimits) : null;
   // An override passed as undefined keeps the default instead of turning the budget into NaN arithmetic.
   const budgets: Budgets = { ...DEFAULT_BUDGETS, ...Object.fromEntries(Object.entries(overrides).filter(([, value]) => value !== undefined)) };
   // The client order id reserves two digits for the resume index, and the band must stay strictly inside the book.
@@ -432,6 +449,25 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     if (action === 'open' && cmp(mul(mul(leg.quantity, quote.bid), instrument.contractSize), instrument.minNotional) < 0) reject('min_notional', `${name} 名义金额低于 ${instrument.minNotional} USDT`);
   }
 
+  /**
+   * Notional of every opening job accepted so far, priced like at its preview. A job counts from its confirm on and is never
+   * given back by fills, cancels or a close; only a job that ended without any order leaving this process (every operation
+   * not-sent, or none) is left out. Jobs are never pruned, so the sum survives restarts and cap changes.
+   */
+  function openNotionalUsed(): string {
+    const rows = db.prepare(`SELECT json FROM jobs WHERE json_extract(json, '$.action') = 'open'
+      AND NOT (final = 1 AND NOT EXISTS (SELECT 1 FROM operations WHERE operations.job_id = jobs.id AND operations.state <> 'not-sent'))`).all() as { json: string }[];
+    return add('0', ...rows.map(row => jobNotional((JSON.parse(row.json) as Job).legs)));
+  }
+  /** Closing jobs only meet the per-job cap: the running total bounds new exposure, and closing must stay possible. */
+  function checkNotional(notional: string, action: Action): void {
+    if (!limits) return;
+    if (cmp(notional, limits.perJob) > 0) reject('notional_job_cap', `本任务名义金额 ${notional} USDT 超过单笔上限 ${limits.perJob} USDT`, 409);
+    if (action !== 'open') return;
+    const used = openNotionalUsed();
+    if (cmp(add(used, notional), limits.totalOpen) > 0) reject('notional_total_cap', `累计开仓名义金额已用 ${used} USDT，加上本任务 ${notional} USDT 超过累计上限 ${limits.totalOpen} USDT`, 409);
+  }
+
   async function preview(input: unknown, session: string): Promise<Preview> {
     if (typeof session !== 'string' || !/^[\x21-\x7e]{8,128}$/.test(session)) reject('session', '会话无效', 401);
     const intent = parseIntent(input);
@@ -452,6 +488,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const legs = intent.legs.map((leg, index) => {
       const { binding, instrument, quote, snapshot } = reads[index];
       const orderSide = orderSideOf(intent.action, leg.side);
+      // A selling chase has only a floor: it may chase the price up for the whole job, past what the caps counted.
+      if (limits && leg.orderType === 'chase' && orderSide === 'sell') reject('notional_chase_sell', '已配置名义金额上限时，卖出方向的追价首腿没有价格上限，不能使用；请改用市价或限价', 409);
       const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
       const planned = { venue: leg.venue, symbol: intent.symbol, side: leg.side, quantity: leg.quantity, orderType: leg.orderType, limitPrice: leg.limitPrice };
       checkQuantity(planned, instrument, quote, intent.action);
@@ -468,8 +506,10 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     // Settlement completes only on equal barrels, so the plan must already be equal; a tolerance here would end every such job in attention.
     const [a, b] = legs.map(leg => units(exposure(leg.quantity, leg.instrument)));
     if (a !== b) reject('unbalanced', `两腿桶数不相等：${fromUnits(a)} 与 ${fromUnits(b)}`);
+    const notional = jobNotional(legs);
+    checkNotional(notional, intent.action);
     const value: Preview = {
-      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs,
+      id: randomUUID(), expiresAt: at + budgets.previewTtlMs, writerGeneration: generation, intent, legs, notional,
       notes: [
         `先发送 ${VENUE_NAMES[legs[0].venue]} 腿，成交确认后按其成交量发送 ${VENUE_NAMES[legs[1].venue]} 对冲腿。`,
         legs[0].orderType === 'market'
@@ -478,6 +518,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
             ? `首腿以 ${VENUE_NAMES[legs[0].venue]} 原生追价策略发送，${legs[0].orderSide === 'buy' ? '最高' : '最低'}追价为 ${slippageBps} 基点界限 ${legs[0].priceBound}；发送前任一腿盘口越过界限（对冲腿界限 ${legs[1].priceBound}）即不发送；截止、停止或策略被交易所暂停时停止策略，按停止后重查的实际成交对冲。追价策略不接受客户编号：交易所回报的策略编号须经查询核对身份后才会被停止；创建结果不明时不重发、不自动核对，任务转人工，需填写策略编号认领、在观察窗后确认未创建，或强制释放（策略可能已成交，由人工在交易所处理）。`
             : `首腿按限价 ${legs[0].limitPrice} 挂单；发送前任一腿盘口越过 ${slippageBps} 基点界限即不发送。`,
         '对冲腿按市价发送；首腿成交后，包括服务重启接管后，按已落盘成交量补发对冲腿，补发不设价格限制。',
+        ...(limits ? [`名义金额按价格保护界限计 ${notional} USDT；单笔上限 ${limits.perJob} USDT，累计开仓上限 ${limits.totalOpen} USDT（确认时按当时累计再核一次，超限拒绝；对冲腿市价成交可能高于此估算）。`] : []),
         '模拟传输：不会访问任何真实交易所。',
       ],
     };
@@ -507,6 +548,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
         if (!row || row.account_key !== leg.accountKey || row.credential_version !== leg.credentialVersion || row.account_mode !== leg.accountMode) reject('binding_changed', `${VENUE_NAMES[leg.venue]} 账户绑定已变化，请重新预览`, 409);
         if (db.prepare('SELECT 1 FROM locks WHERE resource = ?').get(`${leg.accountKey}:${leg.symbol}`)) reject('symbol_locked', '所选合约已有未结束任务', 409);
       }
+      // Inside the write transaction, so two confirms cannot both fit under the running total.
+      checkNotional(jobNotional(plan.legs), plan.intent.action);
       const job: Job = { id: randomUUID(), status: 'accepted', reason: null, createdAt: now(), deadlineAt: now() + plan.intent.timeoutMs, previewId: plan.id, requestId: body.requestId, action: plan.intent.action, legs: plan.legs, holdNewSends: false, acknowledgedAt: null, hedgeWaitSince: null };
       db.prepare('INSERT INTO jobs(id, status, final, version, created_at, updated_at, json) VALUES (?, ?, 0, 1, ?, ?, ?)').run(job.id, job.status, job.createdAt, job.createdAt, JSON.stringify(job));
       for (const leg of plan.legs) db.prepare('INSERT INTO locks(resource, job_id) VALUES (?, ?)').run(`${leg.accountKey}:${leg.symbol}`, job.id);
@@ -1486,6 +1529,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     refreshPositions: positions.refresh,
     asterPositions: positions.view,
     unfinished: () => unfinishedJobs().map(job => job.id),
+    /** null when no caps are configured. */
+    notionalLimits: () => limits ? { ...limits, openUsed: openNotionalUsed() } : null,
     recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
     accounts: () => (db.prepare('SELECT * FROM accounts WHERE environment = ? ORDER BY venue').all(environment) as unknown as AccountRow[])
