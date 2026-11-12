@@ -143,8 +143,8 @@ test('ci.yml gates exactly the selectable jobs and release waits for all of them
   assert.equal(blocks.get('hygiene').some(line => /^ {4}(needs|if):/.test(line)), false);
   const release = blocks.get('release');
   const needs = /^ {4}needs: \[(.*)\]$/.exec(release.find(line => line.startsWith('    needs:')))[1].split(',').map(name => name.trim());
-  assert.deepEqual(needs.sort(), [...JOBS, 'hygiene'].sort());
+  assert.deepEqual([...needs].sort(), [...JOBS, 'hygiene'].sort());
   // The skipped changes job would otherwise skip release on main; requiring
   // every listed job to succeed keeps a partial run from publishing.
-  assert.ok(release.includes("    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}"));
+  assert.ok(release.includes(`    if: \${{ !cancelled() && ${needs.map(name => `needs.${name}.result == 'success'`).join(' && ')} && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}`));
 });
