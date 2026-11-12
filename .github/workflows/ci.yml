@@ -498,8 +498,10 @@ jobs:
     needs: [app, build-tooling, platform-executor, aster-python, module-units, hygiene, installer-release, installer-slots, installer-deploy, aster-relay, options-backtest, main-watch, release-mirror]
     # A status function is required here: changes is skipped outside pull
     # requests, and the default success() would then skip this job too. Every
-    # listed job must have succeeded, so a skipped one never publishes.
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
+    # listed job must have succeeded, so a skipped one never publishes. Each
+    # result is named because contains(needs.*.result, ...) still skips this job
+    # while an indirect dependency is skipped.
+    if: ${{ !cancelled() && needs.app.result == 'success' && needs.build-tooling.result == 'success' && needs.platform-executor.result == 'success' && needs.aster-python.result == 'success' && needs.module-units.result == 'success' && needs.hygiene.result == 'success' && needs.installer-release.result == 'success' && needs.installer-slots.result == 'success' && needs.installer-deploy.result == 'success' && needs.aster-relay.result == 'success' && needs.options-backtest.result == 'success' && needs.main-watch.result == 'success' && needs.release-mirror.result == 'success' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
