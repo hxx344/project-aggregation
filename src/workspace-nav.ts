@@ -2,7 +2,7 @@ import type { Category } from './types';
 
 // 主导航按统一平台方案第 2 节的工作区分组；只决定菜单归属，不改路由与数据来源。
 export type WorkspaceId = 'overview' | 'market' | 'trading' | 'strategy' | 'options' | 'onchain' | 'research' | 'other';
-export type NativeView = 'overview' | 'trading' | 'aero' | 'cost-lab';
+export type NativeView = 'overview' | 'trading' | 'ondo-mm' | 'aero' | 'cost-lab';
 
 export const workspaceOrder: readonly WorkspaceId[] = ['overview', 'market', 'trading', 'strategy', 'options', 'onchain', 'research', 'other'];
 
@@ -11,7 +11,7 @@ export const workspaceLabels: Record<WorkspaceId, string> = {
   options: '期权', onchain: '链上', research: '研究室', other: '其他',
 };
 
-export const nativeViewWorkspace: Record<NativeView, WorkspaceId> = { overview: 'overview', trading: 'trading', aero: 'onchain', 'cost-lab': 'research' };
+export const nativeViewWorkspace: Record<NativeView, WorkspaceId> = { overview: 'overview', trading: 'trading', 'ondo-mm': 'trading', aero: 'onchain', 'cost-lab': 'research' };
 
 const builtinWorkspace: Readonly<Record<string, WorkspaceId>> = { asset: 'overview', monitor: 'market', crossex: 'trading', aster: 'strategy', greeks: 'options' };
 const categoryWorkspace: Record<Category, WorkspaceId> = { assets: 'overview', monitoring: 'market', trading: 'trading', other: 'other' };

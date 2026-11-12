@@ -23,7 +23,7 @@ test('groups follow the plan order, keep project order and hide empty workspaces
   assert.deepEqual(groups.map(g => [g.id, g.label, g.views, g.projects.map(p => p.project.id)]), [
     ['overview', '总览与资产', ['overview'], ['asset']],
     ['market', '市场与机会', [], ['monitor']],
-    ['trading', '交易中心', ['trading'], ['crossex', 'x']],
+    ['trading', '交易中心', ['trading', 'ondo-mm'], ['crossex', 'x']],
     ['strategy', '策略与风险', [], ['aster']],
     ['options', '期权', [], ['greeks']],
     ['onchain', '链上', ['aero'], []],

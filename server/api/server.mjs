@@ -478,6 +478,16 @@ export function createApiServer({ control, catalog, encrypt, decrypt, embeddedMo
       if (req.headers.origin) sameOrigin(req);
       await forward(req, res, url, current); return;
     }
+    if (pathname === '/api/automation/ondo-mm' || pathname.startsWith('/api/automation/ondo-mm/')) {
+      if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台操作 Ondo 挂单');
+      if (req.headers.origin) sameOrigin(req);
+      // A start may place real orders: admitted like a native execution start.
+      if (req.method === 'POST' && pathname === '/api/automation/ondo-mm/start') {
+        const { raw } = await readJsonBody(req.headers['content-type'], req);
+        await updates.withExecutionEntry(() => forward(req, res, url, current, { body: [raw] }), native); return;
+      }
+      await forward(req, res, url, current); return;
+    }
     if (pathname === '/api/automation/feishu-digest' || pathname.startsWith('/api/automation/feishu-digest/')) {
       if (req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'same-origin') throw new HttpError(403, '请从工作台操作飞书汇总');
       if (req.headers.origin) sameOrigin(req);
