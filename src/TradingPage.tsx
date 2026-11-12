@@ -1,5 +1,6 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
-import { ArrowLeftRight, Bot, ChartLine, Layers, Link2, LoaderCircle, Wallet } from 'lucide-react';
+import { ArrowLeftRight, Bot, ChartLine, Layers, Link2, Wallet } from 'lucide-react';
+import { LoadingFallback } from './StateViews';
 import type { TradingCache } from './trading-cache';
 import { TRADING_SECTIONS } from './trading-sections';
 import { readTradingSection, saveTradingSection } from './trading-navigation';
@@ -45,14 +46,14 @@ export default function TradingPage({ cache, onExpired, onProject, navigationSea
     setSection(next);
   }
   return <div className="trading-center">
-    <header className="trading-center-heading"><h1>交易中心</h1><p>全部交易所仓位与原油、海力士、Anthropic 价差套利</p></header>
+    <header className="wb-heading trading-center-heading"><div><h1>交易中心</h1><p>全部交易所仓位与原油、海力士、Anthropic 价差套利</p></div></header>
     <div className="trading-sections" role="tablist" aria-label="交易中心分区">{TRADING_SECTIONS.map(({ id, label }) => {
       const Icon = icons[id];
       return <button key={id} type="button" role="tab" id={`trading-tab-${id}`} aria-selected={section === id} aria-controls="trading-tabpanel" onClick={() => select(id)} {...(id !== 'positions' ? { onMouseEnter: preloadOilPage, onFocus: preloadOilPage } : {})}><Icon size={16} />{label}</button>;
     })}</div>
     <div role="tabpanel" id="trading-tabpanel" aria-labelledby={`trading-tab-${section}`}>
       {section === 'positions' ? <TradingPositions onExpired={onExpired} onProject={onProject} navigationSearch={navigationSearch} /> : null}
-      {arbitrageOpened ? <Suspense fallback={section === 'positions' ? null : <div className="positions-empty" role="status"><LoaderCircle className="spin" size={22} /><p>正在加载套利交易…</p></div>}><OilTradingPage cache={cache} onExpired={onExpired} section={section} onSection={select} /></Suspense> : null}
+      {arbitrageOpened ? <Suspense fallback={section === 'positions' ? null : <LoadingFallback label="正在加载套利交易…" />}><OilTradingPage cache={cache} onExpired={onExpired} section={section} onSection={select} /></Suspense> : null}
     </div>
   </div>;
 }

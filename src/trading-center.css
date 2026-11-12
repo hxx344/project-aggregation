@@ -1,8 +1,7 @@
 /* Trading Center */
 .trading-center{min-width:0;color:var(--text-primary)}
+/* Heading text and alerts come from the shared page kit (wb-heading, Callout, StatePanel). */
 .trading-center-heading{margin-bottom:12px}
-.trading-center-heading h1{margin:0;font-size:1.25rem;line-height:1.3;font-weight:650;letter-spacing:-.01em;color:var(--text-primary)}
-.trading-center-heading p{margin:4px 0 0;color:var(--text-tertiary);font-size:.75rem}
 .trading-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px 16px;flex-wrap:wrap;margin-bottom:14px}
 .trading-toolbar>.button{flex-shrink:0;margin-left:auto}
 .trading-toolbar-note{display:flex;align-items:center;gap:6px;margin:0;font-size:.75rem;color:var(--text-tertiary);line-height:1.6}
@@ -102,19 +101,13 @@
 .positions-scope-empty{padding:0 14px 10px;color:var(--text-tertiary);font-size:.75rem;line-height:1.6}
 .positions-scope-empty.confirmed{color:var(--emerald)}
 
-.positions-notice{display:flex;align-items:center;gap:8px;background:var(--warning-soft);border:1px solid var(--warning-border);border-radius:var(--radius-md);padding:8px 12px;margin-bottom:12px;color:var(--warning);font-size:.8125rem;line-height:1.6}
-.positions-notice>svg{flex-shrink:0}
-
-.positions-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:36px 20px;border:1px solid var(--surface-4);border-radius:var(--radius-lg);background:var(--surface-2);color:var(--text-tertiary);text-align:center;line-height:1.7}
-.positions-empty h2{font-size:.9375rem;font-weight:600;color:var(--text-primary)}
-.positions-empty p{font-size:.8125rem;max-width:540px}
+.positions-page>.callout{margin-bottom:12px}
 
 .positions-footnote{font-size:.6875rem;color:var(--text-tertiary);line-height:1.7;margin:10px 0 0}
 
 @media(max-width:650px){
 .trading-sections{margin-bottom:12px}
 .trading-sections button{padding:8px 11px;font-size:.8125rem}
-.trading-center-heading h1{font-size:1.125rem}
 .trading-toolbar{margin-bottom:12px}
 .trading-toolbar>.button{font-size:.75rem;padding:6px 9px;gap:5px}
 .positions-overview{gap:6px}
@@ -132,9 +125,6 @@
 .positions-scope>.positions-warning{padding-inline:12px}
 .positions-table th:first-child,.positions-table td:first-child{padding-left:12px}
 .positions-scope-empty{padding-inline:12px}
-.positions-notice{align-items:flex-start;padding:10px}
-.positions-notice>svg{margin-top:2px}
-.positions-empty{padding:28px 14px}
 .positions-exchange-heading>span{overflow-wrap:anywhere}
 .positions-source .positions-project-link{min-height:40px}
 .positions-details summary{min-height:36px}
