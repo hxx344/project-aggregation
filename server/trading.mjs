@@ -15,7 +15,7 @@ const POSITION_STALE = 75_000, FUNDING_STALE = 900_000;
 const PAGE_SIZE = 50;
 const HYNIX_NAMES = Object.freeze({ SKHYUSDT: 'SKHY · ADR', SKHYNIXUSDT: 'SKHYNIX · 正股' });
 const iso = time => new Date(time).toISOString();
-const timeOf = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : null;
+const timeOf = value => { const time = typeof value === 'string' ? Date.parse(value) : NaN; return Number.isFinite(time) ? time : null; };
 
 export class TradingError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -119,7 +119,8 @@ function normalizeReceipts(events, exchange, start = 0, end = Infinity, ledger =
   }
   return sortReceipts([...result.values()]);
 }
-// Oldest first, ties by id; each time is parsed once instead of in every comparison.
+// Oldest first (direction -1: newest first), ties by id ascending; each time is
+// parsed once instead of in every comparison.
 function sortReceipts(rows, direction = 1) {
   return rows.map(row => ({ at: timeOf(row.time), row })).sort((a, b) => direction * (a.at - b.at) || a.row.id.localeCompare(b.row.id)).map(item => item.row);
 }
@@ -458,7 +459,8 @@ export function createTrading({ db, stmt, encrypt, decrypt, clientFactory = crea
         const value = unpackTradingView(saved.json, days, now(), pair);
         const start = timeOf(value.period.start), end = timeOf(value.period.end);
         value.funding.events = entriesFor(pair).filter(({ row }) => row.credentials).flatMap(({ snapshot }) => snapshot.funding.events)
-          .filter(event => timeOf(event.time) >= start && timeOf(event.time) < end).sort((a, b) => timeOf(b.time) - timeOf(a.time) || a.id.localeCompare(b.id));
+          .filter(event => timeOf(event.time) >= start && timeOf(event.time) < end);
+        value.funding.events = sortReceipts(value.funding.events, -1);
         restored.set(`${pairKey}:${days}`, value);
       } catch { return false; }
     }
