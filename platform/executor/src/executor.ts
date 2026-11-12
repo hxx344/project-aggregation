@@ -488,6 +488,8 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     const legs = intent.legs.map((leg, index) => {
       const { binding, instrument, quote, snapshot } = reads[index];
       const orderSide = orderSideOf(intent.action, leg.side);
+      // A selling chase has only a floor: it may chase the price up for the whole job, past what the caps counted.
+      if (limits && leg.orderType === 'chase' && orderSide === 'sell') reject('notional_chase_sell', '已配置名义金额上限时，卖出方向的追价首腿没有价格上限，不能使用；请改用市价或限价', 409);
       const priceBound = orderSide === 'buy' ? bandEdge(quote.ask, slippageBps, 'up', instrument.tickSize) : bandEdge(quote.bid, slippageBps, 'down', instrument.tickSize);
       const planned = { venue: leg.venue, symbol: intent.symbol, side: leg.side, quantity: leg.quantity, orderType: leg.orderType, limitPrice: leg.limitPrice };
       checkQuantity(planned, instrument, quote, intent.action);

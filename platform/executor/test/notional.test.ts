@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { ContractError } from '../src/contracts.ts';
 import { add, cmp } from '../src/decimal.ts';
 import { createExecutor } from '../src/executor.ts';
-import { SESSION, bindAccounts, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
+import { SESSION, bindAccounts, chaseIntent, createHarness, openIntent, previewAndConfirm, settle, type Harness } from './harness.ts';
 
 const code = (expected: string) => (error: unknown) => error instanceof ContractError && error.code === expected;
 async function withHarness(run: (h: Harness) => Promise<void>, notionalLimits?: { perJob: string; totalOpen: string }) {
@@ -84,3 +84,34 @@ test('未配置上限时不限制（模拟默认）', () => withHarness(async h 
   const preview = await h.ex.preview(openIntent({ quantity: ['10', '10'] }), SESSION);
   assert.ok(!preview.notes.some(note => note.includes('单笔上限')));
 }));
+
+test('平仓受单笔上限：两笔开仓合计后一次平仓超过单笔上限即拒绝', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  for (let i = 0; i < 2; i++) assert.equal((await settle(h, (await previewAndConfirm(h)).jobId)).status, 'completed');
+  await assert.rejects(h.ex.preview(openIntent({ action: 'close', quantity: ['2', '2'] }), SESSION), code('notional_job_cap'));
+}, { perJob: '100', totalOpen: '1000' }));
+
+test('委托全部未发送的任务不计入；判定未创建的任务仍计入', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  h.binance.inject({ operation: 'place', mode: 'not-sent' });
+  const local = await previewAndConfirm(h);
+  const failed = await settle(h, local.jobId);
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.legs[0].operation?.state, 'not-sent');
+  assert.equal(h.ex.notionalLimits()?.openUsed, '0');
+  h.binance.inject({ operation: 'place', mode: 'lost-request' });
+  const lost = await previewAndConfirm(h);
+  const view = await settle(h, lost.jobId, { ticks: 40, stepMs: 5_000 });
+  assert.equal(view.status, 'failed');
+  assert.equal(view.legs[0].operation?.state, 'not-created');
+  assert.equal(h.ex.notionalLimits()?.openUsed, lost.preview.notional);
+}, { perJob: '100', totalOpen: '1000' }));
+
+test('已配置上限时拒绝卖出方向的追价首腿；买入追价照常按界限计价', () => withHarness(async h => {
+  bindAccounts(h.ex);
+  const sell = chaseIntent();
+  sell.legs = [{ ...sell.legs[0], side: 'short' }, { ...sell.legs[1], side: 'long' }];
+  await assert.rejects(h.ex.preview(sell, SESSION), code('notional_chase_sell'));
+  const buy = await h.ex.preview(chaseIntent(), SESSION);
+  assert.equal(cmp(buy.notional, buy.legs[0].priceBound as string) >= 0, true);
+}, { perJob: '100', totalOpen: '1000' }));
