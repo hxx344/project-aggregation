@@ -10,6 +10,7 @@ import {
 } from '../connector.ts';
 import { add, cmp, isZero } from '../decimal.ts';
 import { exchange, type FetchLike, type HttpReply } from './http.ts';
+import { PreflightError, bybitAccountProblem, bybitPermissionProblem } from './permissions.ts';
 import { ShapeError, amount, describe, hedgeClose, identifier, list, millis, optionalPrice, record, validCredentials, type LiveCredentials } from './values.ts';
 
 export interface BybitConnectorOptions {
@@ -321,6 +322,16 @@ export function createBybitConnector(options: BybitConnectorOptions): ChaseConne
   return {
     venue: 'bybit',
     capabilities,
+
+    preflight: (binding: AccountBinding, { signal }: CallOptions) => reading(async () => {
+      const info = await signed(binding, 'GET', '/v5/user/query-api', {}, { signal });
+      const problem = bybitPermissionProblem(info);
+      if (problem) throw new PreflightError(`Bybit 密钥权限不符合要求：${problem}`);
+      const accountProblem = bybitAccountProblem((await signed(binding, 'GET', '/v5/account/info', {}, { signal })).unifiedMarginStatus);
+      if (accountProblem) throw new PreflightError(accountProblem);
+      const uid = await readIdentity(binding, signal);
+      if (uid !== binding.accountId) throw new PreflightError(`Bybit 密钥属于用户 ${uid}，与配置的账户 ${binding.accountId} 不一致`);
+    }),
 
     instrument: (symbol: string, { signal }: CallOptions) => reading(async (): Promise<Instrument> => {
       if (!VENUE_EXECUTION_SYMBOLS.bybit.includes(symbol)) throw new VenueError('read-failed', `${symbol} 不在 Bybit 可读合约内`);

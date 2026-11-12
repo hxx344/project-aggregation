@@ -177,6 +177,11 @@ export interface VenueConnector {
    * The answer must be complete (every page read); a listing that cannot be read in full must throw a read failure, never return part of it.
    */
   listStrategies?(binding: AccountBinding, symbol: string, window: { from: number; to: number }, options: CallOptions): Promise<StrategyReport[]>;
+  /**
+   * Startup check of a live account, run before it is registered: the key may read and trade futures and nothing else,
+   * the account can trade, and it belongs to binding.accountId. Any throw refuses the start.
+   */
+  preflight?(binding: AccountBinding, options: CallOptions): Promise<void>;
 }
 export type ChaseConnector = VenueConnector & Required<Pick<VenueConnector, 'placeChase' | 'queryStrategy' | 'stopStrategy' | 'listStrategies'>>;
 export const supportsChase = (connector: VenueConnector): connector is ChaseConnector => connector.capabilities.chase === true

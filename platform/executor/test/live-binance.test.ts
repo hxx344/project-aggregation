@@ -2,108 +2,13 @@
 // read-failed split, the single timestamp retry and the account snapshot. No network is used.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
 import { createBinanceConnector } from '../src/live/binance.ts';
-import { VenueError, parseOrderReport, type OrderRequest } from '../src/connector.ts';
-import { ContractError, parseAccountSnapshot, parseInstrument, parseQuote, type AccountBinding } from '../src/contracts.ts';
+import { parseOrderReport } from '../src/connector.ts';
+import { ContractError, parseAccountSnapshot, parseInstrument, parseQuote } from '../src/contracts.ts';
 import { createExecutor } from '../src/executor.ts';
 import { createHarness } from './harness.ts';
 
-const KEY = 'test-key', SECRET = 'test-secret', NOW = 1_800_000_000_000;
-type Row = Record<string, unknown>;
-interface Call { method: string; host: string; path: string; params: URLSearchParams; apiKey: string | null }
-// BigInt values are written as bare JSON numbers, like the venue's 64-bit ids.
-const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body, (_key, value) => typeof value === 'bigint' ? `__big${value}__` : value).replace(/"__big(\d+)__"/g, '$1'), { status, headers: { 'content-type': 'application/json' } });
-const binding = (overrides: Partial<AccountBinding> = {}): AccountBinding => ({ venue: 'binance', environment: 'mainnet', accountId: '123456789', accountMode: 'standard', credentialVersion: 1, ...overrides });
-const order = (overrides: Partial<OrderRequest> = {}): OrderRequest => ({
-  clientOrderId: 'pa1-0123456789abcdef01234567-0', symbol: 'CLUSDT', side: 'buy', positionSide: 'long', quantity: '2', type: 'limit', limitPrice: '70.5', timeInForce: 'ioc', reduceOnly: false, ...overrides,
-});
-const kind = (expected: string) => (error: unknown) => error instanceof VenueError && error.kind === expected;
-const signal = () => new AbortController().signal;
-const send = (beforeSend: () => void = () => undefined) => ({ signal: signal(), beforeSend });
-
-const symbolInfo = (overrides: Row = {}): Row => ({
-  symbol: 'CLUSDT', status: 'TRADING', contractType: 'TRADIFI_PERPETUAL', quoteAsset: 'USDT', marginAsset: 'USDT',
-  orderTypes: ['LIMIT', 'MARKET', 'STOP'], timeInForce: ['GTC', 'IOC', 'FOK', 'GTX'],
-  filters: [
-    { filterType: 'PRICE_FILTER', tickSize: '0.01', minPrice: '0.01', maxPrice: '1000' },
-    { filterType: 'LOT_SIZE', stepSize: '0.1', minQty: '0.1', maxQty: '10000' },
-    { filterType: 'MARKET_LOT_SIZE', stepSize: '0.1', minQty: '0.1', maxQty: '500' },
-    { filterType: 'MIN_NOTIONAL', notional: '5' },
-  ],
-  ...overrides,
-});
-
-/** Stateful stand-in: verifies every signature and recvWindow against its own clock, keeps orders by client id. */
-class FakeBinance {
-  clock = NOW;
-  serverSkew = 0;
-  mode: 'one-way' | 'hedge' = 'one-way';
-  calls: Call[] = [];
-  orders = new Map<string, Row>();
-  positions: Row[] = [];
-  openOrders: Row[] = [];
-  algoOrders: Row[] = [];
-  info: Row[] = [symbolInfo()];
-  /** One-shot replies by "METHOD path", consumed in order; a function may also hang or throw. */
-  scripted = new Map<string, ((call: Call) => Response | Promise<Response>)[]>();
-  nextOrderId = 9_007_199_254_740_993n;
-
-  script(route: string, ...replies: ((call: Call) => Response | Promise<Response>)[]): void { this.scripted.set(route, [...(this.scripted.get(route) ?? []), ...replies]); }
-  count(route: string): number { return this.calls.filter(call => `${call.method} ${call.path}` === route).length; }
-
-  fetch = async (url: string, init: RequestInit): Promise<Response> => {
-    const parsed = new URL(url), headers = new Headers(init.headers);
-    const call: Call = { method: init.method ?? 'GET', host: parsed.origin, path: parsed.pathname, params: parsed.searchParams, apiKey: headers.get('X-MBX-APIKEY') };
-    this.calls.push(call);
-    assert.equal(init.redirect, 'error');
-    const route = `${call.method} ${call.path}`, queue = this.scripted.get(route);
-    if (queue?.length) return queue.shift()!(call);
-    if (call.path === '/fapi/v1/time') return json({ serverTime: this.clock + this.serverSkew });
-    if (call.path === '/fapi/v1/exchangeInfo') return json({ timezone: 'UTC', symbols: this.info });
-    if (call.path === '/fapi/v1/ticker/bookTicker') return json({ lastUpdateId: 1027024, symbol: call.params.get('symbol'), bidPrice: '70.10', bidQty: '31.0', askPrice: '70.12', askQty: '12.5', time: this.clock - 250 });
-    const refused = this.checkSignature(parsed);
-    if (refused) return refused;
-    if (call.path === '/api/v3/account') return json({ uid: 123456789, canTrade: true, balances: [] });
-    if (call.path.endsWith('/accountConfig')) return json({ canTrade: true, dualSidePosition: this.mode === 'hedge', multiAssetsMargin: false });
-    if (call.path.endsWith('/openOrders')) return json(this.openOrders);
-    if (call.path.endsWith('openAlgoOrders')) return json(this.algoOrders);
-    if (call.path.endsWith('/positionRisk')) return json(this.positions);
-    if (call.path.endsWith('/order')) return this.order(call);
-    return json({ code: -1100, msg: 'unknown path' }, 404);
-  };
-
-  checkSignature(url: URL): Response | null {
-    const raw = url.search.slice(1), at = raw.lastIndexOf('&signature=');
-    assert.ok(at > 0, '签名必须是最后一个参数');
-    assert.equal(raw.slice(at + 11), createHmac('sha256', SECRET).update(raw.slice(0, at)).digest('hex'));
-    const timestamp = Number(url.searchParams.get('timestamp')), server = this.clock + this.serverSkew;
-    assert.equal(url.searchParams.get('recvWindow'), '5000');
-    if (timestamp > server + 1000 || server - timestamp > 5000) return json({ code: -1021, msg: 'Timestamp for this request is outside of the recvWindow.' }, 400);
-    return null;
-  }
-
-  order(call: Call): Response {
-    const p = call.params;
-    if (call.method === 'POST') {
-      const id = p.get('newClientOrderId')!;
-      if (this.orders.has(id)) return json({ code: -4116, msg: 'ClientOrderId is duplicated.' }, 400);
-      const market = p.get('type') === 'MARKET';
-      const row: Row = {
-        orderId: this.nextOrderId++, symbol: p.get('symbol'), status: market ? 'FILLED' : 'EXPIRED', clientOrderId: id, price: market ? '0' : p.get('price'), avgPrice: '70.11',
-        origQty: Number(p.get('quantity')).toFixed(3), executedQty: market ? Number(p.get('quantity')).toFixed(3) : '1.000', cumQuote: '70.11', timeInForce: market ? 'GTC' : p.get('timeInForce'), type: p.get('type'), origType: p.get('type'),
-        reduceOnly: p.get('reduceOnly') === 'true', closePosition: false, side: p.get('side'), positionSide: p.get('positionSide') ?? 'BOTH', updateTime: this.clock,
-      };
-      this.orders.set(id, row);
-      return json(row);
-    }
-    const row = this.orders.get(p.get('origClientOrderId')!);
-    if (call.method === 'GET') return row ? json(row) : json({ code: -2013, msg: 'Order does not exist.' }, 400);
-    if (!row || row.status !== 'NEW') return json({ code: -2011, msg: 'Unknown order sent.' }, 400);
-    row.status = 'CANCELED';
-    return json(row);
-  }
-}
+import { KEY, json, binding, order, kind, signal, send, symbolInfo, FakeBinance, SECRET, NOW, type Call } from './live-fake-binance.ts';
 
 function setup(options: { timeoutMs?: number } = {}) {
   const venue = new FakeBinance();
@@ -344,12 +249,14 @@ test('Binance 连接器：按客户订单号查单与撤单；查无返回 null�
   await assert.rejects(connector.query(binding(), resting, { signal: signal() }), kind('read-failed'));
 });
 
-test('Binance 连接器：执行器在实盘接线（3.0c）之前仍拒绝真实传输', () => {
+test('Binance 连接器：执行器不混用真实与模拟传输：实盘里的模拟连接器、模拟环境里的真实连接器都拒绝', () => {
   const h = createHarness();
   try {
     const { connector } = setup();
     assert.equal(connector.capabilities.transport, 'live');
     assert.throws(() => createExecutor({ store: h.store, connectors: [connector, h.bybit], environment: 'mainnet', notionalLimits: { perJob: '100', totalOpen: '500' } }),
+      (error: unknown) => error instanceof ContractError && error.code === 'live_transport_refused');
+    assert.throws(() => createExecutor({ store: h.store, connectors: [connector] }),
       (error: unknown) => error instanceof ContractError && error.code === 'live_transport_refused');
   } finally { h.dispose(); }
 });

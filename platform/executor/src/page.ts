@@ -267,3 +267,18 @@ async function refresh() {
 }
 refresh(); setInterval(refresh, 2000);
 </script></body></html>`;
+
+/** The same page for the live canary: every label that says simulated says live instead, and ASTER says it is not wired. */
+export const LIVE_PAGE = ([
+  ['<title>执行器原型（模拟）</title>', '<title>执行器（实盘金丝雀）</title>'],
+  ['<h1>统一平台执行器原型 · 原油跨所双腿</h1>', '<h1>统一平台执行器 · 实盘金丝雀 · 原油跨所双腿</h1>'],
+  ['<p class="banner">模拟传输：不会访问任何真实交易所，也不持有真实账户执行权。模拟交易所状态在进程退出后丢失。</p>',
+    '<p class="banner" style="background:#ffebe9;border-color:#cf222e">实盘：确认后会向真实 Binance / Bybit 账户下单。每笔任务受单笔与累计开仓名义金额上限约束；ASTER 划转、ADL 与持仓展示在实盘未接入。</p>'],
+  ['<h2>ASTER 保证金平衡（模拟）</h2>', '<h2>ASTER 保证金平衡（实盘未接入）</h2>'],
+  ['<h2>ASTER 账户持仓（模拟，只读）</h2>', '<h2>ASTER 账户持仓（实盘未接入）</h2>'],
+  ['<h2>ASTER ADL 应急处理（模拟）</h2>', '<h2>ASTER ADL 应急处理（实盘未接入）</h2>'],
+  ['确认执行（模拟）', '确认执行（实盘）'],
+] as const).reduce((page, [from, to]) => {
+  if (page.split(from).length !== 2) throw new Error(`实盘页面替换项不唯一或缺失：${from}`);
+  return page.replace(from, to);
+}, PAGE);

@@ -7,7 +7,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { ContractError, VENUES, exactKeys, type Venue } from './contracts.ts';
 import type { Executor } from './executor.ts';
-import { PAGE } from './page.ts';
+import { LIVE_PAGE, PAGE } from './page.ts';
 
 const MAX_BODY_BYTES = 16 * 1024;
 const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$/;
@@ -74,7 +74,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'GET' && url.pathname === '/') {
       const ok = authorized(request);
       response.writeHead(ok ? 200 : 401, PAGE_HEADERS);
-      response.end(ok ? PAGE : LOGIN_REQUIRED);
+      response.end(ok ? (executor.environment === 'mainnet' ? LIVE_PAGE : PAGE) : LOGIN_REQUIRED);
       return;
     }
     if (!url.pathname.startsWith('/api/')) return send(response, 404, { code: 'not_found', message: '不存在' });
@@ -82,7 +82,7 @@ export function createExecutorServer({ executor, accessToken, session = randomBy
     if (request.method === 'POST' && (request.headers['x-pa-executor'] !== '1' || !String(request.headers['content-type'] ?? '').startsWith('application/json'))) return send(response, 403, { code: 'csrf', message: '缺少本页面请求标记' });
 
     if (request.method === 'GET' && url.pathname === '/api/state') {
-      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
+      return send(response, 200, { generation: executor.generation, retired: executor.retired, transport: executor.environment === 'mainnet' ? 'live' : 'simulated', accounts: executor.accounts(), notionalLimits: executor.notionalLimits(), jobs: executor.recentJobs(20),
         transfers: { pairs: executor.transferPairs(), corruptPairs: executor.corruptTransferPairs(), recent: executor.recentTransfers(20) },
         adl: { pairs: executor.adlPairs(), recent: executor.recentAdlIncidents(10) }, positions: executor.asterPositions() });
     }

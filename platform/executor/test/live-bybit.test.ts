@@ -3,146 +3,13 @@
 // (docs/unified-platform-phase0-inventory.md item 47). No network is used.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
 import { createBybitConnector } from '../src/live/bybit.ts';
-import { VenueError, parseOrderReport, parseStrategyReport, type OrderRequest, type StrategyRequest } from '../src/connector.ts';
-import { ContractError, parseAccountSnapshot, parseInstrument, parseQuote, type AccountBinding } from '../src/contracts.ts';
+import { parseOrderReport, parseStrategyReport } from '../src/connector.ts';
+import { ContractError, parseAccountSnapshot, parseInstrument, parseQuote } from '../src/contracts.ts';
 import { createExecutor } from '../src/executor.ts';
 import { createHarness } from './harness.ts';
 
-const KEY = 'test-key', SECRET = 'test-secret', NOW = 1_800_000_000_000;
-const STRATEGY_A = '3f1c2a9e-6b7d-4c58-9a0e-1d2b3c4d5e6f';
-type Row = Record<string, unknown>;
-interface Call { method: string; path: string; params: URLSearchParams; body: Row | null; apiKey: string | null }
-// BigInt values are written as bare JSON numbers, like the venue's 64-bit ids.
-const json = (body: unknown, status = 200): Response => new Response(JSON.stringify(body, (_key, value) => typeof value === 'bigint' ? `__big${value}__` : value).replace(/"__big(\d+)__"/g, '$1'), { status, headers: { 'content-type': 'application/json' } });
-const ok = (result: unknown): Response => json({ retCode: 0, retMsg: 'OK', result, retExtInfo: {}, time: NOW });
-const fail = (retCode: number, retMsg = 'refused', status = 200): Response => json({ retCode, retMsg, result: {}, retExtInfo: {}, time: NOW }, status);
-const binding = (overrides: Partial<AccountBinding> = {}): AccountBinding => ({ venue: 'bybit', environment: 'mainnet', accountId: '9007199254740993', accountMode: 'unified', credentialVersion: 1, ...overrides });
-const order = (overrides: Partial<OrderRequest> = {}): OrderRequest => ({
-  clientOrderId: 'pa1-0123456789abcdef01234567-0', symbol: 'CLUSDT', side: 'buy', positionSide: 'long', quantity: '2', type: 'limit', limitPrice: '70.5', timeInForce: 'ioc', reduceOnly: false, ...overrides,
-});
-const chase = (overrides: Partial<StrategyRequest> = {}): StrategyRequest => ({ symbol: 'CLUSDT', side: 'buy', positionSide: 'long', quantity: '2', maxChasePrice: '71', reduceOnly: false, ...overrides });
-const kind = (expected: string) => (error: unknown) => error instanceof VenueError && error.kind === expected;
-const signal = () => new AbortController().signal;
-const send = (beforeSend: () => void = () => undefined) => ({ signal: signal(), beforeSend });
-
-const instrumentRow = (overrides: Row = {}): Row => ({
-  symbol: 'CLUSDT', contractType: 'LinearPerpetual', status: 'Trading', baseCoin: 'CL', quoteCoin: 'USDT', settleCoin: 'USDT', unifiedMarginTrade: true,
-  priceFilter: { minPrice: '0.01', maxPrice: '1999.98', tickSize: '0.01' },
-  lotSizeFilter: { maxOrderQty: '10000', minOrderQty: '0.1', qtyStep: '0.1', maxMktOrderQty: '500', minNotionalValue: '5', postOnlyMaxOrderQty: '10000' },
-  ...overrides,
-});
-/** Strategy record with the fields seen on the real account (no positionIdx, numeric status, empty average before a fill). */
-const strategyRow = (overrides: Row = {}): Row => ({
-  strategyId: STRATEGY_A, category: 'UTA_USDT', symbol: 'CLUSDT', side: 'Buy', size: '2', strategyType: 'chaseOrder', status: 2, reduceOnly: false,
-  executedSize: '0', executedAvgPrice: '', maxChasePrice: '71', chasePercentE4: '0', chaseDistance: '0', chasePrice: 'Bid1', postOnly: 0, chaseOrderPrice: '70.1',
-  createdTimeE3: String(NOW - 10_000), updatedTimeE3: String(NOW - 5_000), ...overrides,
-});
-const childRow = (overrides: Row = {}): Row => ({ strategyId: STRATEGY_A, symbol: 'CLUSDT', side: 'Buy', orderId: 'c1a2b3c4-0000-4000-8000-000000000001', positionIdx: 0, status: '5', orderType: 'UNKNOWN', size: '2', executedSize: '2', ...overrides });
-
-/** Stateful stand-in: verifies every signature and recv window against its own clock, keeps orders by orderLinkId. */
-class FakeBybit {
-  clock = NOW;
-  serverSkew = 0;
-  mode: 'one-way' | 'hedge' = 'one-way';
-  calls: Call[] = [];
-  orders: Row[] = [];
-  history: Row[] = [];
-  positions: Row[] | null = null;
-  strategies: Row[] = [];
-  children: Row[] = [];
-  instruments: Row[] = [instrumentRow()];
-  /** One-shot replies by "METHOD path", consumed in order. */
-  scripted = new Map<string, ((call: Call) => Response | Promise<Response>)[]>();
-  nextOrder = 1;
-
-  script(route: string, ...replies: ((call: Call) => Response | Promise<Response>)[]): void { this.scripted.set(route, [...(this.scripted.get(route) ?? []), ...replies]); }
-  count(route: string): number { return this.calls.filter(call => `${call.method} ${call.path}` === route).length; }
-  last(route: string): Call { return this.calls.filter(call => `${call.method} ${call.path}` === route).at(-1)!; }
-
-  fetch = async (url: string, init: RequestInit): Promise<Response> => {
-    const parsed = new URL(url), headers = new Headers(init.headers), body = typeof init.body === 'string' ? init.body : null;
-    assert.equal(parsed.origin, 'https://api.bybit.com');
-    assert.equal(init.redirect, 'error');
-    const call: Call = { method: init.method ?? 'GET', path: parsed.pathname, params: parsed.searchParams, body: body === null ? null : JSON.parse(body), apiKey: headers.get('X-BAPI-API-KEY') };
-    this.calls.push(call);
-    const route = `${call.method} ${call.path}`, queue = this.scripted.get(route);
-    if (call.path.startsWith('/v5/market/')) {
-      if (queue?.length) return queue.shift()!(call);
-      if (call.path === '/v5/market/time') { const at = this.clock + this.serverSkew; return ok({ timeSecond: String(Math.floor(at / 1000)), timeNano: `${at}000000` }); }
-      if (call.path === '/v5/market/instruments-info') return ok({ category: 'linear', list: this.instruments.filter(row => row.symbol === call.params.get('symbol')), nextPageCursor: '' });
-      if (call.path === '/v5/market/orderbook') return ok({ s: call.params.get('symbol'), b: [['70.10', '31']], a: [['70.12', '12.5']], ts: this.clock - 250, u: 1, seq: 2, cts: this.clock - 260 });
-    }
-    const refused = this.checkSignature(headers, call.method === 'POST' ? body ?? '' : parsed.search.slice(1));
-    if (refused) return refused;
-    if (call.method === 'POST') assert.equal(headers.get('Content-Type'), 'application/json');
-    if (queue?.length) return queue.shift()!(call);
-    const p = call.params;
-    switch (route) {
-      case 'GET /v5/user/query-api': return ok({ id: '1', apiKey: KEY, readOnly: 0, userID: 9_007_199_254_740_993n, permissions: {} });
-      case 'GET /v5/position/list': return ok({ category: 'linear', list: this.positions ?? this.flat(p.get('symbol')!), nextPageCursor: '' });
-      case 'GET /v5/order/realtime': return ok({ category: 'linear', list: this.matching(this.orders, p), nextPageCursor: '' });
-      case 'GET /v5/order/history': return ok({ category: 'linear', list: this.matching(this.history, p), nextPageCursor: '' });
-      case 'POST /v5/order/create': return this.create(call.body!);
-      case 'POST /v5/order/cancel': {
-        const row = this.orders.find(item => item.orderLinkId === call.body!.orderLinkId);
-        if (!row || !['New', 'PartiallyFilled'].includes(row.orderStatus as string)) return fail(110001, 'order not exists or too late to cancel');
-        row.orderStatus = 'Cancelled';
-        return ok({ orderId: row.orderId, orderLinkId: row.orderLinkId });
-      }
-      case 'POST /v5/strategy/create': {
-        const b = call.body!;
-        if (this.strategies.some(row => [2, 5, 6].includes(row.status as number) && row.symbol === b.symbol && row.side === b.side)) return fail(60081, "can't create same sides order");
-        this.strategies.push(strategyRow({ symbol: b.symbol, side: b.side, size: b.size, reduceOnly: b.reduceOnly, maxChasePrice: b.maxChasePrice, createdTimeE3: String(this.clock), updatedTimeE3: String(this.clock) }));
-        return ok({ strategyId: STRATEGY_A, result: null });
-      }
-      case 'POST /v5/strategy/stop': {
-        const row = this.strategies.find(item => item.strategyId === call.body!.strategyId);
-        if (!row || [3, 4].includes(row.status as number)) return fail(60062, 'Strategy has been terminated');
-        row.status = 3;
-        return ok({ strategyId: row.strategyId });
-      }
-      case 'GET /v5/strategy/list': {
-        assert.deepEqual([p.get('category'), p.get('strategyType'), p.get('pageSize')], ['UTA_USDT', 'chaseOrder', '50']);
-        const begin = p.get('beginTimeE0'), end = p.get('endTimeE0');
-        const list = this.strategies.filter(row => row.symbol === p.get('symbol') && (!p.has('strategyId') || row.strategyId === p.get('strategyId')) && (!p.has('status') || String(row.status) === p.get('status'))
-          && (begin === null || Number(row.createdTimeE3) >= Number(begin) * 1000) && (end === null || Number(row.createdTimeE3) < Number(end) * 1000));
-        return ok({ list, nextCursor: '', prevCursor: '' });
-      }
-      case 'GET /v5/strategy/order-list': return ok({ list: this.children.filter(row => row.strategyId === p.get('strategyId') && row.symbol === p.get('symbol')), nextCursor: '' });
-    }
-    return fail(10001, `unknown path ${route}`, 404);
-  };
-
-  checkSignature(headers: Headers, payload: string): Response | null {
-    const timestamp = headers.get('X-BAPI-TIMESTAMP')!, recvWindow = headers.get('X-BAPI-RECV-WINDOW')!;
-    assert.equal(headers.get('X-BAPI-API-KEY'), KEY);
-    assert.equal(recvWindow, '5000');
-    assert.equal(headers.get('X-BAPI-SIGN'), createHmac('sha256', SECRET).update(timestamp + KEY + recvWindow + payload).digest('hex'));
-    const server = this.clock + this.serverSkew;
-    if (Number(timestamp) >= server + 1000 || server - Number(timestamp) > 5000) return fail(10002, 'invalid request, please check your server timestamp or recv_window param');
-    return null;
-  }
-
-  flat(symbol: string): Row[] {
-    const base = { symbol, size: '0', side: '', avgPrice: '0' };
-    return this.mode === 'one-way' ? [{ ...base, positionIdx: 0 }] : [{ ...base, positionIdx: 1 }, { ...base, positionIdx: 2 }];
-  }
-  matching(rows: Row[], p: URLSearchParams): Row[] {
-    return rows.filter(row => row.symbol === p.get('symbol') && (!p.has('orderLinkId') || row.orderLinkId === p.get('orderLinkId')));
-  }
-  create(b: Row): Response {
-    if (this.orders.some(row => row.orderLinkId === b.orderLinkId)) return fail(110072, 'OrderLinkedID is duplicate');
-    const market = b.orderType === 'Market';
-    this.orders.push({
-      orderId: `0000-${this.nextOrder++}`, orderLinkId: b.orderLinkId, symbol: b.symbol, side: b.side, orderType: b.orderType, price: market ? '73.5' : b.price, qty: b.qty,
-      timeInForce: market ? 'IOC' : b.timeInForce, orderStatus: market ? 'Filled' : 'PartiallyFilledCanceled', cumExecQty: market ? b.qty : '1', avgPrice: '70.11',
-      positionIdx: b.positionIdx, reduceOnly: b.reduceOnly, createType: 'CreateByUser', createdTime: String(this.clock), updatedTime: String(this.clock),
-    });
-    return ok({ orderId: `0000-${this.nextOrder - 1}`, orderLinkId: b.orderLinkId });
-  }
-}
+import { KEY, STRATEGY_A, json, ok, fail, binding, order, chase, kind, signal, send, instrumentRow, strategyRow, childRow, FakeBybit, SECRET, NOW, type Row, type Call } from './live-fake-bybit.ts';
 
 function setup(options: { timeoutMs?: number } = {}) {
   const venue = new FakeBybit();
@@ -473,12 +340,14 @@ test('Bybit 连接器：策略列表含全部运行中、暂停与结束中的�
   await assert.rejects(connector.listStrategies(binding(), 'CLUSDT', { from: NOW, to: NOW - 1 }, { signal: signal() }), kind('read-failed'));
 });
 
-test('Bybit 连接器：执行器在实盘接线（3.0c）之前仍拒绝真实传输', () => {
+test('Bybit 连接器：执行器不混用真实与模拟传输：实盘里的模拟连接器、模拟环境里的真实连接器都拒绝', () => {
   const h = createHarness();
   try {
     const { connector } = setup();
     assert.deepEqual([connector.capabilities.transport, connector.capabilities.chase], ['live', true]);
     assert.throws(() => createExecutor({ store: h.store, connectors: [h.binance, connector], environment: 'mainnet', notionalLimits: { perJob: '100', totalOpen: '500' } }),
+      (error: unknown) => error instanceof ContractError && error.code === 'live_transport_refused');
+    assert.throws(() => createExecutor({ store: h.store, connectors: [connector] }),
       (error: unknown) => error instanceof ContractError && error.code === 'live_transport_refused');
   } finally { h.dispose(); }
 });

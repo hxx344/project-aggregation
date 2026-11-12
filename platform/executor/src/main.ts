@@ -1,12 +1,16 @@
-// Independent entry point of the phase 1 executor prototype. It owns a separate
-// data directory, refuses the legacy workbench data directory and runs only
-// simulated venues on loopback (plan 1, 8).
+// Independent entry point of the executor. It owns a separate data directory,
+// refuses the legacy workbench data directory and listens on loopback only
+// (plan 1, 8). Without --live-config it runs simulated venues; with it, the
+// live canary (3.0c): one Binance and one Bybit account, notional caps, no
+// shared writer registry and no ASTER transfers or ADL.
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { WAL_SIZE_LIMIT_BYTES, openStore } from './store.ts';
-import { createExecutor } from './executor.ts';
+import { createExecutor, type Executor } from './executor.ts';
+import type { Environment } from './contracts.ts';
+import { createLiveConnectors, loadLiveConfig, loadLiveCredentials, preflightLive } from './live/setup.ts';
 import { SIM_BINDINGS, SIM_TRANSFER_PAIR, createSimulatedVenues } from './simulation.ts';
 import { createExecutorServer } from './http.ts';
 
@@ -36,6 +40,21 @@ export function assertDedicatedDataDir(dir: string): string {
   return path;
 }
 
+const ENVIRONMENT_MARKER = 'environment';
+/**
+ * Binds the data directory to one environment for good: jobs, accounts and ledgers of simulated venues must never be read
+ * as real ones, nor the other way round. A directory used before the marker existed ran simulated venues only.
+ */
+export function claimDataDirEnvironment(dir: string, environment: Environment): void {
+  const marker = join(dir, ENVIRONMENT_MARKER);
+  let recorded: string | null = null;
+  try { recorded = readFileSync(marker, 'utf8').trim(); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error(`数据目录环境标记无法读取：${(error as Error).message}`); }
+  const current = recorded ?? (existsSync(join(dir, 'executor.sqlite')) ? 'simulated' : null);
+  if (current !== null && current !== environment) throw new Error(`数据目录已用于${current === 'mainnet' ? '实盘' : current === 'simulated' ? '模拟' : `未知环境（${current.slice(0, 32)}）`}，不能以${environment === 'mainnet' ? '实盘' : '模拟'}模式启动；请另用一个数据目录`);
+  if (recorded === null) writeFileSync(marker, `${environment}\n`, { mode: 0o600, flag: 'wx' });
+}
+
 /**
  * Writes the login link to <dir>/access-url and returns that path. The token never
  * reaches stdout or logs; whoever can read the data directory can log in. The
@@ -52,20 +71,32 @@ export function writeAccessUrl(dir: string, port: number, token: string): string
 }
 
 async function main(): Promise<void> {
-  const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string', default: '4710' } } });
+  const { values } = parseArgs({ options: { 'data-dir': { type: 'string' }, port: { type: 'string', default: '4710' }, 'live-config': { type: 'string' } } });
   if (!values['data-dir']) throw new Error('需要 --data-dir <独立目录的绝对路径>');
   const dir = assertDedicatedDataDir(values['data-dir']);
   const port = Number(values.port);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('--port 无效');
+  const live = values['live-config'] === undefined ? null : loadLiveConfig(values['live-config']);
+  // Keys are read and every account checked before the data directory is touched, so a bad key leaves nothing behind.
+  const liveConnectors = live ? createLiveConnectors(live, loadLiveCredentials(live.credentialsFile)) : null;
+  if (live && liveConnectors) await preflightLive(live, liveConnectors);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  claimDataDirEnvironment(dir, live ? 'mainnet' : 'simulated');
 
   const store = openStore(join(dir, 'executor.sqlite'));
-  const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
-  const executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });
-  if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
-  for (const binding of SIM_BINDINGS) executor.registerAccount(binding);
-  // A new pair starts disabled; an existing one keeps its switch and settings.
-  if (!executor.transferPairs().some(pair => pair.id === SIM_TRANSFER_PAIR.id) && !executor.corruptTransferPairs().includes(SIM_TRANSFER_PAIR.id)) executor.registerTransferPair(SIM_TRANSFER_PAIR);
+  let executor: Executor;
+  if (live && liveConnectors) {
+    executor = createExecutor({ store, connectors: liveConnectors, environment: 'mainnet', notionalLimits: live.notionalLimits });
+    if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
+    for (const binding of live.accounts) executor.registerAccount(binding);
+  } else {
+    const { binance, bybit, aster, asterTrading } = createSimulatedVenues(Date.now);
+    executor = createExecutor({ store, connectors: [binance, bybit], transfers: aster, adl: asterTrading, positions: asterTrading });
+    if (!executor.acquire()) throw new Error('另一个执行器实例持有写入租约；等待其租约过期后再启动');
+    for (const binding of SIM_BINDINGS) executor.registerAccount(binding);
+    // A new pair starts disabled; an existing one keeps its switch and settings.
+    if (!executor.transferPairs().some(pair => pair.id === SIM_TRANSFER_PAIR.id) && !executor.corruptTransferPairs().includes(SIM_TRANSFER_PAIR.id)) executor.registerTransferPair(SIM_TRANSFER_PAIR);
+  }
 
   // Lease renewal runs apart from the passes so a slow venue call cannot let the lease lapse.
   const heartbeat = setInterval(() => {
@@ -113,7 +144,7 @@ async function main(): Promise<void> {
   const server = createExecutorServer({ executor, accessToken });
   server.on('error', error => { process.stderr.write(`HTTP 监听失败：${error.message}\n`); process.exitCode = 1; void shutdown(); });
   server.listen(port, '127.0.0.1', () => {
-    try { process.stdout.write(`执行器原型（模拟传输）已启动，登录链接已写入 ${writeAccessUrl(dir, port, accessToken)}\n`); }
+    try { process.stdout.write(`${live ? `执行器（实盘金丝雀：单笔上限 ${live.notionalLimits.perJob} USDT，累计开仓上限 ${live.notionalLimits.totalOpen} USDT）` : '执行器原型（模拟传输）'}已启动，登录链接已写入 ${writeAccessUrl(dir, port, accessToken)}\n`); }
     catch (error) { process.stderr.write(`写入登录链接失败：${error instanceof Error ? error.message : String(error)}\n`); process.exitCode = 1; void shutdown(); }
   });
   // Started after the server exists; declared first, so a loop that ends at once can still shut everything down.

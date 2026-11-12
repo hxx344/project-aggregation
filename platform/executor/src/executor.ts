@@ -258,16 +258,20 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
   if (controlOptions && Math.max(budgets.callTimeoutMs, budgets.adlOrderTimeoutMs) > MAX_OWNED_BUDGET_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求单次调用不超过 ${MAX_OWNED_BUDGET_MS} 毫秒`);
   // The registry stops gating on an unknown ASTER transfer this long after it; a request still valid then could land unseen.
   if (controlOptions && transferConnector && transferConnector.capabilities.requestValidityMs > REGISTRY_ASTER_EXPIRY_MS) throw new ContractError(500, 'control_budget', `共享写者登记要求划转请求有效期不超过 ${REGISTRY_ASTER_EXPIRY_MS} 毫秒`);
+  // The registry pins an account to its first claimant forever, so a real account claimed here could never be written by
+  // the workbench again; the live canary runs on accounts the workbench does not trade, without the registry (3.0c).
+  if (controlOptions && environment === 'mainnet') throw new ContractError(500, 'control_mainnet', '实盘金丝雀不接入共享写者登记：登记会把真实账户永久归属本模块');
   const venues = new Map<Venue, VenueConnector>();
   for (const connector of connectors) {
-    // The prototype must not be able to reach a real venue by configuration mistake.
-    if (connector.capabilities.transport !== 'simulated' || environment !== 'simulated') throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
+    // A simulated environment reaches only simulated venues and the mainnet only real ones, so no configuration mistake
+    // sends a real order from a test setup or lets a simulated fill stand in for a real account.
+    if (connector.capabilities.transport !== (environment === 'mainnet' ? 'live' : 'simulated')) throw new ContractError(500, 'live_transport_refused', environment === 'mainnet' ? '实盘环境只接受真实交易所连接器' : '模拟环境只接受模拟传输');
     if (venues.has(connector.venue)) throw new ContractError(500, 'duplicate_connector', `重复的 ${connector.venue} 连接器`);
     venues.set(connector.venue, connector);
   }
-  if (transferConnector && (transferConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
-  if (adlConnector && (adlConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
-  if (positionsConnector && (positionsConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', '阶段 1 原型只接受模拟传输');
+  if (transferConnector && (transferConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', 'ASTER 划转、ADL 与持仓展示只接模拟传输（实盘留到阶段 3.3）');
+  if (adlConnector && (adlConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', 'ASTER 划转、ADL 与持仓展示只接模拟传输（实盘留到阶段 3.3）');
+  if (positionsConnector && (positionsConnector.capabilities.transport !== 'simulated' || environment !== 'simulated')) throw new ContractError(500, 'live_transport_refused', 'ASTER 划转、ADL 与持仓展示只接模拟传输（实盘留到阶段 3.3）');
   const db = store.db;
   const owner = randomUUID();
   let generation = 0, held = false, retired = false, closed = false, heldSince = 0;
@@ -1530,6 +1534,7 @@ export function createExecutor({ store, connectors, environment = 'simulated', n
     asterPositions: positions.view,
     unfinished: () => unfinishedJobs().map(job => job.id),
     /** null when no caps are configured. */
+    environment,
     notionalLimits: () => limits ? { ...limits, openUsed: openNotionalUsed() } : null,
     recentJobs: (limit = 20) => (db.prepare('SELECT id FROM jobs ORDER BY created_at DESC, rowid DESC LIMIT ?').all(Math.min(Math.max(1, Math.trunc(limit)), 100)) as { id: string }[]).map(row => jobView(row.id)),
     /** Principal ids are masked: the page needs to tell accounts apart, not to see who they are. */
