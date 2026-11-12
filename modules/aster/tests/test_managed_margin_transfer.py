@@ -438,7 +438,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         # The settling check does not also plan a new transfer.
         self.assertEqual((result["status"], len(self.posts())), ("cooldown", 1), result)
         self.assertFalse(result["blocks_trading"], result)
-        self.assertIn("过有效期", result["reason"])
+        self.assertIn("已到结算时间", result["reason"])
         self.assertNotIn("unsettled_transfers", self.state())
         self.assertEqual(self.settlement(operation_id), {"outcome": "rejected", "by": "expiry",
             "basis": "nonce_expired_no_receipt", "note": "两侧流水均无该笔划转",
@@ -832,8 +832,12 @@ class ManagedMarginTransferTests(unittest.TestCase):
         self.due(self.SPAN + 1)
         start, end = self.window()
         middle = (start + end) // 2
-        receipt = {"asset": "USD1", "incomeType": "TRANSFER", "tranId": "late-page", "time": middle}
-        busy = self.busy_rows(1200, start, end)
+        # The window's midpoint precedes the send, where a receipt without a
+        # tranId cannot be attributed by time: the receipt sits in the later
+        # half and a row at the shared midpoint exercises the duplicate merge.
+        receipt = {"asset": "USD1", "incomeType": "TRANSFER", "tranId": "late-page", "time": end - 1000}
+        busy = self.busy_rows(1200, start, end) + [{"asset": "USD1", "incomeType": "COMMISSION", "income": "-0.01",
+                                                   "tranId": "midpoint", "symbol": "BTCUSDT", "time": middle}]
         calls = self.paged_income({"long": busy + [{**receipt, "income": "-1000.00000000"}],
                                    "short": busy + [{**receipt, "income": "1000.00000000"}]}, exclusive_end=exclusive_end)
         self.balances.update(long="2000", short="2000")
@@ -1368,7 +1372,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
 
     def test_original_and_external_receipts_late_together_are_ambiguous_not_confirmed(self):
         operation_id = self.skip_timed_out_transfer()
-        result, settled_at = self.settle_at(("A", 5), ("external-B", 20))
+        result, settled_at = self.settle_at(("A", 5), ("external-B", 15))
         self.assert_settled_once(operation_id, result, "归属歧义")
         settlement = self.settlement(operation_id)
         self.assertEqual(settlement["basis"], "nonce_expired_ambiguous_receipt")
@@ -1389,8 +1393,9 @@ class ManagedMarginTransferTests(unittest.TestCase):
                                           "short": [{"asset": "USD1", "incomeType": "TRANSFER", "tranId": "pre-B",
                                                      "time": 1, "income": "1000.00000000"}]}
                     operation_id = self.skip_timed_out_transfer()
-                    # B's exchange time lands 55 s after/before the local send.
-                    result, settled_at = self.settle_at(("pre-B", 55 if skew > 0 else -55),
+                    # B's exchange time lands after the local send (inside the
+                    # label window, which ends SPAN after it) or 55 s before.
+                    result, settled_at = self.settle_at(("pre-B", 15 if skew > 0 else -55),
                                                         *([("A-" + str(skew), 10)] if original else []))
                     settlement = self.settlement(operation_id)
                     if original:
@@ -1562,7 +1567,7 @@ class ManagedMarginTransferTests(unittest.TestCase):
         state["unsettled_transfers"][0]["transaction_id"] = "late-1"
         self.store.put("pair_margin:gold", state)
         # A same-amount transfer with another tranId is not this request.
-        result, settled_at = self.settle_at(("late-1", 5), ("external-B", 20))
+        result, settled_at = self.settle_at(("late-1", 5), ("external-B", 15))
         self.assert_settled_once(operation_id, result, None, outcome="confirmed")
         settlement = self.settlement(operation_id)
         self.assertEqual(settlement["basis"], "late_receipt_confirmed")

@@ -10,9 +10,9 @@ from .models import TradingError
 LIMIT = 50
 BASES = {
     "late_receipt_confirmed": "两侧回执匹配（按金额/时间归属，仍须核对来源）",
-    "nonce_expired_no_receipt": "原请求已过有效期；未取得匹配回执，不代表未到账",
-    "nonce_expired_partial_receipt": "原请求已过有效期；仅有单侧回执",
-    "nonce_expired_ambiguous_receipt": "原请求已过有效期；存在多条候选回执",
+    "nonce_expired_no_receipt": "已到结算时间；未取得匹配回执，不代表未到账",
+    "nonce_expired_partial_receipt": "已到结算时间；仅有单侧回执",
+    "nonce_expired_ambiguous_receipt": "已到结算时间；存在多条候选回执",
     "nonce_expired_unreadable": "流水读取失败，到账结果未知",
     "identity_changed": "账户身份已变化，到账结果未知",
     "nonce_expired_no_follow_up": "缺少后续证据，到账结果未知",
